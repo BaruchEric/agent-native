@@ -1,0 +1,1169 @@
+<title>trip — two demos, two defects</title>
+
+<style>
+  :root {
+    --paper:   #F1F3F2;
+    --surface: #FFFFFF;
+    --sunk:    #E7EBEA;
+    --ink:     #121A18;
+    --ink-2:   #4A565A;
+    --ink-3:   #77878A;
+    --line:    #D5DDDB;
+    --line-2:  #BEC9C7;
+    --accent:  #0F7F84;
+    --accent-soft: #0F7F841A;
+
+    --measured: #1B6E4A;
+    --graph:    #9A6B12;
+    --model:    #A93B4A;
+    --measured-bg: #1B6E4A14;
+    --graph-bg:    #9A6B1214;
+    --model-bg:    #A93B4A14;
+
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
+    --r: 3px;
+    --measure: 66ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:   #0E1417;
+      --surface: #151D21;
+      --sunk:    #101719;
+      --ink:     #E6EDEB;
+      --ink-2:   #9DACAE;
+      --ink-3:   #718184;
+      --line:    #253238;
+      --line-2:  #33454B;
+      --accent:  #46C4C8;
+      --accent-soft: #46C4C81F;
+
+      --measured: #4FBE86;
+      --graph:    #D9A441;
+      --model:    #E4707E;
+      --measured-bg: #4FBE861F;
+      --graph-bg:    #D9A4411F;
+      --model-bg:    #E4707E1F;
+    }
+  }
+
+  :root[data-theme="light"] {
+    --paper:#F1F3F2; --surface:#FFFFFF; --sunk:#E7EBEA;
+    --ink:#121A18; --ink-2:#4A565A; --ink-3:#77878A;
+    --line:#D5DDDB; --line-2:#BEC9C7;
+    --accent:#0F7F84; --accent-soft:#0F7F841A;
+    --measured:#1B6E4A; --graph:#9A6B12; --model:#A93B4A;
+    --measured-bg:#1B6E4A14; --graph-bg:#9A6B1214; --model-bg:#A93B4A14;
+  }
+  :root[data-theme="dark"] {
+    --paper:#0E1417; --surface:#151D21; --sunk:#101719;
+    --ink:#E6EDEB; --ink-2:#9DACAE; --ink-3:#718184;
+    --line:#253238; --line-2:#33454B;
+    --accent:#46C4C8; --accent-soft:#46C4C81F;
+    --measured:#4FBE86; --graph:#D9A441; --model:#E4707E;
+    --measured-bg:#4FBE861F; --graph-bg:#D9A4411F; --model-bg:#E4707E1F;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .shell {
+    max-width: 1140px;
+    margin: 0 auto;
+    padding: 0 24px 96px;
+  }
+
+  /* ---------- masthead ---------- */
+
+  .masthead {
+    padding: 72px 0 40px;
+    border-bottom: 1px solid var(--line);
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 20px;
+  }
+  .masthead h1 {
+    font-family: var(--mono);
+    font-size: clamp(28px, 4.6vw, 48px);
+    line-height: 1.12;
+    letter-spacing: -0.02em;
+    font-weight: 600;
+    margin: 0 0 22px;
+    text-wrap: balance;
+    max-width: 20ch;
+  }
+  .masthead h1 em {
+    font-style: normal;
+    color: var(--accent);
+  }
+  .standfirst {
+    max-width: var(--measure);
+    color: var(--ink-2);
+    font-size: 17px;
+    margin: 0;
+  }
+
+  .runbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0;
+    margin-top: 36px;
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    overflow: hidden;
+    background: var(--surface);
+  }
+  .runbar div {
+    flex: 1 1 128px;
+    padding: 12px 16px;
+    border-right: 1px solid var(--line);
+  }
+  .runbar div:last-child { border-right: 0; }
+  .runbar dt {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 4px;
+  }
+  .runbar dd {
+    font-family: var(--mono);
+    font-size: 15px;
+    margin: 0;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---------- body grid + rail ---------- */
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+  @media (min-width: 940px) {
+    .grid { grid-template-columns: 208px 1fr; gap: 56px; }
+  }
+
+  .rail {
+    position: sticky;
+    top: 0;
+    align-self: start;
+    padding: 32px 0;
+    z-index: 5;
+    background: var(--paper);
+  }
+  @media (max-width: 939px) {
+    .rail {
+      display: flex;
+      gap: 4px;
+      overflow-x: auto;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--line);
+      scrollbar-width: thin;
+    }
+  }
+
+  .stop {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 7px 0;
+    color: var(--ink-3);
+    text-decoration: none;
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.01em;
+    position: relative;
+    white-space: nowrap;
+  }
+  @media (min-width: 940px) {
+    .stop::before {
+      content: "";
+      position: absolute;
+      left: 3px;
+      top: 0;
+      bottom: 0;
+      width: 2px;
+      background: var(--line-2);
+    }
+    .stop:first-child::before { top: 50%; }
+    .stop:last-child::before  { bottom: 50%; }
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--paper);
+    border: 2px solid var(--line-2);
+    flex: none;
+    position: relative;
+    z-index: 1;
+    transform: translateY(-1px);
+  }
+  .stop:hover, .stop:focus-visible { color: var(--ink); }
+  .stop:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  .stop.on { color: var(--ink); }
+  .stop.on .dot { border-color: var(--accent); background: var(--accent); }
+  @media (max-width: 939px) {
+    .stop { padding: 6px 12px; border: 1px solid var(--line); border-radius: 999px; }
+    .stop.on { border-color: var(--accent); }
+  }
+
+  main { padding-top: 32px; min-width: 0; }
+
+  section { padding: 44px 0; border-bottom: 1px solid var(--line); }
+  section:last-child { border-bottom: 0; }
+
+  h2 {
+    font-family: var(--mono);
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0 0 6px;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--sans);
+    font-size: 15px;
+    font-weight: 650;
+    margin: 32px 0 10px;
+    letter-spacing: 0.005em;
+  }
+  .sub {
+    color: var(--ink-3);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin: 0 0 24px;
+  }
+  p { max-width: var(--measure); margin: 0 0 16px; }
+  p.wide { max-width: none; }
+  .muted { color: var(--ink-2); }
+  code {
+    font-family: var(--mono);
+    font-size: 0.88em;
+    background: var(--sunk);
+    padding: 1px 5px;
+    border-radius: var(--r);
+  }
+  a { color: var(--accent); }
+
+  /* ---------- basis chips ---------- */
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+    white-space: nowrap;
+  }
+  .chip.measured { color: var(--measured); background: var(--measured-bg); }
+  .chip.graph    { color: var(--graph);    background: var(--graph-bg); }
+  .chip.model    { color: var(--model);    background: var(--model-bg); }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 18px;
+    padding: 14px 16px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    margin: 0 0 28px;
+  }
+  .legend p { margin: 0; font-size: 13px; color: var(--ink-2); max-width: none; }
+
+  /* ---------- terminal ---------- */
+
+  .term {
+    background: var(--sunk);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.65;
+    white-space: pre;
+    color: var(--ink);
+    margin: 0;
+    font-variant-numeric: tabular-nums;
+  }
+  .term .dim { color: var(--ink-3); }
+  .term .hit { color: var(--model); font-weight: 600; }
+  .term .ok  { color: var(--measured); font-weight: 600; }
+
+  /* ---------- the ablation ---------- */
+
+  .ablation {
+    border: 1px solid var(--line-2);
+    border-radius: var(--r);
+    background: var(--surface);
+    overflow: hidden;
+    margin: 8px 0 28px;
+  }
+  .ablation-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--line);
+    background: var(--sunk);
+  }
+  .ablation-head h3 { margin: 0; font-size: 13px; font-family: var(--mono); font-weight: 600; }
+  .ablation-body { padding: 18px; }
+
+  .switch {
+    display: inline-flex;
+    border: 1px solid var(--line-2);
+    border-radius: 999px;
+    overflow: hidden;
+    background: var(--paper);
+  }
+  .switch button {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 7px 14px;
+    border: 0;
+    background: transparent;
+    color: var(--ink-2);
+    cursor: pointer;
+    transition: background 140ms ease, color 140ms ease;
+  }
+  .switch button[aria-pressed="true"] {
+    background: var(--accent);
+    color: var(--surface);
+  }
+  :root[data-theme="dark"] .switch button[aria-pressed="true"],
+  .switch button[aria-pressed="true"] { color: #fff; }
+  @media (prefers-color-scheme: dark) {
+    .switch button[aria-pressed="true"] { color: #08171A; }
+  }
+  :root[data-theme="light"] .switch button[aria-pressed="true"] { color: #fff; }
+  .switch button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  .readout {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    margin-top: 18px;
+    overflow: hidden;
+  }
+  .cell { background: var(--surface); padding: 12px 14px; }
+  .cell .k {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    display: block;
+    margin-bottom: 5px;
+  }
+  .cell .v {
+    font-family: var(--mono);
+    font-size: 19px;
+    font-variant-numeric: tabular-nums;
+    transition: color 160ms ease;
+  }
+  .cell .v.flag { color: var(--model); }
+  .cell .v.calm { color: var(--measured); }
+
+  .swap { transition: opacity 150ms ease; }
+  .swap.fade { opacity: 0.25; }
+  @media (prefers-reduced-motion: reduce) {
+    .swap, .cell .v, .switch button { transition: none; }
+  }
+
+  /* ---------- tables ---------- */
+
+  .tw { overflow-x: auto; margin: 0 0 22px; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 14px;
+    min-width: 460px;
+  }
+  th, td {
+    text-align: left;
+    padding: 9px 14px 9px 0;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.mono { font-family: var(--mono); font-size: 13px; }
+  tr.bad td { background: var(--model-bg); }
+
+  /* ---------- turn cards ---------- */
+
+  .turn {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 4px;
+    padding: 18px 0;
+    border-bottom: 1px dashed var(--line);
+  }
+  .turn:last-child { border-bottom: 0; }
+  @media (min-width: 620px) {
+    .turn { grid-template-columns: 150px 1fr; gap: 24px; }
+  }
+  .turn .said {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--accent);
+  }
+  .turn .did { margin: 0; max-width: var(--measure); }
+  .turn .did strong { font-weight: 650; }
+
+  /* ---------- callout ---------- */
+
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+    padding: 14px 18px;
+    border-radius: 0 var(--r) var(--r) 0;
+    margin: 0 0 24px;
+  }
+  .callout p { margin: 0; }
+  .callout.warn { border-left-color: var(--model); background: var(--model-bg); }
+
+  .files { list-style: none; padding: 0; margin: 0; }
+  .files li {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    padding: 9px 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 14px;
+  }
+  .files code { background: none; padding: 0; color: var(--ink); font-size: 13px; }
+  .files span { color: var(--ink-2); }
+
+  .themer {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    z-index: 20;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 9px 13px;
+    background: var(--surface);
+    color: var(--ink-2);
+    border: 1px solid var(--line-2);
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .themer:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  footer {
+    padding: 40px 0 0;
+    color: var(--ink-3);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+</style>
+
+<div class="shell">
+
+  <header class="masthead">
+    <p class="eyebrow">trip cli · session report · 27 jul 2026</p>
+    <h1>Two demos. <em>Two defects</em> in code that already shipped.</h1>
+    <p class="standfirst">
+      M9 through M12 were done and pushed, and the next milestone was an open
+      choice between six candidates. Then we ran the tool instead of reasoning
+      about it — once on a synthetic Amsterdam trip, once on a real YouTube
+      travel video — and both runs came back with something the 1094-test suite
+      passes straight over.
+    </p>
+
+    <dl class="runbar">
+      <div><dt>baseline</dt><dd>1094 pass / 0 fail</dd></div>
+      <div><dt>typecheck</dt><dd>clean</dd></div>
+      <div><dt>head</dt><dd>8dce2d0</dd></div>
+      <div><dt>schema</dt><dd>v14</dd></div>
+      <div><dt>committed</dt><dd>nothing</dd></div>
+    </dl>
+  </header>
+
+  <div class="grid">
+
+    <nav class="rail" aria-label="Sections">
+      <a class="stop" href="#exchange"><span class="dot"></span>the exchange</a>
+      <a class="stop" href="#zerostop"><span class="dot"></span>defect 1 · zero-stop</a>
+      <a class="stop" href="#walkwins"><span class="dot"></span>defect 2 · exports</a>
+      <a class="stop" href="#chongqing"><span class="dot"></span>the real run</a>
+      <a class="stop" href="#amsterdam"><span class="dot"></span>client test</a>
+      <a class="stop" href="#next"><span class="dot"></span>what m13 is</a>
+      <a class="stop" href="#files"><span class="dot"></span>deliverables</a>
+    </nav>
+
+    <main>
+
+      <!-- ============ EXCHANGE ============ -->
+      <section id="exchange">
+        <h2>The exchange</h2>
+        <p class="sub">five turns, and where each one led</p>
+
+        <p>
+          Each turn was terse. What matters is that none of the findings came
+          from reading the code — they came from running it and looking at
+          what came out.
+        </p>
+
+        <div class="turn">
+          <div class="said">"read handoff and continue"</div>
+          <p class="did">
+            Verified the baseline, read the M12 ledger and both recons, and put
+            <strong>six candidates</strong> for M13 up without pre-pruning.
+            Recommended <strong>C</strong> — open the exports with a real
+            client — as the only one where a shipped claim was still unverified.
+          </p>
+        </div>
+
+        <div class="turn">
+          <div class="said">"demo it"</div>
+          <p class="did">
+            Built a full Amsterdam trip end to end against the live network.
+            Everything worked. Then reading the ICS turned up
+            <strong>defect 2</strong>: every export calls a leg "transit" that
+            the planner itself calls a walk.
+          </p>
+        </div>
+
+        <div class="turn">
+          <div class="said">"show me actual trip use" <span class="muted">+ a .webloc</span></div>
+          <p class="did">
+            A real 19:36 Chongqing travel video, all the way to an itinerary.
+            The compiled plan recommended <strong>boarding a train for zero
+            stops</strong> — that's <strong>defect 1</strong>, and it is wrong
+            advice rather than a wrong label.
+          </p>
+        </div>
+
+        <div class="turn">
+          <div class="said">"where are the deliverable"</div>
+          <p class="did">
+            Everything was sitting in an ephemeral <code>/private/tmp</code>
+            session directory. Consolidated into
+            <code>scratchpad/m13-demo/</code> in the repo — untracked, nothing
+            committed.
+          </p>
+        </div>
+
+        <div class="turn">
+          <div class="said">"communicate the reports"</div>
+          <p class="did">This page.</p>
+        </div>
+      </section>
+
+      <!-- ============ DEFECT 1 ============ -->
+      <section id="zerostop">
+        <h2>Defect 1 — measuring the walk makes the tool worse</h2>
+        <p class="sub">chongqing · 42 directed pairs · reproducible by ablation</p>
+
+        <div class="legend">
+          <span class="chip measured">measured</span>
+          <span class="chip graph">osm-graph</span>
+          <span class="chip model">model</span>
+          <p>
+            The three-valued <code>basis</code> M12 introduced. The defect is
+            what happens when a comparison puts two different ones on either
+            side of a <code>&lt;=</code>.
+          </p>
+        </div>
+
+        <p>
+          Day 3 of the compiled Chongqing plan told me to get on the monorail at
+          Liziba and get off at Liziba. Same station, zero stops. Delete the
+          measured walking legs from the same database, replan the same trip
+          against the same graph, and the verdict reverses.
+        </p>
+
+        <div class="ablation">
+          <div class="ablation-head">
+            <h3>trip plan · day 3 · Liziba Station → Testbed 2</h3>
+            <div class="switch" role="group" aria-label="Measured walking legs">
+              <button id="btn-on"  type="button" aria-pressed="true">route legs: 84</button>
+              <button id="btn-off" type="button" aria-pressed="false">route legs: 0</button>
+            </div>
+          </div>
+          <div class="ablation-body">
+            <pre class="term swap" id="hop" aria-live="polite"></pre>
+            <div class="readout">
+              <div class="cell">
+                <span class="k">verdict</span>
+                <span class="v swap" id="r-verdict"></span>
+              </div>
+              <div class="cell">
+                <span class="k">minutes</span>
+                <span class="v swap" id="r-min"></span>
+              </div>
+              <div class="cell">
+                <span class="k">basis</span>
+                <span class="v swap" id="r-basis"></span>
+              </div>
+              <div class="cell">
+                <span class="k">zero-stop rides</span>
+                <span class="v swap" id="r-zero"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <h3>Across all 42 directed pairs</h3>
+        <div class="tw">
+          <table>
+            <thead>
+              <tr><th>outcome of running <code>trip route</code></th><th>pairs</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>verdict unchanged</td><td class="num">39 / 42</td></tr>
+              <tr class="bad"><td>flipped WALK → RIDE once measured</td><td class="num">3 / 42</td></tr>
+              <tr><td>flipped RIDE → WALK once measured</td><td class="num">0 / 42</td></tr>
+              <tr class="bad"><td>rides of zero stops recommended</td><td class="num">2 / 42</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Why it only goes one way here</h3>
+        <p>
+          <code>ride</code> is identical in both runs, so a reverse flip would
+          need measuring to <em>shorten</em> a walk. That is possible in
+          principle — the model walks at 4.5 km/h with a 1.3 detour factor,
+          about 3.46 km/h over the geodesic, which a real router can beat. It
+          just never happens in Chongqing, the most vertically extreme city this
+          tool has touched:
+        </p>
+
+        <div class="tw">
+          <table>
+            <thead>
+              <tr><th>measured walk vs modelled</th><th>pairs</th><th>delta</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>longer</td><td class="num">40 / 42</td><td class="num">median +9 min</td></tr>
+              <tr><td>shorter</td><td class="num">0 / 42</td><td class="num">max +32 min</td></tr>
+              <tr><td>equal</td><td class="num">2 / 42</td><td class="num">min 0</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted">
+          So the direction follows from the model being wrong in this city, not
+          from geometry. In a flat grid city the flips could go the other way.
+          What <em>is</em> structural is that the two sides of the comparison
+          have different bases.
+        </p>
+
+        <h3>The mechanism</h3>
+        <pre class="term"><span class="dim">// src/plan/travel.ts:121</span>
+const ride = walkMinutesForKm(r.accessKm)   <span class="hit">// modelled</span>
+           + BOARDING_MINUTES               <span class="hit">// assumed</span>
+           + r.rideMinutes
+           + walkMinutesForKm(r.egressKm);  <span class="hit">// modelled</span>
+
+<span class="dim">// src/plan/travel.ts:136</span>
+walkWins: w.minutes &lt;= ride                 <span class="ok">// w is MEASURED</span></pre>
+
+        <div class="callout warn">
+          <p>
+            M12 left the same-station case to fall out of line 136
+            <em>deliberately</em>, and said why at travel.ts:129–132: <span
+            class="muted">"a zero-stop ride still costs boarding."</span> That
+            reasoning is what this run falsifies. A zero-stop ride costs
+            boarding <em>plus two modelled access walks</em>, and against a
+            measured direct walk that sum can come in lower.
+          </p>
+        </div>
+
+        <h3>It contradicts the M12 recon</h3>
+        <p>
+          Finding 3 of that recon called the same-station case structurally
+          safe. It holds only when nothing is measured — and the recon ran with
+          no <code>route_legs</code> present, while <code>trip route</code> is a
+          documented step users are told to run. The recon measured the one
+          configuration in which its own claim is guaranteed true. That is the
+          M6 rule in its M12 form: the recon's setup is one of the things that
+          can be wrong.
+        </p>
+        <p class="muted">
+          Note the 42 pairs here come from the seven places the <em>video</em>
+          named, not from M9's Chongqing set. No same-set comparison is claimed
+          — the recon's statement was general, so one counterexample is enough.
+        </p>
+
+        <h3>Two fixes, and one is blocked</h3>
+        <div class="tw">
+          <table>
+            <thead><tr><th></th><th>what it is</th><th>cost</th></tr></thead>
+            <tbody>
+              <tr>
+                <td class="mono">a</td>
+                <td>The comparison is mixed-basis — measured against modelled.</td>
+                <td>Route segment→station legs. Network + schema.</td>
+              </tr>
+              <tr>
+                <td class="mono">b</td>
+                <td>A same-station "route" is not a route at all.</td>
+                <td>Blocked — see below.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          The one-line version of (b) is to return <code>null</code> for a
+          same-station route. That breaks <code>reach()</code> in
+          <code>src/commands/transit.ts</code>, which asks proximity <em>by
+          routing a point to itself</em> and depends on that branch returning
+          non-null. Which is what makes it a milestone rather than a guard.
+        </p>
+      </section>
+
+      <!-- ============ DEFECT 2 ============ -->
+      <section id="walkwins">
+        <h2>Defect 2 — the exports contradict the planner</h2>
+        <p class="sub">amsterdam · six rendering surfaces · one reads the flag</p>
+
+        <p>
+          M12's headline is that the station graph can say "walk instead" and
+          name why, which the old straight-line constant structurally could not.
+          <code>walkWins</code> is read in exactly one place —
+          <code>src/render-plan.ts:314</code> — and no export format reads it.
+        </p>
+
+        <div class="tw">
+          <table>
+            <thead>
+              <tr><th>surface</th><th>says</th><th>walkWins reachable?</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="mono">trip plan</td>
+                <td class="mono">37 min WALK instead <span class="muted">+ why</span></td>
+                <td>yes — reads it</td>
+              </tr>
+              <tr>
+                <td class="mono">trip day</td>
+                <td class="mono">37 min WALK instead <span class="muted">+ why</span></td>
+                <td>yes — same renderer</td>
+              </tr>
+              <tr>
+                <td class="mono">plan --json</td>
+                <td class="mono">"mode":"transit" <em>and</em> "walkWins":true</td>
+                <td>yes — misleading, recoverable</td>
+              </tr>
+              <tr class="bad">
+                <td class="mono">ICS</td>
+                <td class="mono">37 min transit (measured)</td>
+                <td>no</td>
+              </tr>
+              <tr class="bad">
+                <td class="mono">Markdown</td>
+                <td class="mono">→ 37 min transit (measured)</td>
+                <td>no</td>
+              </tr>
+              <tr class="bad">
+                <td class="mono">GeoJSON</td>
+                <td class="mono">"mode":"transit"</td>
+                <td>no</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          <code>src/export/ical.ts:76</code> prints
+          <code>arriveBy.mode</code> — the <em>trip's</em> mode, not the leg's —
+          so the export layer structurally cannot say it. The minutes and the
+          <span class="chip measured">measured</span> basis are correct in all
+          three; only the mode label lies. M10's basis propagation held. M12's
+          <code>walkWins</code> did not.
+        </p>
+
+        <div class="callout">
+          <p>
+            This is the exact divergence <code>src/export/view.ts:20-25</code>
+            warns about, in the file that warns about it — and worse than the M8
+            case it cites, because M8 dropped a line and this states a wrong
+            claim.
+          </p>
+        </div>
+
+        <h3>Why the suite is green</h3>
+        <p>
+          <code>walkWins</code> appears in one test file,
+          <code>test/travel-transit.test.ts</code>. No export test ever
+          constructs a walk-wins hop, and no test constructs a same-station pair
+          with measured legs present. Both defects live in the gap between two
+          things that are each tested alone.
+        </p>
+      </section>
+
+      <!-- ============ CHONGQING ============ -->
+      <section id="chongqing">
+        <h2>The real run — a webloc to an itinerary</h2>
+        <p class="sub">4 days in chongqing · 19:36 · auto-captions</p>
+
+        <p>
+          The same video the project's own M6 and M12 recons were built against
+          — the <code>watch ingest</code> help text quotes its mangled names.
+          Pipeline as designed: <code>when</code> → <code>watch</code> → read
+          the transcript → <code>watch frames</code> → correct the names →
+          <code>ingest</code> → <code>review resolve</code> →
+          <code>route</code> → <code>transit</code> → <code>plan</code>.
+        </p>
+
+        <h3>Frames earned their place</h3>
+        <p>
+          The transcript's last line is <em>"As promised, here is a budget
+          breakdown"</em> and then the video ends. The numbers are on screen and
+          in no line of the transcript.
+        </p>
+        <pre class="term">$ trip watch frames 1 --from=19:25 --to=19:36
+12 frames for 19:25-19:36
+
+  <span class="dim">frame 5:</span>  Transportation ......... $40
+           Accommodation ......... $230
+           Activities &amp; food ..... $131
+           <span class="ok">Total (USD) ........... $401</span></pre>
+        <p>
+          40 + 230 + 131 = 401 exactly — components <em>and</em> their total,
+          which is the double-count <code>costs add</code> warns about. All four
+          recorded; <code>budget</code> listed them with per-person-per-day
+          rates and refused to add them. <span class="muted">"trip never looks
+          at them — you do" is the agent-native split working.</span>
+        </p>
+
+        <h3>Auto-captions mangled almost every proper noun</h3>
+        <div class="tw">
+          <table>
+            <thead><tr><th>caption said</th><th>actually</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">Arat Temple</td><td class="mono">Luohan Temple 罗汉寺</td></tr>
+              <tr><td class="mono">Longman how old street</td><td class="mono">Longmenhao Old Street 龙门浩老街</td></tr>
+              <tr><td class="mono">Fisher Gorge</td><td class="mono">Longshuixia <strong>Fissure</strong> Gorge 龙水峡地缝</td></tr>
+              <tr><td class="mono">Shabbati</td><td class="mono">Shibati 十八梯</td></tr>
+              <tr><td class="mono">Hongadong</td><td class="mono">Hongya Cave 洪崖洞</td></tr>
+              <tr><td class="mono">Ji Fang Bay Pedestrian Street</td><td class="mono">Jiefangbei 解放碑</td></tr>
+              <tr><td class="mono">Test Bed Creative Park</td><td class="mono">Testbed 2 贰厂文创园</td></tr>
+              <tr><td class="mono">the D world</td><td class="mono">Chongqing's "8D city" nickname — not a place</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The review queue caught two silent wrong answers</h3>
+        <p>
+          <strong>Jiefangbei Pedestrian Street</strong> geocoded to
+          <code>你好酒店(重庆解放碑步行街店)</code> — a <em>hotel</em> named
+          after the street. <strong>Kuixinglou</strong> returned a different
+          square. Both were flagged by the <code>kind</code> mismatch check
+          rather than becoming coordinates nobody would have questioned.
+        </p>
+        <p class="muted">
+          My own use of <code>query</code> backfired exactly as the help warns:
+          <code>李子坝轻轨站</code> found nothing where <code>李子坝站</code>
+          found the right viewing platform, and <code>重庆贰厂</code> returned
+          five candidates, four of them fuzzy 厂 noise — a reservoir, a golf
+          driving range, a playground.
+        </p>
+
+        <div class="tw">
+          <table>
+            <thead><tr><th>funnel</th><th>count</th><th></th></tr></thead>
+            <tbody>
+              <tr><td>mentions submitted</td><td class="num">14</td><td class="muted">names corrected first</td></tr>
+              <tr><td>geocoded without review</td><td class="num">3</td><td class="muted">21% — 30% excluding the day trip</td></tr>
+              <tr><td>queued for review</td><td class="num">11</td><td class="muted"></td></tr>
+              <tr><td>rejected as unreachable</td><td class="num">7</td><td class="muted">4 of them ~130 km out</td></tr>
+              <tr><td><strong>segments in the end</strong></td><td class="num"><strong>7</strong></td><td class="muted">of 10 in-city mentions</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted">
+          The four Wulong day-trip places sit far outside the 25 km search box,
+          so a day trip beyond the city is structurally unrepresentable. Not a
+          bug — a real limit worth naming.
+        </p>
+
+        <h3>What the network returned</h3>
+        <div class="tw">
+          <table>
+            <thead><tr><th>command</th><th>result</th></tr></thead>
+            <tbody>
+              <tr>
+                <td class="mono">trip route</td>
+                <td>84 directed legs, 2 routers. Widest disagreement <strong>21 min</strong> (Longmenhao → Testbed 2); the schedule reads the slower.</td>
+              </tr>
+              <tr>
+                <td class="mono">trip transit</td>
+                <td>38 relations, 288 stations, 692 links. Modes found: light_rail, <strong>monorail</strong>, subway.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted">
+          The monorail is precisely the line a naive <code>route=subway</code>
+          query misses, and precisely what M12 fixed. Overpass 504'd twice
+          before succeeding — the known intermittent failure.
+        </p>
+      </section>
+
+      <!-- ============ AMSTERDAM ============ -->
+      <section id="amsterdam">
+        <h2>Candidate C, answered</h2>
+        <p class="sub">first time these files were opened by anything but the tool</p>
+
+        <p>
+          M10's entire honesty argument rests on a human seeing
+          <code>STATUS:TENTATIVE</code> in a calendar and a <code>basis</code>
+          property on a map. Nothing had ever opened them. So: a real
+          iCalendar parser, the GeoJSON spec linter, and a real map client.
+        </p>
+
+        <div class="tw">
+          <table>
+            <thead><tr><th>check</th><th>through</th><th>result</th></tr></thead>
+            <tbody>
+              <tr><td>VEVENTs parsed</td><td class="mono">node-ical</td><td class="num">7 / 7, 0 errors</td></tr>
+              <tr><td>STATUS survived as TENTATIVE</td><td class="mono">node-ical</td><td class="num">7 / 7</td></tr>
+              <tr><td>X-TRIP-* properties</td><td class="mono">node-ical</td><td>survive, exposed without the X- prefix</td></tr>
+              <tr><td>GEO parsed to lat/lon</td><td class="mono">node-ical</td><td class="num">6 / 6 placed</td></tr>
+              <tr><td>spec issues</td><td class="mono">geojsonhint</td><td class="num">0</td></tr>
+              <tr><td>features rendered</td><td class="mono">Leaflet</td><td class="num">9 + 1 null geometry</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          Floating local time and the <code>TRANSP:TRANSPARENT</code>
+          placeholder event for the unplaced segment are both documented
+          decisions, not defects. The null-geometry feature carrying the
+          unplaced Royal Palace is valid GeoJSON — absence stayed loud.
+        </p>
+
+        <div class="callout">
+          <p>
+            C's premise came back <strong>negative on rendering</strong>: the
+            formats render fine. It came back positive on something else
+            entirely — they render a wrong claim.
+          </p>
+        </div>
+
+        <p class="muted">
+          Still not done: no GUI calendar client has opened the ICS. Importing
+          into Calendar.app writes to a real calendar, so that one needs a
+          yes first.
+        </p>
+      </section>
+
+      <!-- ============ NEXT ============ -->
+      <section id="next">
+        <h2>What M13 should be</h2>
+        <p class="sub">the option set, revised by evidence</p>
+
+        <div class="tw">
+          <table>
+            <thead><tr><th></th><th>candidate</th><th>status after the demos</th></tr></thead>
+            <tbody>
+              <tr class="bad">
+                <td class="mono">new</td>
+                <td><strong>Zero-stop rides / mixed-basis comparison</strong></td>
+                <td><strong>Wrong advice in shipped code. Measured, 3/42.</strong></td>
+              </tr>
+              <tr>
+                <td class="mono">new</td>
+                <td>walkWins unread by every export</td>
+                <td>Wrong label in shipped code. Confirmed in all three formats.</td>
+              </tr>
+              <tr><td class="mono">A</td><td>Station identity</td><td>Real flaw, still no measured effect.</td></tr>
+              <tr><td class="mono">B</td><td>Frequency</td><td>Unchanged — viability unknown until a feed probe.</td></tr>
+              <tr><td class="mono">C</td><td>Exports opened by a real client</td><td><strong>Answered.</strong> Renders fine.</td></tr>
+              <tr><td class="mono">D</td><td>Route geometry</td><td>Unchanged. Still parked, still real.</td></tr>
+              <tr><td class="mono">E</td><td>Elevation for detour outliers</td><td>Unchanged — untested, not refuted.</td></tr>
+              <tr><td class="mono">F</td><td>Clustering uses raw haversine</td><td>Unchanged. Probably sub-milestone.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          The recommendation is the first row. It beats every original candidate
+          because it is wrong <em>advice</em> rather than an unexamined risk —
+          and the two new findings interact: on Liziba → Testbed 2 the ICS would
+          print "12 min transit", wrong twice over.
+        </p>
+        <p>
+          The fix is an interface change. <code>ExportHop</code> needs a per-leg
+          mode, the ride needs both its sides on one basis, and
+          <code>reach()</code> constrains how the same-station branch can move.
+          That wants brainstorming → spec → plan, not a patch.
+        </p>
+      </section>
+
+      <!-- ============ FILES ============ -->
+      <section id="files">
+        <h2>Deliverables</h2>
+        <p class="sub">trip/scratchpad/m13-demo/ · untracked · nothing committed</p>
+
+        <ul class="files">
+          <li><code>chongqing-run.md</code> <span>the real run and defect 1, with the ablation</span></li>
+          <li><code>demo-findings.md</code> <span>the Amsterdam demo and defect 2</span></li>
+          <li><code>flip-probe.ts</code> <span>the 42-pair ablation — run from the repo root, needs the @/ alias</span></li>
+          <li><code>chongqing.db</code> · <code>demo.db</code> <span>both trips, replayable via TRIP_TEST_DB</span></li>
+          <li><code>chongqing-transcript.txt</code> · <code>chongqing-mentions.json</code> <span>input and corrected mentions</span></li>
+          <li><code>frames/budget-frame.jpg</code> <span>the on-screen budget</span></li>
+          <li><code>chongqing.ics</code> · <code>.md</code> — <code>demo.ics</code> · <code>.md</code> · <code>.geojson</code> <span>the exports</span></li>
+          <li><code>map-overview.png</code> · <code>map-hop-popup.png</code> <span>GeoJSON in Leaflet</span></li>
+        </ul>
+      </section>
+
+      <footer>
+        main is clean at 8dce2d0 · nothing committed, nothing pushed
+      </footer>
+    </main>
+  </div>
+</div>
+
+<button class="themer" id="themer" type="button">theme</button>
+
+<script>
+  (function () {
+    "use strict";
+
+    /* ---- the ablation: two real states from the same database ---- */
+    var STATE = {
+      on: {
+        hop:
+          '  09:00 Liziba Station (李子坝站观景平台)     30m\n' +
+          '       -> <span class="hit">12 min transit (modelled)</span>\n' +
+          '          <span class="hit">李子坝 -> 李子坝, 0 stops, 0 changes</span>\n' +
+          '  09:42 Testbed 2 (贰厂文创园)            120m',
+        verdict: "RIDE",
+        min: "12",
+        basis: "modelled",
+        zero: "2 / 42",
+        bad: true
+      },
+      off: {
+        hop:
+          '  09:00 Liziba Station (李子坝站观景平台)     30m\n' +
+          '       -> <span class="ok">7 min WALK instead (estimated)</span>\n' +
+          '          <span class="ok">both stops are nearest 李子坝</span>\n' +
+          '  09:37 Testbed 2 (贰厂文创园)            120m',
+        verdict: "WALK",
+        min: "7",
+        basis: "estimated",
+        zero: "0 / 42",
+        bad: false
+      }
+    };
+
+    var hop = document.getElementById("hop");
+    var rv = document.getElementById("r-verdict");
+    var rm = document.getElementById("r-min");
+    var rb = document.getElementById("r-basis");
+    var rz = document.getElementById("r-zero");
+    var bOn = document.getElementById("btn-on");
+    var bOff = document.getElementById("btn-off");
+    var swaps = [hop, rv, rm, rb, rz];
+
+    function paint(key) {
+      var s = STATE[key];
+      hop.innerHTML = s.hop;
+      rv.textContent = s.verdict;
+      rm.textContent = s.min;
+      rb.textContent = s.basis;
+      rz.textContent = s.zero;
+      [rv, rz].forEach(function (el) {
+        el.classList.toggle("flag", s.bad);
+        el.classList.toggle("calm", !s.bad);
+      });
+      bOn.setAttribute("aria-pressed", key === "on" ? "true" : "false");
+      bOff.setAttribute("aria-pressed", key === "off" ? "true" : "false");
+    }
+
+    function go(key) {
+      swaps.forEach(function (el) { el.classList.add("fade"); });
+      window.setTimeout(function () {
+        paint(key);
+        swaps.forEach(function (el) { el.classList.remove("fade"); });
+      }, 130);
+    }
+
+    bOn.addEventListener("click", function () { go("on"); });
+    bOff.addEventListener("click", function () { go("off"); });
+    paint("on");
+
+    /* ---- rail: mark the section being read ---- */
+    var stops = Array.prototype.slice.call(document.querySelectorAll(".stop"));
+    var sections = stops.map(function (a) {
+      return document.getElementById(a.getAttribute("href").slice(1));
+    });
+
+    if ("IntersectionObserver" in window) {
+      var seen = new Map();
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) { seen.set(e.target, e.intersectionRatio); });
+        var best = null, bestR = 0;
+        sections.forEach(function (s) {
+          var r = seen.get(s) || 0;
+          if (r > bestR) { bestR = r; best = s; }
+        });
+        stops.forEach(function (a, i) {
+          a.classList.toggle("on", sections[i] === best && bestR > 0);
+        });
+      }, { threshold: [0, 0.15, 0.4, 0.75] });
+      sections.forEach(function (s) { if (s) io.observe(s); });
+    }
+
+    /* ---- theme: override whatever the OS says, both directions ---- */
+    var root = document.documentElement;
+    document.getElementById("themer").addEventListener("click", function () {
+      var now = root.getAttribute("data-theme");
+      if (!now) {
+        var dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        now = dark ? "dark" : "light";
+      }
+      root.setAttribute("data-theme", now === "dark" ? "light" : "dark");
+    });
+  })();
+</script>

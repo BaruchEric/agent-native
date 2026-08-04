@@ -1,0 +1,896 @@
+<title>4 Days in Chongqing — a compiled itinerary</title>
+
+<style>
+  :root {
+    --mist:    #E7EBEC;
+    --surface: #FBFCFC;
+    --sunk:    #DDE4E5;
+    --ink:     #1B2A31;
+    --ink-2:   #516369;
+    --ink-3:   #7C8E93;
+    --line:    #CBD5D7;
+    --line-2:  #B2C0C3;
+
+    --accent:  #BE4522;
+    --accent-soft: #BE452216;
+    --jade:    #2E6F68;
+
+    --measured: #2E6F68;
+    --modelled: #A8721A;
+    --unknown:  #8A6BA8;
+
+    --serif: ui-serif, Georgia, "Iowan Old Style", "Times New Roman", serif;
+    --sans:  system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono:  ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+
+    --r: 2px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --mist:    #0D1518;
+      --surface: #141F23;
+      --sunk:    #0A1114;
+      --ink:     #E4EBEA;
+      --ink-2:   #9BADB0;
+      --ink-3:   #6F8286;
+      --line:    #213136;
+      --line-2:  #2E434A;
+
+      --accent:  #E8724B;
+      --accent-soft: #E8724B1C;
+      --jade:    #5FAFA3;
+
+      --measured: #5FAFA3;
+      --modelled: #D3A143;
+      --unknown:  #B394D0;
+    }
+  }
+
+  :root[data-theme="light"] {
+    --mist:#E7EBEC; --surface:#FBFCFC; --sunk:#DDE4E5;
+    --ink:#1B2A31; --ink-2:#516369; --ink-3:#7C8E93;
+    --line:#CBD5D7; --line-2:#B2C0C3;
+    --accent:#BE4522; --accent-soft:#BE452216; --jade:#2E6F68;
+    --measured:#2E6F68; --modelled:#A8721A; --unknown:#8A6BA8;
+  }
+  :root[data-theme="dark"] {
+    --mist:#0D1518; --surface:#141F23; --sunk:#0A1114;
+    --ink:#E4EBEA; --ink-2:#9BADB0; --ink-3:#6F8286;
+    --line:#213136; --line-2:#2E434A;
+    --accent:#E8724B; --accent-soft:#E8724B1C; --jade:#5FAFA3;
+    --measured:#5FAFA3; --modelled:#D3A143; --unknown:#B394D0;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--mist);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 22px 88px; }
+
+  /* ---------- cover ---------- */
+
+  .cover { padding: 76px 0 34px; }
+  .kicker {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 18px;
+  }
+  .cover h1 {
+    font-family: var(--serif);
+    font-size: clamp(38px, 7.5vw, 68px);
+    line-height: 1.02;
+    letter-spacing: -0.018em;
+    font-weight: 600;
+    margin: 0 0 18px;
+    text-wrap: balance;
+  }
+  .cover h1 .cn {
+    display: block;
+    font-size: 0.42em;
+    letter-spacing: 0.22em;
+    color: var(--ink-3);
+    font-weight: 400;
+    margin-top: 12px;
+  }
+  .cover .lede {
+    font-family: var(--serif);
+    font-size: 19px;
+    line-height: 1.55;
+    color: var(--ink-2);
+    max-width: 54ch;
+    margin: 0;
+  }
+
+  .facts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    margin: 34px 0 0;
+    overflow: hidden;
+  }
+  .facts > div { background: var(--surface); padding: 12px 15px; }
+  .facts dt {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 4px;
+  }
+  .facts dd {
+    font-family: var(--mono);
+    font-size: 14px;
+    margin: 0;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---------- generic ---------- */
+
+  section { padding: 40px 0 4px; }
+  h2 {
+    font-family: var(--serif);
+    font-size: 26px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0 0 6px;
+    text-wrap: balance;
+  }
+  .sub {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0 0 22px;
+  }
+  p { max-width: 62ch; margin: 0 0 15px; }
+  .muted { color: var(--ink-2); }
+  code {
+    font-family: var(--mono);
+    font-size: 0.87em;
+    background: var(--sunk);
+    padding: 1px 5px;
+    border-radius: var(--r);
+  }
+  a { color: var(--accent); }
+  hr.rule { border: 0; border-top: 1px solid var(--line); margin: 42px 0 0; }
+
+  /* ---------- the switch ---------- */
+
+  .control {
+    position: sticky;
+    top: 0;
+    z-index: 8;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 0;
+    margin-top: 34px;
+    background: var(--mist);
+    border-bottom: 1px solid var(--line);
+  }
+  .control p {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  .controls-right { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+
+  .seg {
+    display: inline-flex;
+    border: 1px solid var(--line-2);
+    border-radius: 999px;
+    overflow: hidden;
+    background: var(--surface);
+  }
+  .seg button {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 7px 13px;
+    border: 0;
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+    transition: background 140ms ease, color 140ms ease;
+  }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--surface); }
+  @media (prefers-color-scheme: dark) {
+    .seg button[aria-pressed="true"] { color: #10191C; }
+  }
+  :root[data-theme="light"] .seg button[aria-pressed="true"] { color: #FFF; }
+  :root[data-theme="dark"]  .seg button[aria-pressed="true"] { color: #10191C; }
+  .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  .u { font-variant-numeric: tabular-nums; }
+  .toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-2);
+    background: var(--surface);
+    border: 1px solid var(--line-2);
+    border-radius: 999px;
+    padding: 7px 14px;
+    cursor: pointer;
+  }
+  .toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .toggle .pip {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--line-2);
+    transition: background 150ms ease;
+  }
+  .toggle[aria-pressed="true"] { color: var(--ink); border-color: var(--accent); }
+  .toggle[aria-pressed="true"] .pip { background: var(--accent); }
+
+  /* ---------- days ---------- */
+
+  .day {
+    border-left: 2px solid var(--line-2);
+    padding: 30px 0 30px 24px;
+    margin-left: 2px;
+    position: relative;
+  }
+  /* terraced: each day steps in a little, echoing a city built in layers */
+  @media (min-width: 760px) {
+    .day.s1 { margin-left: 0; }
+    .day.s2 { margin-left: 16px; }
+    .day.s3 { margin-left: 32px; }
+    .day.s4 { margin-left: 48px; }
+  }
+
+  .day-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px 14px;
+    margin-bottom: 4px;
+  }
+  .day-head h3 {
+    font-family: var(--serif);
+    font-size: 23px;
+    font-weight: 600;
+    margin: 0;
+    letter-spacing: -0.008em;
+  }
+  .day-head .when {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+  .day-note {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.06em;
+    margin: 0 0 18px;
+  }
+
+  .stop {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 2px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    padding: 14px 16px;
+    position: relative;
+  }
+  @media (min-width: 620px) {
+    .stop { grid-template-columns: 118px 1fr; gap: 18px; }
+  }
+  .stop::before {
+    content: "";
+    position: absolute;
+    left: -31px;
+    top: 20px;
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    background: var(--surface);
+    border: 2px solid var(--accent);
+  }
+  @media (max-width: 759px) { .stop::before { left: -30px; } }
+
+  .stop .clock {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    padding-top: 2px;
+  }
+  .stop .clock small {
+    display: block;
+    color: var(--ink-3);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    margin-top: 2px;
+  }
+  .stop h4 {
+    font-family: var(--serif);
+    font-size: 19px;
+    font-weight: 600;
+    margin: 0 0 2px;
+    letter-spacing: -0.005em;
+  }
+  .stop .local {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-3);
+    margin: 0 0 8px;
+  }
+  .stop .why { margin: 0; font-size: 14px; color: var(--ink-2); max-width: 56ch; }
+
+  .marks { display: flex; flex-wrap: wrap; gap: 6px; }
+  body.reveal .marks { margin-top: 10px; }
+  .mark {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+    color: var(--unknown);
+    display: none;
+  }
+  body.reveal .mark {
+    display: inline-block;
+    animation: rise 220ms ease both;
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(3px); }
+    to   { opacity: 1; transform: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    body.reveal .mark { animation: none; }
+  }
+
+  /* ---------- hops ---------- */
+
+  .hop {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    padding: 11px 16px 11px 0;
+    margin-left: 0;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+  .hop .bar {
+    width: 22px; height: 2px; background: var(--line-2); flex: none;
+  }
+  .hop b { font-weight: 600; color: var(--ink); }
+  .hop .basis {
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 1px 7px;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+  }
+  .hop.walk .basis  { color: var(--measured); }
+  .hop.ride .basis  { color: var(--modelled); }
+  .hop .detail { color: var(--ink-3); flex-basis: 100%; padding-left: 34px; }
+
+  .flaw {
+    margin: 10px 0 0 34px;
+    padding: 10px 14px;
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+    font-family: var(--sans);
+    font-size: 13.5px;
+    color: var(--ink);
+    max-width: 58ch;
+    border-radius: 0 var(--r) var(--r) 0;
+  }
+  .flaw strong { font-weight: 650; }
+
+  .slack {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-3);
+    letter-spacing: 0.06em;
+    padding: 12px 0 0;
+  }
+
+  /* ---------- panels ---------- */
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    padding: 20px 22px;
+    margin: 0 0 18px;
+  }
+  .panel h3 {
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 650;
+    margin: 0 0 10px;
+  }
+  .panel p:last-child { margin-bottom: 0; }
+
+  .tw { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; min-width: 380px; }
+  th, td { text-align: left; padding: 8px 14px 8px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 500;
+  }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tfoot td { border-bottom: 0; font-weight: 650; }
+
+  .themer {
+    position: fixed;
+    right: 16px; bottom: 16px; z-index: 20;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 9px 13px;
+    background: var(--surface);
+    color: var(--ink-2);
+    border: 1px solid var(--line-2);
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .themer:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  footer {
+    padding: 44px 0 0;
+    border-top: 1px solid var(--line);
+    margin-top: 44px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--ink-3);
+    line-height: 1.8;
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="cover">
+    <p class="kicker">compiled by trip · from one youtube video</p>
+    <h1>Four Days in Chongqing<span class="cn">重庆</span></h1>
+    <p class="lede">
+      Seven places, pulled out of a 19-minute travel video, geocoded, measured
+      against two walking routers and a 288-station rail graph, and laid onto
+      four November days. Everything below is what the planner could actually
+      establish — and it is careful to tell you where that stops.
+    </p>
+
+    <dl class="facts">
+      <div><dt>dates</dt><dd>12–15 Nov 2026</dd></div>
+      <div><dt>travellers</dt><dd>1</dd></div>
+      <div><dt>mode</dt><dd>transit</dd></div>
+      <div><dt>currency</dt><dd>CNY</dd></div>
+      <div><dt>stops</dt><dd>7</dd></div>
+    </dl>
+  </header>
+
+  <div class="control">
+    <p>reading it in</p>
+    <div class="controls-right">
+      <div class="seg" role="group" aria-label="Units">
+        <button id="u-imp" type="button" aria-pressed="true">°F · miles</button>
+        <button id="u-met" type="button" aria-pressed="false">°C · km</button>
+      </div>
+      <button class="toggle" id="reveal" type="button" aria-pressed="false">
+        <span class="pip"></span> show what it doesn't know
+      </button>
+    </div>
+  </div>
+
+  <section>
+    <h2>Why November</h2>
+    <p class="sub">ranked by dew-point comfort, not temperature</p>
+    <p>
+      Chongqing in July sits at a dew point around
+      <span class="u" data-m="24 °C" data-i="75 °F">75 °F</span>, which the
+      planner calls oppressive and refuses to recommend. November scores
+      highest of any month at <strong>86</strong>: dew point
+      <span class="u" data-m="11.0 °C" data-i="51.8 °F">51.8 °F</span>, highs
+      near <span class="u" data-m="17 °C" data-i="63 °F">63 °F</span>, twelve
+      rainy days. The dates were chosen from that table rather than picked
+      first and hoped over.
+    </p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>month</th><th>dew</th><th>high</th><th>rain days</th><th>score</th></tr></thead>
+        <tbody>
+          <tr><td>October</td><td class="num"><span class="u" data-m="15.7 °C" data-i="60.3 °F">60.3 °F</span></td><td class="num"><span class="u" data-m="22 °C" data-i="72 °F">72 °F</span></td><td class="num">17</td><td class="num">80</td></tr>
+          <tr><td><strong>November</strong></td><td class="num"><span class="u" data-m="11.0 °C" data-i="51.8 °F">51.8 °F</span></td><td class="num"><span class="u" data-m="17 °C" data-i="63 °F">63 °F</span></td><td class="num">12</td><td class="num"><strong>86</strong></td></tr>
+          <tr><td>December</td><td class="num"><span class="u" data-m="6.1 °C" data-i="43.0 °F">43.0 °F</span></td><td class="num"><span class="u" data-m="12 °C" data-i="54 °F">54 °F</span></td><td class="num">7</td><td class="num">86</td></tr>
+          <tr><td class="muted">July</td><td class="num muted"><span class="u" data-m="~24 °C" data-i="~75 °F">~75 °F</span></td><td class="num muted">—</td><td class="num muted">—</td><td class="num muted">avoid</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ================= DAY 1 ================= -->
+  <div class="day s1">
+    <div class="day-head">
+      <h3>Day one</h3>
+      <span class="when">Thu 12 Nov · 14:00–19:00</span>
+    </div>
+    <p class="day-note">arrival day — the planner keeps it short on purpose</p>
+
+    <div class="stop">
+      <div class="clock">14:00–15:30<small>90 min</small></div>
+      <div>
+        <h4>Longmenhao Old Street</h4>
+        <p class="local">龙门浩老街</p>
+        <p class="why">
+          A restored quarter on the south bank of the Yangtze, where the old
+          stilt-house streets now hold cafés and boutiques. The video opens its
+          first afternoon here.
+        </p>
+        <div class="marks">
+          <span class="mark">price unknown</span>
+          <span class="mark">opening hours unknown</span>
+        </div>
+      </div>
+    </div>
+    <p class="slack">3 h 30 m of the day left unplanned — nothing else survived geocoding for this slot.</p>
+  </div>
+
+  <!-- ================= DAY 2 ================= -->
+  <div class="day s2">
+    <div class="day-head">
+      <h3>Day two</h3>
+      <span class="when">Fri 13 Nov · 09:00–19:00</span>
+    </div>
+    <p class="day-note">the old city, on foot — the railway does not help here</p>
+
+    <div class="stop">
+      <div class="clock">09:00–10:00<small>60 min</small></div>
+      <div>
+        <h4>Luohan Temple</h4>
+        <p class="local">罗汉寺</p>
+        <p class="why">
+          A Song-dynasty Buddhist temple holding more than five hundred
+          life-sized arhat statues, each carved with a different expression.
+          The video's captions called it "Arat Temple".
+        </p>
+        <div class="marks">
+          <span class="mark">price unknown</span>
+          <span class="mark">opening hours unknown</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="hop walk">
+      <span class="bar"></span>
+      <b>9 min walk</b>
+      <span class="basis">measured</span>
+      <span class="detail">both stops are nearest 小什字 — the metro contributes nothing, so the answer is the walk</span>
+    </div>
+
+    <div class="stop">
+      <div class="clock">10:09–11:39<small>90 min</small></div>
+      <div>
+        <h4>Hongya Cave</h4>
+        <p class="local">洪崖洞</p>
+        <p class="why">
+          Eleven storeys of stilt-house pastiche built into the cliff above the
+          Jialing. Worth seeing lit after dark rather than at this hour — the
+          planner has no opening hours and cannot know that.
+        </p>
+        <div class="marks">
+          <span class="mark">price unknown</span>
+          <span class="mark">opening hours unknown</span>
+          <span class="mark">best after dark — not modelled</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="hop walk">
+      <span class="bar"></span>
+      <b>11 min walk</b>
+      <span class="basis">measured</span>
+      <span class="detail">the railway does not help here</span>
+    </div>
+
+    <div class="stop">
+      <div class="clock">11:50–12:50<small>60 min</small></div>
+      <div>
+        <h4>Jiefangbei</h4>
+        <p class="local">解放碑</p>
+        <p class="why">
+          The Liberation Monument and the pedestrian streets around it. The
+          geocoder's first answer for this was a hotel named after the street;
+          the type check caught it.
+        </p>
+        <div class="marks">
+          <span class="mark">price unknown</span>
+          <span class="mark">opening hours unknown</span>
+        </div>
+      </div>
+    </div>
+    <p class="slack">6 h 10 m left unplanned.</p>
+  </div>
+
+  <!-- ================= DAY 3 ================= -->
+  <div class="day s3">
+    <div class="day-head">
+      <h3>Day three</h3>
+      <span class="when">Sat 14 Nov · 09:00–19:00</span>
+    </div>
+    <p class="day-note">west along the monorail</p>
+
+    <div class="stop">
+      <div class="clock">09:00–09:30<small>30 min</small></div>
+      <div>
+        <h4>Liziba Station</h4>
+        <p class="local">李子坝站观景平台</p>
+        <p class="why">
+          The viewing platform where Line 2 runs straight through the sixth to
+          eighth floors of a residential block. Thirty minutes is enough — you
+          are here to watch a train pass through a building.
+        </p>
+        <div class="marks">
+          <span class="mark">price unknown</span>
+          <span class="mark">opening hours unknown</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="hop ride">
+      <span class="bar"></span>
+      <b>12 min transit</b>
+      <span class="basis">modelled</span>
+      <span class="detail">李子坝 → 李子坝, 0 stops, 0 changes</span>
+      <div class="flaw">
+        <strong>Ignore this one and walk it.</strong> The planner is telling you
+        to board at Liziba and get off at Liziba. This is a known defect found
+        while compiling this very trip: the direct walk is measured over real
+        streets while the walk-to-platform is a straight-line estimate, so a
+        zero-stop ride wins a comparison it should lose. With the measured legs
+        removed, the same planner says <b>7 min, walk instead</b>. Trust that.
+      </div>
+    </div>
+
+    <div class="stop">
+      <div class="clock">09:42–11:42<small>120 min</small></div>
+      <div>
+        <h4>Testbed 2</h4>
+        <p class="local">贰厂文创园</p>
+        <p class="why">
+          A printing works turned design quarter — studios, galleries, a rooftop
+          with one of the better views back over the city. The longest single
+          stop in the plan.
+        </p>
+        <div class="marks">
+          <span class="mark">price unknown</span>
+          <span class="mark">opening hours unknown</span>
+        </div>
+      </div>
+    </div>
+    <p class="slack">7 h 18 m left unplanned.</p>
+  </div>
+
+  <!-- ================= DAY 4 ================= -->
+  <div class="day s4">
+    <div class="day-head">
+      <h3>Day four</h3>
+      <span class="when">Sun 15 Nov · 09:00–12:00</span>
+    </div>
+    <p class="day-note">departure day — three hours before the airport</p>
+
+    <div class="stop">
+      <div class="clock">09:00–10:30<small>90 min</small></div>
+      <div>
+        <h4>Shibati</h4>
+        <p class="local">重庆十八梯传统风貌区</p>
+        <p class="why">
+          The Eighteen Steps: a stone staircase quarter of the old city,
+          restored into tea houses and small shops. Searching for it in Chinese
+          returns five candidates; searching "Shibati" returns two — so the
+          planner was asked in the Latin spelling on purpose.
+        </p>
+        <div class="marks">
+          <span class="mark">price unknown</span>
+          <span class="mark">opening hours unknown</span>
+        </div>
+      </div>
+    </div>
+    <p class="slack">1 h 30 m left before the day closes.</p>
+  </div>
+
+  <hr class="rule">
+
+  <!-- ================= UNKNOWNS ================= -->
+  <section>
+    <h2>What this plan does not know</h2>
+    <p class="sub">stated rather than smoothed over</p>
+
+    <div class="panel">
+      <h3>Every price is unknown — which is not the same as free</h3>
+      <p class="muted">
+        All seven stops carry no recorded admission. The trip total is therefore
+        <strong>unknown</strong>, not zero, and any figure you see elsewhere is a
+        floor rather than an estimate. The video never quoted a per-place price.
+      </p>
+    </div>
+
+    <div class="panel">
+      <h3>No opening hours, anywhere</h3>
+      <p class="muted">
+        Seven of seven stops were placed without knowing when they open. The
+        times above are where the planner put them, not when the doors are
+        unlocked. Hongya Cave in particular is a night sight scheduled here at
+        ten in the morning. Verify before you go.
+      </p>
+    </div>
+
+    <div class="panel">
+      <h3>Transit times are geometry, not a timetable</h3>
+      <p class="muted">
+        The rail graph is real — 38 route relations, 288 stations, 692 links,
+        including the monorail a naive query misses. But OpenStreetMap carries
+        no interval, headway or duration tag for any city this was measured in,
+        so line speed and the boarding allowance are assumed and actual waiting
+        depends on a frequency nothing here knows.
+      </p>
+    </div>
+
+    <div class="panel">
+      <h3>The day is mostly empty, and that is honest</h3>
+      <p class="muted">
+        Fourteen places were named in the video; seven became stops. Four were
+        rejected as unreachable, three could not be resolved. The planner leaves
+        the gap visible instead of padding it with places nobody mentioned.
+      </p>
+    </div>
+  </section>
+
+  <!-- ================= NOT INCLUDED ================= -->
+  <section>
+    <h2>What the video did that this plan cannot</h2>
+    <p class="sub">seven mentions that did not become stops</p>
+
+    <p>
+      The video's entire second day was a trip to the Wulong karst, roughly
+      <span class="u" data-m="130 km" data-i="81 miles">81 miles</span> out.
+      Mentions are geocoded inside a
+      <strong><span class="u" data-m="25 km" data-i="16 mile">16 mile</span>
+      box</strong> around the destination, so a day trip beyond the city is
+      structurally unrepresentable — not a lookup failure, a limit worth naming.
+    </p>
+
+    <div class="tw">
+      <table>
+        <thead><tr><th>place</th><th>why it is not above</th></tr></thead>
+        <tbody>
+          <tr><td>Wulong Karst 武隆喀斯特</td><td class="muted">~<span class="u" data-m="130 km" data-i="81 mi">81 mi</span> out, beyond the <span class="u" data-m="25 km" data-i="16 mi">16 mi</span> box</td></tr>
+          <tr><td>Three Natural Bridges 天生三桥</td><td class="muted">same day trip, same reason</td></tr>
+          <tr><td>Tianfu Official Post 天福官驿</td><td class="muted">same day trip, same reason</td></tr>
+          <tr><td>Longshuixia Fissure Gorge 龙水峡地缝</td><td class="muted">same day trip, same reason</td></tr>
+          <tr><td>Kuixinglou 魁星楼</td><td class="muted">geocoder returned a different square; rejected rather than guessed</td></tr>
+          <tr><td>THE RING 光环购物公园</td><td class="muted">candidates were a different mall in another district</td></tr>
+          <tr><td>Air-raid-shelter hot pot</td><td class="muted">the video never names the specific restaurant</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ================= BUDGET ================= -->
+  <section>
+    <h2>What the video's author spent</h2>
+    <p class="sub">someone else's four days · usd · not your plan</p>
+
+    <p>
+      These numbers were never spoken. They appear on a card in the last eleven
+      seconds of the video, and were read out of an extracted frame. They
+      describe a different traveller's trip in a different currency, so they sit
+      apart from the itinerary rather than inside it.
+    </p>
+
+    <div class="tw">
+      <table>
+        <thead><tr><th>item</th><th>amount</th><th>per person per day</th></tr></thead>
+        <tbody>
+          <tr><td>Transportation</td><td class="num">$40</td><td class="num">$10.00</td></tr>
+          <tr><td>Accommodation</td><td class="num">$230</td><td class="num">$57.50</td></tr>
+          <tr><td>Activities &amp; food</td><td class="num">$131</td><td class="num">$32.75</td></tr>
+        </tbody>
+        <tfoot>
+          <tr><td>Stated total</td><td class="num">$401</td><td class="num">$100.25</td></tr>
+        </tfoot>
+      </table>
+    </div>
+    <p class="muted">
+      The three components sum to the total exactly. They are held as four
+      separate observations and never added, because a source that states
+      components <em>and</em> their total describes the same money twice.
+    </p>
+  </section>
+
+  <footer>
+    Compiled 27 Jul 2026 by trip · schema v14 · from
+    "4 Days in Chongqing, China 2026", 19:36, auto-captions.<br>
+    7 stops placed · 84 walking legs measured across 2 routers · 288 stations ·
+    692 links · 0 prices known · 0 opening hours known.<br>
+    One hop on day three is knowingly wrong and is flagged where it appears.
+  </footer>
+</div>
+
+<button class="themer" id="themer" type="button">theme</button>
+
+<script>
+  (function () {
+    "use strict";
+
+    var body = document.body;
+    var btn = document.getElementById("reveal");
+
+    btn.addEventListener("click", function () {
+      var on = btn.getAttribute("aria-pressed") === "true";
+      btn.setAttribute("aria-pressed", on ? "false" : "true");
+      body.classList.toggle("reveal", !on);
+      btn.lastChild.textContent = on
+        ? " show what it doesn't know"
+        : " hiding nothing";
+    });
+
+    /* ---- units: imperial by default ---- */
+    var units = document.querySelectorAll(".u");
+    var impBtn = document.getElementById("u-imp");
+    var metBtn = document.getElementById("u-met");
+
+    function setUnits(system) {
+      Array.prototype.forEach.call(units, function (el) {
+        var next = el.getAttribute(system === "imperial" ? "data-i" : "data-m");
+        if (next !== null) el.textContent = next;
+      });
+      impBtn.setAttribute("aria-pressed", system === "imperial" ? "true" : "false");
+      metBtn.setAttribute("aria-pressed", system === "metric" ? "true" : "false");
+    }
+
+    impBtn.addEventListener("click", function () { setUnits("imperial"); });
+    metBtn.addEventListener("click", function () { setUnits("metric"); });
+    setUnits("imperial");
+
+    var root = document.documentElement;
+    document.getElementById("themer").addEventListener("click", function () {
+      var now = root.getAttribute("data-theme");
+      if (!now) {
+        now = window.matchMedia("(prefers-color-scheme: dark)").matches
+          ? "dark" : "light";
+      }
+      root.setAttribute("data-theme", now === "dark" ? "light" : "dark");
+    });
+  })();
+</script>
