@@ -1,10 +1,29 @@
+import { getDbExec } from "../db/client.js";
 import {
-  getDbExec,
-  intType,
-  isPostgres,
-  retryOnDdlRace,
-} from "../db/client.js";
+  ensureColumnExists,
+  ensureTableExists,
+  ensureIndexExists,
+} from "../db/ddl-guard.js";
+import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import {
+  authorizeComputerOperation,
+  ensureComputerApprovalStore,
+} from "./computer-supervision-store.js";
+import {
+  assertValidComputerCommandEnvelope,
+  ComputerSupervisionError,
+} from "./computer-supervision.js";
+import {
+  getRemoteComputerCapabilities,
+  getRemoteDeviceForOwner,
+} from "./remote-devices-store.js";
+import {
+  assertNoBinaryPayload,
+  serializeBoundedRemoteJson,
+} from "./remote-json-safety.js";
 import type {
+  ComputerCommandEnvelope,
+  ComputerOperationClass,
   RemoteCommand,
   RemoteCommandKind,
   RemoteCommandStatus,
@@ -25,64 +44,78 @@ const REMOTE_COMMAND_KINDS: RemoteCommandKind[] = [
 
 const TERMINAL_STATUSES = new Set<RemoteCommandStatus>(["completed", "failed"]);
 
-async function ensureTable(): Promise<void> {
+export async function ensureTable(): Promise<void> {
   if (!_initPromise) {
-    _initPromise = (async () => {
-      const client = getDbExec();
-      await retryOnDdlRace(() =>
-        client.execute(`
-          CREATE TABLE IF NOT EXISTS integration_remote_commands (
-            id TEXT PRIMARY KEY,
-            device_id TEXT NOT NULL,
-            owner_email TEXT NOT NULL,
-            org_id TEXT,
-            kind TEXT NOT NULL,
-            params_json TEXT NOT NULL,
-            status TEXT NOT NULL,
-            result_json TEXT,
-            platform TEXT,
-            external_thread_id TEXT,
-            attempts ${intType()} NOT NULL DEFAULT 0,
-            next_check_at ${intType()} NOT NULL,
-            claimed_at ${intType()},
-            completed_at ${intType()},
-            error_message TEXT,
-            created_at ${intType()} NOT NULL,
-            updated_at ${intType()} NOT NULL
-          )
-        `),
-      );
-      await retryOnDdlRace(() =>
-        client.execute(
+    const _initPromiseWithRequestDbPoolScope = (async () => {
+      const createSql = `CREATE TABLE IF NOT EXISTS integration_remote_commands (
+  id TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL,
+  owner_email TEXT NOT NULL,
+  org_id TEXT,
+  kind TEXT NOT NULL,
+  params_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  result_json TEXT,
+  platform TEXT,
+  external_thread_id TEXT,
+  computer_task_id TEXT,
+  computer_run_id TEXT,
+  computer_sequence BIGINT,
+  idempotency_key TEXT,
+  operation_class TEXT,
+  approval_scope TEXT,
+  action_hash TEXT,
+  lease_expires_at BIGINT,
+  attempts BIGINT NOT NULL DEFAULT 0,
+  next_check_at BIGINT NOT NULL,
+  claimed_at BIGINT,
+  completed_at BIGINT,
+  error_message TEXT,
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL
+)`;
+
+      {
+        await ensureTableExists("integration_remote_commands", createSql);
+        await ensureComputerCommandColumns();
+        await ensureIndexExists(
+          "idx_remote_commands_device_status_next",
           `CREATE INDEX IF NOT EXISTS idx_remote_commands_device_status_next ON integration_remote_commands(device_id, status, next_check_at)`,
-        ),
-      );
-      await retryOnDdlRace(() =>
-        client.execute(
+        );
+        await ensureIndexExists(
+          "idx_remote_commands_owner",
           `CREATE INDEX IF NOT EXISTS idx_remote_commands_owner ON integration_remote_commands(owner_email, org_id)`,
-        ),
-      );
+        );
+        await ensureComputerCommandIndexes();
+        return;
+      }
     })().catch((err) => {
-      // Retry init on the next call after a failed startup.
       _initPromise = undefined;
       throw err;
     });
+    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
   }
   return _initPromise;
 }
 
 function rowToCommand(row: Record<string, unknown>): RemoteCommand {
+  const params = parseJson(row.params_json, {});
   return {
     id: row.id as string,
     deviceId: row.device_id as string,
     ownerEmail: row.owner_email as string,
     orgId: (row.org_id as string | null) ?? null,
     kind: row.kind as RemoteCommandKind,
-    params: parseJson(row.params_json, {}),
+    params,
     status: row.status as RemoteCommandStatus,
     result: parseJson(row.result_json, null),
     platform: (row.platform as string | null) ?? null,
     externalThreadId: (row.external_thread_id as string | null) ?? null,
+    idempotencyKey: (row.idempotency_key as string | null) ?? null,
+    computerOperation:
+      row.kind === "computer-operation"
+        ? ((params as { envelope?: ComputerCommandEnvelope })?.envelope ?? null)
+        : null,
     attempts: Number(row.attempts ?? 0),
     nextCheckAt: Number(row.next_check_at ?? 0),
     claimedAt: row.claimed_at == null ? null : Number(row.claimed_at as number),
@@ -92,6 +125,39 @@ function rowToCommand(row: Record<string, unknown>): RemoteCommand {
     createdAt: Number(row.created_at ?? 0),
     updatedAt: Number(row.updated_at ?? 0),
   };
+}
+
+async function ensureComputerCommandColumns(): Promise<void> {
+  const columns: Array<[string, string]> = [
+    ["computer_task_id", "TEXT"],
+    ["computer_run_id", "TEXT"],
+    ["computer_sequence", "BIGINT"],
+    ["idempotency_key", "TEXT"],
+    ["operation_class", "TEXT"],
+    ["approval_scope", "TEXT"],
+    ["action_hash", "TEXT"],
+    ["lease_expires_at", "BIGINT"],
+  ];
+  for (const [name, definition] of columns) {
+    const sql = `ALTER TABLE integration_remote_commands ADD COLUMN${" IF NOT EXISTS"} ${name} ${definition}`;
+    await ensureColumnExists("integration_remote_commands", name, sql);
+  }
+}
+
+async function ensureComputerCommandIndexes(): Promise<void> {
+  const indexes = [
+    [
+      "idx_remote_commands_computer_sequence",
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_commands_computer_sequence ON integration_remote_commands(device_id, computer_task_id, computer_run_id, computer_sequence)`,
+    ],
+    [
+      "idx_remote_commands_idempotency",
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_commands_idempotency ON integration_remote_commands(device_id, idempotency_key)`,
+    ],
+  ] as const;
+  for (const [name, sql] of indexes) {
+    await ensureIndexExists(name, sql);
+  }
 }
 
 export function isRemoteCommandKind(
@@ -111,38 +177,157 @@ export async function enqueueRemoteCommand(input: {
   params?: unknown;
   platform?: string | null;
   externalThreadId?: string | null;
+  idempotencyKey?: string | null;
   nextCheckAt?: number;
 }): Promise<RemoteCommand> {
+  if (input.kind === "computer-operation") {
+    throw new ComputerSupervisionError(
+      "invalid-envelope",
+      "Computer operations must use enqueueComputerCommand",
+    );
+  }
   await ensureTable();
   const client = getDbExec();
   const now = Date.now();
   const id = `remote-command-${now}-${randomHex(8)}`;
+  const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey);
 
-  await client.execute({
-    sql: `INSERT INTO integration_remote_commands
-      (id, device_id, owner_email, org_id, kind, params_json, status, result_json,
-       platform, external_thread_id, attempts, next_check_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    args: [
-      id,
-      input.deviceId,
-      input.ownerEmail,
-      input.orgId ?? null,
-      input.kind,
-      JSON.stringify(input.params ?? {}),
-      "pending",
-      null,
-      input.platform ?? null,
-      input.externalThreadId ?? null,
-      0,
-      input.nextCheckAt ?? now,
-      now,
-      now,
-    ],
-  });
+  if (idempotencyKey) {
+    const existing = await getRemoteCommandByIdempotencyKey({
+      deviceId: input.deviceId,
+      idempotencyKey,
+    });
+    if (existing) return existing;
+  }
+
+  try {
+    await client.execute({
+      sql: `INSERT INTO integration_remote_commands
+        (id, device_id, owner_email, org_id, kind, params_json, status, result_json,
+         platform, external_thread_id, idempotency_key, attempts, next_check_at,
+         created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      args: [
+        id,
+        input.deviceId,
+        input.ownerEmail,
+        input.orgId ?? null,
+        input.kind,
+        JSON.stringify(input.params ?? {}),
+        "pending",
+        null,
+        input.platform ?? null,
+        input.externalThreadId ?? null,
+        idempotencyKey,
+        0,
+        input.nextCheckAt ?? now,
+        now,
+        now,
+      ],
+    });
+  } catch (error) {
+    if (idempotencyKey && isUniqueConstraintError(error)) {
+      const existing = await getRemoteCommandByIdempotencyKey({
+        deviceId: input.deviceId,
+        idempotencyKey,
+      });
+      if (existing) return existing;
+    }
+    throw error;
+  }
 
   const command = await getRemoteCommand(id);
   if (!command) throw new Error("remote command insert failed");
+  return command;
+}
+
+export async function enqueueComputerCommand(input: {
+  deviceId: string;
+  ownerEmail: string;
+  orgId?: string | null;
+  envelope: ComputerCommandEnvelope;
+  platform?: string | null;
+}): Promise<RemoteCommand> {
+  const envelope = await assertValidComputerCommandEnvelope(input.envelope);
+  const device = await getRemoteDeviceForOwner({
+    id: input.deviceId,
+    ownerEmail: input.ownerEmail,
+    orgId: input.orgId,
+  });
+  if (!device || device.status !== "active") {
+    throw new ComputerSupervisionError(
+      "approval-mismatch",
+      "Computer device does not belong to this owner and organization",
+    );
+  }
+  const capabilities = getRemoteComputerCapabilities(device);
+  const [surface, mode] = envelope.operationClass.split(".") as [
+    "browser" | "desktop",
+    "observe" | "control",
+  ];
+  if (capabilities?.[surface]?.[mode] !== true) {
+    throw new ComputerSupervisionError(
+      "approval-denied",
+      `Remote device did not advertise ${envelope.operationClass}`,
+    );
+  }
+  await ensureTable();
+  await ensureComputerApprovalStore();
+  const client = getDbExec();
+  const insert = async (tx: typeof client): Promise<string> => {
+    await authorizeComputerOperation({ ...input, envelope }, tx);
+    const now = Date.now();
+    const id = `remote-command-${now}-${randomHex(8)}`;
+    try {
+      await tx.execute({
+        sql: `INSERT INTO integration_remote_commands
+          (id, device_id, owner_email, org_id, kind, params_json, status,
+           result_json, platform, external_thread_id, computer_task_id,
+           computer_run_id, computer_sequence, idempotency_key, operation_class,
+           approval_scope, action_hash, lease_expires_at, attempts, next_check_at,
+           created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          id,
+          input.deviceId,
+          input.ownerEmail,
+          input.orgId ?? null,
+          "computer-operation",
+          JSON.stringify({ envelope }),
+          "pending",
+          null,
+          input.platform ?? null,
+          null,
+          envelope.taskId,
+          envelope.runId,
+          envelope.sequence,
+          envelope.idempotencyKey,
+          envelope.operationClass,
+          envelope.approval.scope,
+          envelope.approval.actionHash,
+          envelope.leaseExpiresAt,
+          0,
+          now,
+          now,
+          now,
+        ],
+      });
+    } catch (error) {
+      if (isUniqueConstraintError(error)) {
+        throw new ComputerSupervisionError(
+          "replay",
+          "Computer operation sequence or idempotency key was already used",
+        );
+      }
+      throw error;
+    }
+    return id;
+  };
+  const id = client.transaction
+    ? await client.transaction((tx) => insert(tx))
+    : await insert(client);
+  const command = await getRemoteCommand(id);
+  if (!command) throw new Error("computer command insert failed");
   return command;
 }
 
@@ -153,6 +338,20 @@ export async function getRemoteCommand(
   const { rows } = await getDbExec().execute({
     sql: `SELECT * FROM integration_remote_commands WHERE id = ? LIMIT 1`,
     args: [id],
+  });
+  return rows[0] ? rowToCommand(rows[0] as Record<string, unknown>) : null;
+}
+
+export async function getRemoteCommandByIdempotencyKey(input: {
+  deviceId: string;
+  idempotencyKey: string;
+}): Promise<RemoteCommand | null> {
+  await ensureTable();
+  const { rows } = await getDbExec().execute({
+    sql: `SELECT * FROM integration_remote_commands
+          WHERE device_id = ? AND idempotency_key = ?
+          LIMIT 1`,
+    args: [input.deviceId, input.idempotencyKey],
   });
   return rows[0] ? rowToCommand(rows[0] as Record<string, unknown>) : null;
 }
@@ -177,7 +376,7 @@ export async function listRemoteCommandsForOwner(input: {
   const { rows } = await getDbExec().execute({
     sql: `SELECT * FROM integration_remote_commands
           WHERE owner_email = ?
-            AND ((org_id IS NULL AND ? IS NULL) OR org_id = ?)
+            AND ((org_id IS NULL AND CAST(? AS TEXT) IS NULL) OR org_id = ?)
           ORDER BY updated_at DESC
           LIMIT ?`,
     args: [input.ownerEmail, input.orgId ?? null, input.orgId ?? null, limit],
@@ -195,6 +394,7 @@ export async function claimNextRemoteCommand(
     sql: `SELECT id FROM integration_remote_commands
           WHERE device_id = ?
             AND status = 'pending'
+            AND kind <> 'computer-operation'
             AND next_check_at <= ?
           ORDER BY created_at ASC
           LIMIT 1`,
@@ -204,26 +404,118 @@ export async function claimNextRemoteCommand(
   if (!id) return null;
 
   const result = await client.execute({
-    sql: isPostgres()
-      ? `UPDATE integration_remote_commands
+    sql: `UPDATE integration_remote_commands
           SET status = ?, attempts = attempts + 1, claimed_at = ?, updated_at = ?
           WHERE id = ? AND device_id = ? AND status = 'pending'
-          RETURNING *`
-      : `UPDATE integration_remote_commands
-          SET status = ?, attempts = attempts + 1, claimed_at = ?, updated_at = ?
-          WHERE id = ? AND device_id = ? AND status = 'pending'`,
+          RETURNING *`,
     args: ["claimed", now, now, id, deviceId],
   });
-  if (isPostgres()) {
+  const row = result.rows?.[0];
+  return row ? rowToCommand(row as Record<string, unknown>) : null;
+}
+
+export async function claimNextComputerCommand(input: {
+  deviceId: string;
+  ownerEmail: string;
+  orgId?: string | null;
+  operationClasses?: ComputerOperationClass[];
+  now?: number;
+}): Promise<RemoteCommand | null> {
+  await ensureTable();
+  if (input.operationClasses?.length === 0) return null;
+  const client = getDbExec();
+  const now = input.now ?? Date.now();
+  const operationClassClause = input.operationClasses?.length
+    ? ` AND operation_class IN (${input.operationClasses.map(() => "?").join(", ")})`
+    : "";
+  const { rows } = await client.execute({
+    sql: `SELECT * FROM integration_remote_commands
+          WHERE device_id = ? AND owner_email = ?
+            AND ((org_id IS NULL AND CAST(? AS TEXT) IS NULL) OR org_id = ?)
+            AND kind = 'computer-operation' AND status = 'pending'
+            AND next_check_at <= ?${operationClassClause}
+          ORDER BY computer_sequence ASC, created_at ASC
+          LIMIT 1`,
+    args: [
+      input.deviceId,
+      input.ownerEmail,
+      input.orgId ?? null,
+      input.orgId ?? null,
+      now,
+      ...(input.operationClasses ?? []),
+    ],
+  });
+  if (!rows[0]) return null;
+  const candidate = rowToCommand(rows[0] as Record<string, unknown>);
+  try {
+    const envelope = await assertValidComputerCommandEnvelope(
+      candidate.computerOperation,
+      { now },
+    );
+    const row = rows[0] as Record<string, unknown>;
+    if (
+      envelope.taskId !== row.computer_task_id ||
+      envelope.runId !== row.computer_run_id ||
+      envelope.sequence !== Number(row.computer_sequence) ||
+      envelope.idempotencyKey !== row.idempotency_key ||
+      envelope.operationClass !== row.operation_class ||
+      envelope.approval.scope !== row.approval_scope ||
+      envelope.approval.actionHash !== row.action_hash ||
+      envelope.leaseExpiresAt !== Number(row.lease_expires_at)
+    ) {
+      throw new ComputerSupervisionError(
+        "action-hash-mismatch",
+        "Stored computer command binding does not match its envelope",
+      );
+    }
+  } catch (error) {
+    await client.execute({
+      sql: `UPDATE integration_remote_commands
+            SET status = 'failed', error_message = ?, completed_at = ?, updated_at = ?
+            WHERE id = ? AND device_id = ? AND owner_email = ?
+              AND ((org_id IS NULL AND CAST(? AS TEXT) IS NULL) OR org_id = ?)
+              AND status = 'pending'`,
+      args: [
+        error instanceof Error
+          ? error.message.slice(0, 2000)
+          : "Invalid computer operation",
+        now,
+        now,
+        candidate.id,
+        input.deviceId,
+        input.ownerEmail,
+        input.orgId ?? null,
+        input.orgId ?? null,
+      ],
+    });
+    return null;
+  }
+
+  const result = await client.execute({
+    sql: `UPDATE integration_remote_commands
+          SET status = 'claimed', attempts = attempts + 1, claimed_at = ?, updated_at = ?
+          WHERE id = ? AND device_id = ? AND owner_email = ?
+            AND ((org_id IS NULL AND CAST(? AS TEXT) IS NULL) OR org_id = ?)
+            AND status = 'pending' AND lease_expires_at > ?
+          RETURNING *`,
+    args: [
+      now,
+      now,
+      candidate.id,
+      input.deviceId,
+      input.ownerEmail,
+      input.orgId ?? null,
+      input.orgId ?? null,
+      now,
+    ],
+  });
+  {
     const row = result.rows?.[0];
     return row ? rowToCommand(row as Record<string, unknown>) : null;
   }
-  const affected = result.rowsAffected ?? (result as any).rowCount;
-  if (affected === 0) return null;
-
-  const command = await getRemoteCommand(id);
-  if (!command || command.status !== "claimed") return null;
-  return command;
+  if (affectedRows(result) === 0) return null;
+  const command = await getRemoteCommand(candidate.id);
+  return command?.status === "claimed" ? command : null;
 }
 
 export async function updateRemoteCommandResult(input: {
@@ -238,7 +530,15 @@ export async function updateRemoteCommandResult(input: {
   const now = Date.now();
   const completedAt = TERMINAL_STATUSES.has(input.status) ? now : null;
   const resultJson =
-    input.result === undefined ? undefined : JSON.stringify(input.result);
+    input.result === undefined
+      ? undefined
+      : serializeBoundedRemoteJson(input.result, {
+          label: "Remote command result",
+          maxBytes: 256_000,
+        });
+  if (input.errorMessage) {
+    assertNoBinaryPayload(input.errorMessage, "Remote command error");
+  }
 
   await client.execute({
     sql: `UPDATE integration_remote_commands
@@ -330,7 +630,9 @@ export async function retryStaleRemoteCommands(options?: {
 function parseJson(value: unknown, fallback: unknown): unknown {
   if (value == null) return fallback;
   try {
-    return JSON.parse(String(value));
+    return JSON.parse(
+      typeof value === "string" ? value : (JSON.stringify(value) ?? ""),
+    );
   } catch {
     return fallback;
   }
@@ -342,4 +644,35 @@ function randomHex(byteLength: number): string {
   return Array.from(bytes)
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
+}
+
+function normalizeIdempotencyKey(
+  value: string | null | undefined,
+): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized ? normalized.slice(0, 512) : null;
+}
+
+function affectedRows(result: {
+  rowsAffected?: number;
+  rows?: unknown[];
+}): number {
+  return (
+    result.rowsAffected ??
+    Number((result as { rowCount?: unknown }).rowCount ?? 0)
+  );
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  const codeValue = (error as { code?: unknown })?.code;
+  const code = typeof codeValue === "string" ? codeValue : "";
+  const message = String((error as { message?: unknown })?.message ?? error)
+    .toLowerCase()
+    .trim();
+  return (
+    code === "23505" ||
+    message.includes("unique constraint") ||
+    message.includes("duplicate key")
+  );
 }

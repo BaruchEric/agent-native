@@ -1,9 +1,10 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import {
   getRequestUserEmail,
   getRequestOrgId,
 } from "@agent-native/core/server";
 import { z } from "zod";
+
 import { removeDashboard } from "../server/lib/dashboards-store";
 
 export default defineAction({

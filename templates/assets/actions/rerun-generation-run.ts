@@ -1,15 +1,28 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
+import { defineAction } from "@agent-native/core/action";
+import type { ActionRunContext } from "@agent-native/core/action";
 import { eq } from "drizzle-orm";
-import { assertAccess } from "@agent-native/core/sharing";
+import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import { parseJson } from "../server/lib/json.js";
-import generateImage from "./generate-image.js";
+import { assertCanDraftAuthoredBy } from "../server/lib/library-access.js";
+import { normalizePresetReferences } from "../server/lib/preset-references.js";
+import {
+  ASSETS_VARIATION_GRID_RENDERER,
+  projectAssetVariationResult,
+} from "../shared/action-ui.js";
 import { requireGenerationSessionInLibrary } from "./_helpers.js";
+import { resolveTemplateAccess } from "./_template-access.js";
+import generateImage from "./generate-image.js";
 
 export default defineAction({
   description:
     "Rerun a prior asset generation using its original prompt and settings, but recompile against the latest library custom instructions, style brief, collection data, and deterministic references.",
+  chatUI: {
+    renderer: ASSETS_VARIATION_GRID_RENDERER,
+    when: (args, result) => projectAssetVariationResult(args, result) !== null,
+    projectResult: projectAssetVariationResult,
+  },
   schema: z.object({
     runId: z.string().describe("Generation run to rerun"),
     slotId: z
@@ -29,7 +42,10 @@ export default defineAction({
       ),
   }),
   parallelSafe: true,
-  run: async ({ runId, slotId, sessionId, source, callerAppId }) => {
+  run: async (
+    { runId, slotId, sessionId, source, callerAppId },
+    context?: ActionRunContext,
+  ) => {
     const db = getDb();
     const [run] = await db
       .select()
@@ -37,10 +53,18 @@ export default defineAction({
       .where(eq(schema.assetGenerationRuns.id, runId))
       .limit(1);
     if (!run) throw new Error("Generation run not found.");
-    await assertAccess("asset-library", run.libraryId, "editor");
+    const draftAccess = await assertCanDraftAuthoredBy(
+      run.libraryId,
+      run.ownerEmail,
+      "A generation run",
+    );
     const resolvedSessionId = sessionId ?? run.sessionId ?? undefined;
     if (resolvedSessionId) {
-      await requireGenerationSessionInLibrary(resolvedSessionId, run.libraryId);
+      await requireGenerationSessionInLibrary(
+        resolvedSessionId,
+        run.libraryId,
+        draftAccess,
+      );
     }
 
     const metadata = parseJson<{
@@ -51,6 +75,9 @@ export default defineAction({
         intent?: string;
         styleStrength?: string;
         subjectAssetId?: string;
+        embeddedText?: string | null;
+        textPlacement?: string | null;
+        boardAssignments?: Record<string, string[]>;
       };
       includeLogo?: boolean;
       categories?: string[];
@@ -59,39 +86,80 @@ export default defineAction({
       intent?: string;
       styleStrength?: string;
       tier?: string | null;
+      embeddedText?: string | null;
+      textPlacement?: string | null;
     }>(run.metadata, {});
     const categories =
       metadata.settingsUsed?.categories ?? metadata.categories ?? undefined;
+    let presetReferenceFills:
+      | Array<{ referenceId: string; assetIds: string[] }>
+      | undefined;
+    const boardAssignments = metadata.settingsUsed?.boardAssignments;
+    if (run.presetId && boardAssignments) {
+      const preset = (await resolveTemplateAccess(run.presetId, "viewer"))
+        .resource;
+      const presetSettings = parseJson<{ presetReferences?: unknown }>(
+        preset?.settings,
+        {},
+      );
+      presetReferenceFills = normalizePresetReferences(
+        presetSettings.presetReferences,
+      )
+        .filter((entry) => entry.variable)
+        .map((entry) => ({
+          referenceId: entry.id,
+          assetIds: Array.isArray(boardAssignments[entry.id])
+            ? boardAssignments[entry.id].filter(
+                (assetId): assetId is string => typeof assetId === "string",
+              )
+            : [],
+        }))
+        .filter((fill) => fill.assetIds.length > 0);
+    }
 
-    return generateImage.run({
-      libraryId: run.libraryId,
-      collectionId: run.collectionId ?? undefined,
-      presetId: run.presetId ?? undefined,
-      sessionId: resolvedSessionId,
-      prompt: run.prompt,
-      aspectRatio: run.aspectRatio as any,
-      imageSize: run.imageSize as any,
-      model: run.model as any,
-      tier: (metadata.settingsUsed?.tier ?? metadata.tier ?? undefined) as any,
-      intent: (metadata.settingsUsed?.intent ??
-        metadata.intent ??
-        "generate") as any,
-      styleStrength: (metadata.settingsUsed?.styleStrength ??
-        metadata.styleStrength ??
-        "balanced") as any,
-      categories: categories as any,
-      includeLogo: Boolean(
-        metadata.settingsUsed?.includeLogo ?? metadata.includeLogo,
-      ),
-      groundingMode: run.groundingMode as any,
-      sourceAssetId: metadata.sourceAssetId,
-      subjectAssetId:
-        metadata.settingsUsed?.subjectAssetId ??
-        metadata.subjectAssetId ??
-        undefined,
-      slotId,
-      source,
-      callerAppId,
-    });
+    return generateImage.run(
+      {
+        libraryId: run.libraryId,
+        collectionId: run.collectionId ?? undefined,
+        presetId: run.presetId ?? undefined,
+        sessionId: resolvedSessionId,
+        prompt: run.prompt,
+        embeddedText:
+          metadata.settingsUsed?.embeddedText ??
+          metadata.embeddedText ??
+          undefined,
+        textPlacement:
+          metadata.settingsUsed?.textPlacement ??
+          metadata.textPlacement ??
+          undefined,
+        aspectRatio: run.aspectRatio as any,
+        imageSize: run.imageSize as any,
+        model: run.model as any,
+        tier: (metadata.settingsUsed?.tier ??
+          metadata.tier ??
+          undefined) as any,
+        intent: (metadata.settingsUsed?.intent ??
+          metadata.intent ??
+          "generate") as any,
+        styleStrength: (metadata.settingsUsed?.styleStrength ??
+          metadata.styleStrength ??
+          "balanced") as any,
+        categories: categories as any,
+        presetReferenceFills,
+        includeLogo: Boolean(
+          metadata.settingsUsed?.includeLogo ?? metadata.includeLogo,
+        ),
+        groundingMode: run.groundingMode as any,
+        sourceAssetId: metadata.sourceAssetId,
+        subjectAssetId:
+          metadata.settingsUsed?.subjectAssetId ??
+          metadata.subjectAssetId ??
+          undefined,
+        slotId,
+        source,
+        callerAppId,
+      },
+      context,
+    );
   },
 });

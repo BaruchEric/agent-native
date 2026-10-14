@@ -1,14 +1,12 @@
-/**
- * `workspace-files` bridge tool.
- *
- * A single tool with an `action` discriminator covering write, append, read,
- * list, delete, and grep. It is kept for `run-code` workspaceRead/workspaceWrite
- * compatibility and delegates storage to the Resources table.
- *
- * Scope is automatically resolved from the active request context:
- *  - org scope when a request orgId is present (shared across users in the org)
- *  - user scope otherwise (personal to the requesting user's email)
- */
+function stringifyValue(value: unknown): string {
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  )
+    return String(value);
+  return value == null ? "" : (JSON.stringify(value) ?? "");
+}
 
 import type { ActionEntry } from "../agent/production-agent.js";
 import {
@@ -28,7 +26,6 @@ import {
 const MAX_READ_CHARS = 100_000;
 const DEFAULT_READ_CHARS = 40_000;
 
-/** Resolve scope from the current request context (org-preferred). */
 function resolveScope(): WorkspaceFilesScope | null {
   const orgId = getRequestOrgId();
   if (orgId) return { scope: "org", scopeId: orgId };
@@ -48,7 +45,7 @@ export function createWorkspaceFilesTool(): Record<string, ActionEntry> {
           "Use scratch/... for temporary intermediate results; scratch files are hidden from the Resources view by default and expire. Use durable folder names for files the user explicitly wants to keep/manage.",
           "Use this to stage large intermediate results (fetched pages, per-item analysis memos, API payloads) so they don't consume context window, then read them back selectively for synthesis.",
           "",
-          "Typical fusion-style workflow:",
+          "Typical staged-analysis workflow:",
           "  1. Fan out: for each item, fetch data and `write` a per-item memo file.",
           "  2. Synthesize: `list` files, then `read` each memo (with offset/maxChars to page large ones).",
           "  3. Optionally `grep` across all memos to find patterns.",
@@ -86,13 +83,16 @@ export function createWorkspaceFilesTool(): Record<string, ActionEntry> {
                 'MIME type for new files. Default: "text/plain". Use "application/json" for JSON, "text/markdown" for Markdown.',
             },
             offset: {
-              type: "number",
+              type: "integer",
+              minimum: 0,
               description:
-                "Character offset to start reading from (for paging large files). Default: 0.",
+                "Non-negative character offset to start reading from (for paging large files). Default: 0.",
             },
             maxChars: {
-              type: "number",
-              description: `Maximum characters to return when reading. Default: ${DEFAULT_READ_CHARS}. Max: ${MAX_READ_CHARS}.`,
+              type: "integer",
+              minimum: 1,
+              maximum: MAX_READ_CHARS,
+              description: `Positive maximum characters to return when reading. Default: ${DEFAULT_READ_CHARS}. Max: ${MAX_READ_CHARS}.`,
             },
             pattern: {
               type: "string",
@@ -115,15 +115,17 @@ export function createWorkspaceFilesTool(): Record<string, ActionEntry> {
           return "Error: workspace-files requires an authenticated request context.";
         }
 
-        const action = String(args.action ?? "").trim();
+        const action = stringifyValue(args.action ?? "").trim();
 
         try {
           switch (action) {
             case "write": {
-              const path = String(args.path ?? "").trim();
+              const path = stringifyValue(args.path ?? "").trim();
               if (!path) return "Error: path is required for write.";
-              const content = String(args.content ?? "");
-              const contentType = String(args.contentType ?? "text/plain");
+              const content = stringifyValue(args.content ?? "");
+              const contentType = stringifyValue(
+                args.contentType ?? "text/plain",
+              );
               const meta = await writeWorkspaceFile(
                 scope,
                 path,
@@ -133,17 +135,21 @@ export function createWorkspaceFilesTool(): Record<string, ActionEntry> {
               return JSON.stringify({
                 ok: true,
                 action: "write",
+                resourceId: meta.id,
                 path: meta.path,
+                contentType: meta.contentType,
                 sizeBytes: meta.sizeBytes,
                 updatedAt: meta.updatedAt,
               });
             }
 
             case "append": {
-              const path = String(args.path ?? "").trim();
+              const path = stringifyValue(args.path ?? "").trim();
               if (!path) return "Error: path is required for append.";
-              const content = String(args.content ?? "");
-              const contentType = String(args.contentType ?? "text/plain");
+              const content = stringifyValue(args.content ?? "");
+              const contentType = stringifyValue(
+                args.contentType ?? "text/plain",
+              );
               const meta = await appendWorkspaceFile(
                 scope,
                 path,
@@ -153,27 +159,31 @@ export function createWorkspaceFilesTool(): Record<string, ActionEntry> {
               return JSON.stringify({
                 ok: true,
                 action: "append",
+                resourceId: meta.id,
                 path: meta.path,
+                contentType: meta.contentType,
                 sizeBytes: meta.sizeBytes,
                 updatedAt: meta.updatedAt,
               });
             }
 
             case "read": {
-              const path = String(args.path ?? "").trim();
+              const path = stringifyValue(args.path ?? "").trim();
               if (!path) return "Error: path is required for read.";
               const rawOffset = Number(args.offset);
               const offset =
-                Number.isFinite(rawOffset) && rawOffset > 0 ? rawOffset : 0;
+                Number.isFinite(rawOffset) && rawOffset > 0
+                  ? Math.floor(rawOffset)
+                  : 0;
               const rawMax = Number(args.maxChars);
               const maxChars =
                 Number.isFinite(rawMax) && rawMax > 0
-                  ? Math.min(rawMax, MAX_READ_CHARS)
+                  ? Math.min(Math.max(1, Math.floor(rawMax)), MAX_READ_CHARS)
                   : DEFAULT_READ_CHARS;
 
               const file = await readWorkspaceFile(scope, path, {
                 offset,
-                maxChars,
+                maxChars: maxChars + 1,
               });
               if (!file) {
                 return JSON.stringify({
@@ -182,26 +192,29 @@ export function createWorkspaceFilesTool(): Record<string, ActionEntry> {
                 });
               }
 
-              const truncated = file.content.length >= maxChars;
+              const truncated = file.content.length > maxChars;
+              const content = file.content.slice(0, maxChars);
               return JSON.stringify({
                 ok: true,
                 path: file.path,
                 contentType: file.contentType,
                 sizeBytes: file.sizeBytes,
                 updatedAt: file.updatedAt,
-                content: file.content,
+                content,
                 ...(truncated
                   ? {
                       truncated: true,
-                      nextOffset: offset + file.content.length,
-                      hint: `File has more content. Call again with offset: ${offset + file.content.length}`,
+                      nextOffset: offset + content.length,
+                      hint: `File has more content. Call again with offset: ${offset + content.length}`,
                     }
                   : {}),
               });
             }
 
             case "list": {
-              const prefix = args.path ? String(args.path).trim() : undefined;
+              const prefix = args.path
+                ? stringifyValue(args.path).trim()
+                : undefined;
               const files = await listWorkspaceFiles(
                 scope,
                 prefix || undefined,
@@ -219,7 +232,7 @@ export function createWorkspaceFilesTool(): Record<string, ActionEntry> {
             }
 
             case "delete": {
-              const path = String(args.path ?? "").trim();
+              const path = stringifyValue(args.path ?? "").trim();
               if (!path) return "Error: path is required for delete.";
               const deleted = await deleteWorkspaceFile(scope, path);
               return JSON.stringify({
@@ -230,11 +243,14 @@ export function createWorkspaceFilesTool(): Record<string, ActionEntry> {
             }
 
             case "grep": {
-              const pattern = String(args.pattern ?? "").trim();
+              const pattern = stringifyValue(args.pattern ?? "").trim();
               if (!pattern) return "Error: pattern is required for grep.";
-              const prefix = args.path ? String(args.path).trim() : undefined;
+              const prefix = args.path
+                ? stringifyValue(args.path).trim()
+                : undefined;
               const useRegex =
-                args.useRegex === true || String(args.useRegex) === "true";
+                args.useRegex === true ||
+                stringifyValue(args.useRegex) === "true";
               const matches = await grepWorkspaceFiles(scope, pattern, {
                 pathPrefix: prefix || undefined,
                 useRegex,

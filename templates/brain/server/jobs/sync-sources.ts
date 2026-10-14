@@ -1,17 +1,27 @@
-import { and, eq, ne } from "drizzle-orm";
-import { accessFilter } from "@agent-native/core/sharing";
 import { runWithRequestContext } from "@agent-native/core/server/request-context";
-import { getDb, schema } from "../db/index.js";
-import { nowIso, parseJson } from "../lib/brain.js";
-import { runConnectorSync } from "../lib/connectors.js";
+import { accessFilter } from "@agent-native/core/sharing";
+import { and, asc, gt, inArray, lte } from "drizzle-orm";
+
 import type { BrainSourceProvider } from "../../shared/types.js";
+import { getDb, schema } from "../db/index.js";
+import { parseJson } from "../lib/brain.js";
+import { runConnectorSync } from "../lib/connectors.js";
 
 const DEFAULT_POLL_MINUTES = 60;
 const SYNC_INTERVAL_MS = 60 * 1000;
+const SCAN_PAGE_SIZE = 100;
+const SCAN_MAX_PAGES = 20;
+const AUTO_SYNC_PROVIDERS: BrainSourceProvider[] = [
+  "slack",
+  "granola",
+  "github",
+  "zoom",
+];
 let skippingLogged = false;
 let running = false;
 
 type SourceRow = typeof schema.brainSources.$inferSelect;
+const RETRYABLE_SOURCE_STATUSES: SourceRow["status"][] = ["active", "error"];
 
 function configuredPollMinutes(source: SourceRow): number {
   const config = parseJson<Record<string, unknown>>(source.configJson, {});
@@ -33,11 +43,13 @@ function configuredPollMinutes(source: SourceRow): number {
 function isAutoSyncEnabled(source: SourceRow): boolean {
   const config = parseJson<Record<string, unknown>>(source.configJson, {});
   if (config.autoSync === false) return false;
-  return (
-    source.provider === "slack" ||
-    source.provider === "granola" ||
-    source.provider === "github"
-  );
+  return AUTO_SYNC_PROVIDERS.includes(source.provider as BrainSourceProvider);
+}
+
+function transientRetryAt(source: SourceRow) {
+  const cursor = parseJson<Record<string, unknown>>(source.cursorJson, {});
+  const value = cursor.transientRetryAt;
+  return typeof value === "string" ? Date.parse(value) : Number.NaN;
 }
 
 function retryAfterAt(source: SourceRow): number | null {
@@ -55,30 +67,84 @@ function retryAfterAt(source: SourceRow): number | null {
   return Number.isFinite(retryAt) ? retryAt : null;
 }
 
+function sourceSyncDueAt(source: SourceRow, nowMs: number): number | null {
+  if (!RETRYABLE_SOURCE_STATUSES.includes(source.status)) return null;
+  if (!isAutoSyncEnabled(source)) return null;
+
+  const pollIntervalMs = configuredPollMinutes(source) * 60 * 1000;
+  let pollAt = nowMs;
+  if (source.status === "error") {
+    const failedAt = Date.parse(source.updatedAt);
+    if (Number.isFinite(failedAt)) pollAt = failedAt + pollIntervalMs;
+    const transientAt = transientRetryAt(source);
+    if (Number.isFinite(transientAt)) pollAt = Math.min(pollAt, transientAt);
+  } else if (source.lastSyncedAt) {
+    const lastSynced = Date.parse(source.lastSyncedAt);
+    if (Number.isFinite(lastSynced)) pollAt = lastSynced + pollIntervalMs;
+  }
+
+  return Math.max(pollAt, retryAfterAt(source) ?? Number.NEGATIVE_INFINITY);
+}
+
 export function isBrainSourceDue(
   source: SourceRow,
   nowMs = Date.now(),
 ): boolean {
-  if (source.status !== "active") return false;
-  if (!isAutoSyncEnabled(source)) return false;
-  const retryAt = retryAfterAt(source);
-  if (retryAt && retryAt > nowMs) return false;
-  if (!source.lastSyncedAt) return true;
-  const lastSynced = Date.parse(source.lastSyncedAt);
-  if (!Number.isFinite(lastSynced)) return true;
-  return nowMs - lastSynced >= configuredPollMinutes(source) * 60 * 1000;
+  const dueAt = sourceSyncDueAt(source, nowMs);
+  return dueAt !== null && dueAt <= nowMs;
 }
 
 export function nextBrainSourceSyncAt(source: SourceRow): string | null {
-  if (source.status !== "active" || !isAutoSyncEnabled(source)) return null;
-  const retryAt = retryAfterAt(source);
-  if (retryAt) return new Date(retryAt).toISOString();
-  if (!source.lastSyncedAt) return nowIso();
-  const lastSynced = Date.parse(source.lastSyncedAt);
-  if (!Number.isFinite(lastSynced)) return nowIso();
-  return new Date(
-    lastSynced + configuredPollMinutes(source) * 60 * 1000,
-  ).toISOString();
+  const dueAt = sourceSyncDueAt(source, Date.now());
+  return dueAt === null ? null : new Date(dueAt).toISOString();
+}
+
+export interface SourceScanPage {
+  afterId: string | null;
+  upToId: string | null;
+}
+
+const PIVOT_ALPHABET =
+  "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+function randomScanPivot(): string {
+  let pivot = "";
+  for (let i = 0; i < 12; i += 1) {
+    pivot += PIVOT_ALPHABET[Math.floor(Math.random() * PIVOT_ALPHABET.length)];
+  }
+  return pivot;
+}
+
+// Scans in id order from a random pivot, wrapping to the start, until enough
+// rows are due. A fixed window or a fixed start lets never-due rows (auto-sync
+// off, dead errors) permanently crowd later sources out of every capped sweep.
+export async function collectDueSources(
+  fetchPage: (page: SourceScanPage) => Promise<SourceRow[]>,
+  limit: number,
+  nowMs = Date.now(),
+  pivot = randomScanPivot(),
+): Promise<{ sources: SourceRow[]; truncated: boolean }> {
+  const due: SourceRow[] = [];
+  const segments: SourceScanPage[] = [
+    { afterId: pivot, upToId: null },
+    { afterId: null, upToId: pivot },
+  ];
+  let pages = 0;
+  for (const segment of segments) {
+    let afterId = segment.afterId;
+    while (true) {
+      if (pages >= SCAN_MAX_PAGES) return { sources: due, truncated: true };
+      pages += 1;
+      const rows = await fetchPage({ afterId, upToId: segment.upToId });
+      for (const source of rows) {
+        if (isBrainSourceDue(source, nowMs)) due.push(source);
+        if (due.length >= limit) return { sources: due, truncated: false };
+      }
+      if (rows.length < SCAN_PAGE_SIZE) break;
+      afterId = rows[rows.length - 1]!.id;
+    }
+  }
+  return { sources: due, truncated: false };
 }
 
 export async function listDueBrainSources(
@@ -88,26 +154,34 @@ export async function listDueBrainSources(
   } = {},
 ) {
   const db = getDb();
+  const eligible = and(
+    inArray(schema.brainSources.status, RETRYABLE_SOURCE_STATUSES),
+    inArray(schema.brainSources.provider, AUTO_SYNC_PROVIDERS),
+  );
   const where = options.system
-    ? // guard:allow-unscoped — system scheduler enumerates active sources,
+    ? // guard:allow-unscoped — system scheduler enumerates retryable sources,
       // then re-enters each row's owner/org context before syncing.
-      and(
-        eq(schema.brainSources.status, "active"),
-        ne(schema.brainSources.provider, "manual"),
-      )
+      eligible
     : and(
         accessFilter(schema.brainSources, schema.brainSourceShares),
-        eq(schema.brainSources.status, "active"),
-        ne(schema.brainSources.provider, "manual"),
+        eligible,
       );
-  const rows = await db
-    .select()
-    .from(schema.brainSources)
-    .where(where)
-    .limit((options.limit ?? 10) * 4);
-  return rows
-    .filter((source) => isBrainSourceDue(source))
-    .slice(0, options.limit ?? 10);
+  return collectDueSources(
+    ({ afterId, upToId }) =>
+      db
+        .select()
+        .from(schema.brainSources)
+        .where(
+          and(
+            where,
+            afterId ? gt(schema.brainSources.id, afterId) : undefined,
+            upToId ? lte(schema.brainSources.id, upToId) : undefined,
+          ),
+        )
+        .orderBy(asc(schema.brainSources.id))
+        .limit(SCAN_PAGE_SIZE),
+    options.limit ?? 10,
+  );
 }
 
 export async function syncDueBrainSourcesOnce(
@@ -116,7 +190,7 @@ export async function syncDueBrainSourcesOnce(
     system?: boolean;
   } = {},
 ) {
-  const due = await listDueBrainSources(options);
+  const { sources: due, truncated } = await listDueBrainSources(options);
   const results: Array<{
     sourceId: string;
     provider: BrainSourceProvider;
@@ -154,7 +228,12 @@ export async function syncDueBrainSourcesOnce(
       await run();
     }
   }
-  return { checked: due.length, results };
+  if (truncated) {
+    console.warn(
+      `[brain-source-sync] Source scan hit its ${SCAN_MAX_PAGES * SCAN_PAGE_SIZE}-row cap; some sources were not checked this sweep (the next sweep starts at a different point).`,
+    );
+  }
+  return { checked: due.length, scanTruncated: truncated, results };
 }
 
 export default function registerBrainSourceSyncJob(): void {

@@ -1,9 +1,10 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
+import { defineAction, fail } from "@agent-native/core/action";
 import { assertAccess, resolveAccess } from "@agent-native/core/sharing";
-import "../server/db/index.js"; // ensure registerShareableResource runs
+import { eq } from "drizzle-orm";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
+import "../server/db/index.js";
 
 export default defineAction({
   description:
@@ -11,19 +12,31 @@ export default defineAction({
     "has good styling (CSS custom properties, fonts, colors), this extracts those " +
     "into reusable design tokens. Alternatively, import from an existing design system " +
     "for cloning/forking. Returns extracted tokens plus raw CSS for agent refinement.",
-  schema: z.object({
-    designId: z.string().describe("Design project ID to extract tokens from"),
-    designSystemId: z
-      .string()
-      .optional()
-      .describe(
-        "If provided, import from this existing design system instead of extracting from the design project",
-      ),
-  }),
+  schema: z
+    .object({
+      designId: z
+        .string()
+        .optional()
+        .describe("Design project ID to extract tokens from"),
+      designSystemId: z
+        .string()
+        .optional()
+        .describe(
+          "If provided, import from this existing design system instead of extracting from the design project",
+        ),
+    })
+    .superRefine((args, ctx) => {
+      if (!args.designId && !args.designSystemId) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["designId"],
+          message: "designId or designSystemId is required",
+        });
+      }
+    }),
   readOnly: true,
   http: { method: "GET" },
   run: async ({ designId, designSystemId }) => {
-    // If importing from an existing design system, return its data for cloning
     if (designSystemId) {
       await assertAccess("design-system", designSystemId, "viewer");
 
@@ -54,24 +67,27 @@ export default defineAction({
       };
     }
 
-    // Extract tokens from the design project
+    if (!designId) {
+      throw new Error(
+        "designId is required when designSystemId is not provided",
+      );
+    }
+
     await assertAccess("design", designId, "viewer");
 
     const access = await resolveAccess("design", designId);
     if (!access) {
-      throw new Error("Design not found");
+      fail("Design not found", { errorCode: "not_found", statusCode: 404 });
     }
 
     const design = access.resource;
     const db = getDb();
 
-    // Fetch all files for this design
     const files = await db
       .select()
       .from(schema.designFiles)
       .where(eq(schema.designFiles.designId, designId));
 
-    // Collect all HTML content for parsing
     const htmlFiles = files.filter(
       (f) => f.fileType === "html" || f.filename.endsWith(".html"),
     );
@@ -82,14 +98,12 @@ export default defineAction({
       .map((f) => f.content)
       .join("\n");
 
-    // Extract CSS custom properties from :root and style blocks
     const cssCustomProperties: Record<string, string> = {};
     const cssVarMatches = allContent.matchAll(/--([\w-]+)\s*:\s*([^;}\n]+)/g);
     for (const match of cssVarMatches) {
       cssCustomProperties[`--${match[1]}`] = match[2].trim();
     }
 
-    // Extract color values (hex, rgb, hsl)
     const colorSet = new Set<string>();
 
     const hexPattern = /#[0-9a-fA-F]{3,8}\b/g;
@@ -112,11 +126,9 @@ export default defineAction({
       colorSet.add(hslMatch[0]);
     }
 
-    // Extract font family declarations
     const fonts: { family: string; weight?: string }[] = [];
     const fontFamilySet = new Set<string>();
 
-    // From font-family CSS declarations
     const fontFamilyPattern = /font-family\s*:\s*["']?([^"';}\n]+)["']?/g;
     let fontMatch;
     while ((fontMatch = fontFamilyPattern.exec(allContent)) !== null) {
@@ -131,7 +143,6 @@ export default defineAction({
       }
     }
 
-    // From @font-face blocks
     const fontFaceMatches = allContent.matchAll(/@font-face\s*\{([^}]+)\}/g);
     for (const match of fontFaceMatches) {
       const block = match[1];
@@ -149,7 +160,6 @@ export default defineAction({
       }
     }
 
-    // Extract Google Fonts links
     const googleFontsLinks: string[] = [];
     const googleFontPattern =
       /https?:\/\/fonts\.googleapis\.com\/css2?\?[^"'>\s]+/g;
@@ -158,21 +168,18 @@ export default defineAction({
       googleFontsLinks.push(gfMatch[0]);
     }
 
-    // Extract border radius values
     const borderRadiusSet = new Set<string>();
     const radiusPattern = /border-radius\s*:\s*([^;}\n]+)/g;
     let radiusMatch;
     while ((radiusMatch = radiusPattern.exec(allContent)) !== null) {
       borderRadiusSet.add(radiusMatch[1].trim());
     }
-    // Also from CSS custom properties named with "radius"
     for (const [key, value] of Object.entries(cssCustomProperties)) {
       if (key.toLowerCase().includes("radius")) {
         borderRadiusSet.add(value);
       }
     }
 
-    // Extract spacing/gap patterns
     const spacingSet = new Set<string>();
     const gapPattern = /gap\s*:\s*([^;}\n]+)/g;
     let gapMatch;
@@ -184,7 +191,6 @@ export default defineAction({
     while ((padMatch = paddingPattern.exec(allContent)) !== null) {
       spacingSet.add(padMatch[1].trim());
     }
-    // Also from CSS custom properties named with "spacing" or "gap"
     for (const [key, value] of Object.entries(cssCustomProperties)) {
       if (
         key.toLowerCase().includes("spacing") ||
@@ -194,7 +200,6 @@ export default defineAction({
       }
     }
 
-    // Collect raw CSS from style blocks and CSS files
     const styleBlockPattern = /<style[^>]*>([\s\S]*?)<\/style>/g;
     const rawCSSParts: string[] = [];
     let styleMatch;
@@ -205,7 +210,6 @@ export default defineAction({
       rawCSSParts.push(cssFile.content);
     }
 
-    // Look up linked design system if any
     let existingDesignSystem: {
       id: string;
       title: string;

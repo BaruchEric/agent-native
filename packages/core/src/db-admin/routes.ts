@@ -1,12 +1,3 @@
-/**
- * HTTP routes for the dev-mode database admin.
- *
- * Mounted under `/_agent-native/db-admin/*`. EVERY handler self-gates on
- * `NODE_ENV === "development"` (this is the authoritative gate — see
- * `isDevEnvironment`). Real logins work locally; there is no localhost or
- * `AUTH_MODE=local` shim. The DB admin exposes raw, unscoped full-database
- * access and must NEVER be reachable in a deployed / production-mode app.
- */
 import {
   defineEventHandler,
   getMethod,
@@ -14,6 +5,7 @@ import {
   setResponseStatus,
 } from "h3";
 import type { H3Event } from "h3";
+
 import { getH3App } from "../server/framework-request-handler.js";
 import { readBody } from "../server/h3-helpers.js";
 import {
@@ -30,10 +22,6 @@ export interface MountDbAdminRoutesOptions {
   routePrefix?: string;
 }
 
-/** Authoritative gate for the DB admin: development mode only.
- *  Available purely on `NODE_ENV === "development"` — real logins work locally
- *  and there is no localhost / `AUTH_MODE=local` shim. The normal
- *  `/_agent-native/*` auth layer still requires a signed-in user on top of this. */
 function isDevEnvironment(): boolean {
   return process.env.NODE_ENV === "development";
 }
@@ -59,7 +47,6 @@ export function mountDbAdminRoutes(
     defineEventHandler(async (event: H3Event) => {
       setResponseHeader(event, "Cache-Control", "no-store");
 
-      // Authoritative gate: development mode only (NODE_ENV === "development").
       if (!isDevEnvironment()) {
         setResponseStatus(event, 403);
         return {
@@ -69,7 +56,6 @@ export function mountDbAdminRoutes(
       }
 
       const method = getMethod(event);
-      // event.path is relative to the mount base path under h3's .use().
       const raw = (event.path || "/").split("?")[0];
       const segments = raw
         .replace(/^\/+/, "")
@@ -78,14 +64,12 @@ export function mountDbAdminRoutes(
         .map(decodeSegment);
 
       try {
-        // GET /overview
         if (segments[0] === "overview" && segments.length === 1) {
           if (method !== "GET") return methodNotAllowed(event);
           const result = await listTables();
           return { ok: true, ...result };
         }
 
-        // /table/:name/...
         if (segments[0] === "table") {
           const name = segments[1];
           if (!name) return badRequest(event, "Table name is required");
@@ -105,6 +89,7 @@ export function mountDbAdminRoutes(
               pageSize: Number(body.pageSize) || 50,
               sort: body.sort,
               filters: body.filters,
+              includeLargeCells: body.includeLargeCells === true,
             });
             return { ok: true, ...result };
           }
@@ -119,7 +104,6 @@ export function mountDbAdminRoutes(
           return notFound(event, "Unknown db-admin table route");
         }
 
-        // POST /query
         if (segments[0] === "query" && segments.length === 1) {
           if (method !== "POST") return methodNotAllowed(event);
           const body = await readBody<{

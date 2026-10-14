@@ -1,43 +1,71 @@
-/**
- * Standard remote MCP OAuth 2.1 endpoints.
- *
- * These routes let MCP hosts such as Claude Code and ChatGPT authenticate
- * through their native remote-MCP OAuth flow instead of pasting bearer tokens.
- * The issued access tokens are audience-bound to `/_agent-native/mcp`, carry
- * the same user/org identity as the existing connect flow, and are mediated by
- * `verifyAuth` before any MCP tool/resource request runs.
- */
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 import type { H3Event } from "h3";
 import { getHeader, getMethod, getQuery, setResponseStatus } from "h3";
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { readBody } from "../server/h3-helpers.js";
-import { getConfiguredLoginHtml, getSession } from "../server/auth.js";
-import { getAuthSecret } from "../server/better-auth-instance.js";
+
+import type { DbExec } from "../db/client.js";
 import { getOrgDomain } from "../org/context.js";
+import {
+  getConfiguredAppBasePath,
+  normalizeAppBasePath,
+} from "../server/app-base-path.js";
+import { getConfiguredLoginHtml, getSession } from "../server/auth.js";
+import {
+  describeBearerCredentialRefusalWithRecovery,
+  type BearerCredentialRefusal,
+} from "../server/bearer-credential-refusal.js";
+import { getAuthSecret } from "../server/better-auth-instance.js";
+import { CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE } from "../server/credential-membership-unavailable.js";
+import { getOrigin } from "../server/google-oauth.js";
+import { readBody } from "../server/h3-helpers.js";
+import { trackAgentConnected } from "./agent-connected.js";
+import {
+  McpCredentialIssuanceError,
+  withMcpCredentialIssuance,
+} from "./credential-issuance.js";
+import {
+  applicationTypeForRedirectUris,
+  isAllowedOAuthRedirectUri,
+  isUrlBasedOAuthClientId,
+  matchesRegisteredRedirectUri,
+  resolveOAuthClientMetadataDocument,
+} from "./oauth-client-metadata.js";
 import {
   createOAuthCode,
   createOAuthRefreshToken,
   consumeOAuthCode,
+  ensureOAuthTables,
   generateOpaqueToken,
   getOAuthClient,
   getOAuthCode,
   getOAuthRefreshToken,
   registerOAuthClient,
+  revokeOAuthRefreshToken,
   touchOAuthRefreshToken,
 } from "./oauth-store.js";
 import {
   MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
-  MCP_OAUTH_DEFAULT_SCOPE,
   MCP_OAUTH_SCOPES,
   normalizeOAuthScope,
   signMcpOAuthAccessToken,
 } from "./oauth-token.js";
+import { resolveMcpOrgChoices } from "./org-choice.js";
+import {
+  MCP_DIRECTORY_ROUTE_PREFIX,
+  MCP_LEGACY_ROUTE_PREFIX,
+  MCP_PUBLIC_ROUTE_PREFIX,
+  MCP_ROUTE_PREFIXES,
+} from "./route-paths.js";
 
 export interface McpOAuthRouteOptions {
   appId?: string;
   appName?: string;
 }
+
+const MCP_OAUTH_RESOURCE_SCOPES = MCP_OAUTH_SCOPES.filter(
+  (scope) => scope !== "offline_access",
+);
+const MCP_OAUTH_RESOURCE_SCOPE = MCP_OAUTH_RESOURCE_SCOPES.join(" ");
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -95,19 +123,6 @@ function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
-function normalizeBasePath(raw: string | undefined): string {
-  const trimmed = (raw ?? "").trim();
-  if (!trimmed || trimmed === "/") return "";
-  const withSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
-  return withSlash.replace(/\/+$/, "");
-}
-
-function configuredBasePath(): string {
-  return normalizeBasePath(
-    process.env.APP_BASE_PATH || process.env.VITE_APP_BASE_PATH,
-  );
-}
-
 function stripTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
 }
@@ -136,11 +151,11 @@ function configuredPublicBaseUrl(): string | undefined {
 }
 
 function appendConfiguredBasePath(baseUrl: string): string {
-  const basePath = configuredBasePath();
+  const basePath = getConfiguredAppBasePath();
   if (!basePath) return stripTrailingSlash(baseUrl);
   try {
     const url = new URL(baseUrl);
-    const pathname = normalizeBasePath(url.pathname);
+    const pathname = normalizeAppBasePath(url.pathname);
     if (pathname === basePath || pathname.endsWith(`${basePath}`)) {
       return stripTrailingSlash(`${url.origin}${pathname}`);
     }
@@ -162,15 +177,62 @@ function deriveOrigin(event: H3Event): string {
 }
 
 export function getMcpOAuthIssuer(event: H3Event): string | undefined {
-  const baseUrl = configuredPublicBaseUrl() || deriveOrigin(event);
+  return resolveMcpOAuthIssuer(deriveOrigin(event));
+}
+
+/**
+ * The issuer MCP credentials are bound to, given the caller's request origin.
+ * Verification accepts only this issuer's resources, so anything that mints a
+ * bearer for this app must resolve its audience here, not from request headers:
+ * a configured public URL wins over the host a page was reached through.
+ */
+export function resolveMcpOAuthIssuer(
+  requestOrigin: string | undefined,
+): string | undefined {
+  const baseUrl = configuredPublicBaseUrl() || requestOrigin;
   if (!baseUrl) return undefined;
   return appendConfiguredBasePath(baseUrl);
 }
 
-export function getMcpOAuthResource(event: H3Event): string | undefined {
+export function getMcpConnectUrl(event: H3Event): string | undefined {
+  const issuer = getMcpOAuthIssuer(event);
+  return issuer ? `${issuer}${MCP_PUBLIC_ROUTE_PREFIX}/connect` : undefined;
+}
+
+function normalizeMcpResourcePath(routePath?: string): string {
+  if (
+    routePath === MCP_LEGACY_ROUTE_PREFIX ||
+    routePath === MCP_DIRECTORY_ROUTE_PREFIX
+  ) {
+    return routePath;
+  }
+  return MCP_PUBLIC_ROUTE_PREFIX;
+}
+
+export function getMcpOAuthResource(
+  event: H3Event,
+  routePath = MCP_PUBLIC_ROUTE_PREFIX,
+): string | undefined {
   const issuer = getMcpOAuthIssuer(event);
   if (!issuer) return undefined;
-  return `${issuer}/_agent-native/mcp`;
+  return `${issuer}${normalizeMcpResourcePath(routePath)}`;
+}
+
+function mcpResourcesForIssuer(
+  issuer: string,
+  routePath = MCP_PUBLIC_ROUTE_PREFIX,
+): string[] {
+  const normalizedPath = normalizeMcpResourcePath(routePath);
+  const paths =
+    normalizedPath === MCP_DIRECTORY_ROUTE_PREFIX
+      ? [MCP_DIRECTORY_ROUTE_PREFIX]
+      : [
+          MCP_PUBLIC_ROUTE_PREFIX,
+          ...MCP_ROUTE_PREFIXES.filter(
+            (prefix) => prefix !== MCP_PUBLIC_ROUTE_PREFIX,
+          ),
+        ];
+  return paths.map((prefix) => `${issuer}${prefix}`);
 }
 
 /**
@@ -182,19 +244,25 @@ export function getMcpOAuthResource(event: H3Event): string | undefined {
  * derived URL and vice-versa.  Returns both so `verifyMcpOAuthAccessToken`
  * accepts either without issuing a 401.
  */
-export function getMcpOAuthAudiences(event: H3Event): string[] {
-  const derived = getMcpOAuthResource(event);
-  const configured = (() => {
+export function getMcpOAuthAudiences(
+  event: H3Event,
+  routePath = MCP_PUBLIC_ROUTE_PREFIX,
+): string[] {
+  const configuredIssuer = (() => {
     const base = configuredPublicBaseUrl();
     if (!base) return undefined;
-    // Re-apply base path if present so the configured resource is also
-    // base-path-aware, consistent with how getMcpOAuthResource computes it.
-    const withPath = appendConfiguredBasePath(base);
-    return `${withPath}/_agent-native/mcp`;
+    return appendConfiguredBasePath(base);
   })();
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const r of [derived, configured]) {
+  for (const r of [
+    ...(getMcpOAuthIssuer(event)
+      ? mcpResourcesForIssuer(getMcpOAuthIssuer(event) as string, routePath)
+      : []),
+    ...(configuredIssuer
+      ? mcpResourcesForIssuer(configuredIssuer, routePath)
+      : []),
+  ]) {
     const n = r?.replace(/\/+$/, "");
     if (n && !seen.has(n)) {
       seen.add(n);
@@ -206,33 +274,77 @@ export function getMcpOAuthAudiences(event: H3Event): string[] {
 
 export function getMcpOAuthProtectedResourceMetadataUrl(
   event: H3Event,
+  routePath = MCP_PUBLIC_ROUTE_PREFIX,
 ): string | undefined {
   const issuer = getMcpOAuthIssuer(event);
   if (!issuer) return undefined;
-  return `${issuer}/.well-known/oauth-protected-resource`;
+  const metadataUrl = new URL(`${issuer}/.well-known/oauth-protected-resource`);
+  if (normalizeMcpResourcePath(routePath) !== MCP_PUBLIC_ROUTE_PREFIX) {
+    metadataUrl.searchParams.set(
+      "resource",
+      normalizeMcpResourcePath(routePath),
+    );
+  }
+  return metadataUrl.toString();
 }
 
-export function buildMcpOAuthChallenge(event: H3Event): string {
-  const metadata = getMcpOAuthProtectedResourceMetadataUrl(event);
-  const scope = MCP_OAUTH_DEFAULT_SCOPE;
-  return metadata
-    ? `Bearer resource_metadata="${metadata}", scope="${scope}"`
-    : `Bearer scope="${scope}"`;
+/** `refusal` is set only when the request presented a bearer token. */
+export function buildMcpOAuthChallenge(
+  event: H3Event,
+  routePath = MCP_PUBLIC_ROUTE_PREFIX,
+  refusal?: BearerCredentialRefusal,
+): string {
+  const metadata = getMcpOAuthProtectedResourceMetadataUrl(event, routePath);
+  const params = [
+    ...(metadata ? [`resource_metadata="${metadata}"`] : []),
+    `scope="${MCP_OAUTH_RESOURCE_SCOPE}"`,
+    ...(refusal
+      ? [
+          `error="invalid_token"`,
+          `error_description="${describeBearerCredentialRefusalWithRecovery(refusal, getMcpConnectUrl(event))}"`,
+        ]
+      : []),
+  ];
+  return `Bearer ${params.join(", ")}`;
+}
+
+function protectedResourcePathFromRequest(
+  event: H3Event,
+): string | undefined | null {
+  let pathname = event.url?.pathname ?? "";
+  const wellKnownPath = "/.well-known/oauth-protected-resource";
+  const wellKnownIndex = pathname.lastIndexOf(wellKnownPath);
+  if (wellKnownIndex >= 0) {
+    pathname = pathname.slice(wellKnownIndex + wellKnownPath.length);
+  }
+  pathname = pathname.replace(/\/+$/, "");
+  if (!pathname || pathname === "/") return undefined;
+  return (
+    [
+      MCP_PUBLIC_ROUTE_PREFIX,
+      MCP_LEGACY_ROUTE_PREFIX,
+      MCP_DIRECTORY_ROUTE_PREFIX,
+    ].find((path) => path === pathname) ?? null
+  );
 }
 
 function authorizationEndpoint(event: H3Event): string | undefined {
   const issuer = getMcpOAuthIssuer(event);
-  return issuer ? `${issuer}/_agent-native/mcp/oauth/authorize` : undefined;
+  return issuer
+    ? `${issuer}${MCP_PUBLIC_ROUTE_PREFIX}/oauth/authorize`
+    : undefined;
 }
 
 function tokenEndpoint(event: H3Event): string | undefined {
   const issuer = getMcpOAuthIssuer(event);
-  return issuer ? `${issuer}/_agent-native/mcp/oauth/token` : undefined;
+  return issuer ? `${issuer}${MCP_PUBLIC_ROUTE_PREFIX}/oauth/token` : undefined;
 }
 
 function registrationEndpoint(event: H3Event): string | undefined {
   const issuer = getMcpOAuthIssuer(event);
-  return issuer ? `${issuer}/_agent-native/mcp/oauth/register` : undefined;
+  return issuer
+    ? `${issuer}${MCP_PUBLIC_ROUTE_PREFIX}/oauth/register`
+    : undefined;
 }
 
 export function handleMcpOAuthProtectedResourceMetadata(
@@ -241,7 +353,31 @@ export function handleMcpOAuthProtectedResourceMetadata(
   if (getMethod(event) !== "GET") {
     return oauthError("invalid_request", "Method not allowed", 405);
   }
-  const resource = getMcpOAuthResource(event);
+  const pathResource = protectedResourcePathFromRequest(event);
+  const queryResource = getQuery(event).resource;
+  const allowedPaths = [
+    MCP_PUBLIC_ROUTE_PREFIX,
+    MCP_LEGACY_ROUTE_PREFIX,
+    MCP_DIRECTORY_ROUTE_PREFIX,
+  ];
+  const queryPath =
+    queryResource === undefined
+      ? undefined
+      : typeof queryResource === "string" &&
+          allowedPaths.includes(queryResource)
+        ? queryResource
+        : null;
+  if (
+    pathResource === null ||
+    queryPath === null ||
+    (pathResource && queryPath && pathResource !== queryPath)
+  ) {
+    return oauthError("invalid_target", "Unknown MCP resource", 404);
+  }
+  const resource = getMcpOAuthResource(
+    event,
+    pathResource ?? queryPath ?? MCP_PUBLIC_ROUTE_PREFIX,
+  );
   const issuer = getMcpOAuthIssuer(event);
   if (!resource || !issuer) {
     return oauthError("server_error", "Unable to derive MCP resource", 500);
@@ -249,7 +385,7 @@ export function handleMcpOAuthProtectedResourceMetadata(
   return json({
     resource,
     authorization_servers: [issuer],
-    scopes_supported: MCP_OAUTH_SCOPES,
+    scopes_supported: MCP_OAUTH_RESOURCE_SCOPES,
     resource_documentation: issuer,
   });
 }
@@ -277,26 +413,9 @@ export function handleMcpOAuthAuthorizationServerMetadata(
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
     scopes_supported: MCP_OAUTH_SCOPES,
+    authorization_response_iss_parameter_supported: true,
+    client_id_metadata_document_supported: true,
   });
-}
-
-function isAllowedRedirectUri(value: unknown): value is string {
-  if (typeof value !== "string" || value.length > 2048) return false;
-  try {
-    const url = new URL(value);
-    if (url.hash) return false;
-    if (url.username || url.password) return false;
-    if (url.protocol === "https:") return true;
-    if (url.protocol !== "http:") return false;
-    return (
-      url.hostname === "localhost" ||
-      url.hostname === "127.0.0.1" ||
-      url.hostname === "::1" ||
-      url.hostname === "[::1]"
-    );
-  } catch {
-    return false;
-  }
 }
 
 function parseStringArray(value: unknown): string[] {
@@ -317,7 +436,7 @@ async function handleRegister(event: H3Event): Promise<Response> {
   if (
     redirectUris.length === 0 ||
     redirectUris.length > 20 ||
-    !redirectUris.every(isAllowedRedirectUri)
+    !redirectUris.every(isAllowedOAuthRedirectUri)
   ) {
     return oauthError(
       "invalid_client_metadata",
@@ -348,6 +467,24 @@ async function handleRegister(event: H3Event): Promise<Response> {
       "Only public OAuth clients are supported",
     );
   }
+  const requestedApplicationType =
+    typeof body.application_type === "string"
+      ? body.application_type
+      : undefined;
+  if (
+    requestedApplicationType &&
+    requestedApplicationType !== "native" &&
+    requestedApplicationType !== "web"
+  ) {
+    return oauthError(
+      "invalid_client_metadata",
+      "application_type must be native or web",
+    );
+  }
+  const applicationType: "native" | "web" =
+    requestedApplicationType === "native" || requestedApplicationType === "web"
+      ? requestedApplicationType
+      : applicationTypeForRedirectUris(redirectUris);
 
   const clientName =
     typeof body.client_name === "string"
@@ -361,6 +498,7 @@ async function handleRegister(event: H3Event): Promise<Response> {
       grantTypes: grantTypes.length ? grantTypes : undefined,
       responseTypes: responseTypes.length ? responseTypes : undefined,
       tokenEndpointAuthMethod: method,
+      applicationType,
     });
   } catch (err: any) {
     if (err?.message === "RATE_LIMITED") {
@@ -377,6 +515,7 @@ async function handleRegister(event: H3Event): Promise<Response> {
       grant_types: client.grantTypes,
       response_types: client.responseTypes,
       token_endpoint_auth_method: client.tokenEndpointAuthMethod,
+      application_type: applicationType,
     },
     201,
   );
@@ -384,12 +523,14 @@ async function handleRegister(event: H3Event): Promise<Response> {
 
 function redirectWithOAuthError(params: {
   redirectUri: string;
+  issuer: string;
   state?: string;
   error: string;
   description?: string;
 }): Response {
   const url = new URL(params.redirectUri);
   url.searchParams.set("error", params.error);
+  url.searchParams.set("iss", params.issuer);
   if (params.description) {
     url.searchParams.set("error_description", params.description);
   }
@@ -397,15 +538,26 @@ function redirectWithOAuthError(params: {
   return redirect(url.toString());
 }
 
+function buildCodeRedirectUrl(params: {
+  redirectUri: string;
+  issuer: string;
+  code: string;
+  state?: string;
+}): string {
+  const url = new URL(params.redirectUri);
+  url.searchParams.set("code", params.code);
+  url.searchParams.set("iss", params.issuer);
+  if (params.state) url.searchParams.set("state", params.state);
+  return url.toString();
+}
+
 function redirectWithCode(params: {
   redirectUri: string;
+  issuer: string;
   code: string;
   state?: string;
 }): Response {
-  const url = new URL(params.redirectUri);
-  url.searchParams.set("code", params.code);
-  if (params.state) url.searchParams.set("state", params.state);
-  return redirect(url.toString());
+  return redirect(buildCodeRedirectUrl(params));
 }
 
 function codeChallengeForVerifier(verifier: string): string {
@@ -504,19 +656,58 @@ function isValidCodeVerifier(value: unknown): value is string {
   );
 }
 
+const OAUTH_PAGE_BASE_STYLE = `
+  :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #09090b; color: #f4f4f5; }
+  body { min-height: 100vh; display: grid; place-items: center; margin: 0; padding: 24px; }
+  main { width: min(520px, 100%); border: 1px solid #27272a; border-radius: 8px; background: #111113; padding: 24px; box-shadow: 0 24px 80px rgba(0,0,0,.35); }
+  h1 { font-size: 22px; line-height: 1.2; margin: 0 0 10px; }
+  p { color: #a1a1aa; line-height: 1.5; margin: 0 0 18px; }
+  .actions { display: flex; gap: 10px; justify-content: flex-end; }
+  button, .btn { border: 0; border-radius: 6px; padding: 10px 14px; font: inherit; font-weight: 650; cursor: pointer; text-decoration: none; display: inline-block; }
+  .primary { background: #f4f4f5; color: #09090b; }
+  /* guard:allow-raw-color — standalone OAuth page intentionally owns its dark palette */
+  .secondary { background: #27272a; color: #f4f4f5; }
+  /* guard:allow-raw-color — standalone OAuth page intentionally owns its dark palette */
+  .field-label { display: block; margin: 0 0 8px; color: #d4d4d8; font-weight: 650; }
+  /* guard:allow-raw-color — standalone OAuth page intentionally owns its dark palette */
+  select { width: 100%; min-height: 42px; box-sizing: border-box; margin: 0 0 22px; border: 1px solid #3f3f46; border-radius: 6px; background: #18181b; color: #f4f4f5; padding: 10px 36px 10px 12px; font: inherit; line-height: 1.25; color-scheme: dark; appearance: auto; }
+  /* guard:allow-raw-color — standalone OAuth page intentionally owns its dark palette */
+  option { background: #18181b; color: #f4f4f5; }`;
+
 function renderConsentPage(params: {
   appName: string;
   email: string;
   clientName: string;
+  redirectUri: string;
   scopes: string[];
   fields: Record<string, string>;
+  organizations: Array<{
+    id: string;
+    name: string;
+    domain: string | null;
+  }>;
 }): string {
   const hidden = Object.entries(params.fields)
+    .filter(
+      ([key]) => key !== "organization_id" || params.organizations.length <= 1,
+    )
     .map(
       ([key, value]) =>
         `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}">`,
     )
     .join("\n");
+  const organizationSelector =
+    params.organizations.length > 1
+      ? `<label class="field-label" for="organization_id">Organization</label>
+    <select id="organization_id" name="organization_id" required>
+      ${params.organizations
+        .map(
+          (organization) =>
+            `<option value="${escapeHtml(organization.id)}"${organization.id === params.fields.organization_id ? " selected" : ""}>${escapeHtml(organization.name)}${organization.domain ? ` (${escapeHtml(organization.domain)})` : ""}</option>`,
+        )
+        .join("\n      ")}
+    </select>`
+      : "";
   const scopes = params.scopes
     .map((scope) => `<li><code>${escapeHtml(scope)}</code></li>`)
     .join("");
@@ -526,18 +717,9 @@ function renderConsentPage(params: {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Authorize ${escapeHtml(params.appName)}</title>
-<style>
-  :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #09090b; color: #f4f4f5; }
-  body { min-height: 100vh; display: grid; place-items: center; margin: 0; padding: 24px; }
-  main { width: min(520px, 100%); border: 1px solid #27272a; border-radius: 8px; background: #111113; padding: 24px; box-shadow: 0 24px 80px rgba(0,0,0,.35); }
-  h1 { font-size: 22px; line-height: 1.2; margin: 0 0 10px; }
-  p { color: #a1a1aa; line-height: 1.5; margin: 0 0 18px; }
+<style>${OAUTH_PAGE_BASE_STYLE}
   ul { margin: 0 0 22px; padding-left: 22px; color: #d4d4d8; }
   code { color: #67e8f9; }
-  .actions { display: flex; gap: 10px; justify-content: flex-end; }
-  button { border: 0; border-radius: 6px; padding: 10px 14px; font-weight: 650; cursor: pointer; }
-  .primary { background: #f4f4f5; color: #09090b; }
-  .secondary { background: #27272a; color: #f4f4f5; }
 </style>
 </head>
 <body>
@@ -545,14 +727,66 @@ function renderConsentPage(params: {
   <h1>Authorize ${escapeHtml(params.clientName)}</h1>
   <p>${escapeHtml(params.appName)} will let this MCP client act as ${escapeHtml(params.email)} for these scopes:</p>
   <ul>${scopes}</ul>
+  <p>After authorization, your browser will return to <code>${escapeHtml(params.redirectUri)}</code>.</p>
   <form method="post">
     ${hidden}
+    ${organizationSelector}
     <div class="actions">
       <button class="secondary" type="submit" name="decision" value="deny">Deny</button>
       <button class="primary" type="submit" name="decision" value="approve">Authorize</button>
     </div>
   </form>
 </main>
+</body>
+</html>`;
+}
+
+function renderAuthorizedPage(params: {
+  appName: string;
+  clientName: string | null;
+  redirectUrl: string;
+}): string {
+  const friendlyClient = params.clientName?.trim() || null;
+  const returnTarget = friendlyClient ?? "your agent";
+  const openLabel = friendlyClient
+    ? `Open ${escapeHtml(friendlyClient)}`
+    : "Return to your agent";
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorized</title>
+<style>${OAUTH_PAGE_BASE_STYLE}
+  main.success { text-align: center; }
+  .check { width: 56px; height: 56px; margin: 4px auto 16px; display: grid; place-items: center; border-radius: 999px; background: rgba(34,197,94,.12); }
+  .check svg { width: 30px; height: 30px; }
+  .success .actions { justify-content: center; margin-top: 4px; }
+  .hint { color: #71717a; font-size: 13px; margin: 18px 0 0; }
+</style>
+</head>
+<body>
+<main class="success">
+  <div class="check">
+    <svg viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M20 6 9 17l-5-5"></path>
+    </svg>
+  </div>
+  <h1>You're all set</h1>
+  <p>${escapeHtml(params.appName)} has authorized ${escapeHtml(returnTarget)}. You can return to ${escapeHtml(returnTarget)} to continue.</p>
+  <div class="actions">
+    <a class="btn primary" id="return-link" href="${escapeHtml(params.redirectUrl)}">${openLabel}</a>
+  </div>
+  <p class="hint">You can close this tab.</p>
+</main>
+<script>
+  (function () {
+    var link = document.getElementById("return-link");
+    if (link && link.href) {
+      try { window.location.href = link.href; } catch (e) {}
+    }
+  })();
+</script>
 </body>
 </html>`;
 }
@@ -609,11 +843,18 @@ async function handleAuthorize(
     );
   }
   const params = await readOAuthParams(event);
+  const issuer = getMcpOAuthIssuer(event);
   const state = params.state;
   const clientId = params.client_id;
   const redirectUri = params.redirect_uri;
-  const resource = params.resource || getMcpOAuthResource(event);
-  const expectedResource = getMcpOAuthResource(event);
+  const resource = (params.resource || getMcpOAuthResource(event))?.replace(
+    /\/+$/,
+    "",
+  );
+  const expectedResources = [
+    ...getMcpOAuthAudiences(event),
+    ...getMcpOAuthAudiences(event, MCP_DIRECTORY_ROUTE_PREFIX),
+  ];
 
   if (params.response_type !== "code") {
     return oauthError(
@@ -621,15 +862,30 @@ async function handleAuthorize(
       "response_type must be code",
     );
   }
-  if (!clientId || !redirectUri || !resource || resource !== expectedResource) {
+  if (
+    !clientId ||
+    !redirectUri ||
+    !issuer ||
+    !resource ||
+    !expectedResources.includes(resource)
+  ) {
     return oauthError("invalid_request", "Invalid OAuth authorization request");
   }
   if (params.code_challenge_method !== "S256" || !params.code_challenge) {
     return oauthError("invalid_request", "PKCE S256 is required");
   }
 
-  const client = await getOAuthClient(clientId);
-  if (!client || !client.redirectUris.includes(redirectUri)) {
+  const client = isUrlBasedOAuthClientId(clientId)
+    ? await resolveOAuthClientMetadataDocument(clientId).catch(() => null)
+    : await getOAuthClient(clientId);
+  if (
+    !client ||
+    !matchesRegisteredRedirectUri(
+      client.redirectUris,
+      redirectUri,
+      client.applicationType,
+    )
+  ) {
     return oauthError("invalid_client", "Unknown client or redirect_uri");
   }
 
@@ -638,13 +894,14 @@ async function handleAuthorize(
     if (params.prompt === "none") {
       return redirectWithOAuthError({
         redirectUri,
+        issuer,
         state,
         error: "login_required",
       });
     }
-    const loginHtml = getConfiguredLoginHtml(event);
-    return loginHtml
-      ? html(loginHtml, 200)
+    const loginPage = getConfiguredLoginHtml(event);
+    return loginPage
+      ? html(loginPage.html, loginPage.status)
       : oauthError("login_required", "Sign in required", 401);
   }
 
@@ -652,17 +909,29 @@ async function handleAuthorize(
   if (!scope) {
     return redirectWithOAuthError({
       redirectUri,
+      issuer,
       state,
       error: "invalid_scope",
     });
   }
+
+  const { organizations, defaultOrganizationId } = await resolveMcpOrgChoices(
+    event,
+    session,
+    method === "POST" && params.organization_id !== undefined
+      ? params.organization_id || null
+      : undefined,
+  );
+
   if (method === "GET") {
     return html(
       renderConsentPage({
-        appName: options.appName || options.appId || "Agent Native",
+        appName: options.appName || options.appId || "Agent-Native",
         email: session.email,
         clientName: client.clientName || client.clientId,
+        redirectUri,
         scopes: scope.split(/\s+/),
+        organizations,
         fields: {
           response_type: "code",
           client_id: clientId,
@@ -672,6 +941,7 @@ async function handleAuthorize(
           state: state ?? "",
           code_challenge: params.code_challenge,
           code_challenge_method: "S256",
+          organization_id: defaultOrganizationId ?? "",
           consent_token: signConsentToken({
             email: session.email,
             clientId,
@@ -701,45 +971,129 @@ async function handleAuthorize(
   if (params.decision !== "approve") {
     return redirectWithOAuthError({
       redirectUri,
+      issuer,
       state,
       error: "access_denied",
     });
   }
 
-  const orgDomain = await resolveOrgDomain(session.orgId);
-  const code = await createOAuthCode({
-    clientId,
+  const selectedOrganizationId =
+    params.organization_id === undefined
+      ? defaultOrganizationId
+      : params.organization_id;
+  const selectedOrganization = organizations.find(
+    ({ id }) => id === selectedOrganizationId,
+  );
+  if (organizations.length > 0 && !selectedOrganization) {
+    return oauthError(
+      "invalid_request",
+      "A valid organization selection is required",
+    );
+  }
+
+  const orgDomain = selectedOrganization
+    ? await resolveOrgDomain(selectedOrganization.id)
+    : undefined;
+  let code;
+  try {
+    await ensureOAuthTables();
+    code = await withMcpCredentialIssuance(
+      {
+        email: session.email,
+        orgId: selectedOrganization?.id ?? null,
+        requestOrigin: getOrigin(event),
+      },
+      (tx) =>
+        createOAuthCode(
+          {
+            clientId,
+            clientName: client.clientName,
+            redirectUri,
+            codeChallenge: params.code_challenge,
+            codeChallengeMethod: "S256",
+            ownerEmail: session.email,
+            orgId: selectedOrganization?.id ?? null,
+            orgDomain: orgDomain ?? null,
+            scope,
+            resource,
+          },
+          tx,
+        ),
+    );
+  } catch (error) {
+    if (
+      error instanceof McpCredentialIssuanceError &&
+      error.reason === "not-member"
+    ) {
+      return redirectWithOAuthError({
+        redirectUri,
+        issuer,
+        state,
+        error: "access_denied",
+      });
+    }
+    return grantUnavailableError(CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE);
+  }
+
+  let isDeepLinkRedirect = false;
+  try {
+    const protocol = new URL(redirectUri).protocol;
+    isDeepLinkRedirect =
+      protocol !== "http:" &&
+      protocol !== "https:" &&
+      /^[a-z][a-z0-9+.-]*:$/.test(protocol);
+  } catch {
+    isDeepLinkRedirect = false;
+  }
+  if (isDeepLinkRedirect) {
+    return html(
+      renderAuthorizedPage({
+        appName: options.appName || options.appId || "Agent-Native",
+        clientName: client.clientName ?? null,
+        redirectUrl: buildCodeRedirectUrl({
+          redirectUri,
+          issuer,
+          state,
+          code: code.code,
+        }),
+      }),
+    );
+  }
+  return redirectWithCode({
     redirectUri,
-    codeChallenge: params.code_challenge,
-    codeChallengeMethod: "S256",
-    ownerEmail: session.email,
-    orgId: session.orgId ?? null,
-    orgDomain: orgDomain ?? null,
-    scope,
-    resource,
+    issuer,
+    state,
+    code: code.code,
   });
-  return redirectWithCode({ redirectUri, state, code: code.code });
 }
 
-async function issueTokenSet(params: {
-  ownerEmail: string;
-  orgId?: string | null;
-  orgDomain?: string | null;
-  clientId: string;
-  scope: string;
-  resource: string;
-  issuer: string;
-}): Promise<Record<string, unknown>> {
+async function issueTokenSet(
+  params: {
+    ownerEmail: string;
+    orgId?: string | null;
+    orgDomain?: string | null;
+    clientId: string;
+    scope: string;
+    resource: string;
+    issuer: string;
+    grantCreatedAtMs: number | null;
+  },
+  tx: DbExec,
+): Promise<Record<string, unknown>> {
   const refreshToken = generateOpaqueToken();
-  await createOAuthRefreshToken({
-    refreshToken,
-    clientId: params.clientId,
-    ownerEmail: params.ownerEmail,
-    orgId: params.orgId ?? null,
-    orgDomain: params.orgDomain ?? null,
-    scope: params.scope,
-    resource: params.resource,
-  });
+  await createOAuthRefreshToken(
+    {
+      refreshToken,
+      clientId: params.clientId,
+      ownerEmail: params.ownerEmail,
+      orgId: params.orgId ?? null,
+      orgDomain: params.orgDomain ?? null,
+      scope: params.scope,
+      resource: params.resource,
+      grantCreatedAtMs: params.grantCreatedAtMs,
+    },
+    tx,
+  );
   const accessToken = await signMcpOAuthAccessToken(params);
   return {
     access_token: accessToken,
@@ -750,9 +1104,20 @@ async function issueTokenSet(params: {
   };
 }
 
+const NOT_A_MEMBER_DESCRIPTION =
+  "The user is no longer a member of the organization this grant was issued for";
+
+/** Retryable: the client must keep its refresh token, not start over. */
+function grantUnavailableError(description: string): Response {
+  const response = oauthError("temporarily_unavailable", description, 503);
+  response.headers.set("Retry-After", "5");
+  return response;
+}
+
 async function handleAuthorizationCodeGrant(
   event: H3Event,
   body: Record<string, string>,
+  options: McpOAuthRouteOptions,
 ): Promise<Response> {
   const code = body.code;
   const clientId = body.client_id;
@@ -761,7 +1126,13 @@ async function handleAuthorizationCodeGrant(
   if (!code || !clientId || !redirectUri || !isValidCodeVerifier(verifier)) {
     return oauthError("invalid_request", "Missing authorization-code fields");
   }
-  const row = await getOAuthCode(code);
+  let row;
+  try {
+    await ensureOAuthTables();
+    row = await getOAuthCode(code);
+  } catch {
+    return grantUnavailableError(CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE);
+  }
   if (!row) return oauthError("invalid_grant", "Invalid or expired code");
   if (row.clientId !== clientId || row.redirectUri !== redirectUri) {
     return oauthError("invalid_grant", "Code was issued to another client");
@@ -770,22 +1141,61 @@ async function handleAuthorizationCodeGrant(
   if (!safeEqual(expectedChallenge, row.codeChallenge)) {
     return oauthError("invalid_grant", "PKCE verification failed");
   }
-  const consumed = await consumeOAuthCode(code);
-  if (!consumed) return oauthError("invalid_grant", "Invalid or expired code");
   const issuer = getMcpOAuthIssuer(event);
   if (!issuer)
     return oauthError("server_error", "Unable to derive issuer", 500);
-  return json(
-    await issueTokenSet({
-      ownerEmail: row.ownerEmail,
-      orgId: row.orgId,
-      orgDomain: row.orgDomain,
-      clientId,
-      scope: row.scope,
-      resource: row.resource,
-      issuer,
-    }),
-  );
+  try {
+    const response = await withMcpCredentialIssuance(
+      {
+        email: row.ownerEmail,
+        orgId: row.orgId,
+        requestOrigin: getOrigin(event),
+      },
+      async (tx) => {
+        const consumed = await consumeOAuthCode(code, row.ownerEmail, tx);
+        if (!consumed)
+          return oauthError("invalid_grant", "Invalid or expired code");
+        return json(
+          await issueTokenSet(
+            {
+              ownerEmail: consumed.ownerEmail,
+              orgId: consumed.orgId,
+              orgDomain: consumed.orgDomain,
+              clientId,
+              scope: consumed.scope,
+              resource: consumed.resource,
+              issuer,
+              grantCreatedAtMs: consumed.createdAt,
+            },
+            tx,
+          ),
+        );
+      },
+    );
+    if (response.status === 200) {
+      await trackAgentConnected({
+        email: row.ownerEmail,
+        origin: issuer,
+        appId: options.appId,
+        client: row.clientName ?? null,
+        method: "oauth",
+      });
+    }
+    return response;
+  } catch (error) {
+    if (
+      error instanceof McpCredentialIssuanceError &&
+      error.reason === "not-member"
+    ) {
+      try {
+        await consumeOAuthCode(code, row.ownerEmail);
+      } catch {
+        return grantUnavailableError(CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE);
+      }
+      return oauthError("invalid_grant", NOT_A_MEMBER_DESCRIPTION);
+    }
+    return grantUnavailableError(CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE);
+  }
 }
 
 async function handleRefreshTokenGrant(
@@ -800,7 +1210,13 @@ async function handleRefreshTokenGrant(
   if (!clientId) {
     return oauthError("invalid_request", "client_id is required");
   }
-  const existing = await getOAuthRefreshToken(refreshToken);
+  let existing;
+  try {
+    await ensureOAuthTables();
+    existing = await getOAuthRefreshToken(refreshToken);
+  } catch {
+    return grantUnavailableError(CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE);
+  }
   if (!existing) return oauthError("invalid_grant", "Invalid refresh token");
   if (existing.clientId !== clientId) {
     return oauthError(
@@ -808,36 +1224,70 @@ async function handleRefreshTokenGrant(
       "Refresh token belongs to another client",
     );
   }
-  await touchOAuthRefreshToken(refreshToken).catch(() => undefined);
   const issuer = getMcpOAuthIssuer(event);
   if (!issuer)
     return oauthError("server_error", "Unable to derive issuer", 500);
-  const accessToken = await signMcpOAuthAccessToken({
-    ownerEmail: existing.ownerEmail,
-    orgId: existing.orgId,
-    orgDomain: existing.orgDomain,
-    clientId: existing.clientId,
-    scope: existing.scope,
-    resource: existing.resource,
-    issuer,
-  });
-  return json({
-    access_token: accessToken,
-    token_type: "Bearer",
-    expires_in: MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
-    refresh_token: refreshToken,
-    scope: existing.scope,
-  });
+  try {
+    return await withMcpCredentialIssuance(
+      {
+        email: existing.ownerEmail,
+        orgId: existing.orgId,
+        requestOrigin: getOrigin(event),
+      },
+      async (tx) => {
+        const renewal = await touchOAuthRefreshToken(
+          refreshToken,
+          existing.ownerEmail,
+          tx,
+        );
+        if (renewal !== "renewed")
+          return oauthError("invalid_grant", "Invalid refresh token");
+        const accessToken = await signMcpOAuthAccessToken({
+          ownerEmail: existing.ownerEmail,
+          orgId: existing.orgId,
+          orgDomain: existing.orgDomain,
+          clientId: existing.clientId,
+          scope: existing.scope,
+          resource: existing.resource,
+          issuer,
+          grantCreatedAtMs: existing.grantCreatedAtMs,
+        });
+        return json({
+          access_token: accessToken,
+          token_type: "Bearer",
+          expires_in: MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
+          refresh_token: refreshToken,
+          scope: existing.scope,
+        });
+      },
+    );
+  } catch (error) {
+    if (
+      error instanceof McpCredentialIssuanceError &&
+      error.reason === "not-member"
+    ) {
+      try {
+        await revokeOAuthRefreshToken(refreshToken, existing.ownerEmail);
+      } catch {
+        return grantUnavailableError(CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE);
+      }
+      return oauthError("invalid_grant", NOT_A_MEMBER_DESCRIPTION);
+    }
+    return grantUnavailableError(CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE);
+  }
 }
 
-async function handleToken(event: H3Event): Promise<Response> {
+async function handleToken(
+  event: H3Event,
+  options: McpOAuthRouteOptions,
+): Promise<Response> {
   if (getMethod(event) !== "POST") {
     return oauthError("invalid_request", "Method not allowed", 405);
   }
   const body = await readOAuthParams(event);
   switch (body.grant_type) {
     case "authorization_code":
-      return handleAuthorizationCodeGrant(event, body);
+      return handleAuthorizationCodeGrant(event, body, options);
     case "refresh_token":
       return handleRefreshTokenGrant(event, body);
     default:
@@ -853,7 +1303,7 @@ export async function handleMcpOAuth(
   const path = subpath.replace(/^\/+/, "").replace(/\/+$/, "");
   try {
     if (path === "authorize") return await handleAuthorize(event, options);
-    if (path === "token") return await handleToken(event);
+    if (path === "token") return await handleToken(event, options);
     if (path === "register") return await handleRegister(event);
     setResponseStatus(event, 404);
     return json({ error: "Not found" }, 404);

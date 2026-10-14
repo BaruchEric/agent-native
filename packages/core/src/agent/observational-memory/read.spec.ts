@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+
 import type { EngineMessage } from "../engine/types.js";
 
 const storeMod = vi.hoisted(() => ({
@@ -49,7 +50,6 @@ describe("buildObservationalContext", () => {
       config: { recentRawMessageCount: 2 },
     });
 
-    // Three tiers present.
     expect(ctx.reflections.map((e) => e.text)).toEqual(["REFL"]);
     expect(ctx.observations.map((e) => e.text)).toEqual(["OBS-1", "OBS-2"]);
     expect(ctx.recentMessages).toHaveLength(2);
@@ -60,7 +60,6 @@ describe("buildObservationalContext", () => {
       text: "recent-B",
     });
 
-    // Token accounting sums each tier.
     expect(ctx.tokens.reflections).toBe(30);
     expect(ctx.tokens.observations).toBe(120);
     expect(ctx.tokens.recentMessages).toBeGreaterThan(0);

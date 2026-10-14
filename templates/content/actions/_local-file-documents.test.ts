@@ -1,14 +1,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import editDocument from "./edit-document";
-import pullDocument from "./pull-document";
-import searchDocuments from "./search-documents";
+
 import {
   createLocalFileDocument,
+  listLocalFileDocuments,
   localFileDocumentId,
   moveLocalFileDocument,
+  removeContentLocalFileRoots,
   updateLocalFileDocument,
 } from "./_local-file-documents";
 
@@ -21,7 +22,6 @@ vi.mock("@agent-native/core/application-state", () => ({
 
 const tmpRoots: string[] = [];
 const OLD_ENV = {
-  AGENT_NATIVE_MODE: process.env.AGENT_NATIVE_MODE,
   AGENT_NATIVE_DATA_MODE: process.env.AGENT_NATIVE_DATA_MODE,
   AGENT_NATIVE_MANIFEST: process.env.AGENT_NATIVE_MANIFEST,
   AGENT_NATIVE_MANIFEST_PATH: process.env.AGENT_NATIVE_MANIFEST_PATH,
@@ -42,7 +42,7 @@ function readFile(root: string, filePath: string) {
   return fs.readFileSync(path.join(root, filePath), "utf8");
 }
 
-function setupLocalContentRepo() {
+function setupLocalContentRepo(options: { profile?: string } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "an-content-local-"));
   tmpRoots.push(root);
   const manifestPath = path.join(root, "agent-native.json");
@@ -50,6 +50,7 @@ function setupLocalContentRepo() {
     mode: "local-files",
     apps: {
       content: {
+        profile: options.profile,
         roots: [
           { name: "Docs", path: "docs", extensions: [".md", ".mdx"] },
           { name: "Blog", path: "blog", extensions: [".md", ".mdx"] },
@@ -63,7 +64,6 @@ function setupLocalContentRepo() {
     },
   });
   process.env.AGENT_NATIVE_MANIFEST_PATH = manifestPath;
-  process.env.AGENT_NATIVE_MODE = "local-files";
   return root;
 }
 
@@ -111,43 +111,76 @@ describe("content local file documents", () => {
     expect(readFile(root, "docs/raw.mdx")).toBe(rawMdx);
   });
 
-  it("lets agent edit/search/pull actions operate on local files", async () => {
+  it("reuses parsed local documents across explicit compatibility reads", async () => {
     const root = setupLocalContentRepo();
-    writeFile(
-      root,
-      "docs/guide.mdx",
-      '---\ntitle: "Guide"\n---\n\nAlpha beta needle.',
-    );
-    writeFile(
-      root,
-      "blog/hidden.mdx",
-      '---\ntitle: "Hidden"\nhideFromSearch: true\n---\n\nneedle secret',
-    );
-    const id = localFileDocumentId("docs/guide.mdx");
+    writeFile(root, "docs/guide.mdx", "# Guide\n\nAlpha needle.");
+    writeFile(root, "docs/other.mdx", "# Other\n\nBeta needle.");
 
-    await expect(
-      editDocument.run({ id, find: "beta", replace: "gamma" }),
-    ).resolves.toMatchObject({ applied: 1, total: 1 });
-    expect(readFile(root, "docs/guide.mdx")).toContain("Alpha gamma needle.");
+    const openSpy = vi.spyOn(fs, "openSync");
+    const localContentOpens = () =>
+      openSpy.mock.calls.filter(
+        ([filePath]) =>
+          typeof filePath === "string" && filePath.endsWith(".mdx"),
+      ).length;
 
-    await expect(
-      searchDocuments.run({ query: "needle", limit: 10 }),
-    ).resolves.toMatchObject({
-      documents: [
-        expect.objectContaining({
-          id,
-          title: "Guide",
-          snippet: expect.stringContaining("needle"),
-        }),
-      ],
+    const first = await listLocalFileDocuments();
+    expect(
+      first.filter((document) => document.source?.kind === "file"),
+    ).toHaveLength(2);
+    const opensAfterFirstRead = localContentOpens();
+    expect(opensAfterFirstRead).toBeGreaterThan(0);
+
+    await listLocalFileDocuments();
+    expect(localContentOpens()).toBe(opensAfterFirstRead);
+
+    await updateLocalFileDocument(localFileDocumentId("docs/guide.mdx"), {
+      content: "# Guide\n\nFresh needle.",
     });
 
-    await expect(
-      pullDocument.run({ id, format: "markdown" }),
-    ).resolves.toMatchObject({
-      id,
-      title: "Guide",
-      content: expect.stringContaining("Alpha gamma needle."),
+    openSpy.mockClear();
+    await expect(listLocalFileDocuments()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: localFileDocumentId("docs/guide.mdx"),
+          content: expect.stringContaining("Fresh needle"),
+        }),
+      ]),
+    );
+    expect(localContentOpens()).toBeGreaterThan(0);
+  });
+
+  it("removes configured local roots from the Content manifest without deleting files", async () => {
+    const root = setupLocalContentRepo();
+    writeFile(root, "docs/guide.mdx", "# Guide\n\nStill on disk.");
+
+    await expect(removeContentLocalFileRoots("docs")).resolves.toMatchObject({
+      removed: 1,
+      roots: ["docs"],
+    });
+
+    const manifest = JSON.parse(readFile(root, "agent-native.json"));
+    expect(manifest.apps.content).toMatchObject({
+      mode: "local-files",
+      roots: [
+        { name: "Blog", path: "blog", extensions: [".md", ".mdx"] },
+        {
+          name: "Resources",
+          path: "resources",
+          extensions: [".md", ".mdx"],
+        },
+      ],
+    });
+    expect(readFile(root, "docs/guide.mdx")).toContain("Still on disk.");
+
+    await expect(removeContentLocalFileRoots()).resolves.toMatchObject({
+      removed: 2,
+      roots: ["blog", "resources"],
+    });
+
+    const emptiedManifest = JSON.parse(readFile(root, "agent-native.json"));
+    expect(emptiedManifest.apps.content).toMatchObject({
+      mode: "database",
+      roots: [],
     });
   });
 
@@ -170,6 +203,16 @@ describe("content local file documents", () => {
     ]).toEqual(expect.arrayContaining([expect.stringContaining("Second")]));
   });
 
+  it("keeps blank docs profile creates formatter-clean", async () => {
+    const root = setupLocalContentRepo({ profile: "docs/no-bookkeeping" });
+
+    const doc = await createLocalFileDocument({ title: "" });
+
+    expect(readFile(root, doc.source?.path ?? "")).toBe(
+      '---\ntitle: "Untitled"\n---\n',
+    );
+  });
+
   it("fails loudly instead of pretending local file moves succeeded", async () => {
     const root = setupLocalContentRepo();
     writeFile(root, "docs/guide.mdx", "# Guide");
@@ -179,5 +222,47 @@ describe("content local file documents", () => {
         parentId: null,
       }),
     ).rejects.toThrow("not supported");
+  });
+
+  it("keeps default local file edits on the existing bookkeeping frontmatter path", async () => {
+    const root = setupLocalContentRepo();
+    writeFile(root, "docs/plain.mdx", "# Plain\n\nOld body");
+
+    await updateLocalFileDocument(localFileDocumentId("docs/plain.mdx"), {
+      content: "New body",
+    });
+
+    const written = readFile(root, "docs/plain.mdx");
+    expect(written).toContain('title: "Plain"');
+    expect(written).toContain("icon: null");
+    expect(written).toContain("isFavorite: false");
+    expect(written).toContain("updatedAt:");
+    expect(written).toContain("New body");
+  });
+
+  it("does not add bookkeeping frontmatter for docs profile content-only edits", async () => {
+    const root = setupLocalContentRepo({ profile: "docs/no-bookkeeping" });
+    writeFile(root, "docs/plain.mdx", "# Plain\n\nOld body");
+
+    await updateLocalFileDocument(localFileDocumentId("docs/plain.mdx"), {
+      content: "# Plain\n\nNew body",
+    });
+
+    expect(readFile(root, "docs/plain.mdx")).toBe("# Plain\n\nNew body");
+  });
+
+  it("writes explicit metadata changes for docs profile local files", async () => {
+    const root = setupLocalContentRepo({ profile: "docs/no-bookkeeping" });
+    writeFile(root, "docs/plain.mdx", "# Plain\n\nBody");
+
+    await updateLocalFileDocument(localFileDocumentId("docs/plain.mdx"), {
+      icon: "book",
+      isFavorite: true,
+    });
+
+    const written = readFile(root, "docs/plain.mdx");
+    expect(written).toContain('icon: "book"');
+    expect(written).toContain("isFavorite: true");
+    expect(written).not.toContain("updatedAt:");
   });
 });

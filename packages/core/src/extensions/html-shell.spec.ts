@@ -1,16 +1,46 @@
-import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import {
+  DEFAULT_EXTENSION_DISPLAY_SOURCES,
+  defineAppConfig,
+  getAppConfig,
+  resetAppConfigForTests,
+} from "../app-config/index.js";
 import {
   buildExtensionHtml,
   EXTENSION_FRAME_ANCESTORS,
   EXTENSION_IFRAME_CSP,
   EXTENSION_IFRAME_META_CSP,
+  extensionIframeCspBase,
+  extensionIframeMetaCspFromDisplaySources,
 } from "./html-shell.js";
+import {
+  buildExtensionIframeCsp,
+  buildExtensionIframeMetaCsp,
+  getExtensionIframeDisplaySources,
+} from "./iframe-csp.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const CLIENT_DIR = join(HERE, "..", "client", "extensions");
+const EXTENSION_HOST_DIR = join(
+  HERE,
+  "..",
+  "..",
+  "..",
+  "toolkit",
+  "src",
+  "app",
+  "extensions",
+);
+
+// The CSP resolves app config, so an unset config has to be the baseline every
+// other assertion in this file measures against.
+afterEach(() => {
+  resetAppConfigForTests();
+});
 
 describe("buildExtensionHtml", () => {
   it("uses a constrained iframe CSP", () => {
@@ -24,6 +54,9 @@ describe("buildExtensionHtml", () => {
     );
     expect(EXTENSION_IFRAME_CSP).not.toContain("frame-ancestors *");
     expect(EXTENSION_FRAME_ANCESTORS).toContain("https://*.agent-native.com");
+    expect(EXTENSION_FRAME_ANCESTORS).toContain(
+      "https://agent-workspace.builder.io",
+    );
     expect(EXTENSION_FRAME_ANCESTORS).toContain(
       "https://*.claudemcpcontent.com",
     );
@@ -70,12 +103,121 @@ describe("buildExtensionHtml", () => {
     expect(html).toContain("_appendActionQuery(path, params)");
   });
 
+  it("hides x-cloak content until Alpine boots", () => {
+    const html = buildExtensionHtml(
+      '<div x-cloak class="fixed inset-0">Alerts</div>',
+      ":root{}",
+      false,
+      "extension-1",
+    );
+
+    expect(html).toContain("[x-cloak] { display: none !important; }");
+  });
+
   it("routes extension navigate calls through the app-state command endpoint", () => {
     const html = buildExtensionHtml("<div/>", ":root{}", false, "extension-1");
 
     expect(html).toContain("if (name === 'navigate')");
     expect(html).toContain("'/_agent-native/application-state/navigate'");
     expect(html).toContain("method: 'PUT'");
+  });
+
+  it("exposes server-side connector helpers without copying credentials into the iframe", () => {
+    const html = buildExtensionHtml("<div/>", ":root{}", false, "extension-1");
+
+    expect(html).toContain("var mcp = {");
+    expect(html).toContain("appAction('list-mcp-tools', params)");
+    expect(html).toContain("appAction('call-mcp-tool'");
+    expect(html).toContain("var providerApi = {");
+    expect(html).toContain("appAction('provider-api-catalog'");
+    expect(html).not.toContain("appAction('provider-api-request'");
+    expect(html).not.toContain("request: function(params)");
+    expect(html).toContain("mcp: mcp");
+    expect(html).toContain("providerApi: providerApi");
+    expect(html).not.toContain("accessToken");
+    expect(html).not.toContain("clientSecret");
+  });
+
+  it("exposes a chat bridge helper to extension code", () => {
+    const html = buildExtensionHtml("<div/>", ":root{}", false, "extension-1");
+
+    expect(html).toContain("function sendToChat(message, options)");
+    expect(html).toContain("type: 'agent-native-send-to-chat'");
+    expect(html).toContain("submit: options.submit === true");
+    expect(html).not.toContain("submit: options.submit !== false");
+    expect(html).toContain("sendToChat: sendToChat");
+    expect(html).toContain("send: sendToChat");
+    expect(html).toContain("window.sendToAgentChat = sendToChat");
+  });
+
+  it("exposes a passive UI output helper keyed by extension id", () => {
+    const html = buildExtensionHtml("<div/>", ":root{}", false, "inline-1");
+
+    expect(html).toContain("function inlineUiOutputKey()");
+    expect(html).toContain("'inline-ui:' + safeId + ':output'");
+    expect(html).toContain("function outputToUi(value, options)");
+    expect(html).toContain(
+      "appFetch('/_agent-native/application-state/' + key",
+    );
+    expect(html).toContain("'X-Request-Source': 'inline-ui'");
+    expect(html).toContain("type: 'agent-native-ui-output'");
+    expect(html).toContain("ui: Object.assign");
+    expect(html).toContain("output: outputToUi");
+  });
+
+  it("auto-resizes transient srcdoc inline iframes", () => {
+    const html = buildExtensionHtml("<div/>", ":root{}", false, "inline-1");
+
+    expect(html).toContain(
+      "new URLSearchParams(location.search).get('slot') || window.parent !== window",
+    );
+    expect(html).toContain("agent-native-extension-resize");
+    expect(html).not.toContain("min-height: 100vh");
+    expect(html).toContain("var bodyRect = body.getBoundingClientRect()");
+    expect(html).toContain("bodyRect.height - paddingBottom");
+    expect(html).toContain("body.querySelectorAll('*')");
+    expect(html).toContain("style.overflowY");
+    expect(html).toContain("auto|scroll|overlay|hidden|clip");
+    expect(html).toContain("style.position === 'fixed'");
+    expect(html).toContain("style.position === 'absolute'");
+    expect(html).toContain("requestAnimationFrame");
+    expect(html).toContain("_positionObservationScheduled");
+    expect(html).toContain("_schedulePositionObservation");
+    expect(html).toContain("_positionMonitorActive");
+    expect(html).toContain("_activeCssMotionCount");
+    expect(html).toContain("_animationProbeTimer");
+    expect(html).toContain("document.getAnimations()");
+    expect(html).toContain("_positionedElements.forEach");
+    expect(html).toContain("_motionElements.forEach");
+    expect(html).toContain("_watchAnimationCompletion");
+    expect(html).toContain("Element.prototype.animate");
+    expect(html).toContain("document.addEventListener('animationend'");
+    expect(html).toContain("document.addEventListener('transitionend'");
+    expect(html).not.toContain(
+      "document.addEventListener('animationiteration'",
+    );
+    expect(html).toContain("_positionMonitorFramesRemaining");
+    expect(html).toContain("document.addEventListener('transitionstart'");
+    expect(html).toContain("new MutationObserver");
+    expect(html).not.toContain("document.createTreeWalker(body, 4");
+    expect(html).not.toContain("range.getClientRects()");
+    const reportStart = html.indexOf("var _reportHeight = function()");
+    const reportEnd = html.indexOf(
+      "window.addEventListener('scroll', _scheduleResizeWork",
+      reportStart,
+    );
+    expect(reportStart).toBeGreaterThanOrEqual(0);
+    expect(reportEnd).toBeGreaterThan(reportStart);
+    expect(html.slice(reportStart, reportEnd)).toContain(
+      "_measurePositionedContent",
+    );
+    expect(html.slice(reportStart, reportEnd)).not.toContain(
+      "querySelectorAll('*')",
+    );
+    expect(html.slice(reportStart, reportEnd)).not.toContain(
+      "document.createTreeWalker(body, 4)",
+    );
+    expect(html).not.toContain("body.scrollHeight");
   });
 
   it("serializes authenticated extension binding metadata", () => {
@@ -94,17 +236,16 @@ describe("buildExtensionHtml", () => {
 
   it("pins CDN scripts to exact versions with SRI integrity hashes", () => {
     const html = buildExtensionHtml("<div/>", ":root{}", false, "t");
-    // Tailwind: pinned to a patch version + SRI.
     expect(html).toMatch(
       /<script[^>]*src="https:\/\/cdn\.jsdelivr\.net\/npm\/@tailwindcss\/browser@\d+\.\d+\.\d+"[^>]*integrity="sha384-[A-Za-z0-9+/=]+"/,
     );
-    // Alpine: pinned to a patch version + SRI.
     expect(html).toMatch(
       /<script[^>]*src="https:\/\/cdn\.jsdelivr\.net\/npm\/alpinejs@\d+\.\d+\.\d+\/dist\/cdn\.min\.js"[^>]*integrity="sha384-[A-Za-z0-9+/=]+"/,
     );
-    // Refuse the old unpinned-major form.
     expect(html).not.toContain('@tailwindcss/browser@4"');
     expect(html).not.toContain("alpinejs@3/dist/cdn.min.js");
+    expect(html).toContain("@rrweb/record@2.1.0/umd/record.min.js");
+    expect(html).toContain("recordCrossOriginIframes: true");
   });
 
   it("adds default canvas padding with a full-bleed escape hatch", () => {
@@ -122,9 +263,296 @@ describe("buildExtensionHtml", () => {
 
     expect(html).toContain('id="__extension-error-dismiss"');
     expect(html).toContain("agent-native-extension-error-fix");
+    expect(html).toContain("function _renderErrorToast()");
+    expect(html).toMatch(
+      /DOMContentLoaded', function\(\) \{\s+_renderErrorToast\(\);/,
+    );
     expect(
       html.match(/__extension-error-toast'\)\.style\.display = 'none'/g),
     ).toHaveLength(2);
+  });
+});
+
+describe("extension iframe display-only media sources", () => {
+  // Read one directive's source list, so a widening assertion cannot pass on
+  // an `https:` that belongs to `script-src` or `style-src`.
+  function sources(csp: string, directive: string): string[] {
+    const match = new RegExp(`(?:^|; )${directive} ([^;]*);`).exec(csp);
+    expect(match).not.toBeNull();
+    return (match?.[1] ?? "").split(" ").filter(Boolean);
+  }
+
+  it("blocks every remote image until a deployment opts in", () => {
+    expect(buildExtensionIframeMetaCsp()).toBe(EXTENSION_IFRAME_META_CSP);
+    expect(sources(buildExtensionIframeMetaCsp(), "img-src")).toEqual([
+      "'self'",
+      "data:",
+      "blob:",
+    ]);
+    expect(sources(buildExtensionIframeMetaCsp(), "media-src")).toEqual([
+      "'self'",
+      "data:",
+      "blob:",
+    ]);
+  });
+
+  it("applies configured image and media sources to the meta CSP", () => {
+    defineAppConfig({
+      extensions: {
+        iframeImageSources: ["'self'", "https:", "data:", "blob:"],
+        iframeMediaSources: ["'self'", "https:", "data:", "blob:"],
+      },
+    });
+
+    const csp = buildExtensionIframeMetaCsp();
+    expect(sources(csp, "img-src")).toEqual([
+      "'self'",
+      "https:",
+      "data:",
+      "blob:",
+    ]);
+    expect(sources(csp, "media-src")).toEqual([
+      "'self'",
+      "https:",
+      "data:",
+      "blob:",
+    ]);
+    expect(
+      buildExtensionHtml(
+        "<div/>",
+        ":root{}",
+        false,
+        "extension-1",
+        undefined,
+        csp,
+      ),
+    ).toContain(
+      `<meta http-equiv="Content-Security-Policy" content="${csp}" />`,
+    );
+  });
+
+  it("keeps the client-built shell on the default CSP unless one is passed", () => {
+    defineAppConfig({
+      extensions: { iframeImageSources: ["'self'", "https:"] },
+    });
+
+    expect(
+      buildExtensionHtml("<div/>", ":root{}", false, "extension-1"),
+    ).toContain(
+      `<meta http-equiv="Content-Security-Policy" content="${EXTENSION_IFRAME_META_CSP}" />`,
+    );
+  });
+
+  // ExtensionViewer and InlineExtensionFrame build this shell in the browser,
+  // so it must not pull the app-config store (top-level process.env reads)
+  // into client bundles.
+  it("does not import app config into the client-rendered shell", () => {
+    // source-read-ok: client-bundle boundary check on html-shell.ts's import list
+    const shell = readFileSync(join(HERE, "html-shell.ts"), "utf8");
+    const imports = shell
+      .split("\n")
+      .filter(
+        (line) =>
+          /^\s*(import|export) .* from /.test(line) || /^} from /.test(line),
+      );
+    for (const line of imports) {
+      expect(line).not.toMatch(/app-config\/(index|store)/);
+    }
+    expect(shell).not.toContain("getAppConfig");
+  });
+
+  it("hands out a fresh default so a mutated config cannot reach the next parse", () => {
+    expect(Object.isFrozen(DEFAULT_EXTENSION_DISPLAY_SOURCES)).toBe(true);
+    defineAppConfig({});
+    const first = getAppConfig().extensions.iframeImageSources;
+    expect(first).not.toBe(DEFAULT_EXTENSION_DISPLAY_SOURCES);
+    first.push("'self'; script-src *");
+    resetAppConfigForTests();
+    defineAppConfig({});
+    expect(getAppConfig().extensions.iframeImageSources).toEqual([
+      "'self'",
+      "data:",
+      "blob:",
+    ]);
+    expect(buildExtensionIframeMetaCsp()).toBe(EXTENSION_IFRAME_META_CSP);
+  });
+
+  // SECURITY: getAppConfig() returns the cached resolved config, which a caller
+  // can mutate after the schema validated it. The CSP builder revalidates.
+  it("refuses a resolved config that was mutated after validation", () => {
+    defineAppConfig({
+      extensions: { iframeImageSources: ["'self'", "https:"] },
+    });
+    getAppConfig().extensions.iframeImageSources.push("'self'; connect-src *");
+    expect(() => buildExtensionIframeMetaCsp()).toThrow(/img-src/);
+    expect(() => buildExtensionIframeCsp()).toThrow(/img-src/);
+    expect(() => getExtensionIframeDisplaySources()).toThrow(/img-src/);
+
+    resetAppConfigForTests();
+    defineAppConfig({});
+    getAppConfig().extensions.iframeMediaSources.splice(
+      0,
+      Infinity,
+      "'none'",
+      "https:",
+    );
+    expect(() => buildExtensionIframeMetaCsp()).toThrow(/media-src/);
+
+    resetAppConfigForTests();
+    defineAppConfig({});
+    getAppConfig().extensions.iframeImageSources.length = 0;
+    expect(() => buildExtensionIframeMetaCsp()).toThrow(/img-src/);
+  });
+
+  it("validates both lists wherever the policy is built", () => {
+    for (const bad of [
+      ["'self'; connect-src *"],
+      ["'self' https://a.example"],
+      ["'none'", "https:"],
+      [],
+    ]) {
+      expect(() => extensionIframeCspBase(bad, ["'self'"])).toThrow(TypeError);
+      expect(() => extensionIframeCspBase(["'self'"], bad)).toThrow(TypeError);
+    }
+    expect(() =>
+      extensionIframeCspBase([42 as unknown as string], ["'self'"]),
+    ).toThrow(TypeError);
+  });
+
+  it("serves copies of the configured lists to client-rendered frames", () => {
+    defineAppConfig({
+      extensions: {
+        iframeImageSources: ["'self'", "https://cdn.example.com"],
+        iframeMediaSources: ["'self'", "blob:"],
+      },
+    });
+    const served = getExtensionIframeDisplaySources();
+    expect(served).toEqual({
+      imageSources: ["'self'", "https://cdn.example.com"],
+      mediaSources: ["'self'", "blob:"],
+    });
+    served.imageSources.push("'self'; connect-src *");
+    expect(getAppConfig().extensions.iframeImageSources).toEqual([
+      "'self'",
+      "https://cdn.example.com",
+    ]);
+  });
+
+  it("builds the client meta CSP from served lists and fails closed", () => {
+    const csp = extensionIframeMetaCspFromDisplaySources({
+      imageSources: ["'self'", "https:"],
+      mediaSources: ["'self'", "data:"],
+    });
+    expect(sources(csp, "img-src")).toEqual(["'self'", "https:"]);
+    expect(sources(csp, "media-src")).toEqual(["'self'", "data:"]);
+    expect(sources(csp, "connect-src")).toEqual(["'self'"]);
+
+    for (const body of [
+      null,
+      "https:",
+      {},
+      { imageSources: ["'self'"] },
+      { imageSources: "https:", mediaSources: ["'self'"] },
+      {
+        imageSources: ["'self'; connect-src *"],
+        mediaSources: ["'self'"],
+      },
+      { imageSources: ["'none'", "https:"], mediaSources: ["'self'"] },
+    ]) {
+      expect(extensionIframeMetaCspFromDisplaySources(body)).toBe(
+        EXTENSION_IFRAME_META_CSP,
+      );
+    }
+  });
+
+  it("applies each directive's own list rather than one shared list", () => {
+    defineAppConfig({
+      extensions: {
+        iframeImageSources: ["'self'", "data:", "https://cdn.example.com"],
+        iframeMediaSources: ["'self'", "data:"],
+      },
+    });
+
+    const csp = buildExtensionIframeMetaCsp();
+    expect(sources(csp, "img-src")).toEqual([
+      "'self'",
+      "data:",
+      "https://cdn.example.com",
+    ]);
+    expect(sources(csp, "media-src")).toEqual(["'self'", "data:"]);
+  });
+
+  it("keeps frame-ancestors in the header CSP the render route sets", () => {
+    defineAppConfig({
+      extensions: { iframeImageSources: ["'self'", "https:"] },
+    });
+
+    const csp = buildExtensionIframeCsp();
+    expect(sources(csp, "img-src")).toEqual(["'self'", "https:"]);
+    expect(csp).toContain(`frame-ancestors ${EXTENSION_FRAME_ANCESTORS};`);
+    expect(csp).not.toContain("frame-ancestors *");
+  });
+
+  // SECURITY: img-src / media-src are the configurable directives. connect-src
+  // and the other directives stay locked. A remote img-src origin is its own
+  // egress permission (the browser requests the URL); it must not also rewrite
+  // connect-src or inject another directive.
+  it("leaves connect-src and every other directive at the framework default", () => {
+    const locked = {
+      "default-src": ["'none'"],
+      "script-src": [
+        "'self'",
+        "https://cdn.jsdelivr.net",
+        "'unsafe-eval'",
+        "'unsafe-inline'",
+      ],
+      "style-src": [
+        "'self'",
+        "'unsafe-inline'",
+        "https://cdn.jsdelivr.net",
+        "https://fonts.googleapis.com",
+      ],
+      "font-src": ["https://fonts.gstatic.com"],
+      "connect-src": ["'self'"],
+      "frame-src": ["'none'"],
+      "object-src": ["'none'"],
+      "base-uri": ["'none'"],
+      "form-action": ["'none'"],
+    };
+
+    defineAppConfig({
+      extensions: {
+        iframeImageSources: ["'self'", "https:", "https://cdn.example.com"],
+        iframeMediaSources: ["'self'", "https:", "https://cdn.example.com"],
+      },
+    });
+
+    const widened = buildExtensionIframeCsp();
+    for (const [directive, expected] of Object.entries(locked)) {
+      expect(sources(widened, directive)).toEqual(expected);
+    }
+    expect(sources(widened, "img-src")).toEqual([
+      "'self'",
+      "https:",
+      "https://cdn.example.com",
+    ]);
+  });
+
+  it("refuses a source expression that would inject another directive", () => {
+    for (const source of [
+      "'self'; script-src *",
+      "'self' https://a.example",
+      "https://cdn.example.com/path",
+      "javascript:alert(1)",
+      "",
+    ]) {
+      expect(() =>
+        defineAppConfig({ extensions: { iframeImageSources: [source] } }),
+      ).toThrow();
+    }
+    expect(() =>
+      defineAppConfig({ extensions: { iframeImageSources: [] } }),
+    ).toThrow();
   });
 });
 
@@ -135,17 +563,43 @@ describe("extension iframe sandbox attribute (CI guard)", () => {
   const HOST_FILES = [
     "ExtensionViewer.tsx",
     "EmbeddedExtension.tsx",
+    "InlineExtensionFrame.tsx",
     "ExtensionEditor.tsx",
   ];
 
   for (const file of HOST_FILES) {
     it(`${file} renders the iframe without allow-same-origin`, () => {
-      const text = readFileSync(join(CLIENT_DIR, file), "utf8");
+      const text = readFileSync(join(EXTENSION_HOST_DIR, file), "utf8");
       const sandboxMatches = text.match(/sandbox="([^"]*)"/g) ?? [];
-      expect(sandboxMatches.length).toBeGreaterThan(0);
+      const usesNormalizedSandbox = text.includes(
+        "sandbox={EXTENSION_IFRAME_SANDBOX}",
+      );
+      if (usesNormalizedSandbox) {
+        expect(text).toContain(
+          "normalizeAgentNativeExtensionSandbox(undefined)",
+        );
+      } else {
+        expect(sandboxMatches.length).toBeGreaterThan(0);
+      }
       for (const sandbox of sandboxMatches) {
         expect(sandbox).not.toContain("allow-same-origin");
       }
+    });
+  }
+});
+
+describe("extension chat submission policy (CI guard)", () => {
+  const HOST_SUBMISSION_GUARDS = [
+    ["ExtensionViewer.tsx", "submit: message.submit === true"],
+    ["EmbeddedExtension.tsx", "submit: (message as any).submit === true"],
+    ["InlineExtensionFrame.tsx", "submit: (message as any).submit === true"],
+  ] as const;
+
+  for (const [file, guard] of HOST_SUBMISSION_GUARDS) {
+    it(`${file} requires explicit submission opt-in`, () => {
+      const text = readFileSync(join(EXTENSION_HOST_DIR, file), "utf8");
+      expect(text).toContain(guard);
+      expect(text).not.toContain(guard.replace("=== true", "!== false"));
     });
   }
 });

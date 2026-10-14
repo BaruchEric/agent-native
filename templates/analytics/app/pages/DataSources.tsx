@@ -1,14 +1,52 @@
-import { useEffect, useState } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
+  appApiPath,
+  agentNativePath,
+} from "@agent-native/core/client/api-path";
+import {
+  callAction,
+  useActionMutation,
+  useActionQuery,
+} from "@agent-native/core/client/hooks";
+import { oauthRedirectUri } from "@agent-native/core/client/host";
+import { useFormatters, useT } from "@agent-native/core/client/i18n";
+import { useOrgRole } from "@agent-native/core/client/org";
+import { mcpIntegrationLogo } from "@agent-native/core/client/resources/mcp-integration-logos";
+import { actionErrorMessage } from "@agent-native/core/client/use-action";
+import { docsUrl } from "@agent-native/core/shared";
+import { useSendToAgentChat } from "@agent-native/toolkit/app/chat";
+import { PromptComposer } from "@agent-native/toolkit/app/chat/composer/index";
+import {
+  IntegrationGrid,
+  type IntegrationGridItem,
+} from "@agent-native/toolkit/app/integrations";
+import { McpIntegrationLogo } from "@agent-native/toolkit/app/resources";
+import {
+  useCredentialSaveScope,
+  WhoField,
+} from "@agent-native/toolkit/app/settings";
+import {
+  IconAlertCircle,
+  IconApi,
+  IconBrandGithub,
+  IconCheck,
+  IconCircle,
+  IconCopy,
+  IconDotsVertical,
+  IconExternalLink,
+  IconFileSpreadsheet,
+  IconKey,
+  IconLoader2,
+  IconPencil,
+  IconPlugConnected,
+  IconPlus,
+  IconSearch,
+  IconTrash,
+  IconUpload,
+} from "@tabler/icons-react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useId, useState, type ReactNode } from "react";
+import { Link, useSearchParams } from "react-router";
+
 import {
   AlertDialog,
   AlertDialogAction,
@@ -19,57 +57,16 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Skeleton } from "@/components/ui/skeleton";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
-  IconCheck,
-  IconChevronDown,
-  IconChevronUp,
-  IconExternalLink,
-  IconLoader2,
-  IconCircle,
-  IconAlertCircle,
-  IconUpload,
-  IconPencil,
-  IconTrash,
-  IconSearch,
-  IconPlus,
-  IconKey,
-  IconCopy,
-  IconDotsVertical,
-  IconBrandGithub,
-} from "@tabler/icons-react";
-import { getIdToken } from "@/lib/auth";
-import {
-  dataSources,
-  categoryLabels,
-  categoryOrder,
-  type DataSource,
-  type WalkthroughStep,
-} from "@/lib/data-sources";
-import {
-  getOptionalCredentialKeys,
-  getSharedConnectionStatus,
-  isSourceReady,
-  isSourceConfigured,
-  credentialRowsFromStatus,
-  type DataSourceStatusResponse,
-  type EnvKeyStatus,
-  type SharedConnectionStatus,
-} from "@/lib/data-source-status";
-import {
-  appApiPath,
-  agentNativePath,
-  oauthRedirectUri,
-  useActionMutation,
-  useActionQuery,
-  useSendToAgentChat,
-  PromptComposer,
-} from "@agent-native/core/client";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -77,6 +74,54 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Textarea } from "@/components/ui/textarea";
+import { getIdToken } from "@/lib/auth";
+import {
+  canConnectWorkspaceOAuth,
+  dataSourceOAuthReturnPath,
+  focusedDataSourceFromSearchParams,
+  getOptionalCredentialKeys,
+  getSharedConnectionStatus,
+  getGoogleSheetsConnection,
+  hasExistingWorkspaceConnection,
+  isWorkspaceOAuthSource,
+  isSourceReady,
+  isSourceLocallyConfigured,
+  shouldOfferWorkspaceOAuthReconnect,
+  shouldShowWorkspaceOAuthAdminNotice,
+  credentialRowsFromStatus,
+  type DataSourceStatusResponse,
+  type EnvKeyStatus,
+  type SharedConnectionStatus,
+} from "@/lib/data-source-status";
+import {
+  dataSources,
+  categoryLabels,
+  categoryOrder,
+  DATA_SOURCE_LOGO_IDS,
+  type DataSource,
+  type DataSourceCategory,
+  type WalkthroughStep,
+} from "@/lib/data-sources";
+
+import {
+  ConnectionTestStatus,
+  type ConnectionTestResult,
+} from "../components/ConnectionTestStatus";
+import { CustomApiPanel } from "../components/CustomApiCard";
 
 interface AnalyticsPublicKeyRow {
   id: string;
@@ -86,6 +131,7 @@ interface AnalyticsPublicKeyRow {
   lastUsedAt: string | null;
   revokedAt: string | null;
   orgId: string | null;
+  replayAllowedOrigins: string[];
 }
 
 interface GitHubOAuthStatus {
@@ -102,32 +148,86 @@ interface GitHubOAuthStatus {
   error?: string;
 }
 
+interface FirstPartyAnalyticsHealthResponse {
+  status: "healthy" | "monitor" | "recommend_bigquery" | "unavailable";
+  externalBackendRecommendation?: "none" | "connect" | "use" | "unknown";
+  metrics: {
+    eventCount: number;
+    slowQueryCount24h: number;
+    maxQueryDurationMs24h: number;
+  };
+  externalBackends?: Array<{
+    id: "bigquery" | "amplitude";
+    label: string;
+    role: "warehouse" | "product-analytics";
+    configured: boolean | null;
+    setupLink: string;
+  }>;
+  bigQuery: {
+    configured: boolean | null;
+  };
+}
+
+/** One row on the page: a data source, Google Sheets export, Custom API, or first-party analytics. */
+interface SourceEntry {
+  id: string;
+  name: string;
+  description?: string;
+  category: DataSourceCategory;
+  logo: ReactNode;
+  status?: string;
+  statusClassName?: string;
+  connected: boolean;
+  searchText: string;
+  detail: ReactNode;
+}
+
 const firstPartyAnalyticsEndpoint =
   (import.meta.env as Record<string, string | undefined>)
     .VITE_AGENT_NATIVE_ANALYTICS_ENDPOINT ||
   "https://analytics.agent-native.com/track";
 
-async function saveEnvVars(
-  vars: Array<{ key: string; value: string }>,
-): Promise<void> {
-  const token = await getIdToken();
-  const res = await fetch(appApiPath("/api/credentials"), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(token && { Authorization: `Bearer ${token}` }),
-    },
-    body: JSON.stringify({ vars }),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || "Failed to save");
+/**
+ * Logos come from the shared table the Settings integrations tab uses. A
+ * Tabler icon stands in only when that table has no logo for the id.
+ */
+function SourceLogo({
+  id,
+  name,
+  fallbackIcon: FallbackIcon,
+}: {
+  id: string;
+  name: string;
+  fallbackIcon: DataSource["icon"];
+}) {
+  const logoId = DATA_SOURCE_LOGO_IDS[id] ?? id;
+  const logoUrl = mcpIntegrationLogo(logoId);
+  if (!logoUrl) {
+    return (
+      <span className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-background text-muted-foreground">
+        <FallbackIcon className="size-4" aria-hidden="true" />
+      </span>
+    );
   }
+  return (
+    <McpIntegrationLogo
+      name={name}
+      logoUrl={logoUrl}
+      integrationId={logoId}
+      className="size-8"
+      imageClassName="size-6"
+    />
+  );
 }
 
-async function testConnection(
-  source: string,
-): Promise<{ ok: boolean; error?: string }> {
+async function saveEnvVars(
+  vars: Array<{ key: string; value: string }>,
+  scope: "user" | "org",
+): Promise<void> {
+  await callAction("update-data-source-credentials", { vars, scope });
+}
+
+async function testConnection(source: string): Promise<ConnectionTestResult> {
   const token = await getIdToken();
   const res = await fetch(appApiPath("/api/test-connection"), {
     method: "POST",
@@ -140,10 +240,22 @@ async function testConnection(
   return res.json();
 }
 
+const GITHUB_OAUTH_STATUS_ABORT_MS = 10_000;
+
 async function fetchGitHubOAuthStatus(): Promise<GitHubOAuthStatus> {
-  const res = await fetch(
-    agentNativePath("/_agent-native/oauth/github/status"),
+  const controller = new AbortController();
+  const abortTimer = setTimeout(
+    () => controller.abort(),
+    GITHUB_OAUTH_STATUS_ABORT_MS,
   );
+  let res: Response;
+  try {
+    res = await fetch(agentNativePath("/_agent-native/oauth/github/status"), {
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(abortTimer);
+  }
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.error || "Failed to load GitHub status");
@@ -168,6 +280,7 @@ function StepItem({
   inputValues: Record<string, string>;
   onInputChange: (key: string, value: string) => void;
 }) {
+  const t = useT();
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !step.inputKey) return;
@@ -178,7 +291,6 @@ function StepItem({
       }
     };
     reader.readAsText(file);
-    // Reset so the same file can be re-selected
     e.target.value = "";
   };
 
@@ -213,7 +325,8 @@ function StepItem({
             rel="noopener noreferrer"
             className="inline-flex items-center gap-1.5 text-xs text-primary hover:underline"
           >
-            {step.linkText || "Open"} <IconExternalLink className="h-3 w-3" />
+            {step.linkText || t("dataSources.open")}{" "}
+            <IconExternalLink className="h-3 w-3" />
           </a>
         )}
         {step.inputKey && (
@@ -225,7 +338,7 @@ function StepItem({
               {step.inputAcceptFile && (
                 <label className="inline-flex items-center gap-1.5 text-xs text-primary hover:text-primary/80 cursor-pointer">
                   <IconUpload className="h-3 w-3" />
-                  Upload file
+                  {t("dataSources.uploadFile")}
                   <input
                     type="file"
                     accept={step.inputAcceptFile}
@@ -253,8 +366,7 @@ function StepItem({
             )}
             {isSaved && !inputValues[step.inputKey] && (
               <p className="text-xs text-muted-foreground">
-                A value is already saved. Leave blank to keep it, or enter a new
-                value to replace it.
+                {t("dataSources.savedValueHint")}
               </p>
             )}
           </div>
@@ -265,19 +377,7 @@ function StepItem({
 }
 
 async function deleteCredentials(keys: string[]): Promise<void> {
-  const token = await getIdToken();
-  const res = await fetch(appApiPath("/api/credentials"), {
-    method: "DELETE",
-    headers: {
-      "Content-Type": "application/json",
-      ...(token && { Authorization: `Bearer ${token}` }),
-    },
-    body: JSON.stringify({ keys }),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || "Failed to delete");
-  }
+  await callAction("delete-data-source-credentials", { keys });
 }
 
 async function disconnectDataSource(source: DataSource): Promise<void> {
@@ -302,6 +402,7 @@ function GitHubOAuthView({
   connected: boolean;
   onSaved: () => void;
 }) {
+  const t = useT();
   const queryClient = useQueryClient();
   const { data: status, isLoading } = useQuery({
     queryKey: ["github-oauth-status"],
@@ -311,7 +412,7 @@ function GitHubOAuthView({
   });
 
   const refresh = () => {
-    queryClient.invalidateQueries({ queryKey: ["github-oauth-status"] });
+    void queryClient.invalidateQueries({ queryKey: ["github-oauth-status"] });
     onSaved();
   };
 
@@ -358,8 +459,18 @@ function GitHubOAuthView({
     },
     onSuccess: () => {
       const startedAt = Date.now();
-      const pollId = window.setInterval(() => {
-        refresh();
+      let inFlight = false;
+      const pollId = window.setInterval(async () => {
+        if (document.hidden || inFlight) return;
+        inFlight = true;
+        try {
+          await queryClient.invalidateQueries({
+            queryKey: ["github-oauth-status"],
+          });
+          onSaved();
+        } finally {
+          inFlight = false;
+        }
         if (Date.now() - startedAt > 120_000) {
           window.clearInterval(pollId);
         }
@@ -373,17 +484,18 @@ function GitHubOAuthView({
     status?.viewer?.name || status?.viewer?.login || status?.viewer?.email;
 
   return (
-    <div className="space-y-3 rounded-md border border-border/50 bg-muted/20 p-3">
+    <div className="space-y-3 rounded-md bg-muted/30 p-3">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-start gap-3">
           <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-background text-muted-foreground">
             <IconBrandGithub className="h-4 w-4" />
           </div>
           <div className="min-w-0 space-y-1">
-            <p className="text-xs font-medium text-foreground">GitHub OAuth</p>
+            <p className="text-xs font-medium text-foreground">
+              {t("dataSources.githubOAuth")}
+            </p>
             <p className="text-xs text-muted-foreground">
-              Grant repository access so the agent can search source code and
-              read files without a manual token.
+              {t("dataSources.githubOAuthDescription")}
             </p>
           </div>
         </div>
@@ -400,12 +512,12 @@ function GitHubOAuthView({
             {connectMutation.isPending ? (
               <>
                 <IconLoader2 className="mr-1.5 h-3 w-3 animate-spin" />
-                Opening...
+                {t("dataSources.opening")}
               </>
             ) : oauthConnected || connected ? (
-              "Reconnect"
+              t("dataSources.reconnect")
             ) : (
-              "Connect"
+              t("dataSources.connect")
             )}
           </Button>
         ) : null}
@@ -416,24 +528,22 @@ function GitHubOAuthView({
           <div className="flex items-center gap-2 text-xs text-emerald-500">
             <IconCheck className="h-3.5 w-3.5" />
             {viewerLabel
-              ? `Connected as ${viewerLabel}`
-              : "GitHub is connected"}
+              ? t("dataSources.connectedAs", { viewer: viewerLabel })
+              : t("dataSources.githubConnected")}
           </div>
         ) : status?.connected && status.valid === false ? (
           <div className="flex items-center gap-2 text-xs text-amber-500">
             <IconAlertCircle className="h-3.5 w-3.5" />
-            Saved GitHub token needs to be reconnected.
+            {t("dataSources.githubReconnectNeeded")}
           </div>
         ) : (
           <p className="text-xs text-muted-foreground">
-            OAuth will request repo read access for code search, file reads,
-            pull requests, and issues.
+            {t("dataSources.githubOAuthRequest")}
           </p>
         )
       ) : (
         <p className="text-xs text-muted-foreground">
-          OAuth app credentials are not configured on this deployment. Use the
-          personal access token field below.
+          {t("dataSources.githubOAuthUnavailable")}
         </p>
       )}
 
@@ -447,19 +557,106 @@ function GitHubOAuthView({
   );
 }
 
+function startWorkspaceOAuth(
+  provider: string,
+  returnPath: string,
+  scope: "user" | "organization" = "organization",
+): void {
+  const params = new URLSearchParams({
+    appId: "analytics",
+    return: returnPath,
+    scope,
+  });
+  window.location.assign(
+    agentNativePath(
+      `/_agent-native/connections/oauth/${provider}/start?${params.toString()}`,
+    ),
+  );
+}
+
+function WorkspaceOAuthView({
+  provider,
+  label,
+  connected,
+  returnPath = "/data-sources",
+  scope = "organization",
+  showDescription = true,
+  onAddLocalCredentials,
+}: {
+  provider: string;
+  label: string;
+  connected: boolean;
+  returnPath?: string;
+  scope?: "user" | "organization";
+  showDescription?: boolean;
+  onAddLocalCredentials?: () => void;
+}) {
+  const t = useT();
+
+  return (
+    <div className="space-y-3 rounded-md bg-muted/30 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-start gap-3">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-background text-muted-foreground">
+            <IconPlugConnected className="h-4 w-4" />
+          </div>
+          <div className="min-w-0 space-y-1">
+            <p className="text-xs font-medium text-foreground">{label}</p>
+            {showDescription && (
+              <p className="text-xs text-muted-foreground">
+                {t("dataSources.sharedIntegration")}
+              </p>
+            )}
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {onAddLocalCredentials && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={onAddLocalCredentials}
+              className="text-xs"
+            >
+              {t("dataSources.addLocalCredentials")}
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant={connected ? "outline" : "default"}
+            onClick={() => startWorkspaceOAuth(provider, returnPath, scope)}
+            className="shrink-0 text-xs"
+          >
+            {connected ? t("dataSources.reconnect") : t("dataSources.connect")}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SharedConnectionBadge({ status }: { status: SharedConnectionStatus }) {
-  const tone =
-    status.kind === "ready"
-      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-      : status.kind === "needs_grant"
-        ? "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400"
-        : status.kind === "local_credentials"
-          ? "border-border/60 bg-muted text-muted-foreground"
-          : "border-border/60 bg-background text-muted-foreground";
+  const t = useT();
+  const tone = {
+    ready:
+      "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+    needs_grant:
+      "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400",
+    needs_credentials: "border-border/60 bg-background text-muted-foreground",
+    local_credentials: "border-border/60 bg-muted text-muted-foreground",
+    needs_reauth:
+      "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400",
+    error: "border-destructive/30 bg-destructive/10 text-destructive",
+  }[status.kind];
+  const label =
+    status.kind === "needs_reauth"
+      ? t("dataSources.reconnect")
+      : status.kind === "error"
+        ? t("dataSources.connectionFailed")
+        : status.label;
 
   return (
     <Badge variant="outline" className={tone}>
-      {status.label}
+      {label}
     </Badge>
   );
 }
@@ -469,21 +666,26 @@ function SharedConnectionStatusRow({
 }: {
   status: SharedConnectionStatus;
 }) {
+  const t = useT();
   const message =
     status.kind === "ready"
-      ? "Analytics can use this provider through a workspace connection granted from Dispatch."
+      ? t("dataSources.sharedReady")
       : status.kind === "needs_grant"
-        ? "A workspace connection exists. Open Dispatch to grant Analytics access."
-        : status.kind === "local_credentials"
-          ? "Using credentials saved in this app. For reuse across apps, connect and grant this provider in Dispatch."
-          : "Connect or grant this provider in Dispatch to reuse it across apps, or save local credentials below.";
+        ? t("dataSources.sharedNeedsGrant")
+        : status.kind === "needs_reauth"
+          ? t("dataSources.sharedNeedsReauth")
+          : status.kind === "error"
+            ? t("dataSources.sharedError")
+            : status.kind === "local_credentials"
+              ? t("dataSources.sharedLocalCredentials")
+              : t("dataSources.sharedFallback");
 
   return (
-    <div className="mb-4 flex items-start justify-between gap-3 rounded-md border border-border/50 bg-muted/20 p-3">
+    <div className="mb-4 flex items-start justify-between gap-3 rounded-md bg-muted/30 p-3">
       <div className="min-w-0 space-y-1">
         <div className="flex flex-wrap items-center gap-2">
           <p className="text-xs font-medium text-foreground">
-            Shared integration
+            {t("dataSources.sharedIntegration")}
           </p>
           <SharedConnectionBadge status={status} />
         </div>
@@ -495,13 +697,22 @@ function SharedConnectionStatusRow({
 
 function WorkspaceReadyView({
   source,
+  sharedConnectionStatus,
+  canManageOrg,
+  oauthReturnPath,
   onSaved,
   onAddLocalCredentials,
+  showDescription = true,
 }: {
   source: DataSource;
+  sharedConnectionStatus: SharedConnectionStatus | null;
+  canManageOrg: boolean;
+  oauthReturnPath: string;
   onSaved: () => void;
   onAddLocalCredentials: () => void;
+  showDescription?: boolean;
 }) {
+  const t = useT();
   const [testResult, setTestResult] = useState<{
     ok: boolean;
     error?: string;
@@ -514,13 +725,20 @@ function WorkspaceReadyView({
       onSaved();
     },
   });
+  const canReconnect = shouldOfferWorkspaceOAuthReconnect(
+    source,
+    sharedConnectionStatus,
+    canManageOrg,
+    testResult?.ok === false,
+  );
 
   return (
     <div className="space-y-3">
-      <p className="text-xs text-muted-foreground">
-        This source is ready through a shared workspace connection. Manage
-        shared access in Dispatch, or add local credentials for this app only.
-      </p>
+      {showDescription && (
+        <p className="text-xs text-muted-foreground">
+          {t("dataSources.workspaceReadyDescription")}
+        </p>
+      )}
       <div className="flex flex-wrap items-center gap-2">
         <Button
           size="sm"
@@ -537,7 +755,9 @@ function WorkspaceReadyView({
           ) : (
             <IconCheck className="mr-1.5 h-3 w-3" />
           )}
-          {testMutation.isPending ? "Testing..." : "Test connection"}
+          {testMutation.isPending
+            ? t("dataSources.testing")
+            : t("dataSources.testConnection")}
         </Button>
         <Button
           size="sm"
@@ -545,8 +765,24 @@ function WorkspaceReadyView({
           onClick={onAddLocalCredentials}
           className="text-xs"
         >
-          Add local credentials
+          {t("dataSources.addLocalCredentials")}
         </Button>
+        {canReconnect && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() =>
+              startWorkspaceOAuth(
+                source.id,
+                oauthReturnPath,
+                source.id === "bigquery" ? "user" : "organization",
+              )
+            }
+            className="text-xs"
+          >
+            {t("dataSources.reconnect")}
+          </Button>
+        )}
         {source.docsUrl && (
           <a
             href={source.docsUrl}
@@ -554,27 +790,15 @@ function WorkspaceReadyView({
             rel="noopener noreferrer"
             className="ml-auto flex items-center gap-1 text-xs text-muted-foreground hover:text-primary"
           >
-            Docs <IconExternalLink className="h-3 w-3" />
+            {t("dataSources.docs")} <IconExternalLink className="h-3 w-3" />
           </a>
         )}
       </div>
-      {testResult && (
-        <div
-          className={`flex items-center gap-2 text-xs ${testResult.ok ? "text-emerald-500" : "text-rose-400"}`}
-        >
-          {testResult.ok ? (
-            <>
-              <IconCheck className="h-3.5 w-3.5" />
-              Connection successful
-            </>
-          ) : (
-            <>
-              <IconAlertCircle className="h-3.5 w-3.5" />
-              {testResult.error || "Connection failed"}
-            </>
-          )}
-        </div>
-      )}
+      <ConnectionTestStatus
+        result={testResult}
+        pending={testMutation.isPending}
+        error={testMutation.error}
+      />
     </div>
   );
 }
@@ -588,6 +812,7 @@ function ConnectedView({
   onSaved: () => void;
   envStatus: EnvKeyStatus[];
 }) {
+  const t = useT();
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [disconnectConfirmOpen, setDisconnectConfirmOpen] = useState(false);
@@ -597,9 +822,12 @@ function ConnectedView({
     ok: boolean;
     error?: string;
   } | null>(null);
+  const saveScope = useCredentialSaveScope();
+  const whoId = useId();
 
   const saveMutation = useMutation({
     mutationFn: async () => {
+      if (!saveScope.scope) return;
       const vars: Array<{ key: string; value: string }> = [];
       for (const [key, value] of Object.entries(inputValues)) {
         const trimmed = value.trim();
@@ -609,7 +837,7 @@ function ConnectedView({
         if (!inputValues[key]?.trim()) vars.push({ key, value: "" });
       }
       if (vars.length === 0) return;
-      await saveEnvVars(vars);
+      await saveEnvVars(vars, saveScope.scope);
     },
     onSuccess: () => {
       setInputValues({});
@@ -624,7 +852,9 @@ function ConnectedView({
     onSuccess: () => {
       setDisconnectConfirmOpen(false);
       if (source.id === "github") {
-        queryClient.invalidateQueries({ queryKey: ["github-oauth-status"] });
+        void queryClient.invalidateQueries({
+          queryKey: ["github-oauth-status"],
+        });
       }
       onSaved();
     },
@@ -634,8 +864,6 @@ function ConnectedView({
     mutationFn: () => testConnection(source.id),
     onSuccess: (result) => {
       setTestResult(result);
-      // Refresh envStatus so the per-key "Configured"/"Missing" labels
-      // reflect reality after a test that revealed missing credentials.
       onSaved();
     },
   });
@@ -643,7 +871,6 @@ function ConnectedView({
   const hasInputValues =
     Object.values(inputValues).some((v) => v.trim()) || pendingClears.size > 0;
 
-  // Get credential labels from walkthrough steps
   const keyLabels: Record<string, string> = {};
   for (const step of source.walkthroughSteps) {
     if (step.inputKey) {
@@ -667,6 +894,13 @@ function ConnectedView({
     ),
   );
   const optionalKeys = getOptionalCredentialKeys(source);
+  const isAnyCredentialMode = source.credentialRequirementMode === "any";
+  const configuredCredentialKeys = new Set(
+    envStatus.filter((s) => s.configured).map((s) => s.key),
+  );
+  const hasAlternativeCredential =
+    isAnyCredentialMode &&
+    source.envKeys.some((key) => configuredCredentialKeys.has(key));
 
   const handleDisconnect = () => {
     if (sharedCredentialKeys.length > 0) {
@@ -713,13 +947,13 @@ function ConnectedView({
                         className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-rose-400 cursor-pointer"
                       >
                         <IconTrash className="h-3 w-3" />
-                        Clear saved value
+                        {t("dataSources.clearSavedValue")}
                       </button>
                     )}
                     {step.inputAcceptFile && !isPendingClear && (
                       <label className="inline-flex items-center gap-1.5 text-xs text-primary hover:text-primary/80 cursor-pointer">
                         <IconUpload className="h-3 w-3" />
-                        Upload file
+                        {t("dataSources.uploadFile")}
                         <input
                           type="file"
                           accept={step.inputAcceptFile}
@@ -774,7 +1008,7 @@ function ConnectedView({
                 )}
                 {isPendingClear ? (
                   <div className="flex items-center justify-between gap-2 text-xs text-amber-500">
-                    <span>Will be cleared on save (back to default).</span>
+                    <span>{t("dataSources.willClearOnSave")}</span>
                     <button
                       type="button"
                       onClick={() => {
@@ -786,35 +1020,45 @@ function ConnectedView({
                       }}
                       className="text-muted-foreground hover:text-foreground cursor-pointer"
                     >
-                      Undo
+                      {t("dataSources.undo")}
                     </button>
                   </div>
                 ) : (
                   isConfigured &&
                   !hasTyped && (
                     <p className="text-xs text-muted-foreground">
-                      A value is already saved. Leave blank to keep it, or enter
-                      a new value to replace it.
+                      {t("dataSources.savedValueHint")}
                     </p>
                   )
                 )}
               </div>
             );
           })}
+        {saveScope.canChoose && saveScope.scope ? (
+          <WhoField
+            id={whoId}
+            choice
+            scope={saveScope.scope}
+            disabled={saveMutation.isPending}
+            onChange={saveScope.setScope}
+          />
+        ) : null}
         <div className="flex items-center gap-2 pt-2">
           <Button
             size="sm"
             onClick={() => saveMutation.mutate()}
-            disabled={saveMutation.isPending || !hasInputValues}
+            disabled={
+              saveMutation.isPending || !hasInputValues || !saveScope.scope
+            }
             className="text-xs"
           >
             {saveMutation.isPending ? (
               <>
                 <IconLoader2 className="h-3 w-3 animate-spin mr-1.5" />
-                Saving...
+                {t("dataSources.saving")}
               </>
             ) : (
-              "Save Changes"
+              t("dataSources.saveChanges")
             )}
           </Button>
           <Button
@@ -827,7 +1071,7 @@ function ConnectedView({
             }}
             className="text-xs"
           >
-            Cancel
+            {t("sidebar.cancel")}
           </Button>
         </div>
         {saveMutation.isError && (
@@ -846,8 +1090,7 @@ function ConnectedView({
         <div className="flex items-start justify-between gap-4">
           <div className="flex-1 space-y-2">
             {source.envKeys.map((key) => {
-              const configured =
-                envStatus.find((s) => s.key === key)?.configured ?? false;
+              const configured = configuredCredentialKeys.has(key);
               const optional = optionalKeys.has(key);
               return (
                 <div
@@ -860,17 +1103,22 @@ function ConnectedView({
                   {configured ? (
                     <span className="flex items-center gap-1 whitespace-nowrap text-emerald-500">
                       <IconCheck className="h-3 w-3" />
-                      Configured
+                      {t("dataSources.configured")}
                     </span>
                   ) : optional ? (
                     <span className="flex items-center gap-1 whitespace-nowrap text-muted-foreground">
                       <IconCircle className="h-3 w-3" />
-                      Optional
+                      {t("dataSources.optional")}
+                    </span>
+                  ) : hasAlternativeCredential ? (
+                    <span className="flex items-center gap-1 whitespace-nowrap text-muted-foreground">
+                      <IconCircle className="h-3 w-3" />
+                      Alternative
                     </span>
                   ) : (
                     <span className="flex items-center gap-1 whitespace-nowrap text-rose-400">
                       <IconAlertCircle className="h-3 w-3" />
-                      Missing
+                      {t("dataSources.missing")}
                     </span>
                   )}
                 </div>
@@ -881,10 +1129,12 @@ function ConnectedView({
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
-                size="icon"
+                size="icon-sm"
                 variant="ghost"
-                className="-mr-1 -mt-1 h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
-                aria-label={`${source.name} actions`}
+                className="-mr-1 -mt-1 shrink-0 text-muted-foreground hover:text-foreground"
+                aria-label={t("dataSources.sourceActions", {
+                  name: source.name,
+                })}
               >
                 <IconDotsVertical className="h-4 w-4" />
               </Button>
@@ -902,11 +1152,13 @@ function ConnectedView({
                 ) : (
                   <IconCheck className="mr-2 h-4 w-4" />
                 )}
-                {testMutation.isPending ? "Testing..." : "Test connection"}
+                {testMutation.isPending
+                  ? t("dataSources.testing")
+                  : t("dataSources.testConnection")}
               </DropdownMenuItem>
               <DropdownMenuItem onSelect={() => setEditing(true)}>
                 <IconPencil className="mr-2 h-4 w-4" />
-                Edit credentials
+                {t("dataSources.editCredentials")}
               </DropdownMenuItem>
               {source.docsUrl && (
                 <DropdownMenuItem asChild>
@@ -916,7 +1168,7 @@ function ConnectedView({
                     rel="noopener noreferrer"
                   >
                     <IconExternalLink className="mr-2 h-4 w-4" />
-                    Open docs
+                    {t("dataSources.openDocs")}
                   </a>
                 </DropdownMenuItem>
               )}
@@ -932,30 +1184,18 @@ function ConnectedView({
                   <IconTrash className="mr-2 h-4 w-4" />
                 )}
                 {disconnectMutation.isPending
-                  ? "Disconnecting..."
-                  : "Disconnect"}
+                  ? t("dataSources.disconnecting")
+                  : t("dataSources.disconnect")}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
 
-        {testResult && (
-          <div
-            className={`flex items-center gap-2 text-xs ${testResult.ok ? "text-emerald-500" : "text-rose-400"}`}
-          >
-            {testResult.ok ? (
-              <>
-                <IconCheck className="h-3.5 w-3.5" />
-                Connection successful
-              </>
-            ) : (
-              <>
-                <IconAlertCircle className="h-3.5 w-3.5" />
-                {testResult.error || "Connection failed"}
-              </>
-            )}
-          </div>
-        )}
+        <ConnectionTestStatus
+          result={testResult}
+          pending={testMutation.isPending}
+          error={testMutation.error}
+        />
       </div>
       <AlertDialog
         open={disconnectConfirmOpen}
@@ -963,27 +1203,32 @@ function ConnectedView({
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Disconnect {source.name}?</AlertDialogTitle>
+            <AlertDialogTitle>
+              {t("dataSources.disconnectTitle", { name: source.name })}
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              This will clear credentials shared with{" "}
-              {sharedSourceNames.join(", ")}. Those sources may stop working
-              until the shared credentials are added again.
+              {t("dataSources.disconnectDescription", {
+                sources: sharedSourceNames.join(", "),
+              })}
             </AlertDialogDescription>
           </AlertDialogHeader>
-          <div className="rounded-md border border-border/60 bg-muted/30 p-3 text-xs text-muted-foreground">
-            Shared credentials:{" "}
-            {sharedCredentialKeys
-              .map((key) => keyLabels[key] || key)
-              .join(", ")}
+          <div className="rounded-md bg-muted/30 p-3 text-xs text-muted-foreground">
+            {t("dataSources.sharedCredentials", {
+              credentials: sharedCredentialKeys
+                .map((key) => keyLabels[key] || key)
+                .join(", "),
+            })}
           </div>
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogCancel>{t("sidebar.cancel")}</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => disconnectMutation.mutate()}
               disabled={disconnectMutation.isPending}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
-              {disconnectMutation.isPending ? "Disconnecting..." : "Disconnect"}
+              {disconnectMutation.isPending
+                ? t("dataSources.disconnecting")
+                : t("dataSources.disconnect")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -992,13 +1237,20 @@ function ConnectedView({
   );
 }
 
-function DataSourceCard({
+/** Setup sheet body for a data source: walkthrough, credentials, workspace connection, and test. */
+function DataSourceDetail({
   source,
   locallyConfigured,
   ready,
   sharedConnectionStatus,
   envStatus,
-  isStatusLoading,
+  statusUnknown,
+  canManageOrg,
+  orgLoaded,
+  hasOrg,
+  focused,
+  oauthReturnPath,
+  showAskContinuation,
   onSaved,
 }: {
   source: DataSource;
@@ -1006,22 +1258,31 @@ function DataSourceCard({
   ready: boolean;
   sharedConnectionStatus: SharedConnectionStatus | null;
   envStatus: EnvKeyStatus[];
-  isStatusLoading: boolean;
+  statusUnknown: boolean;
+  canManageOrg: boolean;
+  orgLoaded: boolean;
+  hasOrg: boolean;
+  focused: boolean;
+  oauthReturnPath: string;
+  showAskContinuation: boolean;
   onSaved: () => void;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  const t = useT();
   const [currentStep, setCurrentStep] = useState(0);
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
   const [showLocalCredentials, setShowLocalCredentials] = useState(false);
   const totalSteps = source.walkthroughSteps.length;
+  const saveScope = useCredentialSaveScope();
+  const whoId = useId();
 
   const saveMutation = useMutation({
     mutationFn: async () => {
+      if (!saveScope.scope) return;
       const vars = Object.entries(inputValues)
         .filter(([, v]) => v.trim())
         .map(([key, value]) => ({ key, value: value.trim() }));
       if (vars.length === 0) return;
-      await saveEnvVars(vars);
+      await saveEnvVars(vars, saveScope.scope);
     },
     onSuccess: () => {
       setInputValues({});
@@ -1029,235 +1290,290 @@ function DataSourceCard({
     },
   });
 
-  const Icon = source.icon;
   const hasInputValues = Object.values(inputValues).some((v) => v.trim());
   const readyViaWorkspace = sharedConnectionStatus?.kind === "ready";
   const showCredentialSetup =
     !locallyConfigured && (!readyViaWorkspace || showLocalCredentials);
+  const preferWorkspaceSetup =
+    isWorkspaceOAuthSource(source) &&
+    !locallyConfigured &&
+    !readyViaWorkspace &&
+    !showLocalCredentials;
+  const workspaceRoleLoading =
+    isWorkspaceOAuthSource(source) &&
+    source.id !== "bigquery" &&
+    !ready &&
+    !orgLoaded;
+  const showUnknownStatus = statusUnknown && !ready && !showLocalCredentials;
+
+  if (showUnknownStatus) {
+    return (
+      <div className="space-y-3">
+        <p className="flex items-start gap-2 text-xs text-muted-foreground">
+          <IconAlertCircle className="mt-px h-3.5 w-3.5 shrink-0 text-amber-500" />
+          {t("dataSources.statusUnknownDescription")}
+        </p>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => setShowLocalCredentials(true)}
+          className="text-xs"
+        >
+          {t("dataSources.addLocalCredentials")}
+        </Button>
+      </div>
+    );
+  }
 
   return (
-    <Card className="data-source-card bg-card border-border/50">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full rounded-t-lg text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
-      >
-        <CardHeader className="p-5">
-          <div className="flex items-center justify-between gap-6">
-            <div className="flex min-w-0 items-center gap-3">
-              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                <Icon className="h-5 w-5" />
-              </div>
-              <div className="min-w-0">
-                <CardTitle className="text-sm font-medium">
-                  {source.name}
-                </CardTitle>
-                <CardDescription className="mt-0.5 line-clamp-2 text-xs">
-                  {source.description}
-                </CardDescription>
-              </div>
+    <div className="space-y-4">
+      {focused && ready && showAskContinuation && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-md bg-emerald-500/10 p-3">
+          <span className="flex items-center gap-2 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+            <IconCheck className="h-3.5 w-3.5" />
+            {t("dataSources.connectionSuccessful")}
+          </span>
+          <Button asChild size="sm" className="text-xs">
+            <Link to="/ask">{t("navigation.ask")}</Link>
+          </Button>
+        </div>
+      )}
+      {source.id === "github" && (
+        <GitHubOAuthView connected={locallyConfigured} onSaved={onSaved} />
+      )}
+      {shouldShowWorkspaceOAuthAdminNotice(
+        source,
+        ready,
+        canManageOrg,
+        orgLoaded,
+        hasOrg,
+      ) && (
+        <div className="rounded-md bg-muted/30 p-3">
+          <div className="flex items-start gap-3">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-background text-muted-foreground">
+              <IconPlugConnected className="h-4 w-4" />
             </div>
-            <div className="flex shrink-0 items-center gap-2">
-              {isStatusLoading ? (
-                <Skeleton className="h-4 w-20 rounded-full" />
-              ) : ready ? (
-                <span className="flex items-center gap-1.5 text-xs text-emerald-500 font-medium whitespace-nowrap">
-                  <IconCheck className="h-3.5 w-3.5" />
-                  {readyViaWorkspace && !locallyConfigured
-                    ? "Ready"
-                    : "Configured"}
-                </span>
-              ) : (
-                <span className="flex items-center gap-1.5 text-xs text-muted-foreground whitespace-nowrap">
-                  <IconCircle className="h-3 w-3" />
-                  Not configured
-                </span>
-              )}
-              {!isStatusLoading && sharedConnectionStatus && (
-                <span className="data-source-shared-badge">
-                  <SharedConnectionBadge status={sharedConnectionStatus} />
-                </span>
-              )}
-              {expanded ? (
-                <IconChevronUp className="h-4 w-4 text-muted-foreground" />
-              ) : (
-                <IconChevronDown className="h-4 w-4 text-muted-foreground" />
-              )}
+            <div className="min-w-0 space-y-1">
+              <p className="text-xs font-medium text-foreground">
+                {t("dataSources.workspaceAdminRequiredTitle")}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {t("dataSources.workspaceAdminRequiredDescription", {
+                  name: source.name,
+                })}
+              </p>
             </div>
           </div>
-        </CardHeader>
-      </button>
-
-      {expanded && (
-        <CardContent className="border-t border-border/50 px-5 py-4">
-          {source.id === "github" && (
-            <div className="mb-4">
-              <GitHubOAuthView
-                connected={locallyConfigured}
-                onSaved={onSaved}
+        </div>
+      )}
+      {source.id !== "bigquery" &&
+        sharedConnectionStatus &&
+        sharedConnectionStatus.kind !== "needs_credentials" &&
+        sharedConnectionStatus.kind !== "needs_grant" && (
+          <SharedConnectionStatusRow status={sharedConnectionStatus} />
+        )}
+      {locallyConfigured ? (
+        <>
+          <ConnectedView
+            source={source}
+            onSaved={onSaved}
+            envStatus={envStatus}
+          />
+          {source.id === "bigquery" && hasOrg && (
+            <WorkspaceOAuthView
+              provider="bigquery"
+              label={source.name}
+              connected={
+                sharedConnectionStatus?.connection?.grantState ===
+                  "connected" ||
+                sharedConnectionStatus?.kind === "needs_grant" ||
+                sharedConnectionStatus?.kind === "needs_reauth"
+              }
+              returnPath={oauthReturnPath}
+              scope="user"
+              showDescription={false}
+            />
+          )}
+        </>
+      ) : readyViaWorkspace && !showCredentialSetup ? (
+        <WorkspaceReadyView
+          source={source}
+          sharedConnectionStatus={sharedConnectionStatus}
+          canManageOrg={canManageOrg}
+          oauthReturnPath={oauthReturnPath}
+          onSaved={onSaved}
+          onAddLocalCredentials={() => setShowLocalCredentials(true)}
+          showDescription={source.id !== "bigquery"}
+        />
+      ) : workspaceRoleLoading ? (
+        <Skeleton className="h-9 w-full rounded-md" />
+      ) : preferWorkspaceSetup &&
+        canConnectWorkspaceOAuth(source, canManageOrg, hasOrg) ? (
+        <WorkspaceOAuthView
+          provider={source.id}
+          label={source.name}
+          connected={hasExistingWorkspaceConnection(sharedConnectionStatus)}
+          returnPath={oauthReturnPath}
+          scope={source.id === "bigquery" ? "user" : "organization"}
+          showDescription={source.id !== "bigquery"}
+          onAddLocalCredentials={
+            source.id === "bigquery"
+              ? () => setShowLocalCredentials(true)
+              : undefined
+          }
+        />
+      ) : preferWorkspaceSetup ? (
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => setShowLocalCredentials(true)}
+          className="text-xs"
+        >
+          {t("dataSources.useKeyJustInThisApp" /* i18n-key-ignore */, {
+            defaultValue: "Use a key just in this app",
+          })}
+        </Button>
+      ) : (
+        <>
+          {/* Step progress */}
+          <div className="flex items-center gap-1.5">
+            {source.walkthroughSteps.map((_, i) => (
+              <button
+                key={i}
+                onClick={() => setCurrentStep(i)}
+                className={`h-1.5 flex-1 rounded-full transition-colors ${
+                  i < currentStep
+                    ? "bg-emerald-500/60"
+                    : i === currentStep
+                      ? "bg-primary"
+                      : "bg-muted"
+                }`}
               />
-            </div>
-          )}
-          {sharedConnectionStatus && (
-            <SharedConnectionStatusRow status={sharedConnectionStatus} />
-          )}
-          {locallyConfigured ? (
-            <ConnectedView
-              source={source}
-              onSaved={onSaved}
-              envStatus={envStatus}
-            />
-          ) : readyViaWorkspace && !showCredentialSetup ? (
-            <WorkspaceReadyView
-              source={source}
-              onSaved={onSaved}
-              onAddLocalCredentials={() => setShowLocalCredentials(true)}
-            />
-          ) : (
-            <>
-              {/* Step progress */}
-              <div className="flex items-center gap-1.5 pb-3">
-                {source.walkthroughSteps.map((_, i) => (
-                  <button
-                    key={i}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setCurrentStep(i);
-                    }}
-                    className={`h-1.5 flex-1 rounded-full transition-colors ${
-                      i < currentStep
-                        ? "bg-emerald-500/60"
-                        : i === currentStep
-                          ? "bg-primary"
-                          : "bg-muted"
-                    }`}
-                  />
-                ))}
-              </div>
+            ))}
+          </div>
 
-              {/* Current step */}
-              {(() => {
-                const step = source.walkthroughSteps[currentStep];
-                const isSaved = !!(
-                  step.inputKey &&
-                  envStatus.find((s) => s.key === step.inputKey)?.configured
-                );
-                return (
-                  <StepItem
-                    key={currentStep}
-                    step={step}
-                    index={currentStep}
-                    isComplete={false}
-                    isActive={true}
-                    isSaved={isSaved}
-                    inputValues={inputValues}
-                    onInputChange={(key, value) =>
-                      setInputValues((prev) => ({ ...prev, [key]: value }))
-                    }
-                  />
-                );
-              })()}
+          {/* Current step */}
+          {(() => {
+            const step = source.walkthroughSteps[currentStep];
+            const isSaved = !!(
+              step.inputKey &&
+              envStatus.find((s) => s.key === step.inputKey)?.configured
+            );
+            return (
+              <StepItem
+                key={currentStep}
+                step={step}
+                index={currentStep}
+                isComplete={false}
+                isActive={true}
+                isSaved={isSaved}
+                inputValues={inputValues}
+                onInputChange={(key, value) =>
+                  setInputValues((prev) => ({ ...prev, [key]: value }))
+                }
+              />
+            );
+          })()}
 
-              {/* Step navigation. Continue is gated on completing the
-                  current step's input — otherwise the progress bar advances
-                  while the user hasn't actually done anything, which feels
-                  misleading. Steps with no input (just a link to a console)
-                  or marked optional always allow Continue. */}
-              {(() => {
-                const step = source.walkthroughSteps[currentStep];
-                const stepKey = step.inputKey;
-                const stepFilled = stepKey
-                  ? !!inputValues[stepKey]?.trim() ||
-                    !!envStatus.find((s) => s.key === stepKey)?.configured
-                  : true;
-                const canAdvance = !stepKey || step.optional || stepFilled;
-                return (
-                  <div className="flex items-center gap-2 pb-4 pt-1">
-                    {currentStep > 0 && (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setCurrentStep((s) => s - 1);
-                        }}
-                        className="text-xs"
-                      >
-                        Back
-                      </Button>
-                    )}
-                    {currentStep < totalSteps - 1 && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={!canAdvance}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setCurrentStep((s) => s + 1);
-                        }}
-                        className="text-xs"
-                      >
-                        Continue
-                      </Button>
-                    )}
-                  </div>
-                );
-              })()}
-
-              <div className="flex items-center gap-2 border-t border-border/30 pt-3">
-                {hasInputValues && (
+          {/* Step navigation. Continue is gated on completing the
+              current step's input — otherwise the progress bar advances
+              while the user hasn't actually done anything, which feels
+              misleading. Steps with no input (just a link to a console)
+              or marked optional always allow Continue. */}
+          {(() => {
+            const step = source.walkthroughSteps[currentStep];
+            const stepKey = step.inputKey;
+            const stepFilled = stepKey
+              ? !!inputValues[stepKey]?.trim() ||
+                !!envStatus.find((s) => s.key === stepKey)?.configured
+              : true;
+            const canAdvance = !stepKey || step.optional || stepFilled;
+            return (
+              <div className="flex items-center gap-2 pt-1">
+                {currentStep > 0 && (
                   <Button
                     size="sm"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      saveMutation.mutate();
-                    }}
-                    disabled={saveMutation.isPending}
+                    variant="ghost"
+                    onClick={() => setCurrentStep((s) => s - 1)}
                     className="text-xs"
                   >
-                    {saveMutation.isPending ? (
-                      <>
-                        <IconLoader2 className="h-3 w-3 animate-spin mr-1.5" />
-                        Saving...
-                      </>
-                    ) : (
-                      "Save Credentials"
-                    )}
+                    {t("dataSources.back")}
                   </Button>
                 )}
-                {source.docsUrl && (
-                  <a
-                    href={source.docsUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs text-muted-foreground hover:text-primary flex items-center gap-1 ml-auto"
-                    onClick={(e) => e.stopPropagation()}
+                {currentStep < totalSteps - 1 && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={!canAdvance}
+                    onClick={() => setCurrentStep((s) => s + 1)}
+                    className="text-xs"
                   >
-                    Docs <IconExternalLink className="h-3 w-3" />
-                  </a>
+                    {t("dataSources.continue")}
+                  </Button>
                 )}
               </div>
+            );
+          })()}
 
-              {saveMutation.isError && (
-                <div className="mt-3 flex items-center gap-2 text-xs text-rose-400">
-                  <IconAlertCircle className="h-3.5 w-3.5" />
-                  {(saveMutation.error as Error).message}
-                </div>
-              )}
-              {saveMutation.isSuccess && (
-                <div className="mt-3 flex items-center gap-2 text-xs text-emerald-500">
-                  <IconCheck className="h-3.5 w-3.5" />
-                  Credentials saved.
-                </div>
-              )}
-            </>
+          {hasInputValues && saveScope.canChoose && saveScope.scope ? (
+            <WhoField
+              id={whoId}
+              choice
+              scope={saveScope.scope}
+              disabled={saveMutation.isPending}
+              onChange={saveScope.setScope}
+            />
+          ) : null}
+          <div className="flex items-center gap-2 pt-1">
+            {hasInputValues && (
+              <Button
+                size="sm"
+                onClick={() => saveMutation.mutate()}
+                disabled={saveMutation.isPending || !saveScope.scope}
+                className="text-xs"
+              >
+                {saveMutation.isPending ? (
+                  <>
+                    <IconLoader2 className="h-3 w-3 animate-spin mr-1.5" />
+                    {t("dataSources.saving")}
+                  </>
+                ) : (
+                  t("dataSources.saveCredentials")
+                )}
+              </Button>
+            )}
+            {source.docsUrl && (
+              <a
+                href={source.docsUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-xs text-muted-foreground hover:text-primary flex items-center gap-1 ml-auto"
+              >
+                {t("dataSources.docs")} <IconExternalLink className="h-3 w-3" />
+              </a>
+            )}
+          </div>
+
+          {saveMutation.isError && (
+            <div className="flex items-center gap-2 text-xs text-rose-400">
+              <IconAlertCircle className="h-3.5 w-3.5" />
+              {(saveMutation.error as Error).message}
+            </div>
           )}
-        </CardContent>
+          {saveMutation.isSuccess && (
+            <div className="flex items-center gap-2 text-xs text-emerald-500">
+              <IconCheck className="h-3.5 w-3.5" />
+              {t("dataSources.credentialsSaved")}
+            </div>
+          )}
+        </>
       )}
-    </Card>
+    </div>
   );
 }
 
 function AddDataSourceCTA() {
+  const t = useT();
   const [open, setOpen] = useState(false);
   const { send, isGenerating } = useSendToAgentChat();
 
@@ -1282,7 +1598,7 @@ function AddDataSourceCTA() {
         <Button
           variant="outline"
           size="sm"
-          className="data-source-add-trigger gap-1.5"
+          className="shrink-0 gap-1.5"
           disabled={isGenerating}
         >
           {isGenerating ? (
@@ -1290,24 +1606,26 @@ function AddDataSourceCTA() {
           ) : (
             <IconPlus className="h-4 w-4" />
           )}
-          {isGenerating ? "Adding..." : "Add Data Source"}
+          {isGenerating
+            ? t("dataSources.adding")
+            : t("dataSources.addDataSource")}
         </Button>
       </PopoverTrigger>
       <PopoverContent
-        className="w-[calc(100vw-2rem)] p-3 sm:w-[420px]"
+        className="relative w-[calc(100vw-2rem)] p-3 sm:w-[420px]"
         align="end"
       >
         <p className="px-1 pb-1 text-sm font-semibold text-foreground">
-          Add a Data Source
+          {t("dataSources.addDataSourceTitle")}
         </p>
         <p className="px-1 pb-3 text-xs text-muted-foreground">
-          Don't see the integration you need? Describe it and the agent will add
-          it.
+          {t("dataSources.addDataSourceDescription")}
         </p>
         <PromptComposer
           autoFocus
+          requireAgentEngine
           disabled={isGenerating}
-          placeholder='e.g., "Add Salesforce integration so I can query CRM data"'
+          placeholder={t("dataSources.addDataSourcePlaceholder")}
           draftScope="analytics:add-data-source"
           onSubmit={handleSubmit}
         />
@@ -1316,28 +1634,90 @@ function AddDataSourceCTA() {
   );
 }
 
-function FirstPartyAnalyticsCard() {
+/**
+ * First-party analytics keys and backend health. The list row and the setup
+ * sheet both read this; react-query shares the requests between them.
+ */
+function useFirstPartyAnalyticsData() {
+  const keysQuery = useActionQuery("list-analytics-public-keys", undefined, {
+    staleTime: 10_000,
+  });
+  const healthQuery = useActionQuery(
+    "get-first-party-analytics-health",
+    undefined,
+    { staleTime: 30_000, retry: false },
+  );
+  const keys = (
+    (keysQuery.data as AnalyticsPublicKeyRow[] | undefined) ?? []
+  ).filter((key) => !key.revokedAt);
+  const health = healthQuery.data as
+    | FirstPartyAnalyticsHealthResponse
+    | undefined;
+  const healthStatus = healthQuery.isError ? "unavailable" : health?.status;
+  const externalBackends = health?.externalBackends ?? [];
+  const externalBackendConfigured = health?.bigQuery.configured === true;
+  const recommendsExternalBackend = healthStatus === "recommend_bigquery";
+  const healthTitleKey = recommendsExternalBackend
+    ? externalBackendConfigured
+      ? "analyticsBackend.connectedTitle"
+      : "analyticsBackend.recommendationTitle"
+    : null;
+  const healthDescriptionKey = recommendsExternalBackend
+    ? externalBackendConfigured
+      ? "analyticsBackend.connectedDescription"
+      : "analyticsBackend.recommendationDescription"
+    : healthStatus === "monitor"
+      ? "analyticsBackend.monitorDescription"
+      : healthStatus === "healthy"
+        ? "analyticsBackend.healthyDescription"
+        : "analyticsBackend.unavailableDescription";
+
+  return {
+    keysLoading: keysQuery.isLoading,
+    keys,
+    connected: keys.length > 0,
+    health,
+    healthLoading: healthQuery.isLoading,
+    healthStatus,
+    externalBackends,
+    recommendsExternalBackend,
+    healthTitleKey,
+    healthDescriptionKey,
+  };
+}
+
+// Keep captureException() and captureMessage() verbatim in every translation:
+// the split below renders them as inline code.
+const SDK_CAPTURE_CALL_PATTERN = /(captureException\(\)|captureMessage\(\))/;
+
+/** First-party analytics setup sheet body: backend health, SDK env, keys, and replay origins. */
+function FirstPartyAnalyticsDetail() {
+  const t = useT();
+  const formatters = useFormatters();
+  const formatNumber = formatters.formatNumber.bind(formatters);
   const queryClient = useQueryClient();
-  const [expanded, setExpanded] = useState(false);
-  const [name, setName] = useState("Hosted templates");
+  const {
+    keys,
+    health,
+    healthLoading,
+    healthStatus,
+    externalBackends,
+    recommendsExternalBackend,
+    healthTitleKey,
+    healthDescriptionKey,
+  } = useFirstPartyAnalyticsData();
+  const [name, setName] = useState(() => t("dataSources.defaultKeyName"));
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
-
-  const { data, isLoading } = useActionQuery(
-    "list-analytics-public-keys",
-    undefined,
-    { staleTime: 10_000 },
-  );
-  const keys = ((data as AnalyticsPublicKeyRow[] | undefined) ?? []).filter(
-    (key) => !key.revokedAt,
-  );
-  const connected = keys.length > 0;
+  const [editingOriginsFor, setEditingOriginsFor] =
+    useState<AnalyticsPublicKeyRow | null>(null);
+  const [originDraft, setOriginDraft] = useState("");
 
   const createKey = useActionMutation("create-analytics-public-key", {
     onSuccess: (result: any) => {
       setCreatedKey(result.publicKey);
       setCopied(false);
-      queryClient.invalidateQueries({
+      void queryClient.invalidateQueries({
         queryKey: ["action", "list-analytics-public-keys"],
       });
     },
@@ -1345,11 +1725,35 @@ function FirstPartyAnalyticsCard() {
 
   const revokeKey = useActionMutation("revoke-analytics-public-key", {
     onSuccess: () => {
-      queryClient.invalidateQueries({
+      void queryClient.invalidateQueries({
         queryKey: ["action", "list-analytics-public-keys"],
       });
     },
   });
+
+  const updateKeyOrigins = useActionMutation("update-analytics-public-key", {
+    method: "PUT",
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: ["action", "list-analytics-public-keys"],
+      });
+      setEditingOriginsFor(null);
+      setOriginDraft("");
+    },
+  });
+
+  const addReplayOrigins = () => {
+    if (!editingOriginsFor) return;
+    const origins = originDraft
+      .split(/\r?\n/)
+      .map((origin) => origin.trim())
+      .filter(Boolean);
+    if (origins.length === 0) return;
+    updateKeyOrigins.mutate({
+      id: editingOriginsFor.id,
+      addReplayAllowedOrigins: origins,
+    });
+  };
 
   const copyCreatedKey = async () => {
     if (!createdKey) return;
@@ -1358,305 +1762,741 @@ function FirstPartyAnalyticsCard() {
   };
 
   return (
-    <Card className="data-source-card bg-card border-border/50">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full rounded-t-lg text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
-      >
-        <CardHeader className="p-5">
-          <div className="flex items-center justify-between gap-6">
-            <div className="flex min-w-0 items-center gap-3">
-              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                <IconKey className="h-5 w-5" />
+    <div className="space-y-4">
+      {healthLoading ? (
+        <Skeleton className="h-28 w-full rounded-md" />
+      ) : (
+        <div
+          className={`rounded-md p-3 text-xs ${
+            recommendsExternalBackend ? "bg-amber-500/10" : "bg-muted/30"
+          }`}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex min-w-0 items-start gap-2">
+              <IconAlertCircle
+                className={`mt-px h-3.5 w-3.5 shrink-0 ${
+                  recommendsExternalBackend
+                    ? "text-amber-500"
+                    : "text-muted-foreground"
+                }`}
+              />
+              <div className="min-w-0 space-y-1">
+                {healthTitleKey && (
+                  <p className="font-medium text-foreground">
+                    {t(healthTitleKey)}
+                  </p>
+                )}
+                <p className="text-muted-foreground">
+                  {t(healthDescriptionKey)}
+                </p>
               </div>
-              <div className="min-w-0">
-                <CardTitle className="text-sm font-medium">
-                  First-party Analytics
-                </CardTitle>
-                <CardDescription className="mt-0.5 line-clamp-2 text-xs">
-                  Receive product events at your first-party endpoint and query
-                  them as a dashboard data source.
-                </CardDescription>
-              </div>
-            </div>
-            <div className="flex shrink-0 items-center gap-2">
-              {isLoading ? (
-                <Skeleton className="h-4 w-20 rounded-full" />
-              ) : connected ? (
-                <span className="flex items-center gap-1.5 text-xs text-emerald-500 font-medium whitespace-nowrap">
-                  <IconCheck className="h-3.5 w-3.5" />
-                  Configured
-                </span>
-              ) : (
-                <span className="flex items-center gap-1.5 text-xs text-muted-foreground whitespace-nowrap">
-                  <IconCircle className="h-3 w-3" />
-                  Not configured
-                </span>
-              )}
-              {expanded ? (
-                <IconChevronUp className="h-4 w-4 text-muted-foreground" />
-              ) : (
-                <IconChevronDown className="h-4 w-4 text-muted-foreground" />
-              )}
             </div>
           </div>
-        </CardHeader>
-      </button>
-
-      {expanded && (
-        <CardContent className="border-t border-border/50 px-5 py-4">
-          <div className="space-y-4">
-            <div className="grid gap-2 rounded-md border border-border/50 bg-muted/20 p-3 text-xs">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-muted-foreground">Endpoint</span>
-                <code className="truncate font-mono">
-                  {firstPartyAnalyticsEndpoint}
-                </code>
+          {externalBackends.length > 0 && (
+            <div className="mt-4">
+              <div className="mb-2 text-muted-foreground">
+                {t("analyticsBackend.options")}
               </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-muted-foreground">Server env</span>
-                <code className="truncate font-mono">
-                  AGENT_NATIVE_ANALYTICS_PUBLIC_KEY
-                </code>
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-muted-foreground">Browser env</span>
-                <code className="truncate font-mono">
-                  VITE_AGENT_NATIVE_ANALYTICS_PUBLIC_KEY
-                </code>
+              <div className="flex flex-wrap gap-2">
+                {externalBackends.map((backend) => {
+                  const statusLabel =
+                    backend.configured === true
+                      ? t("analyticsBackend.configured")
+                      : backend.configured === false
+                        ? t("analyticsBackend.setUp")
+                        : t("dataSources.statusUnknown");
+                  return (
+                    <Button
+                      asChild
+                      key={backend.id}
+                      size="sm"
+                      variant={
+                        backend.configured === true ? "outline" : "default"
+                      }
+                      className="text-xs"
+                    >
+                      <Link to={backend.setupLink}>
+                        {backend.label} · {statusLabel}
+                      </Link>
+                    </Button>
+                  );
+                })}
               </div>
             </div>
-
-            <div className="data-source-inline-form">
-              <input
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                className="flex min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-xs placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
-                placeholder="Key name"
-              />
-              <Button
-                size="sm"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  createKey.mutate({ name });
-                }}
-                disabled={createKey.isPending}
-                className="data-source-inline-form-button text-xs"
-              >
-                {createKey.isPending ? (
-                  <>
-                    <IconLoader2 className="h-3 w-3 animate-spin mr-1.5" />
-                    Generating...
-                  </>
-                ) : (
-                  <>
-                    <IconPlus className="h-3 w-3 mr-1.5" />
-                    Generate Key
-                  </>
-                )}
-              </Button>
-            </div>
-
-            {createdKey && (
-              <div className="space-y-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 p-3">
-                <p className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
-                  New key generated
-                </p>
-                <div className="flex gap-2">
-                  <input
-                    readOnly
-                    value={createdKey}
-                    className="flex min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"
-                  />
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      copyCreatedKey();
-                    }}
-                    className="text-xs"
-                  >
-                    <IconCopy className="h-3 w-3 mr-1.5" />
-                    {copied ? "Copied" : "Copy"}
-                  </Button>
+          )}
+          {health && healthStatus !== "unavailable" && (
+            <div className="mt-4 grid grid-cols-3 gap-2">
+              <div>
+                <div className="text-muted-foreground">
+                  {t("dataSources.analyticsEventCount")}
+                </div>
+                <div className="font-medium text-foreground">
+                  {formatNumber(health.metrics.eventCount)}
                 </div>
               </div>
-            )}
-
-            {keys.length > 0 && (
-              <div className="space-y-2 border-t border-border/30 pt-3">
-                {keys.map((key) => (
-                  <div
-                    key={key.id}
-                    className="flex items-center justify-between gap-3 text-xs"
-                  >
-                    <div className="min-w-0">
-                      <div className="font-medium truncate">{key.name}</div>
-                      <div className="text-muted-foreground font-mono">
-                        {key.publicKeyPrefix}...
-                        {key.lastUsedAt
-                          ? ` last used ${new Date(key.lastUsedAt).toLocaleDateString()}`
-                          : " never used"}
-                      </div>
-                    </div>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          className="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
-                          aria-label={`${key.name} key actions`}
-                        >
-                          <IconDotsVertical className="h-4 w-4" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end" className="w-36">
-                        <DropdownMenuItem
-                          onSelect={() => revokeKey.mutate({ id: key.id })}
-                          disabled={revokeKey.isPending}
-                          className="text-destructive focus:text-destructive"
-                        >
-                          {revokeKey.isPending ? (
-                            <IconLoader2 className="mr-2 h-4 w-4 animate-spin" />
-                          ) : (
-                            <IconTrash className="mr-2 h-4 w-4" />
-                          )}
-                          {revokeKey.isPending ? "Revoking..." : "Revoke"}
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                ))}
+              <div>
+                <div className="text-muted-foreground">
+                  {t("dataSources.slowQueries24h")}
+                </div>
+                <div className="font-medium text-foreground">
+                  {formatNumber(health.metrics.slowQueryCount24h)}
+                </div>
               </div>
+              <div>
+                <div className="text-muted-foreground">
+                  {t("dataSources.maxQueryDuration")}
+                </div>
+                <div className="font-medium text-foreground">
+                  {formatNumber(health.metrics.maxQueryDurationMs24h / 1_000, {
+                    maximumFractionDigits: 1,
+                  })}
+                  s
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      <div className="grid gap-2 rounded-md bg-muted/30 p-3 text-xs">
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-muted-foreground">
+            {t("dataSources.endpoint")}
+          </span>
+          <code className="truncate font-mono">
+            {firstPartyAnalyticsEndpoint}
+          </code>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-muted-foreground">
+            {t("dataSources.serverEnv")}
+          </span>
+          <code className="truncate font-mono">
+            AGENT_NATIVE_ANALYTICS_PUBLIC_KEY
+          </code>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-muted-foreground">
+            {t("dataSources.browserEnv")}
+          </span>
+          <code className="truncate font-mono">
+            VITE_AGENT_NATIVE_ANALYTICS_PUBLIC_KEY
+          </code>
+        </div>
+      </div>
+
+      {/* Error capture note — the analytics SDK also captures uncaught
+          exceptions and links them to session replays. The heading and
+          docs link stay static English because shared i18n is owned
+          elsewhere. */}
+      <div className="rounded-md bg-muted/30 p-3 text-xs">
+        <div className="font-medium text-foreground">
+          Error capture{/* i18n-ignore static SDK docs label */}
+        </div>
+        <p className="mt-1 text-muted-foreground">
+          {t("dataSources.firstPartySdkAutoCapture")
+            .split(SDK_CAPTURE_CALL_PATTERN)
+            .map((part, index) =>
+              index % 2 === 1 ? (
+                <code key={index} className="font-mono">
+                  {part}
+                </code>
+              ) : (
+                part
+              ),
+            )}
+        </p>
+        <a
+          href={docsUrl("tracking", { hash: "posthog-error-tracking" })}
+          target="_blank"
+          rel="noreferrer"
+          className="mt-2 inline-flex items-center gap-1 font-medium text-primary hover:underline"
+        >
+          Error capture docs{/* i18n-ignore static SDK docs link */}
+          <IconExternalLink className="h-3 w-3" />
+        </a>
+      </div>
+
+      <div className="data-source-inline-form">
+        <Input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder={t("dataSources.keyNamePlaceholder")}
+          className="min-w-0 flex-1"
+        />
+        <Button
+          size="sm"
+          onClick={() => createKey.mutate({ name })}
+          disabled={createKey.isPending}
+          className="data-source-inline-form-button text-xs"
+        >
+          {createKey.isPending ? (
+            <>
+              <IconLoader2 className="h-3 w-3 animate-spin mr-1.5" />
+              {t("dataSources.generating")}
+            </>
+          ) : (
+            <>
+              <IconPlus className="h-3 w-3 mr-1.5" />
+              {t("dataSources.generateKey")}
+            </>
+          )}
+        </Button>
+      </div>
+
+      {createdKey && (
+        <div className="space-y-2 rounded-md bg-emerald-500/10 p-3">
+          <p className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
+            {t("dataSources.newKeyGenerated")}
+          </p>
+          <div className="flex gap-2">
+            <Input
+              readOnly
+              value={createdKey}
+              className="min-w-0 flex-1 font-mono text-xs"
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void copyCreatedKey()}
+              className="text-xs"
+            >
+              <IconCopy className="h-3 w-3 mr-1.5" />
+              {copied ? t("dataSources.copied") : t("dataSources.copy")}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {keys.length > 0 && (
+        <div className="space-y-2 pt-1">
+          {keys.map((key) => (
+            <div
+              key={key.id}
+              className="flex items-center justify-between gap-3 text-xs"
+            >
+              <div className="min-w-0">
+                <div className="font-medium truncate">{key.name}</div>
+                <div className="text-muted-foreground font-mono">
+                  {key.publicKeyPrefix}...
+                  {key.lastUsedAt
+                    ? ` ${t("dataSources.lastUsed", {
+                        date: new Date(key.lastUsedAt).toLocaleDateString(),
+                      })}`
+                    : ` ${t("dataSources.neverUsed")}`}
+                </div>
+              </div>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    size="icon-sm"
+                    variant="ghost"
+                    className="shrink-0 text-muted-foreground hover:text-foreground"
+                    aria-label={t("dataSources.keyActions", {
+                      name: key.name,
+                    })}
+                  >
+                    <IconDotsVertical className="h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-36">
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      updateKeyOrigins.reset();
+                      setOriginDraft("");
+                      setEditingOriginsFor(key);
+                    }}
+                  >
+                    {t("dataSources.manageReplayOrigins")}
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    onSelect={() => revokeKey.mutate({ id: key.id })}
+                    disabled={revokeKey.isPending}
+                    className="text-destructive focus:text-destructive"
+                  >
+                    {revokeKey.isPending ? (
+                      <IconLoader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <IconTrash className="mr-2 h-4 w-4" />
+                    )}
+                    {revokeKey.isPending
+                      ? t("dataSources.revoking")
+                      : t("dataSources.revoke")}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <Dialog
+        open={editingOriginsFor !== null}
+        onOpenChange={(open) => {
+          if (!open && !updateKeyOrigins.isPending) {
+            setEditingOriginsFor(null);
+            setOriginDraft("");
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("dataSources.manageReplayOrigins")}</DialogTitle>
+            <DialogDescription>
+              {t("dataSources.replayOriginsDescription")}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="space-y-1.5">
+              <p className="text-xs font-medium">
+                {t("dataSources.currentReplayOrigins")}
+              </p>
+              {editingOriginsFor?.replayAllowedOrigins.length ? (
+                <ul className="max-h-32 space-y-1 overflow-y-auto rounded-md bg-muted/40 p-2 text-xs">
+                  {editingOriginsFor.replayAllowedOrigins.map((origin) => (
+                    <li key={origin} className="break-all font-mono">
+                      {origin}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  {t("dataSources.anyReplayOriginAllowed")}
+                </p>
+              )}
+            </div>
+            <div className="space-y-1.5">
+              <label
+                htmlFor="analytics-replay-origins"
+                className="text-xs font-medium"
+              >
+                {t("dataSources.originsToAdd")}
+              </label>
+              <Textarea
+                id="analytics-replay-origins"
+                value={originDraft}
+                onChange={(event) => setOriginDraft(event.target.value)}
+                placeholder={t("dataSources.replayOriginsPlaceholder")}
+                rows={4}
+                disabled={updateKeyOrigins.isPending}
+              />
+            </div>
+            {updateKeyOrigins.isError && (
+              <p role="alert" className="text-xs text-destructive">
+                {actionErrorMessage(updateKeyOrigins.error) ??
+                  t("dataSources.replayOriginsUpdateFailed")}
+              </p>
             )}
           </div>
-        </CardContent>
-      )}
-    </Card>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setEditingOriginsFor(null)}
+              disabled={updateKeyOrigins.isPending}
+            >
+              {t("dataSources.cancel")}
+            </Button>
+            <Button
+              type="button"
+              onClick={addReplayOrigins}
+              disabled={updateKeyOrigins.isPending || !originDraft.trim()}
+            >
+              {updateKeyOrigins.isPending
+                ? t("dataSources.addingReplayOrigins")
+                : t("dataSources.addReplayOrigins")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+function SourceSection({
+  title,
+  entries,
+  onOpen,
+}: {
+  title: string;
+  entries: SourceEntry[];
+  onOpen: (id: string) => void;
+}) {
+  const t = useT();
+  const items: IntegrationGridItem[] = entries.map((entry) => ({
+    id: entry.id,
+    name: entry.name,
+    description: entry.description,
+    logo: entry.logo,
+    status: entry.status,
+    statusClassName: entry.statusClassName,
+    actionKind: entry.connected ? "manage" : "connect",
+    actionLabel: entry.connected
+      ? t("dataSources.manage")
+      : t("dataSources.connect"),
+    onAction: () => onOpen(entry.id),
+  }));
+  return (
+    <section className="flex flex-col gap-2">
+      <h2 className="text-sm font-semibold text-foreground">{title}</h2>
+      <IntegrationGrid variant="rows" items={items} />
+    </section>
   );
 }
 
 export default function DataSources() {
+  const t = useT();
+  const { canManageOrg, isLoading: isOrgRoleLoading, org } = useOrgRole();
+  const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
-  const [search, setSearch] = useState("");
-
-  const { data: rawStatusData, isLoading: isStatusLoading } = useActionQuery(
-    "data-source-status",
-    undefined,
-    {
-      staleTime: 10_000,
-    },
+  const focusedSourceResolution =
+    focusedDataSourceFromSearchParams(searchParams);
+  const focusedSource =
+    focusedSourceResolution.status === "found"
+      ? focusedSourceResolution.source
+      : undefined;
+  const unknownFocusedSourceId =
+    focusedSourceResolution.status === "unknown"
+      ? focusedSourceResolution.requestedId
+      : null;
+  const focusedSourceId = focusedSource?.id ?? "";
+  const showAskContinuation = searchParams.get("returnTo") === "ask";
+  const [search, setSearch] = useState(() => focusedSource?.name ?? "");
+  const [activeId, setActiveId] = useState(focusedSourceId);
+  const [sheetOpen, setSheetOpen] = useState(focusedSourceId !== "");
+  const oauthReturnPath = dataSourceOAuthReturnPath(
+    focusedSource,
+    showAskContinuation,
   );
+
+  useEffect(() => {
+    if (focusedSource) {
+      setSearch(focusedSource.name);
+    } else if (unknownFocusedSourceId) {
+      setSearch("");
+    }
+  }, [focusedSource, unknownFocusedSourceId]);
+
+  // A deep link to ?source=<id> opens that source's setup sheet.
+  useEffect(() => {
+    if (!focusedSourceId) return;
+    setActiveId(focusedSourceId);
+    setSheetOpen(true);
+  }, [focusedSourceId]);
+
+  const {
+    data: rawStatusData,
+    isLoading: isStatusLoading,
+    isError: isStatusError,
+  } = useActionQuery("data-source-status", undefined, {
+    staleTime: 10_000,
+  });
   const statusData = rawStatusData as DataSourceStatusResponse | undefined;
   const envStatus = credentialRowsFromStatus(statusData);
+  const statusUnknown =
+    !isStatusLoading &&
+    (isStatusError ||
+      !statusData ||
+      Boolean(statusData.error) ||
+      statusData.workspaceConnections?.available === false);
 
-  const configuredCount = dataSources.filter((s) =>
-    isSourceReady(s, statusData, envStatus),
-  ).length;
+  const firstParty = useFirstPartyAnalyticsData();
+  const googleSheetsConnected =
+    getGoogleSheetsConnection(statusData)?.grantState === "connected";
 
   const handleSaved = () => {
-    queryClient.invalidateQueries({
+    void queryClient.invalidateQueries({
       queryKey: ["action", "data-source-status"],
     });
   };
 
-  const searchLower = search.toLowerCase();
-  const filteredSources = search
-    ? dataSources.filter(
-        (s) =>
-          s.name.toLowerCase().includes(searchLower) ||
-          s.description.toLowerCase().includes(searchLower),
-      )
-    : null;
+  const sourceEntries: SourceEntry[] = dataSources.map((source) => {
+    const locallyConfigured = isSourceLocallyConfigured(
+      source,
+      statusData,
+      envStatus,
+    );
+    const ready = isSourceReady(source, statusData, envStatus);
+    const sharedConnectionStatus = getSharedConnectionStatus(
+      source,
+      statusData,
+      envStatus,
+    );
+    const readyViaWorkspace = sharedConnectionStatus?.kind === "ready";
+    const status = ready
+      ? {
+          label:
+            readyViaWorkspace && !locallyConfigured
+              ? t("dataSources.ready")
+              : t("dataSources.configured"),
+          className: "text-emerald-500",
+        }
+      : statusUnknown
+        ? {
+            label: t("dataSources.statusUnknown"),
+            className: "text-amber-500",
+          }
+        : sharedConnectionStatus?.kind === "needs_reauth"
+          ? {
+              label: t("dataSources.reconnect"),
+              className: "text-amber-600 dark:text-amber-400",
+            }
+          : sharedConnectionStatus?.kind === "error"
+            ? {
+                label: t("dataSources.connectionFailed"),
+                className: "text-destructive",
+              }
+            : {
+                label: t("dataSources.notConfigured"),
+                className: "text-muted-foreground",
+              };
+    return {
+      id: source.id,
+      name: source.name,
+      description: source.description,
+      category: source.category,
+      logo: (
+        <SourceLogo
+          id={source.id}
+          name={source.name}
+          fallbackIcon={source.icon}
+        />
+      ),
+      status: isStatusLoading ? undefined : status.label,
+      statusClassName: status.className,
+      connected: ready,
+      searchText: `${source.name} ${source.description}`.toLowerCase(),
+      detail: (
+        <DataSourceDetail
+          source={source}
+          locallyConfigured={locallyConfigured}
+          ready={ready}
+          sharedConnectionStatus={sharedConnectionStatus}
+          envStatus={envStatus}
+          statusUnknown={statusUnknown}
+          canManageOrg={canManageOrg}
+          orgLoaded={!isOrgRoleLoading}
+          hasOrg={Boolean(org?.orgId)}
+          focused={source.id === focusedSourceId}
+          oauthReturnPath={oauthReturnPath}
+          showAskContinuation={showAskContinuation}
+          onSaved={handleSaved}
+        />
+      ),
+    };
+  });
+
+  const firstPartyStatus = firstParty.recommendsExternalBackend
+    ? {
+        label: t(
+          firstParty.healthTitleKey ?? "analyticsBackend.recommendationTitle",
+        ),
+        className: "text-amber-500",
+      }
+    : firstParty.connected
+      ? {
+          label: t("analyticsBackend.configured"),
+          className: "text-emerald-500",
+        }
+      : {
+          label: t("dataSources.notConfigured"),
+          className: "text-muted-foreground",
+        };
+
+  const firstPartyEntry: SourceEntry = {
+    id: "first-party-analytics",
+    name: t("dataSources.firstPartyAnalytics"),
+    description: t("dataSources.firstPartyDescription"),
+    category: "analytics",
+    logo: (
+      <SourceLogo
+        id="first-party-analytics"
+        name={t("dataSources.firstPartyAnalytics")}
+        fallbackIcon={IconKey}
+      />
+    ),
+    status: firstParty.keysLoading ? undefined : firstPartyStatus.label,
+    statusClassName: firstPartyStatus.className,
+    connected: firstParty.connected,
+    searchText: [
+      t("dataSources.firstPartyAnalytics"),
+      t("dataSources.firstPartyDescription"),
+      "first-party analytics tracking observability llm ai generation $ai_generation posthog agent-native analytics AGENT_NATIVE_ANALYTICS_PUBLIC_KEY VITE_AGENT_NATIVE_ANALYTICS_PUBLIC_KEY",
+    ]
+      .join(" ")
+      .toLowerCase(),
+    detail: <FirstPartyAnalyticsDetail />,
+  };
+
+  const googleSheetsEntry: SourceEntry = {
+    id: "google-sheets-export",
+    name: t("dataSources.googleSheetsExport"),
+    description: t("dataSources.googleSheetsExportDescription"),
+    category: "analytics",
+    logo: (
+      <SourceLogo
+        id="google-sheets-export"
+        name={t("dataSources.googleSheetsExport")}
+        fallbackIcon={IconFileSpreadsheet}
+      />
+    ),
+    status: isStatusLoading
+      ? undefined
+      : googleSheetsConnected
+        ? t("dataSources.connected")
+        : t("dataSources.notConfigured"),
+    statusClassName: googleSheetsConnected
+      ? "text-emerald-500"
+      : "text-muted-foreground",
+    connected: googleSheetsConnected,
+    searchText: [
+      t("dataSources.googleSheetsExport"),
+      t("dataSources.googleSheetsExportDescription"),
+    ]
+      .join(" ")
+      .toLowerCase(),
+    detail: (
+      <WorkspaceOAuthView
+        provider="google_sheets"
+        label={t("dataSources.googleSheets")}
+        connected={googleSheetsConnected}
+      />
+    ),
+  };
+
+  const customApiEntry: SourceEntry = {
+    id: "custom-api",
+    name: t("dataSources.customApi.title"),
+    description: t("dataSources.customApi.description"),
+    category: "engineering",
+    logo: (
+      <SourceLogo
+        id="custom-api"
+        name={t("dataSources.customApi.title")}
+        fallbackIcon={IconApi}
+      />
+    ),
+    connected: false,
+    searchText: [
+      t("dataSources.customApi.title"),
+      t("dataSources.customApi.description"),
+    ]
+      .join(" ")
+      .toLowerCase(),
+    detail: <CustomApiPanel />,
+  };
+
+  const entries = [
+    firstPartyEntry,
+    ...sourceEntries,
+    googleSheetsEntry,
+    customApiEntry,
+  ];
+  const activeEntry = entries.find((entry) => entry.id === activeId);
+
+  const openEntry = (id: string) => {
+    setActiveId(id);
+    setSheetOpen(true);
+  };
+
+  const normalizedSearch = search.trim().toLowerCase();
+  const matchesSearch = (entry: SourceEntry) =>
+    !normalizedSearch || entry.searchText.includes(normalizedSearch);
+  // Connected sources lead the page, as on the Settings integrations tab, and
+  // leave their category section so each source appears once.
+  const connectedEntries = entries.filter(
+    (entry) => entry.connected && matchesSearch(entry),
+  );
+  const groups = categoryOrder
+    .map((category) => ({
+      category,
+      entries: entries.filter(
+        (entry) =>
+          entry.category === category &&
+          !entry.connected &&
+          matchesSearch(entry),
+      ),
+    }))
+    .filter((group) => group.entries.length > 0);
 
   return (
-    <div className="data-sources-layout mx-auto max-w-5xl space-y-8">
-      <p className="text-sm text-muted-foreground">
-        Connect your data sources, then ask the agent to create dashboards.{" "}
-        {!isStatusLoading &&
-          (configuredCount > 0 ? (
-            <span className="text-emerald-500 font-medium">
-              {configuredCount} configured
-            </span>
-          ) : (
-            <span className="text-amber-500 font-medium">0 configured</span>
-          ))}
-      </p>
-
-      {/* Search bar + Add Data Source */}
-      <div className="data-sources-toolbar">
-        <div className="relative min-w-0 flex-1">
-          <IconSearch className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
-          <input
-            type="text"
+    <div className="mx-auto flex max-w-5xl flex-col gap-8">
+      <div className="flex items-center justify-end gap-2">
+        <div className="relative min-w-0 flex-1 sm:w-56 sm:flex-none">
+          <IconSearch
+            aria-hidden="true"
+            className="pointer-events-none absolute start-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+          />
+          <Input
+            type="search"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search data sources..."
-            className="flex w-full rounded-md border border-input bg-background pl-9 pr-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
+            placeholder={t("dataSources.searchPlaceholder")}
+            aria-label={t("dataSources.searchPlaceholder")}
+            className="ps-9"
           />
         </div>
         <AddDataSourceCTA />
       </div>
 
-      {/* Filtered results */}
-      {filteredSources !== null ? (
-        filteredSources.length > 0 ? (
-          <div className="data-sources-grid">
-            {filteredSources.map((source) => (
-              <DataSourceCard
-                key={source.id}
-                source={source}
-                locallyConfigured={isSourceConfigured(source, envStatus)}
-                ready={isSourceReady(source, statusData, envStatus)}
-                sharedConnectionStatus={getSharedConnectionStatus(
-                  source,
-                  statusData,
-                  envStatus,
-                )}
-                envStatus={envStatus}
-                isStatusLoading={isStatusLoading}
-                onSaved={handleSaved}
-              />
-            ))}
-          </div>
-        ) : (
-          <p className="text-sm text-muted-foreground py-4">
-            No data sources match "{search}"
-          </p>
-        )
-      ) : (
-        categoryOrder.map((category) => {
-          const sources = dataSources.filter((s) => s.category === category);
-          if (sources.length === 0) return null;
-          return (
-            <div key={category} className="space-y-3">
-              <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
-                {categoryLabels[category]}
-              </h3>
-              <div className="data-sources-grid">
-                {category === "analytics" && <FirstPartyAnalyticsCard />}
-                {sources.map((source) => (
-                  <DataSourceCard
-                    key={source.id}
-                    source={source}
-                    locallyConfigured={isSourceConfigured(source, envStatus)}
-                    ready={isSourceReady(source, statusData, envStatus)}
-                    sharedConnectionStatus={getSharedConnectionStatus(
-                      source,
-                      statusData,
-                      envStatus,
-                    )}
-                    envStatus={envStatus}
-                    isStatusLoading={isStatusLoading}
-                    onSaved={handleSaved}
-                  />
-                ))}
-              </div>
-            </div>
-          );
-        })
+      {unknownFocusedSourceId && (
+        <div
+          role="status"
+          className="flex items-start gap-2 rounded-md bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300"
+        >
+          <IconAlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            {t("dataSources.noMatch", { search: unknownFocusedSourceId })}
+          </span>
+        </div>
       )}
+
+      {connectedEntries.length === 0 && groups.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          {t("dataSources.noMatch", { search })}
+        </p>
+      ) : (
+        <>
+          {connectedEntries.length > 0 && (
+            <SourceSection
+              title={t("dataSources.connected")}
+              entries={connectedEntries}
+              onOpen={openEntry}
+            />
+          )}
+          {groups.map((group) => (
+            <SourceSection
+              key={group.category}
+              title={categoryLabels[group.category]}
+              entries={group.entries}
+              onOpen={openEntry}
+            />
+          ))}
+        </>
+      )}
+
+      <Sheet open={sheetOpen} onOpenChange={setSheetOpen}>
+        <SheetContent
+          aria-describedby={undefined}
+          className="w-full overflow-y-auto sm:max-w-lg"
+        >
+          {activeEntry ? (
+            <>
+              <SheetHeader className="pe-8">
+                <div className="flex min-w-0 items-center gap-3">
+                  {activeEntry.logo}
+                  <SheetTitle className="truncate">
+                    {activeEntry.name}
+                  </SheetTitle>
+                </div>
+              </SheetHeader>
+              <div className="data-source-card mt-5 min-w-0">
+                {activeEntry.detail}
+              </div>
+            </>
+          ) : null}
+        </SheetContent>
+      </Sheet>
     </div>
   );
 }

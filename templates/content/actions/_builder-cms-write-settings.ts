@@ -1,7 +1,7 @@
 import {
-  BUILDER_CMS_SAFE_WRITE_MODEL,
   type ContentDatabaseSourceCapabilities,
   type ContentDatabaseSourcePushMode,
+  type ContentDatabaseSourceWriteMode,
 } from "../shared/api.js";
 
 export type BuilderCmsLiveWriteMode = Exclude<
@@ -14,7 +14,9 @@ export interface BuilderCmsWriteSettingsPatch {
   sourceTable: string;
   capabilitiesJson: string;
   metadataJson: string;
-  liveWritesEnabled: boolean;
+  liveWritesEnabled?: boolean;
+  writeMode?: ContentDatabaseSourceWriteMode;
+  allowPublicationTransitions?: boolean;
   allowedWriteModes?: BuilderCmsLiveWriteMode[];
   allowDraftWrites?: boolean;
   allowPublishWrites?: boolean;
@@ -40,6 +42,16 @@ function normalizeMode(value: unknown): BuilderCmsLiveWriteMode | null {
     : null;
 }
 
+function normalizeWriteMode(
+  value: unknown,
+): ContentDatabaseSourceWriteMode | null {
+  return value === "read_only" ||
+    value === "stage_only" ||
+    value === "publish_updates"
+    ? value
+    : null;
+}
+
 function uniqueModes(
   modes: readonly BuilderCmsLiveWriteMode[] | undefined,
 ): BuilderCmsLiveWriteMode[] {
@@ -50,12 +62,36 @@ function uniqueModes(
   return unique;
 }
 
-export function builderCmsWriteSettingsFromJson(args: {
-  capabilitiesJson: string | null | undefined;
-  metadataJson: string | null | undefined;
-}) {
-  const capabilities = parseRecord(args.capabilitiesJson);
+function legacyWriteModeFromStored(args: {
+  liveWritesEnabled: boolean;
+  allowedWriteModes: readonly BuilderCmsLiveWriteMode[];
+  pushMode?: unknown;
+}): ContentDatabaseSourceWriteMode {
+  if (!args.liveWritesEnabled) return "read_only";
+  const pushMode = normalizeMode(args.pushMode);
+  return args.allowedWriteModes.some((mode) => mode !== "autosave") ||
+    (pushMode && pushMode !== "autosave")
+    ? "publish_updates"
+    : "stage_only";
+}
+
+function writeModeFromPatch(
+  args: BuilderCmsWriteSettingsPatch,
+): ContentDatabaseSourceWriteMode {
+  const explicit = normalizeWriteMode(args.writeMode);
+  if (args.writeMode !== undefined && !explicit) {
+    throw new Error("Choose a valid Builder write mode.");
+  }
+  if (explicit) return explicit;
+  if (args.liveWritesEnabled === false) return "read_only";
+  if (args.liveWritesEnabled === true) {
+    const allowed = uniqueModes(args.allowedWriteModes);
+    return allowed.some((mode) => mode !== "autosave")
+      ? "publish_updates"
+      : "stage_only";
+  }
   const metadata = parseRecord(args.metadataJson);
+  const capabilities = parseRecord(args.capabilitiesJson);
   const allowedWriteModes = Array.isArray(metadata.allowedWriteModes)
     ? uniqueModes(
         metadata.allowedWriteModes
@@ -63,12 +99,89 @@ export function builderCmsWriteSettingsFromJson(args: {
           .filter((mode): mode is BuilderCmsLiveWriteMode => !!mode),
       )
     : [];
+  return (
+    normalizeWriteMode(metadata.writeMode) ??
+    legacyWriteModeFromStored({
+      liveWritesEnabled: capabilities.liveWritesEnabled === true,
+      allowedWriteModes,
+      pushMode: metadata.pushMode,
+    })
+  );
+}
+
+function allowedWriteModesForTier(
+  writeMode: ContentDatabaseSourceWriteMode,
+): BuilderCmsLiveWriteMode[] {
+  if (writeMode === "stage_only") return ["autosave"];
+  if (writeMode === "publish_updates") return ["autosave", "publish"];
+  return [];
+}
+
+function pushModeForTier(
+  writeMode: ContentDatabaseSourceWriteMode,
+): ContentDatabaseSourcePushMode {
+  if (writeMode === "stage_only") return "autosave";
+  if (writeMode === "publish_updates") return "publish";
+  return "none";
+}
+
+function writeModeCopy(writeMode: ContentDatabaseSourceWriteMode) {
+  if (writeMode === "publish_updates") {
+    return {
+      pushModeLabel: "Publish updates",
+      pushModeDescription:
+        "Review, update, and publish existing Builder entries. New entries are never created by this mode.",
+      notes:
+        "Builder CMS source with reviewed update-in-place publication enabled for existing entries.",
+    };
+  }
+  if (writeMode === "stage_only") {
+    return {
+      pushModeLabel: "Stage only",
+      pushModeDescription:
+        "Prepare and review local revisions without writing to Builder.",
+      notes:
+        "Builder CMS source with local review staging enabled and remote writes disabled.",
+    };
+  }
+  return {
+    pushModeLabel: "Read only",
+    pushModeDescription: "Refresh and review Builder content without writing.",
+    notes: "Builder CMS source with remote writes disabled.",
+  };
+}
+
+export function builderCmsWriteSettingsFromJson(args: {
+  capabilitiesJson: string | null | undefined;
+  metadataJson: string | null | undefined;
+}) {
+  const capabilities = parseRecord(args.capabilitiesJson);
+  const metadata = parseRecord(args.metadataJson);
+  const legacyAllowedWriteModes = Array.isArray(metadata.allowedWriteModes)
+    ? uniqueModes(
+        metadata.allowedWriteModes
+          .map(normalizeMode)
+          .filter((mode): mode is BuilderCmsLiveWriteMode => !!mode),
+      )
+    : [];
+  const writeMode =
+    normalizeWriteMode(metadata.writeMode) ??
+    legacyWriteModeFromStored({
+      liveWritesEnabled: capabilities.liveWritesEnabled === true,
+      allowedWriteModes: legacyAllowedWriteModes,
+      pushMode: metadata.pushMode,
+    });
+  const allowedWriteModes = allowedWriteModesForTier(writeMode);
 
   return {
-    liveWritesEnabled: capabilities.liveWritesEnabled === true,
+    writeMode,
+    liveWritesEnabled: writeMode !== "read_only",
     allowedWriteModes,
-    allowDraftWrites: metadata.allowDraftWrites === true,
-    allowPublishWrites: metadata.allowPublishWrites === true,
+    allowPublicationTransitions:
+      writeMode === "publish_updates" &&
+      metadata.allowPublicationTransitions === true,
+    allowDraftWrites: false,
+    allowPublishWrites: writeMode === "publish_updates",
   };
 }
 
@@ -77,63 +190,43 @@ export function buildBuilderCmsWriteModeJson(
 ) {
   const capabilities = parseRecord(args.capabilitiesJson);
   const metadata = parseRecord(args.metadataJson);
+  const writeMode = writeModeFromPatch(args);
+  const enabled = writeMode !== "read_only";
+  const allowPublicationTransitions =
+    enabled &&
+    writeMode === "publish_updates" &&
+    args.allowPublicationTransitions === true;
 
-  if (args.liveWritesEnabled) {
+  if (enabled) {
     if (args.sourceType !== "builder-cms") {
       throw new Error(
         "Live writes can only be enabled for Builder CMS sources.",
       );
     }
-    if (args.sourceTable !== BUILDER_CMS_SAFE_WRITE_MODEL) {
-      throw new Error(
-        `Live Builder writes are only allowed for ${BUILDER_CMS_SAFE_WRITE_MODEL}.`,
-      );
-    }
   }
 
-  const enabled = args.liveWritesEnabled === true;
-  const allowedWriteModes = enabled ? uniqueModes(args.allowedWriteModes) : [];
-  if (args.liveWritesEnabled && allowedWriteModes.length === 0) {
-    throw new Error(
-      "Choose at least one allowed Builder write mode before enabling live writes.",
-    );
-  }
   if (
-    enabled &&
-    allowedWriteModes.includes("draft") &&
-    args.allowDraftWrites !== true
+    args.allowPublicationTransitions === true &&
+    writeMode !== "publish_updates"
   ) {
-    throw new Error("Draft writes require explicit draft opt-in.");
-  }
-  if (
-    enabled &&
-    allowedWriteModes.includes("publish") &&
-    args.allowPublishWrites !== true
-  ) {
-    throw new Error("Publish writes require explicit publish opt-in.");
+    throw new Error("Publication transitions require publish updates mode.");
   }
 
+  const allowedWriteModes = allowedWriteModesForTier(writeMode);
   const nextCapabilities: Partial<ContentDatabaseSourceCapabilities> = {
     ...capabilities,
     liveWritesEnabled: enabled,
   };
   const nextMetadata: Record<string, unknown> = {
     ...metadata,
-    allowedWriteModes: enabled ? allowedWriteModes : [],
-    allowDraftWrites: enabled && args.allowDraftWrites === true,
-    allowPublishWrites: enabled && args.allowPublishWrites === true,
+    ...writeModeCopy(writeMode),
+    writeMode,
+    allowPublicationTransitions,
+    allowedWriteModes,
+    allowDraftWrites: false,
+    allowPublishWrites: writeMode === "publish_updates",
+    pushMode: pushModeForTier(writeMode),
   };
-
-  if (
-    enabled &&
-    (!nextMetadata.pushMode ||
-      nextMetadata.pushMode === "none" ||
-      !allowedWriteModes.includes(
-        normalizeMode(nextMetadata.pushMode) ?? "autosave",
-      ))
-  ) {
-    nextMetadata.pushMode = allowedWriteModes[0];
-  }
 
   return {
     capabilitiesJson: JSON.stringify(nextCapabilities),
@@ -154,8 +247,7 @@ export function mergeBuilderCmsWriteSettingsIntoJson(args: {
   });
   if (
     currentSettings.liveWritesEnabled !== true ||
-    args.sourceTable !== BUILDER_CMS_SAFE_WRITE_MODEL ||
-    currentSettings.allowedWriteModes.length === 0
+    currentSettings.writeMode === "read_only"
   ) {
     return {
       capabilitiesJson: args.nextCapabilitiesJson,
@@ -168,9 +260,19 @@ export function mergeBuilderCmsWriteSettingsIntoJson(args: {
     sourceTable: args.sourceTable,
     capabilitiesJson: args.nextCapabilitiesJson,
     metadataJson: args.nextMetadataJson,
-    liveWritesEnabled: true,
-    allowedWriteModes: currentSettings.allowedWriteModes,
-    allowDraftWrites: currentSettings.allowDraftWrites,
-    allowPublishWrites: currentSettings.allowPublishWrites,
+    writeMode: currentSettings.writeMode,
+    allowPublicationTransitions: currentSettings.allowPublicationTransitions,
   });
+}
+
+export function builderCmsAllowedWriteModesForTier(
+  writeMode: ContentDatabaseSourceWriteMode,
+) {
+  return allowedWriteModesForTier(writeMode);
+}
+
+export function builderCmsPushModeForTier(
+  writeMode: ContentDatabaseSourceWriteMode,
+) {
+  return pushModeForTier(writeMode);
 }

@@ -1,9 +1,14 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
+import { defineAction } from "@agent-native/core/action";
 import { resolveAccess } from "@agent-native/core/sharing";
-import "../server/db/index.js"; // ensure registerShareableResource runs
+import { eq } from "drizzle-orm";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
+import { designDataForAccessRole } from "../server/lib/design-data-access.js";
+import { injectHiddenLayerExportStyle } from "../server/lib/design-export.js";
+import { trackDesign } from "../server/lib/design-tracking.js";
+import { isBoardFile } from "../shared/board-file.js";
+import "../server/db/index.js";
 
 export default defineAction({
   description:
@@ -14,34 +19,50 @@ export default defineAction({
   }),
   readOnly: true,
   http: { method: "GET" },
-  run: async ({ id }) => {
+  run: async ({ id }, ctx) => {
     const access = await resolveAccess("design", id);
     if (!access) throw new Error(`Design not found: ${id}`);
 
     const row = access.resource;
     const db = getDb();
 
-    // Fetch all design files
     const files = await db
       .select()
       .from(schema.designFiles)
       .where(eq(schema.designFiles.designId, id));
+    const exportFiles = files.filter((file) => !isBoardFile(file.filename));
+
+    // This only hands render data to a client; the PDF itself is produced and
+    // recorded as `design_exported` by whoever renders it.
+    trackDesign(
+      "design_export_prepared",
+      {
+        output_id: id,
+        output_type: "design",
+        export_format: "pdf",
+        file_count: exportFiles.length,
+      },
+      ctx,
+    );
 
     return {
       id: row.id,
       title: row.title,
       description: row.description,
       projectType: row.projectType,
-      data: row.data ?? null,
-      files: files.map((f) => ({
+      data: designDataForAccessRole(row.data ?? null, access.role),
+      files: exportFiles.map((f) => ({
         id: f.id,
         filename: f.filename,
         fileType: f.fileType,
-        content: f.content,
+        content:
+          f.fileType === "html" && f.content
+            ? injectHiddenLayerExportStyle(f.content)
+            : f.content,
       })),
       exportInfo: {
         format: "pdf",
-        note: "Use client-side rendering (e.g. html2canvas + jsPDF) to generate the PDF from the returned design data.",
+        note: "The Design editor renders the active artboard as a single-page raster PDF at its fixed authored size. This preserves visual appearance but does not provide selectable/vector text; export separate screens individually.",
       },
     };
   },

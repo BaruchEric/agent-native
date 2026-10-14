@@ -1,74 +1,32 @@
 {
   "name": "agent-native",
-  "displayName": "Agent Native Plans",
-  "description": "Open Agent-Native Plans and MCP handoff links inside VS Code.",
-  "version": "0.0.1",
-  "publisher": "Builder",
-  "license": "MIT",
-  "type": "commonjs",
-  "icon": "icon.png",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/BuilderIO/agent-native.git",
-    "directory": "packages/vscode-extension"
-  },
-  "bugs": {
-    "url": "https://github.com/BuilderIO/agent-native/issues"
-  },
-  "homepage": "https://agent-native.com/docs/template-plan#vscode-extension",
-  "engines": {
-    "vscode": "^1.120.0"
-  },
+  "displayName": "Agent-Native",
+  "version": "0.0.2",
+  "description": "Open Agent-Native Plans, Design, and MCP handoff links inside VS Code.",
   "categories": [
     "Other"
   ],
   "keywords": [
     "agent-native",
-    "plans",
-    "visual plans",
     "coding agents",
-    "mcp"
+    "design",
+    "mcp",
+    "plans",
+    "visual plans"
   ],
-  "galleryBanner": {
-    "color": "#000000",
-    "theme": "dark"
+  "homepage": "https://agent-native.com/docs/template-plan?utm_source=vscode-marketplace&utm_medium=referral&utm_content=vscode-extension-homepage#vscode-extension",
+  "bugs": {
+    "url": "https://github.com/BuilderIO/agent-native/issues"
   },
-  "activationEvents": [
-    "onUri",
-    "onCommand:agentNative.openDefaultApp",
-    "onCommand:agentNative.openUrl",
-    "onCommand:agentNative.connectWorkspace"
-  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BuilderIO/agent-native.git",
+    "directory": "packages/vscode-extension"
+  },
+  "publisher": "Builder",
+  "type": "commonjs",
   "main": "./dist/extension.js",
-  "contributes": {
-    "commands": [
-      {
-        "command": "agentNative.openDefaultApp",
-        "title": "Open Agent Native",
-        "category": "Agent Native"
-      },
-      {
-        "command": "agentNative.openUrl",
-        "title": "Open Agent Native URL",
-        "category": "Agent Native"
-      },
-      {
-        "command": "agentNative.connectWorkspace",
-        "title": "Connect Workspace to Agent Native MCP",
-        "category": "Agent Native"
-      }
-    ],
-    "configuration": {
-      "title": "Agent Native",
-      "properties": {
-        "agentNative.defaultAppUrl": {
-          "type": "string",
-          "default": "https://plan.agent-native.com",
-          "description": "The Agent Native app URL opened by the Open Agent Native command."
-        }
-      }
-    }
-  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
@@ -80,7 +38,56 @@
     "@types/node": "^25.9.3",
     "@types/vscode": "1.120.0",
     "@vscode/test-electron": "3.0.0",
-    "typescript": "catalog:",
+    "typescript-7": "catalog:",
     "vitest": "catalog:"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentNative.openDefaultApp",
+        "title": "Open Agent-Native",
+        "category": "Agent-Native"
+      },
+      {
+        "command": "agentNative.openUrl",
+        "title": "Open Agent-Native URL",
+        "category": "Agent-Native"
+      },
+      {
+        "command": "agentNative.connectWorkspace",
+        "title": "Connect Workspace to Agent-Native MCP",
+        "category": "Agent-Native"
+      },
+      {
+        "command": "agentNative.openDesignCanvas",
+        "title": "Open Design Canvas",
+        "category": "Agent-Native"
+      }
+    ],
+    "configuration": {
+      "title": "Agent-Native",
+      "properties": {
+        "agentNative.defaultAppUrl": {
+          "type": "string",
+          "default": "https://plan.agent-native.com",
+          "description": "The Agent-Native app URL opened by the Open Agent-Native command."
+        }
+      }
+    }
+  },
+  "activationEvents": [
+    "onCommand:agentNative.connectWorkspace",
+    "onCommand:agentNative.openDefaultApp",
+    "onCommand:agentNative.openDesignCanvas",
+    "onCommand:agentNative.openUrl",
+    "onUri"
+  ],
+  "icon": "icon.png",
+  "galleryBanner": {
+    "color": "#000000",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.120.0"
   }
 }

@@ -1,6 +1,44 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction, type ActionRunContext } from "@agent-native/core/action";
 import { z } from "zod";
-import { listWorkspaceApps } from "../server/lib/app-creation-store.js";
+
+import {
+  listWorkspaceApps,
+  type ListWorkspaceAppsOptions,
+  type WorkspaceAppSummary,
+} from "../server/lib/app-creation-store.js";
+
+const inFlightWorkspaceAppLists = new Map<
+  string,
+  Promise<WorkspaceAppSummary[]>
+>();
+
+function listWorkspaceAppsForRequest(
+  input: ListWorkspaceAppsOptions,
+  context?: ActionRunContext,
+): Promise<WorkspaceAppSummary[]> {
+  const email = context?.userEmail?.trim().toLowerCase();
+  if (!context || !email) return listWorkspaceApps(input);
+
+  const key = JSON.stringify([
+    email,
+    context.orgId?.trim() || null,
+    context.appId?.trim() || null,
+    context.caller,
+    input,
+  ]);
+  const pending = inFlightWorkspaceAppLists.get(key);
+  if (pending) return pending;
+
+  const request = listWorkspaceApps(input);
+  inFlightWorkspaceAppLists.set(key, request);
+  const removeSettledRequest = () => {
+    if (inFlightWorkspaceAppLists.get(key) === request) {
+      inFlightWorkspaceAppLists.delete(key);
+    }
+  };
+  void request.then(removeSettledRequest, removeSettledRequest);
+  return request;
+}
 
 const httpBoolean = z.preprocess((value) => {
   if (typeof value !== "string") return value;
@@ -12,18 +50,21 @@ const httpBoolean = z.preprocess((value) => {
 
 export default defineAction({
   description:
-    "List apps installed in this workspace, including mounted paths, absolute URLs, audience (internal/public), page route access overrides, and agent-card/A2A metadata for ready apps by default. UI polling callers can pass includeAgentCards=false to skip network probes.",
+    "List apps mounted inside this workspace deployment, including paths, absolute URLs, audience (internal/public), page route access overrides, and agent-card/A2A metadata for ready mounted apps by default. This is not the hosted/connected A2A agent registry; use list-connected-agents to discover agents such as Analytics or Content. UI polling callers can pass includeAgentCards=false to skip network probes.",
   schema: z.object({
     includeAgentCards: httpBoolean
       .default(true)
       .describe(
         "Fetch each ready app's /.well-known/agent-card.json with a short non-throwing timeout and include agentCardUrl, agentCardReachable, a2aEndpointUrl, agentName, and agentSkillsCount. Defaults to true for agent calls; UI polling should pass false. Pending Builder apps are not probed.",
       ),
+    includeArchived: httpBoolean
+      .default(false)
+      .describe("Include archived workspace apps in the result."),
     audience: z
       .enum(["all", "internal", "public"])
       .default("all")
       .describe("Filter by workspace app audience."),
   }),
   http: { method: "GET" },
-  run: async (input) => listWorkspaceApps(input),
+  run: async (input, context) => listWorkspaceAppsForRequest(input, context),
 });

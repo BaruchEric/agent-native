@@ -1,6 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// In-memory settings store so we can assert org/user scoping isolation.
 const orgStore = new Map<string, Record<string, unknown>>();
 const userStore = new Map<string, Record<string, unknown>>();
 
@@ -45,10 +44,8 @@ const execute = vi.fn(async () => {
 
 vi.mock("../db/client.js", () => ({
   getDbExec: () => ({ execute }),
-  isPostgres: () => false,
 }));
 
-// Request-context resolver values for getAgentAppModelDefaultForCurrentRequest.
 let requestUserEmail: string | undefined;
 let requestOrgId: string | undefined;
 vi.mock("../server/request-context.js", () => ({
@@ -88,10 +85,8 @@ describe("normalizeAgentAppModelDefaultAppId", () => {
     expect(normalizeAgentAppModelDefaultAppId(undefined)).toBeNull();
     expect(normalizeAgentAppModelDefaultAppId("")).toBeNull();
     expect(normalizeAgentAppModelDefaultAppId("   ")).toBeNull();
-    // Must start with a letter.
     expect(normalizeAgentAppModelDefaultAppId("2cool")).toBeNull();
     expect(normalizeAgentAppModelDefaultAppId("-leading")).toBeNull();
-    // No underscores, spaces, dots, or other punctuation.
     expect(normalizeAgentAppModelDefaultAppId("my_app")).toBeNull();
     expect(normalizeAgentAppModelDefaultAppId("a b")).toBeNull();
     expect(normalizeAgentAppModelDefaultAppId("a.b")).toBeNull();
@@ -125,7 +120,7 @@ describe("readAgentAppModelDefaultSettings", () => {
   it("reads org scope and ignores a user value for the same app", async () => {
     orgStore.set(orgK("org1", agentAppModelDefaultSettingsKey("mail")), {
       engine: "builder",
-      model: "claude-sonnet-4-6",
+      model: "claude-sonnet-5",
       updatedAt: 123,
       updatedBy: "boss@x.com",
     });
@@ -140,7 +135,7 @@ describe("readAgentAppModelDefaultSettings", () => {
     expect(s.scope).toBe("org");
     expect(s.source).toBe("org");
     expect(s.engine).toBe("builder");
-    expect(s.model).toBe("claude-sonnet-4-6");
+    expect(s.model).toBe("claude-sonnet-5");
     expect(s.updatedAt).toBe(123);
     expect(s.updatedBy).toBe("boss@x.com");
   });
@@ -148,7 +143,7 @@ describe("readAgentAppModelDefaultSettings", () => {
   it("reads user scope when no org and normalizes the appId casing for the key", async () => {
     userStore.set(userK("a@b.com", agentAppModelDefaultSettingsKey("mail")), {
       engine: "anthropic",
-      model: "claude-opus-4-7",
+      model: "claude-opus-4-8",
     });
     const s = await readAgentAppModelDefaultSettings(
       { userEmail: "a@b.com" },
@@ -169,7 +164,6 @@ describe("readAgentAppModelDefaultSettings", () => {
     expect(s.engine).toBeNull();
     expect(s.model).toBeNull();
     expect(s.source).toBe("default");
-    // Scope still reflects where we looked.
     expect(s.scope).toBe("org");
   });
 
@@ -194,17 +188,17 @@ describe("writeAgentAppModelDefaultSettings", () => {
       "mail",
       {
         engine: " builder ",
-        model: " claude-sonnet-4-6 ",
+        model: " claude-sonnet-5 ",
         updatedBy: "u@x.com",
       },
     );
     expect(s.engine).toBe("builder");
-    expect(s.model).toBe("claude-sonnet-4-6");
+    expect(s.model).toBe("claude-sonnet-5");
     const stored = orgStore.get(
       orgK("org1", agentAppModelDefaultSettingsKey("mail")),
     )!;
     expect(stored.engine).toBe("builder");
-    expect(stored.model).toBe("claude-sonnet-4-6");
+    expect(stored.model).toBe("claude-sonnet-5");
     expect(stored.updatedBy).toBe("u@x.com");
     expect(typeof stored.updatedAt).toBe("number");
     expect(stored.updatedAt as number).toBeGreaterThanOrEqual(before);
@@ -213,7 +207,7 @@ describe("writeAgentAppModelDefaultSettings", () => {
   it("omits updatedBy when not supplied", async () => {
     await writeAgentAppModelDefaultSettings({ userEmail: "a@b.com" }, "mail", {
       engine: "anthropic",
-      model: "claude-opus-4-7",
+      model: "claude-opus-4-8",
     });
     const stored = userStore.get(
       userK("a@b.com", agentAppModelDefaultSettingsKey("mail")),
@@ -348,18 +342,16 @@ describe("getAgentAppModelDefaultForCurrentRequest", () => {
     requestUserEmail = "a@b.com";
     orgStore.set(orgK("org1", agentAppModelDefaultSettingsKey("mail")), {
       engine: "builder",
-      model: "claude-sonnet-4-6",
+      model: "claude-sonnet-5",
       updatedAt: 1,
       updatedBy: "boss@x.com",
     });
-    // A conflicting user-scoped value must NOT leak when an org is in context.
     userStore.set(userK("a@b.com", agentAppModelDefaultSettingsKey("mail")), {
       engine: "anthropic",
       model: "should-not-win",
     });
     const sel = await getAgentAppModelDefaultForCurrentRequest("mail");
-    // Only engine + model are returned (no metadata leakage); org wins.
-    expect(sel).toEqual({ engine: "builder", model: "claude-sonnet-4-6" });
+    expect(sel).toEqual({ engine: "builder", model: "claude-sonnet-5" });
   });
 
   it("returns null when nothing is stored for the request scope", async () => {

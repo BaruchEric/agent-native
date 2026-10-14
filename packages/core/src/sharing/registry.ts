@@ -1,97 +1,172 @@
-/**
- * Registry of shareable resources.
- *
- * Each template registers its ownable resource(s) once on module load so the
- * framework-level share actions (`share-resource`, `list-resource-shares`,
- * etc.) can dispatch to the correct tables.
- *
- *   import { registerShareableResource } from "@agent-native/core/sharing";
- *   import * as schema from "./schema.js";
- *
- *   registerShareableResource({
- *     type: "document",
- *     resourceTable: schema.documents,
- *     sharesTable: schema.documentShares,
- *     displayName: "Document",
- *     titleColumn: "title",
- *   });
- */
+import type { EmailCta, EmailLinkBlock } from "../server/email-template.js";
+import type { UserProfile } from "../user-profile/shared.js";
 
-export interface ShareableResourceRegistration {
-  /** Stable identifier used across actions, UI, and analytics. e.g. "document". */
-  type: string;
-  /** Drizzle table for the parent resource (must have ownableColumns()). */
-  resourceTable: any;
-  /** Drizzle table produced by createSharesTable(). */
-  sharesTable: any;
-  /** Human-readable singular label shown in the share dialog. */
-  displayName: string;
-  /**
-   * Column on the resource table that holds a human-readable title for
-   * display in the share UI. Default: "title".
-   */
-  titleColumn?: string;
-  /**
-   * Optional app-relative path to this resource. Used by share notifications
-   * when the caller does not pass a more specific resourceUrl.
-   */
-  getResourcePath?: (resource: any) => string | undefined;
-  /**
-   * Drizzle DB accessor from the template's server/db/index.ts. Required —
-   * the framework-level share actions and access helpers call this to reach
-   * the right DB instance (schema is template-specific).
-   */
-  getDb: () => any;
-  /**
-   * When `false`, `visibility: "public"` is rejected by `set-resource-visibility`,
-   * and `accessFilter` / `resolveAccess` treat any stored public row as private
-   * (defense in depth — only owner + explicit shares grant access).
-   *
-   * Use this for resources that execute code or expose privileged data and must
-   * never be reachable by a random authenticated user. Extensions set this:
-   * extension HTML runs inside an iframe that calls actions / DB / proxied APIs
-   * as the *viewer*, so a public extension would be arbitrary code with the
-   * viewer's credentials.
-   *
-   * Default: `true` (matches the historical behavior — most resources can be public).
-   */
-  allowPublic?: boolean;
-  /**
-   * When `true`, individual user shares (`principalType: "user"`) must target
-   * an email that is already a member of the same org as the resource, OR has
-   * a pending invitation to that org. Cross-org user shares are rejected.
-   *
-   * Pair with `allowPublic: false` for resources that need a hard "this org
-   * only" trust boundary. Extensions set this so a malicious caller can't
-   * widen reach by sharing a code-executing extension to an outsider email.
-   *
-   * Default: `false` (matches the historical behavior — any email can be granted).
-   */
-  requireOrgMemberForUserShares?: boolean;
-  /**
-   * Optional per-resource access-context adapter. Most resources should use the
-   * request user/org unchanged. Templates with an intentional alternate local
-   * identity can normalize here so the generic framework sharing actions and
-   * access helpers stay in sync with template-owned actions.
-   */
-  resolveAccessContext?: (ctx: { userEmail?: string; orgId?: string }) => {
-    userEmail?: string;
-    orgId?: string;
-  };
+export interface ShareEmailExtras {
+  paragraphs?: string[];
+  secondaryCta?: EmailCta;
+  linkBlock?: EmailLinkBlock;
+  closingParagraphs?: string[];
 }
 
-// Stash the registry on globalThis so it survives SSR bundle duplication.
-// Vite SSR's `noExternal: /^(?!node:)/` policy means @agent-native/core gets
-// inlined into every server bundle that imports it — and each bundle gets its
-// own module-level state. A plain `new Map()` here would create one Map per
-// bundle, so the template's `registerShareableResource()` (called from the
-// Nitro plugin graph) wouldn't be visible to the framework's auto-mounted
-// share-resource action (loaded via `import("../sharing/actions/...js")` in a
-// different module instance). Using globalThis collapses them back to one Map.
+export interface ShareableResourceRegistration {
+  type: string;
+  resourceTable: any;
+  sharesTable: any;
+  displayName: string;
+  titleColumn?: string;
+  getResourcePath?: (resource: any) => string | undefined;
+  getLogoUrl?: (
+    resource: any,
+  ) => string | undefined | Promise<string | undefined>;
+  getBrandName?: (
+    resource: any,
+  ) => string | undefined | Promise<string | undefined>;
+  getSender?: (
+    resource: any,
+    ctx: { sender: UserProfile },
+  ) =>
+    | { fromName?: string; replyTo?: string }
+    | undefined
+    | Promise<{ fromName?: string; replyTo?: string } | undefined>;
+  getHeroHtml?: (
+    resource: any,
+    ctx: { href: string; alt?: string },
+  ) => string | undefined | Promise<string | undefined>;
+  getShareEmailExtras?: (
+    resource: any,
+    ctx: { href: string; sender: UserProfile; recipientEmail: string },
+  ) => ShareEmailExtras | undefined | Promise<ShareEmailExtras | undefined>;
+  getDb: () => any;
+  /**
+   * Optional resource-owned persistence hook for visibility changes. Use this
+   * when changing visibility must share a transaction with another invariant,
+   * such as reserving a human-readable name before the row becomes visible.
+   * The generic action falls back to a direct update when this is omitted.
+   */
+  persistVisibilityChange?: (args: {
+    resource: any;
+    resourceId: string;
+    visibility: "private" | "org" | "public";
+    update: Record<string, unknown>;
+    userEmail?: string;
+    orgId?: string;
+  }) => void | Promise<void>;
+  /**
+   * Runs before a sharing change is persisted. Throw to refuse the change.
+   * It receives the resource row, so a registration can refuse per-row states
+   * (for example, a resource that holds private content). Runs only for a
+   * visibility change that differs from the current value, and for every
+   * `share-resource` grant. It runs again after that change is written, and a
+   * refusal then undoes the write, so one change can call it twice: keep it
+   * free of side effects.
+   */
+  assertSharingChange?: (args: {
+    resource: any;
+    change:
+      | { kind: "visibility"; visibility: "private" | "org" | "public" }
+      | { kind: "grant" };
+  }) => void | Promise<void>;
+  allowPublic?: boolean;
+  publicAccessRole?:
+    | "viewer"
+    | "commenter"
+    | "editor"
+    | "admin"
+    | ((
+        resource: any,
+        ctx: {
+          userEmail?: string;
+          orgId?: string;
+          authCapability?: string;
+        },
+      ) =>
+        | "viewer"
+        | "commenter"
+        | "editor"
+        | "admin"
+        | Promise<"viewer" | "commenter" | "editor" | "admin">);
+  requireOrgMemberForUserShares?: boolean;
+  supportsGroupShares?: boolean;
+  canManageAccess?: (
+    resource: any,
+    ctx: {
+      userEmail?: string;
+      orgId?: string;
+    },
+  ) => boolean | Promise<boolean>;
+  resolveAccessContext?: (ctx: {
+    userEmail?: string;
+    orgId?: string;
+    authCapability?: string;
+  }) => {
+    userEmail?: string;
+    orgId?: string;
+    authCapability?: string;
+  };
+  ownerAccessIgnoresOrg?: boolean;
+  /**
+   * Whether a row still counts as an openable resource, for example not in
+   * the trash. `columns` are the resource-table keys `isAvailable` reads;
+   * they join the lightweight access projection. A row that fails the rule
+   * reads as missing to anyone who can't open it, and as trashed to anyone
+   * who can. Omit it when every row is available.
+   */
+  availability?: {
+    columns: readonly string[];
+    isAvailable: (resource: any) => boolean;
+  };
+  /**
+   * Lets signed-in people who can't open a resource of this type ask its
+   * owner and admins for access. Off by default, so an app only starts
+   * emailing owners once its access screen offers the request.
+   */
+  accessRequests?: boolean;
+  /**
+   * A context that can open the resource when the viewer's own can't, such
+   * as the authority a Content space lends its members. Only a link's status
+   * reads it, so such a viewer hears that a page is in the trash instead of
+   * missing; `resolveAccess` and the share actions use the viewer's own
+   * context, and the app applies the grant in its own access helpers.
+   * `columns` are the resource-table keys `resolve` reads; they join the
+   * lightweight access projection, so `resolve` gets the row already loaded.
+   */
+  fallbackAccessContext?: {
+    columns: readonly string[];
+    resolve: (
+      resource: any,
+      ctx: { userEmail?: string; orgId?: string },
+    ) => Promise<{ userEmail?: string; orgId?: string } | null>;
+  };
+  agentReadable?:
+    | false
+    | {
+        resourceKind: string;
+        getContextPath: (resource: any) => string | undefined;
+        getPagePath?: (resource: any) => string | undefined;
+        ttlSeconds?: number;
+      };
+}
+
 const REGISTRY_KEY = "__agentNativeShareableResources__";
 type RegistryStore = Map<string, ShareableResourceRegistration>;
 const globalRegistry: { [K in typeof REGISTRY_KEY]?: RegistryStore } =
   globalThis as any;
+
+function isTestRuntime(): boolean {
+  return (
+    process.env.NODE_ENV === "test" ||
+    process.env.VITEST === "true" ||
+    process.env.VITEST === "1"
+  );
+}
+
+function registrationCameFromTestFile(): boolean {
+  const stack = new Error().stack ?? "";
+  return /[./\\](?:[^/\\]+[.-])(?:test|spec)\.[cm]?[jt]sx?(?::\d+)?(?::\d+)?/.test(
+    stack,
+  );
+}
+
 function getRegistry(): RegistryStore {
   let r = globalRegistry[REGISTRY_KEY];
   if (!r) {
@@ -104,6 +179,7 @@ function getRegistry(): RegistryStore {
 export function registerShareableResource(
   entry: ShareableResourceRegistration,
 ): void {
+  if (!isTestRuntime() && registrationCameFromTestFile()) return;
   getRegistry().set(entry.type, entry);
 }
 

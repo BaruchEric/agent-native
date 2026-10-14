@@ -1,16 +1,8 @@
-/**
- * DurationPicker — multi-select of booking durations rendered as pills.
- *
- * Bookers will pick between the selected durations on the public booking
- * page (if more than one is selected). Shows 15/30/45/60 as default
- * presets; the user can type an arbitrary number and add it too.
- *
- * Shadcn primitives expected in the consumer: button, input, label.
- */
-import { useState } from "react";
+import { Button, Input } from "@agent-native/toolkit/ui";
 import { IconPlus, IconX } from "@tabler/icons-react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { useState } from "react";
+
+import { useSchedulingT } from "../../i18n.js";
 
 const DEFAULT_PRESETS = [15, 30, 45, 60];
 
@@ -18,7 +10,6 @@ export interface DurationPickerProps {
   value: number[];
   onChange: (next: number[]) => void;
   presets?: number[];
-  /** Minimum valid duration, defaults to 5 (minutes). */
   min?: number;
 }
 
@@ -27,6 +18,7 @@ function cls(...parts: (string | false | null | undefined)[]) {
 }
 
 export function DurationPicker(props: DurationPickerProps) {
+  const t = useSchedulingT();
   const { value, onChange, presets = DEFAULT_PRESETS, min = 5 } = props;
   const [custom, setCustom] = useState(15);
 
@@ -34,7 +26,7 @@ export function DurationPicker(props: DurationPickerProps) {
     const next = value.includes(mins)
       ? value.filter((d) => d !== mins)
       : [...value, mins].sort((a, b) => a - b);
-    if (next.length === 0) return; // keep at least one
+    if (next.length === 0) return;
     onChange(next);
   };
 
@@ -50,7 +42,6 @@ export function DurationPicker(props: DurationPickerProps) {
     onChange(next);
   };
 
-  // Union of presets + selected values → pill row.
   const pillOptions = Array.from(new Set([...presets, ...value])).sort(
     (a, b) => a - b,
   );
@@ -73,7 +64,7 @@ export function DurationPicker(props: DurationPickerProps) {
                   : "border-border text-muted-foreground hover:bg-accent/60 hover:text-foreground",
               )}
             >
-              {mins} min
+              {mins} {t("minAbbrev")}
               {isSelected && isCustom && (
                 <span
                   role="button"
@@ -99,15 +90,17 @@ export function DurationPicker(props: DurationPickerProps) {
           onChange={(e) => setCustom(Number(e.currentTarget.value))}
           min={min}
         />
-        <span className="text-sm text-muted-foreground">minutes</span>
+        <span className="text-sm text-muted-foreground">{t("minutes")}</span>
         <Button size="sm" variant="outline" onClick={add}>
           <IconPlus className="mr-1 h-3.5 w-3.5" />
-          Add
+          {t("add")}
         </Button>
       </div>
       {value.length > 1 && (
         <p className="text-xs text-muted-foreground">
-          Bookers will choose between: {value.map((d) => `${d} min`).join(", ")}
+          {t("bookersChooseBetween", {
+            durations: value.map((d) => `${d} ${t("minAbbrev")}`).join(", "),
+          })}
         </p>
       )}
     </div>

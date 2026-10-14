@@ -2,7 +2,14 @@ import crypto from "crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
+
 import type { AgentPromptAttachment } from "../code-agents/prompt-attachments.js";
+import {
+  appendUniqueJsonLineAtomically,
+  updateJsonFileAtomically,
+  withFileLockSync,
+  writeJsonFileAtomically,
+} from "./atomic-json-file.js";
 
 export type CodeAgentRunStatus =
   | "queued"
@@ -76,6 +83,8 @@ export type CodeAgentTranscriptEventKind =
   | "artifact"
   | "status";
 
+export type CodeAgentTranscriptEventSignal = "credential-gap";
+
 export interface CodeAgentTranscriptEvent {
   schemaVersion: 1;
   id: string;
@@ -84,9 +93,11 @@ export interface CodeAgentTranscriptEvent {
   message: string;
   createdAt: string;
   metadata?: Record<string, unknown>;
+  signal?: CodeAgentTranscriptEventSignal;
 }
 
 export interface CreateCodeAgentRunInput {
+  id?: string;
   goalId: string;
   title: string;
   subtitle?: string;
@@ -103,11 +114,13 @@ export interface CreateCodeAgentRunInput {
 }
 
 export interface AppendCodeAgentTranscriptEventInput {
+  id?: string;
   runId: string;
   kind: CodeAgentTranscriptEventKind;
   message: string;
   createdAt?: string;
   metadata?: Record<string, unknown>;
+  signal?: CodeAgentTranscriptEventSignal;
 }
 
 export interface QueueCodeAgentFollowUpInput {
@@ -146,18 +159,12 @@ export function codeAgentRunTranscriptPath(runId: string): string {
   return path.join(codeAgentTranscriptsDir(), `${runId}.jsonl`);
 }
 
-// --------------- Command allowlist ---------------
-
 const COMMAND_ALLOWLIST_FILENAME = "command-allowlist.json";
 
 export function codeAgentCommandAllowlistPath(): string {
   return path.join(codeAgentStoreRoot(), COMMAND_ALLOWLIST_FILENAME);
 }
 
-/**
- * Load the per-store command allowlist.  Returns an array of exact command
- * strings the user has marked "always allow".
- */
 export function readCodeAgentCommandAllowlist(): string[] {
   try {
     const raw = JSON.parse(
@@ -170,22 +177,15 @@ export function readCodeAgentCommandAllowlist(): string[] {
   }
 }
 
-/**
- * Persist a command to the per-store allowlist so future identical commands
- * are auto-approved without a prompt.  Deduplicates by exact string match.
- */
 export function addCodeAgentCommandToAllowlist(command: string): void {
-  const current = readCodeAgentCommandAllowlist();
-  if (current.includes(command)) return;
-  const next = [...current, command];
-  fs.mkdirSync(codeAgentStoreRoot(), { recursive: true });
-  fs.writeFileSync(
-    codeAgentCommandAllowlistPath(),
-    JSON.stringify(next, null, 2),
-  );
+  const filePath = codeAgentCommandAllowlistPath();
+  withFileLockSync(filePath, () => {
+    const current = readCodeAgentCommandAllowlist();
+    if (current.includes(command)) return;
+    writeJsonFileAtomically(filePath, [...current, command], { mode: 0o600 });
+  });
 }
 
-/** Return true if `command` is in the stored allowlist. */
 export function isCodeAgentCommandAllowed(command: string): boolean {
   return readCodeAgentCommandAllowlist().includes(command);
 }
@@ -194,7 +194,9 @@ export function createCodeAgentRunRecord(
   input: CreateCodeAgentRunInput,
 ): CodeAgentRunRecord {
   const now = new Date().toISOString();
-  const id = `${input.goalId}-${timestampSlug(now)}-${crypto.randomUUID().slice(0, 8)}`;
+  const id =
+    input.id ??
+    `${input.goalId}-${timestampSlug(now)}-${crypto.randomUUID().slice(0, 8)}`;
   const record: CodeAgentRunRecord = {
     schemaVersion: 1,
     id,
@@ -228,11 +230,8 @@ export function normalizeCodeAgentPermissionMode(
 }
 
 export function writeCodeAgentRunRecord(record: CodeAgentRunRecord): void {
-  fs.mkdirSync(codeAgentRunsDir(), { recursive: true });
-  fs.writeFileSync(
-    codeAgentRunRecordPath(record.id),
-    `${JSON.stringify(record, null, 2)}\n`,
-  );
+  const filePath = codeAgentRunRecordPath(record.id);
+  withFileLockSync(filePath, () => writeJsonFileAtomically(filePath, record));
 }
 
 export function getCodeAgentRunRecord(
@@ -247,20 +246,23 @@ export function updateCodeAgentRunRecord(
     | Partial<CodeAgentRunRecord>
     | ((record: CodeAgentRunRecord) => Partial<CodeAgentRunRecord>),
 ): CodeAgentRunRecord | null {
-  const record = getCodeAgentRunRecord(runId);
-  if (!record) return null;
-  const patch = typeof updates === "function" ? updates(record) : updates;
-  const next: CodeAgentRunRecord = {
-    ...record,
-    ...patch,
-    metadata: {
-      ...(record.metadata ?? {}),
-      ...(patch.metadata ?? {}),
+  return updateJsonFileAtomically(
+    codeAgentRunRecordPath(runId),
+    readRunValue,
+    (record) => {
+      if (!record) return null;
+      const patch = typeof updates === "function" ? updates(record) : updates;
+      return {
+        ...record,
+        ...patch,
+        metadata: {
+          ...(record.metadata ?? {}),
+          ...(patch.metadata ?? {}),
+        },
+        updatedAt: patch.updatedAt ?? new Date().toISOString(),
+      };
     },
-    updatedAt: patch.updatedAt ?? new Date().toISOString(),
-  };
-  writeCodeAgentRunRecord(next);
-  return next;
+  );
 }
 
 export function listCodeAgentRunRecords(goalId?: string): CodeAgentRunRecord[] {
@@ -284,24 +286,34 @@ export function getLastCodeAgentRunRecord(
 export function appendCodeAgentTranscriptEvent(
   input: AppendCodeAgentTranscriptEventInput,
 ): CodeAgentTranscriptEvent {
+  const requestedId = input.id?.trim();
+  if (requestedId) {
+    const existing = listCodeAgentTranscriptEvents(input.runId).find(
+      (event) => event.id === requestedId,
+    );
+    if (existing) return existing;
+  }
   const createdAt = input.createdAt ?? new Date().toISOString();
   const event: CodeAgentTranscriptEvent = {
     schemaVersion: 1,
-    id: `evt-${timestampSlug(createdAt)}-${crypto.randomUUID().slice(0, 8)}`,
+    id:
+      requestedId ??
+      `evt-${timestampSlug(createdAt)}-${crypto.randomUUID().slice(0, 8)}`,
     runId: input.runId,
     kind: input.kind,
     message: input.message,
     createdAt,
     metadata: input.metadata,
+    ...(input.signal ? { signal: input.signal } : {}),
   };
 
-  fs.mkdirSync(codeAgentTranscriptsDir(), { recursive: true });
-  fs.appendFileSync(
+  const persisted = appendUniqueJsonLineAtomically(
     codeAgentRunTranscriptPath(input.runId),
-    `${JSON.stringify(event)}\n`,
+    event,
+    readTranscriptValue,
   );
   touchCodeAgentRunRecord(input.runId, createdAt);
-  return event;
+  return persisted.value;
 }
 
 export function listCodeAgentTranscriptEvents(
@@ -402,14 +414,23 @@ function readPendingFollowUps(value: unknown): CodeAgentPendingFollowUp[] {
 }
 
 function touchCodeAgentRunRecord(runId: string, updatedAt: string): void {
-  const record = readRunFile(codeAgentRunRecordPath(runId));
-  if (!record) return;
-  writeCodeAgentRunRecord({ ...record, updatedAt });
+  updateJsonFileAtomically(
+    codeAgentRunRecordPath(runId),
+    readRunValue,
+    (record) => (record ? { ...record, updatedAt } : null),
+  );
 }
 
 function readRunFile(filePath: string): CodeAgentRunRecord | null {
   try {
-    const raw = JSON.parse(fs.readFileSync(filePath, "utf-8")) as unknown;
+    return readRunValue(JSON.parse(fs.readFileSync(filePath, "utf-8")));
+  } catch {
+    return null;
+  }
+}
+
+function readRunValue(raw: unknown): CodeAgentRunRecord | null {
+  try {
     if (!raw || typeof raw !== "object") return null;
     const record = raw as Partial<CodeAgentRunRecord>;
     if (
@@ -432,7 +453,14 @@ function readRunFile(filePath: string): CodeAgentRunRecord | null {
 
 function readTranscriptLine(line: string): CodeAgentTranscriptEvent | null {
   try {
-    const raw = JSON.parse(line) as unknown;
+    return readTranscriptValue(JSON.parse(line) as unknown);
+  } catch {
+    return null;
+  }
+}
+
+function readTranscriptValue(raw: unknown): CodeAgentTranscriptEvent | null {
+  try {
     if (!raw || typeof raw !== "object") return null;
     const event = raw as Partial<CodeAgentTranscriptEvent> & {
       type?: unknown;

@@ -1,28 +1,46 @@
+import { configureTracking } from "@agent-native/core/client/analytics";
+import { appPath } from "@agent-native/core/client/api-path";
+import {
+  createAgentNativeQueryClient,
+  getBrowserTabId,
+  useDbSync,
+} from "@agent-native/core/client/hooks";
+import { getEmbedAuthToken } from "@agent-native/core/client/host";
+import {
+  getLocaleInitScript,
+  type LocaleCode,
+  type LocaleMessages,
+  type LocalizationPreference,
+  useT,
+} from "@agent-native/core/client/i18n";
+import { getThemeInitScript } from "@agent-native/core/client/ui";
+import { resolveLocaleFromRequest } from "@agent-native/core/server";
+import { AppProviders } from "@agent-native/toolkit/app/providers";
+import { useCommandMenuShortcut } from "@agent-native/toolkit/app/shared";
+import { CommandMenu } from "@agent-native/toolkit/app/shared";
+import { IconHierarchy2, IconSun, IconMoon } from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useTheme } from "next-themes";
+import { useCallback, useEffect, useState } from "react";
 import {
   Links,
   Meta,
   Outlet,
   Scripts,
   ScrollRestoration,
+  useNavigate,
+  useLoaderData,
   useLocation,
+  useRouteLoaderData,
 } from "react-router";
-import { useCallback, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
-import { useTheme } from "next-themes";
+import type { LinksFunction, LoaderFunctionArgs } from "react-router";
 import { Toaster } from "sonner";
-import {
-  AppProviders,
-  CommandMenu,
-  DefaultSpinner,
-  appPath,
-  configureTracking,
-  createAgentNativeQueryClient,
-  getThemeInitScript,
-  useCommandMenuShortcut,
-  useDbSync,
-} from "@agent-native/core/client";
-import { IconSun, IconMoon } from "@tabler/icons-react";
-import type { LinksFunction } from "react-router";
+
+import { AppToolkitProvider } from "@/components/ui/toolkit-provider";
+
+import changelog from "../CHANGELOG.md?raw";
+import { i18nCatalog } from "./i18n";
+
 import stylesheet from "./global.css?url";
 configureTracking({
   getDefaultProps: (_name, properties) => ({
@@ -35,11 +53,54 @@ export const links: LinksFunction = () => [
   { rel: "stylesheet", href: stylesheet },
 ];
 
+interface RootLoaderData {
+  locale: LocaleCode;
+  preference: LocalizationPreference;
+  dir: "ltr" | "rtl";
+  messages: LocaleMessages;
+}
+
+export async function loader({
+  request,
+}: LoaderFunctionArgs): Promise<RootLoaderData> {
+  const resolved = resolveLocaleFromRequest({ request });
+  const messages =
+    ((await i18nCatalog.loadMessages?.(resolved.locale)) as
+      | LocaleMessages
+      | null
+      | undefined) ?? i18nCatalog.messages;
+  return {
+    locale: resolved.locale,
+    preference: resolved.preference,
+    dir: resolved.dir,
+    messages,
+  };
+}
+
 const THEME_INIT_SCRIPT = getThemeInitScript();
 
+const DEFAULT_LOADER_DATA: RootLoaderData = {
+  locale: "en-US",
+  preference: { locale: "system" },
+  dir: "ltr",
+  messages: i18nCatalog.messages,
+};
+
 export function Layout({ children }: { children: React.ReactNode }) {
+  const loaderData =
+    useRouteLoaderData<typeof loader>("root") ?? DEFAULT_LOADER_DATA;
+  const localeInitScript = getLocaleInitScript({
+    locale: loaderData.locale,
+    preference: loaderData.preference,
+  });
+
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html
+      lang={loaderData.locale}
+      dir={loaderData.dir}
+      data-locale={loaderData.locale}
+      suppressHydrationWarning
+    >
       <head>
         <meta charSet="utf-8" />
         <meta
@@ -50,8 +111,12 @@ export function Layout({ children }: { children: React.ReactNode }) {
           suppressHydrationWarning
           dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }}
         />
+        <script
+          data-agent-native-locale-init
+          suppressHydrationWarning
+          dangerouslySetInnerHTML={{ __html: localeInitScript }}
+        />
         <link rel="icon" type="image/svg+xml" href={appPath("/favicon.svg")} />
-        <link rel="manifest" href={appPath("/manifest.json")} />
         <meta name="theme-color" content="#00B5FF" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta
@@ -72,7 +137,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
   );
 }
 
-const TAB_ID = Math.random().toString(36).slice(2, 10);
+const TAB_ID = getBrowserTabId();
 
 function DbSyncSetup() {
   const qc = useQueryClient();
@@ -104,44 +169,80 @@ function DbSyncSetup() {
 
 function ThemeToggleItem() {
   const { resolvedTheme, setTheme } = useTheme();
-  const isDark = resolvedTheme === "dark";
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const t = useT();
+  const isDark = mounted && resolvedTheme === "dark";
   return (
     <CommandMenu.Item
       onSelect={() => setTheme(isDark ? "light" : "dark")}
       keywords={["theme", "dark", "light", "mode"]}
     >
       {isDark ? <IconSun size={16} /> : <IconMoon size={16} />}
-      Toggle theme
+      {t("root.toggleTheme")}
     </CommandMenu.Item>
   );
 }
 
-/**
- * Public booking routes (/book/*, /meet/*, /booking/manage/*) must SSR real
- * content for first-visit signed-out users and crawlers. These paths bypass
- * ClientOnly so entry.server.tsx can stream the actual route markup rather than
- * a bare spinner. Auth/private routes are unaffected.
- */
 function isPublicBookingPath(pathname: string): boolean {
   const p = pathname.replace(/\/+$/, "") || "/";
   return (
-    p.startsWith("/book/") ||
-    p.startsWith("/meet/") ||
-    p.startsWith("/booking/manage/")
+    /^\/book\/[^/]+(?:\/[^/]+)?$/.test(p) ||
+    /^\/meet\/[^/]+\/[^/]+$/.test(p) ||
+    /^\/booking\/manage\/[^/]+$/.test(p)
   );
 }
 
-function AppContent() {
+function isAgentNativeDesktop(): boolean {
+  return (
+    typeof navigator !== "undefined" &&
+    /AgentNativeDesktop/i.test(navigator.userAgent)
+  );
+}
+
+function PrivateAppContent() {
   const [cmdkOpen, setCmdkOpen] = useState(false);
+  const navigate = useNavigate();
+  const location = useLocation();
+  const t = useT();
   useCommandMenuShortcut(useCallback(() => setCmdkOpen(true), []));
   return (
     <>
       <DbSyncSetup />
-      <CommandMenu open={cmdkOpen} onOpenChange={setCmdkOpen}>
-        <CommandMenu.Group heading="Actions">
-          <CommandMenu.Item onSelect={() => {}}>Search</CommandMenu.Item>
+      <CommandMenu
+        open={cmdkOpen}
+        onOpenChange={setCmdkOpen}
+        changelog={changelog}
+        changelogKey="calendar"
+      >
+        <CommandMenu.Group heading={t("root.commandActions")}>
+          {location.pathname === "/home" ? (
+            <CommandMenu.Item onSelect={() => navigate("/booking-links")}>
+              {t("navigation.bookingLinks")}
+            </CommandMenu.Item>
+          ) : null}
+          {location.pathname.startsWith("/booking-links") ||
+          location.pathname.startsWith("/settings") ? (
+            <CommandMenu.Item onSelect={() => navigate("/home")}>
+              {t("navigation.calendar")}
+            </CommandMenu.Item>
+          ) : null}
+          <CommandMenu.Item
+            onSelect={() => navigate("/settings/agent")}
+            keywords={[
+              "agent",
+              "context",
+              "files",
+              "connections",
+              "jobs",
+              "access",
+            ]}
+          >
+            <IconHierarchy2 size={16} />
+            {t("settings.openAgentSettings")}
+          </CommandMenu.Item>
         </CommandMenu.Group>
-        <CommandMenu.Group heading="Appearance">
+        <CommandMenu.Group heading={t("root.commandAppearance")}>
           <ThemeToggleItem />
         </CommandMenu.Group>
       </CommandMenu>
@@ -150,34 +251,56 @@ function AppContent() {
   );
 }
 
+/**
+ * Bypass requires an actual embed credential, not just the `embedded=1`
+ * display flag: the Electron desktop shell opens every app tab with that
+ * flag and no token, and a bare-flag bypass sent those signed-out tabs
+ * straight into an infinite 401 poll instead of sign-in.
+ */
+export function computeSessionBypass(): boolean {
+  return Boolean(getEmbedAuthToken());
+}
+
 export default function Root() {
   const [queryClient] = useState(() =>
     createAgentNativeQueryClient({
       defaultOptions: {
         queries: {
-          // Calendar aggressively refetches on focus because external
-          // calendar events can change without a DB sync event (e.g. Google
-          // Calendar webhooks with a processing delay).
-          refetchOnWindowFocus: true,
-          // Flat retry: calendar data fetches don't need the auth-aware
-          // retry function — auth errors surface through the booking flow.
+          // Chrome gets one focus refresh because external calendar events can
+          // change without a DB sync event (e.g. delayed Google webhooks).
+          // Desktop already has the shell's focus-aware DB sync, and repeated
+          // webview focus events otherwise duplicate the events request.
+          // request-storm-allow: one user-driven focus refresh for provider data.
+          refetchOnWindowFocus: !isAgentNativeDesktop(),
           retry: 1,
         },
       },
     }),
   );
   const location = useLocation();
+  const loaderData = useLoaderData<typeof loader>();
+  const isPublicPath = isPublicBookingPath(location.pathname);
 
   return (
-    <AppProviders
-      queryClient={queryClient}
-      isPublicPath={isPublicBookingPath(location.pathname)}
-      clientOnlyFallback={<DefaultSpinner />}
-      toaster={<Toaster richColors position="bottom-center" />}
-    >
-      <AppContent />
-    </AppProviders>
+    <AppToolkitProvider>
+      <AppProviders
+        queryClient={queryClient}
+        skeletonLayout="calendar"
+        isPublicPath={isPublicPath}
+        sessionBypass={computeSessionBypass()}
+        toaster={<Toaster richColors position="bottom-center" />}
+        i18n={{
+          catalog: i18nCatalog,
+          initialLocale: loaderData.locale,
+          initialPreference: loaderData.preference,
+          initialMessages: loaderData.messages,
+          persistPreference: !isPublicPath,
+        }}
+      >
+        <PrivateAppContent />
+      </AppProviders>
+    </AppToolkitProvider>
   );
 }
 
-export { ErrorBoundary } from "@agent-native/core/client";
+export { ErrorBoundary } from "@agent-native/toolkit/app/shared";

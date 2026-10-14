@@ -1,13 +1,16 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { getDb, schema } from "../server/db/index.js";
-import { resolveAccess } from "@agent-native/core/sharing";
+import { defineAction } from "@agent-native/core/action";
 import {
   getRequestUserEmail,
   getRequestOrgId,
 } from "@agent-native/core/server/request-context";
+import { resolveAccess } from "@agent-native/core/sharing";
 import { nanoid } from "nanoid";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
+import { repairDeckSlideReferences } from "../shared/slide-ids.js";
 import { getDeckUrl } from "./_app-url.js";
+import { trackDeckCreated } from "./_deck-tracking.js";
 
 export default defineAction({
   description:
@@ -25,8 +28,21 @@ export default defineAction({
       .describe(
         "Optional client-supplied id for the new deck. Lets the UI pick the id ahead of time so it can navigate optimistically before the server responds.",
       ),
+    slideIds: z
+      .array(z.string().min(1).max(64))
+      .max(1000)
+      .optional()
+      .describe(
+        "Optional client-supplied ids for the copied slides, in slide order. Same purpose as `newId`: when the UI opens an optimistic copy the user can edit immediately, its slide ids must match the persisted copy or those edits address slides the server never had.",
+      ),
   }),
-  run: async ({ deckId, title, newId: clientNewId }) => {
+  http: { method: "POST" },
+  mcpAnnotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    openWorldHint: false,
+  },
+  run: async ({ deckId, title, newId: clientNewId, slideIds }, ctx) => {
     const access = await resolveAccess("deck", deckId);
     if (!access) throw new Error(`Deck not found: ${deckId}`);
 
@@ -36,12 +52,24 @@ export default defineAction({
     const now = new Date().toISOString();
     const deckData = JSON.parse(source.data);
 
-    // Generate new IDs for all slides so edits to the copy don't collide
-    for (const slide of deckData.slides || []) {
-      slide.id = `slide-${nanoid(8)}`;
+    const slides = deckData.slides || [];
+    const originalSlideIds = slides.map((slide: { id?: unknown }) =>
+      typeof slide.id === "string" ? slide.id : null,
+    );
+    for (const [index, slide] of slides.entries()) {
+      slide.id = slideIds?.[index] ?? `slide-${nanoid(8)}`;
+    }
+    if (
+      new Set(slides.map((s: { id: string }) => s.id)).size !== slides.length
+    ) {
+      throw new Error("slideIds must be unique");
     }
 
     const newTitle = title || `Copy of ${source.title}`;
+    Object.assign(
+      deckData,
+      repairDeckSlideReferences(deckData, slides, originalSlideIds),
+    );
     deckData.title = newTitle;
     deckData.createdAt = now;
     deckData.updatedAt = now;
@@ -62,11 +90,22 @@ export default defineAction({
       orgId: getRequestOrgId() || null,
     });
 
+    trackDeckCreated(
+      newId,
+      {
+        creationMethod: "duplicate",
+        purpose: "direct",
+        slideCount: (deckData.slides || []).length,
+      },
+      ctx,
+    );
+
     return {
       id: newId,
       title: newTitle,
       slideCount: (deckData.slides || []).length,
       url: getDeckUrl(newId),
+      appUrl: getDeckUrl(newId),
     };
   },
 });

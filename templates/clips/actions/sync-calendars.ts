@@ -12,113 +12,27 @@
  * row.
  */
 
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
+
+import { defineAction } from "@agent-native/core/action";
+import { writeAppState } from "@agent-native/core/application-state";
+import { emit } from "@agent-native/core/event-bus";
 import { accessFilter } from "@agent-native/core/sharing";
-import { readAppSecret, writeAppSecret } from "@agent-native/core/secrets";
+import { and, eq } from "drizzle-orm";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
+import {
+  recordCalendarFetchError,
+  recordCalendarFetchSuccess,
+  resolveCalendarAccessToken,
+  shouldMarkNeedsReauth,
+} from "../server/lib/calendar-event-meetings.js";
 import {
   listEvents,
-  refreshAccessToken,
   pickJoinUrl,
   type CalendarEvent,
 } from "../server/lib/google-calendar-client.js";
-import { writeAppState } from "@agent-native/core/application-state";
-import { emit } from "@agent-native/core/event-bus";
-
-interface AccessTokenBundle {
-  accessToken: string;
-  expiresAt?: number;
-  tokenType?: string;
-  scope?: string;
-}
-
-function parseAccessBundle(raw: string): AccessTokenBundle {
-  try {
-    const parsed = JSON.parse(raw) as AccessTokenBundle;
-    if (parsed && typeof parsed.accessToken === "string") return parsed;
-  } catch {
-    // older shape: raw token string
-  }
-  return { accessToken: raw };
-}
-
-/**
- * Resolve a fresh access token, refreshing via Google if expired.
- * Returns null if the account is unrecoverable (no refresh token,
- * permanent refresh failure).
- */
-async function resolveAccessToken(args: {
-  ownerEmail: string;
-  accessRef: string | null;
-  refreshRef: string | null;
-}): Promise<string | null> {
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  if (!clientId || !clientSecret) return null;
-
-  let bundle: AccessTokenBundle | null = null;
-  if (args.accessRef) {
-    const stored = await readAppSecret({
-      key: args.accessRef,
-      scope: "user",
-      scopeId: args.ownerEmail,
-    });
-    if (stored?.value) bundle = parseAccessBundle(stored.value);
-  }
-
-  // Token is fresh enough → use as-is (5 min skew).
-  if (
-    bundle?.accessToken &&
-    bundle.expiresAt &&
-    Date.now() < bundle.expiresAt - 5 * 60 * 1000
-  ) {
-    return bundle.accessToken;
-  }
-  if (bundle?.accessToken && !bundle.expiresAt) {
-    // Unknown expiry — try once and let the caller retry on 401 if needed.
-    return bundle.accessToken;
-  }
-
-  // Refresh path.
-  if (!args.refreshRef) return null;
-  const refreshSecret = await readAppSecret({
-    key: args.refreshRef,
-    scope: "user",
-    scopeId: args.ownerEmail,
-  });
-  if (!refreshSecret?.value) return null;
-
-  let refreshed;
-  try {
-    refreshed = await refreshAccessToken({
-      refreshToken: refreshSecret.value,
-      clientId,
-      clientSecret,
-    });
-  } catch {
-    return null;
-  }
-  if (!refreshed.access_token) return null;
-  if (args.accessRef) {
-    await writeAppSecret({
-      key: args.accessRef,
-      value: JSON.stringify({
-        accessToken: refreshed.access_token,
-        expiresAt: refreshed.expires_in
-          ? Date.now() + refreshed.expires_in * 1000
-          : undefined,
-        tokenType: refreshed.token_type,
-        scope: refreshed.scope,
-      }),
-      scope: "user",
-      scopeId: args.ownerEmail,
-    });
-  }
-  return refreshed.access_token;
-}
 
 function eventStartIso(event: CalendarEvent): string | null {
   return event.start?.dateTime || event.start?.date || null;
@@ -126,16 +40,6 @@ function eventStartIso(event: CalendarEvent): string | null {
 
 function eventEndIso(event: CalendarEvent): string | null {
   return event.end?.dateTime || event.end?.date || null;
-}
-
-function shouldMarkNeedsReauth(message: string): boolean {
-  const lower = message.toLowerCase();
-  return (
-    lower.includes("google calendar list failed (401)") ||
-    lower.includes("invalid_grant") ||
-    lower.includes("invalid_token") ||
-    lower.includes("insufficient_scope")
-  );
 }
 
 export default defineAction({
@@ -148,11 +52,6 @@ export default defineAction({
       .describe(
         "If set, only sync this calendar_accounts row. Otherwise sync every account visible to the current user.",
       ),
-    /**
-     * Internal flag used by the recurring `poll-calendars` job — when set,
-     * the action ignores the access filter and syncs every connected
-     * account on the system. Tokens are still scoped per-account-owner.
-     */
     allAccounts: z.boolean().default(false),
   }),
   run: async (args) => {
@@ -171,7 +70,6 @@ export default defineAction({
       .where(where.length ? and(...where) : undefined);
 
     const now = new Date();
-    // Sync window: 1h ago to 30 days out.
     const timeMin = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
     const timeMax = new Date(
       now.getTime() + 30 * 24 * 60 * 60 * 1000,
@@ -182,37 +80,18 @@ export default defineAction({
     const errors: { accountId: string; error: string }[] = [];
 
     for (const account of accounts) {
-      if (account.provider !== "google") continue; // iCloud / Microsoft handled elsewhere.
+      if (account.provider !== "google") continue;
       if (!account.ownerEmail) continue;
-      // Track per-account event counts so we can emit a `calendar-synced`
-      // event with accurate numbers after each account finishes (Fix 7).
       let perAccountEvents = 0;
       let perAccountMeetings = 0;
       try {
-        const accessToken = await resolveAccessToken({
-          ownerEmail: account.ownerEmail,
-          accessRef: account.accessTokenSecretRef ?? null,
-          refreshRef: account.refreshTokenSecretRef ?? null,
-        });
+        const accessToken = await resolveCalendarAccessToken(account);
         if (!accessToken) {
-          // Fix 10: isolate this account's needs-reauth write in its own
-          // try/catch so a downstream throw on a different account doesn't
-          // leave the flag unpersisted.
-          try {
-            await db
-              .update(schema.calendarAccounts)
-              .set({
-                status: "needs-reauth",
-                lastSyncError: "Token refresh failed — reconnect required.",
-                updatedAt: new Date().toISOString(),
-              })
-              .where(eq(schema.calendarAccounts.id, account.id));
-          } catch (writeErr: any) {
-            console.warn(
-              `[sync-calendars] failed to flag account ${account.id} as needs-reauth:`,
-              writeErr?.message ?? writeErr,
-            );
-          }
+          await recordCalendarFetchError(
+            account,
+            new Error("Token refresh failed"),
+            { needsReauth: true },
+          );
           errors.push({
             accountId: account.id,
             error: "needs-reauth",
@@ -228,11 +107,9 @@ export default defineAction({
           maxResults: 250,
         });
 
-        // Upsert events.
         for (const ev of items) {
           if (!ev.id) continue;
           if (ev.status === "cancelled") {
-            // Delete cancelled events from our cache.
             await db
               .delete(schema.calendarEvents)
               .where(
@@ -303,18 +180,8 @@ export default defineAction({
           perAccountEvents += 1;
         }
 
-        // Fix 10: isolate the success-path status write so other accounts'
-        // needs-reauth flags can't be wiped by a later account-level throw.
         try {
-          await db
-            .update(schema.calendarAccounts)
-            .set({
-              lastSyncedAt: new Date().toISOString(),
-              lastSyncError: null,
-              status: "connected",
-              updatedAt: new Date().toISOString(),
-            })
-            .where(eq(schema.calendarAccounts.id, account.id));
+          await recordCalendarFetchSuccess(account);
         } catch (writeErr: any) {
           console.warn(
             `[sync-calendars] failed to update account ${account.id} after success:`,
@@ -322,10 +189,6 @@ export default defineAction({
           );
         }
 
-        // Fix 7: emit `calendar-synced` so the UI can show a fresh-sync toast
-        // (e.g. "Synced 12 events, 3 meetings just now"). Best-effort — the
-        // event bus is in-process so this almost never throws, but we don't
-        // want a subscriber crash to roll back the sync.
         try {
           emit("calendar-synced", {
             accountId: account.id,
@@ -344,7 +207,6 @@ export default defineAction({
         const message = err?.message ?? String(err);
         errors.push({ accountId: account.id, error: message });
         const needsReauth = shouldMarkNeedsReauth(message);
-        // Fix 10: even the error-path write is its own try/catch.
         try {
           await db
             .update(schema.calendarAccounts)

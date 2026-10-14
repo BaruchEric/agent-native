@@ -1,11 +1,12 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
-import { resolveOwnerEmail } from "./helpers.js";
+
 import { loadContactsForEmail } from "../server/handlers/emails.js";
+import { resolveOwnerEmail } from "./helpers.js";
 
 export default defineAction({
   description:
-    "Look up an email address by name or partial email from the user's Google Contacts and recent message history. Use this BEFORE asking the user for someone's address — guessing patterns like 'firstinitiallastname@company.com' is unreliable, and most recipients are already in the user's contacts. Returns up to N matches sorted by how often the user emails them.",
+    "Look up an email address by name or partial email from the user's Google Contacts and recent message history. Use this BEFORE asking the user for someone's address — guessing patterns like 'firstinitiallastname@company.com' is unreliable, and most recipients are already in the user's contacts. Returns up to N matches sorted by how often the user emails them, plus account errors when results may be incomplete.",
   schema: z.object({
     query: z
       .string()
@@ -27,7 +28,7 @@ export default defineAction({
   readOnly: true,
   run: async ({ query, limit }) => {
     const ownerEmail = await resolveOwnerEmail();
-    const contacts = await loadContactsForEmail(ownerEmail);
+    const { contacts, errors } = await loadContactsForEmail(ownerEmail);
 
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
 
@@ -39,6 +40,6 @@ export default defineAction({
       .slice(0, limit)
       .map(({ name, email, count }) => ({ name, email, count }));
 
-    return { matches, total: matches.length };
+    return { matches, total: matches.length, errors };
   },
 });

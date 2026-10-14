@@ -1,9 +1,10 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import {
   getRequestUserEmail,
   getRequestOrgId,
 } from "@agent-native/core/server";
 import { z } from "zod";
+
 import { getDashboard } from "../server/lib/dashboards-store";
 
 export default defineAction({
@@ -32,6 +33,10 @@ export default defineAction({
       ownerEmail: dash.ownerEmail,
       orgId: dash.orgId,
       visibility: dash.visibility,
+      createdAt: dash.createdAt,
+      createdBy: dash.createdBy,
+      updatedAt: dash.updatedAt,
+      updatedBy: dash.updatedBy,
       role: dash.role,
       canEdit: dash.canEdit,
       canManage: dash.canManage,

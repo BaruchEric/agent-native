@@ -13,22 +13,35 @@ export type WorkspaceConnectionTemplateUse =
   | "calendar"
   | "clips"
   | "content"
+  | "crm"
   | "design"
   | "dispatch"
+  | "factory"
   | "forms"
   | "mail"
-  | "slides"
-  | "videos";
+  | "slides";
 
 export type WorkspaceConnectionProviderId =
   | "slack"
   | "github"
+  | "figma"
   | "notion"
   | "gmail"
+  | "google_calendar"
   | "google_drive"
+  | "bigquery"
+  | "google_docs"
+  | "google_sheets"
+  | "google_slides"
   | "hubspot"
+  | "salesforce"
+  | "jira"
+  | "sentry"
   | "granola"
   | "clips"
+  | "dbt"
+  | "sigma"
+  | "anthropic-managed-agents"
   | "generic";
 
 export interface WorkspaceConnectionCredentialKey {
@@ -38,18 +51,35 @@ export interface WorkspaceConnectionCredentialKey {
   required?: boolean;
 }
 
+export interface WorkspaceConnectionConfigurationField {
+  key: string;
+  label: string;
+  description?: string;
+  required?: boolean;
+  defaultValue?: string;
+}
+
 export interface WorkspaceConnectionProvider {
   id: WorkspaceConnectionProviderId;
   label: string;
   description: string;
   credentialKeys: readonly WorkspaceConnectionCredentialKey[];
+  configurationFields?: readonly WorkspaceConnectionConfigurationField[];
   capabilities: readonly WorkspaceConnectionCapability[];
   recommendedTemplateUses: readonly WorkspaceConnectionTemplateUse[];
+  oauth?: {
+    provider: string;
+    authorizationUrl: string;
+    tokenUrl: string;
+    refreshUrl?: string;
+    scopes: readonly string[];
+  };
 }
 
 export interface ListWorkspaceConnectionProvidersOptions {
   capability?: WorkspaceConnectionCapability;
   templateUse?: WorkspaceConnectionTemplateUse;
+  providerOverrides?: readonly WorkspaceConnectionProvider[];
 }
 
 export function defineWorkspaceConnectionProvider<
@@ -57,6 +87,35 @@ export function defineWorkspaceConnectionProvider<
 >(provider: T): T {
   return provider;
 }
+
+const GOOGLE_CREDENTIAL_KEYS = [
+  {
+    key: "GOOGLE_CLIENT_ID",
+    label: "Managed Google OAuth client ID",
+    description:
+      "Resolved from the workspace's shared Google OAuth application. Users do not paste a key to connect a service.",
+    required: true,
+  },
+  {
+    key: "GOOGLE_CLIENT_SECRET",
+    label: "Managed Google OAuth client secret",
+    description:
+      "Resolved from the workspace's shared Google OAuth application. Users do not paste a key to connect a service.",
+    required: true,
+  },
+] as const satisfies readonly WorkspaceConnectionCredentialKey[];
+
+const GOOGLE_OAUTH_BASE = {
+  provider: "google",
+  authorizationUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+  tokenUrl: "https://oauth2.googleapis.com/token",
+} as const;
+
+function googleOAuth(scopes: readonly string[], provider = "google") {
+  return { ...GOOGLE_OAUTH_BASE, provider, scopes };
+}
+
+const GOOGLE_IDENTITY_SCOPES = ["openid", "email", "profile"] as const;
 
 export const WORKSPACE_CONNECTION_PROVIDERS = [
   defineWorkspaceConnectionProvider({
@@ -67,14 +126,14 @@ export const WORKSPACE_CONNECTION_PROVIDERS = [
     credentialKeys: [
       {
         key: "SLACK_BOT_TOKEN",
-        label: "Slack bot token",
+        label: "Slack bot token (legacy)",
         description:
-          "Bot token with the smallest channel and history scopes needed by the template.",
+          "Legacy single-workspace fallback. For new messaging automations, connect Slack from Settings → Messaging instead.",
         required: true,
       },
     ],
     capabilities: ["search", "import", "messages"],
-    recommendedTemplateUses: ["brain", "dispatch", "analytics"],
+    recommendedTemplateUses: ["brain", "dispatch", "analytics", "factory"],
   }),
   defineWorkspaceConnectionProvider({
     id: "github",
@@ -84,29 +143,63 @@ export const WORKSPACE_CONNECTION_PROVIDERS = [
     credentialKeys: [
       {
         key: "GITHUB_TOKEN",
-        label: "GitHub token",
+        label: "GitHub token (fallback)",
         description:
-          "Fine-grained token or app credential scoped to the repositories the workspace should access.",
-        required: true,
+          "Optional fine-grained token fallback. OAuth is preferred for new connections.",
+        required: false,
       },
     ],
+    oauth: {
+      provider: "github",
+      authorizationUrl: "https://github.com/login/oauth/authorize",
+      tokenUrl: "https://github.com/login/oauth/access_token",
+      scopes: ["repo", "read:org", "read:user", "user:email"],
+    },
     capabilities: ["search", "import", "code", "docs"],
-    recommendedTemplateUses: ["brain", "analytics", "dispatch"],
+    recommendedTemplateUses: ["brain", "analytics", "dispatch", "factory"],
+  }),
+  defineWorkspaceConnectionProvider({
+    id: "figma",
+    label: "Figma",
+    description:
+      "Design files, frames, components, rendered previews, and library context for creative workflows.",
+    credentialKeys: [
+      {
+        key: "FIGMA_ACCESS_TOKEN",
+        label: "Figma personal access token (fallback)",
+        description:
+          "Optional fallback for local or individual use. Workspace OAuth is preferred.",
+        required: false,
+      },
+    ],
+    oauth: {
+      provider: "figma",
+      authorizationUrl: "https://www.figma.com/oauth",
+      tokenUrl: "https://api.figma.com/v1/oauth/token",
+      refreshUrl: "https://api.figma.com/v1/oauth/token",
+      scopes: [
+        "current_user:read",
+        "file_content:read",
+        "file_metadata:read",
+        "projects:read",
+      ],
+    },
+    capabilities: ["search", "import", "docs"],
+    recommendedTemplateUses: ["brain", "design", "slides", "content"],
   }),
   defineWorkspaceConnectionProvider({
     id: "notion",
     label: "Notion",
     description:
       "Workspace docs, wikis, pages, and databases for knowledge capture and search.",
-    credentialKeys: [
-      {
-        key: "NOTION_API_KEY",
-        label: "Notion API key",
-        description:
-          "Integration secret with access to the pages or databases shared with the integration.",
-        required: true,
-      },
-    ],
+    credentialKeys: [],
+    oauth: {
+      provider: "notion",
+      authorizationUrl: "https://api.notion.com/v1/oauth/authorize",
+      tokenUrl: "https://api.notion.com/v1/oauth/token",
+      refreshUrl: "https://api.notion.com/v1/oauth/token",
+      scopes: [],
+    },
     capabilities: ["search", "import", "docs"],
     recommendedTemplateUses: ["brain", "content", "dispatch"],
   }),
@@ -115,40 +208,104 @@ export const WORKSPACE_CONNECTION_PROVIDERS = [
     label: "Gmail",
     description:
       "Mailbox messages and threads for search, triage, customer context, and agent replies.",
-    credentialKeys: [
-      {
-        key: "GOOGLE_CLIENT_ID",
-        label: "Google OAuth client ID",
-        required: true,
-      },
-      {
-        key: "GOOGLE_CLIENT_SECRET",
-        label: "Google OAuth client secret",
-        required: true,
-      },
-    ],
+    credentialKeys: GOOGLE_CREDENTIAL_KEYS,
     capabilities: ["search", "import", "messages"],
     recommendedTemplateUses: ["mail", "brain", "dispatch"],
+    oauth: googleOAuth([
+      ...GOOGLE_IDENTITY_SCOPES,
+      "https://www.googleapis.com/auth/gmail.readonly",
+      "https://www.googleapis.com/auth/gmail.send",
+      "https://www.googleapis.com/auth/gmail.modify",
+      "https://www.googleapis.com/auth/gmail.settings.basic",
+      "https://www.googleapis.com/auth/contacts.readonly",
+      "https://www.googleapis.com/auth/contacts.other.readonly",
+    ]),
+  }),
+  defineWorkspaceConnectionProvider({
+    id: "google_calendar",
+    label: "Google Calendar",
+    description:
+      "Calendars and events for scheduling, availability, reminders, and meeting workflows.",
+    credentialKeys: GOOGLE_CREDENTIAL_KEYS,
+    capabilities: ["search", "import", "meetings"],
+    recommendedTemplateUses: ["calendar", "brain", "dispatch", "mail"],
+    oauth: googleOAuth([
+      ...GOOGLE_IDENTITY_SCOPES,
+      "https://www.googleapis.com/auth/calendar.readonly",
+      "https://www.googleapis.com/auth/calendar.events",
+    ]),
+  }),
+  defineWorkspaceConnectionProvider({
+    id: "bigquery",
+    label: "BigQuery",
+    description:
+      "BigQuery datasets and SQL jobs for analytics and data exploration.",
+    credentialKeys: GOOGLE_CREDENTIAL_KEYS,
+    capabilities: ["search"],
+    recommendedTemplateUses: ["analytics"],
+    oauth: googleOAuth([
+      ...GOOGLE_IDENTITY_SCOPES,
+      "https://www.googleapis.com/auth/bigquery",
+    ]),
   }),
   defineWorkspaceConnectionProvider({
     id: "google_drive",
     label: "Google Drive",
     description:
       "Drive files, Docs, Sheets, and Slides for document search and import workflows.",
-    credentialKeys: [
-      {
-        key: "GOOGLE_CLIENT_ID",
-        label: "Google OAuth client ID",
-        required: true,
-      },
-      {
-        key: "GOOGLE_CLIENT_SECRET",
-        label: "Google OAuth client secret",
-        required: true,
-      },
+    credentialKeys: GOOGLE_CREDENTIAL_KEYS,
+    capabilities: ["search", "import", "docs"],
+    recommendedTemplateUses: [
+      "brain",
+      "content",
+      "slides",
+      "dispatch",
+      "analytics",
     ],
+    oauth: googleOAuth([
+      ...GOOGLE_IDENTITY_SCOPES,
+      "https://www.googleapis.com/auth/drive.file",
+      "https://www.googleapis.com/auth/drive.readonly",
+    ]),
+  }),
+  defineWorkspaceConnectionProvider({
+    id: "google_docs",
+    label: "Google Docs",
+    description:
+      "Google Docs files for source material, document search, and agent-assisted writing workflows.",
+    credentialKeys: GOOGLE_CREDENTIAL_KEYS,
     capabilities: ["search", "import", "docs"],
     recommendedTemplateUses: ["brain", "content", "slides", "dispatch"],
+    oauth: googleOAuth([
+      ...GOOGLE_IDENTITY_SCOPES,
+      "https://www.googleapis.com/auth/documents.readonly",
+    ]),
+  }),
+  defineWorkspaceConnectionProvider({
+    id: "google_sheets",
+    label: "Google Sheets",
+    description:
+      "Google Sheets workbooks for analysis, reporting, imports, and structured agent workflows.",
+    credentialKeys: GOOGLE_CREDENTIAL_KEYS,
+    capabilities: ["search", "import", "docs"],
+    recommendedTemplateUses: ["analytics", "brain", "content", "dispatch"],
+    oauth: googleOAuth(
+      [...GOOGLE_IDENTITY_SCOPES, "https://www.googleapis.com/auth/drive.file"],
+      "google_sheets",
+    ),
+  }),
+  defineWorkspaceConnectionProvider({
+    id: "google_slides",
+    label: "Google Slides",
+    description:
+      "Google Slides presentations for reference imports, visual context, and presentation workflows.",
+    credentialKeys: GOOGLE_CREDENTIAL_KEYS,
+    capabilities: ["search", "import", "docs"],
+    recommendedTemplateUses: ["brain", "content", "slides", "dispatch"],
+    oauth: googleOAuth([
+      ...GOOGLE_IDENTITY_SCOPES,
+      "https://www.googleapis.com/auth/presentations.readonly",
+    ]),
   }),
   defineWorkspaceConnectionProvider({
     id: "hubspot",
@@ -158,14 +315,124 @@ export const WORKSPACE_CONNECTION_PROVIDERS = [
     credentialKeys: [
       {
         key: "HUBSPOT_PRIVATE_APP_TOKEN",
-        label: "HubSpot private app token",
+        label: "HubSpot private app token (fallback)",
         description:
-          "Private app token scoped to the CRM objects the workspace needs.",
-        required: true,
+          "Optional private app token fallback. OAuth is preferred for new connections.",
+        required: false,
+      },
+      {
+        key: "HUBSPOT_ACCESS_TOKEN",
+        label: "HubSpot access token (fallback)",
+        description:
+          "Optional legacy access token fallback for existing HubSpot setups.",
+        required: false,
       },
     ],
+    oauth: {
+      provider: "hubspot",
+      authorizationUrl: "https://app.hubspot.com/oauth/authorize",
+      tokenUrl: "https://api.hubapi.com/oauth/v3/token",
+      refreshUrl: "https://api.hubapi.com/oauth/v3/token",
+      scopes: [
+        "oauth",
+        "crm.objects.contacts.read",
+        "crm.objects.companies.read",
+        "crm.objects.deals.read",
+        "crm.objects.tickets.read",
+        "crm.schemas.contacts.read",
+        "crm.schemas.companies.read",
+        "crm.schemas.deals.read",
+        "crm.schemas.tickets.read",
+      ],
+    },
     capabilities: ["search", "import", "crm"],
-    recommendedTemplateUses: ["analytics", "brain", "mail", "dispatch"],
+    recommendedTemplateUses: ["analytics", "brain", "crm", "mail", "dispatch"],
+  }),
+  defineWorkspaceConnectionProvider({
+    id: "salesforce",
+    label: "Salesforce",
+    description:
+      "CRM accounts, contacts, opportunities, custom objects, and activity history for customer-aware apps.",
+    credentialKeys: [],
+    oauth: {
+      provider: "salesforce",
+      authorizationUrl:
+        "https://login.salesforce.com/services/oauth2/authorize",
+      tokenUrl: "https://login.salesforce.com/services/oauth2/token",
+      refreshUrl: "https://login.salesforce.com/services/oauth2/token",
+      scopes: ["api", "refresh_token", "id"],
+    },
+    capabilities: ["search", "import", "crm"],
+    recommendedTemplateUses: ["analytics", "brain", "crm", "dispatch"],
+  }),
+  defineWorkspaceConnectionProvider({
+    id: "jira",
+    label: "Jira Cloud",
+    description:
+      "Projects, issues, sprints, and delivery context for engineering analytics and product workflows.",
+    credentialKeys: [
+      {
+        key: "JIRA_BASE_URL",
+        label: "Jira base URL (fallback)",
+        description:
+          "Optional site URL for API-token fallback connections. OAuth connections discover their site automatically.",
+        required: false,
+      },
+      {
+        key: "JIRA_USER_EMAIL",
+        label: "Jira email (fallback)",
+        description:
+          "Optional Atlassian account email for API-token fallback connections.",
+        required: false,
+      },
+      {
+        key: "JIRA_API_TOKEN",
+        label: "Jira API token (fallback)",
+        description:
+          "Optional API token fallback for existing Jira Cloud setups. OAuth is preferred for new connections.",
+        required: false,
+      },
+    ],
+    oauth: {
+      provider: "jira",
+      authorizationUrl: "https://auth.atlassian.com/authorize",
+      tokenUrl: "https://auth.atlassian.com/oauth/token",
+      refreshUrl: "https://auth.atlassian.com/oauth/token",
+      scopes: ["read:jira-work", "read:jira-user", "offline_access"],
+    },
+    capabilities: ["search", "import", "code", "docs"],
+    recommendedTemplateUses: ["analytics", "brain", "dispatch"],
+  }),
+  defineWorkspaceConnectionProvider({
+    id: "sentry",
+    label: "Sentry",
+    description:
+      "Error tracking, performance issues, projects, and release context for engineering analytics.",
+    credentialKeys: [
+      {
+        key: "SENTRY_AUTH_TOKEN",
+        label: "Sentry auth token (fallback)",
+        description:
+          "Optional auth token fallback for self-hosted or local Sentry setups. OAuth is preferred for sentry.io.",
+        required: false,
+      },
+      {
+        key: "SENTRY_SERVER_TOKEN",
+        label: "Sentry server token (fallback)",
+        description:
+          "Optional server token fallback for existing Sentry deployments.",
+        required: false,
+      },
+    ],
+    oauth: {
+      provider: "sentry",
+      authorizationUrl: "https://sentry.io/oauth/authorize/",
+      tokenUrl: "https://sentry.io/oauth/token/",
+      refreshUrl: "https://sentry.io/oauth/token/",
+      scopes: ["org:read", "project:read", "event:read", "team:read"],
+    },
+    capabilities: ["search", "import", "docs"],
+    recommendedTemplateUses: ["analytics", "brain", "dispatch", "factory"],
   }),
   defineWorkspaceConnectionProvider({
     id: "granola",
@@ -188,10 +455,91 @@ export const WORKSPACE_CONNECTION_PROVIDERS = [
     id: "clips",
     label: "Clips",
     description:
-      "Agent-native Clips exports and recordings for transcript import and searchable meeting context.",
+      "Agent-Native Clips exports and recordings for transcript import and searchable meeting context.",
     credentialKeys: [],
     capabilities: ["search", "import", "meetings"],
-    recommendedTemplateUses: ["brain", "clips", "videos"],
+    recommendedTemplateUses: ["brain", "clips"],
+  }),
+  defineWorkspaceConnectionProvider({
+    id: "sigma",
+    label: "Sigma",
+    description:
+      "Read Sigma workbooks and reviewed dashboard examples for Analytics data discovery.",
+    credentialKeys: [
+      {
+        key: "SIGMA_CLIENT_ID",
+        label: "Sigma client ID",
+        description:
+          "Stored in the workspace vault and exchanged server-side for a short-lived API token.",
+        required: true,
+      },
+      {
+        key: "SIGMA_CLIENT_SECRET",
+        label: "Sigma client secret",
+        description:
+          "Stored in the workspace vault and exchanged server-side for a short-lived API token.",
+        required: true,
+      },
+      {
+        key: "SIGMA_BASE_URL",
+        label: "Sigma API base URL",
+        description:
+          "Optional cloud-region API origin. Defaults to the AWS API origin.",
+        required: false,
+      },
+    ],
+    capabilities: ["search"],
+    recommendedTemplateUses: ["analytics"],
+  }),
+  defineWorkspaceConnectionProvider({
+    id: "dbt",
+    label: "dbt Semantic Layer",
+    description:
+      "Owner-defined dbt metrics and semantic models for governed Analytics queries.",
+    credentialKeys: [
+      {
+        key: "DBT_SEMANTIC_LAYER_TOKEN",
+        label: "dbt Semantic Layer token",
+        description:
+          "Optional read-only service token with Semantic Layer Only and Metadata Only permissions. Store the one-time token in the workspace vault.",
+        required: false,
+      },
+    ],
+    configurationFields: [
+      {
+        key: "semanticLayerBaseUrl",
+        label: "dbt Semantic Layer URL",
+        description:
+          "HTTPS GraphQL endpoint for this dbt account. The host must belong to dbt.com or getdbt.com.",
+        required: true,
+      },
+      {
+        key: "semanticLayerEnvironmentId",
+        label: "dbt environment ID",
+        description:
+          "Environment that contains the approved Semantic Layer definitions.",
+        required: true,
+      },
+    ],
+    capabilities: ["search"],
+    recommendedTemplateUses: ["analytics"],
+  }),
+  defineWorkspaceConnectionProvider({
+    id: "anthropic-managed-agents",
+    label: "Anthropic Managed Agents",
+    description:
+      "Hosted Anthropic agents that run their own tools and context while Agent-Native keeps the app workflow and approvals.",
+    credentialKeys: [
+      {
+        key: "ANTHROPIC_API_KEY",
+        label: "Anthropic API key",
+        description:
+          "API key for the Anthropic Managed Agents API. Store it in the workspace vault.",
+        required: true,
+      },
+    ],
+    capabilities: ["code"],
+    recommendedTemplateUses: ["brain", "dispatch", "factory"],
   }),
   defineWorkspaceConnectionProvider({
     id: "generic",
@@ -218,33 +566,46 @@ const PROVIDERS_BY_ID = new Map<
 export function listWorkspaceConnectionProviders(
   options: ListWorkspaceConnectionProvidersOptions = {},
 ): WorkspaceConnectionProvider[] {
-  return WORKSPACE_CONNECTION_PROVIDERS.filter((provider) => {
-    if (
-      options.capability &&
-      !includesWorkspaceConnectionCapability(
-        provider.capabilities,
-        options.capability,
-      )
-    ) {
-      return false;
-    }
-    if (
-      options.templateUse &&
-      !includesWorkspaceConnectionTemplateUse(
-        provider.recommendedTemplateUses,
-        options.templateUse,
-      )
-    ) {
-      return false;
-    }
-    return true;
-  }).map((provider) => ({ ...provider }));
+  return mergeWorkspaceConnectionProviders(options.providerOverrides)
+    .filter((provider) => {
+      if (
+        options.capability &&
+        !includesWorkspaceConnectionCapability(
+          provider.capabilities,
+          options.capability,
+        )
+      ) {
+        return false;
+      }
+      if (
+        options.templateUse &&
+        !includesWorkspaceConnectionTemplateUse(
+          provider.recommendedTemplateUses,
+          options.templateUse,
+        )
+      ) {
+        return false;
+      }
+      return true;
+    })
+    .map((provider) => ({ ...provider }));
+}
+
+export function mergeWorkspaceConnectionProviders(
+  overrides: readonly WorkspaceConnectionProvider[] = [],
+): WorkspaceConnectionProvider[] {
+  return mergeDefinitionsById(WORKSPACE_CONNECTION_PROVIDERS, overrides);
 }
 
 export function getWorkspaceConnectionProvider(
   id: string,
+  overrides: readonly WorkspaceConnectionProvider[] = [],
 ): WorkspaceConnectionProvider | undefined {
-  const provider = PROVIDERS_BY_ID.get(id as WorkspaceConnectionProviderId);
+  const provider = overrides.length
+    ? mergeWorkspaceConnectionProviders(overrides).find(
+        (candidate) => candidate.id === id,
+      )
+    : PROVIDERS_BY_ID.get(id as WorkspaceConnectionProviderId);
   return provider ? { ...provider } : undefined;
 }
 
@@ -256,14 +617,16 @@ export function isWorkspaceConnectionProviderId(
 
 export function listWorkspaceConnectionProvidersForTemplate(
   templateUse: WorkspaceConnectionTemplateUse,
+  providerOverrides: readonly WorkspaceConnectionProvider[] = [],
 ): WorkspaceConnectionProvider[] {
-  return listWorkspaceConnectionProviders({ templateUse });
+  return listWorkspaceConnectionProviders({ templateUse, providerOverrides });
 }
 
 export function listWorkspaceConnectionProvidersForCapability(
   capability: WorkspaceConnectionCapability,
+  providerOverrides: readonly WorkspaceConnectionProvider[] = [],
 ): WorkspaceConnectionProvider[] {
-  return listWorkspaceConnectionProviders({ capability });
+  return listWorkspaceConnectionProviders({ capability, providerOverrides });
 }
 
 export function workspaceConnectionProviderSupports(
@@ -290,3 +653,4 @@ function includesWorkspaceConnectionTemplateUse(
 ): boolean {
   return templateUses.includes(templateUse);
 }
+import { mergeDefinitionsById } from "../shared/merge-by-id.js";

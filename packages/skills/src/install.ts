@@ -688,20 +688,34 @@ ${MANAGED_BLOCK_END}
 `;
 }
 
+function stripManagedBlocks(text: string): string {
+  let result = text;
+  for (;;) {
+    const start = result.indexOf(MANAGED_BLOCK_START);
+    if (start < 0) break;
+    const end = result.indexOf(MANAGED_BLOCK_END, start);
+    if (end < 0) break;
+    result =
+      result.slice(0, start) + result.slice(end + MANAGED_BLOCK_END.length);
+  }
+  return result;
+}
+
 export function upsertManagedBlock(
   file: string,
   block: string,
   dryRun = false,
 ): boolean {
   const current = fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : "";
-  const start = current.indexOf(MANAGED_BLOCK_START);
-  const end = current.indexOf(MANAGED_BLOCK_END);
+  const firstAt = current.indexOf(MANAGED_BLOCK_START);
   let next: string;
-  if (start >= 0 && end >= start) {
-    const afterEnd = end + MANAGED_BLOCK_END.length;
-    next = `${current.slice(0, start).trimEnd()}\n\n${block.trimEnd()}\n${current
-      .slice(afterEnd)
-      .trimStart()}`;
+  if (firstAt >= 0) {
+    const before = current.slice(0, firstAt).trimEnd();
+    const after = stripManagedBlocks(current.slice(firstAt)).trimStart();
+    next =
+      (before ? `${before}\n\n` : "") +
+      `${block.trimEnd()}\n` +
+      (after ? `\n${after}` : "");
   } else {
     next = `${current.trimEnd()}${current.trim() ? "\n\n" : ""}${block.trimEnd()}\n`;
   }

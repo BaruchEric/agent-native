@@ -1,216 +1,529 @@
+import { useT } from "@agent-native/core/client/i18n";
+import {
+  MIC_AUDIBLE_LEVEL,
+  MIC_SILENCE_WARNING_MS,
+  micSignalWarning,
+} from "@shared/audio-meter";
+import { LiveWaveform } from "@shared/live-waveform";
+import type {
+  RecordingPlayheadConfirmChange,
+  RecordingPlayheadIntent,
+  RecordingPlayheadLayout,
+} from "@shared/recording-playhead";
+import { RecordingPlayhead } from "@shared/recording-playhead";
+import {
+  clampRecordingPlayheadPosition,
+  dockRecordingPlayhead,
+  resizeRecordingPlayheadPosition,
+} from "@shared/recording-playhead-position";
+import type {
+  RecordingPlayheadPosition,
+  RecordingPlayheadSize,
+} from "@shared/recording-playhead-position";
+import { IconAlertTriangle } from "@tabler/icons-react";
 import { useEffect, useRef, useState } from "react";
-import {
-  IconConfetti,
-  IconPlayerPause,
-  IconPlayerPlay,
-  IconPlayerStop,
-  IconX,
-} from "@tabler/icons-react";
-import {
-  clampToViewport,
-  snapToCorner,
-  type BubblePosition,
-} from "./camera-positioner";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import { isMacPlatform } from "@/lib/utils";
 
 export interface RecordingToolbarProps {
-  elapsedMs: number;
+  active: boolean;
+  saving?: boolean;
+  getElapsedMs: () => number;
+  getMicrophoneTrack: () => MediaStreamTrack | null;
+  microphoneEnabled: boolean;
   isPaused: boolean;
   onTogglePause: () => void;
   onStop: () => void;
-  onConfetti: () => void;
   onCancel: () => void;
+  onConfirmAction: (intent: RecordingPlayheadIntent) => void;
+  onConfirmChange: (change: RecordingPlayheadConfirmChange) => void;
 }
 
-const TOOLBAR_WIDTH = 276;
-const TOOLBAR_HEIGHT = 56;
+const TOOLBAR_HORIZONTAL_SIZE: RecordingPlayheadSize = {
+  width: 150,
+  height: 56,
+};
+const TOOLBAR_VERTICAL_SIZE: RecordingPlayheadSize = {
+  width: 42,
+  height: 118,
+};
+const TOOLBAR_TOP_OFFSET = 48;
+const MICROPHONE_TRACK_RETRY_MS = 250;
 
-function formatElapsed(ms: number): string {
-  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
-  const m = Math.floor(totalSeconds / 60);
-  const s = totalSeconds % 60;
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+function getAudioContextCtor(): typeof AudioContext | null {
+  return (
+    window.AudioContext ??
+    (window as typeof window & { webkitAudioContext?: typeof AudioContext })
+      .webkitAudioContext ??
+    null
+  );
+}
+
+function useLiveMicrophoneMeter({
+  active,
+  isPaused,
+  getMicrophoneTrack,
+  microphoneEnabled,
+}: Pick<
+  RecordingToolbarProps,
+  "active" | "isPaused" | "getMicrophoneTrack" | "microphoneEnabled"
+>) {
+  const [level, setLevel] = useState<number | null>(null);
+  const [silentForMs, setSilentForMs] = useState(0);
+  const hadLiveAnalyserRef = useRef(false);
+  const getMicrophoneTrackRef = useRef(getMicrophoneTrack);
+  getMicrophoneTrackRef.current = getMicrophoneTrack;
+
+  useEffect(() => {
+    setLevel(null);
+    setSilentForMs(0);
+    if (!active) {
+      hadLiveAnalyserRef.current = false;
+      return;
+    }
+    if (isPaused || !microphoneEnabled) return;
+
+    let disposed = false;
+    let trackRetryTimeoutId: number | null = null;
+    let cleanupAnalyser: (() => void) | null = null;
+    const missingTrackStartedAt = performance.now();
+
+    const attachAnalyser = (track: MediaStreamTrack) => {
+      const AudioContextCtor = getAudioContextCtor();
+      if (!AudioContextCtor) return;
+
+      let context: AudioContext | null = null;
+      let source: MediaStreamAudioSourceNode | null = null;
+      let analyser: AnalyserNode | null = null;
+      try {
+        context = new AudioContextCtor();
+        source = context.createMediaStreamSource(new MediaStream([track]));
+        analyser = context.createAnalyser();
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.2;
+        source.connect(analyser);
+      } catch {
+        try {
+          source?.disconnect();
+          analyser?.disconnect();
+        } catch {
+          // A partial graph may already have been disconnected by the browser.
+        }
+        void context?.close().catch(() => {});
+        return;
+      }
+
+      const liveContext = context;
+      const liveSource = source;
+      const liveAnalyser = analyser;
+      hadLiveAnalyserRef.current = true;
+
+      let rafId: number | null = null;
+      let stopped = false;
+      let silenceStartedAt: number | null = null;
+      let silenceWarningTimeoutId: number | null = null;
+      const samples = new Uint8Array(analyser.fftSize);
+
+      const clearSilenceWarningTimeout = () => {
+        if (silenceWarningTimeoutId === null) return;
+        window.clearTimeout(silenceWarningTimeoutId);
+        silenceWarningTimeoutId = null;
+      };
+
+      const cleanup = () => {
+        if (stopped) return;
+        stopped = true;
+        if (rafId !== null) cancelAnimationFrame(rafId);
+        clearSilenceWarningTimeout();
+        track.removeEventListener("ended", handleTrackEnded);
+        try {
+          liveSource.disconnect();
+        } catch (error) {
+          console.debug(
+            "[recording-toolbar] audio source was already disconnected",
+            error,
+          );
+        }
+        try {
+          liveAnalyser.disconnect();
+        } catch (error) {
+          console.debug(
+            "[recording-toolbar] audio analyser was already disconnected",
+            error,
+          );
+        }
+        void liveContext.close().catch((error: unknown) => {
+          console.debug(
+            "[recording-toolbar] audio context was already closed",
+            error,
+          );
+        });
+      };
+
+      const handleTrackEnded = () => {
+        cleanup();
+        if (disposed) return;
+        setLevel(null);
+        setSilentForMs(MIC_SILENCE_WARNING_MS);
+      };
+
+      const sample = () => {
+        if (stopped) return;
+        liveAnalyser.getByteTimeDomainData(samples);
+        let squareSum = 0;
+        for (const value of samples) {
+          const normalized = (value - 128) / 128;
+          squareSum += normalized * normalized;
+        }
+        const rms = Math.sqrt(squareSum / samples.length);
+        const audible = rms >= MIC_AUDIBLE_LEVEL;
+        const now = performance.now();
+
+        if (audible) {
+          silenceStartedAt = null;
+          clearSilenceWarningTimeout();
+          setLevel(rms);
+          setSilentForMs(0);
+        } else {
+          setLevel(0);
+          if (silenceStartedAt === null) {
+            silenceStartedAt = now;
+            silenceWarningTimeoutId = window.setTimeout(() => {
+              silenceWarningTimeoutId = null;
+              if (stopped || silenceStartedAt === null) return;
+              setSilentForMs(MIC_SILENCE_WARNING_MS);
+            }, MIC_SILENCE_WARNING_MS);
+          }
+        }
+
+        rafId = requestAnimationFrame(sample);
+      };
+
+      cleanupAnalyser = cleanup;
+      track.addEventListener("ended", handleTrackEnded);
+      if (track.readyState === "ended") {
+        handleTrackEnded();
+        return;
+      }
+      if (liveContext.state === "suspended") {
+        void liveContext.resume().catch(() => {});
+      }
+      sample();
+    };
+
+    const checkForTrack = () => {
+      if (disposed) return;
+      const track = getMicrophoneTrackRef.current();
+      if (track && track.readyState !== "ended") {
+        attachAnalyser(track);
+        return;
+      }
+      if (hadLiveAnalyserRef.current) {
+        setSilentForMs(MIC_SILENCE_WARNING_MS);
+        return;
+      }
+
+      const remaining =
+        MIC_SILENCE_WARNING_MS - (performance.now() - missingTrackStartedAt);
+      if (remaining <= 0) {
+        setSilentForMs(MIC_SILENCE_WARNING_MS);
+        return;
+      }
+      trackRetryTimeoutId = window.setTimeout(
+        checkForTrack,
+        Math.min(MICROPHONE_TRACK_RETRY_MS, remaining),
+      );
+    };
+
+    checkForTrack();
+
+    return () => {
+      disposed = true;
+      if (trackRetryTimeoutId !== null) {
+        window.clearTimeout(trackRetryTimeoutId);
+      }
+      cleanupAnalyser?.();
+    };
+  }, [active, isPaused, microphoneEnabled]);
+
+  return {
+    level,
+    warning: micSignalWarning({
+      microphoneEnabled,
+      paused: isPaused || !active,
+      silentForMs,
+    }),
+  };
 }
 
 export function RecordingToolbar({
-  elapsedMs,
+  active,
+  saving = false,
+  getElapsedMs,
+  getMicrophoneTrack,
+  microphoneEnabled,
   isPaused,
   onTogglePause,
   onStop,
-  onConfetti,
   onCancel,
+  onConfirmAction,
+  onConfirmChange,
 }: RecordingToolbarProps) {
+  const t = useT();
   const rootRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState<BubblePosition>(() =>
+  const microphoneMeter = useLiveMicrophoneMeter({
+    active,
+    isPaused,
+    getMicrophoneTrack,
+    microphoneEnabled,
+  });
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const getElapsedMsRef = useRef(getElapsedMs);
+  getElapsedMsRef.current = getElapsedMs;
+  useEffect(() => {
+    if (!active) return;
+    const id = window.setInterval(() => {
+      setElapsedMs(getElapsedMsRef.current());
+    }, 250);
+    return () => window.clearInterval(id);
+  }, [active]);
+
+  const [pos, setPos] = useState<RecordingPlayheadPosition>(() =>
     typeof window === "undefined"
-      ? { left: 16, top: 16, corner: "tl" }
+      ? {
+          left: 16,
+          top: 16,
+          orientation: "horizontal",
+          dock: "free",
+          slot: null,
+        }
       : {
-          left: Math.max(16, (window.innerWidth - TOOLBAR_WIDTH) / 2),
-          top: window.innerHeight - TOOLBAR_HEIGHT - 32,
-          corner: "bl",
+          left: Math.max(
+            16,
+            (window.innerWidth - TOOLBAR_HORIZONTAL_SIZE.width) / 2,
+          ),
+          top: Math.max(16, window.innerHeight / 2 + TOOLBAR_TOP_OFFSET),
+          orientation: "horizontal",
+          dock: "free",
+          slot: null,
         },
   );
+  const posRef = useRef(pos);
+  posRef.current = pos;
+  const dragPositionRef = useRef(pos);
+  const activePointerIdRef = useRef<number | null>(null);
   const [dragging, setDragging] = useState(false);
   const dragOffsetRef = useRef({ dx: 0, dy: 0 });
+  const [toolbarLayout, setToolbarLayout] = useState<RecordingPlayheadLayout>(
+    TOOLBAR_HORIZONTAL_SIZE,
+  );
+  const playheadSizesRef = useRef({
+    horizontal: TOOLBAR_HORIZONTAL_SIZE,
+    vertical: TOOLBAR_VERTICAL_SIZE,
+  });
+  const [pendingAction, setPendingAction] =
+    useState<RecordingPlayheadIntent | null>(null);
+  const toolbarLayoutRef = useRef(toolbarLayout);
+  toolbarLayoutRef.current = toolbarLayout;
+
+  useEffect(() => {
+    if (!active) setPendingAction(null);
+  }, [active]);
+
+  function handlePlayheadLayoutChange(layout: RecordingPlayheadLayout) {
+    const orientation = posRef.current.orientation;
+    const minimum =
+      orientation === "vertical"
+        ? TOOLBAR_VERTICAL_SIZE
+        : TOOLBAR_HORIZONTAL_SIZE;
+    const nextLayout = {
+      width: Math.max(minimum.width, Math.ceil(layout.width)),
+      height: Math.max(minimum.height, Math.ceil(layout.height)),
+    } satisfies RecordingPlayheadLayout;
+    playheadSizesRef.current[orientation] = nextLayout;
+    toolbarLayoutRef.current = nextLayout;
+    setToolbarLayout((previous) =>
+      previous.width === nextLayout.width &&
+      previous.height === nextLayout.height
+        ? previous
+        : nextLayout,
+    );
+    setPos((previous) => {
+      const next = resizeRecordingPlayheadPosition(
+        previous,
+        playheadSizesRef.current,
+        {
+          left: 0,
+          top: 0,
+          width: window.innerWidth,
+          height: window.innerHeight,
+        },
+      );
+      if (
+        next.left === previous.left &&
+        next.top === previous.top &&
+        next.orientation === previous.orientation
+      ) {
+        return previous;
+      }
+      return next;
+    });
+  }
+
+  function handlePlayheadConfirmAction(intent: RecordingPlayheadIntent) {
+    setPendingAction(intent);
+    onConfirmAction(intent);
+  }
 
   useEffect(() => {
     function onResize() {
-      setPos((p) =>
-        snapToCorner(p.left, p.top, Math.max(TOOLBAR_WIDTH, TOOLBAR_HEIGHT), {
+      setPos((p) => {
+        return resizeRecordingPlayheadPosition(p, playheadSizesRef.current, {
+          left: 0,
+          top: 0,
           width: window.innerWidth,
           height: window.innerHeight,
-        }),
-      );
+        });
+      });
     }
     window.addEventListener("resize", onResize);
+    onResize();
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
   function onPointerDown(e: React.PointerEvent<HTMLDivElement>) {
     const target = e.target as HTMLElement;
-    if (target.closest("[data-toolbar-btn]")) return;
+    if (target.closest("[data-recording-playhead-button]")) return;
     if (!rootRef.current) return;
     const rect = rootRef.current.getBoundingClientRect();
+    dragPositionRef.current = posRef.current;
     dragOffsetRef.current = {
       dx: e.clientX - rect.left,
       dy: e.clientY - rect.top,
     };
-    setDragging(true);
     rootRef.current.setPointerCapture(e.pointerId);
+    activePointerIdRef.current = e.pointerId;
+    setDragging(true);
   }
 
   function onPointerMove(e: React.PointerEvent<HTMLDivElement>) {
-    if (!dragging) return;
+    if (activePointerIdRef.current !== e.pointerId) return;
     const { dx, dy } = dragOffsetRef.current;
-    const left = e.clientX - dx;
-    const top = e.clientY - dy;
-    const clamped = clampToViewport(
-      left,
-      top,
-      Math.max(TOOLBAR_WIDTH, TOOLBAR_HEIGHT),
-      { width: window.innerWidth, height: window.innerHeight },
+    const orientation = posRef.current.orientation;
+    const layout = playheadSizesRef.current[orientation];
+    const clamped = clampRecordingPlayheadPosition(
+      e.clientX - dx,
+      e.clientY - dy,
+      layout,
+      { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight },
     );
-    setPos((prev) => ({ ...prev, left: clamped.left, top: clamped.top }));
+    setPos((prev) => ({
+      ...prev,
+      left: clamped.left,
+      top: clamped.top,
+      dock: "free",
+      slot: null,
+    }));
+    dragPositionRef.current = {
+      ...posRef.current,
+      left: clamped.left,
+      top: clamped.top,
+      dock: "free",
+      slot: null,
+    };
   }
 
   function onPointerUp(e: React.PointerEvent<HTMLDivElement>) {
-    if (!rootRef.current) return;
-    rootRef.current.releasePointerCapture(e.pointerId);
+    if (activePointerIdRef.current !== e.pointerId) return;
+    activePointerIdRef.current = null;
     setDragging(false);
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    const current = dockRecordingPlayhead(
+      dragPositionRef.current.left,
+      dragPositionRef.current.top,
+      playheadSizesRef.current,
+      {
+        left: 0,
+        top: 0,
+        width: window.innerWidth,
+        height: window.innerHeight,
+      },
+    );
+    dragPositionRef.current = current;
+    setPos(current);
   }
-
-  const bg = isPaused ? "bg-white text-black" : "bg-black/85 text-white";
 
   return (
     <div
       ref={rootRef}
-      role="toolbar"
-      aria-label="Recording controls"
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
       className={
-        "fixed z-[95] flex items-center gap-1 rounded-full px-3 py-2 shadow-2xl backdrop-blur " +
-        bg +
-        (dragging ? " cursor-grabbing" : " cursor-grab")
+        dragging ? "fixed z-[95] cursor-grabbing" : "fixed z-[95] cursor-grab"
       }
       style={{
         left: pos.left,
         top: pos.top,
-        minWidth: TOOLBAR_WIDTH,
-        height: TOOLBAR_HEIGHT,
+        width: "max-content",
+        minWidth:
+          pos.orientation === "horizontal"
+            ? TOOLBAR_HORIZONTAL_SIZE.width
+            : undefined,
+        minHeight: toolbarLayout.height,
         touchAction: "none",
       }}
     >
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            data-toolbar-btn
-            type="button"
-            onClick={onTogglePause}
-            className="flex h-9 w-9 items-center justify-center rounded-full hover:bg-white/15"
-            aria-label={isPaused ? "Resume recording" : "Pause recording"}
-          >
-            {isPaused ? (
-              <IconPlayerPlay className="h-4 w-4" />
-            ) : (
-              <IconPlayerPause className="h-4 w-4" />
-            )}
-          </button>
-        </TooltipTrigger>
-        <TooltipContent>
-          {isPaused ? "Resume (⌥⇧P)" : "Pause (⌥⇧P)"}
-        </TooltipContent>
-      </Tooltip>
-
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            data-toolbar-btn
-            type="button"
-            onClick={onStop}
-            className="flex h-9 w-9 items-center justify-center rounded-full bg-white text-black hover:bg-white/85"
-            aria-label="Stop recording"
-          >
-            <IconPlayerStop className="h-4 w-4" />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent>Stop recording</TooltipContent>
-      </Tooltip>
-
-      <div
-        className="mx-2 flex h-9 items-center gap-2 rounded-full bg-white/10 px-3 text-sm font-mono tabular-nums"
-        aria-label="Elapsed time"
-      >
-        <span
-          className="inline-block h-2 w-2 rounded-full bg-white"
-          style={{
-            animation: isPaused ? "none" : "pulse 1s ease-in-out infinite",
-          }}
-        />
-        {formatElapsed(elapsedMs)}
-        {isPaused && (
-          <span className="text-[10px] uppercase tracking-wide">Paused</span>
-        )}
-      </div>
-
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            data-toolbar-btn
-            type="button"
-            onClick={onConfetti}
-            className="flex h-9 w-9 items-center justify-center rounded-full hover:bg-white/15"
-            aria-label="Confetti"
-          >
-            <IconConfetti className="h-4 w-4" />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent>
-          Confetti ({isMacPlatform() ? "Ctrl+\u2318+C" : "Ctrl+Alt+C"})
-        </TooltipContent>
-      </Tooltip>
-
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            data-toolbar-btn
-            type="button"
-            onClick={onCancel}
-            className="flex h-9 w-9 items-center justify-center rounded-full hover:bg-white/15"
-            aria-label="Cancel recording"
-          >
-            <IconX className="h-4 w-4" />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent>Cancel (⌥⇧C)</TooltipContent>
-      </Tooltip>
+      <RecordingPlayhead
+        elapsedMs={elapsedMs}
+        paused={isPaused}
+        orientation={pos.orientation}
+        enabled={active}
+        saving={saving}
+        pendingAction={pendingAction}
+        meter={
+          microphoneMeter.warning !== null ? (
+            <span
+              role="status"
+              aria-label={t("preRecord.noAudio")}
+              className="inline-flex size-[18px] items-center justify-center text-current"
+              style={{ color: "var(--playhead-rec)" }}
+            >
+              <IconAlertTriangle aria-hidden className="size-4" />
+            </span>
+          ) : (
+            <LiveWaveform
+              level={microphoneMeter.level}
+              dimmed={!active || isPaused}
+            />
+          )
+        }
+        labels={{
+          controls: t("recordingToolbar.controls"),
+          stop: t("recordingToolbar.stop"),
+          pause: t("recordingToolbar.pauseRecording"),
+          resume: t("recordingToolbar.resumeRecording"),
+          pauseShortcut: t("recordingToolbar.pauseShortcut"),
+          resumeShortcut: t("recordingToolbar.resumeShortcut"),
+          restart: t("recordingToolbar.restart"),
+          restartShortcut: t("recordingToolbar.restartShortcut"),
+          delete: t("recordingToolbar.cancel"),
+          deleteShortcut: t("recordingToolbar.cancelShortcut"),
+          restartQuestion: t("recordingToolbar.restartQuestion"),
+          deleteQuestion: () => t("recordingToolbar.discardConfirmTitle"),
+          restartConfirm: t("recordingToolbar.restartConfirm"),
+          deleteConfirm: t("recordingToolbar.discardRecording"),
+          resumeConfirm: t("recordingToolbar.resume"),
+        }}
+        onStop={onStop}
+        onTogglePause={onTogglePause}
+        onConfirmAction={handlePlayheadConfirmAction}
+        onDeleteRequest={onCancel}
+        onConfirmChange={onConfirmChange}
+        onLayoutChange={handlePlayheadLayoutChange}
+        className={active || saving ? undefined : "opacity-80"}
+      />
     </div>
   );
 }

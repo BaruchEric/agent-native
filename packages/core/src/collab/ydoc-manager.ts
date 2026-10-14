@@ -1,29 +1,7 @@
-/**
- * Server-side Yjs document manager with LRU caching and SQL persistence.
- *
- * Performance notes:
- * - `getDoc()` loads from the DB once on cache miss; subsequent calls return
- *   the cached Y.Doc directly with no DB I/O.
- * - Mutations no longer call `applyStoredState()` unconditionally on every
- *   write. The defensive re-read from the DB happens only inside
- *   `persistMergedState` (needed for the CAS version read), not as a
- *   separate SELECT before applying the new update. This removes the
- *   redundant double-read that the previous implementation performed on
- *   every write even on a hot cache.
- * - Compaction: when the stored blob is >4x the freshly encoded state, the
- *   GC'd encoding is stored instead (removes accumulated Yjs tombstones,
- *   preventing unbounded blob growth without any background jobs).
- */
-
 import * as Y from "yjs";
-import {
-  loadYDocRecord,
-  loadYDocState,
-  saveYDocState,
-  trySaveYDocState,
-} from "./storage.js";
-import { applyTextToYDoc, initYDocWithText } from "./text-to-yjs.js";
-import { searchAndReplaceInYXml, extractTextFromYXml } from "./xml-ops.js";
+
+import type { DbExec } from "../db/client.js";
+import { emitCollabUpdate } from "./emitter.js";
 import {
   applyJsonDiff,
   applyJsonPatch,
@@ -31,36 +9,90 @@ import {
   initYDocWithJson,
   type PatchOp,
 } from "./json-to-yjs.js";
-import { emitCollabUpdate } from "./emitter.js";
+import {
+  loadYDocRecord,
+  loadYDocRecordWithClient,
+  loadYDocVersion,
+  trySaveYDocState,
+  trySaveYDocStateWithClient,
+} from "./storage.js";
 import { uint8ArrayToBase64 } from "./storage.js";
+import { applyTextToYDoc, initYDocWithText } from "./text-to-yjs.js";
+import { searchAndReplaceInYXml, extractTextFromYXml } from "./xml-ops.js";
 
 const DEFAULT_FIELD = "content";
+
+export class CollabBaseVersionConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CollabBaseVersionConflictError";
+  }
+}
+
 const MAX_CACHE = 50;
 
-/**
- * Compaction ratio threshold. When the stored state byte count exceeds
- * COMPACTION_RATIO × the freshly encoded state, write the compact form
- * (strips accumulated tombstones). A value of 4 means: compact when the
- * stored blob is 4× larger than necessary.
- */
+function touchAgentPresence(
+  docId: string,
+  requestSource: string | undefined,
+  edit: { descriptor: Record<string, unknown>; label?: string } | null,
+): void {
+  if (requestSource !== "agent") return;
+  import("./agent-presence.js")
+    .then((mod) => {
+      mod.agentTouchDocument(docId, edit ? { edit: edit as any } : undefined);
+    })
+    .catch(() => {
+      // Presence is best-effort; never fail the write for it.
+    });
+}
+
+export function computeTextEditDescriptor(
+  oldText: string,
+  newText: string,
+): { kind: "text"; quote: string } | { kind: "doc" } {
+  let start = 0;
+  const maxStart = Math.min(oldText.length, newText.length);
+  while (start < maxStart && oldText[start] === newText[start]) start++;
+
+  let endOld = oldText.length;
+  let endNew = newText.length;
+  while (
+    endOld > start &&
+    endNew > start &&
+    oldText[endOld - 1] === newText[endNew - 1]
+  ) {
+    endOld--;
+    endNew--;
+  }
+
+  const inserted = newText.slice(start, endNew).trim();
+  if (inserted.length > 0) {
+    return { kind: "text", quote: inserted.slice(0, 120) };
+  }
+  return { kind: "doc" };
+}
+
 const COMPACTION_RATIO = 4;
 
 interface CacheEntry {
   doc: Y.Doc;
   lastAccess: number;
+  syncedVersion: number | null;
 }
 
 const _cache = new Map<string, CacheEntry>();
 const _writeLocks = new Map<string, Promise<void>>();
-// Coalesces concurrent cache-miss loads for the same docId. Without this, two
-// simultaneous getDoc() callers both miss the cache, both build a Y.Doc and
-// apply stored state, and the second _cache.set silently orphans the first
-// doc (a memory leak that grows with concurrent read traffic).
+const _refreshLocks = new Map<string, Promise<void>>();
 const _loadLocks = new Map<string, Promise<Y.Doc>>();
+
+export interface PreparedYDocMutationLease {
+  doc: Y.Doc;
+  baseVersion: number | null;
+  persist(transaction: DbExec, textSnapshot: string): Promise<void>;
+}
 
 function evictIfNeeded(): void {
   if (_cache.size <= MAX_CACHE) return;
-  // Evict least-recently-accessed entry
   let oldest: string | null = null;
   let oldestTime = Infinity;
   for (const [id, entry] of _cache) {
@@ -99,77 +131,176 @@ async function withDocWriteLock<T>(
   }
 }
 
-/**
- * Build state to persist. If the stored blob is significantly larger than
- * the freshly encoded state, store the compact (GC'd) form instead to
- * prevent unbounded blob growth from accumulated tombstones.
- */
+export async function withPreparedYDocMutation<T>(
+  docId: string,
+  requestSource: string | undefined,
+  run: (lease: PreparedYDocMutationLease) => Promise<T>,
+): Promise<T> {
+  return withDocWriteLock(docId, async () => {
+    const current = await getDocForWrite(docId);
+    const latest = await loadYDocRecord(docId);
+    if (latest?.state.length) Y.applyUpdate(current, latest.state);
+
+    const candidate = new Y.Doc();
+    Y.applyUpdate(candidate, Y.encodeStateAsUpdate(current));
+    const baseVector = Y.encodeStateVector(candidate);
+    const baseVersion = latest?.version ?? null;
+    let persisted = false;
+    const lease: PreparedYDocMutationLease = {
+      doc: candidate,
+      baseVersion,
+      persist: async (transaction, textSnapshot) => {
+        if (persisted) {
+          throw new Error("Prepared Yjs mutation was already persisted");
+        }
+        const saved = await trySaveYDocStateWithClient(
+          transaction,
+          docId,
+          Y.encodeStateAsUpdate(candidate),
+          textSnapshot,
+          baseVersion,
+        );
+        if (!saved) {
+          throw new CollabBaseVersionConflictError(
+            `Document ${docId} changed while the prepared mutation was committing.`,
+          );
+        }
+        persisted = true;
+      },
+    };
+
+    try {
+      const result = await run(lease);
+      if (!persisted) {
+        candidate.destroy();
+        return result;
+      }
+      const update = Y.encodeStateAsUpdate(candidate, baseVector);
+      const previous = _cache.get(docId);
+      previous?.doc.destroy();
+      _cache.set(docId, {
+        doc: candidate,
+        lastAccess: Date.now(),
+        syncedVersion: baseVersion === null ? 0 : baseVersion + 1,
+      });
+      evictIfNeeded();
+      if (update.length > 0) {
+        emitCollabUpdate(docId, uint8ArrayToBase64(update), requestSource);
+      }
+      return result;
+    } catch (error) {
+      candidate.destroy();
+      throw error;
+    }
+  });
+}
+
 function buildStateToStore(doc: Y.Doc, storedByteCount: number): Uint8Array {
   const encoded = Y.encodeStateAsUpdate(doc);
   if (
     storedByteCount > 0 &&
     storedByteCount > encoded.length * COMPACTION_RATIO
   ) {
-    // Stored blob is much larger than needed — return the GC'd encoding.
     return encoded;
   }
   return encoded;
 }
 
-/**
- * Persist the merged doc state with CAS retry on conflict.
- *
- * REMOVED: the unconditional `applyStoredState()` that was called on every
- * write path before this function. The only DB read is the `loadYDocRecord`
- * call here — needed to get the CAS version and merge any concurrent writes
- * from OTHER processes. Within this process, the in-memory doc is already
- * up-to-date because mutations are serialized by withDocWriteLock.
- */
 async function persistMergedState(
   docId: string,
   doc: Y.Doc,
   getTextSnapshot: () => string,
+  validateTextSnapshot?: (snapshot: string) => void,
+  validatedBaseVersion?: number | null,
 ): Promise<void> {
   for (let attempt = 0; attempt < 5; attempt++) {
-    // One DB read per persist attempt. On first attempt this is the only read
-    // on the write path (previously there was an unconditional second read
-    // before the update was applied). On retry attempts it re-reads to get the
-    // latest version after a CAS conflict.
     const latest = await loadYDocRecord(docId);
+    if (validatedBaseVersion !== undefined) {
+      const currentVersion = latest?.version ?? null;
+      if (currentVersion !== validatedBaseVersion) {
+        throw new CollabBaseVersionConflictError(
+          `Document ${docId} moved from version ${String(validatedBaseVersion)} to ${String(currentVersion)} while the edit was being applied.`,
+        );
+      }
+    }
     if (latest?.state && latest.state.length > 0) {
       Y.applyUpdate(doc, latest.state);
     }
 
     const stateToStore = buildStateToStore(doc, latest?.state?.length ?? 0);
+    const textSnapshot = getTextSnapshot();
+    validateTextSnapshot?.(textSnapshot);
+    const expectedVersion = latest?.version ?? null;
     const saved = await trySaveYDocState(
       docId,
       stateToStore,
-      getTextSnapshot(),
-      latest?.version ?? null,
+      textSnapshot,
+      expectedVersion,
     );
-    if (saved) return;
+    if (saved) {
+      noteCachedVersion(
+        docId,
+        doc,
+        expectedVersion === null ? 0 : expectedVersion + 1,
+      );
+      return;
+    }
   }
 
-  // All CAS attempts failed — fall back to unconditional save.
-  await saveYDocState(docId, Y.encodeStateAsUpdate(doc), getTextSnapshot());
+  throw new CollabBaseVersionConflictError(
+    `Document ${docId} kept changing while the edit was being applied; the write was not saved.`,
+  );
 }
 
-/**
- * Get or load a Yjs document by ID. Creates a new empty doc if none exists.
- */
-export async function getDoc(docId: string): Promise<Y.Doc> {
-  const cached = _cache.get(docId);
-  if (cached) {
-    cached.lastAccess = Date.now();
-    return cached.doc;
-  }
+function cachedVersionFor(
+  docId: string,
+  doc: Y.Doc,
+): number | null | undefined {
+  const entry = _cache.get(docId);
+  if (entry?.doc !== doc) return undefined;
+  return entry.syncedVersion ?? undefined;
+}
 
+function noteCachedVersion(
+  docId: string,
+  doc: Y.Doc,
+  version: number | null,
+): void {
+  const entry = _cache.get(docId);
+  if (entry?.doc === doc) entry.syncedVersion = version;
+}
+
+async function mergeNewerStoredState(
+  docId: string,
+  entry: CacheEntry,
+): Promise<void> {
+  const inFlight = _refreshLocks.get(docId);
+  if (inFlight) return inFlight;
+
+  const refresh = (async () => {
+    const storedVersion = await loadYDocVersion(docId);
+    if (storedVersion === null) return;
+    if (entry.syncedVersion === storedVersion) return;
+
+    const record = await loadYDocRecord(docId);
+    if (record === null) return;
+    if (record.state.length > 0) Y.applyUpdate(entry.doc, record.state);
+    entry.syncedVersion = record.version;
+  })();
+
+  _refreshLocks.set(docId, refresh);
+  try {
+    await refresh;
+  } finally {
+    if (_refreshLocks.get(docId) === refresh) _refreshLocks.delete(docId);
+  }
+}
+
+async function loadDoc(docId: string): Promise<Y.Doc> {
   const inFlight = _loadLocks.get(docId);
   if (inFlight) return inFlight;
 
   const load = (async () => {
-    // Re-check the cache: a concurrent writer (or loader) may have populated it
-    // between our miss above and acquiring this load slot.
     const reCached = _cache.get(docId);
     if (reCached) {
       reCached.lastAccess = Date.now();
@@ -177,13 +308,25 @@ export async function getDoc(docId: string): Promise<Y.Doc> {
     }
 
     const doc = new Y.Doc();
-    const stored = await loadYDocState(docId);
-    if (stored && stored.length > 0) {
-      Y.applyUpdate(doc, stored);
+    let record = await loadYDocRecord(docId);
+    if (record && record.state.length > 0) {
+      Y.applyUpdate(doc, record.state);
+    }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const storedVersion = await loadYDocVersion(docId);
+      if (storedVersion === (record?.version ?? null)) break;
+      record = await loadYDocRecord(docId);
+      if (record && record.state.length > 0) {
+        Y.applyUpdate(doc, record.state);
+      }
     }
 
     evictIfNeeded();
-    _cache.set(docId, { doc, lastAccess: Date.now() });
+    _cache.set(docId, {
+      doc,
+      lastAccess: Date.now(),
+      syncedVersion: record?.version ?? null,
+    });
     return doc;
   })();
 
@@ -195,20 +338,39 @@ export async function getDoc(docId: string): Promise<Y.Doc> {
   }
 }
 
-/**
- * Apply a binary Yjs update (from a client) to a document.
- * Persists the result and emits a change event.
- */
+export async function getDocForWrite(docId: string): Promise<Y.Doc> {
+  const cached = _cache.get(docId);
+  if (cached) {
+    cached.lastAccess = Date.now();
+    return cached.doc;
+  }
+  return loadDoc(docId);
+}
+
+async function awaitPendingWrite(docId: string): Promise<void> {
+  const pending = _writeLocks.get(docId);
+  if (pending) await pending.catch(() => {});
+}
+
+export async function getDoc(docId: string): Promise<Y.Doc> {
+  await awaitPendingWrite(docId);
+  const cached = _cache.get(docId);
+  if (cached) {
+    cached.lastAccess = Date.now();
+    await mergeNewerStoredState(docId, cached);
+    return cached.doc;
+  }
+
+  return loadDoc(docId);
+}
+
 export async function applyUpdate(
   docId: string,
   update: Uint8Array,
   requestSource?: string,
 ): Promise<void> {
   return withDocWriteLock(docId, async () => {
-    const doc = await getDoc(docId);
-    // The cached doc is already up-to-date from the initial load or a previous
-    // write in this process. No redundant applyStoredState() here — cross-
-    // process writes are merged inside persistMergedState when needed.
+    const doc = await getDocForWrite(docId);
     Y.applyUpdate(doc, update);
 
     await persistMergedState(docId, doc, () =>
@@ -219,41 +381,153 @@ export async function applyUpdate(
   });
 }
 
-/**
- * Apply a text change to a document. Computes the minimal diff and
- * converts it to Yjs operations.
- *
- * Returns the text snapshot after the update.
- */
+function isEmptyXmlSeedTarget(fragment: Y.XmlFragment): boolean {
+  if (fragment.length === 0) return true;
+  if (fragment.length !== 1) return false;
+  const first = fragment.get(0);
+  if (!(first instanceof Y.XmlElement) || first.nodeName !== "paragraph") {
+    return false;
+  }
+  for (let index = 0; index < first.length; index += 1) {
+    const child = first.get(index);
+    if (!(child instanceof Y.XmlText) || child.toString().length > 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export async function seedXmlFragmentIfEmpty(
+  docId: string,
+  seedUpdate: Uint8Array,
+  requestSource?: string,
+): Promise<{ seeded: boolean; state: Uint8Array }> {
+  const candidate = new Y.Doc();
+  try {
+    const decoded = Y.decodeUpdate(seedUpdate);
+    if (decoded.ds.clients.size > 0) {
+      throw new Error("Initial XmlFragment seed cannot contain deletions");
+    }
+    Y.applyUpdate(candidate, seedUpdate);
+    const fragment = candidate.getXmlFragment("default");
+    if (
+      candidate.share.size !== 1 ||
+      !candidate.share.has("default") ||
+      isEmptyXmlSeedTarget(fragment)
+    ) {
+      throw new Error(
+        "Initial XmlFragment seed must contain only a nonempty default fragment",
+      );
+    }
+  } finally {
+    candidate.destroy();
+  }
+
+  return withDocWriteLock(docId, async () => {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const stored = await loadYDocRecord(docId);
+      const committed = new Y.Doc();
+      try {
+        if (stored?.state.length) Y.applyUpdate(committed, stored.state);
+        const fragment = committed.getXmlFragment("default");
+        if (!isEmptyXmlSeedTarget(fragment)) {
+          return { seeded: false, state: Y.encodeStateAsUpdate(committed) };
+        }
+
+        const beforeVector = Y.encodeStateVector(committed);
+        if (fragment.length === 1) fragment.delete(0, 1);
+        Y.applyUpdate(committed, seedUpdate);
+        if (isEmptyXmlSeedTarget(fragment)) {
+          throw new Error(
+            "Initial XmlFragment seed did not populate the default fragment",
+          );
+        }
+        const state = Y.encodeStateAsUpdate(committed);
+        const committedUpdate = Y.encodeStateAsUpdate(committed, beforeVector);
+        const textSnapshot =
+          committed.getText(DEFAULT_FIELD).toString() ||
+          extractTextFromYXml(fragment);
+        const saved = await trySaveYDocState(
+          docId,
+          state,
+          textSnapshot,
+          stored?.version ?? null,
+        );
+        if (!saved) continue;
+
+        releaseDoc(docId);
+        emitCollabUpdate(
+          docId,
+          uint8ArrayToBase64(committedUpdate),
+          requestSource,
+        );
+        return { seeded: true, state };
+      } finally {
+        committed.destroy();
+      }
+    }
+    throw new CollabBaseVersionConflictError(
+      `Document ${docId} kept changing while its initial XmlFragment seed was being committed.`,
+    );
+  });
+}
+
 export async function applyText(
   docId: string,
   newText: string,
   fieldName: string = DEFAULT_FIELD,
   requestSource?: string,
+  options: {
+    validateBase?: (base: string) => void;
+    validateSnapshot?: (snapshot: string) => void;
+  } = {},
 ): Promise<string> {
   return withDocWriteLock(docId, async () => {
-    const doc = await getDoc(docId);
+    const doc = await getDocForWrite(docId);
+    const validatedBaseVersion = options.validateBase
+      ? cachedVersionFor(docId, doc)
+      : undefined;
+    const oldText = doc.getText(fieldName).toString();
+    if (options.validateBase && validatedBaseVersion === undefined) {
+      throw new CollabBaseVersionConflictError(
+        `Document ${docId} has no known base version to validate against; re-read the file and retry.`,
+      );
+    }
+    options.validateBase?.(oldText);
     const update = applyTextToYDoc(doc, fieldName, newText, "server");
 
     if (update.length === 0) {
-      return doc.getText(fieldName).toString();
+      const snapshot = doc.getText(fieldName).toString();
+      try {
+        options.validateSnapshot?.(snapshot);
+      } catch (error) {
+        releaseDoc(docId);
+        throw error;
+      }
+      return snapshot;
     }
 
-    await persistMergedState(docId, doc, () =>
-      doc.getText(fieldName).toString(),
-    );
+    try {
+      await persistMergedState(
+        docId,
+        doc,
+        () => doc.getText(fieldName).toString(),
+        options.validateSnapshot,
+        validatedBaseVersion,
+      );
+    } catch (error) {
+      releaseDoc(docId);
+      throw error;
+    }
 
     emitCollabUpdate(docId, uint8ArrayToBase64(update), requestSource);
+    touchAgentPresence(docId, requestSource, {
+      descriptor: computeTextEditDescriptor(oldText, newText),
+    });
     return doc.getText(fieldName).toString();
   });
 }
 
-/**
- * Search-and-replace text within a Y.XmlFragment (ProseMirror tree).
- * Produces minimal Yjs operations for cursor-preserving updates.
- *
- * Returns whether the text was found and the binary update.
- */
 export async function searchAndReplace(
   docId: string,
   find: string,
@@ -261,10 +535,9 @@ export async function searchAndReplace(
   requestSource?: string,
 ): Promise<{ found: boolean; update: Uint8Array }> {
   return withDocWriteLock(docId, async () => {
-    const doc = await getDoc(docId);
+    const doc = await getDocForWrite(docId);
     const fragment = doc.getXmlFragment("default");
 
-    // Capture the update produced by the transaction
     let update: Uint8Array = new Uint8Array(0);
     const handler = (u: Uint8Array) => {
       update = u;
@@ -284,14 +557,17 @@ export async function searchAndReplace(
 
     await persistMergedState(docId, doc, () => extractTextFromYXml(fragment));
     emitCollabUpdate(docId, uint8ArrayToBase64(update), requestSource);
+    touchAgentPresence(docId, requestSource, {
+      descriptor: {
+        kind: "text",
+        quote: (replace || find).slice(0, 120),
+      },
+    });
 
     return { found: true, update };
   });
 }
 
-/**
- * Get the current text content of a document field.
- */
 export async function getText(
   docId: string,
   fieldName: string = DEFAULT_FIELD,
@@ -300,17 +576,11 @@ export async function getText(
   return doc.getText(fieldName).toString();
 }
 
-/**
- * Get the full document state as a Uint8Array.
- */
 export async function getState(docId: string): Promise<Uint8Array> {
   const doc = await getDoc(docId);
   return Y.encodeStateAsUpdate(doc);
 }
 
-/**
- * Get an incremental update relative to a client's state vector.
- */
 export async function getIncUpdate(
   docId: string,
   clientStateVector: Uint8Array,
@@ -319,34 +589,56 @@ export async function getIncUpdate(
   return Y.encodeStateAsUpdate(doc, clientStateVector);
 }
 
-/**
- * Seed a document from existing text content (for migration).
- * Only seeds if no collab state exists yet.
- */
 export async function seedFromText(
   docId: string,
   text: string,
   fieldName: string = DEFAULT_FIELD,
+  client?: DbExec,
 ): Promise<void> {
   return withDocWriteLock(docId, async () => {
-    const existing = await loadYDocState(docId);
-    if (existing && existing.length > 0) return; // Already seeded
+    const existing = client
+      ? await loadYDocRecordWithClient(client, docId)
+      : await loadYDocRecord(docId);
+    if (existing && existing.state.length > 0) return;
+    const expectedVersion = existing ? existing.version : null;
 
     const { doc, state } = initYDocWithText(fieldName, text);
-    await saveYDocState(docId, state, text);
+    let saved: boolean;
+    try {
+      saved = client
+        ? await trySaveYDocStateWithClient(
+            client,
+            docId,
+            state,
+            text,
+            expectedVersion,
+          )
+        : await trySaveYDocState(docId, state, text, expectedVersion);
+    } catch (error) {
+      doc.destroy();
+      throw error;
+    }
+    if (!saved) {
+      releaseDoc(docId);
+      doc.destroy();
+      return;
+    }
 
-    // Cache the doc
+    releaseDoc(docId);
+    if (client) {
+      doc.destroy();
+      return;
+    }
+
     evictIfNeeded();
-    _cache.set(docId, { doc, lastAccess: Date.now() });
+    _cache.set(docId, {
+      doc,
+      lastAccess: Date.now(),
+      syncedVersion: existing ? existing.version + 1 : 0,
+    });
   });
 }
 
-// ─── Structured JSON Operations ─────────────────────────────────────
-
-/**
- * Apply a full JSON update to a document. Computes the minimal diff
- * and converts it to Yjs operations on Y.Map/Y.Array.
- */
 export async function applyJson(
   docId: string,
   newJson: any,
@@ -355,25 +647,20 @@ export async function applyJson(
   requestSource?: string,
 ): Promise<void> {
   return withDocWriteLock(docId, async () => {
-    const doc = await getDoc(docId);
+    const doc = await getDocForWrite(docId);
     const update = applyJsonDiff(doc, fieldName, newJson, "server");
 
     if (update.length === 0) return;
 
-    // Snapshot the doc's actual post-merge state, not the caller-supplied
-    // `newJson` — persistMergedState may re-apply newer DB state to resolve
-    // concurrent writes, so `newJson` can be stale. Matches applyPatchOps.
     await persistMergedState(docId, doc, () =>
       JSON.stringify(yDocToJson(doc, fieldName)),
     );
 
     emitCollabUpdate(docId, uint8ArrayToBase64(update), requestSource);
+    touchAgentPresence(docId, requestSource, { descriptor: { kind: "doc" } });
   });
 }
 
-/**
- * Apply surgical JSON patch operations to a document.
- */
 export async function applyPatchOps(
   docId: string,
   ops: PatchOp[],
@@ -381,7 +668,7 @@ export async function applyPatchOps(
   requestSource?: string,
 ): Promise<void> {
   return withDocWriteLock(docId, async () => {
-    const doc = await getDoc(docId);
+    const doc = await getDocForWrite(docId);
     const update = applyJsonPatch(doc, fieldName, ops, "server");
 
     if (update.length === 0) return;
@@ -391,12 +678,15 @@ export async function applyPatchOps(
     );
 
     emitCollabUpdate(docId, uint8ArrayToBase64(update), requestSource);
+    touchAgentPresence(docId, requestSource, {
+      descriptor: {
+        kind: "paths",
+        paths: ops.slice(0, 5).map((op) => op.path),
+      },
+    });
   });
 }
 
-/**
- * Get the current JSON state of a document field.
- */
 export async function getJson(
   docId: string,
   fieldName: string = "data",
@@ -405,32 +695,62 @@ export async function getJson(
   return yDocToJson(doc, fieldName);
 }
 
-/**
- * Seed a document from existing JSON content (for migration).
- * Only seeds if no collab state exists yet.
- */
 export async function seedFromJson(
   docId: string,
   json: any,
   fieldName: string = "data",
   type: "map" | "array" = "map",
+  client?: DbExec,
 ): Promise<void> {
   return withDocWriteLock(docId, async () => {
-    const existing = await loadYDocState(docId);
-    if (existing && existing.length > 0) return; // Already seeded
+    const existing = client
+      ? await loadYDocRecordWithClient(client, docId)
+      : await loadYDocRecord(docId);
+    if (existing && existing.state.length > 0) return;
+    const expectedVersion = existing ? existing.version : null;
 
     const { doc, state } = initYDocWithJson(fieldName, json, type);
-    await saveYDocState(docId, state, JSON.stringify(json));
+    let saved: boolean;
+    try {
+      saved = client
+        ? await trySaveYDocStateWithClient(
+            client,
+            docId,
+            state,
+            JSON.stringify(json),
+            expectedVersion,
+          )
+        : await trySaveYDocState(
+            docId,
+            state,
+            JSON.stringify(json),
+            expectedVersion,
+          );
+    } catch (error) {
+      doc.destroy();
+      throw error;
+    }
+    if (!saved) {
+      releaseDoc(docId);
+      doc.destroy();
+      return;
+    }
 
-    // Cache the doc
+    releaseDoc(docId);
+    if (client) {
+      doc.destroy();
+      return;
+    }
+
     evictIfNeeded();
-    _cache.set(docId, { doc, lastAccess: Date.now() });
+    _cache.set(docId, {
+      doc,
+      lastAccess: Date.now(),
+      syncedVersion: existing ? existing.version + 1 : 0,
+    });
   });
 }
 
-/**
- * Release a document from the in-memory cache.
- */
 export function releaseDoc(docId: string): void {
   const entry = _cache.get(docId);
   if (entry) {

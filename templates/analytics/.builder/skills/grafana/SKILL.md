@@ -45,13 +45,13 @@ description: >
 Use `grafana` for agent-facing Grafana work. Do not call `/api/grafana/*`
 directly from the agent.
 
-| Mode | Args | Description |
-| --- | --- | --- |
-| `dashboards` | `search` | Search dashboards |
-| `dashboard` | `uid` | Full dashboard JSON |
-| `datasources` | | List datasources |
-| `alerts` | | Alert rules and firing instances |
-| `query` | `datasourceUid`, `queries`, `from`, `to` | Query a datasource |
+| Mode          | Args                                     | Description                      |
+| ------------- | ---------------------------------------- | -------------------------------- |
+| `dashboards`  | `search`                                 | Search dashboards                |
+| `dashboard`   | `uid`                                    | Full dashboard JSON              |
+| `datasources` |                                          | List datasources                 |
+| `alerts`      |                                          | Alert rules and firing instances |
+| `query`       | `datasourceUid`, `queries`, `from`, `to` | Query a datasource               |
 
 ### Dashboard
 
@@ -100,4 +100,5 @@ For production issues, query Grafana/Prometheus FIRST:
 3. Error rates (`llm_failures_total`)
 4. Instance counts (via Cloud Monitoring)
 
-Then check Sentry for application errors, Cloud Logging for raw logs.
+Then check Agent-Native Analytics Monitoring -> Errors for captured application
+issues, external Sentry when connected, and Cloud Logging for raw logs.

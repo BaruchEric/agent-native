@@ -1,26 +1,37 @@
-import { useLocation, useNavigate } from "react-router";
-import { useHeaderTitle, useHeaderActions } from "./HeaderActions";
-import { AgentToggleButton } from "@agent-native/core/client";
-import { RunsTray } from "@agent-native/core/client/progress";
-import { Button } from "@/components/ui/button";
+import type { AgentRun } from "@agent-native/core/progress/types";
+import { AgentToggleButton } from "@agent-native/toolkit/app/chat/AgentSidebar";
+import { RunsTray } from "@agent-native/toolkit/app/progress";
 import { IconLayoutSidebar } from "@tabler/icons-react";
+import { useLocation, useNavigate } from "react-router";
+
+import { getDispatchRunThreadContext } from "../../lib/dispatch-run-thread.js";
+import { Button } from "../ui/button";
+import { useHeaderTitle, useHeaderActions } from "./HeaderActions";
 
 const pageTitles: Record<string, string> = {
   "/": "Overview",
   "/overview": "Overview",
   "/vault": "Vault",
-  "/integrations": "Integrations",
   "/workspace": "Resources",
   "/messaging": "Messaging",
   "/agents": "Agents",
   "/destinations": "Destinations",
   "/identities": "Identities",
   "/approvals": "Approvals",
+  "/automations": "Automations",
   "/audit": "Audit",
-  "/team": "Team",
+  "/dreams": "Dreams",
+  "/thread-debug": "Thread Debug",
+  "/transactional-email": "Transactional email",
+  "/settings": "Settings",
 };
 
 function resolveTitle(pathname: string): string {
+  if (pathname === "/admin" || pathname === "/admin/") return "Admin";
+  if (pathname.startsWith("/admin/")) {
+    const adminPath = pathname.slice("/admin".length);
+    return pageTitles[adminPath] ?? "Admin";
+  }
   if (pageTitles[pathname]) return pageTitles[pathname];
 
   if (pathname.startsWith("/extensions")) return "Extensions";
@@ -40,21 +51,15 @@ export function Header({
   const title = useHeaderTitle();
   const actions = useHeaderActions();
 
-  function openRunThread(threadId: string) {
-    navigate("/chat", {
+  function openRunThread(threadId: string, run: AgentRun) {
+    void navigate("/chat", {
       state: {
         dispatchThread: {
           id: `${Date.now()}-${threadId}`,
           threadId,
+          ...getDispatchRunThreadContext(threadId, run),
         },
       },
-    });
-    window.requestAnimationFrame(() => {
-      window.dispatchEvent(
-        new CustomEvent("agent-chat:open-thread", {
-          detail: { threadId },
-        }),
-      );
     });
   }
 
@@ -63,8 +68,8 @@ export function Header({
       {onOpenMobile ? (
         <Button
           variant="ghost"
-          size="icon"
-          className="h-8 w-8 lg:hidden cursor-pointer"
+          size="icon-sm"
+          className="lg:hidden cursor-pointer"
           onClick={onOpenMobile}
           aria-label="Open navigation"
         >

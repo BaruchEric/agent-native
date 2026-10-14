@@ -1,7 +1,9 @@
-import { useState } from "react";
-import { cn } from "@/lib/utils";
+import { useT } from "@agent-native/core/client/i18n";
+import type { MobileActionId } from "@shared/types";
 import {
   IconArchive,
+  IconFilter,
+  IconInbox,
   IconTrash,
   IconStarFilled,
   IconStar,
@@ -12,7 +14,8 @@ import {
   IconChevronDown,
   IconSettings,
 } from "@tabler/icons-react";
-import type { MobileActionId } from "@shared/types";
+import { useState } from "react";
+
 import {
   Drawer,
   DrawerContent,
@@ -26,9 +29,11 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 
 export const ALL_MOBILE_ACTIONS: MobileActionId[] = [
   "archive",
+  "aiFilter",
   "trash",
   "star",
   "reply",
@@ -41,6 +46,7 @@ export const ALL_MOBILE_ACTIONS: MobileActionId[] = [
 
 export const DEFAULT_MOBILE_ACTIONS: MobileActionId[] = [
   "archive",
+  "aiFilter",
   "trash",
   "star",
   "reply",
@@ -51,24 +57,32 @@ export const DEFAULT_MOBILE_ACTIONS: MobileActionId[] = [
   "next",
 ];
 
-/** Metadata for each action: icon SVG, label */
 const ACTION_META: Record<
   MobileActionId,
   {
-    label: string;
+    labelKey: string;
     icon: (active?: boolean) => React.ReactNode;
   }
 > = {
   archive: {
-    label: "Archive",
+    labelKey: "mail.mobileActions.archive",
     icon: () => <IconArchive className="h-5 w-5" />,
   },
+  aiFilter: {
+    labelKey: "mail.aiFilter.filterButton",
+    icon: (active) =>
+      active ? (
+        <IconInbox className="h-5 w-5" />
+      ) : (
+        <IconFilter className="h-5 w-5" />
+      ),
+  },
   trash: {
-    label: "Trash",
+    labelKey: "mail.mobileActions.trash",
     icon: () => <IconTrash className="h-5 w-5" />,
   },
   star: {
-    label: "Star",
+    labelKey: "mail.mobileActions.star",
     icon: (active) =>
       active ? (
         <IconStarFilled className="h-5 w-5 text-yellow-500" />
@@ -77,27 +91,27 @@ const ACTION_META: Record<
       ),
   },
   reply: {
-    label: "Reply",
-    icon: () => <IconArrowBackUp className="h-5 w-5" />,
+    labelKey: "mail.mobileActions.reply",
+    icon: () => <IconArrowBackUp className="h-5 w-5 rtl:-scale-x-100" />,
   },
   replyAll: {
-    label: "Reply All",
-    icon: () => <IconArrowBackUp className="h-5 w-5" />,
+    labelKey: "mail.mobileActions.replyAll",
+    icon: () => <IconArrowBackUp className="h-5 w-5 rtl:-scale-x-100" />,
   },
   forward: {
-    label: "Forward",
-    icon: () => <IconArrowForwardUp className="h-5 w-5" />,
+    labelKey: "mail.mobileActions.forward",
+    icon: () => <IconArrowForwardUp className="h-5 w-5 rtl:-scale-x-100" />,
   },
   markUnread: {
-    label: "Unread",
+    labelKey: "mail.mobileActions.unread",
     icon: () => <IconMail className="h-5 w-5" />,
   },
   prev: {
-    label: "Prev",
+    labelKey: "mail.mobileActions.prev",
     icon: () => <IconChevronUp className="h-5 w-5" />,
   },
   next: {
-    label: "Next",
+    labelKey: "mail.mobileActions.next",
     icon: () => <IconChevronDown className="h-5 w-5" />,
   },
 };
@@ -105,6 +119,7 @@ const ACTION_META: Record<
 export type MobileActionBarProps = {
   actions: MobileActionId[];
   isStarred?: boolean;
+  isAiFiltered?: boolean;
   onAction: (action: MobileActionId) => void;
   onUpdateActions?: (actions: MobileActionId[]) => void;
 };
@@ -112,10 +127,12 @@ export type MobileActionBarProps = {
 export function MobileActionBar({
   actions,
   isStarred,
+  isAiFiltered,
   onAction,
   onUpdateActions,
 }: MobileActionBarProps) {
   const [customizeOpen, setCustomizeOpen] = useState(false);
+  const t = useT();
 
   return (
     <>
@@ -132,32 +149,49 @@ export function MobileActionBar({
                   )}
                 >
                   <IconSettings className="h-5 w-5" />
-                  <span className="text-[10px] leading-tight">Settings</span>
+                  <span className="text-[10px] leading-tight">
+                    {t("mail.mobileActions.settings")}
+                  </span>
                 </button>
               </TooltipTrigger>
-              <TooltipContent>Customize</TooltipContent>
+              <TooltipContent>
+                {t("mail.mobileActions.customize")}
+              </TooltipContent>
             </Tooltip>
           )}
           {actions.map((id) => {
             const meta = ACTION_META[id];
             if (!meta) return null;
+            const label =
+              id === "aiFilter"
+                ? t(
+                    isAiFiltered
+                      ? "mail.aiFilter.keepButton"
+                      : "mail.aiFilter.filterButton",
+                  )
+                : t(meta.labelKey);
             return (
               <Tooltip key={id}>
                 <TooltipTrigger asChild>
                   <button
                     onClick={() => onAction(id)}
+                    aria-label={label}
                     className={cn(
                       "flex shrink-0 flex-col items-center justify-center gap-0.5 py-2 px-3 min-w-[44px] min-h-[44px]",
                       "text-muted-foreground active:text-foreground active:bg-accent/50 rounded-lg",
                     )}
                   >
-                    {meta.icon(id === "star" ? isStarred : false)}
-                    <span className="text-[10px] leading-tight">
-                      {meta.label}
-                    </span>
+                    {meta.icon(
+                      id === "star"
+                        ? isStarred
+                        : id === "aiFilter"
+                          ? isAiFiltered
+                          : false,
+                    )}
+                    <span className="text-[10px] leading-tight">{label}</span>
                   </button>
                 </TooltipTrigger>
-                <TooltipContent>{meta.label}</TooltipContent>
+                <TooltipContent>{label}</TooltipContent>
               </Tooltip>
             );
           })}
@@ -168,13 +202,19 @@ export function MobileActionBar({
         <Drawer open={customizeOpen} onOpenChange={setCustomizeOpen}>
           <DrawerContent>
             <DrawerHeader>
-              <DrawerTitle>Customize Actions</DrawerTitle>
+              <DrawerTitle>
+                {t("mail.mobileActions.customizeActions")}
+              </DrawerTitle>
             </DrawerHeader>
             <div className="px-4 pb-6 space-y-1">
               {ALL_MOBILE_ACTIONS.map((id) => {
                 const meta = ACTION_META[id];
                 if (!meta) return null;
                 const enabled = actions.includes(id);
+                const label =
+                  id === "aiFilter"
+                    ? t("mail.aiFilter.filterButton")
+                    : t(meta.labelKey);
                 return (
                   <div
                     key={id}
@@ -183,7 +223,6 @@ export function MobileActionBar({
                       const next = enabled
                         ? actions.filter((a) => a !== id)
                         : [...actions, id];
-                      // Maintain canonical order
                       const ordered = ALL_MOBILE_ACTIONS.filter((a) =>
                         next.includes(a),
                       );
@@ -194,7 +233,7 @@ export function MobileActionBar({
                       <span className="text-muted-foreground">
                         {meta.icon(false)}
                       </span>
-                      <span className="text-sm font-medium">{meta.label}</span>
+                      <span className="text-sm font-medium">{label}</span>
                     </div>
                     <Switch
                       checked={enabled}
@@ -202,7 +241,6 @@ export function MobileActionBar({
                         const next = checked
                           ? [...actions, id]
                           : actions.filter((a) => a !== id);
-                        // Maintain canonical order
                         const ordered = ALL_MOBILE_ACTIONS.filter((a) =>
                           next.includes(a),
                         );
@@ -217,7 +255,7 @@ export function MobileActionBar({
             <div className="px-4 pb-6">
               <DrawerClose asChild>
                 <button className="w-full rounded-lg bg-accent py-2.5 text-sm font-medium">
-                  Close
+                  {t("mail.mobileActions.close")}
                 </button>
               </DrawerClose>
             </div>

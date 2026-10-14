@@ -1,14 +1,18 @@
-import { defineAction } from "@agent-native/core";
-import { readAppState } from "@agent-native/core/application-state";
-import { and, asc, inArray } from "drizzle-orm";
+import { defineAction } from "@agent-native/core/action";
+import {
+  readAppState,
+  readAppStateForCurrentTab,
+} from "@agent-native/core/application-state";
+import { accessFilter, resolveAccess } from "@agent-native/core/sharing";
+import { and, asc, inArray, isNull } from "drizzle-orm";
+import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import {
   documentDiscoveryFilter,
   parseDocumentFavorite,
   parseDocumentHideFromSearch,
 } from "../server/lib/documents.js";
-import { accessFilter, resolveAccess } from "@agent-native/core/sharing";
-import { z } from "zod";
 import type {
   ContentDatabaseColumnCalculation,
   ContentDatabaseFilterMode,
@@ -21,28 +25,27 @@ import type {
   DocumentProperty,
 } from "../shared/api.js";
 import {
+  databaseColumnWraps,
+  databaseFrozenColumnIds,
+  databaseTableColumnIds,
+} from "../shared/database-table-columns.js";
+import {
   documentPropertyDateKey,
   formulaValueText,
   isEmptyPropertyValue,
 } from "../shared/properties.js";
 import {
-  listPropertiesForDocument,
-  serializeDatabase,
-} from "./_property-utils.js";
-import {
   filterDatabaseContainedDocuments,
   getContentDatabaseResponse,
   getDatabaseByDocumentId,
   getDatabaseItemByDocumentId,
+  getDocumentContextPath,
   serializeDatabaseMembership,
 } from "./_database-utils.js";
 import {
-  getLocalFileDocument,
-  isContentLocalFileMode,
-  isLocalDocumentId,
-  localContentViewScreenSummary,
-} from "./_local-file-documents.js";
-import { serializeDocumentSource } from "./_document-source.js";
+  listPropertiesForDocument,
+  serializeDatabase,
+} from "./_property-utils.js";
 
 type ScreenTreeDocument = Pick<
   typeof schema.documents.$inferSelect,
@@ -114,6 +117,25 @@ function arrayValue(value: unknown) {
   return Array.isArray(value) ? value : undefined;
 }
 
+function frozenColumnIdsValue(
+  value: unknown,
+  intendedFrozenColumnIds: readonly string[],
+) {
+  if (
+    !Array.isArray(value) ||
+    value.some((columnId) => typeof columnId !== "string" || !columnId)
+  ) {
+    return undefined;
+  }
+  if (
+    value.length > intendedFrozenColumnIds.length ||
+    value.some((columnId, index) => columnId !== intendedFrozenColumnIds[index])
+  ) {
+    return undefined;
+  }
+  return value as string[];
+}
+
 function recordValue(value: unknown) {
   return isRecord(value) ? value : undefined;
 }
@@ -127,7 +149,8 @@ function databaseViewTypeValue(
     value === "list" ||
     value === "gallery" ||
     value === "calendar" ||
-    value === "timeline"
+    value === "timeline" ||
+    value === "form"
   ) {
     return value;
   }
@@ -179,8 +202,11 @@ function propertyValueTextForScreen(
   ) {
     return (
       property.definition.options.options?.find(
-        (option) => option.id === String(value),
-      )?.name ?? String(value)
+        (option) =>
+          option.id ===
+          (typeof value === "string" ? value : (JSON.stringify(value) ?? "")),
+      )?.name ??
+      (typeof value === "string" ? value : (JSON.stringify(value) ?? ""))
     );
   }
   if (property.definition.type === "checkbox") {
@@ -190,6 +216,73 @@ function propertyValueTextForScreen(
 }
 
 export const DATABASE_CURRENT_VIEW_VISIBLE_ITEM_LIMIT = 50;
+export const SCREEN_DOCUMENT_PREVIEW_CHARS = 1_200;
+
+export function documentContentPreview(content: string) {
+  const normalized = content.trim();
+  if (normalized.length <= SCREEN_DOCUMENT_PREVIEW_CHARS) {
+    return {
+      contentPreview: normalized,
+      contentLength: content.length,
+      contentTruncated: false,
+    };
+  }
+
+  return {
+    contentPreview: `${normalized.slice(0, SCREEN_DOCUMENT_PREVIEW_CHARS).trimEnd()}... [document body truncated; call get-document for the full content]`,
+    contentLength: content.length,
+    contentTruncated: true,
+  };
+}
+
+interface ContentSelectionAppState {
+  documentId?: unknown;
+  collapsed?: unknown;
+  selectedText?: unknown;
+  textTruncated?: unknown;
+  blockText?: unknown;
+  heading?: unknown;
+}
+
+export function buildSelectionScreenSection(
+  selection: unknown,
+  openDocumentId: string | undefined,
+): Record<string, unknown> | null {
+  if (!selection || typeof selection !== "object") return null;
+  const state = selection as ContentSelectionAppState;
+  if (
+    typeof state.documentId !== "string" ||
+    !openDocumentId ||
+    state.documentId !== openDocumentId
+  ) {
+    return null;
+  }
+
+  const heading = typeof state.heading === "string" ? state.heading : null;
+  const blockText = typeof state.blockText === "string" ? state.blockText : "";
+
+  if (state.collapsed === true || typeof state.selectedText !== "string") {
+    return {
+      documentId: state.documentId,
+      collapsed: true,
+      blockText,
+      heading,
+      hint: "Cursor position only; no text is selected. Call get-document for full body access before editing.",
+    };
+  }
+
+  return {
+    documentId: state.documentId,
+    collapsed: false,
+    selectedText: state.selectedText,
+    textTruncated: state.textTruncated === true,
+    blockText,
+    heading,
+    hint:
+      "To edit this exact text, call edit-document with find set to selectedText above (verbatim) and replace set to the new text; " +
+      "id, baseRevision, and idempotencyKey are all required and come from get-document.",
+  };
+}
 
 function propertyForDatabaseItem(
   item: ContentDatabaseItem,
@@ -209,6 +302,17 @@ function calculationRecord(value: unknown) {
     Object.entries(record).filter(
       (entry): entry is [string, ContentDatabaseColumnCalculation] =>
         typeof entry[0] === "string" && isDatabaseColumnCalculation(entry[1]),
+    ),
+  );
+}
+
+function booleanRecord(value: unknown) {
+  const record = recordValue(value);
+  if (!record) return undefined;
+  return Object.fromEntries(
+    Object.entries(record).filter(
+      (entry): entry is [string, boolean] =>
+        entry[0].length > 0 && typeof entry[1] === "boolean",
     ),
   );
 }
@@ -466,7 +570,12 @@ function propertyNumberValueForScreen(property: DocumentProperty) {
   const value =
     typeof property.value === "number"
       ? property.value
-      : Number(String(property.value).trim());
+      : Number(
+          (typeof property.value === "string"
+            ? property.value
+            : (JSON.stringify(property.value) ?? "")
+          ).trim(),
+        );
   return Number.isFinite(value) ? value : Number.NaN;
 }
 
@@ -536,11 +645,13 @@ export function databaseCurrentViewSnapshot(
     {};
   const calculationResults =
     arrayValue(nav.databaseCalculationResults) ??
-    databaseCalculationSummariesForScreen(
-      calculations,
-      response.items,
-      visibleProperties,
-    );
+    (response.pagination?.hasMore
+      ? null
+      : databaseCalculationSummariesForScreen(
+          calculations,
+          response.items,
+          visibleProperties,
+        ));
   const groupByPropertyId =
     stringValue(nav.databaseGroupByPropertyId) ??
     activeView?.groupByPropertyId ??
@@ -573,11 +684,59 @@ export function databaseCurrentViewSnapshot(
         (property) => property.definition.id === endDatePropertyId,
       )
     : null;
+  const viewType =
+    stringValue(nav.databaseViewType) ?? activeView?.type ?? "table";
+  const tableColumnOrderIds =
+    viewType === "table"
+      ? databaseTableColumnIds(
+          visibleProperties.map((property) => property.definition.id),
+          arrayValue(nav.databaseTableColumnOrderIds)?.filter(
+            (id): id is string => typeof id === "string",
+          ) ?? activeView?.tableColumnOrderIds,
+        )
+      : undefined;
+  const wrapCells =
+    typeof nav.databaseWrapCells === "boolean"
+      ? nav.databaseWrapCells
+      : activeView?.wrapCells === true;
+  const columnWrapOverrides =
+    booleanRecord(nav.databaseColumnWrapOverrides) ??
+    activeView?.columnWrapOverrides ??
+    {};
+  const navigationFrozenThroughColumnId =
+    nav.databaseFrozenThroughColumnId === null
+      ? null
+      : stringValue(nav.databaseFrozenThroughColumnId);
+  const frozenThroughColumnId =
+    navigationFrozenThroughColumnId !== undefined
+      ? navigationFrozenThroughColumnId
+      : activeView?.frozenThroughColumnId;
+  const intendedFrozenColumnIds = tableColumnOrderIds
+    ? databaseFrozenColumnIds({ frozenThroughColumnId }, tableColumnOrderIds)
+    : undefined;
+  const tablePresentation = tableColumnOrderIds
+    ? {
+        tableColumnOrderIds,
+        columnWrapOverrides,
+        effectiveColumnWrapById: Object.fromEntries(
+          tableColumnOrderIds.map((columnId) => [
+            columnId,
+            databaseColumnWraps({ wrapCells, columnWrapOverrides }, columnId),
+          ]),
+        ),
+        frozenThroughColumnId,
+        intendedFrozenColumnIds,
+        effectiveFrozenColumnIds: frozenColumnIdsValue(
+          nav.databaseEffectiveFrozenColumnIds,
+          intendedFrozenColumnIds ?? [],
+        ),
+      }
+    : {};
 
   return {
     id: activeViewId,
     name: stringValue(nav.databaseViewName) ?? activeView?.name ?? "Table",
-    type: stringValue(nav.databaseViewType) ?? activeView?.type ?? "table",
+    type: viewType,
     views: databaseViewSummariesForScreen(nav.databaseViews, response),
     searchQuery: stringValue(nav.databaseSearchQuery),
     sorts: arrayValue(nav.databaseSorts) ?? activeView?.sorts ?? [],
@@ -611,10 +770,8 @@ export function databaseCurrentViewSnapshot(
     dateRangeLabel: stringValue(nav.databaseDateRangeLabel),
     calculations,
     calculationResults,
-    wrapCells:
-      typeof nav.databaseWrapCells === "boolean"
-        ? nav.databaseWrapCells
-        : activeView?.wrapCells === true,
+    ...tablePresentation,
+    wrapCells,
     rowDensity:
       rowDensityValue(nav.databaseRowDensity) ??
       activeView?.rowDensity ??
@@ -623,10 +780,16 @@ export function databaseCurrentViewSnapshot(
       openPagesInValue(nav.databaseOpenPagesIn) ??
       activeView?.openPagesIn ??
       "preview",
+    formQuestions:
+      arrayValue(nav.databaseFormQuestions) ?? activeView?.formQuestions ?? [],
     visibleItemCount:
-      numberValue(nav.databaseVisibleItemCount) ?? response.items.length,
+      numberValue(nav.databaseVisibleItemCount) ??
+      response.pagination?.returnedItems ??
+      response.items.length,
     totalItemCount:
-      numberValue(nav.databaseTotalItemCount) ?? response.items.length,
+      numberValue(nav.databaseTotalItemCount) ??
+      response.pagination?.totalItems ??
+      response.items.length,
     visibleItems: arrayValue(nav.databaseVisibleItems) ?? fallbackVisibleItems,
     visibleItemLimit:
       numberValue(nav.databaseVisibleItemLimit) ??
@@ -644,54 +807,32 @@ interface NavigationState {
 
 export default defineAction({
   description:
-    "See what the user is currently looking at on screen. Reads navigation state and fetches matching data.",
+    "See what the user is currently looking at on screen. Returns bounded navigation, document previews, the current collection window, and the editor's current text selection (if any); use get-document for full page content.",
+  deferLoading: false,
   schema: z.object({}),
   http: false,
   run: async () => {
-    const navigation = await readAppState("navigation");
+    const navigation = await readAppStateForCurrentTab("navigation");
+    const suggestionMode = await readAppStateForCurrentTab(
+      "content-suggestion-mode",
+    );
     const localFilesState = await readAppState("local-files");
+    const contentSpaceState = await readAppState("content-space");
+    const selectionState = await readAppStateForCurrentTab("content-selection");
+    const importState = await readAppStateForCurrentTab("content-import");
 
     const screen: Record<string, unknown> = {};
     if (navigation) screen.navigation = navigation;
+    if (importState) screen.contentImport = importState;
+    if (suggestionMode) screen.suggestionMode = suggestionMode;
+    if (contentSpaceState) screen.contentSpace = contentSpaceState;
 
     const nav = navigation as NavigationState | null;
-    if (await isContentLocalFileMode()) {
-      screen.localFiles = {
-        ...(await localContentViewScreenSummary()),
-        actions: [
-          "list-documents",
-          "get-document",
-          "create-document",
-          "update-document",
-          "delete-document",
-          "share-local-file-document",
-        ],
-      };
-      if (nav?.documentId && isLocalDocumentId(nav.documentId)) {
-        screen.document = await getLocalFileDocument(nav.documentId);
-      } else if (nav?.documentId) {
-        const access = await resolveAccess("document", nav.documentId);
-        if (access) {
-          const doc = access.resource;
-          screen.document = {
-            id: doc.id,
-            parentId: doc.parentId,
-            title: doc.title,
-            content: doc.content,
-            icon: doc.icon,
-            position: doc.position,
-            isFavorite: parseDocumentFavorite(doc.isFavorite),
-            hideFromSearch: parseDocumentHideFromSearch(doc.hideFromSearch),
-            visibility: doc.visibility,
-            source: serializeDocumentSource(doc),
-            createdAt: doc.createdAt,
-            updatedAt: doc.updatedAt,
-          };
-        }
-      }
-      return screen;
-    }
-
+    const selectionSection = buildSelectionScreenSection(
+      selectionState,
+      nav?.documentId,
+    );
+    if (selectionSection) screen.selection = selectionSection;
     const db = getDb();
 
     if (nav?.view === "local-files") {
@@ -713,27 +854,36 @@ export default defineAction({
         const doc = access.resource;
         const database = await getDatabaseByDocumentId(doc.id);
         const databaseMembership = await getDatabaseItemByDocumentId(doc.id);
+        const contentSummary = documentContentPreview(doc.content);
         screen.document = {
           id: doc.id,
           parentId: doc.parentId,
           title: doc.title,
-          content: doc.content,
+          ...contentSummary,
+          description: doc.description,
           icon: doc.icon,
           position: doc.position,
           isFavorite: parseDocumentFavorite(doc.isFavorite),
           hideFromSearch: parseDocumentHideFromSearch(doc.hideFromSearch),
           visibility: doc.visibility,
-          database: database ? serializeDatabase(database) : undefined,
+          database: database
+            ? serializeDatabase(database, doc.description)
+            : undefined,
           databaseMembership: databaseMembership
             ? serializeDatabaseMembership(databaseMembership)
             : undefined,
           properties: await listPropertiesForDocument(doc),
           createdAt: doc.createdAt,
           updatedAt: doc.updatedAt,
+          contextPath: await getDocumentContextPath(doc),
         };
         if (database) {
           const databaseResponse = await getContentDatabaseResponse(
             database.id,
+            {
+              limit: DATABASE_CURRENT_VIEW_VISIBLE_ITEM_LIMIT,
+              includeSources: false,
+            },
           );
           screen.database = databaseResponse;
           screen.databaseCurrentView = databaseCurrentViewSnapshot(
@@ -757,6 +907,9 @@ export default defineAction({
               previewMembership?.database.id === database.id
             ) {
               const previewDoc = previewAccess.resource;
+              const previewContentSummary = documentContentPreview(
+                previewDoc.content,
+              );
               screen.databasePreview = {
                 itemId: previewMembership.item.id,
                 databaseId: previewMembership.database.id,
@@ -766,7 +919,8 @@ export default defineAction({
                   id: previewDoc.id,
                   parentId: previewDoc.parentId,
                   title: previewDoc.title,
-                  content: previewDoc.content,
+                  ...previewContentSummary,
+                  description: previewDoc.description,
                   icon: previewDoc.icon,
                   position: previewDoc.position,
                   isFavorite: parseDocumentFavorite(previewDoc.isFavorite),
@@ -779,6 +933,7 @@ export default defineAction({
                   properties: await listPropertiesForDocument(previewDoc),
                   createdAt: previewDoc.createdAt,
                   updatedAt: previewDoc.updatedAt,
+                  contextPath: await getDocumentContextPath(previewDoc),
                 },
               };
             }
@@ -788,11 +943,20 @@ export default defineAction({
     }
 
     const docs = await db
-      .select()
+      .select({
+        id: schema.documents.id,
+        parentId: schema.documents.parentId,
+        title: schema.documents.title,
+        icon: schema.documents.icon,
+        isFavorite: schema.documents.isFavorite,
+        hideFromSearch: schema.documents.hideFromSearch,
+        visibility: schema.documents.visibility,
+      })
       .from(schema.documents)
       .where(
         and(
           accessFilter(schema.documents, schema.documentShares),
+          isNull(schema.documents.trashedAt),
           documentDiscoveryFilter(),
         ),
       )
@@ -815,7 +979,17 @@ export default defineAction({
       const treeDatabases =
         treeDocs.length > 0
           ? await db
-              .select()
+              .select({
+                id: schema.contentDatabases.id,
+                ownerEmail: schema.contentDatabases.ownerEmail,
+                orgId: schema.contentDatabases.orgId,
+                documentId: schema.contentDatabases.documentId,
+                title: schema.contentDatabases.title,
+                systemRole: schema.contentDatabases.systemRole,
+                viewConfigJson: schema.contentDatabases.viewConfigJson,
+                createdAt: schema.contentDatabases.createdAt,
+                updatedAt: schema.contentDatabases.updatedAt,
+              })
               .from(schema.contentDatabases)
               .where(
                 inArray(

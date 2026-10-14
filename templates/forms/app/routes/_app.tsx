@@ -1,13 +1,11 @@
 import { Outlet } from "react-router";
-import { AppLayout } from "@/components/layout/AppLayout";
 
-// Pathless layout route — wraps all protected routes with AppLayout so the
-// agent sidebar persists across client-side navigations. Public routes
-// (f.$ for form filling, _index chat home) live outside this layout.
+import { Layout } from "@/components/layout/Layout";
+
 export default function AppLayoutRoute() {
   return (
-    <AppLayout>
+    <Layout>
       <Outlet />
-    </AppLayout>
+    </Layout>
   );
 }

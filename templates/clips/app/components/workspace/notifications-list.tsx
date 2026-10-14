@@ -1,4 +1,5 @@
-import { Link } from "react-router";
+import { useFormatters, useT } from "@agent-native/core/client/i18n";
+import { InlineMarkdown } from "@agent-native/toolkit/app/review";
 import {
   IconMessage,
   IconMoodSmile,
@@ -6,7 +7,15 @@ import {
   IconAt,
   IconBell,
 } from "@tabler/icons-react";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Link } from "react-router";
+
+import { ClipsAvatar } from "@/components/clips-avatar";
+import {
+  Empty,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty";
 
 export type NotificationKind = "comment" | "reaction" | "mention" | "share";
 
@@ -16,6 +25,7 @@ export interface NotificationItem {
   recordingId: string;
   recordingTitle: string;
   authorEmail: string | null;
+  authorName: string | null;
   preview: string;
   createdAt: string;
 }
@@ -25,24 +35,14 @@ interface NotificationsListProps {
   onReply?: (item: NotificationItem) => void;
 }
 
-function initials(email: string | null): string {
-  if (!email) return "??";
-  const [name] = email.split("@");
-  return (name || email).slice(0, 2).toUpperCase();
-}
-
-function formatTime(iso: string): string {
-  try {
-    const d = new Date(iso);
-    const now = Date.now();
-    const delta = (now - d.getTime()) / 1000;
-    if (delta < 60) return "just now";
-    if (delta < 60 * 60) return `${Math.floor(delta / 60)}m ago`;
-    if (delta < 60 * 60 * 24) return `${Math.floor(delta / 3600)}h ago`;
-    return d.toLocaleDateString();
-  } catch {
-    return iso;
-  }
+function initials(nameOrEmail: string | null): string {
+  if (!nameOrEmail) return "??";
+  return nameOrEmail
+    .split(/\s+|@/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase() ?? "")
+    .join("");
 }
 
 function KindIcon({ kind }: { kind: NotificationKind }) {
@@ -58,79 +58,133 @@ function KindIcon({ kind }: { kind: NotificationKind }) {
 }
 
 export function NotificationsList({ items, onReply }: NotificationsListProps) {
+  const t = useT();
+  const formatters = useFormatters();
+  const formatDate = (date: Date) => formatters.formatDate(date);
+  const formatRelativeTime = (
+    value: number,
+    unit: Parameters<typeof formatters.formatRelativeTime>[1],
+  ) => formatters.formatRelativeTime(value, unit);
   if (!items.length) {
     return (
-      <div className="text-center py-16 text-sm text-muted-foreground">
-        <IconBell className="size-10 mx-auto mb-3 text-muted-foreground/50" />
-        You're all caught up.
-      </div>
+      <Empty className="gap-3 rounded-none py-16">
+        <EmptyHeader>
+          <EmptyMedia variant="icon">
+            <IconBell />
+          </EmptyMedia>
+          <EmptyTitle className="text-sm font-medium text-muted-foreground">
+            {t("clipsFinalRaw.allCaughtUp")}
+          </EmptyTitle>
+        </EmptyHeader>
+      </Empty>
     );
   }
 
   return (
     <ul className="divide-y">
-      {items.map((item) => (
-        <li key={item.id} className="py-3 flex items-start gap-3">
-          <Avatar className="h-9 w-9 flex-shrink-0">
-            <AvatarFallback className="text-xs bg-primary text-primary-foreground">
-              {initials(item.authorEmail)}
-            </AvatarFallback>
-          </Avatar>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2 text-sm">
-              <KindIcon kind={item.kind} />
-              <span className="font-medium truncate">
-                {item.authorEmail ?? "Someone"}
-              </span>
-              <span className="text-muted-foreground">
-                {labelFor(item.kind)}
-              </span>
-              <span className="text-muted-foreground truncate">
-                {item.recordingTitle}
-              </span>
-              <span className="text-muted-foreground/70 ml-auto flex-shrink-0">
-                {formatTime(item.createdAt)}
-              </span>
-            </div>
-            {item.preview ? (
-              <div className="mt-1 text-sm text-muted-foreground line-clamp-2">
-                {item.preview}
+      {items.map((item) => {
+        const displayName =
+          item.authorName?.trim() ||
+          item.authorEmail ||
+          t("clipsFinalRaw.someone");
+        return (
+          <li key={item.id} className="flex items-start gap-3 py-3">
+            <ClipsAvatar
+              email={item.authorEmail}
+              alt={displayName}
+              fallback={initials(displayName)}
+              className="h-9 w-9 flex-shrink-0"
+              fallbackClassName="text-xs bg-primary text-primary-foreground"
+            />
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2 text-sm">
+                <KindIcon kind={item.kind} />
+                <span className="truncate font-medium">{displayName}</span>
+                {displayName !== item.authorEmail && item.authorEmail ? (
+                  <span className="truncate text-muted-foreground">
+                    {item.authorEmail}
+                  </span>
+                ) : null}
+                <span className="text-muted-foreground">
+                  {labelFor(item.kind, t)}
+                </span>
+                <span className="truncate text-muted-foreground">
+                  {item.recordingTitle}
+                </span>
+                <span className="ml-auto flex-shrink-0 text-muted-foreground/70">
+                  {formatNotificationTime(
+                    item.createdAt,
+                    formatDate,
+                    formatRelativeTime,
+                  )}
+                </span>
               </div>
-            ) : null}
-            <div className="mt-1.5 flex items-center gap-3 text-xs">
-              <Link
-                to={`/r/${item.recordingId}`}
-                className="text-primary hover:underline"
-              >
-                View
-              </Link>
-              {item.kind === "comment" && onReply ? (
-                <button
-                  className="text-primary hover:underline"
-                  onClick={() => onReply(item)}
-                >
-                  Reply
-                </button>
+              {item.preview ? (
+                item.kind === "comment" || item.kind === "mention" ? (
+                  <InlineMarkdown
+                    content={item.preview}
+                    className="mt-1 line-clamp-2 text-sm text-muted-foreground"
+                  />
+                ) : (
+                  <div className="mt-1 line-clamp-2 text-sm text-muted-foreground">
+                    {item.preview}
+                  </div>
+                )
               ) : null}
+              <div className="mt-1.5 flex items-center gap-3 text-xs">
+                <Link
+                  to={`/r/${item.recordingId}`}
+                  className="text-primary hover:underline"
+                >
+                  {t("clipsFinalRaw.view")}
+                </Link>
+                {item.kind === "comment" && onReply ? (
+                  <button
+                    className="text-primary hover:underline"
+                    onClick={() => onReply(item)}
+                  >
+                    {t("clipsFinalRaw.reply")}
+                  </button>
+                ) : null}
+              </div>
             </div>
-          </div>
-        </li>
-      ))}
+          </li>
+        );
+      })}
     </ul>
   );
 }
 
-function labelFor(kind: NotificationKind): string {
+function labelFor(kind: NotificationKind, t: ReturnType<typeof useT>): string {
   switch (kind) {
     case "comment":
-      return "commented on";
+      return t("clipsFinalRaw.commentedOn");
     case "reaction":
-      return "reacted to";
+      return t("clipsFinalRaw.reactedTo");
     case "mention":
-      return "mentioned you in";
+      return t("clipsFinalRaw.mentionedYouIn");
     case "share":
-      return "shared";
+      return t("clipsFinalRaw.shared");
     default:
       return "";
+  }
+}
+
+function formatNotificationTime(
+  iso: string,
+  formatDate: ReturnType<typeof useFormatters>["formatDate"],
+  formatRelativeTime: ReturnType<typeof useFormatters>["formatRelativeTime"],
+): string {
+  try {
+    const date = new Date(iso);
+    const delta = (date.getTime() - Date.now()) / 1000;
+    const abs = Math.abs(delta);
+    if (abs < 60) return formatRelativeTime(Math.round(delta), "second");
+    if (abs < 3600) return formatRelativeTime(Math.round(delta / 60), "minute");
+    if (abs < 86400)
+      return formatRelativeTime(Math.round(delta / 3600), "hour");
+    return formatDate(date);
+  } catch {
+    return iso;
   }
 }

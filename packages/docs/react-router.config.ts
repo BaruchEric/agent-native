@@ -1,10 +1,10 @@
 import type { Config } from "@react-router/dev/config";
 
+import { buildPrerenderPaths } from "./app/vite-sitemap-plugin";
+
 export default {
   appDirectory: "app",
   ssr: true,
   routeDiscovery: { mode: "initial" },
-  future: {
-    v8_viteEnvironmentApi: true,
-  },
+  prerender: { paths: () => buildPrerenderPaths(), concurrency: 8 },
 } satisfies Config;

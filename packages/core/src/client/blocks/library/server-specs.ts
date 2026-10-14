@@ -1,33 +1,68 @@
-import { defineBlock, type BlockSpec } from "../types.js";
 import { registerBlocks, type BlockRegistry } from "../registry.js";
-
-// React-free schema + MDX config for the standard library. The matching React
-// `Read`/`Edit` live in the full client entry; the server path only ever touches
-// `spec.schema` / `spec.mdx`, so these configs register with a render-only stub.
+import { defineBlock, type BlockSpec } from "../types.js";
+import {
+  annotatedCodeSchema,
+  annotatedCodeMdx,
+  type AnnotatedCodeData,
+} from "./annotated-code.config.js";
+import {
+  apiEndpointSchema,
+  apiEndpointMdx,
+  type ApiEndpointData,
+} from "./api-endpoint.config.js";
+import {
+  calloutSchema,
+  calloutMdx,
+  type CalloutData,
+} from "./callout.config.js";
 import {
   checklistSchema,
   checklistMdx,
   type ChecklistData,
 } from "./checklist.config.js";
-import { tableSchema, tableMdx, type TableData } from "./table.config.js";
-import { codeSchema, codeMdx, type CodeData } from "./code.config.js";
 import {
   codeTabsSchema,
   codeTabsMdx,
   type CodeTabsData,
 } from "./code-tabs.config.js";
-import { htmlSchema, htmlMdx, type HtmlBlockData } from "./html.config.js";
-import { tabsSchema, tabsMdx, type TabsData } from "./tabs.config.js";
+import { codeSchema, codeMdx, type CodeData } from "./code.config.js";
 import {
   columnsSchema,
   columnsMdx,
   type ColumnsData,
 } from "./columns.config.js";
 import {
-  calloutSchema,
-  calloutMdx,
-  type CalloutData,
-} from "./callout.config.js";
+  dataModelSchema,
+  dataModelMdx,
+  type DataModelData,
+} from "./data-model.config.js";
+import {
+  diagramSchema,
+  diagramMdx,
+  type DiagramData,
+} from "./diagram.config.js";
+import { diffSchema, diffMdx, type DiffData } from "./diff.config.js";
+import {
+  fileTreeSchema,
+  fileTreeMdx,
+  type FileTreeData,
+} from "./file-tree.config.js";
+import { htmlSchema, htmlMdx, type HtmlBlockData } from "./html.config.js";
+import {
+  jsonExplorerSchema,
+  jsonExplorerMdx,
+  type JsonExplorerData,
+} from "./json-explorer.config.js";
+import {
+  mermaidSchema,
+  mermaidMdx,
+  type MermaidData,
+} from "./mermaid.config.js";
+import {
+  openApiSpecSchema,
+  openApiSpecMdx,
+  type OpenApiSpecData,
+} from "./openapi-spec.config.js";
 import {
   questionFormSchema,
   questionFormMdx,
@@ -36,70 +71,16 @@ import {
   type QuestionFormData,
   type VisualQuestionsData,
 } from "./question-form.config.js";
-import {
-  diagramSchema,
-  diagramMdx,
-  type DiagramData,
-} from "./diagram.config.js";
+import { tableSchema, tableMdx, type TableData } from "./table.config.js";
+import { tabsSchema, tabsMdx, type TabsData } from "./tabs.config.js";
 import {
   wireframeSchema,
   wireframeMdx,
   type WireframeData,
 } from "./wireframe.config.js";
-import {
-  mermaidSchema,
-  mermaidMdx,
-  type MermaidData,
-} from "./mermaid.config.js";
-import {
-  apiEndpointSchema,
-  apiEndpointMdx,
-  type ApiEndpointData,
-} from "./api-endpoint.config.js";
-import {
-  openApiSpecSchema,
-  openApiSpecMdx,
-  type OpenApiSpecData,
-} from "./openapi-spec.config.js";
-import {
-  dataModelSchema,
-  dataModelMdx,
-  type DataModelData,
-} from "./data-model.config.js";
-import { diffSchema, diffMdx, type DiffData } from "./diff.config.js";
-import {
-  fileTreeSchema,
-  fileTreeMdx,
-  type FileTreeData,
-} from "./file-tree.config.js";
-import {
-  jsonExplorerSchema,
-  jsonExplorerMdx,
-  type JsonExplorerData,
-} from "./json-explorer.config.js";
-import {
-  annotatedCodeSchema,
-  annotatedCodeMdx,
-  type AnnotatedCodeData,
-} from "./annotated-code.config.js";
 
-/** Render-only stub for server / agent registries (never invoked off-browser). */
 const ServerReadStub = () => null;
 
-/**
- * Canonical React-free specs for the standard library, used by BOTH apps' server
- * / shared registries (`plan-block-registry.ts`, `nfm-registry.ts`). Each carries
- * only the parts the server path touches — `schema` + `mdx` + metadata for the
- * agent schema export — with a render-only `Read` stub. The full client specs
- * (with real React `Read`/`Edit`) live in `./specs.tsx`; both share the identical
- * `schema`/`mdx` config so inline source can never drift from what renders.
- *
- * `table` keeps the core default `type` here; content's server registry renames
- * it to `table-block` via {@link LibraryBlockConfigOverrides}. The descriptions
- * are the neutral agent-schema phrasing; an app that curates a longer
- * description for a block (e.g. plan's hand-drawn Mermaid, plan's detailed file
- * tree) passes an override rather than re-authoring the spec.
- */
 export const libraryBlockConfigs: BlockSpec<any>[] = [
   defineBlock<ChecklistData>({
     type: "checklist",
@@ -212,7 +193,7 @@ export const libraryBlockConfigs: BlockSpec<any>[] = [
     placement: ["block"],
     label: "Diagram",
     description:
-      "A flexible inline architecture/code diagram. Prefer html/css with SVG or semantic HTML for polished two-dimensional layouts; use .diagram-* primitives and --wf-* tokens for theme/sketch compatibility. Legacy nodes/edges are only for simple previews.",
+      "A flexible inline architecture/code diagram. Prefer html/css with SVG or semantic HTML for polished two-dimensional layouts; use .diagram-* primitives and --wf-* tokens for theme/sketch compatibility. Set frame to show for standalone artifacts that need containment, hide when surrounding docs/canvas chrome already supplies the boundary. Legacy nodes/edges are only for simple previews.",
   }),
   defineBlock<WireframeData>({
     type: "wireframe",
@@ -222,7 +203,7 @@ export const libraryBlockConfigs: BlockSpec<any>[] = [
     placement: ["block"],
     label: "Wireframe",
     description:
-      "A sketch wireframe of one screen built from kit primitives (or an HTML mockup), rendered in a chosen surface frame (desktop/mobile/popover/panel/browser).",
+      "A sketch wireframe of one screen built from kit primitives (or an HTML mockup), rendered in a chosen surface (desktop/mobile/popover/panel/browser). Set frame to show for standalone screens and recap comparisons, hide only when surrounding chrome already supplies the boundary.",
   }),
   defineBlock<MermaidData>({
     type: "mermaid",
@@ -306,12 +287,6 @@ export const libraryBlockConfigs: BlockSpec<any>[] = [
   }),
 ];
 
-/**
- * Per-block overrides for {@link registerLibraryBlockConfigs}, keyed by canonical
- * `type`. Servers tweak only the agent-facing fields that legitimately differ:
- * content re-types `table` → `table-block`; plan curates a longer Mermaid and
- * file-tree description. The `schema` / `mdx` config always stays shared.
- */
 export type LibraryBlockConfigOverrides = Record<
   string,
   Partial<
@@ -319,13 +294,6 @@ export type LibraryBlockConfigOverrides = Record<
   >
 >;
 
-/**
- * Register the React-free standard-library config stubs into a server / shared
- * {@link BlockRegistry}. Both `plan-block-registry.ts` and `nfm-registry.ts` call
- * this, then register only their app-specific block configs (plan adds callout /
- * diagram / wireframe / question-form) on top — so the shared library lives in
- * exactly one place across browser AND server registries.
- */
 export function registerLibraryBlockConfigs(
   registry: BlockRegistry,
   options: { overrides?: LibraryBlockConfigOverrides } = {},

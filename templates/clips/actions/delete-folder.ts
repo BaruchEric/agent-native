@@ -1,9 +1,13 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
+import { writeAppState } from "@agent-native/core/application-state";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
-import { writeAppState } from "@agent-native/core/application-state";
-import { getCurrentOwnerEmail } from "../server/lib/recordings.js";
+import {
+  getCurrentOwnerEmail,
+  ownerEmailMatches,
+} from "../server/lib/recordings.js";
 
 export default defineAction({
   description:
@@ -15,14 +19,13 @@ export default defineAction({
     const db = getDb();
     const ownerEmail = getCurrentOwnerEmail();
 
-    // Find the folder and gather all descendant folder ids
     const [folder] = await db
       .select()
       .from(schema.folders)
       .where(
         and(
           eq(schema.folders.id, args.id),
-          eq(schema.folders.ownerEmail, ownerEmail),
+          ownerEmailMatches(schema.folders.ownerEmail, ownerEmail),
         ),
       );
 
@@ -30,7 +33,6 @@ export default defineAction({
       throw new Error(`Folder not found: ${args.id}`);
     }
 
-    // BFS for descendants
     const descendants: string[] = [folder.id];
     let frontier: string[] = [folder.id];
     while (frontier.length > 0) {
@@ -40,7 +42,7 @@ export default defineAction({
         .where(
           and(
             inArray(schema.folders.parentId, frontier),
-            eq(schema.folders.ownerEmail, ownerEmail),
+            ownerEmailMatches(schema.folders.ownerEmail, ownerEmail),
           ),
         );
       const nextIds = children.map((c) => c.id);
@@ -48,21 +50,18 @@ export default defineAction({
       frontier = nextIds;
     }
 
-    // Cascade recordings out to parent scope (library root OR parent folder)
-    // All recordings whose folderId is any descendant bubble up to folder.parentId
     const now = new Date().toISOString();
     await db
       .update(schema.recordings)
       .set({ folderId: folder.parentId ?? null, updatedAt: now })
       .where(inArray(schema.recordings.folderId, descendants));
 
-    // Delete the folders (deepest first is unnecessary since all will go)
     await db
       .delete(schema.folders)
       .where(
         and(
           inArray(schema.folders.id, descendants),
-          eq(schema.folders.ownerEmail, ownerEmail),
+          ownerEmailMatches(schema.folders.ownerEmail, ownerEmail),
         ),
       );
 

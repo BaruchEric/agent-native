@@ -1,6 +1,7 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
+import { defineAction } from "@agent-native/core/action";
 import { resolveAccess } from "@agent-native/core/sharing";
+import { z } from "zod";
+
 import { parseJson } from "../server/lib/brain.js";
 import { testSlackConnection } from "../server/lib/connectors.js";
 
@@ -70,6 +71,7 @@ export default defineAction({
   }),
   run: async ({ sourceId, channelRefs, resolveNames }) => {
     let refs = channelRefs;
+    let workspaceConnectionId: string | undefined;
     if (sourceId) {
       const access = await resolveAccess("brain-source", sourceId);
       if (!access) throw new Error(`No access to brain source ${sourceId}`);
@@ -78,13 +80,21 @@ export default defineAction({
           "test-slack-connection sourceId must reference a Slack source.",
         );
       }
-      refs = refs.length
-        ? refs
-        : channelRefsFromConfig(parseJson(access.resource.configJson, {}));
+      const config = parseJson<Record<string, unknown>>(
+        access.resource.configJson,
+        {},
+      );
+      workspaceConnectionId =
+        typeof config.workspaceConnectionId === "string" &&
+        config.workspaceConnectionId.trim()
+          ? config.workspaceConnectionId.trim()
+          : undefined;
+      refs = refs.length ? refs : channelRefsFromConfig(config);
     }
     const result = await testSlackConnection({
       channelRefs: refs,
       resolveNames,
+      workspaceConnectionId,
     });
     return { ...result, sourceId: sourceId ?? null };
   },

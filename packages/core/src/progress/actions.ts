@@ -1,11 +1,12 @@
-/**
- * Framework-level agent tools for the progress primitive. Registered as
- * native tools so every template exposes them. Use from long agent loops
- * to communicate status to the user while work is still in-flight.
- *
- * All operations are consolidated into a single `manage-progress` tool
- * with an `action` discriminator.
- */
+function stringifyValue(value: unknown): string {
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  )
+    return String(value);
+  return value == null ? "" : (JSON.stringify(value) ?? "");
+}
 
 import type { ActionEntry } from "../agent/production-agent.js";
 import {
@@ -26,6 +27,7 @@ export function createProgressToolEntries(
 ): Record<string, ActionEntry> {
   return {
     "manage-progress": {
+      confirmsAutomationWork: false,
       tool: {
         description: `Track multi-step task progress visible to the user in the runs tray.
 
@@ -35,6 +37,7 @@ Use for non-trivial work with multiple real steps (not single-action lookups). D
 - Exactly one task in progress at a time; never batch-complete steps after the fact — update as you go.
 - Always transition pending → in_progress before completing a step.
 - If the task pivots (scope change, unexpected blocker), update the current step to reflect it before continuing.
+- Only include fields for the selected action; do not send empty placeholder fields.
 - End every run with "complete" (succeeded / failed / cancelled). Never leave a run open indefinitely.
 
 Actions:
@@ -78,8 +81,9 @@ Actions:
             },
             status: {
               type: "string",
-              enum: ["succeeded", "failed", "cancelled"],
-              description: "[complete] Terminal status for the run.",
+              enum: ["", "succeeded", "failed", "cancelled"],
+              description:
+                '[complete] Terminal status for the run. Omit it for "start" and "update".',
             },
             active: {
               type: "boolean",
@@ -94,18 +98,23 @@ Actions:
           required: ["action"],
         },
       },
+      planMode: {
+        effect: (args) => (args.action === "list" ? "read" : "write"),
+        allowedValues: { action: ["list"] },
+        description: "Plan mode allows listing recent progress runs.",
+      },
       run: async (args: Record<string, unknown>) => {
         const owner = getCurrentUser();
-        const action = String(args.action ?? "");
+        const action = stringifyValue(args.action ?? "");
 
         switch (action) {
           case "start": {
-            const title = args.title ? String(args.title) : "";
+            const title = args.title ? stringifyValue(args.title) : "";
             if (!title) return "Error: title is required for the start action.";
             let metadata: Record<string, unknown> | undefined;
             if (args.metadataJson) {
               try {
-                metadata = JSON.parse(String(args.metadataJson));
+                metadata = JSON.parse(stringifyValue(args.metadataJson));
               } catch {
                 return "Error: metadataJson must be valid JSON.";
               }
@@ -113,29 +122,29 @@ Actions:
             const run = await startRun({
               owner,
               title,
-              step: args.step ? String(args.step) : undefined,
+              step: args.step ? stringifyValue(args.step) : undefined,
               metadata,
             });
             return `Run started. runId=${run.id}`;
           }
 
           case "update": {
-            const runId = String(args.runId ?? "");
+            const runId = stringifyValue(args.runId ?? "");
             if (!runId)
               return "Error: runId is required for the update action.";
             const percent =
               args.percent == null ? undefined : Number(args.percent);
             const run = await updateRunProgress(runId, owner, {
               percent,
-              step: args.step ? String(args.step) : undefined,
+              step: args.step ? stringifyValue(args.step) : undefined,
             });
             if (!run) return `Error: run ${runId} not found.`;
             return `Run updated (percent=${run.percent ?? "?"}, step=${run.step ?? ""}).`;
           }
 
           case "complete": {
-            const runId = String(args.runId ?? "");
-            const status = String(args.status ?? "");
+            const runId = stringifyValue(args.runId ?? "");
+            const status = stringifyValue(args.status ?? "");
             if (!runId || !status) {
               return "Error: runId and status are required for the complete action.";
             }
@@ -146,7 +155,11 @@ Actions:
               runId,
               owner,
               status as "succeeded" | "failed" | "cancelled",
-              args.step ? { step: String(args.step) } : undefined,
+              args.step
+                ? {
+                    step: stringifyValue(args.step),
+                  }
+                : undefined,
             );
             if (!run) return `Error: run ${runId} not found.`;
             return `Run ${run.id} completed with status=${run.status}.`;

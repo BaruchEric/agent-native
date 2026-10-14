@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
 import { getAllowedCorsOrigin } from "./cors-origins.js";
 
 describe("getAllowedCorsOrigin", () => {
@@ -40,6 +41,46 @@ describe("getAllowedCorsOrigin", () => {
         allowedOrigins: ["https://preview.example.com"],
       }),
     ).toBe("https://preview.example.com");
+  });
+
+  it("still rejects an origin that is genuinely absent from the allowlist", () => {
+    expect(
+      getAllowedCorsOrigin("https://evil.example.com", {
+        allowedOrigins: ["https://app.example.com"],
+      }),
+    ).toBeNull();
+  });
+
+  it("admits a real Origin header when the allowlist entry has different casing", () => {
+    expect(
+      getAllowedCorsOrigin("https://app.example.com", {
+        allowedOrigins: ["HTTPS://App.Example.com"],
+      }),
+    ).toBe("https://app.example.com");
+  });
+
+  it("admits a real Origin header when the allowlist entry has a trailing slash", () => {
+    expect(
+      getAllowedCorsOrigin("https://app.example.com", {
+        allowedOrigins: ["https://app.example.com/"],
+      }),
+    ).toBe("https://app.example.com");
+  });
+
+  it("admits a real Origin header when the allowlist entry is a bare domain with no scheme", () => {
+    expect(
+      getAllowedCorsOrigin("https://app.example.com", {
+        allowedOrigins: ["app.example.com"],
+      }),
+    ).toBe("https://app.example.com");
+  });
+
+  it("does not admit a different host just because the scheme was implied", () => {
+    expect(
+      getAllowedCorsOrigin("https://evil.example.com", {
+        allowedOrigins: ["app.example.com"],
+      }),
+    ).toBeNull();
   });
 
   describe("production localhost gate (no allowlist, no explicit override)", () => {

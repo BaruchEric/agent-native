@@ -1,21 +1,5 @@
-/**
- * Surgical search/replace engine for design files. Lets the agent make the
- * smallest possible change to an HTML/CSS document instead of regenerating the
- * whole file — the "smart diff" path used by the `edit-design` action.
- *
- * Two matching strategies, tried in order, both requiring a UNIQUE match so an
- * edit can never silently hit the wrong place:
- *   1. exact substring
- *   2. whitespace-flexible (any run of whitespace in `search` matches any run
- *      of whitespace in the file) — tolerates re-indentation / reflowed markup
- *
- * Pure + dependency-free so it is trivially unit-testable.
- */
-
 export interface DesignEdit {
-  /** Exact text to find, with enough surrounding context to be unique. */
   search: string;
-  /** Replacement text. Inserted verbatim — `$`/`$1` are NOT interpreted. */
   replace: string;
 }
 
@@ -30,8 +14,6 @@ function escapeRegExp(value: string): string {
 
 function countOccurrences(haystack: string, needle: string): number {
   if (!needle) return 0;
-  // Step by 1 (not by needle length) so self-overlapping matches — e.g. "aa"
-  // inside "aaa" — are both counted and treated as ambiguous, not unique.
   let count = 0;
   let idx = haystack.indexOf(needle);
   while (idx !== -1) {
@@ -41,10 +23,6 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
-/**
- * Apply a single edit. Throws a clear, agent-actionable error when the search
- * text is missing or ambiguous so the agent can re-read the file and retry.
- */
 export function applyOneEdit(
   content: string,
   edit: DesignEdit,
@@ -58,27 +36,23 @@ export function applyOneEdit(
     throw new Error(`Edit ${index + 1}: "replace" must be a string.`);
   }
 
-  // Strategy 1 — exact substring.
   const exact = countOccurrences(content, search);
   if (exact === 1) return content.split(search).join(replace);
-  if (exact > 1) {
-    throw new Error(
-      `Edit ${index + 1}: "search" matched ${exact} places — add more surrounding context so it matches exactly one location.`,
-    );
-  }
 
-  // Strategy 2 — whitespace-flexible.
   const pattern = escapeRegExp(search).replace(/\s+/g, "\\s+");
   const re = new RegExp(pattern, "g");
   const matches = content.match(re);
   const flexible = matches ? matches.length : 0;
   if (flexible === 1) {
-    // Function replacer so `$&`/`$1` in `replace` are inserted literally.
     return content.replace(re, () => replace);
   }
   if (flexible > 1) {
+    const detail =
+      exact > 1
+        ? `${exact} places (exact) and ${flexible} places (whitespace-insensitive)`
+        : `${flexible} places (whitespace-insensitive)`;
     throw new Error(
-      `Edit ${index + 1}: "search" matched ${flexible} places (whitespace-insensitive) — add more surrounding context.`,
+      `Edit ${index + 1}: "search" matched ${detail} — add more surrounding context so it matches exactly one location.`,
     );
   }
 
@@ -87,11 +61,6 @@ export function applyOneEdit(
   );
 }
 
-/**
- * Apply edits in order against a single document. Edits are sequential — a
- * later edit sees the result of earlier ones. Atomic at the call site: the
- * caller should only persist the returned content (this never mutates input).
- */
 export function applyEdits(
   content: string,
   edits: DesignEdit[],

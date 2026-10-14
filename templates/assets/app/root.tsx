@@ -1,22 +1,39 @@
-import { Links, Meta, Outlet, Scripts, ScrollRestoration } from "react-router";
-import { useCallback, useState } from "react";
+import { configureTracking } from "@agent-native/core/client/analytics";
+import { appPath } from "@agent-native/core/client/api-path";
+import { useDbSync } from "@agent-native/core/client/hooks";
+import {
+  createAgentNativeQueryClient,
+  getBrowserTabId,
+} from "@agent-native/core/client/hooks";
+import { getLocaleInitScript, useT } from "@agent-native/core/client/i18n";
+import { getThemeInitScript } from "@agent-native/core/client/ui";
+import { AppProviders } from "@agent-native/toolkit/app/providers";
+import { useCommandMenuShortcut } from "@agent-native/toolkit/app/shared";
+import { CommandMenu } from "@agent-native/toolkit/app/shared";
+import { IconSun, IconMoon } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTheme } from "next-themes";
-import { useDbSync } from "@agent-native/core/client";
+import { useCallback, useState } from "react";
 import {
-  AppProviders,
-  CommandMenu,
-  appPath,
-  configureTracking,
-  createAgentNativeQueryClient,
-  getThemeInitScript,
-  useCommandMenuShortcut,
-} from "@agent-native/core/client";
-import { Toaster } from "@/components/ui/sonner";
-import { IconSun, IconMoon } from "@tabler/icons-react";
-import { Layout as AppLayout } from "@/components/layout/Layout";
-import { TAB_ID } from "@/lib/tab-id";
+  Links,
+  Meta,
+  Outlet,
+  Scripts,
+  ScrollRestoration,
+  useLocation,
+  useNavigate,
+} from "react-router";
 import type { LinksFunction } from "react-router";
+
+import { Layout as AppLayout } from "@/components/layout/Layout";
+import { Toaster } from "@/components/ui/sonner";
+import { AppToolkitProvider } from "@/components/ui/toolkit-provider";
+import { ASSETS_CHAT_STORAGE_KEY } from "@/lib/chat";
+import "@/lib/register-chat-renderers";
+
+import changelog from "../CHANGELOG.md?raw";
+import { i18nCatalog } from "./i18n";
+
 import stylesheet from "./global.css?url";
 
 configureTracking({
@@ -31,6 +48,7 @@ export const links: LinksFunction = () => [
 ];
 
 const THEME_INIT_SCRIPT = getThemeInitScript();
+const LOCALE_INIT_SCRIPT = getLocaleInitScript();
 
 export function Layout({ children }: { children: React.ReactNode }) {
   return (
@@ -45,7 +63,11 @@ export function Layout({ children }: { children: React.ReactNode }) {
           suppressHydrationWarning
           dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }}
         />
-        <link rel="manifest" href={appPath("/manifest.json")} />
+        <script
+          data-agent-native-locale-init
+          suppressHydrationWarning
+          dangerouslySetInnerHTML={{ __html: LOCALE_INIT_SCRIPT }}
+        />
         <meta name="theme-color" content="#71717A" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta
@@ -79,13 +101,14 @@ function DbSyncSetup() {
       "app-state",
       "extensions",
     ],
-    ignoreSource: TAB_ID,
+    ignoreSource: getBrowserTabId(),
   });
   return null;
 }
 
 function ThemeToggleItem() {
   const { resolvedTheme, setTheme } = useTheme();
+  const t = useT();
   const isDark = resolvedTheme === "dark";
   return (
     <CommandMenu.Item
@@ -93,32 +116,84 @@ function ThemeToggleItem() {
       keywords={["theme", "dark", "light", "mode"]}
     >
       {isDark ? <IconSun size={16} /> : <IconMoon size={16} />}
-      Toggle {isDark ? "light" : "dark"} mode
+      {t("root.toggleTheme")}
     </CommandMenu.Item>
+  );
+}
+
+function AssetsCommandMenu({
+  open,
+  onOpenChange,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const t = useT();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const searchPath = location.pathname.startsWith("/templates")
+    ? "/templates?focus=search"
+    : "/library?tab=generated&focus=search";
+  return (
+    <CommandMenu
+      open={open}
+      onOpenChange={onOpenChange}
+      changelog={changelog}
+      changelogKey="assets"
+      chatStorageKey={ASSETS_CHAT_STORAGE_KEY}
+    >
+      <CommandMenu.Group heading={t("root.commandActions")}>
+        {location.pathname === "/home" ||
+        location.pathname.startsWith("/chat/") ? (
+          <CommandMenu.Item onSelect={() => navigate("/library")}>
+            {t("navigation.library")}
+          </CommandMenu.Item>
+        ) : null}
+        {location.pathname.startsWith("/library") ||
+        location.pathname.startsWith("/templates") ? (
+          <CommandMenu.Item onSelect={() => navigate("/home")}>
+            {t("navigation.create")}
+          </CommandMenu.Item>
+        ) : null}
+        <CommandMenu.Item onSelect={() => navigate(searchPath)}>
+          {t("root.commandSearch")}
+        </CommandMenu.Item>
+      </CommandMenu.Group>
+      <CommandMenu.Group heading={t("root.commandAppearance")}>
+        <ThemeToggleItem />
+      </CommandMenu.Group>
+    </CommandMenu>
+  );
+}
+
+function AppContent() {
+  const [cmdkOpen, setCmdkOpen] = useState(false);
+  useCommandMenuShortcut(useCallback(() => setCmdkOpen(true), []));
+  return (
+    <>
+      <DbSyncSetup />
+      <AssetsCommandMenu open={cmdkOpen} onOpenChange={setCmdkOpen} />
+      <AppLayout>
+        <Outlet />
+      </AppLayout>
+    </>
   );
 }
 
 export default function Root() {
   const [queryClient] = useState(() => createAgentNativeQueryClient());
-  const [cmdkOpen, setCmdkOpen] = useState(false);
-  useCommandMenuShortcut(useCallback(() => setCmdkOpen(true), []));
   return (
-    <AppProviders queryClient={queryClient}>
-      <DbSyncSetup />
-      <Toaster richColors position="bottom-left" />
-      <CommandMenu open={cmdkOpen} onOpenChange={setCmdkOpen}>
-        <CommandMenu.Group heading="Actions">
-          <CommandMenu.Item onSelect={() => {}}>Search</CommandMenu.Item>
-        </CommandMenu.Group>
-        <CommandMenu.Group heading="Appearance">
-          <ThemeToggleItem />
-        </CommandMenu.Group>
-      </CommandMenu>
-      <AppLayout>
-        <Outlet />
-      </AppLayout>
-    </AppProviders>
+    <AppToolkitProvider>
+      <AppProviders
+        queryClient={queryClient}
+        skeletonLayout="prompt-library"
+        toaster={<Toaster richColors position="bottom-left" />}
+        i18n={{ catalog: i18nCatalog }}
+      >
+        <AppContent />
+      </AppProviders>
+    </AppToolkitProvider>
   );
 }
 
-export { ErrorBoundary } from "@agent-native/core/client";
+export { ErrorBoundary } from "@agent-native/toolkit/app/shared";

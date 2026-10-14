@@ -1,9 +1,18 @@
-import OverviewPage from "@/pages/overview/OverviewPage";
+import { withSsrHtmlContentType } from "@agent-native/core/shared";
+import { redirect, type LoaderFunctionArgs } from "react-router";
 
-export function meta() {
-  return [{ title: "Overview — Analytics" }];
+function target(url: URL): string {
+  return `/ask${url.search}${url.hash}`;
 }
 
-export default function OverviewRoute() {
-  return <OverviewPage />;
+export function loader({ url }: LoaderFunctionArgs) {
+  throw withSsrHtmlContentType(redirect(target(url)), { varyByQuery: true });
+}
+
+export function clientLoader({ url }: LoaderFunctionArgs) {
+  throw withSsrHtmlContentType(redirect(target(url)), { varyByQuery: true });
+}
+
+export default function OverviewAliasRoute() {
+  return null;
 }

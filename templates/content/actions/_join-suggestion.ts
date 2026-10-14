@@ -1,17 +1,5 @@
-/**
- * Deterministic key-suggestion heuristic for federating a second source.
- *
- * The actual row join is always normalize-then-EXACT (no fuzzy matching). This
- * heuristic only proposes *which field* to join on and a normalization formula,
- * by measuring Jaccard overlap of each cross-source field pair's normalized
- * value sets. A name/format nudge breaks ties toward url/slug/id-like fields.
- * The user confirms (and may tweak the formula) before anything commits — and in
- * the agent-native flow, the session agent can compose the same join record
- * directly. No model is required here.
- */
-
-import { evaluateNormalizationFormula } from "../shared/properties.js";
 import type { DocumentPropertyValue } from "../shared/api.js";
+import { evaluateNormalizationFormula } from "../shared/properties.js";
 
 export interface JoinSide {
   keyField: string;
@@ -36,7 +24,16 @@ export interface JoinSuggestion {
 
 type ValueRow = Record<string, DocumentPropertyValue>;
 
-const KEY_NAME_HINTS = ["url", "slug", "handle", "id", "key", "path", "ref"];
+const KEY_NAME_HINTS = [
+  "url",
+  "slug",
+  "handle",
+  "id",
+  "key",
+  "path",
+  "ref",
+  "author",
+];
 
 function stringValue(value: DocumentPropertyValue): string | null {
   if (typeof value === "string") return value.trim() ? value : null;
@@ -59,6 +56,18 @@ function proposeFormula(field: string, urlLike: boolean): string {
     : `lower(trim({${field}}))`;
 }
 
+function looksLikeBuilderReference(values: string[]): boolean {
+  return values.some((value) => /^[a-z0-9_-]+:[a-z0-9_-]+$/i.test(value));
+}
+
+function proposeFormulas(field: string, values: string[], urlLike: boolean) {
+  const formulas = [proposeFormula(field, urlLike)];
+  if (looksLikeBuilderReference(values)) {
+    formulas.push(`lower(trim(regexreplace({${field}}, "^[^:]+:", "")))`);
+  }
+  return formulas;
+}
+
 function fieldLabel(field: string): string {
   return (
     field
@@ -71,7 +80,6 @@ function fieldLabel(field: string): string {
   );
 }
 
-// String-valued field keys present across a set of rows.
 function stringFieldKeys(rows: ValueRow[]): string[] {
   const keys = new Set<string>();
   for (const row of rows) {
@@ -85,7 +93,7 @@ function stringFieldKeys(rows: ValueRow[]): string[] {
 interface FieldProfile {
   field: string;
   formula: string;
-  normalizedByRaw: Map<string, string>; // raw value → normalized key
+  normalizedByRaw: Map<string, string>;
   normalizedSet: Set<string>;
 }
 
@@ -98,12 +106,11 @@ function rawStringValuesForField(field: string, rows: ValueRow[]) {
   return raws;
 }
 
-function profileField(
+function profileFieldWithFormula(
   field: string,
   raws: string[],
-  urlLike: boolean,
+  formula: string,
 ): FieldProfile {
-  const formula = proposeFormula(field, urlLike);
   const normalizedByRaw = new Map<string, string>();
   const normalizedSet = new Set<string>();
   for (const raw of raws) {
@@ -123,6 +130,19 @@ function jaccard(a: Set<string>, b: Set<string>): number {
   return union === 0 ? 0 : intersection / union;
 }
 
+function intersectionSize(a: Set<string>, b: Set<string>): number {
+  let intersection = 0;
+  for (const value of a) if (b.has(value)) intersection += 1;
+  return intersection;
+}
+
+function lowInformationField(field: string): boolean {
+  const normalized = field.toLowerCase();
+  return /(^|[._-])(published|state|status|sync_state|created|updated|lastupdated|last_updated)([._-]|$)/.test(
+    normalized,
+  );
+}
+
 function nameNudge(primaryField: string, secondaryField: string): number {
   const hinted = (field: string) =>
     KEY_NAME_HINTS.some((hint) => field.toLowerCase().includes(hint));
@@ -132,10 +152,6 @@ function nameNudge(primaryField: string, secondaryField: string): number {
   return nudge;
 }
 
-/**
- * Propose a join between a primary source's sampled rows and a candidate
- * (secondary) source's sampled rows. Returns null when no field pair overlaps.
- */
 export function suggestJoinKey(args: {
   primaryValues: ValueRow[];
   secondaryValues: ValueRow[];
@@ -164,24 +180,65 @@ export function suggestJoinKey(args: {
     for (const [secondaryField, secondaryRaws] of secondaryRawByField) {
       const pairUrlLike =
         looksLikeUrl(primaryRaws) || looksLikeUrl(secondaryRaws);
-      const primary = profileField(primaryField, primaryRaws, pairUrlLike);
-      const secondary = profileField(
-        secondaryField,
-        secondaryRaws,
+      for (const primaryFormula of proposeFormulas(
+        primaryField,
+        primaryRaws,
         pairUrlLike,
-      );
-      const overlap = jaccard(primary.normalizedSet, secondary.normalizedSet);
-      if (overlap <= 0) continue;
-      const score = overlap + nameNudge(primary.field, secondary.field);
-      if (!best || score > best.score) {
-        best = { primary, secondary, score, overlap };
+      )) {
+        for (const secondaryFormula of proposeFormulas(
+          secondaryField,
+          secondaryRaws,
+          pairUrlLike,
+        )) {
+          const primary = profileFieldWithFormula(
+            primaryField,
+            primaryRaws,
+            primaryFormula,
+          );
+          const secondary = profileFieldWithFormula(
+            secondaryField,
+            secondaryRaws,
+            secondaryFormula,
+          );
+          const overlap = jaccard(
+            primary.normalizedSet,
+            secondary.normalizedSet,
+          );
+          if (overlap <= 0) continue;
+          const sharedCount = intersectionSize(
+            primary.normalizedSet,
+            secondary.normalizedSet,
+          );
+          if (
+            sharedCount < 2 &&
+            (primary.normalizedByRaw.size > 2 ||
+              secondary.normalizedByRaw.size > 2)
+          ) {
+            continue;
+          }
+          const lowInfoPenalty =
+            lowInformationField(primary.field) ||
+            lowInformationField(secondary.field)
+              ? 0.5
+              : 0;
+          const cardinalityNudge =
+            Math.min(primary.normalizedSet.size, secondary.normalizedSet.size) *
+            0.001;
+          const score =
+            overlap +
+            nameNudge(primary.field, secondary.field) +
+            cardinalityNudge -
+            lowInfoPenalty;
+          if (!best || score > best.score) {
+            best = { primary, secondary, score, overlap };
+          }
+        }
       }
     }
   }
 
   if (!best) return null;
 
-  // Sample matches reflect the committed formulas exactly (same evaluator).
   const sampleMatches: JoinSampleMatch[] = [];
   for (const [raw, normalized] of best.primary.normalizedByRaw) {
     let secondaryRaw = "";

@@ -3,12 +3,14 @@
 import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 import {
   buildDynamicAgentSuggestions,
   mergeAgentSuggestions,
   normalizeAgentDynamicSuggestionsConfig,
   useAgentDynamicSuggestionsResult,
 } from "./dynamic-suggestions.js";
+import type { ChatThreadScope } from "./use-chat-threads.js";
 
 describe("buildDynamicAgentSuggestions", () => {
   it("prioritizes selection-aware suggestions", () => {
@@ -85,7 +87,7 @@ describe("mergeAgentSuggestions", () => {
     ).toEqual(["Draft a reply", "Summarize this thread", "Search my inbox"]);
   });
 
-  it("preserves the existing static list when no dynamic suggestions are available", () => {
+  it("caps the static list when no dynamic suggestions are available", () => {
     expect(
       mergeAgentSuggestions({
         dynamicSuggestions: [],
@@ -99,13 +101,7 @@ describe("mergeAgentSuggestions", () => {
         includeStatic: true,
         max: 3,
       }),
-    ).toEqual([
-      "Summarize my inbox",
-      "Draft a reply",
-      "Search my inbox",
-      "Plan my day",
-      "Find action items",
-    ]);
+    ).toEqual(["Summarize my inbox", "Draft a reply", "Search my inbox"]);
   });
 });
 
@@ -113,7 +109,7 @@ describe("normalizeAgentDynamicSuggestionsConfig", () => {
   it("keeps dynamic suggestions enabled by default", () => {
     expect(normalizeAgentDynamicSuggestionsConfig()).toMatchObject({
       enabled: true,
-      max: 4,
+      max: 3,
       includeStatic: true,
     });
   });
@@ -133,6 +129,22 @@ function SuggestionsProbe() {
   return React.createElement("div", {
     "data-testid": "suggestions-probe",
     "data-loading": String(result.isLoading),
+    "data-suggestions": (result.suggestions ?? []).join("|"),
+  });
+}
+
+function ScopedSuggestionsProbe({ scope }: { scope: ChatThreadScope }) {
+  const result = useAgentDynamicSuggestionsResult({
+    dynamicSuggestions: {
+      getSuggestions: ({ scope: currentScope }) =>
+        currentScope?.contextVersion
+          ? [`Current ${currentScope.contextVersion}`]
+          : [],
+    },
+    scope,
+  });
+  return React.createElement("div", {
+    "data-testid": "scoped-suggestions-probe",
     "data-suggestions": (result.suggestions ?? []).join("|"),
   });
 }
@@ -188,5 +200,46 @@ describe("useAgentDynamicSuggestionsResult", () => {
 
     expect(probe().dataset.loading).toBe("false");
     expect(probe().dataset.suggestions).toBe("Static prompt");
+  });
+
+  it("refreshes suggestions when scoped context changes", async () => {
+    const scope = {
+      type: "deck",
+      id: "deck-1",
+      contextVersion: "slide-1",
+    } satisfies ChatThreadScope;
+    act(() => {
+      root.render(React.createElement(ScopedSuggestionsProbe, { scope }));
+    });
+
+    await act(async () => {
+      releaseFetches();
+      await fetchGate;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(
+      container
+        .querySelector("[data-testid='scoped-suggestions-probe']")
+        ?.getAttribute("data-suggestions"),
+    ).toBe("Current slide-1");
+
+    act(() => {
+      root.render(
+        React.createElement(ScopedSuggestionsProbe, {
+          scope: { ...scope, contextVersion: "slide-2" },
+        }),
+      );
+    });
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(
+      container
+        .querySelector("[data-testid='scoped-suggestions-probe']")
+        ?.getAttribute("data-suggestions"),
+    ).toBe("Current slide-2");
   });
 });

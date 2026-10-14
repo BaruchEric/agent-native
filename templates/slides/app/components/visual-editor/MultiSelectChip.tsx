@@ -1,35 +1,23 @@
-import { createPortal } from "react-dom";
+import { useT } from "@agent-native/core/client/i18n";
 import { IconX, IconArrowRight } from "@tabler/icons-react";
+import { createPortal } from "react-dom";
 
 interface MultiSelectChipProps {
-  /** Number of currently-selected elements */
   count: number;
-  /**
-   * Anchor rect (the canvas / slide) used to position the chip top-center.
-   * If null, the chip renders centered near the top of the viewport.
-   */
   anchorRect: DOMRect | null;
-  /** Clear the entire selection (X button + Escape) */
   onClear: () => void;
-  /** Send the selection list to the agent chat composer (prefill, no submit) */
   onSendToAgent: () => void;
 }
 
-/**
- * Floating chip that hovers above a multi-select selection (Figma-style).
- * Rendered via portal so it isn't constrained by the slide canvas's stacking
- * context. Reusable across the slides editor and the design template.
- */
 export function MultiSelectChip({
   count,
   anchorRect,
   onClear,
   onSendToAgent,
 }: MultiSelectChipProps) {
+  const t = useT();
   if (count === 0) return null;
 
-  // Position the chip top-center relative to the anchor (the slide canvas).
-  // Falls back to a fixed top-center placement when no anchor is provided.
   const top = anchorRect ? anchorRect.top + 12 : 16;
   const left = anchorRect
     ? anchorRect.left + anchorRect.width / 2
@@ -60,7 +48,9 @@ export function MultiSelectChip({
       }}
     >
       <span style={{ color: "#609FF8" }}>{count}</span>
-      <span style={{ color: "rgba(255,255,255,0.85)" }}>selected</span>
+      <span style={{ color: "rgba(255,255,255,0.85)" }}>
+        {t("raw.selected")}
+      </span>
       <button
         type="button"
         onClick={onSendToAgent}
@@ -79,13 +69,13 @@ export function MultiSelectChip({
           cursor: "pointer",
         }}
       >
-        Send to agent
+        {t("raw.sendToAgent")}
         <IconArrowRight size={12} stroke={3} />
       </button>
       <button
         type="button"
         onClick={onClear}
-        aria-label="Clear selection"
+        aria-label={t("raw.clearSelection")}
         style={{
           display: "inline-flex",
           alignItems: "center",

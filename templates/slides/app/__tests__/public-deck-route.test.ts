@@ -1,3 +1,4 @@
+import { SSR_QUERY_CACHE_KEY_HEADER } from "@agent-native/core/shared";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const resultQueue = vi.hoisted(() => ({ current: [] as unknown[][] }));
@@ -7,16 +8,19 @@ const limit = vi.hoisted(() =>
 const where = vi.hoisted(() => vi.fn(() => ({ limit })));
 const from = vi.hoisted(() => vi.fn(() => ({ where })));
 const select = vi.hoisted(() => vi.fn(() => ({ from })));
+const configuredBasePath = vi.hoisted(() => ({ current: "" }));
+const mockVerifyScopedAgentAccessToken = vi.hoisted(() =>
+  vi.fn((_token: unknown, _options: unknown) => ({ ok: false })),
+);
 
 vi.mock("@/pages/SharedPresentation", () => ({ default: () => null }));
 vi.mock("@/components/ui/spinner", () => ({ Spinner: () => null }));
 
-// The presentation page renders impersonally on the server (SSR reads no
-// session so the public page stays CDN-cacheable), so the loader no longer
-// reads the request user — it only needs the app base path to build the
-// client-side redirect to the auth-guarded editor for restricted decks.
 vi.mock("@agent-native/core/server", () => ({
-  getConfiguredAppBasePath: () => "",
+  AGENT_ACCESS_PARAM: "agent_access",
+  getConfiguredAppBasePath: () => configuredBasePath.current,
+  verifyScopedAgentAccessToken: (token: unknown, options: unknown) =>
+    mockVerifyScopedAgentAccessToken(token, options),
 }));
 
 vi.mock("drizzle-orm", () => ({
@@ -36,32 +40,46 @@ vi.mock("../../server/db", () => ({
   },
 }));
 
-import { loader } from "../routes/p.$id";
+import { buildDeckDiscovery, loader } from "../routes/p.$id";
 
-function requestFor(id = "deck-1") {
+function unwrapLoaderData(result: Awaited<ReturnType<typeof loader>>) {
+  const maybeWrapped = result as any;
+  return maybeWrapped.type === "DataWithResponseInit"
+    ? maybeWrapped.data
+    : maybeWrapped;
+}
+
+function requestFor(id = "deck-1", token?: string) {
+  const url = new URL(`https://slides.example.test/p/${id}`);
+  if (token) url.searchParams.set("agent_access", token);
   return {
     params: { id },
-    request: new Request(`https://slides.example.test/p/${id}`),
+    request: new Request(url),
   } as any;
 }
 
 describe("public deck route", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    configuredBasePath.current = "";
     resultQueue.current = [];
+    mockVerifyScopedAgentAccessToken.mockReturnValue({ ok: false });
   });
 
   it("serves a public deck for every viewer without speaker notes", async () => {
     resultQueue.current = [deckRows("public")];
 
-    const result = await loader(requestFor());
+    const result = unwrapLoaderData(await loader(requestFor()));
 
+    if (result.deck === null) throw new Error("expected a public deck");
     expect(result.deck?.title).toBe("Launch review");
+    expect(result.basePath).toBe("");
     expect(result.deck?.aspectRatio).toBe("16:9");
     expect(result.deck?.slides).toEqual([
       {
         id: "slide-1",
-        content: "<h1>Launch</h1>",
+        content:
+          '<div class="fmd-slide"><p>Intro</p><div><h1>Launch</h1></div></div>',
         notes: "",
         layout: "title",
         background: "#111",
@@ -77,19 +95,66 @@ describe("public deck route", () => {
         ],
       },
     ]);
-    // SSR is impersonal: the deck is looked up by id alone, and visibility is
-    // checked in JS — no per-user access filter is applied server-side.
     expect(where).toHaveBeenCalledWith({ column: "id_col", value: "deck-1" });
   });
 
-  it("routes a restricted (non-public) deck to the guarded editor for client-side access resolution", async () => {
+  it("prefixes agent-readable deck context URLs with the app base path", () => {
+    const discovery = buildDeckDiscovery({
+      id: "deck-1",
+      title: "Launch review",
+      basePath: "/slides",
+    });
+
+    expect(discovery.url).toBe("/slides/p/deck-1");
+    expect(discovery.contextUrl).toBe(
+      "/slides/api/deck-agent-context.json?id=deck-1",
+    );
+  });
+
+  it("returns the configured app base path for public deck discovery", async () => {
+    configuredBasePath.current = "/slides";
+    resultQueue.current = [deckRows("public")];
+
+    const result = unwrapLoaderData(await loader(requestFor()));
+
+    expect(result).toMatchObject({
+      id: "deck-1",
+      basePath: "/slides",
+    });
+  });
+
+  it.each(["private", "org"] as const)(
+    "routes a %s deck to the guarded editor for client-side access resolution",
+    async (visibility) => {
+      resultQueue.current = [deckRows(visibility)];
+
+      const result = unwrapLoaderData(await loader(requestFor()));
+
+      if (result.deck !== null) throw new Error("expected a restricted deck");
+      expect(result.error).toBe("restricted");
+      expect(result.restricted).toEqual({ id: "deck-1", basePath: "" });
+    },
+  );
+
+  it("uses a query-specific cache key for token-authorized deck pages", async () => {
+    mockVerifyScopedAgentAccessToken.mockReturnValue({ ok: true });
     resultQueue.current = [deckRows("private")];
 
-    const result = await loader(requestFor());
+    const result = (await loader(requestFor("deck-1", "tok+1"))) as any;
 
-    if (result.deck !== null) throw new Error("expected a restricted deck");
-    expect(result.error).toBe("restricted");
-    expect(result.restricted).toEqual({ id: "deck-1", basePath: "" });
+    expect(mockVerifyScopedAgentAccessToken).toHaveBeenCalledWith("tok+1", {
+      resourceKind: "slides:deck",
+      resourceId: "deck-1",
+    });
+    expect(result.type).toBe("DataWithResponseInit");
+    expect(result.init.headers).toEqual({
+      "Cache-Control": "private, max-age=0, no-store",
+      "Referrer-Policy": "no-referrer",
+      [SSR_QUERY_CACHE_KEY_HEADER]: "query",
+    });
+    expect(result.data.agentAccessToken).toBe("tok+1");
+    if (result.data.deck === null) throw new Error("expected tokenized deck");
+    expect(result.data.deck.title).toBe("Launch review");
   });
 
   it("404s when the deck does not exist", async () => {
@@ -108,7 +173,8 @@ function deckRows(visibility: "public" | "private" | "org") {
         slides: [
           {
             id: "slide-1",
-            content: "<h1>Launch</h1>",
+            content:
+              '<div class="fmd-slide"><p>Intro</p><div><h1>Launch</h1></div></div>',
             notes: "internal talking points",
             layout: "title",
             background: "#111",

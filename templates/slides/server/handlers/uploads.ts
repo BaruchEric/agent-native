@@ -1,21 +1,55 @@
+import fs from "fs";
+import path from "path";
+
+import {
+  attachmentFailureToError,
+  describeAttachmentFailure,
+  isAttachmentError,
+  isPrivateBlobConfiguredForRequest,
+} from "@agent-native/core/private-blob";
+import { getRequestOrgId } from "@agent-native/core/server";
 import {
   defineEventHandler,
+  readBody,
   setResponseStatus,
   readMultipartFormData,
 } from "h3";
-import path from "path";
-import fs from "fs";
 import { nanoid } from "nanoid";
-import { getSession } from "@agent-native/core/server";
-import { tenantUploadDir } from "../lib/tenant-files.js";
-import { canSaveAsUploadedAsset, uploadImageAsset } from "./assets.js";
+
 import {
+  MAX_FIG_REFERENCE_FILE_BYTES,
+  MAX_REFERENCE_FILE_BYTES,
+  MAX_REFERENCE_FILES,
+  MAX_SVG_REFERENCE_FILE_BYTES,
   SLIDES_REFERENCE_FILE_ERROR_LABEL,
   isSlidesReferenceFileExtension,
-} from "../../shared/upload-types";
+} from "../../shared/upload-types.js";
+import { tenantUploadDir } from "../lib/tenant-files.js";
+import {
+  isHostedSlidesRuntime,
+  deleteUploadedReference,
+  mintUploadedReference,
+} from "../lib/uploaded-reference-storage.js";
+import {
+  canSaveAsUploadedAsset,
+  hasExpectedSvgSignature,
+  isSafeSvg,
+  stripSafeSvgDoctype,
+  uploadImageAsset,
+} from "./assets.js";
+import {
+  resolveSlidesRequestAuth,
+  withSlidesRequestContext,
+} from "./request-auth-context.js";
 
-export const MAX_REFERENCE_FILE_BYTES = 50 * 1024 * 1024;
-export const MAX_FIG_REFERENCE_FILE_BYTES = 200 * 1024 * 1024;
+export {
+  MAX_FIG_REFERENCE_FILE_BYTES,
+  MAX_REFERENCE_FILE_BYTES,
+  MAX_SVG_REFERENCE_FILE_BYTES,
+} from "../../shared/upload-types.js";
+const FIG_LOCAL_COPY_SIGNATURE = new Uint8Array([
+  0x66, 0x69, 0x67, 0x2d, 0x6b, 0x69, 0x77, 0x69,
+]);
 
 export interface UploadedReferenceFile {
   path: string;
@@ -26,14 +60,12 @@ export interface UploadedReferenceFile {
   size: number;
 }
 
-function safeFilename(originalName: string): string | null {
-  const ext = path.extname(originalName).toLowerCase();
+function safeFilename(
+  originalName: string,
+  extension = path.extname(originalName).toLowerCase(),
+): string | null {
+  const ext = extension.toLowerCase();
   if (!isSlidesReferenceFileExtension(ext)) return null;
-  // Filename uniqueness comes from nanoid (~21 chars, ~126 bits of entropy),
-  // not `Date.now()` — second-resolution timestamps are guessable and let
-  // someone with the per-tenant URL prefix probe the upload window. The
-  // tenant subdir already namespaces by user; nanoid makes the leaf
-  // unguessable too. (audit 10 medium / audit 01 medium).
   return `${nanoid()}${ext}`;
 }
 
@@ -44,10 +76,34 @@ function ascii(data: Uint8Array, start: number, end: number): string {
 export function maxReferenceFileBytes(
   originalName: string | undefined,
 ): number {
+  if (path.extname(originalName ?? "").toLowerCase() === ".svg") {
+    return MAX_SVG_REFERENCE_FILE_BYTES;
+  }
   return path.extname(originalName ?? "").toLowerCase() === ".fig"
     ? MAX_FIG_REFERENCE_FILE_BYTES
     : MAX_REFERENCE_FILE_BYTES;
 }
+
+export const getUploadStorageStatus = defineEventHandler(async (event) => {
+  const auth = await resolveSlidesRequestAuth(event);
+  if (!auth.ok) {
+    setResponseStatus(event, auth.statusCode);
+    return { error: auth.error };
+  }
+  if (!auth.context.email) {
+    setResponseStatus(event, 401);
+    return { error: "Unauthorized" };
+  }
+
+  return withSlidesRequestContext(
+    event,
+    async () => ({
+      referenceStorageReady:
+        !isHostedSlidesRuntime() || (await isPrivateBlobConfiguredForRequest()),
+    }),
+    auth.context,
+  );
+});
 
 function formatMaxFileSize(bytes: number): string {
   return `${Math.round(bytes / 1024 / 1024)} MB`;
@@ -62,8 +118,10 @@ function hasExpectedSignature(ext: string, data: Uint8Array): boolean {
   }
   if (ext === ".fig") {
     const isZip = data[0] === 0x50 && data[1] === 0x4b;
-    const isKiwi = ascii(data, 0, 8) === "fig-kiwi";
-    return isZip || isKiwi;
+    const isLocalCopy = FIG_LOCAL_COPY_SIGNATURE.every(
+      (byte, index) => data[index] === byte,
+    );
+    return isZip || isLocalCopy;
   }
   if (ext === ".png") {
     return (
@@ -84,16 +142,28 @@ function hasExpectedSignature(ext: string, data: Uint8Array): boolean {
     return ascii(data, 0, 4) === "RIFF" && ascii(data, 8, 12) === "WEBP";
   }
   if (ext === ".svg") {
-    const head = Buffer.from(
-      data.subarray(0, Math.min(data.length, 8192)),
-    ).toString("utf8");
-    const normalized = head.replace(/^\uFEFF/, "").trimStart();
-    return (
-      /^<svg(?:\s|>)/i.test(normalized) ||
-      /^<\?xml\b[\s\S]{0,4096}<svg(?:\s|>)/i.test(normalized)
-    );
+    return hasExpectedSvgSignature(data);
   }
   return !data.subarray(0, 4096).includes(0);
+}
+
+interface DetectedReferenceImage {
+  extension: ".png" | ".jpg" | ".gif" | ".webp";
+  mimeType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+}
+
+function detectReferenceImage(data: Uint8Array): DetectedReferenceImage | null {
+  const candidates: DetectedReferenceImage[] = [
+    { extension: ".png", mimeType: "image/png" },
+    { extension: ".jpg", mimeType: "image/jpeg" },
+    { extension: ".gif", mimeType: "image/gif" },
+    { extension: ".webp", mimeType: "image/webp" },
+  ];
+  return (
+    candidates.find((candidate) =>
+      hasExpectedSignature(candidate.extension, data),
+    ) ?? null
+  );
 }
 
 function pathForAgent(absPath: string): string {
@@ -106,111 +176,265 @@ function pathForAgent(absPath: string): string {
 
 export async function saveUploadedReferenceFile(args: {
   email: string;
+  orgId?: string | null;
   originalName: string;
   data: Uint8Array;
   type?: string;
 }): Promise<UploadedReferenceFile> {
-  const filename = safeFilename(args.originalName);
+  const orgId = args.orgId === undefined ? getRequestOrgId() : args.orgId;
+  const declaredExt = path.extname(args.originalName).toLowerCase();
+  if (!isSlidesReferenceFileExtension(declaredExt)) {
+    throw new Error(
+      `Unsupported file type. Allowed: ${SLIDES_REFERENCE_FILE_ERROR_LABEL}.`,
+    );
+  }
+  const maxBytes = maxReferenceFileBytes(args.originalName);
+  if (args.data.length > maxBytes) {
+    throw new Error(`File too large (max ${formatMaxFileSize(maxBytes)})`);
+  }
+  const isDeclaredImage = [".png", ".jpg", ".jpeg", ".gif", ".webp"].includes(
+    declaredExt,
+  );
+  const detectedImage = isDeclaredImage
+    ? detectReferenceImage(args.data)
+    : null;
+  const ext =
+    detectedImage && !hasExpectedSignature(declaredExt, args.data)
+      ? detectedImage.extension
+      : declaredExt;
+  const filename = safeFilename(args.originalName, ext);
   if (!filename) {
     throw new Error(
       `Unsupported file type. Allowed: ${SLIDES_REFERENCE_FILE_ERROR_LABEL}.`,
     );
   }
-  const ext = path.extname(filename).toLowerCase();
   if (!hasExpectedSignature(ext, args.data)) {
     throw new Error(`File contents do not match ${ext} upload type`);
   }
-  const uploadDir = tenantUploadDir(args.email);
-  await fs.promises.mkdir(uploadDir, { recursive: true });
-  const destPath = path.join(uploadDir, filename);
-  await fs.promises.writeFile(destPath, args.data);
-  // For images, also push to the file-upload provider so the agent can embed
-  // a hosted URL (in slide HTML, chat replies, etc.). For non-image reference
-  // files (PPTX, DOCX, PDF), the on-disk path is what the agent uses via
-  // shell — no provider URL is required.
+  let data = args.data;
+  if (ext === ".svg") {
+    const normalizedSvg = stripSafeSvgDoctype(data);
+    if (!normalizedSvg || !isSafeSvg(normalizedSvg)) {
+      throw new Error("SVG contains active content or external references");
+    }
+    data = normalizedSvg;
+  }
+  const assetOriginalName =
+    ext === declaredExt
+      ? args.originalName
+      : `${path.basename(args.originalName, path.extname(args.originalName))}${ext}`;
+  const resolvedType =
+    detectedImage?.mimeType ??
+    (declaredExt === ".svg"
+      ? "image/svg+xml"
+      : args.type || "application/octet-stream");
+  let uploadedPath: string;
+  if (isHostedSlidesRuntime()) {
+    const minted = await mintUploadedReference({
+      email: args.email,
+      orgId,
+      data,
+      filename,
+      mimeType: resolvedType,
+    });
+    if (minted.status !== "ok") throw attachmentFailureToError(minted, "save");
+    uploadedPath = minted.ref;
+  } else {
+    const uploadDir = tenantUploadDir(args.email);
+    await fs.promises.mkdir(uploadDir, { recursive: true });
+    const destPath = path.join(uploadDir, filename);
+    await fs.promises.writeFile(destPath, data);
+    uploadedPath = pathForAgent(destPath);
+  }
   let url: string | undefined;
   if (
     canSaveAsUploadedAsset({
-      originalName: args.originalName,
-      data: args.data,
+      originalName: assetOriginalName,
+      data,
     })
   ) {
     try {
       url = (
         await uploadImageAsset({
           email: args.email,
-          originalName: args.originalName,
-          data: args.data,
-          type: args.type,
+          orgId,
+          originalName: assetOriginalName,
+          data,
+          type: resolvedType,
         })
       ).url;
     } catch {
-      // No provider configured or upload failed — the agent still has the
-      // on-disk path. The caller's UI can prompt the user to connect a
-      // provider if it needs a public URL.
       url = undefined;
     }
   }
   return {
-    path: pathForAgent(destPath),
+    path: uploadedPath,
     url,
     originalName: args.originalName,
     filename,
-    type: args.type || "application/octet-stream",
-    size: args.data.length,
+    type: resolvedType,
+    size: data.length,
   };
 }
 
-// Upload one or more files
+/**
+ * The wire shape of a failed upload. Typed attachment errors carry their own
+ * status, code and details; the client branches on those, never on the text.
+ */
+function describeUploadFailure(reason: unknown): {
+  message: string;
+  statusCode: number;
+  errorCode?: string;
+  details?: Record<string, unknown>;
+} {
+  const typed = (reason ?? {}) as {
+    statusCode?: unknown;
+    errorCode?: unknown;
+    details?: unknown;
+  };
+  const message = isAttachmentError(reason)
+    ? describeAttachmentFailure(reason.failure, "save").message
+    : reason instanceof Error
+      ? reason.message
+      : "Invalid upload";
+  return {
+    message,
+    statusCode: typeof typed.statusCode === "number" ? typed.statusCode : 400,
+    ...(typeof typed.errorCode === "string"
+      ? { errorCode: typed.errorCode }
+      : {}),
+    ...(typed.details && typeof typed.details === "object"
+      ? { details: typed.details as Record<string, unknown> }
+      : {}),
+  };
+}
+
 export const uploadFiles = defineEventHandler(async (event) => {
-  const session = await getSession(event).catch(() => null);
-  if (!session?.email) {
+  const auth = await resolveSlidesRequestAuth(event);
+  if (!auth.ok) {
+    setResponseStatus(event, auth.statusCode);
+    return { error: auth.error };
+  }
+  const authContext = auth.context;
+  const email = authContext.email;
+  if (!email) {
     setResponseStatus(event, 401);
     return { error: "Unauthorized" };
   }
 
-  const parts = await readMultipartFormData(event);
-  const fileParts =
-    parts?.filter((p) => (p.name === "files" || p.name === "file") && p.data) ??
-    [];
+  return withSlidesRequestContext(
+    event,
+    async ({ orgId }) => {
+      const parts = await readMultipartFormData(event);
+      const fileParts =
+        parts?.filter(
+          (p) => (p.name === "files" || p.name === "file") && p.data,
+        ) ?? [];
 
-  if (fileParts.length === 0) {
-    setResponseStatus(event, 400);
-    return { error: "No files uploaded" };
-  }
+      if (fileParts.length === 0) {
+        setResponseStatus(event, 400);
+        return { error: "No files uploaded" };
+      }
 
-  const MAX_FILES = 20;
+      if (fileParts.length > MAX_REFERENCE_FILES) {
+        setResponseStatus(event, 413);
+        return { error: `Too many files (max ${MAX_REFERENCE_FILES})` };
+      }
 
-  if (fileParts.length > MAX_FILES) {
-    setResponseStatus(event, 413);
-    return { error: `Too many files (max ${MAX_FILES})` };
-  }
+      const oversized = fileParts.find(
+        (p) => p.data.length > maxReferenceFileBytes(p.filename),
+      );
+      if (oversized) {
+        const limit = maxReferenceFileBytes(oversized.filename);
+        setResponseStatus(event, 413);
+        return {
+          error: `File "${oversized.filename || "upload"}": File too large (max ${formatMaxFileSize(limit)})`,
+          failedFileName: oversized.filename,
+        };
+      }
 
-  const oversized = fileParts.find(
-    (p) => p.data.length > maxReferenceFileBytes(p.filename),
+      const results = await Promise.allSettled(
+        fileParts.map(async (part) => {
+          return saveUploadedReferenceFile({
+            email,
+            orgId,
+            originalName: part.filename || "upload",
+            data: part.data,
+            type: part.type,
+          });
+        }),
+      );
+      const successfulResults = results.filter(
+        (result): result is PromiseFulfilledResult<UploadedReferenceFile> =>
+          result.status === "fulfilled",
+      );
+      const failedResultIndex = results.findIndex(
+        (result) => result.status === "rejected",
+      );
+      if (failedResultIndex !== -1) {
+        await Promise.allSettled(
+          successfulResults.map((result) =>
+            deleteUploadedReference(result.value.path, email),
+          ),
+        );
+        const failedResult = results[failedResultIndex];
+        const failedFile = fileParts[failedResultIndex];
+        const failure = describeUploadFailure(
+          failedResult?.status === "rejected" ? failedResult.reason : undefined,
+        );
+        setResponseStatus(event, failure.statusCode);
+        return {
+          error: `File "${failedFile?.filename || "upload"}": ${failure.message}`,
+          ...(failure.errorCode ? { errorCode: failure.errorCode } : {}),
+          ...(failure.details ? { details: failure.details } : {}),
+          failedFileName: failedFile?.filename,
+        };
+      }
+
+      return successfulResults.map((result) => result.value);
+    },
+    authContext,
   );
-  if (oversized) {
-    const limit = maxReferenceFileBytes(oversized.filename);
-    setResponseStatus(event, 413);
-    return { error: `File too large (max ${formatMaxFileSize(limit)})` };
+});
+
+export const deleteUploadedFile = defineEventHandler(async (event) => {
+  const auth = await resolveSlidesRequestAuth(event);
+  if (!auth.ok) {
+    setResponseStatus(event, auth.statusCode);
+    return { error: auth.error };
+  }
+  const email = auth.context.email;
+  if (!email) {
+    setResponseStatus(event, 401);
+    return { error: "Unauthorized" };
   }
 
-  let results;
-  try {
-    results = await Promise.all(
-      fileParts.map(async (part) => {
-        return saveUploadedReferenceFile({
-          email: session.email,
-          originalName: part.filename || "upload",
-          data: part.data,
-          type: part.type,
-        });
-      }),
-    );
-  } catch (err) {
+  // coercion-ok: malformed JSON is reported as the existing missing-path 400.
+  const body = (await readBody(event).catch(() => null)) as {
+    path?: unknown;
+  } | null;
+  if (typeof body?.path !== "string" || !body.path) {
     setResponseStatus(event, 400);
-    return { error: err instanceof Error ? err.message : "Invalid upload" };
+    return { error: "Uploaded file path is required" };
   }
 
-  return results;
+  return withSlidesRequestContext(
+    event,
+    async () => {
+      try {
+        return {
+          deleted: await deleteUploadedReference(body.path as string, email),
+        };
+      } catch (error) {
+        const failure = describeUploadFailure(error);
+        setResponseStatus(event, failure.statusCode);
+        return {
+          error: failure.message,
+          ...(failure.errorCode ? { errorCode: failure.errorCode } : {}),
+          ...(failure.details ? { details: failure.details } : {}),
+        };
+      }
+    },
+    auth.context,
+  );
 });

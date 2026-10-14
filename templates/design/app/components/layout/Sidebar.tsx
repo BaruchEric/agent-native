@@ -1,39 +1,24 @@
+import { useT } from "@agent-native/core/client/i18n";
+import { DevDatabaseLink } from "@agent-native/toolkit/app/db-admin";
+import { FeedbackButton } from "@agent-native/toolkit/app/feedback";
+import {
+  BuilderCreditNotice,
+  OrgSwitcher,
+} from "@agent-native/toolkit/app/org";
+import {
+  AppSidebar,
+  AppSidebarFooter,
+  type AppSidebarItemDefinition,
+} from "@agent-native/toolkit/app/shared";
+import { IconComponents, IconHome, IconTemplate } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
-import { Link, useLocation } from "react-router";
-import {
-  IconPencil,
-  IconPalette,
-  IconSettings,
-  IconLayoutSidebarLeftCollapse,
-  IconLayoutSidebarLeftExpand,
-  IconTemplate,
-} from "@tabler/icons-react";
-import { cn } from "@/lib/utils";
-import { ExtensionsSidebarSection } from "@agent-native/core/client/extensions";
-import {
-  DevDatabaseLink,
-  FeedbackButton,
-  appPath,
-} from "@agent-native/core/client";
-import { OrgSwitcher } from "@agent-native/core/client/org";
-import { ThemeToggle } from "@/components/ThemeToggle";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-
-const navItems = [
-  { icon: IconPencil, label: "Designs", href: "/" },
-  { icon: IconTemplate, label: "Templates", href: "/templates" },
-  { icon: IconPalette, label: "Design Systems", href: "/design-systems" },
-  { icon: IconSettings, label: "Settings", href: "/settings" },
-];
+import { useLocation } from "react-router";
 
 const COLLAPSE_KEY = "design.sidebar.collapsed";
 
 export function Sidebar() {
   const location = useLocation();
+  const t = useT();
   const [collapsed, setCollapsed] = useState<boolean>(() => {
     if (typeof window === "undefined") return false;
     try {
@@ -52,113 +37,59 @@ export function Sidebar() {
     }
   }, [collapsed]);
 
+  const items: AppSidebarItemDefinition[] = [
+    {
+      to: "/home",
+      label: t("navigation.home"),
+      icon: IconHome,
+      active:
+        location.pathname === "/home" ||
+        location.pathname.startsWith("/design/") ||
+        location.pathname.startsWith("/d/"),
+    },
+    {
+      to: "/templates",
+      label: t("navigation.templates"),
+      icon: IconTemplate,
+      active: location.pathname.startsWith("/templates"),
+    },
+    {
+      to: "/design-systems",
+      label: t("navigation.designSystems"),
+      icon: IconComponents,
+      active: location.pathname.startsWith("/design-systems"),
+    },
+  ];
+
+  const feedbackButton = (
+    <FeedbackButton variant={collapsed ? "icon" : "sidebar"} side="right" />
+  );
+
+  const orgSwitcher = (
+    <OrgSwitcher compact={collapsed} hideBuilderCreditNotice />
+  );
+
   return (
-    <aside
-      className={cn(
-        "flex h-full min-w-0 shrink-0 flex-col overflow-hidden border-r border-border bg-sidebar text-sidebar-foreground",
-        collapsed ? "w-14" : "w-56",
-      )}
-    >
-      <div
-        className={cn(
-          "flex h-12 shrink-0 items-center border-b border-border",
-          collapsed ? "justify-center px-2" : "justify-between px-4",
-        )}
-      >
-        {!collapsed && (
-          <div className="flex items-center gap-2">
-            <img
-              src={appPath("/agent-native-icon-light.svg")}
-              alt=""
-              aria-hidden="true"
-              className="block h-4 w-auto dark:hidden"
-            />
-            <img
-              src={appPath("/agent-native-icon-dark.svg")}
-              alt=""
-              aria-hidden="true"
-              className="hidden h-4 w-auto dark:block"
-            />
-            <span className="text-sm font-semibold tracking-tight">Design</span>
+    <AppSidebar
+      collapsed={collapsed}
+      onCollapsedChange={setCollapsed}
+      brandName={t("navigation.brand")}
+      appId="design"
+      brandHref="/home"
+      items={items}
+      footerContent={
+        <>
+          <div className={collapsed ? "flex flex-col items-center" : undefined}>
+            <BuilderCreditNotice compact showAtLimitOnly className="mb-2" />
           </div>
-        )}
-        <Tooltip delayDuration={0}>
-          <TooltipTrigger asChild>
-            <button
-              onClick={() => setCollapsed((c) => !c)}
-              className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground"
-              aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-            >
-              {collapsed ? (
-                <IconLayoutSidebarLeftExpand className="h-4 w-4" />
-              ) : (
-                <IconLayoutSidebarLeftCollapse className="h-4 w-4" />
-              )}
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="right">
-            {collapsed ? "Expand sidebar" : "Collapse sidebar"}
-          </TooltipContent>
-        </Tooltip>
-      </div>
-
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-        <nav className={cn("space-y-1 py-2", collapsed ? "px-1.5" : "px-2")}>
-          {navItems.map((item) => {
-            const Icon = item.icon;
-            const isActive =
-              item.href === "/"
-                ? location.pathname === "/" ||
-                  location.pathname.startsWith("/design/")
-                : location.pathname.startsWith(item.href);
-            const link = (
-              <Link
-                key={item.href}
-                to={item.href}
-                className={cn(
-                  "flex items-center rounded-lg text-sm",
-                  collapsed ? "h-9 w-9 justify-center" : "gap-3 px-3 py-2",
-                  isActive
-                    ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                    : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground",
-                )}
-              >
-                <Icon className="h-4 w-4 shrink-0" />
-                {!collapsed && item.label}
-              </Link>
-            );
-            if (collapsed) {
-              return (
-                <Tooltip key={item.href} delayDuration={0}>
-                  <TooltipTrigger asChild>{link}</TooltipTrigger>
-                  <TooltipContent side="right">{item.label}</TooltipContent>
-                </Tooltip>
-              );
-            }
-            return link;
-          })}
-        </nav>
-
-        {!collapsed && (
-          <div className="mt-auto shrink-0">
-            <div className="border-t border-border px-2 py-1">
-              <ExtensionsSidebarSection />
-            </div>
-
-            <div className="border-t border-border px-3 py-2">
-              <OrgSwitcher />
-            </div>
-
-            <div className="border-t border-border px-3 py-2">
-              <DevDatabaseLink />
-              <div className="flex items-center gap-1">
-                <FeedbackButton className="min-w-0 flex-1" />
-                <ThemeToggle className="h-8 w-8 shrink-0" />
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
-    </aside>
+          <AppSidebarFooter
+            collapsed={collapsed}
+            feedback={feedbackButton}
+            orgSwitcher={orgSwitcher}
+            footerExtras={<DevDatabaseLink />}
+          />
+        </>
+      }
+    />
   );
 }

@@ -1,23 +1,51 @@
-import { and, desc, eq, sql } from "drizzle-orm";
-import type { H3Event } from "h3";
-import { getDb, schema } from "../db/index.js";
+import { readAppState } from "@agent-native/core/application-state";
+import {
+  implicitServiceOrgRole,
+  organizations,
+  orgMembers,
+} from "@agent-native/core/org";
 import { getSession } from "@agent-native/core/server";
-import { orgMembers } from "@agent-native/core/org";
 import {
   getRequestUserEmail,
   getRequestOrgId,
 } from "@agent-native/core/server/request-context";
-import { readAppState } from "@agent-native/core/application-state";
+import { getUserSetting } from "@agent-native/core/settings";
+import { and, count, desc, eq, sql } from "drizzle-orm";
+import { HTTPError, type H3Event } from "h3";
+
+import {
+  CLIPS_USER_PREFS_KEY,
+  DEFAULT_CLIPS_RECORDING_VISIBILITY,
+  type ClipsUserPrefs,
+} from "../../shared/clips-ai-prefs.js";
+import { getDb, schema } from "../db/index.js";
 
 export function getCurrentOwnerEmail(): string {
   const email = getRequestUserEmail();
   if (!email) throw new Error("no authenticated user");
-  return email;
+  return normalizeOwnerEmail(email);
+}
+
+export function normalizeOwnerEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+export function ownerEmailMatches(column: unknown, email: string) {
+  return sql`lower(${column as any}) = ${normalizeOwnerEmail(email)}`;
+}
+
+export function sameOwnerEmail(
+  a: string | null | undefined,
+  b: string | null | undefined,
+): boolean {
+  if (!a || !b) return false;
+  return normalizeOwnerEmail(a) === normalizeOwnerEmail(b);
 }
 
 export async function getEventOwnerContext(event: H3Event): Promise<{
   userEmail: string;
   orgId?: string;
+  authUserId?: string;
 }> {
   const session = await getSession(event);
   if (!session?.email) {
@@ -34,7 +62,11 @@ export async function getEventOwnerContext(event: H3Event): Promise<{
       // Keep the auth context usable even if org resolution is unavailable.
     }
   }
-  return { userEmail: session.email, orgId: orgId ?? undefined };
+  return {
+    userEmail: session.email,
+    orgId: orgId ?? undefined,
+    ...(session.authUserId ? { authUserId: session.authUserId } : {}),
+  };
 }
 
 export async function getEventOwnerEmail(event: H3Event): Promise<string> {
@@ -42,6 +74,81 @@ export async function getEventOwnerEmail(event: H3Event): Promise<string> {
 }
 
 export type OrganizationAccessRole = "owner" | "admin" | "member";
+
+export type RecordingVisibility = "private" | "org" | "public";
+
+export const DEFAULT_RECORDING_VISIBILITY: RecordingVisibility =
+  DEFAULT_CLIPS_RECORDING_VISIBILITY;
+
+export function isRecordingVisibility(
+  value: unknown,
+): value is RecordingVisibility {
+  return value === "private" || value === "org" || value === "public";
+}
+
+export function resolveRecordingVisibility(
+  explicit: RecordingVisibility | null | undefined,
+  configured: unknown,
+): RecordingVisibility {
+  if (explicit) return explicit;
+  return isRecordingVisibility(configured)
+    ? configured
+    : DEFAULT_RECORDING_VISIBILITY;
+}
+
+/** The organization's saved default, or null when it never set one. */
+export async function readOrganizationDefaultVisibility(
+  organizationId: string,
+): Promise<RecordingVisibility | null> {
+  const [row] = await getDb()
+    .select({
+      defaultVisibility: schema.organizationSettings.defaultVisibility,
+    })
+    .from(schema.organizationSettings)
+    .where(eq(schema.organizationSettings.organizationId, organizationId))
+    .limit(1);
+  return isRecordingVisibility(row?.defaultVisibility)
+    ? row.defaultVisibility
+    : null;
+}
+
+/** The active organization's saved default; null with no org or none set. */
+export async function readActiveOrganizationDefaultVisibility(): Promise<RecordingVisibility | null> {
+  const organizationId = await getActiveOrganizationId();
+  return organizationId
+    ? readOrganizationDefaultVisibility(organizationId)
+    : null;
+}
+
+export async function getOrganizationDefaultVisibility(
+  organizationId: string | null | undefined,
+): Promise<RecordingVisibility> {
+  if (!organizationId) return DEFAULT_RECORDING_VISIBILITY;
+
+  return (
+    (await readOrganizationDefaultVisibility(organizationId)) ??
+    DEFAULT_RECORDING_VISIBILITY
+  );
+}
+
+export async function getDefaultRecordingVisibility(
+  organizationId: string | null | undefined,
+  userEmail: string | null | undefined = getRequestUserEmail(),
+  explicit?: RecordingVisibility | null,
+): Promise<RecordingVisibility> {
+  if (explicit) return explicit;
+
+  const email = userEmail;
+  if (email) {
+    const prefs = (await getUserSetting(
+      normalizeOwnerEmail(email),
+      CLIPS_USER_PREFS_KEY,
+    )) as ClipsUserPrefs | null;
+    const preferred = prefs?.defaultRecordingVisibility;
+    if (isRecordingVisibility(preferred)) return preferred;
+  }
+  return getOrganizationDefaultVisibility(organizationId);
+}
 
 const ORG_ROLE_RANK: Record<OrganizationAccessRole, number> = {
   member: 1,
@@ -86,7 +193,11 @@ export async function getOrganizationRoleForEmail(
     // org_members table may not exist yet on first boot before migrations finish.
   }
 
-  return null;
+  return implicitServiceOrgRole({
+    email,
+    orgId: organizationId,
+    requestOrgId: getRequestOrgId(),
+  });
 }
 
 export async function requireOrganizationAccess(
@@ -103,24 +214,14 @@ export async function requireOrganizationAccess(
   const email = getCurrentOwnerEmail();
   const role = await getOrganizationRoleForEmail(resolvedOrganizationId, email);
   if (!role || !organizationRoleAllowed(role, allowedRoles)) {
-    throw new Error("Organization not found or access denied");
+    throw new HTTPError({
+      statusCode: 403,
+      statusMessage: "Organization not found or access denied",
+    });
   }
   return { organizationId: resolvedOrganizationId, email, role };
 }
 
-/**
- * Resolve the caller's active organization id.
- *
- * Resolution order:
- *   1. When an H3Event is available: the framework `getOrgContext()` resolves
- *      the active org via `active-org-id` user-setting, with membership
- *      cross-checked against `org_members`.
- *   2. CLI / no-event: the caller's most recent `org_members` row for their
- *      request email.
- *   3. Any org in the DB (dev / solo fallback).
- *   4. Legacy `current-workspace` app-state key or latest `workspaces` row
- *      (back-compat for in-flight sessions spanning the migration).
- */
 export async function getActiveOrganizationId(
   event?: H3Event,
 ): Promise<string | null> {
@@ -134,35 +235,37 @@ export async function getActiveOrganizationId(
     }
   }
 
-  // Request-context ALS stores the orgId resolved by the framework middleware
-  // (e.g. from better-auth session). This covers action calls where the H3
-  // event isn't forwarded.
   const ctxOrgId = getRequestOrgId();
   if (ctxOrgId) return ctxOrgId;
 
   const email = getRequestUserEmail();
 
   if (email) {
+    let resolved: string | null | undefined;
     try {
-      // Honors the user's `active-org-id` setting with a fall back to the
-      // first membership — the same logic getOrgContext uses for HTTP paths.
-      // Don't reach into org_members directly: an ORDER BY here picks the
-      // wrong org when the user belongs to more than one.
       const { resolveOrgIdForEmail } = await import("@agent-native/core/org");
-      const orgId = await resolveOrgIdForEmail(email);
-      if (orgId) return orgId;
+      resolved = await resolveOrgIdForEmail(email);
     } catch {
-      // fall through
+      // coercion-ok: the framework helper is unavailable in this context, and
+      // leaving `resolved` undefined is the typed "could not answer" the check
+      // below keeps distinct from a definite null.
     }
+    if (resolved) return resolved;
+    // A definite null covers both no membership and an explicit Personal
+    // selection, and the legacy sources below cannot improve on either: they
+    // are not scoped to a caller, so they would either hand over an org this
+    // caller has no relationship with or reactivate scope the user opted out
+    // of. Migration v61 seeds `org_members` for every legacy workspace owner
+    // and member, so a real legacy user resolves here rather than below.
+    if (resolved === null) return null;
   }
 
-  // Legacy fallback: old workspace UI's `current-workspace` app-state key,
-  // and the deprecated `workspaces` table.
   try {
     const legacy = (await readAppState("current-workspace")) as {
       id?: string;
     } | null;
-    if (legacy?.id) return legacy.id;
+    const legacyOrgId = await legacyOrganizationIdForCaller(legacy?.id, email);
+    if (legacyOrgId) return legacyOrgId;
   } catch {
     // fall through
   }
@@ -173,7 +276,8 @@ export async function getActiveOrganizationId(
       .from(schema.workspaces)
       .orderBy(desc(schema.workspaces.createdAt))
       .limit(1);
-    if (row?.id) return row.id;
+    const legacyOrgId = await legacyOrganizationIdForCaller(row?.id, email);
+    if (legacyOrgId) return legacyOrgId;
   } catch {
     // fall through
   }
@@ -181,15 +285,35 @@ export async function getActiveOrganizationId(
   return null;
 }
 
-/**
- * Like `getActiveOrganizationId` but throws if there's no active org — use
- * in mutations where a null org id should never reach the SQL layer.
- */
+async function legacyOrganizationIdForCaller(
+  organizationId: string | null | undefined,
+  email: string | undefined,
+): Promise<string | null> {
+  if (!organizationId) return null;
+
+  const [row] = await getDb()
+    .select({ id: organizations.id })
+    .from(organizations)
+    .where(eq(organizations.id, organizationId))
+    .limit(1);
+  if (!row) return null;
+
+  if (!email) return organizationId;
+  const role = await getOrganizationRoleForEmail(organizationId, email);
+  return role ? organizationId : null;
+}
+
 export async function requireActiveOrganizationId(
   event?: H3Event,
 ): Promise<string> {
   const id = await getActiveOrganizationId(event);
-  if (!id) throw new Error("No active organization");
+  if (!id) {
+    throw new HTTPError({
+      statusCode: 409,
+      statusMessage:
+        "No active organization yet. Reload the page, then try again.",
+    });
+  }
   return id;
 }
 
@@ -211,7 +335,7 @@ export interface RecordingRow {
   durationMs: number;
   videoUrl: string | null;
   status: "uploading" | "processing" | "ready" | "failed";
-  visibility: "private" | "org" | "public";
+  visibility: RecordingVisibility;
   ownerEmail: string;
   folderId: string | null;
   spaceIds: string[];
@@ -255,9 +379,7 @@ export async function getRecordingOrThrow(id: string): Promise<RecordingRow> {
     .where(
       and(
         eq(schema.recordings.id, id),
-        // visibility check happens at the action layer via the framework
-        // sharing helpers; this is just the ownership-or-visible fallback.
-        eq(schema.recordings.ownerEmail, ownerEmail),
+        ownerEmailMatches(schema.recordings.ownerEmail, ownerEmail),
       ),
     );
   if (!row) throw new Error(`Recording not found: ${id}`);
@@ -292,14 +414,42 @@ export async function getRecordingOrThrow(id: string): Promise<RecordingRow> {
   };
 }
 
-/**
- * Count a view if it meets the view-counting rule:
- *   ≥ 5 seconds watched, OR ≥ 75% of video, OR scrubbed to end.
- */
 export function shouldCountView(
   totalWatchMs: number,
   completedPct: number,
   scrubbedToEnd: boolean,
 ): boolean {
   return totalWatchMs >= 5000 || completedPct >= 75 || scrubbedToEnd;
+}
+
+export function countedViewCondition() {
+  return eq(schema.recordingViewers.countedView, true);
+}
+
+export async function countRecordingViews(
+  recordingId: string,
+): Promise<number> {
+  const db = getDb();
+  const [viewerRow] = await db
+    .select({ value: count() })
+    .from(schema.recordingViewers)
+    .where(
+      and(
+        eq(schema.recordingViewers.recordingId, recordingId),
+        countedViewCondition(),
+      ),
+    );
+  const [viewLogRow] = await db
+    .select({ value: count() })
+    .from(schema.recordingViews)
+    .where(eq(schema.recordingViews.recordingId, recordingId));
+
+  // `recording_views` only exists from migration v46, so clips recorded before
+  // it have zero log rows. Floor the total at the counted-viewer count so those
+  // clips keep reporting a real number instead of dropping to 0, and so the
+  // total can never read below the unique-viewer count beside it.
+  return Math.max(
+    Number(viewLogRow?.value ?? 0),
+    Number(viewerRow?.value ?? 0),
+  );
 }

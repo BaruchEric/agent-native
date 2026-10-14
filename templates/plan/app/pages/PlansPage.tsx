@@ -1,17 +1,86 @@
 import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type CSSProperties,
-  type FormEvent,
-  type PointerEvent,
-  type ReactNode,
-  type SyntheticEvent,
-} from "react";
-import { Link, useLocation, useNavigate, useParams } from "react-router";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+  SIDEBAR_STATE_CHANGE_EVENT,
+  sendToAgentChat,
+  setAgentChatContextItem,
+  useAgentEngineConfigured,
+  type AgentSidebarStateChangeDetail,
+} from "@agent-native/core/client/agent-chat";
+import {
+  track,
+  trackAnonymousEvent,
+  trackEvent,
+} from "@agent-native/core/client/analytics";
+import { appPath, agentNativePath } from "@agent-native/core/client/api-path";
+import { emailToColor, emailToName } from "@agent-native/core/client/collab";
+import {
+  callAction,
+  useActionQuery,
+  useAvatarUrl,
+  useSession,
+} from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import {
+  useAcceptInvitation,
+  useJoinByDomain,
+  useOrg,
+  useOrgRole,
+  useSetOrgDomain,
+} from "@agent-native/core/client/org";
+import { fetchOrgMemberPage } from "@agent-native/core/client/sharing";
+import { buildSignInReturnHref } from "@agent-native/core/client/sign-in-return";
+import { type ErrorReportDebugItem } from "@agent-native/core/client/ui";
+import { isFreeEmailProvider } from "@agent-native/core/org/free-email-providers";
+import { docsUrl } from "@agent-native/core/shared";
+import {
+  useSetHeaderActions,
+  useSetPageTitle,
+} from "@agent-native/toolkit/app-shell";
+import { PromptComposer } from "@agent-native/toolkit/app/chat/composer/index";
+import { ErrorReportActions } from "@agent-native/toolkit/app/feedback";
+import {
+  InlineMarkdown,
+  type InlineMarkdownProtectedSpan,
+} from "@agent-native/toolkit/app/review";
+import { ShareButton } from "@agent-native/toolkit/app/sharing";
+import { writeClipboardText } from "@agent-native/toolkit/clipboard";
+import { type RichMarkdownCollabUser } from "@agent-native/toolkit/editor";
+import { ShareCopyRow, ShareTrigger } from "@agent-native/toolkit/sharing";
+import {
+  SOURCE_AUTHOR_COMMENT_MENTION_EMAIL,
+  extractCommentMentions,
+  formatPlanCommentAnchorForAgent,
+  formatPlanCommentMentionToken,
+  normalizePlanCommentResolutionTarget,
+  parsePlanCommentAnchor,
+  planCommentAnchorDetails,
+  type PlanCommentMention,
+  type PlanCommentResolutionTarget,
+} from "@shared/comment-context";
+import type {
+  PlanAnnotation,
+  PlanBlock,
+  PlanContent,
+  PlanContentPatch,
+} from "@shared/plan-content";
+import {
+  diffPlanVersions,
+  formatVersionDiffSummary,
+} from "@shared/plan-version-diff";
+import {
+  PLAN_SHARE_SURFACE,
+  readPlanShareAttribution,
+  withPlanShareAttribution,
+} from "@shared/share-attribution";
+import {
+  type PlanBundle,
+  type PlanKind,
+  type PlanReportReason,
+  type PlanSource,
+  type PlanStatus,
+  type PlanSummary,
+  type PlanVersionDetail,
+  type PlanVersionSummary,
+} from "@shared/types";
 import {
   IconAt,
   IconArrowLeft,
@@ -42,7 +111,6 @@ import {
   IconMessageCircle,
   IconMoon,
   IconPlus,
-  IconShare3,
   IconLink,
   IconWorld,
   IconSun,
@@ -54,40 +122,35 @@ import {
   IconUserPlus,
   IconTrash,
 } from "@tabler/icons-react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTheme } from "next-themes";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type FormEvent,
+  type PointerEvent,
+  type ReactNode,
+  type SyntheticEvent,
+} from "react";
+import { Link, useLocation, useNavigate, useParams } from "react-router";
 import { toast } from "sonner";
+
+import type {
+  CanvasMarkupCreateContext,
+  CanvasMarkupMode,
+} from "@/components/plan/CanvasArea";
+import { GuestModeBanner } from "@/components/plan/GuestModeBanner";
+import { PlanContentRenderer } from "@/components/plan/PlanContentRenderer";
+import type { PlanVisualSurfaceMode } from "@/components/plan/PlanVisualSurface";
 import {
-  SIDEBAR_STATE_CHANGE_EVENT,
-  PromptComposer,
-  BuilderSetupCard,
-  ShareButton,
-  appPath,
-  agentNativePath,
-  sendToAgentChat,
-  setAgentChatContextItem,
-  useAgentEngineConfigured,
-  useActionQuery,
-  useSession,
-  emailToColor,
-  emailToName,
-  type AgentSidebarStateChangeDetail,
-  type RichMarkdownCollabUser,
-} from "@agent-native/core/client";
-import {
-  useAcceptInvitation,
-  useJoinByDomain,
-  useOrg,
-  type OrgInfo,
-  type OrgInvitationSummary,
-  type DomainMatchOrg,
-} from "@agent-native/core/client/org";
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+  toggleWireframeStyle,
+  useWireframeStyle,
+} from "@/components/plan/wireframe/use-wireframe-style";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -98,6 +161,15 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import {
   Dialog,
   DialogContent,
@@ -121,17 +193,22 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Popover,
+  PopoverAnchor,
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import {
   Sheet,
@@ -140,14 +217,8 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import {
@@ -156,22 +227,8 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
-  useSetHeaderActions,
-  useSetPageTitle,
-} from "@/components/layout/HeaderActions";
-import { PlanContentRenderer } from "@/components/plan/PlanContentRenderer";
-import { GuestModeBanner } from "@/components/plan/GuestModeBanner";
-import type { PlanVisualSurfaceMode } from "@/components/plan/PlanVisualSurface";
-import {
-  toggleWireframeStyle,
-  useWireframeStyle,
-} from "@/components/plan/wireframe/use-wireframe-style";
-import type {
-  CanvasMarkupCreateContext,
-  CanvasMarkupMode,
-} from "@/components/plan/CanvasArea";
-import {
   planBundleQueryKey,
+  planBundleQueryParams,
   localPlanBundleQueryKey,
   localPlanBundleQueryParams,
   ALL_PLANS_QUERY_ARGS,
@@ -186,6 +243,7 @@ import {
   usePublishVisualPlan,
   useReportVisualPlan,
   useRestorePlanVersion,
+  useSavePlanBlocks,
   useUpdatePlan,
   useUpdateLocalPlan,
   useUpdateLocalPlanComments,
@@ -201,47 +259,115 @@ import {
   type PlanAccessStatusResponse,
   type PublishVisualPlanResult,
 } from "@/hooks/use-plans";
-import { cn } from "@/lib/utils";
+import { sendToPlanCreationAgentChat } from "@/lib/agent-chat";
+import {
+  assessPlanPrompt,
+  isProbablyImportedPlan,
+  type CreatePlanKind,
+} from "@/lib/create-plan-routing";
 import {
   getDesktopPlanFiles,
   type DesktopPlanFilesFolder,
-  type PlanMdxFolder,
 } from "@/lib/desktop-plan-files";
 import { syncLocalControlResources } from "@/lib/local-control-resources";
+import {
+  resolvePlanOrgAccessPrompt,
+  type PlanOrgAccessPrompt,
+} from "@/lib/plan-access-prompt";
+import {
+  PREFERRED_EDITOR_VALUES,
+  PREFERRED_EDITOR_STORAGE_KEY,
+  DESKTOP_PLAN_SYNC_AUTO_KEY_PREFIX,
+  injectAnnotationRuntime,
+  type PreferredEditor,
+  type RuntimeAnnotation,
+  type RuntimeAnnotationComment,
+  type RuntimeAnnotationParticipant,
+} from "@/lib/plan-annotation-runtime";
+import {
+  saveBlocksMergingConflicts,
+  type PlanBlocksRevision,
+} from "@/lib/plan-block-save";
+import {
+  appendMessageToEditor,
+  canSubmitInlineCommentDraft,
+  commentBodyText,
+  createMentionChip,
+  displayNameForMention,
+  mentionQueryAtCaret,
+  serializeCommentEditor,
+  type CommentDraft,
+} from "@/lib/plan-comment-editor-helpers";
 import { planDocumentTitle } from "@/lib/plan-document-title";
+import { hasSameDomainCoworkerInPages } from "@/lib/plan-invite-suggestion";
 import {
-  type PlanBundle,
-  type PlanKind,
-  type PlanReportReason,
-  type PlanSource,
-  type PlanStatus,
-  type PlanSummary,
-  type PlanVersionDetail,
-  type PlanVersionSummary,
-} from "@shared/types";
+  fetchLocalPlanBridgeComments,
+  fetchLocalPlanBridgeBundle,
+  localNetworkAccessPermissionState,
+  localPlanBridgeUrlFromLocation,
+  localPlanBridgeQueryKey,
+  localPlanBridgeRetryDelay,
+  localPlanRoutePath,
+  localPlanRouteUrl,
+  mergeLocalBridgeComments,
+  planReturnPathFromLocation,
+  shouldRetryLocalPlanBridgeBundle,
+  shouldShowLocalPlanLoadError,
+  shouldShowPlanLoadError,
+  updateLocalPlanBridgeComments,
+  LocalPlanBridgePermissionError,
+  type LocalPlanBundle,
+  type LocalNetworkAccessPermissionState,
+  type PlanBundleWithHtml,
+  type PlanCommentItem,
+} from "@/lib/plan-local-bridge";
 import {
-  diffPlanVersions,
-  formatVersionDiffSummary,
-} from "@shared/plan-version-diff";
-import {
-  extractCommentMentions,
-  formatPlanCommentAnchorForAgent,
-  formatPlanCommentMentionToken,
-  normalizePlanCommentResolutionTarget,
-  parsePlanCommentAnchor,
-  planCommentAnchorDetails,
-  type PlanCommentAnchor,
-  type PlanCommentMention,
-  type PlanCommentResolutionTarget,
-} from "@shared/comment-context";
-import type {
-  PlanAnnotation,
-  PlanBlock,
-  PlanContent,
-  PlanContentPatch,
-} from "@shared/plan-content";
-import { mimeTypeFromFilename } from "@shared/plan-assets";
-import { parsePlanMdxFolder } from "../../server/plan-mdx";
+  buildNativeAnchorFromElement,
+  clamp,
+  findPlanBlockById,
+  nativeMarkerPlacementForAnchor,
+  nativePointForAnchor,
+  prototypeScreenIdForAnchor,
+  resolveNativeAnchorTarget,
+  selectorForElementWithin,
+  textQuoteContextForBlock,
+  type PlanAnnotationAnchor,
+} from "@/lib/plan-native-anchors";
+import { cn } from "@/lib/utils";
+
+export {
+  resolvePlanOrgAccessPrompt,
+  buildNativeAnchorFromElement,
+  nativeMarkerPlacementForAnchor,
+  nativePointForAnchor,
+  prototypeScreenIdForAnchor,
+  resolveNativeAnchorTarget,
+  selectorForElementWithin,
+  localPlanBridgeRetryDelay,
+  shouldRetryLocalPlanBridgeBundle,
+  shouldShowPlanLoadError,
+};
+export type { NativeMarkerPlacement } from "@/lib/plan-native-anchors";
+export type { PlanOrgAccessPrompt } from "@/lib/plan-access-prompt";
+export { canSubmitInlineCommentDraft, mentionQueryAtCaret };
+export type { CommentDraft } from "@/lib/plan-comment-editor-helpers";
+
+export function buildPlanEmailVerificationCallbackURL(
+  location: Pick<Location, "pathname" | "search" | "hash">,
+): string {
+  return buildSignInReturnHref({
+    returnTo: appPath(planReturnPathFromLocation(location)),
+  });
+}
+
+function isPlanEmailVerificationPendingMessage(message: string): boolean {
+  return /\b(?:email|account)\b.*\b(?:not\s+verified|isn't\s+verified|is\s+not\s+verified|unverified)\b/i.test(
+    message,
+  );
+}
+
+const useBrowserLayoutEffect =
+  typeof window === "undefined" ? useEffect : useLayoutEffect;
 
 function GoogleLogoIcon({ className }: { className?: string }) {
   return (
@@ -271,28 +397,27 @@ function GoogleLogoIcon({ className }: { className?: string }) {
   );
 }
 
-const SOURCE_OPTIONS: Array<{ value: PlanSource; label: string }> = [
-  { value: "codex", label: "Codex" },
-  { value: "claude-code", label: "Claude Code" },
-  { value: "cursor", label: "Cursor" },
-  { value: "pi", label: "Pi" },
-  { value: "manual", label: "Manual" },
-  { value: "imported", label: "Imported" },
+const SOURCE_OPTIONS: Array<{ value: PlanSource }> = [
+  { value: "codex" },
+  { value: "claude-code" },
+  { value: "cursor" },
+  { value: "pi" },
+  { value: "manual" },
+  { value: "imported" },
 ];
 
 const REPORT_REASON_OPTIONS: Array<{
   value: PlanReportReason;
-  label: string;
 }> = [
-  { value: "spam", label: "Spam or deceptive" },
-  { value: "harassment", label: "Harassment" },
-  { value: "hate", label: "Hateful content" },
-  { value: "sexual", label: "Sexual content" },
-  { value: "violence", label: "Violence or threats" },
-  { value: "self-harm", label: "Self-harm" },
-  { value: "privacy", label: "Privacy concern" },
-  { value: "illegal", label: "Illegal activity" },
-  { value: "other", label: "Something else" },
+  { value: "spam" },
+  { value: "harassment" },
+  { value: "hate" },
+  { value: "sexual" },
+  { value: "violence" },
+  { value: "self-harm" },
+  { value: "privacy" },
+  { value: "illegal" },
+  { value: "other" },
 ];
 
 const PLAN_READER_VIEW_EVENT = "plans-reader-view-change";
@@ -302,50 +427,14 @@ const ENABLE_PLAN_STATUS_FEATURE = false;
 const GITHUB_LIGHT_CANVAS_BACKGROUND = "#ffffff";
 const GITHUB_DARK_CANVAS_BACKGROUND = "#0d1117";
 const LOCAL_PLAN_OWNER_EMAIL = "local@agent-native.local";
-const PLAN_DOCS_URL = "https://www.agent-native.com/docs/template-plan";
-const LOCAL_FILES_DOCS_URL = `${PLAN_DOCS_URL}#local-files`;
+const PLAN_DOCS_URL = docsUrl("template-plan");
+const LOCAL_FILES_DOCS_URL = docsUrl("template-plan-local-and-desktop", {
+  hash: "local-files",
+});
 const AUTO_DEV_COMMENT_EMAILS = new Set(["dev@local.test", "dev@local"]);
 const CURRENT_USER_FALLBACK_NAME = "You";
 const CURRENT_USER_FALLBACK_INITIALS = "You";
 const CURRENT_USER_FALLBACK_COLOR = "#2563eb";
-
-type PreferredEditor =
-  | "vscode"
-  | "cursor"
-  | "finder"
-  | "terminal"
-  | "ghostty"
-  | "xcode";
-
-const PREFERRED_EDITOR_STORAGE_KEY = "agent-native-plans.preferredEditor";
-const DESKTOP_PLAN_SYNC_AUTO_KEY_PREFIX =
-  "agent-native-plans.desktopSync.auto.";
-const PREFERRED_EDITOR_VALUES: PreferredEditor[] = [
-  "vscode",
-  "cursor",
-  "finder",
-  "terminal",
-  "ghostty",
-  "xcode",
-];
-
-const EDITOR_OPTIONS: Array<{ value: PreferredEditor; label: string }> = [
-  { value: "vscode", label: "VS Code" },
-  { value: "cursor", label: "Cursor" },
-  { value: "finder", label: "Finder" },
-  { value: "terminal", label: "Terminal" },
-  { value: "ghostty", label: "Ghostty" },
-  { value: "xcode", label: "Xcode" },
-];
-
-const EDITOR_ICON_HTML: Record<PreferredEditor, string> = {
-  vscode: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="tabler-icon tabler-icon-brand-vscode" aria-hidden="true"><path d="M16 3v18l4 -2.5v-13l-4 -2.5"></path><path d="M9.165 13.903l-4.165 3.597l-2 -1l4.333 -4.5m1.735 -1.802l6.932 -7.198v5l-4.795 4.141"></path><path d="M16 16.5l-11 -10l-2 1l13 13.5"></path></svg>`,
-  cursor: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="tabler-icon tabler-icon-cube" aria-hidden="true"><path d="M21 16.008v-8.018a1.98 1.98 0 0 0 -1 -1.717l-7 -4.008a2.016 2.016 0 0 0 -2 0l-7 4.008c-.619 .355 -1 1.01 -1 1.718v8.018c0 .709 .381 1.363 1 1.717l7 4.008a2.016 2.016 0 0 0 2 0l7 -4.008c.619 -.355 1 -1.01 1 -1.718"></path><path d="M12 22v-10"></path><path d="M12 12l8.73 -5.04"></path><path d="M3.27 6.96l8.73 5.04"></path></svg>`,
-  finder: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="tabler-icon tabler-icon-brand-finder" aria-hidden="true"><path d="M3 5a1 1 0 0 1 1 -1h16a1 1 0 0 1 1 1v14a1 1 0 0 1 -1 1h-16a1 1 0 0 1 -1 -1l0 -14"></path><path d="M7 8v1"></path><path d="M17 8v1"></path><path d="M12.5 4c-.654 1.486 -1.26 3.443 -1.5 9h2.5c-.19 2.867 .094 5.024 .5 7"></path><path d="M7 15.5c3.667 2 6.333 2 10 0"></path></svg>`,
-  terminal: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="tabler-icon tabler-icon-terminal-2" aria-hidden="true"><path d="M8 9l3 3l-3 3"></path><path d="M13 15l3 0"></path><path d="M3 6a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2l0 -12"></path></svg>`,
-  ghostty: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="tabler-icon tabler-icon-ghost-3" aria-hidden="true"><path d="M5 11a7 7 0 0 1 14 0v7a1.78 1.78 0 0 1 -3.1 1.4a1.65 1.65 0 0 0 -2.6 0a1.65 1.65 0 0 1 -2.6 0a1.65 1.65 0 0 0 -2.6 0a1.78 1.78 0 0 1 -3.1 -1.4v-7"></path><path d="M10 10h.01"></path><path d="M14 10h.01"></path></svg>`,
-  xcode: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="tabler-icon tabler-icon-hammer" aria-hidden="true"><path d="M11.414 10l-7.383 7.418a2.091 2.091 0 0 0 0 2.967a2.11 2.11 0 0 0 2.976 0l7.407 -7.385"></path><path d="M18.121 15.293l2.586 -2.586a1 1 0 0 0 0 -1.414l-7.586 -7.586a1 1 0 0 0 -1.414 0l-2.586 2.586a1 1 0 0 0 0 1.414l7.586 7.586a1 1 0 0 0 1.414 0"></path></svg>`,
-};
 
 function readPreferredEditor(): PreferredEditor {
   if (typeof window === "undefined") return "vscode";
@@ -364,61 +453,9 @@ function readDesktopPlanAutoSync(planId: string | undefined): boolean {
   return window.localStorage.getItem(desktopPlanAutoSyncKey(planId)) === "1";
 }
 
-type PlanAnnotationAnchor = PlanCommentAnchor & { x: number; y: number };
-
-type CommentDraft = {
-  message: string;
-  mentions: PlanCommentMention[];
-  resolutionTarget: PlanCommentResolutionTarget;
-};
-
 type OrgMemberSuggestion = {
   email: string;
   role?: string;
-};
-
-type RuntimeAnnotation = {
-  id: string;
-  index: number;
-  message: string;
-  kind: string;
-  status: string;
-  createdBy: string;
-  parentCommentId?: string | null;
-  authorEmail?: string | null;
-  authorName?: string | null;
-  authorAvatarUrl?: string | null;
-  authorColor?: string | null;
-  authorInitials?: string | null;
-  sectionId?: string | null;
-  createdAt?: string;
-  anchor: PlanAnnotationAnchor;
-  replies: RuntimeAnnotationComment[];
-  participants: RuntimeAnnotationParticipant[];
-  commentCount: number;
-};
-
-type RuntimeAnnotationComment = {
-  id: string;
-  message: string;
-  status: string;
-  createdBy: string;
-  parentCommentId?: string | null;
-  authorEmail?: string | null;
-  authorName?: string | null;
-  authorAvatarUrl?: string | null;
-  authorColor?: string | null;
-  authorInitials?: string | null;
-  createdAt?: string;
-};
-
-type RuntimeAnnotationParticipant = {
-  id: string;
-  authorEmail?: string | null;
-  authorName?: string | null;
-  authorAvatarUrl?: string | null;
-  authorColor?: string | null;
-  authorInitials?: string | null;
 };
 
 type InlineCommentPosition = {
@@ -444,6 +481,17 @@ type PlanDocumentState = {
   clientWidth: number;
   clientHeight: number;
 };
+
+export function resetPlanReaderScrollPosition(reader: HTMLElement | null) {
+  if (reader) {
+    reader.scrollTo({ left: 0, top: 0, behavior: "auto" });
+    reader.scrollLeft = 0;
+    reader.scrollTop = 0;
+  }
+  if (typeof window !== "undefined") {
+    window.scrollTo(0, 0);
+  }
+}
 
 function shortDate(value: string) {
   return new Intl.DateTimeFormat(undefined, {
@@ -482,385 +530,6 @@ type CurrentCommentAuthor = {
   avatarUrl: string | null;
   color: string;
 };
-
-type LocalPlanBundle = PlanBundle & {
-  localOnly: true;
-  slug: string;
-  folder: string;
-  repoPath?: string | null;
-  suggestedRepoPath?: string;
-  path?: string;
-  url?: string;
-  html?: string;
-  mdx?: PlanMdxFolder;
-};
-type PlanBundleWithHtml = (PlanBundle & { html?: string }) | LocalPlanBundle;
-type PlanCommentItem = PlanBundle["comments"][number];
-
-type LocalPlanBridgePayload = {
-  ok?: boolean;
-  version?: number;
-  source?: string;
-  localOnly?: boolean;
-  slug?: string;
-  dir?: string;
-  title?: string;
-  brief?: string;
-  kind?: PlanKind;
-  updatedAt?: string;
-  files?: string[];
-  mdx?: PlanMdxFolder;
-  error?: string;
-};
-
-function assertLocalBridgeUrl(value: string): string {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new Error("Local plan bridge URL is invalid.");
-  }
-  const allowedHosts = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
-  if (url.protocol !== "http:") {
-    throw new Error("Local plan bridge must use HTTP on localhost.");
-  }
-  if (!allowedHosts.has(url.hostname)) {
-    throw new Error("Local plan bridge must point to localhost.");
-  }
-  if (!url.port) {
-    throw new Error("Local plan bridge must use an explicit localhost port.");
-  }
-  if (url.username || url.password || url.hash) {
-    throw new Error("Local plan bridge URL contains unsupported credentials.");
-  }
-  if (url.pathname !== "/local-plan.json") {
-    throw new Error("Local plan bridge must point to /local-plan.json.");
-  }
-  const params = Array.from(url.searchParams.keys());
-  if (
-    params.length !== 1 ||
-    params[0] !== "token" ||
-    !url.searchParams.get("token")?.trim()
-  ) {
-    throw new Error("Local plan bridge URL is missing its access token.");
-  }
-  return url.toString();
-}
-
-const LOCAL_PLAN_BRIDGE_MAX_RETRIES = 5;
-
-export function shouldRetryLocalPlanBridgeBundle(
-  failureCount: number,
-  error: unknown,
-) {
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  if (
-    message.includes("Local plan bridge URL") ||
-    message.includes("Local plan bridge must") ||
-    message.includes("Local plan bridge response was not")
-  ) {
-    return false;
-  }
-  return failureCount < LOCAL_PLAN_BRIDGE_MAX_RETRIES;
-}
-
-export function localPlanBridgeRetryDelay(attemptIndex: number) {
-  return Math.min(500 * 2 ** attemptIndex, 2_500);
-}
-
-/**
- * Decide whether the hosted-plan render should surface the retryable load
- * error card instead of the initial skeleton.
- *
- * A React Query read can be *paused* (browser offline, or the tab blurred
- * during a retry backoff): in that state it never errors and never resolves,
- * so `isError`/`isLoading`/`isFetching` are all false and `data` stays
- * undefined. Without treating that as an error-like state the page sits on the
- * initial skeleton forever until a manual refresh — exactly the "wasn't
- * loading the content until I do another refresh" report. Surfacing the
- * retry card lets the user recover; React Query also auto-resumes the paused
- * fetch when the network/tab returns, which clears the card on its own.
- */
-export function shouldShowPlanLoadError(input: {
-  hasSelectedId: boolean;
-  localPlanMode: boolean;
-  hasBundle: boolean;
-  planQueryPending: boolean;
-  planQueryError: boolean;
-  planQueryPaused: boolean;
-  accessStatusPending: boolean;
-  accessStatusPaused: boolean;
-  accessDenied: boolean;
-}): boolean {
-  if (!input.hasSelectedId || input.localPlanMode || input.hasBundle) {
-    return false;
-  }
-  // While a read is actively in flight, keep showing the skeleton.
-  if (input.planQueryPending) return false;
-  if (input.planQueryError) return true;
-  // Paused/stalled read that will never settle on its own input.
-  if (input.planQueryPaused || input.accessStatusPaused) return true;
-  if (!input.accessStatusPending && input.accessDenied) return true;
-  return false;
-}
-
-export type PlanOrgAccessPrompt =
-  | {
-      kind: "invitation";
-      organizationId: string;
-      organizationName: string;
-      invitationId: string;
-      invitedBy: string;
-      buttonLabel: string;
-      message: string;
-    }
-  | {
-      kind: "domain";
-      organizationId: string;
-      organizationName: string;
-      domain: string | null;
-      buttonLabel: string;
-      message: string;
-    };
-
-export function resolvePlanOrgAccessPrompt(input: {
-  accessStatus?: PlanAccessStatusResponse | null;
-  org?: Pick<OrgInfo, "email" | "pendingInvitations" | "domainMatches"> | null;
-}): PlanOrgAccessPrompt | null {
-  const orgId = input.accessStatus?.orgId;
-  const orgName = input.accessStatus?.orgName?.trim();
-  if (
-    !orgId ||
-    !orgName ||
-    input.accessStatus?.visibility !== "org" ||
-    input.accessStatus.hasAccess
-  ) {
-    return null;
-  }
-
-  const pendingInvitation = input.org?.pendingInvitations?.find(
-    (inv: OrgInvitationSummary) => inv.orgId === orgId,
-  );
-  if (pendingInvitation) {
-    return {
-      kind: "invitation",
-      organizationId: orgId,
-      organizationName: orgName,
-      invitationId: pendingInvitation.id,
-      invitedBy: pendingInvitation.invitedBy,
-      buttonLabel: "Accept invite",
-      message: `You already have an invite to ${orgName}. Accept it to open this plan.`,
-    };
-  }
-
-  const domainMatch = input.org?.domainMatches?.find(
-    (match: DomainMatchOrg) => match.orgId === orgId,
-  );
-  if (domainMatch) {
-    const domain = input.org?.email?.split("@")[1]?.toLowerCase() || null;
-    return {
-      kind: "domain",
-      organizationId: orgId,
-      organizationName: orgName,
-      domain,
-      buttonLabel: `Join ${orgName}`,
-      message: domain
-        ? `Your @${domain} email can join ${orgName}. Join it to open this plan.`
-        : `You can join ${orgName} to open this plan.`,
-    };
-  }
-
-  return null;
-}
-
-function localPlanRoutePath(slug: string, repoPath?: string | null): string {
-  const base = appPath(`/local-plans/${encodeURIComponent(slug)}`);
-  if (!repoPath) return base;
-  const params = new URLSearchParams({ path: repoPath });
-  return `${base}?${params.toString()}`;
-}
-
-function localPlanRouteUrl(slug: string, repoPath?: string | null): string {
-  const path = localPlanRoutePath(slug, repoPath);
-  return typeof window === "undefined"
-    ? path
-    : `${window.location.origin}${path}`;
-}
-
-function localPlanAssetDataUrl(
-  url: string | undefined,
-  assets: Record<string, string> | undefined,
-): string | undefined {
-  if (!url || !assets) return url;
-  const match = url.match(/^(?:\.\/)?assets\/(.+)$/);
-  const filename = match?.[1];
-  if (!filename) return url;
-  const base64 = assets[filename];
-  if (!base64) return url;
-  const mime = mimeTypeFromFilename(filename);
-  if (!mime) return url;
-  return `data:${mime};base64,${base64}`;
-}
-
-function inlineLocalPlanAssets(
-  content: PlanContent,
-  assets: Record<string, string> | undefined,
-): PlanContent {
-  if (!assets || Object.keys(assets).length === 0) return content;
-  const rewriteBlocks = (blocks: PlanBlock[]): PlanBlock[] =>
-    blocks.map((block): PlanBlock => {
-      if (block.type === "image") {
-        return {
-          ...block,
-          data: {
-            ...block.data,
-            url: localPlanAssetDataUrl(block.data.url, assets),
-            assetId: undefined,
-          },
-        };
-      }
-      if (block.type === "tabs") {
-        return {
-          ...block,
-          data: {
-            ...block.data,
-            tabs: block.data.tabs.map((tab) => ({
-              ...tab,
-              blocks: rewriteBlocks(tab.blocks),
-            })),
-          },
-        };
-      }
-      if (block.type === "columns") {
-        return {
-          ...block,
-          data: {
-            ...block.data,
-            columns: block.data.columns.map((column) => ({
-              ...column,
-              blocks: rewriteBlocks(column.blocks),
-            })),
-          },
-        };
-      }
-      return block;
-    });
-  return { ...content, blocks: rewriteBlocks(content.blocks) };
-}
-
-function countLocalPlanBlocks(blocks: PlanBlock[]): Record<string, number> {
-  const counts: Record<string, number> = {};
-  const visitBlocks = (items: PlanBlock[]) => {
-    for (const block of items) {
-      counts[block.type] = (counts[block.type] ?? 0) + 1;
-      if (block.type === "tabs") {
-        for (const tab of block.data.tabs) visitBlocks(tab.blocks);
-      } else if (block.type === "columns") {
-        for (const column of block.data.columns) visitBlocks(column.blocks);
-      }
-    }
-  };
-  visitBlocks(blocks);
-  return counts;
-}
-
-function localPlanBridgeQueryKey(slug: string, bridgeUrl: string) {
-  return ["local-plan-bridge", slug, bridgeUrl] as const;
-}
-
-// Merge folder comments.json onto a read-only bridge bundle (which serves none);
-// the bundle's own comments win so optimistic/just-written ones aren't clobbered.
-function mergeLocalBridgeComments(
-  bundle: LocalPlanBundle | undefined,
-  folderComments: LocalPlanBundle["comments"] | undefined,
-): LocalPlanBundle | undefined {
-  if (!bundle) return bundle;
-  const comments =
-    bundle.comments.length > 0 ? bundle.comments : (folderComments ?? []);
-  if (comments === bundle.comments) return bundle;
-  return {
-    ...bundle,
-    comments,
-    summary: {
-      ...bundle.summary,
-      commentCount: comments.length,
-      openCommentCount: comments.filter((c) => c.status === "open").length,
-    },
-  };
-}
-
-async function fetchLocalPlanBridgeBundle(
-  bridgeUrl: string,
-  fallbackSlug: string,
-): Promise<LocalPlanBundle> {
-  const safeUrl = assertLocalBridgeUrl(bridgeUrl);
-  const response = await fetch(safeUrl, { cache: "no-store" });
-  const payload = (await response
-    .json()
-    .catch(() => null)) as LocalPlanBridgePayload | null;
-  if (!response.ok || !payload?.ok) {
-    throw new Error(
-      payload?.error ||
-        `Local plan bridge returned ${response.status || "an error"}.`,
-    );
-  }
-  if (
-    payload.source !== "agent-native-local-bridge" ||
-    !payload.mdx?.["plan.mdx"]
-  ) {
-    throw new Error("Local plan bridge response was not a Plan MDX folder.");
-  }
-
-  const rawContent = await parsePlanMdxFolder(payload.mdx, {
-    salvageInvalidBlocks: payload.kind === "recap",
-  });
-  const content = inlineLocalPlanAssets(rawContent, payload.mdx["assets/"]);
-  const now = payload.updatedAt || new Date().toISOString();
-  const slug = payload.slug || fallbackSlug || "local-plan";
-  const kind = payload.kind === "recap" ? "recap" : "plan";
-  const title = content.title || payload.title || slug;
-  const brief = content.brief || payload.brief || "Local files preview.";
-  const url = localPlanRouteUrl(slug);
-  const bundle: LocalPlanBundle = {
-    plan: {
-      id: `local-${slug}`,
-      title,
-      brief,
-      kind,
-      status: "review",
-      source: "imported",
-      repoPath: payload.dir ?? null,
-      currentFocus: "local-files preview",
-      html: null,
-      markdown: payload.mdx["plan.mdx"],
-      content,
-      createdAt: now,
-      updatedAt: now,
-      approvedAt: null,
-    },
-    access: {
-      role: "viewer",
-      ownerEmail: null,
-      orgId: null,
-      visibility: "private",
-    },
-    sections: [],
-    comments: [],
-    events: [],
-    summary: {
-      sectionCounts: countLocalPlanBlocks(content.blocks),
-      commentCount: 0,
-      openCommentCount: 0,
-    },
-    localOnly: true,
-    slug,
-    folder: payload.dir ?? slug,
-    path: `/local-plans/${encodeURIComponent(slug)}`,
-    url,
-    mdx: payload.mdx,
-  };
-  return bundle;
-}
 
 type CommentThread = {
   id: string;
@@ -977,8 +646,10 @@ function commentDescendantCount(
   return count;
 }
 
-function deleteCommentLabel(replyCount: number) {
-  return replyCount > 0 ? "Delete thread" : "Delete comment";
+function deleteCommentLabel(replyCount: number, t: ReturnType<typeof useT>) {
+  return replyCount > 0
+    ? t("plansPage.comments.deleteThread")
+    : t("plansPage.comments.deleteComment");
 }
 
 export function shouldKeepCommentPopoverOpenForTarget(
@@ -1049,9 +720,9 @@ function commentAuthorName(
   if (explicitName) return explicitName;
   const email = normalizeCommentEmail(source.authorEmail);
   if (email) return emailToName(email);
-  if (source.createdBy === "agent") return "Agent";
-  if (source.createdBy === "import") return "Imported";
-  return "Reviewer";
+  if (source.createdBy === "agent") return "Agent"; // i18n-key-ignore stable actor id fallback
+  if (source.createdBy === "import") return "Imported"; // i18n-key-ignore stable import actor fallback
+  return "Reviewer"; // i18n-key-ignore stable anonymous reviewer fallback
 }
 
 function commentAuthorInitials(name: string) {
@@ -1230,8 +901,108 @@ function useOrgMemberMentionSearch(query: string | null) {
   return { members, isLoading };
 }
 
-function displayNameForMention(email: string) {
-  return emailToName(email).replace(/\s+/g, " ").trim() || email;
+function elementForShortcutTarget(target: EventTarget | null) {
+  if (target instanceof Element) return target;
+  if (target instanceof Node) return target.parentElement;
+  return null;
+}
+
+export function isPlanCommentShortcutEditableTarget(
+  target: EventTarget | null,
+) {
+  const element = elementForShortcutTarget(target);
+  if (!element) return false;
+  return Boolean(
+    element.closest(
+      "input, textarea, select, [contenteditable]:not([contenteditable='false']), [role='textbox']",
+    ),
+  );
+}
+
+export function shouldHandlePlanCommentShortcut(
+  event: Pick<
+    KeyboardEvent,
+    | "altKey"
+    | "ctrlKey"
+    | "defaultPrevented"
+    | "key"
+    | "metaKey"
+    | "shiftKey"
+    | "target"
+  >,
+) {
+  if (event.defaultPrevented) return false;
+  const activeElement =
+    typeof document === "undefined" ? null : document.activeElement;
+  if (
+    isPlanCommentShortcutEditableTarget(activeElement) ||
+    isPlanCommentShortcutEditableTarget(event.target)
+  ) {
+    return false;
+  }
+  const key = event.key.toLowerCase();
+  if (
+    key === "c" &&
+    !event.metaKey &&
+    !event.ctrlKey &&
+    !event.altKey &&
+    !event.shiftKey
+  ) {
+    return true;
+  }
+  return (
+    key === "m" &&
+    event.metaKey &&
+    event.shiftKey &&
+    !event.ctrlKey &&
+    !event.altKey
+  );
+}
+
+export function defaultInlineCommentDraftForPlanContext(input: {
+  planKind?: PlanKind | null;
+  ownerEmail?: string | null;
+  sourceAuthorName?: string | null;
+  sourceAuthorLogin?: string | null;
+  accessRole?: NonNullable<PlanBundle["access"]>["role"] | null;
+  currentEmail?: string | null;
+}): CommentDraft {
+  const currentEmail = normalizeCommentEmail(input.currentEmail);
+  if (input.planKind === "recap") {
+    const targetLabel =
+      input.sourceAuthorName?.trim() || input.sourceAuthorLogin?.trim();
+    if (!targetLabel || input.accessRole === "owner") {
+      return { message: "", mentions: [], resolutionTarget: "agent" };
+    }
+    const mention: PlanCommentMention = {
+      email: SOURCE_AUTHOR_COMMENT_MENTION_EMAIL,
+      label: targetLabel,
+      role: "source-author",
+    };
+    return {
+      message: `${formatPlanCommentMentionToken(mention)} `,
+      mentions: [mention],
+      resolutionTarget: "human",
+    };
+  }
+
+  const targetEmail = normalizeCommentEmail(input.ownerEmail);
+  if (
+    !targetEmail ||
+    input.accessRole === "owner" ||
+    targetEmail === currentEmail
+  ) {
+    return { message: "", mentions: [], resolutionTarget: "agent" };
+  }
+  const mention = {
+    email: targetEmail,
+    label: displayNameForMention(targetEmail),
+  };
+  return {
+    message: `${formatPlanCommentMentionToken(mention)} `,
+    mentions: [mention],
+    resolutionTarget: "human",
+  };
 }
 
 function safeDecodeURIComponent(value: string): string {
@@ -1243,30 +1014,35 @@ function safeDecodeURIComponent(value: string): string {
 }
 
 function renderCommentMessage(message: string) {
-  const parts: ReactNode[] = [];
-  let lastIndex = 0;
+  const protectedSpans: InlineMarkdownProtectedSpan[] = [];
   const pattern = /@\[([^\]]+)\]\(mailto:([^)]+)\)/g;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(message)) !== null) {
-    if (match.index > lastIndex) {
-      parts.push(message.slice(lastIndex, match.index));
-    }
     const label = match[1] ?? "";
     const email = safeDecodeURIComponent(match[2] ?? "");
-    parts.push(
-      <span
-        key={`${email}-${match.index}`}
-        className="mx-0.5 inline-flex max-w-[14rem] translate-y-[2px] items-center gap-1 rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-xs font-medium text-primary"
-        title={email}
-      >
-        <IconAt className="size-3" />
-        <span className="truncate">{label || email}</span>
-      </span>,
-    );
-    lastIndex = pattern.lastIndex;
+    protectedSpans.push({
+      source: match[0],
+      label: label || email,
+      title: email,
+    });
   }
-  if (lastIndex < message.length) parts.push(message.slice(lastIndex));
-  return parts.length > 0 ? parts : message;
+  return (
+    <InlineMarkdown
+      content={message}
+      inline
+      protectedSpans={protectedSpans}
+      renderProtectedSpan={(span, children) => (
+        <span
+          key={span.source}
+          className="mx-0.5 inline-flex max-w-[14rem] translate-y-[2px] items-center gap-1 rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-xs font-medium text-primary"
+          title={span.title}
+        >
+          <IconAt className="size-3" />
+          <span className="truncate">{children}</span>
+        </span>
+      )}
+    />
+  );
 }
 
 function CommentAvatar({
@@ -1282,11 +1058,7 @@ function CommentAvatar({
     size === "pin" ? "size-7" : size === "md" ? "size-8" : "size-7";
   return (
     <Avatar
-      className={cn(
-        sizeClass,
-        "border-2 border-background shadow-sm ring-1 ring-border/60",
-        className,
-      )}
+      className={cn(sizeClass, "border border-background shadow-sm", className)}
       title={author.email ? `${author.name} (${author.email})` : author.name}
     >
       {author.avatarUrl && (
@@ -1706,652 +1478,6 @@ function downloadBlob(filename: string, blob: Blob) {
   URL.revokeObjectURL(url);
 }
 
-function clamp(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, value));
-}
-
-function percent(value: number, total: number) {
-  return clamp((value / Math.max(total, 1)) * 100, 0, 100);
-}
-
-const PLAN_TEXT_TARGET_SELECTOR = [
-  "p",
-  "li",
-  "h1",
-  "h2",
-  "h3",
-  "h4",
-  "td",
-  "th",
-  "blockquote",
-  "figcaption",
-  "summary",
-  "button",
-  "a",
-  "label",
-  "pre",
-  "code",
-  "[data-plan-text]",
-].join(",");
-
-const PLAN_VISUAL_TARGET_SELECTOR = [
-  "img",
-  "svg",
-  "canvas",
-  "video",
-  "iframe",
-  "table",
-  "pre",
-  "code",
-  "[data-plan-canvas-world]",
-  ".plan-canvas-world",
-  "[data-plan-prototype-viewer]",
-  "[data-prototype-screen]",
-  "[data-canvas-frame]",
-  ".plan-artboard-frame",
-  ".plan-block",
-].join(",");
-
-function normalizedElementText(value: string | null | undefined) {
-  return value?.replace(/\s+/g, " ").trim() ?? "";
-}
-
-function textSnippetFromElement(element: Element | null, max = 220) {
-  if (!element) return "";
-  return normalizedElementText(element.textContent).slice(0, max);
-}
-
-function textQuoteContextForBlock(input: {
-  block: Element | null;
-  quote: string;
-  radius?: number;
-}) {
-  const quote = normalizedElementText(input.quote);
-  const blockText = normalizedElementText(input.block?.textContent);
-  if (!quote || !blockText) return {};
-  const index = blockText.indexOf(quote);
-  if (index < 0) return {};
-  const radius = input.radius ?? 60;
-  const contextBefore = blockText.slice(Math.max(0, index - radius), index);
-  const contextAfter = blockText.slice(
-    index + quote.length,
-    index + quote.length + radius,
-  );
-  const secondIndex = blockText.indexOf(quote, index + quote.length);
-  return {
-    contextBefore: contextBefore || undefined,
-    contextAfter: contextAfter || undefined,
-    ambiguous: secondIndex >= 0 || undefined,
-  };
-}
-
-function textNeedleForAnchor(anchor: PlanAnnotationAnchor) {
-  const source =
-    anchor.textQuote ??
-    (anchor.anchorKind === "text" || anchor.targetKind === "text"
-      ? anchor.snippet
-      : undefined);
-  return normalizedElementText(source).slice(0, 120);
-}
-
-function findTextAnchorTarget(scope: Element, needle: string) {
-  if (!needle) return null;
-  const candidates = [
-    ...(scope.matches(PLAN_TEXT_TARGET_SELECTOR) ? [scope] : []),
-    ...Array.from(
-      scope.querySelectorAll<HTMLElement>(PLAN_TEXT_TARGET_SELECTOR),
-    ),
-  ];
-  return (
-    candidates.find((candidate) =>
-      normalizedElementText(candidate.textContent).includes(needle),
-    ) ?? null
-  );
-}
-
-function findPlanBlockById(blocks: PlanBlock[], id: string): PlanBlock | null {
-  for (const block of blocks) {
-    if (block.id === id) return block;
-    if (block.type !== "tabs") continue;
-    for (const tab of block.data.tabs) {
-      const match = findPlanBlockById(tab.blocks, id);
-      if (match) return match;
-    }
-  }
-  return null;
-}
-
-function cssAttr(value: string) {
-  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-function elementIndexAmongType(element: Element) {
-  const parent = element.parentElement;
-  if (!parent) return 1;
-  const tag = element.tagName;
-  return (
-    Array.from(parent.children)
-      .filter((child) => child.tagName === tag)
-      .indexOf(element) + 1
-  );
-}
-
-function childPathSelectorWithin(scope: Element, element: Element) {
-  if (scope === element) return "";
-  if (!scope.contains(element)) return undefined;
-  const parts: string[] = [];
-  let current: Element | null = element;
-  while (current && current !== scope) {
-    const parent = current.parentElement;
-    if (!parent) return undefined;
-    const tag = current.tagName.toLowerCase();
-    parts.unshift(`${tag}:nth-of-type(${elementIndexAmongType(current)})`);
-    current = parent;
-  }
-  return current === scope ? parts.join(" > ") : undefined;
-}
-
-function dataSelector(name: string, value: string) {
-  return `[${name}="${cssAttr(value)}"]`;
-}
-
-function scopedSelector(scope: string | undefined, selector: string) {
-  return scope ? `${scope} ${selector}` : selector;
-}
-
-function selectorForElementInScope(
-  scopeElement: Element,
-  scopeSelector: string,
-  element: Element,
-) {
-  const path = childPathSelectorWithin(scopeElement, element);
-  if (path === undefined) return undefined;
-  return path ? `${scopeSelector} > ${path}` : scopeSelector;
-}
-
-function stableDataSelectorForElement(
-  element: Element,
-  scope?: string,
-): string | undefined {
-  const wireNode = element.closest<HTMLElement>("[data-wire-node-id]");
-  if (wireNode?.dataset.wireNodeId) {
-    return scopedSelector(
-      scope,
-      dataSelector("data-wire-node-id", wireNode.dataset.wireNodeId),
-    );
-  }
-  const designNode = element.closest<HTMLElement>("[data-design-id]");
-  if (designNode?.dataset.designId) {
-    return scopedSelector(
-      scope,
-      dataSelector("data-design-id", designNode.dataset.designId),
-    );
-  }
-  const planDesignNode = element.closest<HTMLElement>("[data-plan-design-id]");
-  if (planDesignNode?.dataset.planDesignId) {
-    return scopedSelector(
-      scope,
-      dataSelector("data-plan-design-id", planDesignNode.dataset.planDesignId),
-    );
-  }
-  return undefined;
-}
-
-export function selectorForElementWithin(
-  root: HTMLElement,
-  element: Element | null,
-) {
-  if (!element || !root.contains(element)) return undefined;
-  const prototype = element.closest<HTMLElement>("[data-prototype-screen]");
-  const prototypeScope = prototype?.dataset.prototypeScreen
-    ? dataSelector("data-prototype-screen", prototype.dataset.prototypeScreen)
-    : undefined;
-  const prototypeStableSelector = prototypeScope
-    ? stableDataSelectorForElement(element, prototypeScope)
-    : undefined;
-  if (prototypeStableSelector) return prototypeStableSelector;
-  if (prototype && prototypeScope) {
-    return selectorForElementInScope(prototype, prototypeScope, element);
-  }
-  const frame = element.closest<HTMLElement>("[data-canvas-frame]");
-  const frameScope = frame?.dataset.canvasFrame
-    ? dataSelector("data-canvas-frame", frame.dataset.canvasFrame)
-    : undefined;
-  const frameStableSelector = frameScope
-    ? stableDataSelectorForElement(element, frameScope)
-    : undefined;
-  if (frameStableSelector) return frameStableSelector;
-  if (frame && frameScope) {
-    return selectorForElementInScope(frame, frameScope, element);
-  }
-  const canvasWorld = element.closest<HTMLElement>(
-    "[data-plan-canvas-world], .plan-canvas-world",
-  );
-  if (canvasWorld) {
-    return canvasWorld.hasAttribute("data-plan-canvas-world")
-      ? "[data-plan-canvas-world]"
-      : ".plan-canvas-world";
-  }
-  const stableSelector = stableDataSelectorForElement(element);
-  if (stableSelector) return stableSelector;
-  const block = element.closest<HTMLElement>("[data-block-id]");
-  if (block?.dataset.blockId) {
-    return selectorForElementInScope(
-      block,
-      dataSelector("data-block-id", block.dataset.blockId),
-      element,
-    );
-  }
-  if (element.id) return `#${cssAttr(element.id)}`;
-  return undefined;
-}
-
-function prototypeScreenIdFromSelector(selector: string | undefined) {
-  if (!selector) return undefined;
-  const match = selector.match(/\[data-prototype-screen="([^"]+)"\]/);
-  return match?.[1]?.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
-}
-
-export function prototypeScreenIdForAnchor(anchor: PlanAnnotationAnchor) {
-  return (
-    anchor.screenId ??
-    prototypeScreenIdFromSelector(anchor.targetSelector) ??
-    (anchor.targetKind === "prototype" ? anchor.sectionId : undefined)
-  );
-}
-
-function prototypeScopeForAnchor(
-  anchor: PlanAnnotationAnchor,
-  reader: HTMLElement,
-) {
-  const screenId = prototypeScreenIdForAnchor(anchor);
-  if (!screenId) return undefined;
-  return (
-    reader.querySelector<HTMLElement>(
-      `[data-prototype-screen="${cssAttr(screenId)}"]`,
-    ) ?? null
-  );
-}
-
-function queryFirstElement(
-  scopes: Array<Element | null | undefined>,
-  selector: string,
-) {
-  const seen = new Set<Element>();
-  for (const scope of scopes) {
-    if (!scope || seen.has(scope)) continue;
-    seen.add(scope);
-    const target = scope.matches(selector)
-      ? scope
-      : scope.querySelector<HTMLElement>(selector);
-    if (target) return target;
-  }
-  return null;
-}
-
-function resolveStableVisualAnchorTarget(
-  anchor: PlanAnnotationAnchor,
-  reader: HTMLElement,
-  queryRoot: Element,
-) {
-  const frame = anchor.sectionId
-    ? reader.querySelector<HTMLElement>(
-        dataSelector("data-canvas-frame", anchor.sectionId),
-      )
-    : null;
-  if (anchor.targetNodeId) {
-    const nodeSelectors = [
-      dataSelector("data-wire-node-id", anchor.targetNodeId),
-      dataSelector("data-design-id", anchor.targetNodeId),
-      dataSelector("data-plan-design-id", anchor.targetNodeId),
-    ];
-    for (const selector of nodeSelectors) {
-      const target = queryFirstElement([frame, queryRoot, reader], selector);
-      if (target) return target;
-    }
-  }
-  return null;
-}
-
-function sectionTitleForElement(element: Element | null, fallback?: string) {
-  const block = element?.closest<HTMLElement>("[data-block-id]");
-  const prototype = element?.closest<HTMLElement>("[data-prototype-screen]");
-  const frame = element?.closest<HTMLElement>("[data-canvas-frame]");
-  const title =
-    prototype
-      ?.querySelector<HTMLElement>("h1,h2,h3,[data-plan-section-title]")
-      ?.textContent?.replace(/\s+/g, " ")
-      .trim() ||
-    block
-      ?.querySelector<HTMLElement>("h1,h2,h3,[data-plan-section-title]")
-      ?.textContent?.replace(/\s+/g, " ")
-      .trim() ||
-    frame
-      ?.querySelector<HTMLElement>(".plan-artboard-label")
-      ?.textContent?.replace(/\s+/g, " ")
-      .trim() ||
-    element
-      ?.closest<HTMLElement>(".plan-block,.plan-canvas")
-      ?.querySelector<HTMLElement>("h1,h2,h3,[data-plan-section-title]")
-      ?.textContent?.replace(/\s+/g, " ")
-      .trim() ||
-    fallback;
-  return title || undefined;
-}
-
-function targetKindForElement(
-  element: Element | null,
-): PlanCommentAnchor["targetKind"] {
-  if (!element) return undefined;
-  const tag = element.tagName.toLowerCase();
-  if (tag === "img") return "image";
-  if (tag === "table") return "table";
-  if (tag === "pre" || tag === "code") return "code";
-  if (tag === "svg") return "diagram";
-  if (element.closest("[data-plan-prototype-viewer]")) return "prototype";
-  if (element.closest("[data-canvas-frame],.plan-artboard-frame")) {
-    return "wireframe";
-  }
-  if (tag === "canvas" || element.closest(".plan-canvas")) return "canvas";
-  if (element.matches("button,a,input,textarea,select,label")) return "control";
-  if (element.closest("[data-block-id]")) return "block";
-  return "unknown";
-}
-
-export function buildNativeAnchorFromElement(input: {
-  reader: HTMLElement;
-  target: HTMLElement;
-  pointX: number;
-  pointY: number;
-  planTitle?: string;
-}): PlanAnnotationAnchor {
-  const { reader, target, pointX, pointY } = input;
-  const scrollWidth = Math.max(reader.scrollWidth, 1);
-  const scrollHeight = Math.max(reader.scrollHeight, 1);
-  const base: PlanAnnotationAnchor = {
-    x: percent(pointX + reader.scrollLeft, scrollWidth),
-    y: percent(pointY + reader.scrollTop, scrollHeight),
-    anchorKind: "point",
-    visualLabel: input.planTitle,
-    resolutionTarget: "agent",
-  };
-
-  const textElement = target.closest<HTMLElement>(PLAN_TEXT_TARGET_SELECTOR);
-  const visualElement = target.closest<HTMLElement>(
-    PLAN_VISUAL_TARGET_SELECTOR,
-  );
-  const wireNodeEl = target.closest<HTMLElement>("[data-wire-node-id]");
-  const designNodeEl = target.closest<HTMLElement>("[data-design-id]");
-  const planDesignNodeEl = target.closest<HTMLElement>("[data-plan-design-id]");
-  const stableVisualElement = wireNodeEl ?? designNodeEl ?? planDesignNodeEl;
-  const anchorElement =
-    stableVisualElement ??
-    (textElement && textSnippetFromElement(textElement)
-      ? textElement
-      : (visualElement ?? target));
-  const rect = anchorElement.getBoundingClientRect();
-  const readerRect = reader.getBoundingClientRect();
-  const localX = pointX + readerRect.left;
-  const localY = pointY + readerRect.top;
-  const targetX = percent(
-    clamp(localX, rect.left, rect.right) - rect.left,
-    rect.width,
-  );
-  const targetY = percent(
-    clamp(localY, rect.top, rect.bottom) - rect.top,
-    rect.height,
-  );
-  const sectionTitle = sectionTitleForElement(anchorElement, input.planTitle);
-  const prototype = anchorElement.closest<HTMLElement>(
-    "[data-prototype-screen]",
-  );
-  const block = anchorElement.closest<HTMLElement>("[data-block-id]");
-  const frame = anchorElement.closest<HTMLElement>("[data-canvas-frame]");
-  const targetText = textSnippetFromElement(anchorElement);
-  const targetKind = targetKindForElement(anchorElement);
-  const image =
-    anchorElement.tagName.toLowerCase() === "img"
-      ? (anchorElement as HTMLImageElement)
-      : anchorElement.querySelector<HTMLImageElement>("img");
-  const visualContext =
-    prototype?.dataset.prototypeScreen && sectionTitle
-      ? `Inside prototype screen ${prototype.dataset.prototypeScreen} (${sectionTitle})`
-      : prototype?.dataset.prototypeScreen
-        ? `Inside prototype screen ${prototype.dataset.prototypeScreen}`
-        : frame?.dataset.canvasFrame && sectionTitle
-          ? `Inside canvas frame ${frame.dataset.canvasFrame} (${sectionTitle})`
-          : frame?.dataset.canvasFrame
-            ? `Inside canvas frame ${frame.dataset.canvasFrame}`
-            : undefined;
-
-  const targetNodeId =
-    wireNodeEl?.dataset.wireNodeId ||
-    designNodeEl?.dataset.designId ||
-    planDesignNodeEl?.dataset.planDesignId ||
-    undefined;
-
-  // Build a short human-readable node path from the frame root down to the
-  // target node, e.g. `card > list > listItem "Acme Inc"`.
-  let targetNodePath: string | undefined;
-  if (wireNodeEl) {
-    const frameRoot =
-      anchorElement.closest<HTMLElement>("[data-canvas-frame]") ??
-      anchorElement.closest<HTMLElement>(".plan-artboard-frame");
-    if (frameRoot) {
-      const pathEls: HTMLElement[] = [];
-      let current: HTMLElement | null = wireNodeEl;
-      while (current && current !== frameRoot && frameRoot.contains(current)) {
-        if (current.dataset.wireNodeId) pathEls.unshift(current);
-        current = current.parentElement;
-      }
-      if (pathEls.length === 0) pathEls.push(wireNodeEl);
-      const segments = pathEls.map((el) => {
-        const elName = el.dataset.wireNodeEl ?? el.tagName.toLowerCase();
-        const directText = Array.from(el.childNodes)
-          .filter((n) => n.nodeType === Node.TEXT_NODE)
-          .map((n) => n.textContent ?? "")
-          .join("")
-          .replace(/\s+/g, " ")
-          .trim()
-          .slice(0, 40);
-        return directText ? `${elName} "${directText}"` : elName;
-      });
-      if (segments.length > 0) targetNodePath = segments.join(" > ");
-    }
-  }
-
-  return {
-    ...base,
-    sectionId:
-      prototype?.dataset.prototypeScreen ??
-      frame?.dataset.canvasFrame ??
-      block?.dataset.blockId,
-    screenId: prototype?.dataset.prototypeScreen,
-    sectionTitle,
-    targetSelector: selectorForElementWithin(reader, anchorElement),
-    targetX,
-    targetY,
-    tagName: anchorElement.tagName.toLowerCase(),
-    anchorKind:
-      textElement && targetText ? "text" : targetKind ? "visual" : "point",
-    textQuote: textElement && targetText ? targetText.slice(0, 220) : undefined,
-    snippet: targetText || sectionTitle,
-    visualLabel: sectionTitle ?? input.planTitle,
-    visualX: targetX,
-    visualY: targetY,
-    targetKind,
-    targetLabel:
-      image?.alt?.trim() ||
-      anchorElement.getAttribute("aria-label") ||
-      sectionTitle ||
-      targetText.slice(0, 80) ||
-      input.planTitle,
-    targetText: targetText || undefined,
-    targetAlt: image?.alt?.trim() || undefined,
-    targetSrc: image?.currentSrc || image?.src || undefined,
-    visualContext,
-    ...(targetNodeId !== undefined ? { targetNodeId } : {}),
-    ...(targetNodePath !== undefined ? { targetNodePath } : {}),
-  };
-}
-
-export function resolveNativeAnchorTarget(
-  anchor: PlanAnnotationAnchor,
-  reader: HTMLElement,
-) {
-  const prototypeScope = prototypeScopeForAnchor(anchor, reader);
-  if (prototypeScope === null) return null;
-  const queryRoot = prototypeScope ?? reader;
-  const needle = textNeedleForAnchor(anchor);
-  const stableVisualTarget = resolveStableVisualAnchorTarget(
-    anchor,
-    reader,
-    queryRoot,
-  );
-  if (stableVisualTarget) return stableVisualTarget;
-  if (anchor.targetSelector) {
-    try {
-      const target = queryRoot.matches(anchor.targetSelector)
-        ? queryRoot
-        : queryRoot.querySelector<HTMLElement>(anchor.targetSelector);
-      if (target) {
-        if (!needle) return target;
-        const textTarget = findTextAnchorTarget(target, needle);
-        if (textTarget) return textTarget;
-      }
-    } catch {
-      // Fall back to broad visual targets or quote matching below.
-    }
-  }
-  if (
-    anchor.planAnnotationId ||
-    anchor.canvasX !== undefined ||
-    anchor.targetKind === "canvas"
-  ) {
-    const canvasWorld = reader.querySelector<HTMLElement>(
-      "[data-plan-canvas-world], .plan-canvas-world",
-    );
-    if (canvasWorld) return canvasWorld;
-  }
-  if (anchor.targetKind === "wireframe" && anchor.sectionId) {
-    const frame = reader.querySelector<HTMLElement>(
-      dataSelector("data-canvas-frame", anchor.sectionId),
-    );
-    if (frame) return frame;
-  }
-  if (!needle) return null;
-  const scopes: Element[] = [];
-  if (prototypeScope) {
-    scopes.push(prototypeScope);
-  } else if (anchor.sectionId) {
-    const byBlock = reader.querySelector<HTMLElement>(
-      `[data-block-id="${cssAttr(anchor.sectionId)}"]`,
-    );
-    const byFrame = reader.querySelector<HTMLElement>(
-      `[data-canvas-frame="${cssAttr(anchor.sectionId)}"]`,
-    );
-    if (byBlock) scopes.push(byBlock);
-    if (byFrame) scopes.push(byFrame);
-  }
-  if (!prototypeScope) scopes.push(reader);
-  for (const scope of scopes) {
-    const match = findTextAnchorTarget(scope, needle);
-    if (match) return match;
-  }
-  return null;
-}
-
-export function nativePointForAnchor(
-  anchor: PlanAnnotationAnchor,
-  reader: HTMLElement,
-) {
-  const target = resolveNativeAnchorTarget(anchor, reader);
-  if (!target && prototypeScreenIdForAnchor(anchor)) return null;
-  const readerRect = reader.getBoundingClientRect();
-  if (target) {
-    const rect = target.getBoundingClientRect();
-    if (rect.width || rect.height) {
-      return {
-        left:
-          rect.left -
-          readerRect.left +
-          ((anchor.targetX ?? anchor.visualX ?? 50) / 100) * rect.width,
-        top:
-          rect.top -
-          readerRect.top +
-          ((anchor.targetY ?? anchor.visualY ?? 50) / 100) * rect.height,
-      };
-    }
-  }
-  return {
-    left: (anchor.x / 100) * reader.scrollWidth - reader.scrollLeft,
-    top: (anchor.y / 100) * reader.scrollHeight - reader.scrollTop,
-  };
-}
-
-type NativeMarkerClip = {
-  left: number;
-  top: number;
-  width: number;
-  height: number;
-};
-
-export type NativeMarkerPlacement = {
-  marker: {
-    left: number;
-    top: number;
-  };
-  clip: NativeMarkerClip | null;
-};
-
-function rectForElementWithinReader(element: HTMLElement, reader: HTMLElement) {
-  const elementRect = element.getBoundingClientRect();
-  if (!elementRect.width && !elementRect.height) return null;
-  const readerRect = reader.getBoundingClientRect();
-  return {
-    left: elementRect.left - readerRect.left,
-    top: elementRect.top - readerRect.top,
-    width: elementRect.width,
-    height: elementRect.height,
-  } satisfies NativeMarkerClip;
-}
-
-function visualMarkerClipForAnchor(
-  anchor: PlanAnnotationAnchor,
-  reader: HTMLElement,
-): NativeMarkerClip | null {
-  const surfaceMode = visualSurfaceModeForAnchor(anchor);
-  if (!surfaceMode) return null;
-  const target = resolveNativeAnchorTarget(anchor, reader);
-  const visualRoot =
-    surfaceMode === "prototype"
-      ? (target?.closest<HTMLElement>("[data-plan-prototype-viewer]") ??
-        prototypeScopeForAnchor(anchor, reader)?.closest<HTMLElement>(
-          "[data-plan-prototype-viewer]",
-        ) ??
-        reader.querySelector<HTMLElement>("[data-plan-prototype-viewer]"))
-      : (target?.closest<HTMLElement>("[data-plan-canvas-viewport]") ??
-        reader.querySelector<HTMLElement>("[data-plan-canvas-viewport]"));
-  return visualRoot ? rectForElementWithinReader(visualRoot, reader) : null;
-}
-
-export function nativeMarkerPlacementForAnchor(
-  anchor: PlanAnnotationAnchor,
-  reader: HTMLElement,
-): NativeMarkerPlacement | null {
-  const point = nativePointForAnchor(anchor, reader);
-  if (!point) return null;
-  const clip = visualMarkerClipForAnchor(anchor, reader);
-  if (!clip) return { marker: point, clip: null };
-  return {
-    clip,
-    marker: {
-      left: point.left - clip.left,
-      top: point.top - clip.top,
-    },
-  };
-}
-
 function resolveInlineCommentPosition(input: {
   pointX: number;
   pointY: number;
@@ -2383,12 +1509,14 @@ function resolveInlineCommentPosition(input: {
   };
 }
 
-function buildPlanAgentContext(input: {
+export function buildPlanAgentContext(input: {
   bundle: PlanBundle & { html?: string };
   documentHtml: string;
   url: string;
   screenshotNote?: string;
 }) {
+  const isLocalPlan =
+    "localOnly" in input.bundle && input.bundle.localOnly === true;
   const contentBlockCount = input.bundle.plan.content?.blocks.length ?? 0;
   const contentBlocks = input.bundle.plan.content?.blocks
     .slice(0, 12)
@@ -2448,7 +1576,9 @@ function buildPlanAgentContext(input: {
     Math.max(0, humanReviewThreads.length - 8);
   const omittedCommentNote =
     omittedComments > 0
-      ? `\n${omittedComments} additional open thread(s) omitted from this composer context. Call get-plan-feedback for the full list before editing.`
+      ? isLocalPlan
+        ? `\n${omittedComments} additional open thread(s) omitted from this composer context. Reopen the local plan or inspect comments.json for the full list before editing.`
+        : `\n${omittedComments} additional open thread(s) omitted from this composer context. Call get-plan-feedback for the full list before editing.`
       : "";
   const legacyUnroutedThreads = openThreads.filter(
     (thread) => !thread.anchor?.resolutionTarget,
@@ -2475,7 +1605,7 @@ function buildPlanAgentContext(input: {
         .join("\n");
     })
     .join("\n");
-  const recentReviewEvents = input.bundle.events
+  const recentReviewEvents = (input.bundle.events ?? [])
     .filter((event) => event.type === "plan.updated")
     .slice(-6)
     .map((event) => {
@@ -2493,20 +1623,35 @@ function buildPlanAgentContext(input: {
     ...(ENABLE_PLAN_STATUS_FEATURE
       ? [`Status: ${input.bundle.plan.status}`]
       : []),
+    ...(isLocalPlan ? [`Local folder: ${input.bundle.plan.repoPath}`] : []),
     `URL: ${input.url}`,
     input.bundle.plan.content
       ? `Structured content blocks: ${contentBlockCount}`
       : `Legacy rendered HTML length: ${input.documentHtml.length} characters`,
     "",
-    "Fast iteration workflow:",
-    "1. Call get-visual-plan with this plan ID to read structured content, exported HTML, sections, comments, and activity.",
-    "2. Prefer update-visual-plan contentPatches for targeted edits. Examples: update-rich-text for copy, patch-prototype-html / update-prototype-screen for live prototype states, update-wireframe-node for one kit-tree node, update-canvas-frame for frame layout, append-canvas-annotation / update-canvas-annotation for canvas markup, append-block/remove-block for document changes, or replace-block for a single block. Use full content only for broad restructuring. Use html only when preserving or importing a legacy standalone HTML artifact.",
-    "3. Preserve the user's existing annotation comments and intent unless the user asks to remove or resolve them.",
-    "4. Keep the output as a refined document with rich text, tables, sketch diagrams, wireframes, implementation maps, code tabs, and bounded custom HTML fragments.",
-    "5. After applying feedback, keep the plan scannable, editable, and serious instead of turning it into a marketing page.",
-    "6. Work the actionable agent comments first. Treat human-review comments as FYI/questions/approval items; do not silently resolve those unless the user explicitly asks.",
-    "7. When visual screenshots are attached, each crop is centered near a comment marker and has a red ring on the exact commented point. Use the comment IDs and anchor details below to connect screenshots to threads. If a visual comment is listed as overflow, rely on its anchorDetails/coordinates and call get-plan-feedback for the full manifest.",
-    "8. For text comments, use the quoted text plus Text before/Text after and Block type details. If a quote is marked ambiguous, ask instead of editing the wrong span.",
+    ...(isLocalPlan
+      ? [
+          "Local-files workflow:",
+          "1. This is a local-only Agent-Native Plan or recap. Do not call hosted Plan tools such as get-visual-plan, get-plan-feedback, or update-visual-plan for this plan.",
+          "2. Use the local MDX files and the feedback threads included below. If your host exposes local Plan tools, read the local folder and comments.json before editing.",
+          "3. Preserve the user's existing annotation comments and intent unless the user asks to remove or resolve them.",
+          "4. Keep the output as a refined document with rich text, tables, sketch diagrams, wireframes, implementation maps, code tabs, and bounded custom HTML fragments.",
+          "5. After applying feedback, rerun the local Plan check/serve/verify path available in your environment and report the updated local URL or folder.",
+          "6. Work the actionable agent comments first. Treat human-review comments as FYI/questions/approval items; do not silently resolve those unless the user explicitly asks.",
+          "7. When visual screenshots are attached, each crop is centered near a comment marker and has a red ring on the exact commented point. Use the comment IDs and anchor details below to connect screenshots to threads.",
+          "8. For text comments, use the quoted text plus Text before/Text after and Block type details. If a quote is marked ambiguous, ask instead of editing the wrong span.",
+        ]
+      : [
+          "Fast iteration workflow:",
+          "1. Call get-visual-plan with this plan ID to read structured content, exported HTML, sections, comments, and activity.",
+          '2. Prefer small update-visual-plan contentPatches for every edit to an existing plan. Examples: append-block for new tasks, update-rich-text for a bounded copy change, patch-prototype-html / update-prototype-screen for live prototype states, update-wireframe-node for one kit-tree node, update-canvas-frame for frame layout, append-canvas-annotation / update-canvas-annotation for canvas markup, or remove-block for one block. Never resend the full plan, use replace-blocks, or use patch-visual-plan-source replace-file for an incremental change - those payloads can be truncated before the tool receives them. When the user asks for higher fidelity, polished mockups, production-like UI, real design, or anything "not sketchy," update this same plan in place: rewrite the relevant screen HTML/CSS and include set-visual-render-mode with renderMode design. Do not create a second plan, put CSS in style tags, or treat the viewer-local Clean toggle as a fidelity upgrade. Use a full replacement only for an explicit broad rebuild. Use html only when preserving or importing a legacy standalone HTML artifact.',
+          "3. Preserve the user's existing annotation comments and intent unless the user asks to remove or resolve them.",
+          "4. Match the requested fidelity: ordinary UI planning can use sketch diagrams and wireframes; high-fidelity requests need the persisted Design surface with deliberate branded HTML/CSS and stable data-design-id targets.",
+          "5. After applying feedback, keep the plan scannable, editable, and serious instead of turning it into a marketing page.",
+          "6. Work the actionable agent comments first. Treat human-review comments as FYI/questions/approval items; do not silently resolve those unless the user explicitly asks.",
+          "7. When visual screenshots are attached, each crop is centered near a comment marker and has a red ring on the exact commented point. Use the comment IDs and anchor details below to connect screenshots to threads. If a visual comment is listed as overflow, rely on its anchorDetails/coordinates and call get-plan-feedback for the full manifest.",
+          "8. For text comments, use the quoted text plus Text before/Text after and Block type details. If a quote is marked ambiguous, ask instead of editing the wrong span.",
+        ]),
     contentBlocks ? `\nStructured content blocks:\n${contentBlocks}` : "",
     recentReviewEvents
       ? `\nRecent review/edit events:\n${recentReviewEvents}`
@@ -2529,7 +1674,13 @@ function buildPlanAgentContext(input: {
     .join("\n");
 }
 
-function buildApplyFeedbackMessage(openCommentCount: number) {
+function buildApplyFeedbackMessage(
+  openCommentCount: number,
+  options: { local?: boolean } = {},
+) {
+  if (options.local) {
+    return `Apply the ${openCommentCount} open comment${openCommentCount === 1 ? "" : "s"} on this local visual plan. Use the local files and feedback context in this handoff; do not call hosted Plan tools for this local-only plan. Use any attached focused screenshots to understand visual comments, then update the local MDX plan/recap files as needed.`;
+  }
   return `Apply the ${openCommentCount} open comment${openCommentCount === 1 ? "" : "s"} on this visual plan. Read the plan with get-visual-plan, read feedback with get-plan-feedback, use any attached focused screenshots to understand visual comments, then update structured content blocks, prototype screens, and related implementation details as needed. Use HTML only for legacy imported artifacts.`;
 }
 
@@ -2677,12 +1828,8 @@ function cropFeedbackScreenshot(input: {
   return output.toDataURL("image/png");
 }
 
-type PlanAccessRole = "owner" | "viewer" | "editor" | "admin";
+type PlanAccessRole = "owner" | "viewer" | "commenter" | "editor" | "admin";
 
-/**
- * Status options available in the reviewer approval workflow.
- * "archived" is intentionally omitted — it lives in the kebab menu.
- */
 const APPROVAL_STATUSES: PlanStatus[] = [
   "draft",
   "review",
@@ -2690,15 +1837,6 @@ const APPROVAL_STATUSES: PlanStatus[] = [
   "in_progress",
   "complete",
 ];
-
-const STATUS_LABELS: Record<PlanStatus, string> = {
-  draft: "Draft",
-  review: "In review",
-  approved: "Approved",
-  in_progress: "In progress",
-  complete: "Complete",
-  archived: "Archived",
-};
 
 function statusBadgeClasses(status: PlanStatus): string {
   if (status === "approved") {
@@ -2710,18 +1848,9 @@ function statusBadgeClasses(status: PlanStatus): string {
   if (status === "in_progress") {
     return "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400";
   }
-  // draft, review, archived — neutral
   return "";
 }
 
-/**
- * Compact status badge/chip for the plan detail toolbar.
- *
- * - Editors (owner/admin/editor): clicking the badge opens a DropdownMenu to
- *   transition the plan's status. The update is optimistic with rollback.
- * - Viewers / anonymous: the badge is inert (shows current status, no menu).
- * - Recaps: the parent must not render this component at all.
- */
 function PlanStatusControl({
   planId,
   status,
@@ -2731,13 +1860,13 @@ function PlanStatusControl({
   status: PlanStatus;
   canEdit: boolean;
 }) {
+  const t = useT();
   const qc = useQueryClient();
   const updateStatus = useUpdatePlanStatus();
 
   const handleSelect = useCallback(
     (newStatus: PlanStatus) => {
       if (newStatus === status) return;
-      // Optimistic: patch both the bundle cache and the list cache.
       const bundleKey = planBundleQueryKey(planId);
       const prevBundle = qc.getQueryData<PlanBundleWithHtml>(bundleKey);
       const prevActiveList = qc.getQueryData<PlanSummary[]>(
@@ -2758,19 +1887,18 @@ function PlanStatusControl({
         { planId, status: newStatus },
         {
           onError: () => {
-            // Roll back optimistic updates.
             if (prevBundle !== undefined)
               qc.setQueryData(bundleKey, prevBundle);
             if (prevActiveList !== undefined)
               qc.setQueryData(ACTIVE_PLANS_QUERY_KEY, prevActiveList);
             if (prevAllList !== undefined)
               qc.setQueryData(ALL_PLANS_QUERY_KEY, prevAllList);
-            toast.error("Failed to update plan status.");
+            toast.error(t("plansPage.status.updateFailed"));
           },
         },
       );
     },
-    [planId, qc, status, updateStatus],
+    [planId, qc, status, t, updateStatus],
   );
 
   const badgeClassName = cn(
@@ -2783,7 +1911,7 @@ function PlanStatusControl({
       {status === "approved" && (
         <IconCircleCheck className="size-3.5 shrink-0" />
       )}
-      {STATUS_LABELS[status] ?? statusLabel(status)}
+      {t(`plansPage.status.labels.${status}`)}
       {canEdit && <IconChevronDown className="size-3 shrink-0 opacity-60" />}
     </>
   );
@@ -2797,14 +1925,14 @@ function PlanStatusControl({
       <DropdownMenuTrigger asChild>
         <button
           type="button"
-          aria-label="Set plan status"
+          aria-label={t("plansPage.status.setPlanStatus")}
           className={badgeClassName}
         >
           {badgeInner}
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-44 rounded-xl">
-        <DropdownMenuLabel>Set status</DropdownMenuLabel>
+        <DropdownMenuLabel>{t("plansPage.status.setStatus")}</DropdownMenuLabel>
         <DropdownMenuGroup>
           {APPROVAL_STATUSES.map((s) => (
             <DropdownMenuItem
@@ -2817,7 +1945,7 @@ function PlanStatusControl({
               ) : (
                 <span className="size-4" />
               )}
-              {STATUS_LABELS[s]}
+              {t(`plansPage.status.labels.${s}`)}
             </DropdownMenuItem>
           ))}
         </DropdownMenuGroup>
@@ -2827,6 +1955,7 @@ function PlanStatusControl({
 }
 
 function LocalModeBadge() {
+  const t = useT();
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -2835,22 +1964,23 @@ function LocalModeBadge() {
           target="_blank"
           rel="noreferrer"
           className="pointer-events-auto inline-flex h-8 items-center gap-1.5 rounded-md border border-emerald-500/35 bg-emerald-500/10 px-2.5 text-xs font-medium text-emerald-700 outline-none transition-colors hover:bg-emerald-500/15 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 dark:text-emerald-300"
-          aria-label="Local mode privacy details"
+          aria-label={t("plansPage.localMode.privacyDetails")}
         >
           <span className="size-1.5 rounded-full bg-emerald-500" />
-          <span>Local mode</span>
-          <IconHelpCircle className="size-3.5 opacity-75" />
+          <span>{t("plansPage.localMode.badge")}</span>
+          <IconHelpCircle className="size-3 opacity-75" />
         </a>
       </TooltipTrigger>
       <TooltipContent align="end" side="bottom" className="max-w-xs p-3">
         <div className="grid gap-1.5">
-          <p className="font-medium leading-5">100% private local mode</p>
+          <p className="font-medium leading-5">
+            {t("plansPage.localMode.title")}
+          </p>
           <p className="text-xs leading-5 text-muted-foreground">
-            Your data is never saved to our backend or seen by us. This page
-            only renders and edits your local MDX files.
+            {t("plansPage.localMode.description")}
           </p>
           <p className="text-xs font-medium leading-5 text-foreground">
-            Open docs.
+            {t("plansPage.localMode.openDocs")}
           </p>
         </div>
       </TooltipContent>
@@ -2862,7 +1992,17 @@ export function canEditPlanContentRole(role?: PlanAccessRole | null) {
   return role === "owner" || role === "admin" || role === "editor";
 }
 
+export function canCommentPlanRole(role?: PlanAccessRole | null) {
+  return (
+    role === "owner" ||
+    role === "commenter" ||
+    role === "admin" ||
+    role === "editor"
+  );
+}
+
 export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
+  const t = useT();
   const params = useParams<{ id?: string }>();
   const navigate = useNavigate();
   const location = useLocation();
@@ -2876,6 +2016,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
   const pendingDocumentRestoreRef = useRef<PlanDocumentState | null>(null);
   const pendingDocumentRestoreTimerRef = useRef<number | null>(null);
   const nativeScrollFrameRef = useRef<number | null>(null);
+  const initialReaderScrollResetKeyRef = useRef<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [annotationsOpen, setAnnotationsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -2895,6 +2036,11 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
   );
   const [agentSidebarOpen, setAgentSidebarOpen] = useState(false);
   const [sendingFeedback, setSendingFeedback] = useState(false);
+  const [planShareSucceededId, setPlanShareSucceededId] = useState<
+    string | null
+  >(null);
+  const [localBridgeCommentPending, setLocalBridgeCommentPending] =
+    useState(false);
   const [pendingAnnotation, setPendingAnnotation] =
     useState<PlanAnnotationAnchor | null>(null);
   const [inlineCommentPosition, setInlineCommentPosition] =
@@ -2912,33 +2058,55 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
   const [nativeMarkerVersion, setNativeMarkerVersion] = useState(0);
   const [commentVisibility, setCommentVisibility] =
     useState<CommentVisibility>("open");
-  // When a comment submit fails, stash the draft here so the popover can
-  // re-open with the user's text pre-filled (Issue 2a).
   const [failedCommentDraft, setFailedCommentDraft] =
     useState<CommentDraft | null>(null);
-  // Ref that signals the 3-second poll to pause while a comment mutation is
-  // in-flight. Prevents poll-driven cache replacement from evicting optimistic
-  // comments before the server write commits (Issue 4a).
-  const commentMutationPendingRef = useRef(false);
   const { session, isLoading: sessionLoading } = useSession();
   const localPlanMode = Boolean(localPlanSlug);
   const routeSearchParams = useMemo(
     () => new URLSearchParams(location.search),
     [location.search],
   );
-  const localPlanBridgeUrl = localPlanMode
-    ? routeSearchParams.get("bridge")
-    : null;
+  const localPlanBridgeUrl =
+    localPlanMode && localPlanSlug
+      ? localPlanBridgeUrlFromLocation(location.hash, localPlanSlug)
+      : null;
   const localPlanRepoPath = localPlanMode
     ? routeSearchParams.get("path")
     : null;
   const routeSelectedId = params.id;
+  const [localNetworkPermission, setLocalNetworkPermission] =
+    useState<LocalNetworkAccessPermissionState>(
+      localPlanBridgeUrl ? "checking" : "unsupported",
+    );
+  const [localBridgeConnectionRequested, setLocalBridgeConnectionRequested] =
+    useState(false);
+  const checkLocalNetworkPermission = useCallback(async () => {
+    if (!localPlanBridgeUrl) {
+      setLocalNetworkPermission("unsupported");
+      return;
+    }
+    setLocalNetworkPermission("checking");
+    setLocalBridgeConnectionRequested(false);
+    const state = await localNetworkAccessPermissionState();
+    setLocalNetworkPermission(state);
+  }, [localPlanBridgeUrl]);
+  useEffect(() => {
+    void checkLocalNetworkPermission();
+  }, [checkLocalNetworkPermission]);
+  const localBridgeFetchEnabled = Boolean(
+    localPlanMode &&
+    localPlanSlug &&
+    localPlanBridgeUrl &&
+    (localNetworkPermission === "granted" ||
+      localNetworkPermission === "unsupported" ||
+      localBridgeConnectionRequested),
+  );
   const localPlanBridgeQuery = useQuery<LocalPlanBundle>({
     queryKey: localPlanBridgeQueryKey(
       localPlanSlug ?? "",
       localPlanBridgeUrl ?? "",
     ),
-    enabled: localPlanMode && Boolean(localPlanSlug && localPlanBridgeUrl),
+    enabled: localBridgeFetchEnabled,
     refetchOnWindowFocus: false,
     retry: shouldRetryLocalPlanBridgeBundle,
     retryDelay: localPlanBridgeRetryDelay,
@@ -2953,26 +2121,36 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
       refetchInterval: false,
     },
   );
-  // Bridge bundles carry no comments; load comments.json from the colocated
-  // folder so they render and survive refresh in bridge mode too.
-  const localPlanBridgeCommentsQuery = useActionQuery<LocalPlanBundle>(
-    "get-local-plan-folder",
-    localPlanBundleQueryParams(localPlanSlug ?? "", localPlanRepoPath),
-    {
-      enabled: localPlanMode && Boolean(localPlanSlug && localPlanBridgeUrl),
-      refetchInterval: false,
-      retry: false,
-    },
+  const localPlanBridgeCommentsQuery = useQuery<LocalPlanBundle["comments"]>({
+    queryKey: ["local-plan-bridge-comments", localPlanBridgeUrl],
+    enabled: localPlanMode && Boolean(localPlanSlug && localPlanBridgeUrl),
+    refetchInterval: false,
+    retry: false,
+    queryFn: () => fetchLocalPlanBridgeComments(localPlanBridgeUrl ?? ""),
+  });
+  const localPlanData = useMemo(
+    () =>
+      localPlanBridgeUrl
+        ? mergeLocalBridgeComments(
+            localPlanBridgeQuery.data,
+            localPlanBridgeCommentsQuery.data,
+          )
+        : localPlanQuery.data,
+    [
+      localPlanBridgeQuery.data,
+      localPlanBridgeCommentsQuery.data,
+      localPlanBridgeUrl,
+      localPlanQuery.data,
+    ],
   );
-  const localPlanData = localPlanBridgeUrl
-    ? mergeLocalBridgeComments(
-        localPlanBridgeQuery.data,
-        localPlanBridgeCommentsQuery.data?.comments,
-      )
-    : localPlanQuery.data;
   const localPlanError = localPlanBridgeUrl
     ? localPlanBridgeQuery.error
     : localPlanQuery.error;
+  useEffect(() => {
+    if (!(localPlanError instanceof LocalPlanBridgePermissionError)) return;
+    setLocalNetworkPermission(localPlanError.permissionState);
+    setLocalBridgeConnectionRequested(false);
+  }, [localPlanError]);
   const localPlanLoading = localPlanBridgeUrl
     ? localPlanBridgeQuery.isLoading
     : localPlanQuery.isLoading;
@@ -2991,8 +2169,6 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     enabled: Boolean(session && !selectedId && !localPlanMode),
   });
   const plans = plansQuery.data ?? [];
-  // Identity for collaborative cursor labels. Only a signed-in user enables
-  // real-time multi-user prose editing; guests/anonymous keep single-user editing.
   const collabUser = useMemo<RichMarkdownCollabUser | null>(
     () =>
       session?.email
@@ -3004,14 +2180,12 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
         : null,
     [session?.email, session?.name],
   );
-  // Redirect to sign-in, returning to wherever the guest currently is.
   const openSignIn = useCallback((returnOverride?: string) => {
-    const returnPath =
-      returnOverride ??
-      window.location.pathname + window.location.search + window.location.hash;
-    window.location.href = `${agentNativePath(
-      "/_agent-native/sign-in",
-    )}?return=${encodeURIComponent(returnPath)}`;
+    window.location.href = buildSignInReturnHref({
+      returnTo: appPath(
+        returnOverride ?? planReturnPathFromLocation(window.location),
+      ),
+    });
   }, []);
   const requestCreatePlan = useCallback(() => {
     if (sessionLoading) return;
@@ -3021,7 +2195,6 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     }
     setCreateOpen(true);
   }, [openSignIn, session, sessionLoading]);
-  // Refetch once a session appears so account-scoped plans show up immediately.
   const wasSignedInRef = useRef(false);
   useEffect(() => {
     if (sessionLoading) return;
@@ -3086,11 +2259,17 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
   const immersiveReader = Boolean(
     selectedId && (planFullscreen || prototypeOnly),
   );
-  const planQuery = usePlan(
-    localPlanMode ? undefined : selectedId,
-    commentMutationPendingRef,
-  );
+  const planQuery = usePlan(localPlanMode ? undefined : selectedId);
   const bundle = localPlanMode ? localPlanData : planQuery.data;
+  useEffect(() => {
+    if (!bundle) return;
+    trackEvent("app.first_action", {
+      action: "plan_viewed",
+      surface: "plan_reader",
+      resource_type: "plan",
+      resource_id: bundle.plan.id,
+    });
+  }, [bundle?.plan.id]);
   const localPlanBundle =
     localPlanMode && bundle && "localOnly" in bundle
       ? (bundle as LocalPlanBundle)
@@ -3106,32 +2285,54 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
   const localPlanSuggestedRepoPath =
     localPlanBundle?.suggestedRepoPath ??
     (localPlanSlug ? `plans/${localPlanSlug}` : "plans");
+  const localPlanMenuPath =
+    localPlanRepoPath ??
+    localPlanBundle?.repoPath ??
+    localPlanSuggestedRepoPath ??
+    localPlanSlug ??
+    "local plan files";
   const planAccessStatusQuery = usePlanAccessStatus(
     selectedId,
     Boolean(selectedId && !bundle && !localPlanMode),
   );
   const planAccessStatus = planAccessStatusQuery.data ?? null;
-  const planQueryPending = planQuery.isLoading || planQuery.isFetching;
-  const planAccessStatusPending =
-    planAccessStatusQuery.isLoading || planAccessStatusQuery.isFetching;
+  const planQueryInitialPending = planQuery.isLoading;
+  const planAccessStatusInitialPending = planAccessStatusQuery.isLoading;
   const showPlanLoadError = shouldShowPlanLoadError({
     hasSelectedId: Boolean(selectedId),
     localPlanMode,
     hasBundle: Boolean(bundle),
-    planQueryPending,
+    planQueryInitialPending,
     planQueryError: planQuery.isError,
     planQueryPaused: planQuery.isPaused,
-    accessStatusPending: planAccessStatusPending,
+    accessStatusInitialPending: planAccessStatusInitialPending,
     accessStatusPaused: planAccessStatusQuery.isPaused,
     accessDenied: Boolean(planAccessStatus && !planAccessStatus.hasAccess),
   });
-  const showLocalPlanLoadError = Boolean(
+  const showLocalPlanLoadError = shouldShowLocalPlanLoadError({
+    localPlanMode,
+    hasBundle: Boolean(bundle),
+    hasBridgeUrl: Boolean(localPlanBridgeUrl),
+    bridgeFetchEnabled: localBridgeFetchEnabled,
+    error: localPlanError,
+    loading: localPlanLoading,
+    fetching: localPlanFetching,
+    permissionState: localNetworkPermission,
+  });
+  const showLocalPlanConnection = Boolean(
     localPlanMode &&
+    localPlanBridgeUrl &&
     !bundle &&
-    (Boolean(localPlanError) || (!localPlanLoading && !localPlanFetching)),
+    !localBridgeConnectionRequested &&
+    (localNetworkPermission === "prompt" ||
+      localNetworkPermission === "denied"),
   );
   const showInitialPlanSkeleton = Boolean(
-    selectedId && !bundle && !showPlanLoadError && !showLocalPlanLoadError,
+    selectedId &&
+    !bundle &&
+    !showPlanLoadError &&
+    !showLocalPlanLoadError &&
+    !showLocalPlanConnection,
   );
   const requestPlanAccessMutation = useRequestPlanAccess();
   const [accessRequestSentPlanId, setAccessRequestSentPlanId] = useState<
@@ -3143,8 +2344,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     }
   }, [accessRequestSentPlanId, selectedId]);
   const startGoogleSignIn = useCallback(async () => {
-    const returnPath =
-      window.location.pathname + window.location.search + window.location.hash;
+    const returnPath = planReturnPathFromLocation(window.location);
     try {
       const res = await fetch(
         `${agentNativePath("/_agent-native/google/auth-url")}?return=${encodeURIComponent(returnPath)}`,
@@ -3198,14 +2398,6 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
       selectedId,
     ],
   );
-  // Reflect a structural block edit (drag-to-columns, reorder) into the
-  // `get-visual-plan` cache IMMEDIATELY so the editor's authoritative content
-  // tracks the new layout instead of lagging the debounced (600ms) save. This
-  // keeps every reader of the plan content consistent with what the editor shows
-  // the moment the drop lands. The reconcile's own non-collab stale-poll guard is
-  // what actually stops a lagging refetch from reverting the layout, so this does
-  // NOT bump `updatedAt` — leaving the server's timestamp intact so a genuinely
-  // newer agent/external edit still wins.
   const writeBlocksOptimistically = useCallback(
     (blocks: PlanBlock[]) => {
       if (!selectedPlanQueryKey) return;
@@ -3225,9 +2417,6 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     },
     [queryClient, selectedPlanQueryKey],
   );
-  // Recaps are read-only review surfaces: text can't be edited inline (the agent
-  // owns the content), but highlighting + commenting stay available because those
-  // affordances key off `bundle`/`session`, not `canEditPlanContent`.
   const isRecap = bundle?.plan.kind === "recap";
   const effectivePlanAccessRole = bundle?.access?.role ?? null;
   const canEditLocalPlanContent =
@@ -3242,6 +2431,8 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
       canEditPlanContentRole(effectivePlanAccessRole));
   const canManagePlan =
     !localPlanMode && canEditPlanContentRole(effectivePlanAccessRole);
+  const canCommentPlan =
+    localPlanMode || canCommentPlanRole(effectivePlanAccessRole);
   const canDeleteCurrentPlan =
     !localPlanMode && effectivePlanAccessRole === "owner";
   const currentPlanDeleteTarget = useMemo<DeletePlanTarget | null>(() => {
@@ -3267,29 +2458,24 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     Boolean(bundle) &&
     effectivePlanVisibility === "public" &&
     !canManagePlan;
-  const canResolveCommentThreads = Boolean(
-    bundle && (localPlanMode || session || canEditPlanContent),
-  );
+  const canResolveCommentThreads = Boolean(bundle && canCommentPlan);
   const defaultInlineCommentDraft = useMemo<CommentDraft>(() => {
-    const ownerEmail = normalizeCommentEmail(bundle?.access?.ownerEmail);
-    const currentEmail = normalizeCommentEmail(collabUser?.email);
-    if (
-      !ownerEmail ||
-      effectivePlanAccessRole === "owner" ||
-      ownerEmail === currentEmail
-    ) {
-      return { message: "", mentions: [], resolutionTarget: "agent" };
-    }
-    const mention = {
-      email: ownerEmail,
-      label: displayNameForMention(ownerEmail),
-    };
-    return {
-      message: `${formatPlanCommentMentionToken(mention)} `,
-      mentions: [mention],
-      resolutionTarget: "human",
-    };
-  }, [bundle?.access?.ownerEmail, collabUser?.email, effectivePlanAccessRole]);
+    return defaultInlineCommentDraftForPlanContext({
+      planKind: bundle?.plan.kind,
+      ownerEmail: bundle?.access?.ownerEmail,
+      sourceAuthorName: bundle?.plan.sourceAuthorName,
+      sourceAuthorLogin: bundle?.plan.sourceAuthorLogin,
+      accessRole: effectivePlanAccessRole,
+      currentEmail: collabUser?.email,
+    });
+  }, [
+    bundle?.access?.ownerEmail,
+    bundle?.plan.kind,
+    bundle?.plan.sourceAuthorName,
+    bundle?.plan.sourceAuthorLogin,
+    collabUser?.email,
+    effectivePlanAccessRole,
+  ]);
   const commentThreads = useMemo(
     () => buildCommentThreads(bundle?.comments ?? []),
     [bundle?.comments],
@@ -3376,6 +2562,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
   );
   const canDeletePlanComment = useCallback(
     (comment: { authorEmail?: string | null }) => {
+      if (!canCommentPlan) return false;
       if (canManagePlan) return true;
       const currentEmail = normalizeCommentEmail(collabUser?.email);
       const authorEmail = normalizeCommentEmail(comment.authorEmail);
@@ -3386,7 +2573,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
         (!currentEmail || isLocalCurrentUserEmail(currentEmail))
       );
     },
-    [canManagePlan, collabUser?.email],
+    [canCommentPlan, canManagePlan, collabUser?.email],
   );
   const canDeleteCommentThread = useCallback(
     (thread: CommentThread) => canDeletePlanComment(thread.root),
@@ -3411,27 +2598,16 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     });
   }, [runtimeCommentThreads]);
   const updatePlan = useUpdatePlan();
+  const savePlanBlocks = useSavePlanBlocks();
   const updateLocalPlan = useUpdateLocalPlan();
   const promoteLocalPlan = usePromoteLocalPlan();
-  // Stable ref so closures (e.g. message-event handler) always call the latest
-  // mutate without needing to be in a dependency array.
   const updatePlanMutateRef = useRef(updatePlan.mutate);
   updatePlanMutateRef.current = updatePlan.mutate;
-  // Separate mutation instance for comment-only writes (reply / resolve /
-  // reopen). Keeping it separate from the prose-autosave `updatePlan` instance
-  // means the autosave `isPending` state cannot bleed into comment button
-  // disabled states (Issue 3).
   const updateCommentMutation = useUpdatePlanComments();
-  // Local-files plans write comments to comments.json (no DB) via this action.
   const updateLocalCommentMutation = useUpdateLocalPlanComments();
   const deleteCommentMutation = useDeletePlanComment();
   const deletePlanMutation = useDeletePlan();
 
-  /**
-   * Archive or unarchive a plan from the overview. Optimistically updates the
-   * list-visual-plans cache so the card disappears/reappears immediately.
-   * Rolls back on error with a toast.
-   */
   const handleArchivePlan = useCallback(
     (planId: string, archive: boolean) => {
       const newStatus = archive ? "archived" : "draft";
@@ -3440,7 +2616,6 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
       );
       const prevAll =
         queryClient.getQueryData<PlanSummary[]>(ALL_PLANS_QUERY_KEY);
-      // Optimistic update
       for (const listKey of [ACTIVE_PLANS_QUERY_KEY, ALL_PLANS_QUERY_KEY]) {
         queryClient.setQueryData(listKey, (old: PlanSummary[] | undefined) =>
           old?.map((p) => (p.id === planId ? { ...p, status: newStatus } : p)),
@@ -3450,19 +2625,20 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
         { planId, status: newStatus },
         {
           onError: () => {
-            // Roll back
             if (prevActive !== undefined)
               queryClient.setQueryData(ACTIVE_PLANS_QUERY_KEY, prevActive);
             if (prevAll !== undefined)
               queryClient.setQueryData(ALL_PLANS_QUERY_KEY, prevAll);
             toast.error(
-              archive ? "Failed to archive plan." : "Failed to unarchive plan.",
+              archive
+                ? t("plansPage.reader.archiveFailed")
+                : t("plansPage.reader.unarchiveFailed"),
             );
           },
         },
       );
     },
-    [queryClient, updatePlan],
+    [queryClient, t, updatePlan],
   );
 
   const updatePlanListCaches = useCallback(
@@ -3505,7 +2681,9 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
               ),
           );
           toast.success(
-            `${target.kind === "recap" ? "Recap" : "Plan"} moved to Deleted.`,
+            target.kind === "recap"
+              ? t("plansPage.reader.recapMovedToDeleted")
+              : t("plansPage.reader.planMovedToDeleted"),
           );
           if (selectedId === target.id) navigate("/plans");
         } else if (result.mode === "restore") {
@@ -3517,7 +2695,9 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
             ),
           );
           toast.success(
-            `${target.kind === "recap" ? "Recap" : "Plan"} restored.`,
+            target.kind === "recap"
+              ? t("plansPage.reader.recapRestored")
+              : t("plansPage.reader.planRestored"),
           );
         } else {
           updatePlanListCaches((items) =>
@@ -3527,7 +2707,9 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
             queryKey: planBundleQueryKey(target.id),
           });
           toast.success(
-            `${target.kind === "recap" ? "Recap" : "Plan"} permanently deleted.`,
+            target.kind === "recap"
+              ? t("plansPage.reader.recapPermanentlyDeleted")
+              : t("plansPage.reader.planPermanentlyDeleted"),
           );
           if (selectedId === target.id) navigate("/plans");
         }
@@ -3542,44 +2724,73 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
       navigate,
       queryClient,
       selectedId,
+      t,
       updatePlanListCaches,
     ],
   );
 
-  /**
-   * Persist question-form answers as an agent-targeted comment so
-   * share-link reviewers' answers are visible to get-plan-feedback even when
-   * no agent is attached on their machine.  Fire-and-forget: the existing
-   * sendToAgentChat fast-path runs first, and this is a best-effort backup.
-   */
   const persistQuestionFormAnswers = useCallback(
     (summary: string, planId: string | undefined) => {
       if (!planId) return;
+      const comment: PlanCommentInput = {
+        kind: "comment",
+        status: "open",
+        message: summary,
+        createdBy: "human",
+        authorEmail: collabUser?.email,
+        authorName: collabUser?.name,
+        resolutionTarget: "agent",
+      };
+      if (localPlanMode && localPlanSlug) {
+        void (async () => {
+          if (localPlanBridgeUrl) setLocalBridgeCommentPending(true);
+          try {
+            const updated = localPlanBridgeUrl
+              ? await updateLocalPlanBridgeComments(
+                  localPlanBridgeUrl,
+                  localPlanSlug,
+                  { comments: [comment] },
+                )
+              : await updateLocalCommentMutation.mutateAsync({
+                  slug: localPlanSlug,
+                  ...(localPlanRepoPath ? { path: localPlanRepoPath } : {}),
+                  comments: [comment],
+                });
+            if (selectedPlanQueryKey) {
+              queryClient.setQueryData(selectedPlanQueryKey, updated);
+            }
+          } catch {
+            toast.error(t("plansPage.reader.saveAnswersFailed"));
+          } finally {
+            if (localPlanBridgeUrl) setLocalBridgeCommentPending(false);
+          }
+        })();
+        return;
+      }
       updatePlanMutateRef.current(
         {
           planId,
-          comments: [
-            {
-              kind: "comment",
-              status: "open",
-              message: summary,
-              createdBy: "human",
-              authorEmail: collabUser?.email,
-              authorName: collabUser?.name,
-              resolutionTarget: "agent",
-            },
-          ],
+          comments: [comment],
         },
         {
           onError: () => {
-            toast.error(
-              "Could not save answers — they were sent to the agent chat only.",
-            );
+            toast.error(t("plansPage.reader.saveAnswersFailed"));
           },
         },
       );
     },
-    [collabUser?.email, collabUser?.name],
+    [
+      collabUser?.email,
+      collabUser?.name,
+      localPlanBridgeUrl,
+      localPlanMode,
+      localPlanRepoPath,
+      localPlanSlug,
+      queryClient,
+      selectedPlanQueryKey,
+      t,
+      updateLocalCommentMutation,
+    ],
   );
 
   const exportPlan = useExportPlan(localPlanMode ? undefined : selectedId);
@@ -3671,7 +2882,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
         size="sm"
         onClick={() => openSignIn()}
       >
-        Sign in
+        {t("plansPage.loadError.signIn")}
       </Button>
     ) : null,
   );
@@ -3727,26 +2938,46 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
 
   const documentHtml = useMemo(() => {
     if (!bundle) return "";
-    return bundle.html || bundle.plan.html || buildClientPlanHtml(bundle);
-  }, [bundle]);
+    return (
+      bundle.html ||
+      bundle.plan.html ||
+      buildClientPlanHtml(bundle, {
+        workingPlan: t("plansPage.reader.clientHtmlWorkingPlan"),
+      })
+    );
+  }, [bundle, t]);
 
   const annotatedDocumentHtml = useMemo(() => {
     if (!bundle) return "";
     const defaults = iframeRuntimeDefaultsRef.current;
-    return injectAnnotationRuntime(
-      documentHtml,
-      visiblePlanComments,
-      false,
-      defaults.planTheme,
-      defaults.preferredEditor,
-      commentAvatarUrls,
-      currentCommentAuthor,
-    );
+    const annotations = buildCommentThreads(visiblePlanComments)
+      .map((thread, index) =>
+        runtimeAnnotationFromThread(
+          thread,
+          index,
+          commentAvatarUrls,
+          currentCommentAuthor,
+        ),
+      )
+      .filter((annotation): annotation is RuntimeAnnotation =>
+        Boolean(annotation),
+      );
+    return injectAnnotationRuntime({
+      html: documentHtml,
+      annotations,
+      annotateMode: false,
+      theme: defaults.planTheme,
+      preferredEditor: defaults.preferredEditor,
+      labels: {
+        closeCodePreview: t("plansPage.reader.runtimeCloseCodePreview"),
+      },
+    });
   }, [
     bundle,
     commentAvatarUrls,
     currentCommentAuthor,
     documentHtml,
+    t,
     visiblePlanComments,
   ]);
 
@@ -3777,13 +3008,78 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     }
     if (!selectedId) return undefined;
     const base = bundle?.plan.kind === "recap" ? "recaps" : "plans";
-    return `${window.location.origin}${appPath(`/${base}/${selectedId}`)}`;
+    const url = `${window.location.origin}${appPath(`/${base}/${selectedId}`)}`;
+    const ownerViaId =
+      effectivePlanAccessRole === "owner" ? (session?.userId ?? null) : null;
+    return withPlanShareAttribution(url, ownerViaId);
   }, [
     bundle?.plan.kind,
+    effectivePlanAccessRole,
     localPlanMode,
     localPlanRepoPath,
     localPlanSlug,
     selectedId,
+    session?.userId,
+  ]);
+
+  const shareAttribution = useMemo(
+    () =>
+      readPlanShareAttribution(
+        typeof window === "undefined" ? "" : window.location.search,
+      ),
+    [],
+  );
+
+  const isLoggedOutPublicPlanView =
+    !sessionLoading &&
+    !session &&
+    !localPlanMode &&
+    Boolean(selectedId) &&
+    effectivePlanVisibility === "public";
+
+  const fireShareCtaClick = useCallback(
+    (cta: string) => {
+      if (!isLoggedOutPublicPlanView) return;
+      try {
+        void trackEvent("share_cta_click", {
+          surface: PLAN_SHARE_SURFACE,
+          plan_id: selectedId ?? "",
+          cta,
+          ref: shareAttribution.ref,
+          via: shareAttribution.via,
+        });
+      } catch {
+        // Never let analytics break a CTA.
+      }
+    },
+    [
+      isLoggedOutPublicPlanView,
+      selectedId,
+      shareAttribution.ref,
+      shareAttribution.via,
+    ],
+  );
+
+  const shareViewFiredRef = useRef(false);
+  useEffect(() => {
+    if (!isLoggedOutPublicPlanView) return;
+    if (shareViewFiredRef.current) return;
+    shareViewFiredRef.current = true;
+    try {
+      void trackEvent("share_view", {
+        surface: PLAN_SHARE_SURFACE,
+        plan_id: selectedId ?? "",
+        ref: shareAttribution.ref,
+        via: shareAttribution.via,
+      });
+    } catch {
+      // Never let analytics break the page render.
+    }
+  }, [
+    isLoggedOutPublicPlanView,
+    selectedId,
+    shareAttribution.ref,
+    shareAttribution.via,
   ]);
 
   useEffect(() => {
@@ -3915,6 +3211,47 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
 
   useEffect(() => clearPendingDocumentRestore, [clearPendingDocumentRestore]);
 
+  useBrowserLayoutEffect(() => {
+    if (!selectedId || !bundle?.plan.content || location.hash) return;
+    const resetKey = `${bundle.plan.kind}:${selectedId}`;
+    if (initialReaderScrollResetKeyRef.current === resetKey) return;
+    initialReaderScrollResetKeyRef.current = resetKey;
+    clearPendingDocumentRestore();
+    documentStateRef.current = null;
+
+    const reset = () => resetPlanReaderScrollPosition(nativeReaderRef.current);
+    const frameIds: number[] = [];
+    const timeoutIds: number[] = [];
+    const scheduleFrame = () => {
+      frameIds.push(window.requestAnimationFrame(reset));
+    };
+    const scheduleTimeout = (delay: number) => {
+      timeoutIds.push(
+        window.setTimeout(() => {
+          reset();
+          scheduleFrame();
+        }, delay),
+      );
+    };
+
+    reset();
+    scheduleFrame();
+    scheduleTimeout(0);
+    scheduleTimeout(120);
+    scheduleTimeout(500);
+
+    return () => {
+      frameIds.forEach((id) => window.cancelAnimationFrame(id));
+      timeoutIds.forEach((id) => window.clearTimeout(id));
+    };
+  }, [
+    bundle?.plan.content,
+    bundle?.plan.kind,
+    clearPendingDocumentRestore,
+    location.hash,
+    selectedId,
+  ]);
+
   useEffect(() => {
     const frame = requestAnimationFrame(() => postRuntimeState());
     return () => cancelAnimationFrame(frame);
@@ -4039,7 +3376,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
           /^file:\/\//i.test(data.href)
         ) {
           window.location.href = data.href;
-          toast.info("Opening file in your editor");
+          toast.info(t("plansPage.reader.openingFile"));
         }
       }
       if (data?.type === "agent-native-plan-editor-preference") {
@@ -4052,7 +3389,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
         window.localStorage.setItem(PREFERRED_EDITOR_STORAGE_KEY, editor);
       }
       if (data?.type === "agent-native-plan-link-blocked") {
-        toast.info("Links are disabled in review so the document stays put.");
+        toast.info(t("plansPage.reader.linksDisabled"));
       }
       if (data?.type === "agent-native-plan-doc-state" && data.state) {
         documentStateRef.current = data.state;
@@ -4067,7 +3404,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
         typeof data.summary === "string"
       ) {
         void navigator.clipboard.writeText(data.summary).then(() => {
-          toast.success("Visual intake prompt copied");
+          toast.success(t("plansPage.reader.visualPromptCopied"));
         });
       }
       if (
@@ -4081,7 +3418,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
           message: buildQuestionFormRevisionMessage(data.summary),
         });
         persistQuestionFormAnswers(data.summary, bundle?.plan.id);
-        toast.success("Sent answers to the agent");
+        toast.success(t("plansPage.reader.sentAnswers"));
       }
     };
     window.addEventListener("message", onMessage);
@@ -4103,12 +3440,16 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
   const copyPlanLink = async () => {
     if (!planShareUrl) return;
     await navigator.clipboard.writeText(planShareUrl);
-    toast.success(isRecap ? "Recap link copied" : "Plan link copied");
+    toast.success(
+      isRecap
+        ? t("plansPage.reader.recapLinkCopied")
+        : t("plansPage.reader.planLinkCopied"),
+    );
   };
 
   const copyLocalPlanFolder = async () => {
     await navigator.clipboard.writeText(localPlanDisplayFolder);
-    toast.success("Local path copied");
+    toast.success(t("plansPage.reader.localPathCopied"));
   };
 
   const openPromoteLocalPlanDialog = () => {
@@ -4124,7 +3465,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     if (!localPlanSlug || localPlanBridgeUrl) return;
     const targetPath = promoteLocalPlanTargetPath.trim();
     if (!targetPath) {
-      toast.error("Enter a repo-relative folder path.");
+      toast.error(t("plansPage.reader.enterRepoFolder"));
       return;
     }
 
@@ -4137,10 +3478,11 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     setPromoteLocalPlanOpen(false);
     toast.success(
       result.alreadyPromoted
-        ? "Local plan is already saved in the repo"
-        : `Saved ${result.localFiles?.files.length ?? 0} local files to ${
-            result.targetPath ?? targetPath
-          }`,
+        ? t("plansPage.reader.localPlanAlreadySaved")
+        : t("plansPage.reader.savedLocalFiles", {
+            count: result.localFiles?.files.length ?? 0,
+            path: result.targetPath ?? targetPath,
+          }),
     );
     navigate(localPlanRoutePath(result.slug, result.repoPath ?? targetPath));
   };
@@ -4170,7 +3512,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     if (localPlanMode) {
       const localBundle = bundle as LocalPlanBundle | undefined;
       if (!localBundle) {
-        throw new Error("Local plan source was not available yet.");
+        throw new Error(t("plansPage.reader.localSourceUnavailable"));
       }
       const mdx =
         localBundle.mdx ??
@@ -4178,7 +3520,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
           ? { "plan.mdx": localBundle.plan.markdown }
           : undefined);
       if (!mdx?.["plan.mdx"]) {
-        throw new Error("Local plan source files were not available yet.");
+        throw new Error(t("plansPage.reader.localSourceFilesUnavailable"));
       }
       return {
         markdown: localBundle.plan.markdown ?? mdx["plan.mdx"],
@@ -4200,7 +3542,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     const result = await exportPlan.refetch();
     const data = result.data ?? exportPlan.data;
     if (!data) {
-      throw new Error("Plan export was not available yet.");
+      throw new Error(t("plansPage.reader.exportUnavailable"));
     }
     return data;
   }, [
@@ -4218,7 +3560,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
       const plan = bundle?.plan;
       const planFiles = getDesktopPlanFiles();
       if (!plan || !planFiles) {
-        throw new Error("Desktop local file sync is not available.");
+        throw new Error(t("plansPage.reader.desktopSyncUnavailable"));
       }
 
       setDesktopPlanSyncing(true);
@@ -4246,7 +3588,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
 
         const data = await readPlanExport();
         if (!data.mdx || !data.mdx["plan.mdx"]) {
-          throw new Error("Plan source files were not available yet.");
+          throw new Error(t("plansPage.reader.sourceFilesUnavailable"));
         }
         const written = await planFiles.writePlan({
           planId: plan.id,
@@ -4264,7 +3606,11 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
         }
         desktopAutoSyncedVersionRef.current[plan.id] = plan.updatedAt;
         if (!options.quiet) {
-          toast.success(`Synced ${written.files?.length ?? 0} local files`);
+          toast.success(
+            t("plansPage.reader.syncedLocalFiles", {
+              count: written.files?.length ?? 0,
+            }),
+          );
         }
         return written.folder;
       } finally {
@@ -4278,14 +3624,14 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     const plan = bundle?.plan;
     const planFiles = getDesktopPlanFiles();
     if (!plan || !planFiles) {
-      throw new Error("Desktop local file sync is not available.");
+      throw new Error(t("plansPage.reader.desktopSyncUnavailable"));
     }
 
     setDesktopPlanImporting(true);
     try {
       const result = await planFiles.readPlan({ planId: plan.id });
       if (result.ok === false) throw new Error(result.error);
-      if (!result.mdx) throw new Error("No Plan source files were found.");
+      if (!result.mdx) throw new Error(t("plansPage.reader.noSourceFiles"));
       const synced = await syncLocalControlResources({
         folderName: result.folder.name,
         files: result.controlResources,
@@ -4300,7 +3646,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
         currentFocus: "desktop local files sync",
       });
       setDesktopPlanFolder(result.folder);
-      toast.success("Imported local source files");
+      toast.success(t("plansPage.reader.importedLocalSource"));
       const updatedAt = imported.plan?.updatedAt;
       if (updatedAt) {
         desktopAutoSyncedVersionRef.current[plan.id] = updatedAt;
@@ -4323,7 +3669,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
             toast.error(
               error instanceof Error
                 ? error.message
-                : "Could not enable local file sync.",
+                : t("plansPage.reader.enableLocalSyncFailed"),
             );
           },
         );
@@ -4347,7 +3693,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
       toast.error(
         error instanceof Error
           ? error.message
-          : "Could not sync plan to local files.",
+          : t("plansPage.reader.syncLocalFailed"),
       );
     });
   }, [
@@ -4360,13 +3706,13 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
   const copyPlanHtml = async () => {
     const data = await readPlanExport();
     await navigator.clipboard.writeText(data.html);
-    toast.success("Plan HTML copied");
+    toast.success(t("plansPage.reader.planHtmlCopied"));
   };
 
   const copyPlanMarkdown = async () => {
     const data = await readPlanExport();
     await navigator.clipboard.writeText(data.markdown);
-    toast.success("Plan Markdown copied");
+    toast.success(t("plansPage.reader.planMarkdownCopied"));
   };
 
   const downloadPlanHtml = async () => {
@@ -4387,7 +3733,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     const data = await readPlanExport();
     const files = data.mdx;
     if (!files || Object.keys(files).length === 0) {
-      throw new Error("Plan source files were not available yet.");
+      throw new Error(t("plansPage.reader.sourceFilesUnavailable"));
     }
     const { default: JSZip } = await import("jszip");
     const zip = new JSZip();
@@ -4402,16 +3748,21 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     }
     const blob = await zip.generateAsync({ type: "blob" });
     downloadBlob(planExportFilename(bundle?.plan.title, "zip"), blob);
-    toast.success("Plan source downloaded");
+    toast.success(t("plansPage.reader.planSourceDownloaded"));
   };
 
   const runPlanExportAction = (action: () => Promise<void>) => {
+    trackEvent("plan_reader_action_started", {
+      app_name: "plan",
+      template_name: "plan",
+      surface: localPlanMode ? "local_reader" : "reader",
+    });
     preservePlanReaderScroll(() => {
       void action().catch((error) => {
         toast.error(
           error instanceof Error
             ? error.message
-            : "Plan export was not available.",
+            : t("plansPage.reader.exportUnavailable"),
         );
       });
     });
@@ -4431,15 +3782,21 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     });
   };
 
-  const startCommenting = () => {
+  const startCommenting = useCallback(() => {
+    if (!canCommentPlan) return;
     setCanvasMarkupMode("none");
     setActiveAnnotation(null);
     setAnnotationsOpen(false);
     setCommentVisibility("open");
     setAnnotateMode(true);
-  };
+  }, [canCommentPlan]);
 
   const selectReviewMode = (mode: CanvasMarkupMode) => {
+    trackEvent("plan_review_mode_selected", {
+      app_name: "plan",
+      template_name: "plan",
+      mode,
+    });
     preservePlanReaderScroll(() => {
       if (mode !== "comment") {
         closeInlineComment();
@@ -4490,98 +3847,140 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
   const handleNativeReaderScroll = () => {
     documentStateRef.current = readNativeDocumentState();
     setNativeSelectionComment(null);
-    scheduleNativeMarkerUpdate();
+    if (commentMarkersVisible || pendingAnnotation || activeAnnotation) {
+      scheduleNativeMarkerUpdate();
+    }
   };
 
-  const readNativeSelectionComment = (): NativeSelectionComment | null => {
-    const reader = nativeReaderRef.current;
-    const selection = window.getSelection();
-    if (!reader || !selection || selection.rangeCount === 0) return null;
-    if (selection.isCollapsed) return null;
-    const textQuote = selection.toString().replace(/\s+/g, " ").trim();
-    if (!textQuote) return null;
-    const range = selection.getRangeAt(0);
-    if (!reader.contains(range.commonAncestorContainer)) return null;
+  const readNativeSelectionComment =
+    useCallback((): NativeSelectionComment | null => {
+      const reader = nativeReaderRef.current;
+      const selection = window.getSelection();
+      if (!reader || !selection || selection.rangeCount === 0) return null;
+      if (selection.isCollapsed) return null;
+      const textQuote = selection.toString().replace(/\s+/g, " ").trim();
+      if (!textQuote) return null;
+      const range = selection.getRangeAt(0);
+      if (!reader.contains(range.commonAncestorContainer)) return null;
 
-    const rects = Array.from(range.getClientRects()).filter(
-      (rect) => rect.width > 0 && rect.height > 0,
-    );
-    const selectionRect = rects[0] ?? range.getBoundingClientRect();
-    if (selectionRect.width <= 0 || selectionRect.height <= 0) return null;
+      const rects = Array.from(range.getClientRects()).filter(
+        (rect) => rect.width > 0 && rect.height > 0,
+      );
+      const selectionRect = rects[0] ?? range.getBoundingClientRect();
+      if (selectionRect.width <= 0 || selectionRect.height <= 0) return null;
 
-    const readerRect = reader.getBoundingClientRect();
-    const pointX =
-      selectionRect.left + selectionRect.width / 2 - readerRect.left;
-    const pointY =
-      selectionRect.top + selectionRect.height / 2 - readerRect.top;
-    const startElement =
-      range.startContainer instanceof Element
-        ? range.startContainer
-        : range.startContainer.parentElement;
-    const blockElement = startElement?.closest<HTMLElement>("[data-block-id]");
-    const blockType = blockElement?.dataset.blockId
-      ? findPlanBlockById(
-          bundle?.plan.content?.blocks ?? [],
-          blockElement.dataset.blockId,
-        )?.type
-      : undefined;
-    const quoteContext = textQuoteContextForBlock({
-      block: blockElement,
-      quote: textQuote,
-    });
-    const snippet = textQuote.slice(0, 220);
-    const anchor = {
-      ...buildNativeAnchorFromElement({
-        reader,
-        target: startElement instanceof HTMLElement ? startElement : reader,
-        pointX,
-        pointY,
-        planTitle: bundle?.plan.title,
-      }),
-      snippet,
-      textQuote: snippet,
-      anchorKind: "text",
-      tagName: "selection",
-      blockType,
-      ...quoteContext,
-    } satisfies PlanAnnotationAnchor;
-    const toolbarWidth = 132;
-    const toolbarLeft = clamp(
-      pointX - toolbarWidth / 2,
-      12,
-      Math.max(12, readerRect.width - toolbarWidth - 12),
-    );
-    const toolbarTop = clamp(
-      selectionRect.top - readerRect.top - 48,
-      12,
-      Math.max(12, readerRect.height - 48),
-    );
-    return {
-      anchor,
-      toolbarLeft,
-      toolbarTop,
-      position:
-        getPositionFromAnchor(anchor) ??
-        resolveInlineCommentPosition({
+      const readerRect = reader.getBoundingClientRect();
+      const pointX =
+        selectionRect.left + selectionRect.width / 2 - readerRect.left;
+      const pointY =
+        selectionRect.top + selectionRect.height / 2 - readerRect.top;
+      const startElement =
+        range.startContainer instanceof Element
+          ? range.startContainer
+          : range.startContainer.parentElement;
+      const blockElement =
+        startElement?.closest<HTMLElement>("[data-block-id]");
+      const blockType = blockElement?.dataset.blockId
+        ? findPlanBlockById(
+            bundle?.plan.content?.blocks ?? [],
+            blockElement.dataset.blockId,
+          )?.type
+        : undefined;
+      const quoteContext = textQuoteContextForBlock({
+        block: blockElement,
+        quote: textQuote,
+      });
+      const snippet = textQuote.slice(0, 220);
+      const anchor = {
+        ...buildNativeAnchorFromElement({
+          reader,
+          target: startElement instanceof HTMLElement ? startElement : reader,
           pointX,
           pointY,
-          viewportWidth: readerRect.width,
-          viewportHeight: readerRect.height,
+          planTitle: bundle?.plan.title,
         }),
-    };
-  };
+        snippet,
+        textQuote: snippet,
+        anchorKind: "text",
+        tagName: "selection",
+        blockType,
+        ...quoteContext,
+      } satisfies PlanAnnotationAnchor;
+      const toolbarWidth = 132;
+      const toolbarLeft = clamp(
+        pointX - toolbarWidth / 2,
+        12,
+        Math.max(12, readerRect.width - toolbarWidth - 12),
+      );
+      const toolbarTop = clamp(
+        selectionRect.top - readerRect.top - 48,
+        12,
+        Math.max(12, readerRect.height - 48),
+      );
+      return {
+        anchor,
+        toolbarLeft,
+        toolbarTop,
+        position:
+          getPositionFromAnchor(anchor) ??
+          resolveInlineCommentPosition({
+            pointX,
+            pointY,
+            viewportWidth: readerRect.width,
+            viewportHeight: readerRect.height,
+          }),
+      };
+    }, [
+      bundle?.plan.content?.blocks,
+      bundle?.plan.title,
+      getPositionFromAnchor,
+    ]);
+
+  const openNativeSelectionComment = useCallback(
+    (selectionComment: NativeSelectionComment) => {
+      if (!canCommentPlan) return;
+      documentStateRef.current = readNativeDocumentState();
+      setCanvasMarkupMode("none");
+      setActiveAnnotation(null);
+      setAnnotationsOpen(false);
+      setCommentVisibility("open");
+      setAnnotateMode(true);
+      setPendingAnnotation(selectionComment.anchor);
+      setInlineCommentPosition(selectionComment.position);
+      setNativeSelectionComment(null);
+      window.getSelection()?.removeAllRanges();
+    },
+    [canCommentPlan, readNativeDocumentState],
+  );
 
   const beginNativeSelectionComment = () => {
-    if (!nativeSelectionComment) return;
-    documentStateRef.current = readNativeDocumentState();
-    // Implicitly enter annotate mode when a selection comment is started
-    // outside of review mode so the inline comment popover renders correctly.
-    if (!annotateMode) setAnnotateMode(true);
-    setPendingAnnotation(nativeSelectionComment.anchor);
-    setInlineCommentPosition(nativeSelectionComment.position);
-    setNativeSelectionComment(null);
-    window.getSelection()?.removeAllRanges();
+    if (!canCommentPlan || !nativeSelectionComment) return;
+    openNativeSelectionComment(nativeSelectionComment);
   };
+
+  useEffect(() => {
+    if (!bundle) return;
+    const handleCommentShortcut = (event: KeyboardEvent) => {
+      if (!shouldHandlePlanCommentShortcut(event)) return;
+      event.preventDefault();
+      preservePlanReaderScroll(() => {
+        const selectionComment = readNativeSelectionComment();
+        if (selectionComment) {
+          openNativeSelectionComment(selectionComment);
+          return;
+        }
+        startCommenting();
+      });
+    };
+    window.addEventListener("keydown", handleCommentShortcut);
+    return () => window.removeEventListener("keydown", handleCommentShortcut);
+  }, [
+    bundle,
+    openNativeSelectionComment,
+    preservePlanReaderScroll,
+    readNativeSelectionComment,
+    startCommenting,
+  ]);
 
   const handleNativeReaderPointerDown = (
     event: PointerEvent<HTMLDivElement>,
@@ -4589,8 +3988,6 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     if (event.button !== 0) return;
     const target = event.target as HTMLElement;
     if (target.closest("[data-plan-interactive]")) return;
-    // Clear any previous selection comment tooltip on pointer-down so it
-    // doesn't linger while a new selection gesture starts.
     setNativeSelectionComment(null);
     if (!annotateMode) return;
     nativeCommentPointerRef.current = {
@@ -4600,15 +3997,12 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
   };
 
   const handleNativeReaderPointerUp = (event: PointerEvent<HTMLDivElement>) => {
+    if (!canCommentPlan) return;
     if (event.button !== 0) return;
     const target = event.target as HTMLElement;
     if (target.closest("[data-plan-interactive]")) return;
     const reader = nativeReaderRef.current;
     if (!reader) return;
-    // Text-selection "Comment" affordance: show the floating button whenever
-    // the user finishes a selection inside the reader, even outside annotate
-    // mode. Click-to-place annotations (the else branch) remain annotate-mode
-    // only because they don't have a visible target without the full review UI.
     const selectionComment = readNativeSelectionComment();
     if (selectionComment) {
       event.preventDefault();
@@ -4663,50 +4057,111 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     }
     await updatePlan.mutateAsync({
       planId: bundle.plan.id,
+      expectedUpdatedAt: bundle.plan.updatedAt,
       content,
       note: "Updated structured visual plan content.",
     });
   };
 
-  const patchStructuredContent = async (patch: PlanContentPatch) => {
-    if (!bundle) return;
-    // For background autosave (replace-blocks) ops, suppress the global
-    // onError toast so the autosave loop's backoff+pill handles error state
-    // instead of spamming toast.error on every retry.
-    const silentError = patch.op === "replace-blocks";
-    try {
-      if (localPlanMode) {
-        if (!localPlanSlug || localPlanBridgeUrl) return;
-        await updateLocalPlan.mutateAsync(
-          {
-            slug: localPlanSlug,
-            ...(localPlanRepoPath ? { path: localPlanRepoPath } : {}),
-            contentPatches: [patch],
-            note:
-              patch.op === "update-rich-text"
-                ? `Edited local markdown block ${patch.blockId}.`
-                : "Patched local structured visual plan content.",
-          },
-          silentError ? { onError: () => {} } : undefined,
-        );
-        return;
+  // The newest block save this tab made, with the blocks it sent. Until the
+  // open document adopts the saved result, that save (not the older revision
+  // the document still reports) is what the next edit was made on top of, and
+  // the blocks sent, not the merged result, are what the document holds.
+  const lastBlockSaveRef = useRef<{
+    planId: string;
+    updatedAt: string;
+    sent: PlanBlock[];
+  } | null>(null);
+
+  // `base` is the saved revision the open document's edits were made on top
+  // of; without a document (no live editor) the plan as loaded stands in.
+  const saveBlocks = async (
+    plan: PlanBundleWithHtml["plan"],
+    blocks: PlanBlock[],
+    documentBase: PlanBlocksRevision | null | undefined,
+  ) => {
+    const planId = plan.id;
+    const toRevision = (saved: PlanBundleWithHtml): PlanBlocksRevision => {
+      if (!saved.plan?.content) {
+        throw new Error("The saved plan has no structured content.");
       }
-      await updatePlan.mutateAsync(
+      return {
+        updatedAt: saved.plan.updatedAt,
+        blocks: saved.plan.content.blocks,
+      };
+    };
+    const loaded =
+      documentBase ??
+      (plan.content
+        ? { updatedAt: plan.updatedAt, blocks: plan.content.blocks }
+        : null);
+    const own = lastBlockSaveRef.current;
+    const base =
+      own?.planId === planId && (!loaded || own.updatedAt >= loaded.updatedAt)
+        ? { updatedAt: own.updatedAt, blocks: own.sent }
+        : loaded;
+    const saved = await saveBlocksMergingConflicts({
+      base,
+      blocks,
+      save: async (nextBlocks, expectedUpdatedAt) =>
+        toRevision(
+          await savePlanBlocks.mutateAsync({
+            planId,
+            expectedUpdatedAt,
+            contentPatches: [{ op: "replace-blocks", blocks: nextBlocks }],
+            note: "Patched structured visual plan content.",
+          }),
+        ),
+      readLatest: async () =>
+        toRevision(
+          await callAction<PlanBundleWithHtml>(
+            "get-visual-plan",
+            planBundleQueryParams(planId),
+            { method: "GET" },
+          ),
+        ),
+    });
+    lastBlockSaveRef.current = {
+      planId,
+      updatedAt: saved.updatedAt,
+      sent: blocks,
+    };
+    return saved;
+  };
+
+  const patchStructuredContent = async (
+    patch: PlanContentPatch,
+    options?: { base?: PlanBlocksRevision | null },
+  ) => {
+    if (!bundle) return;
+    if (localPlanMode) {
+      if (!localPlanSlug || localPlanBridgeUrl) return;
+      await updateLocalPlan.mutateAsync(
         {
-          planId: bundle.plan.id,
+          slug: localPlanSlug,
+          ...(localPlanRepoPath ? { path: localPlanRepoPath } : {}),
           contentPatches: [patch],
           note:
             patch.op === "update-rich-text"
-              ? `Edited markdown block ${patch.blockId}.`
-              : "Patched structured visual plan content.",
+              ? `Edited local markdown block ${patch.blockId}.`
+              : "Patched local structured visual plan content.",
         },
-        silentError ? { onError: () => {} } : undefined,
+        patch.op === "replace-blocks" ? { onError: () => {} } : undefined,
       );
-    } catch (error) {
-      // Re-throw so the autosave backoff loop in PlanContentRenderer can handle
-      // retries. The global onError toast was already suppressed above.
-      throw error;
+      return;
     }
+    if (patch.op === "replace-blocks") {
+      await saveBlocks(bundle.plan, patch.blocks, options?.base);
+      return;
+    }
+    await updatePlan.mutateAsync({
+      planId: bundle.plan.id,
+      contentPatches: [patch],
+      note:
+        patch.op === "update-rich-text"
+          ? `Edited markdown block ${patch.blockId}.`
+          : "Patched structured visual plan content.",
+    });
   };
 
   const updatePlanMetadata = async (patch: {
@@ -4964,7 +4419,9 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
         : "",
       ...labels.map((label) => `- ${label}`),
       overflow.length > 0
-        ? `- ${overflow.length} additional visual comment(s) exceeded the screenshot budget. Use get-plan-feedback anchorDetails/coordinates for these overflow comments:`
+        ? localPlanMode
+          ? `- ${overflow.length} additional visual comment(s) exceeded the screenshot budget. Use comments.json anchor details/coordinates for these overflow comments:`
+          : `- ${overflow.length} additional visual comment(s) exceeded the screenshot budget. Use get-plan-feedback anchorDetails/coordinates for these overflow comments:`
         : "",
       ...overflowLabels,
     ]
@@ -5000,15 +4457,25 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
       sendToAgentChat({
         type: "content",
         submit: true,
+        chatTarget: "local",
+        openSidebar: true,
         context,
         images: capture.images,
-        message: buildApplyFeedbackMessage(openCommentCount),
+        message: buildApplyFeedbackMessage(openCommentCount, {
+          local: localPlanMode,
+        }),
       });
       toast.success(
         capture.images.length > 0
-          ? "Sent comments and focused screenshots to the agent"
-          : "Sent comments to the agent",
+          ? t("plansPage.reader.sentCommentsWithScreenshots")
+          : t("plansPage.reader.sentComments"),
       );
+    } catch (error) {
+      console.error(
+        "[PlansPage] Failed to send plan feedback to inline agent:",
+        error,
+      );
+      toast.error(t("plansPage.comments.sendFailed"));
     } finally {
       setSendingFeedback(false);
     }
@@ -5022,19 +4489,31 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
       return;
     }
     await navigator.clipboard.writeText(
-      [buildApplyFeedbackMessage(openCommentCount), "", planAgentContext].join(
-        "\n",
-      ),
+      [
+        buildApplyFeedbackMessage(openCommentCount, { local: localPlanMode }),
+        "",
+        planAgentContext,
+      ].join("\n"),
     );
-    toast.success("Feedback instructions copied");
+    toast.success(t("plansPage.reader.feedbackCopied"));
   };
 
-  // Route comment writes to the DB (hosted) or comments.json (local); both
-  // return the same bundle shape.
-  const writeComments = (
+  const writeComments = async (
     comments: PlanCommentInput[],
     note: string,
   ): Promise<PlanBundleWithHtml> => {
+    if (localPlanMode && localPlanBridgeUrl) {
+      setLocalBridgeCommentPending(true);
+      try {
+        return await updateLocalPlanBridgeComments(
+          localPlanBridgeUrl,
+          localPlanSlug ?? "",
+          { comments },
+        );
+      } finally {
+        setLocalBridgeCommentPending(false);
+      }
+    }
     if (localPlanMode) {
       return updateLocalCommentMutation.mutateAsync({
         slug: localPlanSlug ?? "",
@@ -5050,6 +4529,22 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     }) as Promise<PlanBundleWithHtml>;
   };
   const removeCommentById = async (commentId: string): Promise<void> => {
+    if (localPlanMode && localPlanBridgeUrl) {
+      setLocalBridgeCommentPending(true);
+      try {
+        const updated = await updateLocalPlanBridgeComments(
+          localPlanBridgeUrl,
+          localPlanSlug ?? "",
+          { deletedCommentIds: [commentId] },
+        );
+        if (selectedPlanQueryKey) {
+          queryClient.setQueryData(selectedPlanQueryKey, updated);
+        }
+      } finally {
+        setLocalBridgeCommentPending(false);
+      }
+      return;
+    }
     if (localPlanMode) {
       await updateLocalCommentMutation.mutateAsync({
         slug: localPlanSlug ?? "",
@@ -5065,13 +4560,17 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     });
   };
   const commentWritePending =
-    updateCommentMutation.isPending || updateLocalCommentMutation.isPending;
+    updateCommentMutation.isPending ||
+    updateLocalCommentMutation.isPending ||
+    localBridgeCommentPending;
   const commentDeletePending =
-    deleteCommentMutation.isPending || updateLocalCommentMutation.isPending;
+    deleteCommentMutation.isPending ||
+    updateLocalCommentMutation.isPending ||
+    localBridgeCommentPending;
 
   const submitInlineComment = async (draft: CommentDraft) => {
+    if (!canCommentPlan) return;
     if (!bundle || !pendingAnnotation || !selectedPlanQueryKey) return;
-    // Capture the current position before clearing (used to restore on failure).
     const capturedPosition = inlineCommentPosition;
     const anchor: PlanAnnotationAnchor = {
       ...pendingAnnotation,
@@ -5123,10 +4622,6 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     };
     clearPendingDocumentRestore();
     pendingDocumentRestoreRef.current = documentStateRef.current;
-    commentMutationPendingRef.current = true;
-    // Await the cancel so an in-flight 3s poll can't resolve *after* our
-    // optimistic write and revert it (the "comment lagged / didn't stick"
-    // symptom). cancelQueries reverts outstanding fetches before we patch.
     await queryClient.cancelQueries({ queryKey: selectedPlanQueryKey });
     queryClient.setQueryData(
       selectedPlanQueryKey,
@@ -5153,17 +4648,11 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
               : current,
         );
         clearPendingDocumentRestore();
-        // Restore the draft so the reviewer doesn't lose their typed text.
-        // Re-open the composer at the same anchor with the original draft
-        // pre-filled (Issue 2a).
         setFailedCommentDraft(draft);
         setPendingAnnotation(anchor);
         setInlineCommentPosition(
           getPositionFromAnchor(anchor) ?? capturedPosition,
         );
-      })
-      .finally(() => {
-        commentMutationPendingRef.current = false;
       });
   };
 
@@ -5171,6 +4660,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     annotation: RuntimeAnnotation,
     message: string,
   ) => {
+    if (!canCommentPlan) return;
     if (!bundle) return;
     const anchor: PlanAnnotationAnchor = {
       ...annotation.anchor,
@@ -5179,7 +4669,6 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
         annotation.anchor.resolutionTarget,
       ),
     };
-    commentMutationPendingRef.current = true;
     void writeComments(
       [
         {
@@ -5198,13 +4687,10 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     )
       .then(() => {
         setActiveAnnotation(null);
-        toast.success("Comment updated");
+        toast.success(t("plansPage.comments.commentUpdated"));
       })
       .catch(() => {
         // The mutation hook surfaces the failure toast; just clear pending.
-      })
-      .finally(() => {
-        commentMutationPendingRef.current = false;
       });
   };
 
@@ -5212,13 +4698,14 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     threadRootId: string,
     message: string,
   ) => {
+    if (!canCommentPlan) {
+      throw new Error("Commenter access is required to reply to a comment.");
+    }
     if (!bundle || !selectedPlanQueryKey) return;
     const thread = commentThreads.find((item) => item.id === threadRootId);
     if (!thread) {
       throw new Error("Comment thread is no longer available.");
     }
-    // Optimistic reply: insert into cache immediately so the UI updates
-    // before the server round-trip completes (Issue 3).
     const replyId = newCommentId();
     const now = new Date().toISOString();
     const optimisticReply: PlanCommentItem = {
@@ -5242,10 +4729,6 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
       createdAt: now,
       updatedAt: now,
     };
-    commentMutationPendingRef.current = true;
-    // Await the cancel so an in-flight 3s poll can't resolve *after* our
-    // optimistic write and revert it (the "comment lagged / didn't stick"
-    // symptom). cancelQueries reverts outstanding fetches before we patch.
     await queryClient.cancelQueries({ queryKey: selectedPlanQueryKey });
     queryClient.setQueryData(
       selectedPlanQueryKey,
@@ -5269,21 +4752,17 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
         ],
         "Human replied to visual plan feedback.",
       );
-      // Replace optimistic entry with the authoritative server response.
       if (selectedPlanQueryKey) {
         queryClient.setQueryData(selectedPlanQueryKey, updated);
       }
-      toast.success("Reply added");
+      toast.success(t("plansPage.comments.replyAdded"));
     } catch {
-      // Roll back the optimistic reply on error.
       queryClient.setQueryData(
         selectedPlanQueryKey,
         (current: PlanBundleWithHtml | undefined) =>
           current ? removePlanCommentFromBundle(current, replyId) : current,
       );
       throw new Error("Could not send reply. Try again.");
-    } finally {
-      commentMutationPendingRef.current = false;
     }
   };
 
@@ -5298,14 +4777,8 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     const fallbackAnchorJson = fallbackAnchor
       ? JSON.stringify(fallbackAnchor)
       : undefined;
-    // Optimistic status flip: update the cache immediately so the marker and
-    // popover update without waiting for the server round-trip (Issue 3).
     const prevBundle =
       queryClient.getQueryData<PlanBundleWithHtml>(selectedPlanQueryKey);
-    commentMutationPendingRef.current = true;
-    // Await the cancel so an in-flight 3s poll can't resolve *after* our
-    // optimistic write and revert it (the "comment lagged / didn't stick"
-    // symptom). cancelQueries reverts outstanding fetches before we patch.
     await queryClient.cancelQueries({ queryKey: selectedPlanQueryKey });
     queryClient.setQueryData(
       selectedPlanQueryKey,
@@ -5340,17 +4813,15 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     )
       .then(() => {
         toast.success(
-          status === "resolved" ? "Comment resolved" : "Comment reopened",
+          status === "resolved"
+            ? t("plansPage.comments.commentResolved")
+            : t("plansPage.comments.commentReopened"),
         );
       })
       .catch(() => {
-        // Roll back the optimistic status change.
         if (prevBundle !== undefined) {
           queryClient.setQueryData(selectedPlanQueryKey, prevBundle);
         }
-      })
-      .finally(() => {
-        commentMutationPendingRef.current = false;
       });
   };
 
@@ -5373,10 +4844,6 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     const prevBundle =
       queryClient.getQueryData<PlanBundleWithHtml>(selectedPlanQueryKey);
     const commentId = request.commentId;
-    commentMutationPendingRef.current = true;
-    // Await the cancel so an in-flight 3s poll can't resolve *after* our
-    // optimistic write and revert it (the "comment lagged / didn't stick"
-    // symptom). cancelQueries reverts outstanding fetches before we patch.
     await queryClient.cancelQueries({ queryKey: selectedPlanQueryKey });
     queryClient.setQueryData(
       selectedPlanQueryKey,
@@ -5391,14 +4858,12 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     setDeleteCommentRequest(null);
     try {
       await removeCommentById(commentId);
-      toast.success("Comment deleted");
+      toast.success(t("plansPage.comments.commentDeleted"));
     } catch (error) {
       if (prevBundle !== undefined) {
         queryClient.setQueryData(selectedPlanQueryKey, prevBundle);
       }
       setDeleteCommentRequest(request);
-    } finally {
-      commentMutationPendingRef.current = false;
     }
   };
 
@@ -5468,6 +4933,9 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
             <PlansOverview
               plans={plans}
               isLoading={sessionLoading || plansQuery.isLoading}
+              isError={plansQuery.isError}
+              onRetry={() => void plansQuery.refetch()}
+              viewerEmail={session?.email ?? null}
               onCreate={requestCreatePlan}
               canCreate={Boolean(session)}
               onArchive={handleArchivePlan}
@@ -5480,6 +4948,14 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
               }
               onSignIn={() => openSignIn()}
             />
+          ) : showLocalPlanConnection ? (
+            <LocalPlanConnection
+              permissionState={
+                localNetworkPermission === "denied" ? "denied" : "prompt"
+              }
+              onConnect={() => setLocalBridgeConnectionRequested(true)}
+              onRetry={() => void checkLocalNetworkPermission()}
+            />
           ) : showLocalPlanLoadError ? (
             <LocalPlanLoadError
               error={localPlanError}
@@ -5489,6 +4965,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
           ) : showPlanLoadError ? (
             <PlanLoadError
               error={planQuery.error}
+              planId={selectedId}
               accessStatus={planAccessStatus}
               onRetry={() => void planQuery.refetch()}
               onSignIn={() => openSignIn()}
@@ -5514,8 +4991,8 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                         <Button
                           type="button"
                           variant="ghost"
-                          size="icon"
-                          className="pointer-events-auto size-8 rounded-lg border border-border/70 bg-background/82 shadow-2xl backdrop-blur-xl"
+                          size="icon-sm"
+                          className="pointer-events-auto rounded-lg border border-border/70 bg-background/82 shadow-2xl backdrop-blur-xl"
                           onClick={() => {
                             if (session) {
                               navigate("/plans");
@@ -5523,12 +5000,14 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                               window.location.href = appPath("/plans");
                             }
                           }}
-                          aria-label="Back to plans"
+                          aria-label={t("plansPage.reader.backToPlans")}
                         >
                           <IconArrowLeft className="size-4" />
                         </Button>
                       </TooltipTrigger>
-                      <TooltipContent>Back to plans</TooltipContent>
+                      <TooltipContent>
+                        {t("plansPage.reader.backToPlans")}
+                      </TooltipContent>
                     </Tooltip>
                   </div>
                 )}
@@ -5551,6 +5030,10 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                     localShareUrl={planShareUrl}
                     hostedPlanId={bundle.plan.hostedPlanId}
                     hostedPlanUrl={bundle.plan.hostedPlanUrl}
+                    firstShare={planShareSucceededId === bundle.plan.id}
+                    onShareSuccess={() =>
+                      setPlanShareSucceededId(bundle.plan.id)
+                    }
                     onOpenChange={(open) => {
                       if (open) closeInlineComment();
                     }}
@@ -5578,8 +5061,8 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                       <Button
                         type="button"
                         variant="ghost"
-                        size="icon"
-                        className="pointer-events-auto size-8"
+                        size="icon-sm"
+                        className="pointer-events-auto"
                         onClick={() =>
                           preservePlanReaderScroll(() => {
                             if (prototypeOnly) {
@@ -5591,8 +5074,8 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                         }
                         aria-label={
                           prototypeOnly
-                            ? "Open full plan"
-                            : "Open prototype window"
+                            ? t("plansPage.reader.openFullPlan")
+                            : t("plansPage.reader.openPrototypeWindow")
                         }
                       >
                         <IconExternalLink className="size-4" />
@@ -5600,8 +5083,8 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                     </TooltipTrigger>
                     <TooltipContent>
                       {prototypeOnly
-                        ? "Open full plan"
-                        : "Open prototype window"}
+                        ? t("plansPage.reader.openFullPlan")
+                        : t("plansPage.reader.openPrototypeWindow")}
                     </TooltipContent>
                   </Tooltip>
                 )}
@@ -5615,7 +5098,9 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                         className="pointer-events-auto gap-1.5"
                         disabled={sendingFeedback}
                       >
-                        {sendingFeedback ? "Sending" : "Send to agent"}
+                        {sendingFeedback
+                          ? t("plansPage.reader.sending")
+                          : t("plansPage.reader.sendToAgent")}
                         <span className="flex size-4 items-center justify-center rounded-full bg-background/20 text-[10px] font-medium">
                           {bundle.summary.openCommentCount}
                         </span>
@@ -5626,7 +5111,9 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                       align="end"
                       className="w-64 rounded-xl"
                     >
-                      <DropdownMenuLabel>Send feedback</DropdownMenuLabel>
+                      <DropdownMenuLabel>
+                        {t("plansPage.reader.sendFeedback")}
+                      </DropdownMenuLabel>
                       <DropdownMenuGroup>
                         <DropdownMenuItem
                           onClick={() =>
@@ -5638,9 +5125,9 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                         >
                           <IconClipboardText className="mt-0.5 size-4" />
                           <span className="grid gap-0.5">
-                            <span>Copy for your agent</span>
+                            <span>{t("plansPage.reader.copyForAgent")}</span>
                             <span className="text-xs font-normal leading-4 text-muted-foreground">
-                              Copies a prompt you can paste into chat.
+                              {t("plansPage.reader.copyForAgentDescription")}
                             </span>
                           </span>
                         </DropdownMenuItem>
@@ -5655,9 +5142,13 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                         >
                           <IconSend className="mt-0.5 size-4" />
                           <span className="grid gap-0.5">
-                            <span>Send to inline agent</span>
+                            <span>
+                              {t("plansPage.reader.sendToInlineAgent")}
+                            </span>
                             <span className="text-xs font-normal leading-4 text-muted-foreground">
-                              Posts open comments into the app side agent.
+                              {t(
+                                "plansPage.reader.sendToInlineAgentDescription",
+                              )}
                             </span>
                           </span>
                         </DropdownMenuItem>
@@ -5677,9 +5168,10 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                     <Button
                       type="button"
                       variant="ghost"
-                      size="icon"
-                      className="pointer-events-auto size-8"
-                      aria-label="Plan actions"
+                      size="icon-sm"
+                      className="pointer-events-auto"
+                      data-plan-actions-trigger
+                      aria-label={t("plansPage.overview.planActions")}
                     >
                       <IconDotsVertical className="size-4" />
                     </Button>
@@ -5688,13 +5180,16 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                     {localPlanMode && (
                       <>
                         <DropdownMenuLabel className="text-xs font-medium text-muted-foreground">
-                          Local files
+                          {t("plansPage.reader.localFiles")}
                         </DropdownMenuLabel>
                         <div className="px-2 pb-1 text-xs leading-5 text-muted-foreground">
-                          <div className="break-words text-foreground">
-                            {localPlanDisplayFolder}
+                          <div
+                            className="truncate text-foreground"
+                            title={localPlanDisplayFolder}
+                          >
+                            {localPlanMenuPath}
                           </div>
-                          <div>No hosted database writes or sharing.</div>
+                          <div>{t("plansPage.reader.localFilesNoHosted")}</div>
                         </div>
                         <DropdownMenuItem
                           onClick={() =>
@@ -5703,7 +5198,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                           className="gap-2"
                         >
                           <IconFolder className="size-4" />
-                          Copy local path
+                          {t("plansPage.reader.copyLocalPath")}
                         </DropdownMenuItem>
                         {!localPlanBridgeUrl && (
                           <DropdownMenuItem
@@ -5720,7 +5215,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                             ) : (
                               <IconFolder className="size-4" />
                             )}
-                            Save to repo...
+                            {t("plansPage.reader.saveToRepo")}
                           </DropdownMenuItem>
                         )}
                         {localPlanBridgeUrl && desktopPlanFilesAvailable && (
@@ -5738,7 +5233,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                             ) : (
                               <IconFolder className="size-4" />
                             )}
-                            Save source to folder...
+                            {t("plansPage.reader.saveSourceToFolder")}
                           </DropdownMenuItem>
                         )}
                         <DropdownMenuSeparator />
@@ -5748,20 +5243,22 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                       {!localPlanMode && (
                         <>
                           <DropdownMenuLabel className="text-xs font-medium text-muted-foreground">
-                            Comments
+                            {t("plansPage.comments.comments")}
                           </DropdownMenuLabel>
                           <DropdownMenuRadioGroup value={commentVisibility}>
                             <DropdownMenuRadioItem
                               value="hidden"
                               onSelect={() => chooseCommentVisibility("hidden")}
                             >
-                              Hide comments
+                              {t("plansPage.reader.hideComments")}
                             </DropdownMenuRadioItem>
                             <DropdownMenuRadioItem
                               value="open"
                               onSelect={() => chooseCommentVisibility("open")}
                             >
-                              <span className="flex-1">Show comments</span>
+                              <span className="flex-1">
+                                {t("plansPage.reader.showComments")}
+                              </span>
                               {hasOpenThreads && (
                                 <span className="text-xs text-muted-foreground">
                                   {bundle.summary.openCommentCount}
@@ -5772,7 +5269,9 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                               value="all"
                               onSelect={() => chooseCommentVisibility("all")}
                             >
-                              <span className="flex-1">Show all comments</span>
+                              <span className="flex-1">
+                                {t("plansPage.reader.showAllComments")}
+                              </span>
                               {resolvedCommentThreadCount > 0 && (
                                 <span className="text-xs text-muted-foreground">
                                   {commentThreads.length}
@@ -5780,18 +5279,24 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                               )}
                             </DropdownMenuRadioItem>
                           </DropdownMenuRadioGroup>
-                          <DropdownMenuItem
-                            onClick={() => {
-                              preservePlanReaderScroll(() => {
-                                closeInlineComment();
-                                setHistoryOpen(true);
-                              });
-                            }}
-                            className="gap-2"
-                          >
-                            <IconHistory className="size-4" />
-                            History
-                          </DropdownMenuItem>
+                          {canEditPlanContent ? (
+                            <DropdownMenuItem
+                              onClick={() => {
+                                trackEvent("plan_history_opened", {
+                                  app_name: "plan",
+                                  template_name: "plan",
+                                });
+                                preservePlanReaderScroll(() => {
+                                  closeInlineComment();
+                                  setHistoryOpen(true);
+                                });
+                              }}
+                              className="gap-2"
+                            >
+                              <IconHistory className="size-4" />
+                              {t("plansPage.history.title")}
+                            </DropdownMenuItem>
+                          ) : null}
                         </>
                       )}
                       <DropdownMenuItem
@@ -5816,10 +5321,10 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                           <IconArrowsMaximize className="size-4" />
                         )}
                         {prototypeOnly
-                          ? "Full plan"
+                          ? t("plansPage.reader.fullPlan")
                           : immersiveReader
-                            ? "App view"
-                            : "Full screen"}
+                            ? t("plansPage.reader.appView")
+                            : t("plansPage.reader.fullScreen")}
                       </DropdownMenuItem>
                       <DropdownMenuItem
                         onClick={() =>
@@ -5834,7 +5339,9 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                         ) : (
                           <IconMoon className="size-4" />
                         )}
-                        {isDarkTheme ? "Light mode" : "Dark mode"}
+                        {isDarkTheme
+                          ? t("plansPage.reader.lightMode")
+                          : t("plansPage.reader.darkMode")}
                       </DropdownMenuItem>
                       <DropdownMenuItem
                         onClick={() =>
@@ -5844,8 +5351,8 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                       >
                         <IconPencil className="size-4" />
                         {wireframeStyle === "sketchy"
-                          ? "Clean wireframes"
-                          : "Sketchy wireframes"}
+                          ? t("plansPage.reader.cleanWireframes")
+                          : t("plansPage.reader.sketchyWireframes")}
                       </DropdownMenuItem>
                       {bundle.plan.content?.prototype ? (
                         <DropdownMenuItem
@@ -5855,7 +5362,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                           className="gap-2"
                         >
                           <IconExternalLink className="size-4" />
-                          Open prototype window
+                          {t("plansPage.reader.openPrototypeWindow")}
                         </DropdownMenuItem>
                       ) : null}
                     </DropdownMenuGroup>
@@ -5866,7 +5373,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                         className="gap-2"
                       >
                         <IconCopy className="size-4" />
-                        Copy link
+                        {t("plansPage.reader.copyLink")}
                       </DropdownMenuItem>
                       <DropdownMenuItem asChild className="gap-2">
                         <a
@@ -5874,8 +5381,9 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                           target="_blank"
                           rel="noreferrer"
                         >
+                          {/* guard:allow-large-help-icon - menu action icon */}
                           <IconHelpCircle className="size-4" />
-                          Open docs
+                          {t("plansPage.reader.openDocs")}
                         </a>
                       </DropdownMenuItem>
                       <DropdownMenuItem
@@ -5883,13 +5391,13 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                         className="gap-2"
                       >
                         <IconFileZip className="size-4" />
-                        Download source (.zip)
+                        {t("plansPage.reader.downloadSourceZip")}
                       </DropdownMenuItem>
                       {desktopPlanFilesAvailable && !localPlanMode && (
                         <>
                           <DropdownMenuSeparator />
                           <DropdownMenuLabel className="text-xs font-medium text-muted-foreground">
-                            Local files
+                            {t("plansPage.reader.localFiles")}
                           </DropdownMenuLabel>
                           <DropdownMenuItem
                             onClick={() =>
@@ -5908,8 +5416,8 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                               <IconFolder className="size-4" />
                             )}
                             {desktopPlanFolder
-                              ? "Change local folder"
-                              : "Link local folder"}
+                              ? t("plansPage.reader.changeLocalFolder")
+                              : t("plansPage.reader.linkLocalFolder")}
                           </DropdownMenuItem>
                           <DropdownMenuItem
                             onClick={() =>
@@ -5925,7 +5433,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                             ) : (
                               <IconRefresh className="size-4" />
                             )}
-                            Sync to local folder
+                            {t("plansPage.reader.syncToLocalFolder")}
                           </DropdownMenuItem>
                           <DropdownMenuItem
                             onClick={() =>
@@ -5943,7 +5451,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                             ) : (
                               <IconDownload className="size-4" />
                             )}
-                            Import local edits
+                            {t("plansPage.reader.importLocalEdits")}
                           </DropdownMenuItem>
                           <DropdownMenuCheckboxItem
                             checked={desktopPlanAutoSync}
@@ -5952,14 +5460,14 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                               setDesktopPlanAutoSyncEnabled(checked === true)
                             }
                           >
-                            Auto-sync changes
+                            {t("plansPage.reader.autoSyncChanges")}
                           </DropdownMenuCheckboxItem>
                         </>
                       )}
                       <DropdownMenuSub>
                         <DropdownMenuSubTrigger className="gap-2">
                           <IconDownload className="size-4" />
-                          Export
+                          {t("plansPage.reader.export")}
                         </DropdownMenuSubTrigger>
                         <DropdownMenuSubContent className="w-56 rounded-xl">
                           <DropdownMenuItem
@@ -5969,7 +5477,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                             className="gap-2"
                           >
                             <IconClipboardText className="size-4" />
-                            Copy Markdown
+                            {t("plansPage.reader.copyMarkdown")}
                           </DropdownMenuItem>
                           <DropdownMenuItem
                             onClick={() =>
@@ -5978,14 +5486,14 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                             className="gap-2"
                           >
                             <IconDownload className="size-4" />
-                            Download Markdown
+                            {t("plansPage.reader.downloadMarkdown")}
                           </DropdownMenuItem>
                           <DropdownMenuItem
                             onClick={() => runPlanExportAction(copyPlanHtml)}
                             className="gap-2"
                           >
                             <IconCopy className="size-4" />
-                            Copy HTML
+                            {t("plansPage.reader.copyHtml")}
                           </DropdownMenuItem>
                           <DropdownMenuItem
                             onClick={() =>
@@ -5994,7 +5502,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                             className="gap-2"
                           >
                             <IconDownload className="size-4" />
-                            Download HTML
+                            {t("plansPage.reader.downloadHtml")}
                           </DropdownMenuItem>
                         </DropdownMenuSubContent>
                       </DropdownMenuSub>
@@ -6009,7 +5517,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                             className="gap-2"
                           >
                             <IconClipboardText className="size-4" />
-                            Copy feedback
+                            {t("plansPage.reader.copyFeedback")}
                           </DropdownMenuItem>
                         )}
                     </DropdownMenuGroup>
@@ -6025,7 +5533,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                           className="gap-2 text-destructive focus:text-destructive"
                         >
                           <IconTrash className="size-4" />
-                          Delete...
+                          {t("plansPage.overview.delete")}
                         </DropdownMenuItem>
                       </>
                     )}
@@ -6036,24 +5544,30 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                     <Button
                       type="button"
                       variant="ghost"
-                      size="icon"
-                      className="pointer-events-auto size-8"
+                      size="icon-sm"
+                      className="pointer-events-auto"
                       onClick={togglePlansAgent}
-                      aria-label="Toggle agent sidebar"
+                      aria-label={t("plansPage.reader.toggleAgentSidebar")}
                     >
                       <IconLayoutSidebarRight className="size-4" />
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent>Toggle side chat</TooltipContent>
+                  <TooltipContent>
+                    {t("plansPage.reader.toggleSideChat")}
+                  </TooltipContent>
                 </Tooltip>
               </div>
               {reviewMode !== "none" && !recapScreenshotMode && (
                 <div className="pointer-events-none absolute left-1/2 top-3 z-10 -translate-x-1/2 rounded-full border border-border/70 bg-background/82 px-3 py-2 text-xs text-muted-foreground shadow-2xl backdrop-blur-xl">
                   {reviewMode === "comment"
-                    ? `Click the ${isRecap ? "recap" : "plan"} or select text to comment`
+                    ? t("plansPage.reader.clickToComment", {
+                        noun: isRecap
+                          ? t("plansPage.nouns.recap")
+                          : t("plansPage.nouns.plan"),
+                      })
                     : reviewMode === "text"
-                      ? "Click the canvas to place a note"
-                      : "Drag on the canvas to draw a callout"}
+                      ? t("plansPage.reader.clickCanvasNote")
+                      : t("plansPage.reader.dragCanvasCallout")}
                 </div>
               )}
               {bundle.plan.content ? (
@@ -6119,11 +5633,11 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                           message: buildQuestionFormRevisionMessage(summary),
                         });
                         persistQuestionFormAnswers(summary, bundle.plan.id);
-                        toast.success("Sent answers to the agent");
+                        toast.success(t("plansPage.reader.sentAnswers"));
                       }}
                     />
                   </div>
-                  {nativeSelectionComment && (
+                  {canCommentPlan && nativeSelectionComment && (
                     <div
                       className="absolute z-30"
                       style={{
@@ -6138,7 +5652,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                         onClick={beginNativeSelectionComment}
                       >
                         <IconMessageCircle className="size-4 text-primary" />
-                        Comment
+                        {t("plansPage.comments.comment")}
                       </Button>
                     </div>
                   )}
@@ -6202,7 +5716,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                   )}
                 />
               )}
-              {pendingAnnotation && inlineCommentPosition && (
+              {canCommentPlan && pendingAnnotation && inlineCommentPosition && (
                 <>
                   {pendingMarkerPlacement?.clip ? (
                     <div
@@ -6214,14 +5728,15 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                   ) : (
                     pendingCommentPin
                   )}
-                  {!session ? (
+                  {!session && !localPlanMode ? (
                     <GuestCommentCta
                       position={inlineCommentPosition}
-                      onSignIn={() =>
+                      onSignIn={() => {
+                        fireShareCtaClick("comment_signin");
                         openSignIn(
                           window.location.pathname + window.location.search,
-                        )
-                      }
+                        );
+                      }}
                       onCancel={closeInlineComment}
                     />
                   ) : (
@@ -6244,6 +5759,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                   position={activeAnnotation.position}
                   isPending={commentWritePending}
                   pendingAuthor={pendingCommentAuthor}
+                  canComment={canCommentPlan}
                   canEditRootComment={canEditPlanContent}
                   onSave={(message) =>
                     updateAnnotationComment(
@@ -6286,6 +5802,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                   currentUser={currentCommentAuthor}
                   pendingAuthor={pendingCommentAuthor}
                   isPending={commentWritePending}
+                  canComment={canCommentPlan}
                   onReply={replyToCommentThread}
                   canResolve={canResolveCommentThreads}
                   canDeleteThread={canDeleteCommentThread}
@@ -6328,13 +5845,17 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
             className="space-y-4"
           >
             <DialogHeader>
-              <DialogTitle>Save local plan to repo</DialogTitle>
+              <DialogTitle>
+                {t("plansPage.reader.saveLocalPlanToRepo")}
+              </DialogTitle>
               <DialogDescription>
-                Choose a repo-relative folder for these MDX files.
+                {t("plansPage.reader.chooseRepoFolder")}
               </DialogDescription>
             </DialogHeader>
             <div className="space-y-2">
-              <Label htmlFor="local-plan-repo-path">Repo folder</Label>
+              <Label htmlFor="local-plan-repo-path">
+                {t("plansPage.reader.repoFolder")}
+              </Label>
               <Input
                 id="local-plan-repo-path"
                 value={promoteLocalPlanTargetPath}
@@ -6356,7 +5877,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                   setPromoteLocalPlanOverwrite(checked === true)
                 }
               />
-              Replace existing folder
+              {t("plansPage.reader.replaceExistingFolder")}
             </label>
             <DialogFooter>
               <Button
@@ -6365,7 +5886,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                 onClick={() => setPromoteLocalPlanOpen(false)}
                 disabled={promoteLocalPlan.isPending}
               >
-                Cancel
+                {t("plansPage.common.cancel")}
               </Button>
               <Button
                 type="submit"
@@ -6387,7 +5908,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
       {bundle && (
         <PlanHistorySheet
           planId={bundle.plan.id}
-          open={historyOpen}
+          open={historyOpen && canEditPlanContent}
           onOpenChange={setHistoryOpen}
           canRestore={canEditPlanContent}
         />
@@ -6425,27 +5946,26 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
   );
 }
 
-// Shared copy for the rich access-management share popover. The public note
-// makes clear that anyone-with-link can view, but commenting on a public
-// plan/recap still needs an agent-native account (comments are attributed +
-// scoped). `noun` is "plan" or "recap" so recaps read as recaps everywhere.
-const buildShareVisibilityCopy = (noun: string) => ({
+const buildShareVisibilityCopy = (
+  t: ReturnType<typeof useT>,
+  noun: string,
+) => ({
   private: {
-    label: "Private",
-    description: `Only invited people can open this ${noun}`,
+    label: t("plansPage.share.visibility.private.label"),
+    description: t("plansPage.share.visibility.private.description", { noun }),
   },
   org: {
-    label: "Organization",
-    description: "Anyone in your organization with the link can view",
+    label: t("plansPage.share.visibility.org.label"),
+    description: t("plansPage.share.visibility.org.description"),
   },
   public: {
-    label: "Public",
-    description: "Anyone with the link can view",
+    label: t("plansPage.share.visibility.public.label"),
+    description: t("plansPage.share.visibility.public.description"),
   },
 });
 
-const buildShareAccessNote = (noun: string) =>
-  `Anyone with edit access can change the ${noun}. Viewing a public ${noun} needs no account, but commenting on it requires an agent-native account.`;
+const buildShareAccessNote = (t: ReturnType<typeof useT>, noun: string) =>
+  t("plansPage.share.accessNote", { noun });
 
 function PlanReportControl({
   planId,
@@ -6458,6 +5978,7 @@ function PlanReportControl({
   isRecap?: boolean;
   onOpenChange?: (open: boolean) => void;
 }) {
+  const t = useT();
   const noun = isRecap ? "recap" : "plan";
   const reportPlan = useReportVisualPlan();
   const [open, setOpen] = useState(false);
@@ -6509,22 +6030,24 @@ function PlanReportControl({
           <Button
             type="button"
             variant="ghost"
-            size="icon"
-            className="pointer-events-auto size-8"
+            size="icon-sm"
+            className="pointer-events-auto"
             onClick={() => setDialogOpen(true)}
-            aria-label={`Report ${noun}`}
+            aria-label={t("plansPage.report.reportAria", { noun })}
           >
             <IconFlag className="size-4" />
           </Button>
         </TooltipTrigger>
-        <TooltipContent>Report {noun}</TooltipContent>
+        <TooltipContent>
+          {t("plansPage.report.report", { noun })}
+        </TooltipContent>
       </Tooltip>
       <DialogContent className="sm:max-w-[460px]">
         <form onSubmit={submitReport} className="space-y-4">
           <DialogHeader>
-            <DialogTitle>Report {noun}</DialogTitle>
+            <DialogTitle>{t("plansPage.report.report", { noun })}</DialogTitle>
             <DialogDescription>
-              Tell us why this public {noun} should be reviewed.
+              {t("plansPage.report.description", { noun })}
             </DialogDescription>
           </DialogHeader>
 
@@ -6533,7 +6056,9 @@ function PlanReportControl({
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="plan-report-reason">Reason</Label>
+            <Label htmlFor="plan-report-reason">
+              {t("plansPage.report.reason")}
+            </Label>
             <Select
               value={reason}
               onValueChange={(value) => setReason(value as PlanReportReason)}
@@ -6544,7 +6069,7 @@ function PlanReportControl({
               <SelectContent>
                 {REPORT_REASON_OPTIONS.map((option) => (
                   <SelectItem key={option.value} value={option.value}>
-                    {option.label}
+                    {t(`plansPage.report.reasons.${option.value}`)}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -6553,7 +6078,9 @@ function PlanReportControl({
 
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-3">
-              <Label htmlFor="plan-report-details">Details</Label>
+              <Label htmlFor="plan-report-details">
+                {t("plansPage.report.details")}
+              </Label>
               <span className="text-xs text-muted-foreground">
                 {details.length}/1000
               </span>
@@ -6563,7 +6090,7 @@ function PlanReportControl({
               value={details}
               onChange={(event) => setDetails(event.target.value)}
               maxLength={1000}
-              placeholder="Add a short note for moderators"
+              placeholder={t("plansPage.report.detailsPlaceholder")}
               className="min-h-28 resize-none"
             />
           </div>
@@ -6575,18 +6102,18 @@ function PlanReportControl({
               onClick={() => setDialogOpen(false)}
               disabled={reportPlan.isPending}
             >
-              Cancel
+              {t("plansPage.common.cancel")}
             </Button>
             <Button type="submit" disabled={reportPlan.isPending}>
               {reportPlan.isPending ? (
                 <>
                   <IconLoader2 className="size-4 animate-spin" />
-                  Sending
+                  {t("plansPage.reader.sending")}
                 </>
               ) : (
                 <>
                   <IconFlag className="size-4" />
-                  Submit report
+                  {t("plansPage.report.submit")}
                 </>
               )}
             </Button>
@@ -6597,14 +6124,6 @@ function PlanReportControl({
   );
 }
 
-/**
- * Share affordance for a plan. People with a session (logged in, or local dev
- * identity) get the full access-management popover immediately. People in
- * local/no-account mode get a "Create shareable link" step first: clicking it
- * publishes the plan to a hosted, shareable URL — creating a lazy account /
- * signing in along the way when the server reports `needsAuth` — and then
- * swaps in the same rich sharing menu.
- */
 function PlanShareControl({
   planId,
   planTitle,
@@ -6612,6 +6131,8 @@ function PlanShareControl({
   localShareUrl,
   hostedPlanId,
   hostedPlanUrl,
+  firstShare = false,
+  onShareSuccess,
   onOpenChange,
 }: {
   planId: string;
@@ -6620,8 +6141,11 @@ function PlanShareControl({
   localShareUrl?: string;
   hostedPlanId?: string | null;
   hostedPlanUrl?: string | null;
+  firstShare?: boolean;
+  onShareSuccess?: () => void;
   onOpenChange?: (open: boolean) => void;
 }) {
+  const t = useT();
   const noun = isRecap ? "recap" : "plan";
   const Noun = isRecap ? "Recap" : "Plan";
   const { session, isLoading: sessionLoading } = useSession();
@@ -6661,7 +6185,7 @@ function PlanShareControl({
       : planId;
   const managedShareUrl =
     effectivePublishedUrl && hostedPlanOnCurrentOrigin
-      ? effectivePublishedUrl
+      ? withPlanShareAttribution(effectivePublishedUrl, session?.userId ?? null)
       : localShareUrl;
 
   useEffect(() => {
@@ -6671,19 +6195,25 @@ function PlanShareControl({
   }, [planId]);
 
   const openAuthFlow = useCallback((authUrl?: string) => {
-    const returnPath = `${window.location.pathname}${window.location.search}`;
-    const target =
-      authUrl ||
-      `${agentNativePath("/_agent-native/sign-in")}?return=${encodeURIComponent(returnPath)}`;
-    window.location.href = target;
+    window.location.href = authUrl || buildSignInReturnHref();
   }, []);
 
-  const copyPublishedUrl = useCallback((url: string) => {
-    void navigator.clipboard.writeText(url).then(
-      () => toast.success("Shareable link copied"),
-      () => toast.error("Could not copy link"),
-    );
-  }, []);
+  const copyPublishedUrl = useCallback(
+    async (url: string) => {
+      try {
+        if (!(await writeClipboardText(url))) {
+          toast.error(t("plansPage.share.copyFailed"));
+          return false;
+        }
+        toast.success(t("plansPage.share.linkCopied"));
+        return true;
+      } catch {
+        toast.error(t("plansPage.share.copyFailed"));
+        return false;
+      }
+    },
+    [t],
+  );
 
   const handlePublish = useCallback(() => {
     publishPlan.mutate(
@@ -6695,44 +6225,69 @@ function PlanShareControl({
               authUrl: result.authUrl,
               connectCommand: result.connectCommand,
             });
-            toast.message(`Create a free account to publish this ${noun}`);
+            toast.message(
+              t("plansPage.share.createAccountToPublish", { noun }),
+            );
             return;
           }
           setPublishedPlan({
             url: result.hostedPlanUrl ?? result.url,
             hostedPlanId: result.hostedPlanId,
           });
+          onShareSuccess?.();
           setAuthPrompt(null);
-          copyPublishedUrl(result.hostedPlanUrl ?? result.url);
+          copyPublishedUrl(
+            withPlanShareAttribution(
+              result.hostedPlanUrl ?? result.url,
+              session?.userId ?? null,
+            ) ??
+              result.hostedPlanUrl ??
+              result.url,
+          );
         },
       },
     );
-  }, [copyPublishedUrl, planId, publishPlan]);
+  }, [copyPublishedUrl, onShareSuccess, planId, publishPlan, session?.userId]);
 
-  // Logged-in / local-dev: manage shares for the plan in this app instance.
   if (canManageLocalShares) {
     if (!managedShareUrl) return null;
-    return (
+    const shareButton = (
       <ShareButton
         resourceType="plan"
         resourceId={managedShareResourceId}
         resourceTitle={planTitle}
         shareUrl={managedShareUrl}
-        shareUrlLabel={`${Noun} link`}
-        shareUrlDescription="Private by default. Invite people, share with your org, or set Public for anyone-with-link review."
+        shareUrlLabel={t("plansPage.share.linkLabel", { noun: Noun })}
+        shareUrlDescription={t("plansPage.share.description")}
         shareUrlPlacement="top"
-        peopleAccessLabel={`People with ${noun} access`}
-        generalAccessLabel={`General ${noun} access`}
-        accessNote={buildShareAccessNote(noun)}
-        visibilityCopy={buildShareVisibilityCopy(noun)}
-        trigger="icon"
-        triggerClassName="pointer-events-auto size-8"
+        peopleAccessLabel={t("plansPage.share.peopleAccess", { noun })}
+        generalAccessLabel={t("plansPage.share.generalAccess", { noun })}
+        roleCopy={{
+          commenter: {
+            label: t("plansPage.share.commenterRoleLabel"),
+            description: t("plansPage.share.commenterRoleDescription"),
+          },
+        }}
+        accessNote={buildShareAccessNote(t, noun)}
+        visibilityCopy={buildShareVisibilityCopy(t, noun)}
+        triggerClassName="pointer-events-auto h-8 px-2"
         onOpenChange={onOpenChange}
+        onShareSuccess={onShareSuccess}
       />
+    );
+    return session?.userId ? (
+      <PlanInviteSuggestion
+        key={session.userId}
+        userId={session.userId}
+        firstShare={firstShare}
+      >
+        {shareButton}
+      </PlanInviteSuggestion>
+    ) : (
+      shareButton
     );
   }
 
-  // No account yet: publish-to-share step, anchored to the Share button.
   return (
     <Popover
       open={publishOpen}
@@ -6742,22 +6297,13 @@ function PlanShareControl({
         if (!open) setAuthPrompt(null);
       }}
     >
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <PopoverTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="pointer-events-auto size-8"
-              aria-label={`Share ${noun}`}
-            >
-              <IconShare3 className="size-4" />
-            </Button>
-          </PopoverTrigger>
-        </TooltipTrigger>
-        <TooltipContent>Share {noun}</TooltipContent>
-      </Tooltip>
+      <PopoverTrigger asChild>
+        <ShareTrigger
+          label={t("plansPage.share.share", { noun })}
+          aria-label={t("plansPage.share.shareAria", { noun })}
+          className="pointer-events-auto"
+        />
+      </PopoverTrigger>
       <PopoverContent
         align="end"
         sideOffset={6}
@@ -6765,19 +6311,18 @@ function PlanShareControl({
       >
         <div className="mb-1 flex items-center gap-2 text-sm font-semibold">
           <IconWorld className="size-4 text-muted-foreground" />
-          Share this {noun}
+          {t("plansPage.share.shareThis", { noun })}
         </div>
         <p className="mb-3 text-xs leading-5 text-muted-foreground">
           {effectivePublishedUrl
-            ? `This local ${noun} has a hosted copy for sharing. Open the hosted ${noun} to manage access.`
-            : `Create a free account to publish this ${noun} to a shareable link. You can keep editing locally with your coding agent until you do.`}
+            ? t("plansPage.share.hostedCopy", { noun })
+            : t("plansPage.share.publishDescription", { noun })}
         </p>
 
         {authPrompt ? (
           <div className="space-y-3">
             <div className="rounded-md border border-border bg-muted/35 p-3 text-xs leading-5 text-muted-foreground">
-              Finish creating your account, then come back and we will generate
-              the link.
+              {t("plansPage.share.finishAccount")}
             </div>
             {authPrompt.connectCommand ? (
               <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-2.5 py-1.5 font-mono text-[11px] text-foreground">
@@ -6795,10 +6340,10 @@ function PlanShareControl({
                 {publishPlan.isPending ? (
                   <>
                     <IconLoader2 className="size-3.5 animate-spin" />
-                    Checking
+                    {t("plansPage.share.checking")}
                   </>
                 ) : (
-                  "I'm signed in — retry"
+                  t("plansPage.share.signedInRetry")
                 )}
               </Button>
               <Button
@@ -6806,28 +6351,22 @@ function PlanShareControl({
                 size="sm"
                 onClick={() => openAuthFlow(authPrompt.authUrl)}
               >
-                Create account
+                {t("plansPage.loadError.createAccount")}
               </Button>
             </div>
           </div>
         ) : effectivePublishedUrl ? (
           <div className="space-y-3">
-            <div className="flex min-w-0 items-center gap-2 rounded-md border border-border bg-muted/35 px-2.5 py-2">
-              <IconLink className="size-4 shrink-0 text-muted-foreground" />
-              <span className="min-w-0 truncate text-xs text-muted-foreground">
-                {effectivePublishedUrl}
-              </span>
-            </div>
+            <ShareCopyRow
+              value={effectivePublishedUrl}
+              label={t("plansPage.share.linkLabel", { noun: Noun })}
+              description={t("plansPage.share.hostedCopy", { noun })}
+              copyLabel={t("plansPage.loggedOut.copy")}
+              copiedLabel={t("plansPage.loggedOut.copied")}
+              onCopy={copyPublishedUrl}
+              className="rounded-md border border-border bg-muted/35 px-2.5 py-2"
+            />
             <div className="flex flex-wrap items-center justify-end gap-2">
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                onClick={() => copyPublishedUrl(effectivePublishedUrl)}
-              >
-                <IconCopy className="size-3.5" />
-                Copy
-              </Button>
               <Button
                 type="button"
                 size="sm"
@@ -6838,13 +6377,10 @@ function PlanShareControl({
                 {publishPlan.isPending ? (
                   <>
                     <IconLoader2 className="size-3.5 animate-spin" />
-                    Updating
+                    {t("plansPage.share.updating")}
                   </>
                 ) : (
-                  <>
-                    <IconRefresh className="size-3.5" />
-                    Update link
-                  </>
+                  t("plansPage.share.updateLink")
                 )}
               </Button>
               <Button type="button" size="sm" asChild>
@@ -6853,8 +6389,7 @@ function PlanShareControl({
                   target="_blank"
                   rel="noreferrer"
                 >
-                  <IconExternalLink className="size-3.5" />
-                  Open hosted plan
+                  {t("plansPage.share.openHostedPlan")}
                 </a>
               </Button>
             </div>
@@ -6869,13 +6404,10 @@ function PlanShareControl({
             {publishPlan.isPending ? (
               <>
                 <IconLoader2 className="size-4 animate-spin" />
-                Creating link
+                {t("plansPage.share.creatingLink")}
               </>
             ) : (
-              <>
-                <IconLink className="size-4" />
-                Create shareable link
-              </>
+              t("plansPage.share.createShareableLink")
             )}
           </Button>
         )}
@@ -6884,18 +6416,227 @@ function PlanShareControl({
   );
 }
 
+function PlanInviteSuggestion({
+  userId,
+  firstShare,
+  children,
+}: {
+  userId: string;
+  firstShare: boolean;
+  children: ReactNode;
+}) {
+  const { org, isOwner, canInviteMembers, isLoading } = useOrgRole();
+  const email = org?.email ?? "";
+  const emailParts = email.trim().toLowerCase().split("@");
+  const domain = emailParts[emailParts.length - 1] ?? "";
+  const canOfferDomainJoin =
+    isOwner &&
+    !org?.allowedDomain &&
+    domain.length > 0 &&
+    !isFreeEmailProvider(domain);
+
+  if (isLoading) return <div className="inline-flex">{children}</div>;
+  if (!canInviteMembers) return <div className="inline-flex">{children}</div>;
+
+  if (canOfferDomainJoin) {
+    return (
+      <PlanDomainInviteSuggestion
+        userId={userId}
+        orgId={org?.orgId ?? ""}
+        email={email}
+        domain={domain}
+        firstShare={firstShare}
+      >
+        {children}
+      </PlanDomainInviteSuggestion>
+    );
+  }
+
+  return (
+    <PlanInviteSuggestionCard
+      userId={userId}
+      firstShare={firstShare}
+      domain={null}
+    >
+      {children}
+    </PlanInviteSuggestionCard>
+  );
+}
+
+function PlanDomainInviteSuggestion({
+  userId,
+  orgId,
+  email,
+  domain,
+  firstShare,
+  children,
+}: {
+  userId: string;
+  orgId: string;
+  email: string;
+  domain: string;
+  firstShare: boolean;
+  children: ReactNode;
+}) {
+  const membersQuery = useQuery({
+    queryKey: ["plan-domain-coworker", orgId, email.toLowerCase(), domain],
+    queryFn: ({ signal }) =>
+      hasSameDomainCoworkerInPages(email, (offset) =>
+        fetchOrgMemberPage({ search: domain, limit: 100, offset, signal }),
+      ),
+    enabled: Boolean(orgId),
+  });
+
+  return (
+    <PlanInviteSuggestionCard
+      userId={userId}
+      firstShare={firstShare}
+      domain={membersQuery.data ? domain : null}
+    >
+      {children}
+    </PlanInviteSuggestionCard>
+  );
+}
+
+function PlanInviteSuggestionCard({
+  userId,
+  firstShare,
+  domain,
+  children,
+}: {
+  userId: string;
+  firstShare: boolean;
+  domain: string | null;
+  children: ReactNode;
+}) {
+  const t = useT();
+  const navigate = useNavigate();
+  const setOrgDomain = useSetOrgDomain();
+  const reason = firstShare
+    ? "first_share"
+    : domain
+      ? "same_domain_coworkers"
+      : null;
+  const storageKey = `plan.invite-suggestion.shown.v1.${userId}`;
+  const shownRef = useRef(false);
+  const actionCloseRef = useRef(false);
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || shownRef.current || !reason) return;
+    try {
+      if (window.localStorage.getItem(storageKey)) {
+        shownRef.current = true;
+        return;
+      }
+      window.localStorage.setItem(storageKey, "1");
+    } catch (error) {
+      console.warn(
+        "Plan invite suggestion skipped because local storage is unavailable.",
+        error,
+      );
+      return;
+    }
+    shownRef.current = true;
+    setVisible(true);
+    trackAnonymousEvent("plan_invite_suggestion_shown", { trigger: reason });
+  }, [reason, storageKey]);
+
+  const trackAction = (event: string, action?: string) => {
+    if (!reason) return;
+    trackAnonymousEvent(event, {
+      trigger: reason,
+      ...(action ? { action } : {}),
+    });
+  };
+
+  const inviteTeammates = () => {
+    trackAction("plan_invite_suggestion_clicked", "invite_teammates");
+    trackAction("plan_invite_suggestion_accepted", "invite_teammates");
+    actionCloseRef.current = true;
+    setVisible(false);
+    navigate("/settings#team");
+  };
+
+  const enableDomainJoin = async () => {
+    if (!domain || setOrgDomain.isPending) return;
+    trackAction("plan_invite_suggestion_clicked", "enable_domain_join");
+    try {
+      await setOrgDomain.mutateAsync(domain);
+    } catch {
+      toast.error(t("plansPage.share.teammateSuggestion.enableFailed"));
+      return;
+    }
+    trackAction("plan_invite_suggestion_accepted", "enable_domain_join");
+    actionCloseRef.current = true;
+    setVisible(false);
+  };
+
+  return (
+    <Popover
+      open={visible}
+      onOpenChange={(open) => {
+        if (!open && visible) {
+          if (!actionCloseRef.current) {
+            trackAction("plan_invite_suggestion_dismissed");
+          }
+          actionCloseRef.current = false;
+        }
+        setVisible(open);
+      }}
+    >
+      <PopoverAnchor asChild>
+        <div className="inline-flex">{children}</div>
+      </PopoverAnchor>
+      {visible && (
+        <PopoverContent
+          align="end"
+          side="bottom"
+          sideOffset={8}
+          className="flex w-[min(360px,calc(100vw-1.5rem))] flex-wrap items-center gap-2"
+        >
+          <p className="px-1 text-xs text-muted-foreground">
+            {t("plansPage.share.teammateSuggestion.message")}
+          </p>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            onClick={inviteTeammates}
+          >
+            {t("plansPage.share.teammateSuggestion.invite")}
+          </Button>
+          {domain && (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={enableDomainJoin}
+              disabled={setOrgDomain.isPending}
+            >
+              {t("plansPage.share.teammateSuggestion.enableDomain", {
+                domain,
+              })}
+            </Button>
+          )}
+        </PopoverContent>
+      )}
+    </Popover>
+  );
+}
+
 function PlanSkeleton({ isRecap = false }: { isRecap?: boolean }) {
-  // Recaps are document-only review surfaces that almost never use the top
-  // canvas, so skip the canvas placeholder for them while keeping it for plans.
+  const t = useT();
+  const loadingLabel = isRecap
+    ? t("plansPage.skeleton.loadingRecap")
+    : t("plansPage.skeleton.loadingPlan");
   return (
     <div
       className="plan-content-surface h-full min-h-0 overflow-auto bg-plan-document text-plan-text"
       role="status"
-      aria-label={isRecap ? "Loading recap" : "Loading plan"}
+      aria-label={loadingLabel}
     >
-      <span className="sr-only">
-        {isRecap ? "Loading recap" : "Loading plan"}
-      </span>
+      <span className="sr-only">{loadingLabel}</span>
       {!isRecap && <PlanCanvasSkeleton />}
       <PlanDocumentSkeleton />
     </div>
@@ -6928,11 +6669,11 @@ const PLAN_SKELETON_FILL = {
 function PlanCanvasSkeleton() {
   return (
     <section
-      className="plan-canvas relative h-[65vh] overflow-hidden border-b border-plan-line"
+      className="plan-canvas relative flex min-h-[65vh] flex-col overflow-hidden border-b border-plan-line"
       aria-hidden="true"
     >
       <div
-        className="plan-canvas-viewport absolute inset-0"
+        className="plan-canvas-grid absolute inset-0"
         style={{
           backgroundPosition: "96px 64px",
           backgroundSize: "20px 20px",
@@ -6948,13 +6689,17 @@ function PlanCanvasSkeleton() {
         <PlanSkeletonIcon />
       </div>
 
-      <div className="absolute inset-x-4 bottom-20 top-24 mx-auto flex max-w-5xl items-center gap-7 overflow-hidden px-1 sm:px-6">
-        <div className="min-w-0 flex-[1_1_44rem]">
-          <DesktopArtboardSkeleton />
-        </div>
+      {/* Normal flow + flex-1 so the canvas grows to contain the artboards on
+          short viewports (the surface scrolls) instead of clipping them. */}
+      <div className="relative z-0 flex flex-1 items-center justify-center px-4 py-16 sm:px-6">
+        <div className="mx-auto flex w-full max-w-5xl items-center gap-7">
+          <div className="min-w-0 flex-[1_1_44rem]">
+            <DesktopArtboardSkeleton />
+          </div>
 
-        <div className="hidden w-[15rem] shrink-0 lg:block">
-          <PhoneArtboardSkeleton />
+          <div className="hidden w-[15rem] shrink-0 lg:block">
+            <PhoneArtboardSkeleton />
+          </div>
         </div>
       </div>
 
@@ -7032,7 +6777,7 @@ function PlanDocumentSkeleton() {
 
 function DesktopArtboardSkeleton() {
   return (
-    <div className="h-[20rem] overflow-hidden rounded-[12px] border border-plan-line bg-plan-wireframe p-6 shadow-[0_10px_34px_rgba(24,24,27,0.08)] sm:h-[23rem] sm:p-8">
+    <div className="h-[20rem] overflow-hidden rounded-[12px] border border-plan-line bg-muted p-6 shadow-[0_10px_34px_rgba(24,24,27,0.08)] sm:h-[23rem] sm:p-8">
       <Skeleton
         className="h-14 w-2/5 max-w-[20rem] rounded-lg"
         style={PLAN_SKELETON_FILL.heading}
@@ -7051,7 +6796,7 @@ function DesktopArtboardSkeleton() {
 
 function PhoneArtboardSkeleton() {
   return (
-    <div className="h-[22rem] overflow-hidden rounded-[26px] border border-plan-line bg-plan-wireframe p-5 shadow-[0_10px_34px_rgba(24,24,27,0.08)]">
+    <div className="h-[22rem] overflow-hidden rounded-[26px] border border-plan-line bg-muted p-5 shadow-[0_10px_34px_rgba(24,24,27,0.08)]">
       <PlanSkeletonBox className="h-28" />
       <div className="mt-5 space-y-3">
         <PlanSkeletonBar className="h-3 w-full" />
@@ -7095,6 +6840,7 @@ function ReviewMarkupToolbar({
   mode: CanvasMarkupMode;
   onModeChange: (mode: CanvasMarkupMode) => void;
 }) {
+  const t = useT();
   const value = mode === "comment" ? "comment" : "";
   const setValue = (next: string) => {
     onModeChange(next === "comment" ? "comment" : "none");
@@ -7107,23 +6853,58 @@ function ReviewMarkupToolbar({
       variant="default"
       size="sm"
       className="pointer-events-auto gap-0.5 rounded-md border border-border/60 bg-background/55 p-0.5"
-      aria-label="Review markup tools"
+      aria-label={t("plansPage.reader.reviewMarkupTools")}
     >
       <Tooltip>
         <TooltipTrigger asChild>
           <ToggleGroupItem
             value="comment"
             className="size-7 px-0"
-            aria-label={mode === "comment" ? "Stop commenting" : "Comment"}
+            aria-label={
+              mode === "comment"
+                ? t("plansPage.reader.stopCommenting")
+                : t("plansPage.comments.comment")
+            }
           >
             <IconMessageCircle className="size-4" />
           </ToggleGroupItem>
         </TooltipTrigger>
         <TooltipContent>
-          {mode === "comment" ? "Stop commenting" : "Pin a comment"}
+          {mode === "comment"
+            ? t("plansPage.reader.stopCommenting")
+            : t("plansPage.reader.pinComment")}
         </TooltipContent>
       </Tooltip>
     </ToggleGroup>
+  );
+}
+
+function PlanErrorFeedbackActions({
+  title,
+  message,
+  status,
+  extraDebug,
+}: {
+  title: string;
+  message: string;
+  status?: number;
+  extraDebug?: ErrorReportDebugItem[];
+}) {
+  const t = useT();
+  return (
+    <ErrorReportActions
+      appName="Plan"
+      title={title}
+      details={message}
+      status={status}
+      issueTitle={`Plan error: ${title}`}
+      feedbackLabel={t("plansPage.loadError.sendFeedback")}
+      feedbackPlaceholder={t("plansPage.loadError.feedbackPlaceholder")}
+      githubLabel={t("plansPage.loadError.openGitHubIssue")}
+      align="start"
+      className="justify-start"
+      extraDebug={extraDebug}
+    />
   );
 }
 
@@ -7136,10 +6917,12 @@ function LocalPlanLoadError({
   slug: string;
   onRetry: () => void;
 }) {
+  const t = useT();
   const message =
     error instanceof Error && error.message
       ? error.message.replace(/^Action [\w-]+ failed:\s*/, "")
-      : `The local plan folder "${slug}" could not be read.`;
+      : t("plansPage.localPlanLoadError.message", { slug });
+  const title = t("plansPage.localPlanLoadError.title");
 
   return (
     <div className="flex min-h-0 flex-1 items-center justify-center px-6 py-12">
@@ -7149,21 +6932,88 @@ function LocalPlanLoadError({
             <IconAlertTriangle className="size-5" />
           </div>
           <div>
-            <h1 className="text-lg font-semibold tracking-tight">
-              Local plan not found
-            </h1>
+            <h1 className="text-lg font-semibold tracking-tight">{title}</h1>
             <p className="mt-1 text-sm text-muted-foreground">{message}</p>
           </div>
         </div>
         <div className="mt-5 flex flex-wrap gap-2">
           <Button type="button" variant="outline" onClick={onRetry}>
-            <IconRefresh className="mr-2 size-4" />
-            Retry
+            <IconRefresh className="me-2 size-4" />
+            {t("plansPage.loadError.retry")}
           </Button>
           <Button asChild type="button" variant="ghost">
             <Link to="/plans">
-              <IconArrowLeft className="mr-2 size-4" />
-              Plans
+              <IconArrowLeft className="me-2 size-4 rtl:-scale-x-100" />
+              {t("plansPage.overview.title")}
+            </Link>
+          </Button>
+        </div>
+        <div className="mt-4 border-t border-border/70 pt-3">
+          <PlanErrorFeedbackActions
+            title={title}
+            message={message}
+            extraDebug={[
+              { label: "Local plan slug", value: slug }, // i18n-ignore debug label
+            ]}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LocalPlanConnection({
+  permissionState,
+  onConnect,
+  onRetry,
+}: {
+  permissionState: "prompt" | "denied";
+  onConnect: () => void;
+  onRetry: () => void;
+}) {
+  const t = useT();
+  const denied = permissionState === "denied";
+  return (
+    <div className="flex min-h-0 flex-1 items-center justify-center px-6 py-12">
+      <div className="w-full max-w-xl rounded-xl border border-border bg-background p-6 shadow-sm">
+        <div className="flex items-center gap-3">
+          <div className="flex size-10 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+            <IconLink className="size-5" />
+          </div>
+          <div>
+            <h1 className="text-lg font-semibold tracking-tight">
+              {t(
+                denied
+                  ? "plansPage.localPlanConnection.deniedTitle"
+                  : "plansPage.localPlanConnection.promptTitle",
+              )}
+            </h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {t(
+                denied
+                  ? "plansPage.localPlanConnection.deniedMessage"
+                  : "plansPage.localPlanConnection.promptMessage",
+              )}
+            </p>
+          </div>
+        </div>
+        <div className="mt-5 flex flex-wrap gap-2">
+          <Button
+            type="button"
+            variant={denied ? "outline" : "default"}
+            onClick={denied ? onRetry : onConnect}
+          >
+            {denied ? <IconRefresh /> : <IconLink />}
+            {t(
+              denied
+                ? "plansPage.localPlanConnection.checkAgain"
+                : "plansPage.localPlanConnection.connect",
+            )}
+          </Button>
+          <Button asChild type="button" variant="ghost">
+            <Link to="/plans">
+              <IconArrowLeft className="rtl:-scale-x-100" />
+              {t("plansPage.overview.title")}
             </Link>
           </Button>
         </div>
@@ -7172,8 +7022,9 @@ function LocalPlanLoadError({
   );
 }
 
-function PlanLoadError({
+export function PlanLoadError({
   error,
+  planId,
   accessStatus,
   onRetry,
   onSignIn,
@@ -7184,6 +7035,7 @@ function PlanLoadError({
   viewerEmail,
 }: {
   error?: unknown;
+  planId?: string | null;
   accessStatus?: PlanAccessStatusResponse | null;
   onRetry: () => void;
   onSignIn: () => void;
@@ -7191,22 +7043,29 @@ function PlanLoadError({
   onRequestAccess: () => void;
   requestAccessPending?: boolean;
   accessRequestSent?: boolean;
-  /** The signed-in identity for THIS origin, or null when anonymous. */
   viewerEmail?: string | null;
 }) {
+  const t = useT();
   const [emailOpen, setEmailOpen] = useState(false);
+  const [switchAccountOpen, setSwitchAccountOpen] = useState(false);
   const [emailMode, setEmailMode] = useState<"sign-in" | "create">("sign-in");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [emailAuthError, setEmailAuthError] = useState<string | null>(null);
   const [emailAuthNotice, setEmailAuthNotice] = useState<string | null>(null);
   const [emailAuthPending, setEmailAuthPending] = useState(false);
+  const [verificationResendPending, setVerificationResendPending] =
+    useState(false);
+  const [verificationResendMessage, setVerificationResendMessage] = useState<{
+    kind: "success" | "error";
+    text: string;
+  } | null>(null);
   const [googlePending, setGooglePending] = useState(false);
 
   const message =
     error instanceof Error && error.message
       ? error.message.replace(/^Action [\w-]+ failed:\s*/, "")
-      : "This plan could not be loaded from the current session.";
+      : t("plansPage.loadError.genericMessage");
   const status =
     error && typeof error === "object" && "status" in error
       ? (error as { status?: number }).status
@@ -7224,15 +7083,14 @@ function PlanLoadError({
   const orgName = accessStatus?.orgName?.trim() || null;
   const orgAccessBody =
     orgName && accessStatus?.visibility === "org"
-      ? `This plan belongs to ${orgName}. You need to be a member of ${orgName} to view it.`
+      ? t("plansPage.loadError.orgBody", { orgName })
       : null;
   const orgAccessTitle =
     orgName && accessStatus?.visibility === "org"
-      ? `Join ${orgName} to view this plan`
+      ? t("plansPage.loadError.orgTitle", { orgName })
       : null;
 
-  const returnPath = () =>
-    window.location.pathname + window.location.search + window.location.hash;
+  const returnPath = () => appPath(planReturnPathFromLocation(window.location));
 
   const readAuthError = async (res: Response, fallback: string) => {
     const data = (await res.json().catch(() => null)) as {
@@ -7242,10 +7100,50 @@ function PlanLoadError({
     return data?.error ?? data?.message ?? fallback;
   };
 
+  const resendVerificationEmail = async () => {
+    const normalizedEmail = email.trim();
+    if (!normalizedEmail || verificationResendPending) return;
+    setVerificationResendPending(true);
+    setVerificationResendMessage(null);
+    try {
+      const response = await fetch(
+        agentNativePath("/_agent-native/auth/ba/send-verification-email"),
+        {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email: normalizedEmail,
+            callbackURL: buildPlanEmailVerificationCallbackURL(window.location),
+          }),
+        },
+      );
+      setVerificationResendMessage(
+        response.ok
+          ? {
+              kind: "success",
+              text: t("plansPage.loadError.verificationEmailResent"),
+            }
+          : {
+              kind: "error",
+              text: t("plansPage.loadError.verificationEmailFailed"),
+            },
+      );
+    } catch {
+      setVerificationResendMessage({
+        kind: "error",
+        text: t("plansPage.loadError.verificationEmailFailed"),
+      });
+    } finally {
+      setVerificationResendPending(false);
+    }
+  };
+
   const submitEmailAuth = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setEmailAuthError(null);
     setEmailAuthNotice(null);
+    setVerificationResendMessage(null);
     setEmailAuthPending(true);
     const body = {
       email,
@@ -7259,12 +7157,20 @@ function PlanLoadError({
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
+            body: JSON.stringify({
+              ...body,
+              callbackURL: buildPlanEmailVerificationCallbackURL(
+                window.location,
+              ),
+            }),
           },
         );
         if (!registerRes.ok) {
           throw new Error(
-            await readAuthError(registerRes, "Could not create account."),
+            await readAuthError(
+              registerRes,
+              t("plansPage.loadError.createAccountFailed"),
+            ),
           );
         }
       }
@@ -7278,7 +7184,10 @@ function PlanLoadError({
       );
       if (!loginRes.ok) {
         throw new Error(
-          await readAuthError(loginRes, "Could not sign in with email."),
+          await readAuthError(
+            loginRes,
+            t("plansPage.loadError.emailSignInFailed"),
+          ),
         );
       }
       window.location.assign(returnPath());
@@ -7286,11 +7195,10 @@ function PlanLoadError({
       const next =
         authError instanceof Error
           ? authError.message
-          : "Could not sign in with email.";
-      if (/not verified|verification/i.test(next)) {
-        setEmailAuthNotice(
-          "Check your email to verify the account, then reopen this link.",
-        );
+          : t("plansPage.loadError.emailSignInFailed");
+      if (isPlanEmailVerificationPendingMessage(next)) {
+        setEmailMode("sign-in");
+        setEmailAuthNotice(t("plansPage.loadError.verifyEmail"));
       } else {
         setEmailAuthError(next);
       }
@@ -7309,27 +7217,26 @@ function PlanLoadError({
   };
 
   const title = planMissing
-    ? "Plan not found"
+    ? t("plansPage.loadError.notFoundTitle")
     : showAccessHelp
       ? signedIn
-        ? (orgAccessTitle ?? "Request access to this plan")
-        : "Sign in to view this plan"
-      : "Plan did not load";
+        ? (orgAccessTitle ?? t("plansPage.loadError.requestAccessTitle"))
+        : t("plansPage.loadError.signInTitle")
+      : t("plansPage.loadError.didNotLoadTitle");
   const body = planMissing
-    ? "This plan does not exist, or it belongs to another organization and you need access."
+    ? t("plansPage.loadError.notFoundBody")
     : showAccessHelp
       ? orgAccessBody
         ? orgAccessBody
         : signedIn
           ? planExists
-            ? "This plan exists, but this account does not have access to view it."
-            : "This plan may belong to another organization, or this account may not have access."
-          : "This plan is private. Sign in with an account that has access."
+            ? t("plansPage.loadError.noAccessBody")
+            : t("plansPage.loadError.maybeOtherOrgBody")
+          : t("plansPage.loadError.privateBody")
       : message;
-
   return (
     <div className="flex h-full flex-col items-center justify-center bg-background p-8">
-      <div className="w-full max-w-md rounded-lg border border-border bg-background p-5 text-left shadow-sm">
+      <div className="w-full max-w-sm rounded-xl border border-border bg-background p-6 text-start shadow-sm">
         <div className={cn("flex items-start", !showAccessHelp && "gap-3")}>
           {!showAccessHelp && !planMissing && (
             <div className="flex size-10 shrink-0 items-center justify-center rounded-lg border border-amber-500/25 bg-amber-500/10 text-amber-600 dark:text-amber-300">
@@ -7337,15 +7244,15 @@ function PlanLoadError({
             </div>
           )}
           <div className="min-w-0">
-            <h2 className="text-base font-semibold tracking-tight">{title}</h2>
-            <p className="mt-1 text-sm leading-6 text-muted-foreground">
+            <h2 className="text-lg font-semibold tracking-tight">{title}</h2>
+            <p className="mt-2 text-sm leading-6 text-muted-foreground">
               {body}
             </p>
             {showAccessHelp && signedInEmail ? (
-              <div className="mt-3 flex items-center gap-2 rounded-md border border-border bg-muted/35 px-3 py-2 text-sm">
-                <IconAt className="size-4 shrink-0 text-muted-foreground" />
-                <span className="min-w-0 truncate text-muted-foreground">
-                  Signed in as{" "}
+              <div className="mt-3 flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground">
+                <IconAt className="size-4 shrink-0" />
+                <span className="min-w-0 truncate">
+                  {t("plansPage.loadError.signedInAs")}{" "}
                   <span className="font-medium text-foreground">
                     {signedInEmail}
                   </span>
@@ -7354,21 +7261,19 @@ function PlanLoadError({
             ) : null}
             {accessRequestSent ? (
               <div className="mt-3 rounded-md border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300">
-                Access request sent. You will be able to open this link once an
-                owner grants access.
+                {t("plansPage.loadError.accessRequestSent")}
               </div>
             ) : null}
             {!showAccessHelp && !planMissing ? (
               <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                Retry the load, or sign in with another account if this is a
-                private plan link.
+                {t("plansPage.loadError.retryHelp")}
               </p>
             ) : null}
           </div>
         </div>
 
         {showAccessHelp || !planMissing ? (
-          <div className="mt-5 flex flex-col gap-2">
+          <div className="mt-6 flex flex-col gap-3">
             {showAccessHelp ? (
               <>
                 {signedIn ? (
@@ -7391,32 +7296,65 @@ function PlanLoadError({
                     ) : (
                       <GoogleLogoIcon className="size-[18px]" />
                     )}
-                    Continue with Google
+                    {t("plansPage.loadError.continueWithGoogle")}
                   </Button>
                 )}
                 {signedIn ? (
-                  <div className="flex flex-wrap gap-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={() => void startGoogle()}
-                      disabled={googlePending}
-                    >
-                      <IconLogin2 className="size-4" />
-                      Switch account
-                    </Button>
-                  </div>
+                  <Collapsible
+                    open={switchAccountOpen}
+                    onOpenChange={setSwitchAccountOpen}
+                  >
+                    <CollapsibleTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="w-full justify-between px-1.5 text-muted-foreground hover:text-foreground"
+                      >
+                        <span className="inline-flex items-center gap-2">
+                          <IconLogin2 className="size-4" />
+                          {t("plansPage.loadError.switchAccount")}
+                        </span>
+                        <IconChevronDown
+                          className={cn(
+                            "size-4 transition-transform",
+                            switchAccountOpen ? "rotate-180" : "",
+                          )}
+                        />
+                      </Button>
+                    </CollapsibleTrigger>
+                    <CollapsibleContent className="pt-1">
+                      <Button
+                        type="button"
+                        onClick={() => void startGoogle()}
+                        disabled={googlePending}
+                        className="h-9 w-full gap-2.5 rounded-md bg-white px-2 text-sm font-medium text-black shadow-none hover:bg-[#e5e5e5] hover:text-black dark:bg-white dark:text-black dark:hover:bg-[#e5e5e5]"
+                      >
+                        {googlePending ? (
+                          <IconLoader2 className="size-[18px] animate-spin" />
+                        ) : (
+                          <GoogleLogoIcon className="size-[18px]" />
+                        )}
+                        {t("plansPage.loadError.continueWithGoogle")}
+                      </Button>
+                    </CollapsibleContent>
+                  </Collapsible>
                 ) : null}
-                <Collapsible open={emailOpen} onOpenChange={setEmailOpen}>
+                <Collapsible
+                  open={emailOpen}
+                  onOpenChange={setEmailOpen}
+                  className={cn(signedIn && !switchAccountOpen && "hidden")}
+                >
                   <CollapsibleTrigger asChild>
                     <Button
                       type="button"
                       variant="ghost"
-                      className="w-full justify-between px-2 text-muted-foreground"
+                      size="sm"
+                      className="w-full justify-between px-1.5 text-muted-foreground"
                     >
                       <span className="inline-flex items-center gap-2">
                         <IconMail className="size-4" />
-                        Sign in with email
+                        {t("plansPage.loadError.signInWithEmail")}
                       </span>
                       <IconChevronDown
                         className={cn(
@@ -7428,22 +7366,29 @@ function PlanLoadError({
                   </CollapsibleTrigger>
                   <CollapsibleContent className="pt-2">
                     <form
-                      className="space-y-3 rounded-md border border-border bg-muted/20 p-3"
+                      className="space-y-3 rounded-lg border border-border bg-muted/20 p-3"
                       onSubmit={submitEmailAuth}
                     >
                       <div className="space-y-1.5">
-                        <Label htmlFor="plan-access-email">Email</Label>
+                        <Label htmlFor="plan-access-email">
+                          {t("plansPage.loadError.email")}
+                        </Label>
                         <Input
                           id="plan-access-email"
                           type="email"
                           autoComplete="email"
                           value={email}
-                          onChange={(event) => setEmail(event.target.value)}
+                          onChange={(event) => {
+                            setEmail(event.target.value);
+                            setVerificationResendMessage(null);
+                          }}
                           required
                         />
                       </div>
                       <div className="space-y-1.5">
-                        <Label htmlFor="plan-access-password">Password</Label>
+                        <Label htmlFor="plan-access-password">
+                          {t("plansPage.loadError.password")}
+                        </Label>
                         <Input
                           id="plan-access-password"
                           type="password"
@@ -7464,9 +7409,41 @@ function PlanLoadError({
                         </p>
                       ) : null}
                       {emailAuthNotice ? (
-                        <p className="text-sm text-muted-foreground">
-                          {emailAuthNotice}
-                        </p>
+                        <div className="space-y-2" aria-live="polite">
+                          <p className="text-sm text-muted-foreground">
+                            {emailAuthNotice}
+                          </p>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={
+                              verificationResendPending || !email.trim()
+                            }
+                            onClick={() => void resendVerificationEmail()}
+                          >
+                            {verificationResendPending
+                              ? t("plansPage.loadError.resendingVerification")
+                              : t("plansPage.loadError.resendVerification")}
+                          </Button>
+                          {verificationResendMessage ? (
+                            <p
+                              className={cn(
+                                "text-sm",
+                                verificationResendMessage.kind === "error"
+                                  ? "text-destructive"
+                                  : "text-muted-foreground",
+                              )}
+                              role={
+                                verificationResendMessage.kind === "error"
+                                  ? "alert"
+                                  : "status"
+                              }
+                            >
+                              {verificationResendMessage.text}
+                            </p>
+                          ) : null}
+                        </div>
                       ) : null}
                       <div className="flex flex-wrap items-center gap-2">
                         <Button type="submit" disabled={emailAuthPending}>
@@ -7476,8 +7453,8 @@ function PlanLoadError({
                             <IconLock className="size-4" />
                           )}
                           {emailMode === "create"
-                            ? "Create account"
-                            : "Sign in"}
+                            ? t("plansPage.loadError.createAccount")
+                            : t("plansPage.loadError.signIn")}
                         </Button>
                         <Button
                           type="button"
@@ -7488,11 +7465,12 @@ function PlanLoadError({
                             );
                             setEmailAuthError(null);
                             setEmailAuthNotice(null);
+                            setVerificationResendMessage(null);
                           }}
                         >
                           {emailMode === "create"
-                            ? "I have an account"
-                            : "Create account"}
+                            ? t("plansPage.loadError.haveAccount")
+                            : t("plansPage.loadError.createAccount")}
                         </Button>
                       </div>
                     </form>
@@ -7503,23 +7481,13 @@ function PlanLoadError({
               <div className="flex flex-wrap gap-2">
                 <Button type="button" variant="outline" onClick={onSignIn}>
                   <IconExternalLink className="size-4" />
-                  Sign in
+                  {t("plansPage.loadError.signIn")}
                 </Button>
               </div>
             )}
           </div>
         ) : null}
       </div>
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        onClick={onRetry}
-        className="mt-3 gap-1.5 text-muted-foreground hover:text-foreground"
-      >
-        <IconRefresh className="size-3.5" />
-        Retry
-      </Button>
     </div>
   );
 }
@@ -7537,6 +7505,7 @@ function SignedInPlanAccessActions({
   requestAccessPending?: boolean;
   accessRequestSent?: boolean;
 }) {
+  const t = useT();
   const { data: org } = useOrg();
   const acceptInvitation = useAcceptInvitation();
   const joinByDomain = useJoinByDomain();
@@ -7552,7 +7521,9 @@ function SignedInPlanAccessActions({
 
     const onSuccess = () => {
       toast.success(
-        `Joined ${orgAccessPrompt.organizationName}. Opening plan…`,
+        t("plansPage.loadError.joinedOrg", {
+          orgName: orgAccessPrompt.organizationName,
+        }),
       );
       onAccessResolved();
     };
@@ -7572,21 +7543,41 @@ function SignedInPlanAccessActions({
   const label = orgAccessPrompt
     ? orgAccessPending
       ? orgAccessPrompt.kind === "invitation"
-        ? "Accepting invite"
-        : "Joining organization"
-      : orgAccessPrompt.buttonLabel
+        ? t("plansPage.loadError.acceptingInvite")
+        : t("plansPage.loadError.joiningOrg")
+      : orgAccessPrompt.kind === "invitation"
+        ? t("plansPage.loadError.acceptInvite")
+        : t("plansPage.loadError.joinOrg", {
+            orgName: orgAccessPrompt.organizationName,
+          })
     : accessRequestSent
-      ? "Request sent"
-      : "Request access";
+      ? t("plansPage.loadError.requestSent")
+      : t("plansPage.loadError.requestAccess");
 
   return (
     <>
       {orgAccessPrompt ? (
         <div className="rounded-md border border-border bg-muted/35 px-3 py-2 text-sm leading-5 text-muted-foreground">
-          {orgAccessPrompt.message}
+          {orgAccessPrompt.kind === "invitation"
+            ? t("plansPage.loadError.inviteMessage", {
+                orgName: orgAccessPrompt.organizationName,
+              })
+            : orgAccessPrompt.domain
+              ? t("plansPage.loadError.domainMessage", {
+                  domain: orgAccessPrompt.domain,
+                  orgName: orgAccessPrompt.organizationName,
+                })
+              : t("plansPage.loadError.joinMessage", {
+                  orgName: orgAccessPrompt.organizationName,
+                })}
         </div>
       ) : null}
-      <Button type="button" onClick={handleOrgAccess} disabled={disabled}>
+      <Button
+        type="button"
+        className="w-full"
+        onClick={handleOrgAccess}
+        disabled={disabled}
+      >
         {pending ? (
           <IconLoader2 className="size-4 animate-spin" />
         ) : orgAccessPrompt?.kind === "domain" ? (
@@ -7610,25 +7601,16 @@ const PLAN_SKILL_INSTALL_COMMAND =
 
 type PlanSkillDemo = {
   command: string;
-  label: string;
-  description: string;
-  videoAriaLabel: string;
   videoUrl?: string;
 };
 
 const PLAN_SKILL_DEMOS: PlanSkillDemo[] = [
   {
     command: "/visual-plan",
-    label: "Visual Plan",
-    description: "Review the implementation shape before code changes land.",
-    videoAriaLabel: "Visual Plan skill demo video",
     videoUrl: import.meta.env.VITE_VISUAL_PLAN_SKILL_DEMO_VIDEO_URL,
   },
   {
     command: "/visual-recap",
-    label: "Visual Recap",
-    description: "Turn a PR or diff into a shareable review recap.",
-    videoAriaLabel: "Visual Recap skill demo video",
     videoUrl: import.meta.env.VITE_VISUAL_RECAP_SKILL_DEMO_VIDEO_URL,
   },
 ];
@@ -7640,6 +7622,7 @@ function EmptyPlan({
   onCreate: () => void;
   canCreate: boolean;
 }) {
+  const t = useT();
   if (!canCreate) {
     return <LoggedOutEmptyPlan />;
   }
@@ -7651,22 +7634,21 @@ function EmptyPlan({
           <IconClipboardText className="size-5 text-muted-foreground" />
         </div>
         <h2 className="mt-4 text-xl font-semibold tracking-tight">
-          Start with a visual plan
+          {t("plansPage.empty.title")}
         </h2>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          Create a polished plan with editable document blocks, diagrams,
-          wireframes, and comments before implementation starts.
+          {t("plansPage.empty.description")}
         </p>
         <Button className="mt-5" onClick={onCreate}>
           <IconPlus className="size-4" />
-          New Plan
+          {t("plansPage.empty.newPlan")}
         </Button>
         <p className="mt-3 text-xs text-muted-foreground/70">
-          Or install the skill and use{" "}
+          {t("plansPage.empty.installPrefix")}{" "}
           <code className="rounded bg-muted/60 px-1 py-0.5 font-mono text-[11px]">
             /visual-plan
           </code>{" "}
-          from your coding agent:
+          {t("plansPage.empty.installSuffix")}
           <br />
           <code className="mt-1 inline-block rounded bg-muted/60 px-1 py-0.5 font-mono text-[11px]">
             {PLAN_SKILL_INSTALL_COMMAND}
@@ -7678,6 +7660,7 @@ function EmptyPlan({
 }
 
 function PlanSkillDemoVideo({ demo }: { demo: PlanSkillDemo }) {
+  const t = useT();
   const [isLoaded, setIsLoaded] = useState(false);
   if (!demo.videoUrl) return null;
 
@@ -7695,9 +7678,11 @@ function PlanSkillDemoVideo({ demo }: { demo: PlanSkillDemo }) {
     <article className="flex min-w-0 flex-col overflow-hidden rounded-lg border border-border bg-card text-left">
       <div className="flex items-start justify-between gap-3 p-3">
         <div className="min-w-0">
-          <p className="text-sm font-medium text-foreground">{demo.label}</p>
+          <p className="text-sm font-medium text-foreground">
+            {t(`plansPage.skillDemos.${demo.command.slice(1)}.label`)}
+          </p>
           <p className="mt-1 min-h-10 text-xs leading-5 text-muted-foreground">
-            {demo.description}
+            {t(`plansPage.skillDemos.${demo.command.slice(1)}.description`)}
           </p>
         </div>
         <code className="shrink-0 rounded bg-muted/70 px-1.5 py-1 font-mono text-[11px] text-muted-foreground">
@@ -7707,7 +7692,9 @@ function PlanSkillDemoVideo({ demo }: { demo: PlanSkillDemo }) {
       <div className="relative aspect-[1189/1080] overflow-hidden bg-muted">
         <video
           src={demo.videoUrl}
-          aria-label={demo.videoAriaLabel}
+          aria-label={t(
+            `plansPage.skillDemos.${demo.command.slice(1)}.videoAriaLabel`,
+          )}
           autoPlay
           muted
           loop
@@ -7720,11 +7707,11 @@ function PlanSkillDemoVideo({ demo }: { demo: PlanSkillDemo }) {
         />
         <div
           aria-hidden
-          className={`pointer-events-none absolute inset-0 bg-muted transition-opacity duration-300 ${
+          className={`skeleton-shimmer pointer-events-none absolute inset-0 bg-muted transition-opacity duration-300 ${
             isLoaded ? "opacity-0" : "opacity-100"
           }`}
         >
-          <div className="flex size-full animate-pulse flex-col justify-between p-4">
+          <div className="flex size-full flex-col justify-between p-4">
             <div className="space-y-2">
               <div className="h-3 w-1/3 rounded-full bg-border" />
               <div className="h-2.5 w-2/3 rounded-full bg-border/80" />
@@ -7742,6 +7729,7 @@ function PlanSkillDemoVideo({ demo }: { demo: PlanSkillDemo }) {
 }
 
 function LoggedOutEmptyPlan() {
+  const t = useT();
   const [installCommandCopied, setInstallCommandCopied] = useState(false);
   const copyResetTimeoutRef = useRef<number | null>(null);
 
@@ -7757,7 +7745,7 @@ function LoggedOutEmptyPlan() {
     try {
       await navigator.clipboard.writeText(PLAN_SKILL_INSTALL_COMMAND);
       setInstallCommandCopied(true);
-      toast.success("Install command copied");
+      toast.success(t("plansPage.loggedOut.installCopied"));
       if (copyResetTimeoutRef.current) {
         window.clearTimeout(copyResetTimeoutRef.current);
       }
@@ -7765,19 +7753,18 @@ function LoggedOutEmptyPlan() {
         setInstallCommandCopied(false);
       }, 2200);
     } catch {
-      toast.error("Could not copy install command");
+      toast.error(t("plansPage.loggedOut.installCopyFailed"));
     }
   }, []);
 
   return (
-    <div className="flex min-h-full items-center justify-center overflow-auto p-4 sm:p-8">
+    <div className="flex min-h-full -translate-y-[10vh] items-center justify-center overflow-auto p-4 sm:p-8">
       <div className="flex w-full max-w-4xl flex-col items-center gap-3 py-8 text-center">
         <h2 className="text-2xl font-semibold tracking-tight">
-          Start with /visual-plan
+          {t("plansPage.loggedOut.title")}
         </h2>
         <p className="max-w-md text-sm leading-6 text-muted-foreground">
-          Install the Plan skills in your coding agent, then use the slash
-          command to create your first review plan.
+          {t("plansPage.loggedOut.description")}
         </p>
         <div className="mt-1 flex w-full max-w-xl items-center gap-2 rounded-md bg-muted/40 p-1.5 text-left">
           <code className="min-w-0 flex-1 overflow-x-auto px-2 py-1 font-mono text-xs leading-5 text-foreground">
@@ -7788,11 +7775,11 @@ function LoggedOutEmptyPlan() {
             variant="ghost"
             size="sm"
             onClick={copyInstallCommand}
-            className="h-8 min-w-20 shrink-0 gap-1.5 px-2 text-xs text-muted-foreground hover:text-foreground"
+            className="min-w-20 shrink-0 gap-1.5 px-2 text-xs text-muted-foreground hover:text-foreground"
             aria-label={
               installCommandCopied
-                ? "Install command copied"
-                : "Copy install command"
+                ? t("plansPage.loggedOut.installCopied")
+                : t("plansPage.loggedOut.copyInstallCommand")
             }
           >
             {installCommandCopied ? (
@@ -7800,7 +7787,9 @@ function LoggedOutEmptyPlan() {
             ) : (
               <IconCopy className="size-3.5" />
             )}
-            {installCommandCopied ? "Copied" : "Copy"}
+            {installCommandCopied
+              ? t("plansPage.loggedOut.copied")
+              : t("plansPage.loggedOut.copy")}
           </Button>
         </div>
         <div className="grid w-full gap-3 pt-2 sm:grid-cols-2">
@@ -7816,7 +7805,7 @@ function LoggedOutEmptyPlan() {
         >
           <a href={PLAN_DOCS_URL} target="_blank" rel="noreferrer">
             <IconExternalLink className="size-4" />
-            View the docs
+            {t("plansPage.loggedOut.viewDocs")}
           </a>
         </Button>
       </div>
@@ -7826,9 +7815,29 @@ function LoggedOutEmptyPlan() {
 
 type OverviewFilter = "all" | "plans" | "recaps" | "archived" | "deleted";
 
+function PlanOwnerAvatar({ email }: { email: string }) {
+  const avatarUrl = useAvatarUrl(email);
+  const name = emailToName(email);
+
+  return (
+    <Avatar className="size-5">
+      {avatarUrl ? <AvatarImage src={avatarUrl} alt={name} /> : null}
+      <AvatarFallback
+        className="text-[9px] font-semibold text-primary-foreground"
+        style={{ backgroundColor: emailToColor(email) }}
+      >
+        {commentAuthorInitials(name)}
+      </AvatarFallback>
+    </Avatar>
+  );
+}
+
 function PlansOverview({
   plans,
   isLoading,
+  isError,
+  onRetry,
+  viewerEmail,
   onCreate,
   canCreate,
   onArchive,
@@ -7838,6 +7847,9 @@ function PlansOverview({
 }: {
   plans: PlanSummary[];
   isLoading: boolean;
+  isError: boolean;
+  onRetry: () => void;
+  viewerEmail?: string | null;
   onCreate: () => void;
   canCreate: boolean;
   onArchive: (planId: string, archived: boolean) => void;
@@ -7845,11 +7857,34 @@ function PlansOverview({
   onRestore: (plan: DeletePlanTarget) => void;
   onSignIn?: () => void;
 }) {
+  const t = useT();
   const [filter, setFilter] = useState<OverviewFilter>("all");
   const [search, setSearch] = useState("");
+  const [author, setAuthor] = useState<string>("all");
 
   if (isLoading) {
     return <PlansOverviewSkeleton />;
+  }
+  if (isError) {
+    return (
+      <div className="flex min-h-0 flex-1 items-center justify-center bg-muted/20 p-6">
+        <div className="flex max-w-sm flex-col items-center gap-3 text-center">
+          <IconAlertTriangle className="size-7 text-destructive/70" />
+          <div>
+            <h1 className="font-medium">
+              {t("plansPage.loadError.didNotLoadTitle")}
+            </h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {t("plansPage.loadError.genericMessage")}
+            </p>
+          </div>
+          <Button type="button" variant="outline" onClick={onRetry}>
+            <IconRefresh className="size-4" />
+            {t("plansPage.loadError.retry")}
+          </Button>
+        </div>
+      </div>
+    );
   }
   if (plans.length === 0) {
     return <EmptyPlan onCreate={onCreate} canCreate={canCreate} />;
@@ -7857,13 +7892,41 @@ function PlansOverview({
 
   const activePlans = plans.filter((p) => !p.deletedAt);
   const deletedPlans = plans.filter((p) => p.deletedAt);
+  const ownedEmail = plans.find((p) => p.canDelete)?.ownerEmail?.trim() || null;
+  const normalizedViewerEmail =
+    (ownedEmail ?? viewerEmail)?.trim().toLowerCase() || null;
+  const authorEmails = Array.from(
+    new Set(
+      plans
+        .map((p) => p.ownerEmail?.trim())
+        .filter((email): email is string => Boolean(email)),
+    ),
+  ).sort((a, b) => emailToName(a).localeCompare(emailToName(b)));
+  const hasMine =
+    normalizedViewerEmail !== null &&
+    authorEmails.some((email) => email.toLowerCase() === normalizedViewerEmail);
   const visibleBeforeSearch = plans.filter((p) => {
-    if (filter === "deleted") return Boolean(p.deletedAt);
-    if (p.deletedAt) return false;
-    if (filter === "archived") return p.status === "archived";
-    if (p.status === "archived") return false;
-    if (filter === "plans") return p.kind === "plan";
-    if (filter === "recaps") return p.kind === "recap";
+    if (filter === "deleted") {
+      if (!p.deletedAt) return false;
+    } else {
+      if (p.deletedAt) return false;
+      if (filter === "archived") {
+        if (p.status !== "archived") return false;
+      } else {
+        if (p.status === "archived") return false;
+        if (filter === "plans" && p.kind !== "plan") return false;
+        if (filter === "recaps" && p.kind !== "recap") return false;
+      }
+    }
+    if (author === "me") {
+      return Boolean(
+        normalizedViewerEmail &&
+        p.ownerEmail?.trim().toLowerCase() === normalizedViewerEmail,
+      );
+    }
+    if (author !== "all") {
+      return p.ownerEmail?.trim() === author;
+    }
     return true;
   });
 
@@ -7889,30 +7952,49 @@ function PlansOverview({
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <h1 className="truncate text-xl font-semibold tracking-tight">
-                Plans
+                {t("plansPage.overview.title")}
               </h1>
               <p className="text-sm text-muted-foreground">
-                {totalVisible} document{totalVisible === 1 ? "" : "s"}
+                {t("plansPage.overview.documentCount", {
+                  count: totalVisible,
+                })}
               </p>
             </div>
             <Button type="button" onClick={onCreate}>
               <IconPlus className="size-4" />
-              {canCreate ? "New Plan" : "Sign in to create"}
+              {canCreate
+                ? t("plansPage.overview.newPlan")
+                : t("plansPage.overview.signInToCreate")}
             </Button>
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
             <Tabs
               value={filter}
-              onValueChange={(v) => setFilter(v as OverviewFilter)}
+              onValueChange={(v) => {
+                trackEvent("plan_filter_changed", {
+                  app_name: "plan",
+                  template_name: "plan",
+                  filter: v,
+                });
+                setFilter(v as OverviewFilter);
+              }}
             >
               <TabsList>
-                <TabsTrigger value="all">All</TabsTrigger>
-                <TabsTrigger value="plans">Plans</TabsTrigger>
-                <TabsTrigger value="recaps">Recaps</TabsTrigger>
-                <TabsTrigger value="archived">Archived</TabsTrigger>
+                <TabsTrigger value="all">
+                  {t("plansPage.overview.tabs.all")}
+                </TabsTrigger>
+                <TabsTrigger value="plans">
+                  {t("plansPage.overview.tabs.plans")}
+                </TabsTrigger>
+                <TabsTrigger value="recaps">
+                  {t("plansPage.overview.tabs.recaps")}
+                </TabsTrigger>
+                <TabsTrigger value="archived">
+                  {t("plansPage.overview.tabs.archived")}
+                </TabsTrigger>
                 <TabsTrigger value="deleted">
-                  Deleted
+                  {t("plansPage.overview.tabs.deleted")}
                   {deletedPlans.length > 0 && (
                     <span className="ml-1 text-[11px] text-muted-foreground">
                       {deletedPlans.length}
@@ -7922,14 +8004,47 @@ function PlansOverview({
               </TabsList>
             </Tabs>
 
+            {authorEmails.length > 1 && (
+              <Select value={author} onValueChange={setAuthor}>
+                <SelectTrigger className="w-[170px] text-sm">
+                  <SelectValue
+                    placeholder={t("plansPage.overview.createdBy")}
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">
+                    {t("plansPage.overview.allAuthors")}
+                  </SelectItem>
+                  {hasMine && (
+                    <SelectItem value="me">
+                      {t("plansPage.overview.me")}
+                    </SelectItem>
+                  )}
+                  {authorEmails
+                    .filter(
+                      (email) =>
+                        !(
+                          hasMine &&
+                          email.toLowerCase() === normalizedViewerEmail
+                        ),
+                    )
+                    .map((email) => (
+                      <SelectItem key={email} value={email}>
+                        {emailToName(email)}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+            )}
+
             <div className="relative min-w-0 flex-1">
               <IconSearch className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
               <Input
                 type="search"
-                placeholder="Search plans…"
+                placeholder={t("plansPage.overview.searchPlaceholder")}
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                className="h-9 pl-8 text-sm"
+                className="pl-8 text-sm"
               />
             </div>
           </div>
@@ -7937,12 +8052,12 @@ function PlansOverview({
           {visiblePlans.length === 0 ? (
             <div className="py-12 text-center text-sm text-muted-foreground">
               {search.trim()
-                ? "No plans match."
+                ? t("plansPage.overview.empty.noMatch")
                 : filter === "archived"
-                  ? "No archived plans."
+                  ? t("plansPage.overview.empty.noArchived")
                   : filter === "deleted"
-                    ? "No deleted plans."
-                    : "No plans here yet."}
+                    ? t("plansPage.overview.empty.noDeleted")
+                    : t("plansPage.overview.empty.noPlans")}
             </div>
           ) : (
             <div className="grid gap-3 md:grid-cols-2">
@@ -7961,7 +8076,7 @@ function PlansOverview({
                               variant="outline"
                               className="shrink-0 text-[10px]"
                             >
-                              Recap
+                              {t("plansPage.overview.recapBadge")}
                             </Badge>
                           )}
                           {isDeleted && (
@@ -7969,7 +8084,7 @@ function PlansOverview({
                               variant="outline"
                               className="shrink-0 border-destructive/30 text-[10px] text-destructive"
                             >
-                              Deleted
+                              {t("plansPage.overview.deletedBadge")}
                             </Badge>
                           )}
                         </div>
@@ -7985,7 +8100,11 @@ function PlansOverview({
                     </div>
                     <div className="mt-4 flex items-center gap-2 text-xs text-muted-foreground">
                       {isDeleted ? (
-                        <span>Deleted {shortDate(plan.deletedAt ?? "")}</span>
+                        <span>
+                          {t("plansPage.overview.deletedAt", {
+                            date: shortDate(plan.deletedAt ?? ""),
+                          })}
+                        </span>
                       ) : ENABLE_PLAN_STATUS_FEATURE ? (
                         <>
                           <span>{statusLabel(plan.status)}</span>
@@ -7993,6 +8112,20 @@ function PlansOverview({
                         </>
                       ) : null}
                       {!isDeleted && <span>{shortDate(plan.updatedAt)}</span>}
+                      {plan.ownerEmail && (
+                        <>
+                          <span>·</span>
+                          <span
+                            className="flex min-w-0 items-center gap-1.5"
+                            title={plan.ownerEmail}
+                          >
+                            <PlanOwnerAvatar email={plan.ownerEmail} />
+                            <span className="truncate">
+                              {emailToName(plan.ownerEmail)}
+                            </span>
+                          </span>
+                        </>
+                      )}
                     </div>
                   </>
                 );
@@ -8028,7 +8161,8 @@ function PlansOverview({
                           <button
                             type="button"
                             className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                            aria-label="Plan actions"
+                            data-plan-actions-trigger
+                            aria-label={t("plansPage.overview.planActions")}
                           >
                             <IconDots className="size-4" />
                           </button>
@@ -8044,7 +8178,7 @@ function PlansOverview({
                                 disabled={!plan.canDelete}
                               >
                                 <IconRestore className="size-4" />
-                                Restore
+                                {t("plansPage.overview.restore")}
                               </DropdownMenuItem>
                               <DropdownMenuItem
                                 onClick={(e) => {
@@ -8055,7 +8189,7 @@ function PlansOverview({
                                 className="text-destructive focus:text-destructive"
                               >
                                 <IconTrash className="size-4" />
-                                Delete permanently
+                                {t("plansPage.overview.deletePermanently")}
                               </DropdownMenuItem>
                             </>
                           ) : (
@@ -8068,7 +8202,7 @@ function PlansOverview({
                                   }}
                                 >
                                   <IconArchiveOff className="size-4" />
-                                  Unarchive
+                                  {t("plansPage.overview.unarchive")}
                                 </DropdownMenuItem>
                               ) : (
                                 <DropdownMenuItem
@@ -8078,7 +8212,7 @@ function PlansOverview({
                                   }}
                                 >
                                   <IconArchive className="size-4" />
-                                  Archive
+                                  {t("plansPage.overview.archive")}
                                 </DropdownMenuItem>
                               )}
                               {plan.canDelete && (
@@ -8092,7 +8226,7 @@ function PlansOverview({
                                     className="text-destructive focus:text-destructive"
                                   >
                                     <IconTrash className="size-4" />
-                                    Delete...
+                                    {t("plansPage.overview.delete")}
                                   </DropdownMenuItem>
                                 </>
                               )}
@@ -8151,11 +8285,18 @@ function PlansOverviewSkeleton() {
   );
 }
 
-function planVersionSurfaceLabel(version: PlanVersionSummary) {
-  if (version.hasPrototype) return "Prototype";
-  if (version.hasCanvas) return "Canvas";
-  if (version.blockCount > 0) return `${version.blockCount} blocks`;
-  return `${version.sectionCount} sections`;
+function planVersionSurfaceLabel(
+  version: PlanVersionSummary,
+  t: ReturnType<typeof useT>,
+) {
+  if (version.hasPrototype) return t("plansPage.history.surface.prototype");
+  if (version.hasCanvas) return t("plansPage.history.surface.canvas");
+  if (version.blockCount > 0) {
+    return t("plansPage.history.surface.blocks", { count: version.blockCount });
+  }
+  return t("plansPage.history.surface.sections", {
+    count: version.sectionCount,
+  });
 }
 
 function PlanHistorySheet({
@@ -8169,18 +8310,22 @@ function PlanHistorySheet({
   onOpenChange: (open: boolean) => void;
   canRestore: boolean;
 }) {
+  const t = useT();
   const [selectedVersionId, setSelectedVersionId] = useState<string | null>(
     null,
   );
-  const versionsQuery = usePlanVersions(planId, open);
-  const versionQuery = usePlanVersion(open ? planId : null, selectedVersionId);
+  const [restoreCandidateId, setRestoreCandidateId] = useState<string | null>(
+    null,
+  );
+  const versionsQuery = usePlanVersions(planId, open && canRestore);
+  const versionQuery = usePlanVersion(
+    open && canRestore ? planId : null,
+    selectedVersionId,
+  );
   const restoreVersion = useRestorePlanVersion();
   const versions = versionsQuery.data?.versions ?? [];
   const selectedVersion = versionQuery.data;
 
-  // Cache of fully-loaded version details by version id. Populated as the
-  // user browses individual versions; used to compute block-level diff
-  // summaries on the list view without any extra network calls.
   const versionDetailCache = useRef<Map<string, PlanVersionDetail>>(new Map());
 
   useEffect(() => {
@@ -8192,7 +8337,6 @@ function PlanHistorySheet({
     versionDetailCache.current = new Map();
   }, [planId]);
 
-  // Store the freshly loaded version detail in the cache whenever it arrives.
   useEffect(() => {
     if (versionQuery.data) {
       versionDetailCache.current.set(versionQuery.data.id, versionQuery.data);
@@ -8204,375 +8348,351 @@ function PlanHistorySheet({
     onOpenChange(nextOpen);
   };
 
-  const restoreSelectedVersion = async () => {
-    if (!selectedVersionId) return;
+  const restoreVersionById = async (versionId: string | null) => {
+    if (!versionId) return;
     try {
-      await restoreVersion.mutateAsync({
-        planId,
-        versionId: selectedVersionId,
-      });
-      toast.success("Plan version restored.");
+      await restoreVersion.mutateAsync({ planId, versionId });
+      toast.success(t("plansPage.history.restoreSuccess"));
+      setRestoreCandidateId(null);
       close(false);
     } catch (error) {
       toast.error(
         error instanceof Error
           ? error.message.replace(/^Action [\w-]+ failed:\s*/, "")
-          : "Failed to restore plan version.",
+          : t("plansPage.history.restoreFailed"),
       );
     }
   };
+  const restoreCandidate =
+    versions.find((version) => version.id === restoreCandidateId) ?? null;
 
   return (
-    <Sheet open={open} onOpenChange={close}>
-      <SheetContent side="right" className="w-[92vw] max-w-[720px] p-0">
-        <SheetHeader className="px-4 pt-4 pb-0">
-          <SheetTitle className="flex min-w-0 items-center gap-2 text-sm font-medium">
-            {selectedVersionId ? (
-              <button
-                type="button"
-                onClick={() => setSelectedVersionId(null)}
-                className="inline-flex min-w-0 items-center gap-1.5 text-muted-foreground transition-colors hover:text-foreground"
-              >
-                <IconArrowLeft className="size-4" />
-                <span>Back to history</span>
-              </button>
-            ) : (
-              <>
-                <IconHistory className="size-4 text-primary" />
-                <span>Plan history</span>
-              </>
-            )}
-          </SheetTitle>
-          <SheetDescription className="sr-only">
-            Browse saved plan versions and restore a previous snapshot.
-          </SheetDescription>
-        </SheetHeader>
-        <Separator className="mt-3" />
-
-        {selectedVersionId ? (
-          <div className="flex h-[calc(100%-60px)] min-h-0 flex-col">
-            <div className="border-b border-border px-4 py-3">
-              {versionQuery.isLoading ? (
-                <div className="space-y-2">
-                  <Skeleton className="h-4 w-2/3" />
-                  <Skeleton className="h-3 w-1/3" />
-                </div>
+    <>
+      <Sheet open={open} onOpenChange={close}>
+        <SheetContent side="right" className="w-[92vw] max-w-[720px] p-0">
+          <SheetHeader className="px-4 pt-4 pb-0">
+            <SheetTitle className="flex min-w-0 items-center gap-2 text-sm font-medium">
+              {selectedVersionId ? (
+                <button
+                  type="button"
+                  onClick={() => setSelectedVersionId(null)}
+                  className="inline-flex min-w-0 items-center gap-1.5 text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  <IconArrowLeft className="size-4" />
+                  <span>{t("plansPage.history.back")}</span>
+                </button>
               ) : (
                 <>
-                  <p className="truncate text-sm font-medium">
-                    {selectedVersion?.title || "Untitled plan"}
-                  </p>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">
-                    {selectedVersion
-                      ? `${shortDate(selectedVersion.createdAt)} · ${planVersionSurfaceLabel(selectedVersion)}`
-                      : "Snapshot unavailable"}
-                  </p>
+                  <IconHistory className="size-4 text-primary" />
+                  <span>{t("plansPage.history.title")}</span>
                 </>
               )}
-            </div>
-            <ScrollArea className="min-h-0 flex-1 bg-plan-document">
-              {versionQuery.isLoading ? (
-                <div className="space-y-3 p-4">
-                  <Skeleton className="h-48 w-full rounded-lg" />
-                  <Skeleton className="h-28 w-full rounded-lg" />
-                  <Skeleton className="h-28 w-full rounded-lg" />
+            </SheetTitle>
+            <SheetDescription className="sr-only">
+              {t("plansPage.history.description")}
+            </SheetDescription>
+          </SheetHeader>
+          <Separator className="mt-3" />
+
+          {selectedVersionId ? (
+            <div className="flex h-[calc(100%-60px)] min-h-0 flex-col">
+              <div className="border-b border-border px-4 py-3">
+                {versionQuery.isLoading ? (
+                  <div className="space-y-2">
+                    <Skeleton className="h-4 w-2/3" />
+                    <Skeleton className="h-3 w-1/3" />
+                  </div>
+                ) : (
+                  <>
+                    <p className="truncate text-sm font-medium">
+                      {selectedVersion?.title ||
+                        t("plansPage.history.untitled")}
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-muted-foreground">
+                      {selectedVersion
+                        ? `${shortDate(selectedVersion.createdAt)} · ${planVersionSurfaceLabel(selectedVersion, t)}`
+                        : t("plansPage.history.snapshotUnavailable")}
+                    </p>
+                  </>
+                )}
+              </div>
+              <ScrollArea className="min-h-0 flex-1 bg-plan-document">
+                {versionQuery.isLoading ? (
+                  <div className="space-y-3 p-4">
+                    <Skeleton className="h-48 w-full rounded-lg" />
+                    <Skeleton className="h-28 w-full rounded-lg" />
+                    <Skeleton className="h-28 w-full rounded-lg" />
+                  </div>
+                ) : selectedVersion?.plan.content ? (
+                  <PlanContentRenderer
+                    content={selectedVersion.plan.content}
+                    fallbackTitle={selectedVersion.plan.title}
+                    fallbackBrief={selectedVersion.plan.brief}
+                    contentUpdatedAt={selectedVersion.plan.updatedAt}
+                    editingDisabled
+                    isRecap={selectedVersion.plan.kind === "recap"}
+                    planId={null}
+                  />
+                ) : selectedVersion?.html ? (
+                  <iframe
+                    title={t("plansPage.history.previewTitle")}
+                    srcDoc={selectedVersion.html}
+                    sandbox="allow-forms allow-scripts"
+                    className="h-[calc(100vh-142px)] w-full border-0 bg-background"
+                  />
+                ) : (
+                  <div className="px-6 py-14 text-center text-sm text-muted-foreground">
+                    {t("plansPage.history.noPreview")}
+                  </div>
+                )}
+              </ScrollArea>
+              {canRestore ? (
+                <div className="border-t border-border p-3">
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="w-full gap-1.5"
+                    onClick={() => void restoreVersionById(selectedVersionId)}
+                    disabled={
+                      restoreVersion.isPending || versionQuery.isLoading
+                    }
+                  >
+                    {restoreVersion.isPending ? (
+                      <IconLoader2 className="size-4 animate-spin" />
+                    ) : (
+                      <IconRestore className="size-4" />
+                    )}
+                    {t("plansPage.history.restoreThisVersion")}
+                  </Button>
+                  <p className="mt-2 text-center text-[11px] text-muted-foreground">
+                    {t("plansPage.history.savedFirst")}
+                  </p>
                 </div>
-              ) : selectedVersion?.plan.content ? (
-                <PlanContentRenderer
-                  content={selectedVersion.plan.content}
-                  fallbackTitle={selectedVersion.plan.title}
-                  fallbackBrief={selectedVersion.plan.brief}
-                  contentUpdatedAt={selectedVersion.plan.updatedAt}
-                  editingDisabled
-                  isRecap={selectedVersion.plan.kind === "recap"}
-                  planId={null}
-                />
-              ) : selectedVersion?.html ? (
-                <iframe
-                  title="Plan version preview"
-                  srcDoc={selectedVersion.html}
-                  // Stored plan HTML is agent-authored and may carry
-                  // prompt-injected markup. Match the main document iframe
-                  // (search "allow-forms allow-scripts"): run scripts only in
-                  // an opaque origin — never allow-same-origin — so a malicious
-                  // snapshot cannot reach the app origin's cookies, DOM, or
-                  // actions.
-                  sandbox="allow-forms allow-scripts"
-                  className="h-[calc(100vh-142px)] w-full border-0 bg-background"
-                />
+              ) : null}
+            </div>
+          ) : (
+            <ScrollArea className="h-[calc(100%-60px)]">
+              {versionsQuery.isLoading ? (
+                <div className="space-y-2 p-3">
+                  {Array.from({ length: 5 }).map((_, index) => (
+                    <Skeleton key={index} className="h-20 w-full rounded-lg" />
+                  ))}
+                </div>
+              ) : versions.length ? (
+                <div className="p-2">
+                  {versions.map((version, index) => {
+                    const cache = versionDetailCache.current;
+                    const thisDetail = cache.get(version.id);
+                    const olderVersion = versions[index + 1];
+                    const olderDetail = olderVersion
+                      ? cache.get(olderVersion.id)
+                      : undefined;
+                    const isOldest = index === versions.length - 1;
+                    const diffSummary =
+                      thisDetail && (isOldest || olderDetail)
+                        ? formatVersionDiffSummary(
+                            diffPlanVersions(
+                              {
+                                content: thisDetail.plan.content,
+                                sections: thisDetail.sections,
+                                html: thisDetail.html,
+                              },
+                              isOldest
+                                ? null
+                                : {
+                                    content: olderDetail!.plan.content,
+                                    sections: olderDetail!.sections,
+                                    html: olderDetail!.html,
+                                  },
+                            ),
+                          )
+                        : null;
+
+                    return (
+                      <div
+                        key={version.id}
+                        className="group relative rounded-lg transition-colors hover:bg-accent"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => setSelectedVersionId(version.id)}
+                          className="w-full rounded-lg px-3 py-2.5 text-left"
+                        >
+                          <div className="flex min-w-0 items-start gap-3">
+                            <div className="mt-1 flex size-7 shrink-0 items-center justify-center rounded-md border border-border bg-muted/45">
+                              <IconHistory className="size-4 text-muted-foreground" />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex min-w-0 items-center gap-2 pr-7">
+                                <p className="truncate text-sm font-medium">
+                                  {version.title ||
+                                    t("plansPage.history.untitled")}
+                                </p>
+                                <span className="shrink-0 text-[10px] text-muted-foreground">
+                                  {planVersionSurfaceLabel(version, t)}
+                                </span>
+                              </div>
+                              <p className="mt-0.5 text-[11px] text-muted-foreground">
+                                {shortDate(version.createdAt)}
+                                {version.label ? ` · ${version.label}` : ""}
+                              </p>
+                              {diffSummary ? (
+                                <p className="mt-0.5 truncate text-[11px] text-muted-foreground/70">
+                                  {diffSummary}
+                                </p>
+                              ) : version.preview ? (
+                                <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-muted-foreground/80">
+                                  {version.preview}
+                                </p>
+                              ) : null}
+                            </div>
+                          </div>
+                        </button>
+                        {canRestore ? (
+                          <div className="absolute right-2 top-2 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <button
+                                  type="button"
+                                  className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                  aria-label={t(
+                                    "plansPage.history.versionActions",
+                                  )}
+                                >
+                                  <IconDots className="size-4" />
+                                </button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end" className="w-52">
+                                <DropdownMenuItem
+                                  onClick={(event) => {
+                                    event.preventDefault();
+                                    setRestoreCandidateId(version.id);
+                                  }}
+                                >
+                                  <IconRestore className="size-4" />
+                                  {t("plansPage.history.restoreThisVersion")}
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
               ) : (
-                <div className="px-6 py-14 text-center text-sm text-muted-foreground">
-                  This snapshot has no previewable content.
+                <div className="px-6 py-14 text-center">
+                  <IconHistory className="mx-auto mb-3 size-6 text-muted-foreground/60" />
+                  <p className="text-sm font-medium">
+                    {t("plansPage.history.noVersions")}
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                    {t("plansPage.history.noVersionsDescription")}
+                  </p>
                 </div>
               )}
             </ScrollArea>
-            {canRestore ? (
-              <div className="border-t border-border p-3">
-                <Button
-                  type="button"
-                  size="sm"
-                  className="w-full gap-1.5"
-                  onClick={() => void restoreSelectedVersion()}
-                  disabled={restoreVersion.isPending || versionQuery.isLoading}
-                >
-                  {restoreVersion.isPending ? (
-                    <IconLoader2 className="size-4 animate-spin" />
-                  ) : (
-                    <IconRestore className="size-4" />
-                  )}
-                  Restore this version
-                </Button>
-                <p className="mt-2 text-center text-[11px] text-muted-foreground">
-                  Your current version is saved to history first.
-                </p>
-              </div>
-            ) : null}
-          </div>
-        ) : (
-          <ScrollArea className="h-[calc(100%-60px)]">
-            {versionsQuery.isLoading ? (
-              <div className="space-y-2 p-3">
-                {Array.from({ length: 5 }).map((_, index) => (
-                  <Skeleton key={index} className="h-20 w-full rounded-lg" />
-                ))}
-              </div>
-            ) : versions.length ? (
-              <div className="p-2">
-                {versions.map((version, index) => {
-                  // Compute a diff summary when both this version and its
-                  // predecessor have been loaded into the cache. Versions are
-                  // ordered newest-first, so index+1 is the older snapshot.
-                  // The oldest entry (no predecessor) shows "Initial version".
-                  const cache = versionDetailCache.current;
-                  const thisDetail = cache.get(version.id);
-                  const olderVersion = versions[index + 1];
-                  const olderDetail = olderVersion
-                    ? cache.get(olderVersion.id)
-                    : undefined;
-                  // Show a diff when: this version's detail is loaded AND
-                  // (it's the oldest OR the older neighbour's detail is loaded).
-                  const isOldest = index === versions.length - 1;
-                  const diffSummary =
-                    thisDetail && (isOldest || olderDetail)
-                      ? formatVersionDiffSummary(
-                          diffPlanVersions(
-                            {
-                              content: thisDetail.plan.content,
-                              sections: thisDetail.sections,
-                              html: thisDetail.html,
-                            },
-                            isOldest
-                              ? null
-                              : {
-                                  content: olderDetail!.plan.content,
-                                  sections: olderDetail!.sections,
-                                  html: olderDetail!.html,
-                                },
-                          ),
-                        )
-                      : null;
-
-                  return (
-                    <button
-                      key={version.id}
-                      type="button"
-                      onClick={() => setSelectedVersionId(version.id)}
-                      className="w-full rounded-lg px-3 py-2.5 text-left transition-colors hover:bg-accent"
-                    >
-                      <div className="flex min-w-0 items-start gap-3">
-                        <div className="mt-1 flex size-7 shrink-0 items-center justify-center rounded-md border border-border bg-muted/45">
-                          <IconHistory className="size-4 text-muted-foreground" />
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex min-w-0 items-center gap-2">
-                            <p className="truncate text-sm font-medium">
-                              {version.title || "Untitled plan"}
-                            </p>
-                            <span className="shrink-0 text-[10px] text-muted-foreground">
-                              {planVersionSurfaceLabel(version)}
-                            </span>
-                          </div>
-                          <p className="mt-0.5 text-[11px] text-muted-foreground">
-                            {shortDate(version.createdAt)}
-                            {version.label ? ` · ${version.label}` : ""}
-                          </p>
-                          {diffSummary ? (
-                            <p className="mt-0.5 truncate text-[11px] text-muted-foreground/70">
-                              {diffSummary}
-                            </p>
-                          ) : version.preview ? (
-                            <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-muted-foreground/80">
-                              {version.preview}
-                            </p>
-                          ) : null}
-                        </div>
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            ) : (
-              <div className="px-6 py-14 text-center">
-                <IconHistory className="mx-auto mb-3 size-6 text-muted-foreground/60" />
-                <p className="text-sm font-medium">No saved versions yet</p>
-                <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                  Versions are saved automatically before future plan edits.
-                </p>
-              </div>
-            )}
-          </ScrollArea>
-        )}
-      </SheetContent>
-    </Sheet>
+          )}
+        </SheetContent>
+      </Sheet>
+      <AlertDialog
+        open={Boolean(restoreCandidateId)}
+        onOpenChange={(next) => {
+          if (!next) setRestoreCandidateId(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t("plansPage.history.restoreConfirmTitle")}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("plansPage.history.restoreConfirmDescription", {
+                date: restoreCandidate
+                  ? shortDate(restoreCandidate.createdAt)
+                  : "",
+              })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={restoreVersion.isPending}>
+              {t("plansPage.common.cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(event) => {
+                event.preventDefault();
+                void restoreVersionById(restoreCandidateId);
+              }}
+              disabled={restoreVersion.isPending}
+            >
+              {restoreVersion.isPending
+                ? t("plansPage.history.restoring")
+                : t("plansPage.history.restore")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   );
 }
 
 const CREATE_PLAN_PROMPTS = [
   {
-    label: "Checkout flow",
-    prompt:
-      "Plan a checkout review flow with desktop and mobile wireframes, key empty/loading/error states, comment prompts, and implementation notes.",
+    id: "checkout",
   },
   {
-    label: "Settings redesign",
-    prompt:
-      "Create a UI flow plan for a settings redesign, including navigation states, risky interactions, review annotations, and code handoff notes.",
+    id: "settings",
   },
   {
-    label: "Imported plan",
-    prompt:
-      "# Implementation plan\n\nPaste the existing Codex or Claude Code plan here and turn it into a visual review document.",
+    id: "imported",
   },
 ] as const;
 
-type CreatePlanKind = "auto" | "ui" | "questions" | "visual";
-type ResolvedPlanKind = Exclude<CreatePlanKind, "auto">;
-type AutoPlanKind = Exclude<ResolvedPlanKind, "questions">;
-
-function isProbablyImportedPlan(prompt: string) {
-  const trimmed = prompt.trim();
-  const lines = trimmed.split(/\r?\n/).filter((line) => line.trim());
-  if (trimmed.length > 900 && lines.length > 8) return true;
-  const hasHeading = lines.some((line) => /^#{1,4}\s+\S/.test(line.trim()));
-  const checklistCount = lines.filter((line) =>
-    /^[-*]\s+\[[ x]\]\s+\S/i.test(line.trim()),
-  ).length;
-  const taskCount = lines.filter((line) =>
-    /^([-*]|\d+[.)])\s+\S/.test(line.trim()),
-  ).length;
-  const hasPlanLanguage =
-    /\b(implementation plan|acceptance criteria|milestones?|phases?|risks?|open questions?|test plan)\b/i.test(
-      trimmed,
-    );
-  return (
-    trimmed.includes("```") ||
-    (hasHeading && (taskCount >= 3 || hasPlanLanguage)) ||
-    (checklistCount >= 2 && trimmed.length > 220)
-  );
+function sourceOptionDisplayLabel(
+  source: PlanSource,
+  t: ReturnType<typeof useT>,
+) {
+  return t(`plansPage.create.sourceOptions.${source}`);
 }
 
-function assessPlanPrompt(prompt: string): {
-  kind: AutoPlanKind;
-  label: string;
-  reason: string;
-} {
-  let score = 0;
-  let ambiguitySignals = 0;
-
-  const wantsExploration =
-    /\b(ask questions|questions first|intake first|show me options|explore options|help me choose|not sure|unsure|which direction|compare)\b/i.test(
-      prompt,
-    );
-  const exactOrTrivial =
-    /\b(typo|copy tweak|one line|single file|exactly|no questions|don't ask|dont ask|just implement)\b/i.test(
-      prompt,
-    );
-  const uiDirection =
-    /\b(ui|screen|screens|layout|wireframe|mockup|form factor|mobile|desktop|responsive|nav|sidebar|flow|redesign|empty state|loading state|error state)\b/i.test(
-      prompt,
-    );
-  const multipleApproaches =
-    /\b(option|variant|alternative|tradeoff|approach|architecture|data model|permission|auth|integration|migration|state machine)\b/i.test(
-      prompt,
-    );
-  const newSurface =
-    /\b(new surface|multi-screen|workflow|journey|end-to-end|dashboard|settings|checkout|onboarding|review flow)\b/i.test(
-      prompt,
-    );
-  const risky =
-    /\b(auth|permission|billing|migration|schema|integration|oauth|webhook|security|role|privacy|external)\b/i.test(
-      prompt,
-    );
-
-  if (uiDirection) {
-    score += 2;
-    ambiguitySignals += 1;
-  }
-  if (multipleApproaches) {
-    score += 2;
-    ambiguitySignals += 1;
-  }
-  if (newSurface) score += 1;
-  if (risky) score += 1;
-  if (
-    wantsExploration ||
-    /\b(best|better|improve|explore|direction|choose)\b/i.test(prompt)
-  ) {
-    score += 1;
-    ambiguitySignals += 1;
-  }
-  if (exactOrTrivial) score -= 3;
-
-  if (uiDirection) {
-    return {
-      kind: "ui",
-      label: "UI flow",
-      reason:
-        "Auto detected UI states or flows; the agent will make a wireframe-first plan.",
-    };
-  }
-
-  return {
-    kind: "visual",
-    label: "General visual",
-    reason:
-      "Auto will ask the agent for a rich technical plan with diagrams and implementation detail.",
-  };
-}
-
-function sourceOptionLabel(source: PlanSource) {
-  return (
-    SOURCE_OPTIONS.find((option) => option.value === source)?.label ?? source
-  );
+function planKindDisplayLabel(
+  kind: CreatePlanKind,
+  t: ReturnType<typeof useT>,
+) {
+  return t(`plansPage.create.kindOptions.${kind}.label`);
 }
 
 function buildCreatePlanAgentMessage({
   prompt,
   source,
   planKind,
+  t,
 }: {
   prompt: string;
   source: PlanSource;
   planKind: CreatePlanKind;
+  t: ReturnType<typeof useT>;
 }) {
   const imported = isProbablyImportedPlan(prompt);
   const resolvedPlanKind =
     planKind === "auto" ? assessPlanPrompt(prompt).kind : planKind;
   const routing = imported
     ? "Build from this existing plan while preserving its intent."
-    : resolvedPlanKind === "ui"
-      ? "Create a UI-first plan with AI-authored wireframes and state coverage."
-      : resolvedPlanKind === "questions"
-        ? "Create visual intake questions before generating the final plan."
-        : "Create a general visual plan with diagrams and implementation detail.";
+    : resolvedPlanKind === "design"
+      ? "Create a design-first plan with full-fidelity branded screens. Use create-plan-design, ground the result in the real app shell and design tokens, and treat the Design tab as the visual source of truth."
+      : resolvedPlanKind === "ui"
+        ? "Create a UI-first plan with AI-authored wireframes and state coverage."
+        : resolvedPlanKind === "questions"
+          ? "Create visual intake questions before generating the final plan."
+          : "Create a general visual plan with diagrams and implementation detail.";
 
   return [
     "Create an Agent-Native Plan from this request.",
     "",
     routing,
-    `Source/provenance: ${sourceOptionLabel(source)}.`,
+    `Source/provenance: ${sourceOptionDisplayLabel(source, t)}.`,
     "",
-    "Use the Plan actions after you have enough substance. Generate the wireframes, diagrams, implementation map, review prompts, and concrete file/symbol notes yourself. Do not use placeholder file names, generic scaffold text, or browser-generated fallback sections as the final plan content.",
+    "Use the Plan actions after you have enough substance. Generate the requested review surface, diagrams, implementation map, review prompts, and concrete file/symbol notes yourself. Do not use placeholder file names, generic scaffold text, or browser-generated fallback sections as the final plan content.",
     "After creating the plan, open the plan link for review.",
     "",
     "Request:",
@@ -8591,14 +8711,13 @@ function CreatePlanDialog({
   canCreate: boolean;
   onRequireSignIn: () => void;
 }) {
+  const t = useT();
   const [source, setSource] = useState<PlanSource>("codex");
   const [planKind, setPlanKind] = useState<CreatePlanKind>("auto");
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [promptText, setPromptText] = useState("");
   const [promptSeed, setPromptSeed] = useState("");
   const [promptSeedKey, setPromptSeedKey] = useState(0);
-  // Gate the composer when signed in but nothing can run the agent (guests get
-  // the sign-in path instead). Clears live when a key is added.
   const agentMissing = useAgentEngineConfigured(canCreate).missing;
   const composerLocked = !canCreate || agentMissing;
 
@@ -8619,53 +8738,41 @@ function CreatePlanDialog({
       return;
     }
     if (agentMissing) {
-      toast.message(
-        "Connect the agent to run — add an API key or use Builder.",
-      );
+      toast.message(t("plansPage.create.agentMissing"));
       return;
     }
     const prompt = value.trim();
     if (!prompt) {
-      toast.message("Describe the plan first.");
+      toast.message(t("plansPage.create.describeFirst"));
       return;
     }
-    sendToAgentChat({
+    sendToPlanCreationAgentChat({
       type: "content",
       submit: true,
-      message: buildCreatePlanAgentMessage({ prompt, source, planKind }),
+      message: buildCreatePlanAgentMessage({ prompt, source, planKind, t }),
     });
     onOpenChange(false);
-    toast.success("Sent to the Plan agent");
+    toast.success(t("plansPage.create.sent"));
   };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[680px]">
         <DialogHeader>
-          <DialogTitle>Ask agent to create plan</DialogTitle>
+          <DialogTitle>{t("plansPage.create.title")}</DialogTitle>
           <DialogDescription>
-            Describe the plan you want, or paste an existing Codex/Claude plan.
-            The Plan agent will generate the wireframes and review structure.
+            {t("plansPage.create.description")}
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3">
-          {canCreate && agentMissing ? (
-            <BuilderSetupCard
-              fullWidth
-              onConnected={() =>
-                window.dispatchEvent(
-                  new Event("agent-engine:configured-changed"),
-                )
-              }
-            />
-          ) : null}
           <div className="rounded-xl border border-border bg-background p-2 shadow-sm">
             <PromptComposer
               autoFocus
+              requireAgentEngine
               disabled={composerLocked}
               attachmentsEnabled={false}
               showModelSelector={false}
-              placeholder="Ask the agent for a UI flow, implementation map, review notes..."
+              placeholder={t("plansPage.create.placeholder")}
               draftScope="plans:create-plan"
               initialText={promptSeed}
               initialTextKey={promptSeedKey}
@@ -8676,19 +8783,22 @@ function CreatePlanDialog({
           <div className="flex flex-wrap gap-2">
             {CREATE_PLAN_PROMPTS.map((preset) => (
               <Button
-                key={preset.label}
+                key={preset.id}
                 type="button"
                 variant="outline"
                 size="sm"
-                className="h-8 rounded-full border-border/80 px-3 text-xs font-medium text-muted-foreground hover:text-foreground"
+                className="rounded-full border-border/80 text-xs font-medium text-muted-foreground hover:text-foreground"
                 disabled={composerLocked}
                 onClick={() => {
-                  setPromptSeed(preset.prompt);
+                  const presetPrompt = t(
+                    `plansPage.create.presetPrompts.${preset.id}`,
+                  );
+                  setPromptSeed(presetPrompt);
                   setPromptSeedKey((key) => key + 1);
-                  setPromptText(preset.prompt);
+                  setPromptText(presetPrompt);
                 }}
               >
-                {preset.label}
+                {t(`plansPage.create.presets.${preset.id}`)}
               </Button>
             ))}
           </div>
@@ -8698,19 +8808,28 @@ function CreatePlanDialog({
                 type="button"
                 className="flex w-full items-center justify-between gap-3 rounded-lg px-1 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:text-foreground"
               >
-                <span className="font-medium">Advanced</span>
+                <span className="font-medium">
+                  {t("plansPage.create.advanced")}
+                </span>
                 <span className="flex min-w-0 items-center gap-2">
                   <span className="truncate">
-                    {sourceOptionLabel(source)} ·{" "}
+                    {sourceOptionDisplayLabel(source, t)} ·{" "}
                     {planKind === "auto"
                       ? promptAssessment
-                        ? `Auto: ${promptAssessment.label}`
-                        : "Auto"
-                      : planKind === "ui"
-                        ? "UI flow"
-                        : planKind === "questions"
-                          ? "Visual questions"
-                          : "General visual"}
+                        ? t("plansPage.create.autoWithLabel", {
+                            label: planKindDisplayLabel(
+                              promptAssessment.kind,
+                              t,
+                            ),
+                          })
+                        : planKindDisplayLabel("auto", t)
+                      : planKind === "design"
+                        ? planKindDisplayLabel("design", t)
+                        : planKind === "ui"
+                          ? planKindDisplayLabel("ui", t)
+                          : planKind === "questions"
+                            ? planKindDisplayLabel("questions", t)
+                            : planKindDisplayLabel("visual", t)}
                   </span>
                   <IconChevronDown
                     className={cn(
@@ -8725,67 +8844,71 @@ function CreatePlanDialog({
               <div className="grid gap-3 rounded-lg border border-border/70 bg-muted/20 p-3 sm:grid-cols-2">
                 <div className="grid gap-1.5">
                   <span className="text-xs font-medium text-foreground">
-                    Source
+                    {t("plansPage.create.source")}
                   </span>
                   <Select
                     value={source}
                     onValueChange={(value) => setSource(value as PlanSource)}
                   >
-                    <SelectTrigger aria-label="Plan source">
+                    <SelectTrigger aria-label={t("plansPage.create.source")}>
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       {SOURCE_OPTIONS.map((option) => (
                         <SelectItem key={option.value} value={option.value}>
-                          {option.label}
+                          {sourceOptionDisplayLabel(option.value, t)}
                         </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
                   <p className="text-xs leading-5 text-muted-foreground">
-                    Provenance only. It helps explain where the plan started.
+                    {t("plansPage.create.sourceHelp")}
                   </p>
                 </div>
                 <div className="grid gap-1.5">
                   <span className="text-xs font-medium text-foreground">
-                    Agent planning style
+                    {t("plansPage.create.planningStyle")}
                   </span>
                   <Select
                     value={planKind}
                     onValueChange={(value) =>
                       setPlanKind(
-                        value === "auto"
-                          ? "auto"
-                          : value === "visual"
-                            ? "visual"
-                            : value === "questions"
-                              ? "questions"
-                              : "ui",
+                        value === "auto" ||
+                          value === "design" ||
+                          value === "visual" ||
+                          value === "questions"
+                          ? value
+                          : "ui",
                       )
                     }
                   >
-                    <SelectTrigger aria-label="Fresh prompt style">
+                    <SelectTrigger
+                      aria-label={t("plansPage.create.planningStyle")}
+                    >
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="auto">
-                        Auto - choose the right planning path
+                        {t("plansPage.create.kindOptions.auto.description")}
                       </SelectItem>
                       <SelectItem value="ui">
-                        UI flow - wireframes and states
+                        {t("plansPage.create.kindOptions.ui.description")}
+                      </SelectItem>
+                      <SelectItem value="design">
+                        {t("plansPage.create.kindOptions.design.description")}
                       </SelectItem>
                       <SelectItem value="questions">
-                        Visual questions - explicit intake
+                        {t(
+                          "plansPage.create.kindOptions.questions.description",
+                        )}
                       </SelectItem>
                       <SelectItem value="visual">
-                        General visual - diagrams and notes
+                        {t("plansPage.create.kindOptions.visual.description")}
                       </SelectItem>
                     </SelectContent>
                   </Select>
                   <p className="text-xs leading-5 text-muted-foreground">
-                    Pasted plans are detected and sent to the agent with import
-                    context. Auto keeps the normal plan flow; choose Visual
-                    questions when you want intake first.
+                    {t("plansPage.create.planningHelp")}
                   </p>
                 </div>
               </div>
@@ -8793,129 +8916,18 @@ function CreatePlanDialog({
           </Collapsible>
           {promptAssessment && planKind === "auto" ? (
             <p className="px-1 text-xs text-muted-foreground">
-              {promptAssessment.reason}
+              {t(`plansPage.create.assessment.${promptAssessment.kind}`)}
             </p>
           ) : null}
           {promptText.trim() && isProbablyImportedPlan(promptText) ? (
             <p className="px-1 text-xs text-muted-foreground">
-              Looks like an existing plan. The agent will preserve it and add
-              visual review structure.
+              {t("plansPage.create.importDetected")}
             </p>
           ) : null}
         </div>
       </DialogContent>
     </Dialog>
   );
-}
-
-function createMentionChip(mention: PlanCommentMention) {
-  const chip = document.createElement("span");
-  chip.contentEditable = "false";
-  chip.dataset.mentionEmail = mention.email;
-  chip.dataset.mentionLabel = mention.label;
-  chip.className =
-    "inline-flex max-w-[12rem] items-center gap-1 rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-xs font-medium text-primary";
-  chip.textContent = `@${mention.label}`;
-  return chip;
-}
-
-function appendMessageToEditor(root: HTMLElement, message: string) {
-  root.replaceChildren();
-  const pattern = /@\[([^\]]+)\]\(mailto:([^)]+)\)/g;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(message)) !== null) {
-    if (match.index > lastIndex) {
-      root.append(
-        document.createTextNode(message.slice(lastIndex, match.index)),
-      );
-    }
-    const label = match[1]?.trim();
-    const email = decodeURIComponent(match[2] ?? "")
-      .trim()
-      .toLowerCase();
-    if (label && email) {
-      root.append(createMentionChip({ label, email }));
-    }
-    lastIndex = pattern.lastIndex;
-  }
-  if (lastIndex < message.length) {
-    root.append(document.createTextNode(message.slice(lastIndex)));
-  }
-}
-
-function serializeCommentEditor(root: HTMLElement) {
-  const serialize = (node: Node): string => {
-    if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
-    if (!(node instanceof HTMLElement)) return "";
-    const mentionEmail = node.dataset.mentionEmail;
-    if (mentionEmail) {
-      return formatPlanCommentMentionToken({
-        email: mentionEmail,
-        label: node.dataset.mentionLabel || displayNameForMention(mentionEmail),
-      });
-    }
-    if (node.tagName === "BR") return "\n";
-    return Array.from(node.childNodes).map(serialize).join("");
-  };
-  return Array.from(root.childNodes)
-    .map(serialize)
-    .join("")
-    .replace(/\u00a0/g, " ")
-    .replace(/[ \t]+\n/g, "\n")
-    .trim();
-}
-
-function commentBodyText(message: string) {
-  return message
-    .replace(/@\[([^\]]+)\]\(mailto:[^)]+\)/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-export function mentionQueryAtCaret(root: HTMLElement) {
-  const selection = window.getSelection();
-  if (!selection || selection.rangeCount === 0) return null;
-  const range = selection.getRangeAt(0);
-  if (!range.collapsed || !root.contains(range.startContainer)) return null;
-  const textBeforeCaretRange = range.cloneRange();
-  textBeforeCaretRange.selectNodeContents(root);
-  textBeforeCaretRange.setEnd(range.startContainer, range.startOffset);
-  const text = textBeforeCaretRange.toString();
-  const match = /(?:^|\s)@([a-zA-Z0-9._+-]{0,64})$/.exec(text);
-  if (!match) return null;
-  const start = text.lastIndexOf("@");
-  const end = text.length;
-  const startPosition = textPositionInRoot(root, start);
-  const endPosition = textPositionInRoot(root, end);
-  if (!startPosition || !endPosition) return null;
-  const queryRange = document.createRange();
-  queryRange.setStart(startPosition.node, startPosition.offset);
-  queryRange.setEnd(endPosition.node, endPosition.offset);
-  return {
-    query: match[1] ?? "",
-    range: queryRange,
-  };
-}
-
-function textPositionInRoot(root: HTMLElement, offset: number) {
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  let seen = 0;
-  let lastText: Text | null = null;
-  let node = walker.nextNode() as Text | null;
-  while (node) {
-    const length = node.textContent?.length ?? 0;
-    if (offset <= seen + length) {
-      return { node, offset: Math.max(0, offset - seen) };
-    }
-    seen += length;
-    lastText = node;
-    node = walker.nextNode() as Text | null;
-  }
-  if (lastText && offset === seen) {
-    return { node: lastText, offset: lastText.textContent?.length ?? 0 };
-  }
-  return null;
 }
 
 function CommentMentionEditor({
@@ -8935,6 +8947,7 @@ function CommentMentionEditor({
   onChange: (draft: Pick<CommentDraft, "message" | "mentions">) => void;
   onSubmitShortcut?: () => void;
 }) {
+  const t = useT();
   const editorRef = useRef<HTMLDivElement>(null);
   const activeQueryRef = useRef<ReturnType<typeof mentionQueryAtCaret>>(null);
   const onChangeRef = useRef(onChange);
@@ -9063,16 +9076,16 @@ function CommentMentionEditor({
       {suggestionsOpen && (
         <div
           role="listbox"
-          aria-label="Mention organization member"
+          aria-label={t("plansPage.comments.mentionMember")}
           className="absolute bottom-full left-0 z-50 mb-2 w-[min(320px,calc(100vw-48px))] overflow-hidden rounded-xl border border-border/80 bg-background/98 p-1 shadow-2xl backdrop-blur-xl"
         >
           {isLoading && members.length === 0 ? (
             <div className="px-3 py-2 text-xs text-muted-foreground">
-              Searching people...
+              {t("plansPage.comments.searchingPeople")}
             </div>
           ) : members.length === 0 ? (
             <div className="px-3 py-2 text-xs text-muted-foreground">
-              No matching organization members.
+              {t("plansPage.comments.noMatchingMembers")}
             </div>
           ) : (
             members.map((member, index) => {
@@ -9119,6 +9132,7 @@ function ResolutionTargetToggle({
   value: PlanCommentResolutionTarget;
   onChange: (value: PlanCommentResolutionTarget) => void;
 }) {
+  const t = useT();
   return (
     <ToggleGroup
       type="single"
@@ -9129,15 +9143,15 @@ function ResolutionTargetToggle({
       variant="default"
       size="sm"
       className="w-fit gap-0.5 rounded-md border border-border/70 bg-muted/35 p-0.5"
-      aria-label="Expected resolver"
+      aria-label={t("plansPage.comments.expectedResolver")}
     >
       <ToggleGroupItem value="agent" className="h-7 gap-1.5 px-2 text-xs">
         <IconSend className="size-3.5" />
-        Agent
+        {t("plansPage.comments.agent")}
       </ToggleGroupItem>
       <ToggleGroupItem value="human" className="h-7 gap-1.5 px-2 text-xs">
         <IconMessageCircle className="size-3.5" />
-        Human
+        {t("plansPage.comments.human")}
       </ToggleGroupItem>
     </ToggleGroup>
   );
@@ -9156,6 +9170,7 @@ function InlineCommentPopover({
   onSubmit: (draft: CommentDraft) => Promise<void>;
   lockToAgent?: boolean;
 }) {
+  const t = useT();
   const initialMessageRef = useRef(initialDraft.message);
   const [draft, setDraft] = useState<CommentDraft>(initialDraft);
   const [resolverTouched, setResolverTouched] = useState(false);
@@ -9167,7 +9182,11 @@ function InlineCommentPopover({
       mountedRef.current = false;
     };
   }, []);
-  const canSubmit = commentBodyText(draft.message).length > 0 && !isSubmitting;
+  const canSubmit = canSubmitInlineCommentDraft({
+    draft,
+    isSubmitting,
+    lockToAgent,
+  });
   const submit = async () => {
     if (!canSubmit) return;
     setSubmitError(false);
@@ -9202,7 +9221,7 @@ function InlineCommentPopover({
         {lockToAgent ? (
           <span className="flex items-center gap-1.5 px-1 text-xs font-medium text-muted-foreground">
             <IconSend className="size-3.5" />
-            To agent
+            {t("plansPage.comments.toAgent")}
           </span>
         ) : (
           <ResolutionTargetToggle
@@ -9216,11 +9235,11 @@ function InlineCommentPopover({
         <div className="flex items-center gap-1">
           <Button
             type="button"
-            size="icon"
+            size="icon-sm"
             variant="ghost"
-            className="size-8 shrink-0 text-muted-foreground/70 hover:bg-muted hover:text-foreground"
+            className="shrink-0 text-muted-foreground/70 hover:bg-muted hover:text-foreground"
             onClick={onCancel}
-            aria-label="Cancel comment"
+            aria-label={t("plansPage.comments.cancelComment")}
           >
             <IconX className="size-3.5" />
           </Button>
@@ -9229,19 +9248,23 @@ function InlineCommentPopover({
       <div className="flex items-start gap-2">
         <CommentMentionEditor
           initialMessage={initialMessageRef.current}
-          placeholder="Add a comment..."
+          placeholder={t("plansPage.comments.addPlaceholder")}
           autoFocus
           onSubmitShortcut={submit}
           onChange={(value) =>
-            setDraft((current) => ({
-              ...current,
-              ...value,
-              resolutionTarget: resolverTouched
-                ? current.resolutionTarget
-                : value.mentions.length > 0
-                  ? "human"
-                  : "agent",
-            }))
+            setDraft((current) => {
+              const addedMention =
+                value.mentions.length > current.mentions.length;
+              return {
+                ...current,
+                ...value,
+                resolutionTarget: resolverTouched
+                  ? current.resolutionTarget
+                  : addedMention
+                    ? "human"
+                    : current.resolutionTarget,
+              };
+            })
           }
         />
         <Button
@@ -9251,12 +9274,14 @@ function InlineCommentPopover({
           onClick={submit}
           disabled={!canSubmit}
         >
-          {isSubmitting ? "Saving" : "Save"}
+          {isSubmitting
+            ? t("plansPage.comments.saving")
+            : t("plansPage.common.save")}
         </Button>
       </div>
       {submitError && (
         <p className="mt-2 px-1 text-xs text-destructive">
-          Couldn't save. Try again.
+          {t("plansPage.comments.saveFailed")}
         </p>
       )}
     </div>
@@ -9272,6 +9297,7 @@ function GuestCommentCta({
   onSignIn: () => void;
   onCancel: () => void;
 }) {
+  const t = useT();
   return (
     <div
       data-plan-interactive
@@ -9279,23 +9305,25 @@ function GuestCommentCta({
       style={{ left: position.left, top: position.top, width: position.width }}
     >
       <div className="mb-3 flex items-center justify-between gap-2">
-        <p className="text-sm font-semibold">Sign in to comment</p>
+        <p className="text-sm font-semibold">
+          {t("plansPage.comments.signInTitle")}
+        </p>
         <Button
           type="button"
-          size="icon"
+          size="icon-sm"
           variant="ghost"
-          className="size-8 shrink-0 text-muted-foreground/70 hover:bg-muted hover:text-foreground"
+          className="shrink-0 text-muted-foreground/70 hover:bg-muted hover:text-foreground"
           onClick={onCancel}
-          aria-label="Cancel"
+          aria-label={t("plansPage.common.cancel")}
         >
           <IconX className="size-3.5" />
         </Button>
       </div>
       <p className="mb-4 text-sm text-muted-foreground">
-        Create a free account to leave comments on this plan.
+        {t("plansPage.comments.signInDescription")}
       </p>
       <Button type="button" size="sm" className="w-full" onClick={onSignIn}>
-        Sign in
+        {t("plansPage.loadError.signIn")}
       </Button>
     </div>
   );
@@ -9321,9 +9349,9 @@ function CommentThreadMessage({
             </p>
           )}
         </div>
-        <p className="mt-1 whitespace-pre-wrap text-sm leading-6">
+        <div className="mt-1 text-sm leading-6">
           {renderCommentMessage(comment.message)}
-        </p>
+        </div>
       </div>
       {action}
     </div>
@@ -9362,7 +9390,7 @@ function CommentDeleteButton({
 function ReplyComposer({
   author,
   isPending,
-  placeholder = "Reply",
+  placeholder,
   onSubmit,
 }: {
   author: CommentAuthorPresentation;
@@ -9370,6 +9398,7 @@ function ReplyComposer({
   placeholder?: string;
   onSubmit: (message: string) => Promise<void>;
 }) {
+  const t = useT();
   const [draft, setDraft] = useState<
     Pick<CommentDraft, "message" | "mentions">
   >({
@@ -9403,7 +9432,9 @@ function ReplyComposer({
         <CommentAvatar author={author} size="md" className="mb-1" />
         <div className="flex min-w-0 flex-1 items-end gap-2 rounded-xl border border-border/80 bg-muted/40 px-3 py-2 focus-within:border-primary/60 focus-within:bg-background">
           <CommentMentionEditor
-            placeholder={placeholder}
+            placeholder={
+              placeholder ?? t("plansPage.comments.replyPlaceholder")
+            }
             resetKey={`reply-${resetKey}`}
             className="min-h-10 border-0 bg-transparent px-0 py-2 shadow-none focus-visible:ring-0"
             onChange={setDraft}
@@ -9411,11 +9442,11 @@ function ReplyComposer({
           />
           <Button
             type="button"
-            size="icon"
-            className="mb-0.5 size-8 shrink-0 rounded-full"
+            size="icon-sm"
+            className="mb-0.5 shrink-0 rounded-full"
             onClick={() => void submit()}
             disabled={!canSubmit}
-            aria-label="Send reply"
+            aria-label={t("plansPage.comments.sendReply")}
           >
             {isSubmitting ? (
               <IconLoader2 className="size-4 animate-spin" />
@@ -9427,7 +9458,7 @@ function ReplyComposer({
       </div>
       {submitError && (
         <p className="ml-11 text-xs text-destructive">
-          Couldn't send. Try again.
+          {t("plansPage.comments.sendFailed")}
         </p>
       )}
     </div>
@@ -9439,6 +9470,7 @@ function AnnotationPopover({
   position,
   isPending,
   pendingAuthor,
+  canComment,
   canEditRootComment,
   onSave,
   onReply,
@@ -9454,6 +9486,7 @@ function AnnotationPopover({
   position: InlineCommentPosition;
   isPending: boolean;
   pendingAuthor: CommentAuthorPresentation;
+  canComment: boolean;
   canEditRootComment: boolean;
   onSave: (message: string) => void;
   onReply: (threadRootId: string, message: string) => Promise<void>;
@@ -9465,6 +9498,7 @@ function AnnotationPopover({
   onDeleteComment: (commentId: string) => void;
   onClose?: () => void;
 }) {
+  const t = useT();
   const popoverRef = useRef<HTMLDivElement>(null);
   const [editing, setEditing] = useState(false);
   const [messageDraft, setMessageDraft] = useState<
@@ -9473,15 +9507,10 @@ function AnnotationPopover({
     message: annotation.message,
     mentions: extractCommentMentions(annotation.message),
   });
-  // Reset edit state when the user opens a different comment pin.
   useEffect(() => {
     setEditing(false);
   }, [annotation.id]);
   useEffect(() => {
-    // Don't clobber in-progress edits when poll-driven annotation refreshes
-    // arrive (Issue 4b). Only sync the display message while NOT editing.
-    // When editing ends (editing flips false), this effect re-runs and picks
-    // up any fresh server state that arrived during the edit session.
     if (editing) return;
     setMessageDraft({
       message: annotation.message,
@@ -9493,6 +9522,7 @@ function AnnotationPopover({
   const annotationComments = [rootComment, ...replies];
   const rootDeleteLabel = deleteCommentLabel(
     commentDescendantCount(annotationComments, rootComment.id),
+    t,
   );
   const canSave =
     canEditRootComment && messageDraft.message.trim().length > 0 && !isPending;
@@ -9506,7 +9536,6 @@ function AnnotationPopover({
     onSave(messageDraft.message.trim());
   };
 
-  // Escape key closes the popover.
   useEffect(() => {
     if (!onClose) return;
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -9519,9 +9548,6 @@ function AnnotationPopover({
       window.removeEventListener("keydown", handleKeyDown, { capture: true });
   }, [onClose]);
 
-  // Pointer-down outside the popover closes it. Clicks on comment marker
-  // buttons (data-comment-marker) are intentionally allowed through so switching
-  // to another pin still works without double-clicking.
   useEffect(() => {
     if (!onClose) return;
     const handlePointerDown = (event: MouseEvent) => {
@@ -9551,7 +9577,9 @@ function AnnotationPopover({
       <div className="flex h-12 shrink-0 items-center justify-between gap-3 border-b border-border/70 px-4">
         <div className="flex min-w-0 items-center gap-2">
           <IconMessageCircle className="size-4 text-muted-foreground" />
-          <h2 className="truncate text-sm font-semibold">Comment</h2>
+          <h2 className="truncate text-sm font-semibold">
+            {t("plansPage.comments.comment")}
+          </h2>
           {annotation.commentCount > 1 && (
             <Badge variant="secondary" className="h-5 rounded-md px-1.5">
               {annotation.commentCount}
@@ -9561,7 +9589,9 @@ function AnnotationPopover({
             variant="outline"
             className="h-5 rounded-md px-1.5 text-[11px]"
           >
-            {resolver === "human" ? "Human review" : "Agent action"}
+            {resolver === "human"
+              ? t("plansPage.comments.humanReview")
+              : t("plansPage.comments.agentAction")}
           </Badge>
         </div>
         <div className="flex shrink-0 items-center gap-1">
@@ -9570,10 +9600,10 @@ function AnnotationPopover({
               <DropdownMenuTrigger asChild>
                 <Button
                   type="button"
-                  size="icon"
+                  size="icon-sm"
                   variant="ghost"
-                  className="size-8 shrink-0"
-                  aria-label="Comment options"
+                  className="shrink-0"
+                  aria-label={t("plansPage.comments.options")}
                 >
                   <IconDotsVertical className="size-4" />
                 </Button>
@@ -9591,7 +9621,9 @@ function AnnotationPopover({
                     }
                   >
                     <IconCircleCheck className="size-4" />
-                    {isResolved ? "Reopen thread" : "Mark as resolved"}
+                    {isResolved
+                      ? t("plansPage.comments.reopenThread")
+                      : t("plansPage.comments.markResolved")}
                   </DropdownMenuItem>
                 )}
                 {canEditRootComment && (
@@ -9600,7 +9632,7 @@ function AnnotationPopover({
                     onClick={() => setEditing(true)}
                   >
                     <IconPencil className="size-4" />
-                    Edit first comment
+                    {t("plansPage.comments.editFirstComment")}
                   </DropdownMenuItem>
                 )}
                 {canDelete && (
@@ -9623,30 +9655,36 @@ function AnnotationPopover({
               <TooltipTrigger asChild>
                 <Button
                   type="button"
-                  size="icon"
+                  size="icon-sm"
                   variant={isResolved ? "secondary" : "ghost"}
-                  className="size-8 shrink-0 rounded-full"
+                  className="shrink-0 rounded-full"
                   onClick={() =>
                     onStatusChange(isResolved ? "open" : "resolved")
                   }
-                  aria-label={isResolved ? "Reopen thread" : "Mark as resolved"}
+                  aria-label={
+                    isResolved
+                      ? t("plansPage.comments.reopenThread")
+                      : t("plansPage.comments.markResolved")
+                  }
                 >
                   <IconCircleCheck className="size-4" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>
-                {isResolved ? "Reopen thread" : "Mark as resolved"}
+                {isResolved
+                  ? t("plansPage.comments.reopenThread")
+                  : t("plansPage.comments.markResolved")}
               </TooltipContent>
             </Tooltip>
           )}
           {onClose && (
             <Button
               type="button"
-              size="icon"
+              size="icon-sm"
               variant="ghost"
-              className="size-8 shrink-0"
+              className="shrink-0"
               onClick={onClose}
-              aria-label="Close comment"
+              aria-label={t("plansPage.comments.closeComment")}
             >
               <IconX className="size-4" />
             </Button>
@@ -9660,7 +9698,7 @@ function AnnotationPopover({
               <CommentMentionEditor
                 initialMessage={annotation.message}
                 resetKey={`edit-${annotation.id}-${editing ? "on" : "off"}`}
-                placeholder="Edit comment..."
+                placeholder={t("plansPage.comments.editPlaceholder")}
                 autoFocus
                 className="min-h-24"
                 onChange={setMessageDraft}
@@ -9679,7 +9717,7 @@ function AnnotationPopover({
                     });
                   }}
                 >
-                  Cancel
+                  {t("plansPage.common.cancel")}
                 </Button>
                 <Button
                   type="button"
@@ -9687,7 +9725,7 @@ function AnnotationPopover({
                   onClick={save}
                   disabled={!canSave}
                 >
-                  Save
+                  {t("plansPage.common.save")}
                 </Button>
               </div>
             </div>
@@ -9697,6 +9735,7 @@ function AnnotationPopover({
           {replies.map((reply) => {
             const replyDeleteLabel = deleteCommentLabel(
               commentDescendantCount(annotationComments, reply.id),
+              t,
             );
             return (
               <CommentThreadMessage
@@ -9715,13 +9754,15 @@ function AnnotationPopover({
           })}
         </div>
       </div>
-      <div className="shrink-0 border-t border-border/70 p-3">
-        <ReplyComposer
-          author={pendingAuthor}
-          isPending={isPending}
-          onSubmit={(reply) => onReply(annotation.id, reply)}
-        />
-      </div>
+      {canComment && (
+        <div className="shrink-0 border-t border-border/70 p-3">
+          <ReplyComposer
+            author={pendingAuthor}
+            isPending={isPending}
+            onSubmit={(reply) => onReply(annotation.id, reply)}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -9734,6 +9775,7 @@ function AnnotationsPanel({
   pendingAuthor,
   isPending,
   onReply,
+  canComment,
   canResolve,
   canDeleteThread,
   canDeleteComment,
@@ -9749,6 +9791,7 @@ function AnnotationsPanel({
   pendingAuthor: CommentAuthorPresentation;
   isPending: boolean;
   onReply: (threadRootId: string, message: string) => Promise<void>;
+  canComment: boolean;
   canResolve: boolean;
   canDeleteThread: (thread: CommentThread) => boolean;
   canDeleteComment: (comment: PlanCommentItem) => boolean;
@@ -9760,6 +9803,7 @@ function AnnotationsPanel({
   onDeleteComment: (thread: CommentThread, commentId: string) => void;
   onClose: () => void;
 }) {
+  const t = useT();
   const panelRef = useRef<HTMLElement>(null);
   const [filterTab, setFilterTab] = useState<"open" | "resolved">("open");
 
@@ -9769,7 +9813,6 @@ function AnnotationsPanel({
     }
   }, [filterTab, showResolvedComments]);
 
-  // Move focus into the panel when it opens.
   useEffect(() => {
     const panel = panelRef.current;
     if (!panel) return;
@@ -9779,17 +9822,13 @@ function AnnotationsPanel({
     focusable?.focus();
   }, []);
 
-  // Escape closes the panel and attempts to return focus to the toolbar
-  // trigger that opened it (the "Plan actions" dots button).
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
-      // Only handle Escape if focus is inside this panel.
       if (!panelRef.current?.contains(document.activeElement)) return;
       onClose();
-      // Return focus to the toolbar dots-menu trigger if reachable.
       const trigger = document.querySelector<HTMLElement>(
-        '[aria-label="Plan actions"]',
+        "[data-plan-actions-trigger]",
       );
       trigger?.focus();
     };
@@ -9816,15 +9855,16 @@ function AnnotationsPanel({
       <div className="flex h-12 shrink-0 items-center justify-between gap-3 border-b border-border/70 px-4">
         <div className="flex min-w-0 items-center gap-2">
           <IconMessageCircle className="size-4 text-muted-foreground" />
-          <h2 className="truncate text-sm font-semibold">Comments</h2>
+          <h2 className="truncate text-sm font-semibold">
+            {t("plansPage.comments.comments")}
+          </h2>
         </div>
         <Button
           type="button"
-          size="icon"
+          size="icon-sm"
           variant="ghost"
-          className="size-8"
           onClick={onClose}
-          aria-label="Close comments"
+          aria-label={t("plansPage.comments.closeComments")}
         >
           <IconX className="size-4" />
         </Button>
@@ -9839,7 +9879,7 @@ function AnnotationsPanel({
           >
             <TabsList className="h-7 gap-0.5 rounded-lg p-0.5">
               <TabsTrigger value="open" className="h-6 gap-1.5 px-2 text-xs">
-                Open
+                {t("plansPage.comments.open")}
                 {openThreads.length > 0 && (
                   <span className="rounded-md bg-muted px-1 text-[10px] font-medium text-muted-foreground">
                     {openThreads.length}
@@ -9850,7 +9890,7 @@ function AnnotationsPanel({
                 value="resolved"
                 className="h-6 gap-1.5 px-2 text-xs"
               >
-                Resolved
+                {t("plansPage.comments.resolved")}
                 {resolvedThreads.length > 0 && (
                   <span className="rounded-md bg-muted px-1 text-[10px] font-medium text-muted-foreground">
                     {resolvedThreads.length}
@@ -9866,8 +9906,8 @@ function AnnotationsPanel({
           {visibleThreads.length === 0 ? (
             <p className="rounded-lg border border-dashed border-border p-4 text-sm leading-6 text-muted-foreground">
               {showResolvedComments && filterTab === "resolved"
-                ? "No resolved comments."
-                : "No open comments. Click Comment, then click to place one."}
+                ? t("plansPage.comments.noResolved")
+                : t("plansPage.comments.noOpen")}
             </p>
           ) : (
             visibleThreads.map((thread) => {
@@ -9875,6 +9915,7 @@ function AnnotationsPanel({
               const canDelete = canDeleteThread(thread);
               const rootDeleteLabel = deleteCommentLabel(
                 commentDescendantCount(thread.comments, thread.root.id),
+                t,
               );
               return (
                 <article
@@ -9892,8 +9933,8 @@ function AnnotationsPanel({
                             {normalizePlanCommentResolutionTarget(
                               thread.anchor.resolutionTarget,
                             ) === "human"
-                              ? "Human review"
-                              : "Agent action"}
+                              ? t("plansPage.comments.humanReview")
+                              : t("plansPage.comments.agentAction")}
                           </span>
                           {" · "}
                           {formatAnchorForAgent(thread.anchor)}
@@ -9905,9 +9946,9 @@ function AnnotationsPanel({
                             <TooltipTrigger asChild>
                               <Button
                                 type="button"
-                                size="icon"
+                                size="icon-sm"
                                 variant={isResolved ? "secondary" : "ghost"}
-                                className="size-8 rounded-full"
+                                className="rounded-full"
                                 onClick={() =>
                                   onStatusChange(
                                     thread,
@@ -9916,8 +9957,8 @@ function AnnotationsPanel({
                                 }
                                 aria-label={
                                   isResolved
-                                    ? "Reopen thread"
-                                    : "Mark as resolved"
+                                    ? t("plansPage.comments.reopenThread")
+                                    : t("plansPage.comments.markResolved")
                                 }
                               >
                                 <IconCircleCheck className="size-4" />
@@ -9925,8 +9966,8 @@ function AnnotationsPanel({
                             </TooltipTrigger>
                             <TooltipContent>
                               {isResolved
-                                ? "Reopen thread"
-                                : "Mark as resolved"}
+                                ? t("plansPage.comments.reopenThread")
+                                : t("plansPage.comments.markResolved")}
                             </TooltipContent>
                           </Tooltip>
                           {canDelete && (
@@ -9934,9 +9975,9 @@ function AnnotationsPanel({
                               <TooltipTrigger asChild>
                                 <Button
                                   type="button"
-                                  size="icon"
+                                  size="icon-sm"
                                   variant="ghost"
-                                  className="size-8 rounded-full text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                                  className="rounded-full text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                                   onClick={() => onDeleteThread(thread)}
                                   aria-label={rootDeleteLabel}
                                 >
@@ -9953,9 +9994,9 @@ function AnnotationsPanel({
                           <TooltipTrigger asChild>
                             <Button
                               type="button"
-                              size="icon"
+                              size="icon-sm"
                               variant="ghost"
-                              className="size-8 shrink-0 rounded-full text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                              className="shrink-0 rounded-full text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                               onClick={() => onDeleteThread(thread)}
                               aria-label={rootDeleteLabel}
                             >
@@ -9975,6 +10016,7 @@ function AnnotationsPanel({
                     );
                     const commentDeleteLabel = deleteCommentLabel(
                       commentDescendantCount(thread.comments, comment.id),
+                      t,
                     );
                     return (
                       <CommentThreadMessage
@@ -9994,11 +10036,13 @@ function AnnotationsPanel({
                       />
                     );
                   })}
-                  <ReplyComposer
-                    author={pendingAuthor}
-                    isPending={isPending}
-                    onSubmit={(reply) => onReply(thread.id, reply)}
-                  />
+                  {canComment && (
+                    <ReplyComposer
+                      author={pendingAuthor}
+                      isPending={isPending}
+                      onSubmit={(reply) => onReply(thread.id, reply)}
+                    />
+                  )}
                 </article>
               );
             })
@@ -10022,29 +10066,36 @@ function DeleteCommentDialog({
   onOpenChange: (open: boolean) => void;
   onConfirm: () => void;
 }) {
+  const t = useT();
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>
-            {replyCount > 0 ? "Delete thread?" : "Delete comment?"}
+            {replyCount > 0
+              ? t("plansPage.comments.deleteThreadTitle")
+              : t("plansPage.comments.deleteCommentTitle")}
           </AlertDialogTitle>
           <AlertDialogDescription>
             {replyCount > 0
-              ? `This will remove the comment and ${replyCount} ${
-                  replyCount === 1 ? "reply" : "replies"
-                } from the plan.`
-              : "This will remove the comment from the plan."}
+              ? t("plansPage.comments.deleteThreadDescription", {
+                  count: replyCount,
+                })
+              : t("plansPage.comments.deleteCommentDescription")}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogCancel disabled={isDeleting}>Cancel</AlertDialogCancel>
+          <AlertDialogCancel disabled={isDeleting}>
+            {t("plansPage.common.cancel")}
+          </AlertDialogCancel>
           <AlertDialogAction
             disabled={isDeleting}
             onClick={onConfirm}
             className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
           >
-            {isDeleting ? "Deleting..." : "Delete"}
+            {isDeleting
+              ? t("plansPage.common.deleting")
+              : t("plansPage.common.delete")}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
@@ -10067,6 +10118,7 @@ function DeletePlanDialog({
   onOpenChange: (open: boolean) => void;
   onConfirm: (mode: "soft" | "hard", confirmation?: string) => void;
 }) {
+  const t = useT();
   const [mode, setMode] = useState<"soft" | "hard">("soft");
   const [confirmation, setConfirmation] = useState("");
   const plan = request?.plan ?? null;
@@ -10074,6 +10126,10 @@ function DeletePlanDialog({
   const effectiveMode = hardOnly ? "hard" : mode;
   const phrase = plan ? hardDeletePlanPhrase(plan.id) : "";
   const noun = plan?.kind === "recap" ? "recap" : "plan";
+  const nounLabel =
+    plan?.kind === "recap"
+      ? t("plansPage.nouns.recap")
+      : t("plansPage.nouns.plan");
   const canSubmit =
     Boolean(plan) &&
     !isPending &&
@@ -10091,12 +10147,13 @@ function DeletePlanDialog({
         <DialogHeader>
           <DialogTitle>
             {effectiveMode === "hard"
-              ? `Permanently delete this ${noun}?`
-              : `Delete this ${noun}?`}
+              ? t("plansPage.deletePlan.hardTitle", { noun: nounLabel })
+              : t("plansPage.deletePlan.softTitle", { noun: nounLabel })}
           </DialogTitle>
           <DialogDescription>
-            {plan?.title ?? "This hosted plan"} will no longer be available from
-            normal plan views.
+            {t("plansPage.deletePlan.description", {
+              title: plan?.title ?? t("plansPage.deletePlan.fallbackTitle"),
+            })}
           </DialogDescription>
         </DialogHeader>
 
@@ -10115,9 +10172,11 @@ function DeletePlanDialog({
                   : "border-border hover:bg-accent/40",
               )}
             >
-              <span className="font-medium">Move to Deleted</span>
+              <span className="font-medium">
+                {t("plansPage.deletePlan.moveToDeleted")}
+              </span>
               <span className="mt-1 block text-xs leading-5 text-muted-foreground">
-                Hide it now, stop public access, and keep restore available.
+                {t("plansPage.deletePlan.softOptionDescription")}
               </span>
             </button>
             <button
@@ -10131,10 +10190,10 @@ function DeletePlanDialog({
               )}
             >
               <span className="font-medium text-destructive">
-                Delete permanently
+                {t("plansPage.deletePlan.deletePermanently")}
               </span>
               <span className="mt-1 block text-xs leading-5 text-muted-foreground">
-                Remove hosted rows and references. This cannot be undone.
+                {t("plansPage.deletePlan.hardOptionDescription")}
               </span>
             </button>
           </div>
@@ -10142,9 +10201,7 @@ function DeletePlanDialog({
 
         {effectiveMode === "soft" ? (
           <div className="rounded-lg border border-border bg-muted/30 p-3 text-sm leading-6 text-muted-foreground">
-            Soft delete moves the {noun} to the Deleted tab. Direct links,
-            public sharing, comments, and agent reads stop working until you
-            restore it.
+            {t("plansPage.deletePlan.softDescription", { noun: nounLabel })}
           </div>
         ) : (
           <div className="space-y-3">
@@ -10153,23 +10210,23 @@ function DeletePlanDialog({
                 <IconAlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
                 <div className="space-y-1 text-sm">
                   <p className="font-medium text-destructive">
-                    Permanent deletion cannot be undone.
+                    {t("plansPage.deletePlan.permanentWarning")}
                   </p>
                   <p className="leading-6 text-muted-foreground">
-                    This removes the hosted {noun}, comments, shares, activity,
-                    versions, reports, and Plan SQL asset records. Local files
-                    and external upload-provider lifecycle rules are separate.
+                    {t("plansPage.deletePlan.permanentDescription", {
+                      noun: nounLabel,
+                    })}
                   </p>
                 </div>
               </div>
             </div>
             <div className="space-y-2">
               <Label htmlFor="hard-delete-plan-confirmation">
-                Type{" "}
+                {t("plansPage.deletePlan.typePrefix")}{" "}
                 <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
                   {phrase}
                 </code>{" "}
-                to confirm
+                {t("plansPage.deletePlan.typeSuffix")}
               </Label>
               <Input
                 id="hard-delete-plan-confirmation"
@@ -10189,7 +10246,7 @@ function DeletePlanDialog({
             onClick={() => onOpenChange(false)}
             disabled={isPending}
           >
-            Cancel
+            {t("plansPage.common.cancel")}
           </Button>
           <Button
             type="button"
@@ -10203,10 +10260,10 @@ function DeletePlanDialog({
             }
           >
             {isPending
-              ? "Deleting..."
+              ? t("plansPage.common.deleting")
               : effectiveMode === "hard"
-                ? "Delete permanently"
-                : "Move to Deleted"}
+                ? t("plansPage.deletePlan.deletePermanently")
+                : t("plansPage.deletePlan.moveToDeleted")}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -10241,1351 +10298,12 @@ function formatAnchorForAgent(anchor: PlanAnnotationAnchor | null) {
   return formatPlanCommentAnchorForAgent(anchor);
 }
 
-function injectAnnotationRuntime(
-  html: string,
-  comments: PlanBundle["comments"],
-  annotateMode: boolean,
-  theme: "dark" | "light",
-  preferredEditor: PreferredEditor,
-  avatarUrls: Record<string, string | null> = {},
-  currentUser?: CurrentCommentAuthor | null,
+function buildClientPlanHtml(
+  bundle: PlanBundle,
+  labels: {
+    workingPlan: string;
+  },
 ) {
-  const annotations = buildCommentThreads(comments)
-    .map((thread, index) =>
-      runtimeAnnotationFromThread(thread, index, avatarUrls, currentUser),
-    )
-    .filter((annotation): annotation is RuntimeAnnotation =>
-      Boolean(annotation),
-    );
-  const payload = JSON.stringify({
-    annotateMode,
-    annotations,
-    theme,
-    preferredEditor,
-  }).replace(/[<>&\u2028\u2029]/g, (char) => {
-    return (
-      {
-        "<": "\\u003c",
-        ">": "\\u003e",
-        "&": "\\u0026",
-        "\u2028": "\\u2028",
-        "\u2029": "\\u2029",
-      }[char] ?? char
-    );
-  });
-  const editorOptionsPayload = JSON.stringify(EDITOR_OPTIONS).replace(
-    /[<>&\u2028\u2029]/g,
-    (char) => {
-      return (
-        {
-          "<": "\\u003c",
-          ">": "\\u003e",
-          "&": "\\u0026",
-          "\u2028": "\\u2028",
-          "\u2029": "\\u2029",
-        }[char] ?? char
-      );
-    },
-  );
-  const editorIconPayload = JSON.stringify(EDITOR_ICON_HTML).replace(
-    /[<>&\u2028\u2029]/g,
-    (char) => {
-      return (
-        {
-          "<": "\\u003c",
-          ">": "\\u003e",
-          "&": "\\u0026",
-          "\u2028": "\\u2028",
-          "\u2029": "\\u2029",
-        }[char] ?? char
-      );
-    },
-  );
-  const runtime = `<style>
-    :root[data-agent-native-theme="light"] {
-      color-scheme: light;
-      --bg: #f7f7f4;
-      --paper: #ffffff;
-      --paper-2: #f3f3ef;
-      --paper-3: #e9e9e3;
-      --line: #dadad2;
-      --line-soft: #e8e8e2;
-      --text: #171717;
-      --soft: #4b4b4b;
-      --muted: #70706c;
-      --faint: #999992;
-      --accent: #00B5FF;
-      --accent-soft: rgba(0, 181, 255, .11);
-      --shadow: 0 24px 70px rgba(29, 29, 24, .08);
-    }
-    :root[data-agent-native-theme="light"] body { background: var(--bg) !important; color: var(--text) !important; }
-    :root[data-agent-native-theme="light"] code { background: #eeeeea !important; color: #242424 !important; }
-    :root[data-agent-native-theme] pre code,
-    :root[data-agent-native-theme] pre code * { background: transparent !important; background-image: none !important; box-shadow: none !important; }
-    :root[data-agent-native-theme="light"] .mock-plan,
-    :root[data-agent-native-theme="light"] .mock-sidebar,
-    :root[data-agent-native-theme="light"] .diagram-card,
-    :root[data-agent-native-theme="light"] .mock-browser { background-color: #ffffff !important; }
-    :root[data-agent-native-theme="light"] .floating-tools,
-    :root[data-agent-native-theme="light"] .product-screen,
-    :root[data-agent-native-theme="light"] .comment-screen,
-    :root[data-agent-native-theme="light"] .annotation-card,
-    :root[data-agent-native-theme="light"] .inline-comment,
-    :root[data-agent-native-theme="light"] .panel { background-color: #f5f5f1 !important; }
-    :root[data-agent-native-theme="light"] .doc-title,
-    :root[data-agent-native-theme="light"] .tool.primary,
-    :root[data-agent-native-theme="light"] .pin { background: #171717 !important; color: #ffffff !important; }
-    :root[data-agent-native-theme="light"] .doc-line,
-    :root[data-agent-native-theme="light"] .panel i,
-    :root[data-agent-native-theme="light"] .pill { background: #d8d8d2 !important; }
-    ::selection { background: rgba(0,181,255,.32); }
-    .an-plan-annotating, .an-plan-annotating * { cursor: crosshair !important; }
-    .an-plan-annotation-layer { position: absolute; inset: 0; z-index: 2147483000; pointer-events: none; }
-    .an-plan-marker { position: absolute; transform: translate(-50%, -50%); min-width: 30px; height: 30px; overflow: visible; border: 1px solid rgba(255,255,255,.18); border-radius: 999px; background: rgba(23,23,25,.86); color: #fff; font: 800 10px/1 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; display: inline-flex; align-items: center; justify-content: center; gap: 3px; box-shadow: 0 10px 28px rgba(0,0,0,.36); pointer-events: auto; padding: 2px 6px 2px 2px; }
-    .an-plan-marker[data-single="true"] { width: 30px; min-width: 30px; padding: 0; border: 2px solid var(--paper, #111113); background: var(--author-color, #00B5FF); overflow: hidden; }
-    .an-plan-marker-stack { display: inline-flex; align-items: center; flex: 0 0 auto; }
-    .an-plan-marker-face { width: 26px; height: 26px; margin-left: -7px; overflow: hidden; border: 2px solid var(--paper, #111113); border-radius: 999px; background: var(--author-color, #00B5FF); color: #fff; display: inline-flex; align-items: center; justify-content: center; }
-    .an-plan-marker-face:first-child { margin-left: 0; }
-    .an-plan-marker[data-single="true"] .an-plan-marker-face { width: 28px; height: 28px; margin-left: 0; border: 0; }
-    .an-plan-marker-avatar { width: 100%; height: 100%; border-radius: inherit; object-fit: cover; display: block; }
-    .an-plan-marker-initials { width: 100%; height: 100%; border-radius: inherit; background: var(--author-color, #00B5FF); color: #fff; display: inline-flex; align-items: center; justify-content: center; letter-spacing: 0; }
-    .an-plan-marker-count { min-width: 13px; padding: 0 2px; color: rgba(255,255,255,.94); font-size: 11px; line-height: 1; }
-    .an-plan-marker[hidden] { display: none !important; }
-    .an-plan-marker[data-status="resolved"] { opacity: .46; }
-    .an-plan-selection-toolbar { position: absolute; z-index: 2147483001; display: none; align-items: center; gap: 4px; border: 1px solid rgba(255,255,255,.16); border-radius: 14px; background: rgba(16,16,18,.96); padding: 5px; box-shadow: 0 14px 42px rgba(0,0,0,.34); backdrop-filter: blur(16px); }
-    :root[data-agent-native-theme="light"] .an-plan-selection-toolbar { border-color: rgba(0,0,0,.12); background: rgba(255,255,255,.97); box-shadow: 0 14px 42px rgba(29,29,24,.13); }
-    .an-plan-selection-toolbar button { height: 34px; display: inline-flex; align-items: center; gap: 8px; border: 0; border-radius: 10px; background: transparent; color: var(--text); padding: 0 11px; font: 650 13px/1 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; cursor: pointer; }
-    .an-plan-selection-toolbar button:hover { background: rgba(255,255,255,.08); }
-    :root[data-agent-native-theme="light"] .an-plan-selection-toolbar button:hover { background: rgba(0,0,0,.06); }
-    .an-plan-selection-toolbar svg { width: 17px; height: 17px; color: #00B5FF; }
-    .an-plan-code-popover { position: absolute; z-index: 2147483001; width: min(760px, calc(100vw - 24px)); max-height: min(520px, calc(100vh - 24px)); overflow: hidden; border: 1px solid rgba(255,255,255,.16); border-radius: 16px; background: rgba(16,16,18,.98); box-shadow: 0 24px 70px rgba(0,0,0,.42); backdrop-filter: blur(18px); }
-    :root[data-agent-native-theme="light"] .an-plan-code-popover { border-color: rgba(0,0,0,.12); background: rgba(255,255,255,.98); box-shadow: 0 24px 70px rgba(29,29,24,.16); }
-    .an-plan-code-popover-header { display: flex; min-height: 46px; align-items: center; gap: 12px; border-bottom: 1px solid var(--line, rgba(255,255,255,.12)); padding: 7px 9px 7px 14px; color: var(--muted, #a4a4aa); font: 650 12px/1.3 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    .an-plan-code-popover-title { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text, #f4f4f5); font: 650 13px/1.3 "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
-    .an-plan-code-popover-actions { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
-    .an-plan-code-popover-close { display: inline-flex; width: 30px; height: 30px; align-items: center; justify-content: center; border: 0; border-radius: 8px; background: transparent; color: inherit; cursor: pointer; font-size: 18px; }
-    .an-plan-code-popover-close:hover { background: rgba(255,255,255,.08); color: var(--text, #f4f4f5); }
-    :root[data-agent-native-theme="light"] .an-plan-code-popover-close:hover { background: rgba(0,0,0,.06); }
-    .an-plan-code-popover .code-preview-title { display: none !important; }
-    .an-plan-code-popover .code-preview { border: 0 !important; background: transparent !important; box-shadow: none !important; }
-    .an-plan-code-popover .code-preview pre { margin: 0 !important; max-height: 474px; overflow: auto; padding: 14px 16px !important; background: #0c0c0e !important; color: #e9e9ea; font: 12px/1.65 "SFMono-Regular", Consolas, "Liberation Mono", monospace !important; tab-size: 2; }
-    .an-plan-code-popover .code-preview pre code { display: block !important; min-width: max-content; border: 0 !important; background: transparent !important; color: inherit !important; font: inherit !important; padding: 0 !important; white-space: pre !important; }
-    .an-plan-code-popover .code-preview pre code * { margin: 0 !important; border: 0 !important; border-radius: 0 !important; outline: 0 !important; background: transparent !important; background-image: none !important; box-shadow: none !important; padding: 0 !important; text-decoration: none !important; font: inherit !important; }
-    .an-plan-code-popover .code-preview pre code code { display: inline !important; }
-    .editor-picker { position: relative; display: inline-flex; min-height: 32px; align-items: stretch; overflow: visible; border: 1px solid var(--line, rgba(255,255,255,.14)); border-radius: 8px; background: transparent; }
-    .editor-picker:focus-within, .editor-picker:hover { border-color: rgba(0,181,255,.44); background: rgba(0,181,255,.06); }
-    .editor-picker button { min-height: 30px; border: 0; border-radius: 0; background: transparent; color: var(--soft, #d4d4d8); padding: 0 10px; font: 650 12px/30px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; cursor: pointer; }
-    .editor-picker button:hover { color: var(--text, #f4f4f5); background: rgba(255,255,255,.05); }
-    .editor-picker-trigger { display: inline-flex; width: 48px; align-items: center; justify-content: center; gap: 6px; border-right: 1px solid var(--line, rgba(255,255,255,.14)) !important; border-radius: 7px 0 0 7px !important; }
-    .editor-picker-open { border-radius: 0 7px 7px 0 !important; color: var(--text, #f4f4f5) !important; }
-    .editor-picker-select { display: none; }
-    .editor-picker-caret { width: 6px; height: 6px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: translateY(-1px) rotate(45deg); opacity: .72; }
-    .editor-picker-menu { position: absolute; top: calc(100% + 7px); right: 0; z-index: 2147483002; display: none; width: 188px; border: 1px solid var(--line, rgba(255,255,255,.14)); border-radius: 12px; background: var(--paper, #111113); padding: 6px; box-shadow: 0 18px 50px rgba(0,0,0,.32); }
-    .editor-picker[data-open="true"] .editor-picker-menu { display: grid; gap: 2px; }
-    .editor-picker-option { display: flex !important; align-items: center; justify-content: flex-start; gap: 10px; width: 100%; border-radius: 8px !important; text-align: left; }
-    .editor-picker-option:hover, .editor-picker-option.is-active { background: rgba(255,255,255,.06); color: var(--text, #f4f4f5); }
-    .editor-icon { display: inline-flex; width: 18px; height: 18px; flex: 0 0 auto; align-items: center; justify-content: center; }
-    .editor-icon svg { width: 18px; height: 18px; stroke-width: 2; }
-    .editor-icon-vscode { color: #41a6f6; }
-    .editor-icon-cursor { color: var(--text, #f4f4f5); }
-    .editor-icon-finder { color: #4aa9ff; }
-    .editor-icon-terminal { color: #73d99f; }
-    .editor-icon-ghostty { color: #a78bfa; }
-    .editor-icon-xcode { color: #54a7ff; }
-    .editor-picker-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
-    :root[data-agent-native-theme="light"] .editor-picker button { color: var(--soft, #4b4b4b); }
-    :root[data-agent-native-theme="light"] .editor-picker button:hover, :root[data-agent-native-theme="light"] .editor-picker-option.is-active { background: rgba(0,0,0,.06); color: var(--text, #171717); }
-    :root[data-agent-native-theme="light"] .editor-picker-menu { background: var(--paper, #ffffff); box-shadow: 0 18px 50px rgba(29,29,24,.13); }
-    .visual-tabs[data-plan-tabs] { display: grid; gap: 14px; }
-    .visual-tabs[data-plan-tabs] .tab-list { display: inline-flex; width: fit-content; max-width: 100%; gap: 8px; border: 0; border-radius: 0; background: transparent; padding: 0; overflow-x: auto; }
-    .visual-tabs[data-plan-tabs] .tab-button { min-height: 30px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--muted, #a4a4aa); padding: 0 11px; font: 650 12px/30px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; white-space: nowrap; cursor: pointer; }
-    .visual-tabs[data-plan-tabs] .tab-button:hover { color: var(--text, #f4f4f5); background: rgba(255,255,255,.05); }
-    .visual-tabs[data-plan-tabs] .tab-button.is-active { border-color: var(--text, #f4f4f5); background: transparent; color: var(--text, #f4f4f5); }
-    .visual-tabs[data-plan-tabs] .tab-button.is-active:hover { background: transparent; color: var(--text, #f4f4f5); }
-    :root[data-agent-native-theme="light"] .visual-tabs[data-plan-tabs] .tab-button:hover { background: rgba(0,0,0,.06); }
-    :root[data-agent-native-theme="light"] .visual-tabs[data-plan-tabs] .tab-button.is-active:hover { background: transparent; color: var(--text, #171717); }
-    .visual-tabs[data-plan-tabs] .tab-panel { display: none; }
-    .visual-tabs[data-plan-tabs] .tab-panel.is-active { display: block; }
-    .implementation-map { margin: 24px 0; border-top: 1px solid var(--line, rgba(255,255,255,.14)); }
-    .implementation-map-header { display: flex; justify-content: space-between; gap: 16px; padding: 14px 0; color: var(--muted, #a4a4aa); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
-    .implementation-file-tabs { min-height: 330px; display: grid; grid-template-columns: minmax(220px, .44fr) minmax(0, 1fr); border-top: 1px solid var(--line, rgba(255,255,255,.14)); border-bottom: 1px solid var(--line, rgba(255,255,255,.14)); }
-    .implementation-file-list { display: grid; align-content: start; border-right: 1px solid var(--line, rgba(255,255,255,.14)); }
-    .implementation-file-tab { width: 100%; display: grid; gap: 3px; border: 0; border-bottom: 1px solid var(--line, rgba(255,255,255,.14)); background: transparent; color: var(--muted, #a4a4aa); padding: 13px 14px; text-align: left; cursor: pointer; }
-    .implementation-file-tab:hover { background: rgba(255,255,255,.035); color: var(--soft, #d4d4d8); }
-    .implementation-file-tab.is-active { background: var(--paper-2, rgba(255,255,255,.04)); color: var(--text, #f4f4f5); box-shadow: inset 2px 0 0 var(--accent, #00B5FF); }
-    .file-tab-name, .file-tab-path { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .file-tab-name { font: 700 14px/1.35 "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
-    .file-tab-path { font: 500 12px/1.35 "SFMono-Regular", Consolas, "Liberation Mono", monospace; color: var(--muted, #a4a4aa); }
-    .implementation-file-tab.is-active .file-tab-path { color: var(--soft, #d4d4d8); }
-    .implementation-file-panels { min-width: 0; }
-    .implementation-file-panel { display: none; min-height: 100%; padding: 18px 20px 20px; border: 0 !important; }
-    .implementation-file-panel.is-active { display: block; }
-    .file-detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding-bottom: 16px; border-bottom: 1px solid var(--line, rgba(255,255,255,.14)); }
-    .file-title-stack { min-width: 0; display: grid; gap: 5px; }
-    .file-name { margin: 0; color: var(--text, #f4f4f5); font: 750 18px/1.25 "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
-    .file-path { margin: 0; overflow-wrap: anywhere; color: var(--muted, #a4a4aa); font: 500 12px/1.45 "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
-    .file-detail-body { padding-top: 16px; }
-    .file-summary { max-width: 760px; margin: 0; color: var(--soft, #d4d4d8); font-size: 15px; }
-    .inline-code-preview { margin-top: 18px; overflow: hidden; border: 1px solid var(--line, rgba(255,255,255,.14)); border-radius: 10px; background: #0c0c0e; }
-    .code-preview pre, .inline-code-preview pre { margin: 0 !important; max-height: 420px; overflow: auto; padding: 14px 16px !important; background: #0c0c0e !important; color: #e9e9ea; font: 12px/1.65 "SFMono-Regular", Consolas, "Liberation Mono", monospace !important; tab-size: 2; }
-    .code-preview pre code, .inline-code-preview pre code { display: block !important; min-width: max-content; border: 0 !important; background: transparent !important; color: inherit !important; font: inherit !important; padding: 0 !important; white-space: pre !important; }
-    .code-preview pre code *, .inline-code-preview pre code * { margin: 0 !important; border: 0 !important; border-radius: 0 !important; outline: 0 !important; background: transparent !important; background-image: none !important; box-shadow: none !important; padding: 0 !important; text-decoration: none !important; font: inherit !important; }
-    .code-preview pre code code, .inline-code-preview pre code code { display: inline !important; }
-    .syntax-keyword { color: #7cc7ff; }
-    .syntax-string { color: #a6e3a1; }
-    .syntax-literal { color: #c4b5fd; }
-    .syntax-comment { color: #7a7a83; }
-    .file-actions { display: flex; align-items: flex-start; gap: 8px; }
-    @media (max-width: 760px) { .implementation-file-tabs { grid-template-columns: 1fr; } .implementation-file-list { border-right: 0; } .implementation-file-panels { border-top: 1px solid var(--line, rgba(255,255,255,.14)); } .implementation-map-header, .file-detail-header, .file-actions { flex-wrap: wrap; } }
-  </style><script>
-    (() => {
-      const state = ${payload};
-      const editorOptions = ${editorOptionsPayload};
-      const editorIconMap = ${editorIconPayload};
-      const root = document.documentElement;
-      root.dataset.agentNativeTheme = state.theme || "dark";
-      if (state.annotateMode) root.classList.add("an-plan-annotating");
-      function removeEmptyPlanSections() {
-        const candidates = Array.from(document.querySelectorAll("section[data-plan-section-id], section.plan-section, section[id]"));
-        for (const section of candidates) {
-          const text = (section.textContent || "").replace(/\\s+/g, " ").trim();
-          const hasMedia = Boolean(section.querySelector("img,svg,canvas,video,iframe,table,pre,code,template,.visual,.flow-diagram,.wireframe-shell,.implementation-map,[data-plan-tabs],[data-agent-native-code-preview]"));
-          if (!text && !hasMedia) section.remove();
-        }
-      }
-      function initializePlanTabs() {
-        const tabsets = Array.from(document.querySelectorAll("[data-plan-tabs]"));
-        for (const tabset of tabsets) {
-          const buttons = Array.from(tabset.querySelectorAll("[data-tab-target]"));
-          const panels = Array.from(tabset.querySelectorAll("[data-tab-panel]"));
-          if (buttons.length === 0 || panels.length === 0) continue;
-          const activate = (target, notify = true) => {
-            for (const button of buttons) {
-              const isActive = button.getAttribute("data-tab-target") === target;
-              button.classList.toggle("is-active", isActive);
-              button.setAttribute("aria-selected", String(isActive));
-            }
-            for (const panel of panels) {
-              panel.classList.toggle("is-active", panel.getAttribute("data-tab-panel") === target);
-            }
-            requestAnimationFrame(syncAnnotationMarkers);
-            if (notify) {
-              window.parent.postMessage({ type: "agent-native-plan-close-comment-popover" }, "*");
-            }
-            postDocState();
-          };
-          for (const button of buttons) {
-            button.setAttribute("role", "tab");
-            button.addEventListener("click", (event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              activate(button.getAttribute("data-tab-target") || "");
-            });
-          }
-          for (const panel of panels) panel.setAttribute("role", "tabpanel");
-          const initial = buttons.find((button) => button.classList.contains("is-active")) || buttons[0];
-          activate(initial.getAttribute("data-tab-target") || "", false);
-        }
-      }
-      function displayFilePath(rawPath) {
-        return String(rawPath || "").replace(/\\s+/g, " ").trim().replace(/:\\d+$/, "");
-      }
-      function basenameForPath(path) {
-        return path.split("/").filter(Boolean).pop() || path || "File";
-      }
-      function removeImplementationSymbolList(file) {
-        file.querySelector(".symbol-list")?.remove();
-      }
-      function removeImplementationPreviewButtons(container) {
-        for (const button of Array.from(container.querySelectorAll("[data-agent-native-code-preview]"))) {
-          button.removeAttribute("data-agent-native-code-preview");
-          button.removeAttribute("data-agent-native-hover-preview");
-          if (button.tagName === "BUTTON" && button.closest(".file-actions")) button.remove();
-        }
-      }
-      function inlinePreviewFromTemplate(template) {
-        const preview = template?.content?.querySelector?.(".code-preview");
-        if (!preview) return null;
-        const clone = preview.cloneNode(true);
-        clone.classList.add("inline-code-preview");
-        clone.querySelector?.(".code-preview-title")?.remove?.();
-        return clone;
-      }
-      function ensureInlineCodePreview(file) {
-        const body = file.querySelector(".file-detail-body");
-        const template = file.querySelector("template");
-        if (body && !body.querySelector(".inline-code-preview")) {
-          const inline = inlinePreviewFromTemplate(template);
-          if (inline) body.appendChild(inline);
-        }
-        template?.remove?.();
-        removeImplementationPreviewButtons(file);
-      }
-      function upgradeImplementationFileMaps() {
-        const maps = Array.from(document.querySelectorAll(".implementation-map"));
-        for (const map of maps) {
-          const oldContainer = map.querySelector(":scope > .implementation-files");
-          if (!oldContainer) {
-            removeImplementationPreviewButtons(map);
-            for (const file of Array.from(map.querySelectorAll(".implementation-file"))) {
-              removeImplementationSymbolList(file);
-              file.querySelector(".file-path span")?.remove();
-              ensureInlineCodePreview(file);
-            }
-            continue;
-          }
-          const files = Array.from(oldContainer.querySelectorAll(":scope > .implementation-file"));
-          if (files.length === 0) continue;
-          map.dataset.planTabs = "true";
-          oldContainer.className = "implementation-file-tabs";
-          const list = document.createElement("div");
-          list.className = "implementation-file-list";
-          list.setAttribute("role", "tablist");
-          list.setAttribute("aria-label", "Files touched");
-          const panels = document.createElement("div");
-          panels.className = "implementation-file-panels";
-          oldContainer.replaceChildren(list, panels);
-          files.forEach((file, index) => {
-            const path = displayFilePath(file.getAttribute("data-file-path") || file.querySelector(".file-path")?.textContent || ("File " + (index + 1)));
-            const existingActions = file.querySelector(":scope > .file-actions") || file.querySelector(".file-actions");
-            const existingTemplates = Array.from(file.querySelectorAll(":scope > template"));
-            const existingInfo = Array.from(file.children).find((child) => child !== existingActions && child.tagName !== "TEMPLATE");
-            const summary = existingInfo?.querySelector?.(".file-summary") || file.querySelector(".file-summary");
-            const legacyButtons = Array.from(existingActions?.querySelectorAll("[data-agent-native-open-editor]") || []);
-            const vscodeHref = legacyButtons.map((button) => button.getAttribute("data-agent-native-open-editor") || "").find((href) => href.startsWith("vscode://file/")) || "";
-            const cursorHref = legacyButtons.map((button) => button.getAttribute("data-agent-native-open-editor") || "").find((href) => href.startsWith("cursor://file/")) || "";
-            const openFile = openFileFromHref(vscodeHref || cursorHref);
-            const target = "runtime-file-" + index + "-" + path.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-|-$/g, "");
-            const tab = document.createElement("button");
-            tab.type = "button";
-            tab.className = "implementation-file-tab" + (index === 0 ? " is-active" : "");
-            tab.dataset.tabTarget = target;
-            tab.dataset.filePath = path;
-            if (openFile) tab.dataset.agentNativeOpenFile = openFile;
-            tab.innerHTML = '<span class="file-tab-name"></span><span class="file-tab-path"></span>';
-            tab.querySelector(".file-tab-name").textContent = basenameForPath(path);
-            tab.querySelector(".file-tab-path").textContent = path;
-            list.appendChild(tab);
-
-            file.className = "implementation-file implementation-file-panel tab-panel" + (index === 0 ? " is-active" : "");
-            file.dataset.tabPanel = target;
-            file.dataset.filePath = path;
-
-            const header = document.createElement("div");
-            header.className = "file-detail-header";
-            const title = document.createElement("div");
-            title.className = "file-title-stack";
-            title.innerHTML = '<p class="file-name"></p><p class="file-path"></p>';
-            title.querySelector(".file-name").textContent = basenameForPath(path);
-            title.querySelector(".file-path").textContent = path;
-            header.appendChild(title);
-            if (existingActions) header.appendChild(existingActions);
-
-            const body = document.createElement("div");
-            body.className = "file-detail-body";
-            if (summary) body.appendChild(summary);
-            const inlinePreview = inlinePreviewFromTemplate(existingTemplates[0]);
-            if (inlinePreview) body.appendChild(inlinePreview);
-
-            removeImplementationPreviewButtons(file);
-            file.replaceChildren(header, body);
-            removeImplementationSymbolList(file);
-            ensureInlineCodePreview(file);
-            panels.appendChild(file);
-          });
-        }
-      }
-      const editorValues = editorOptions.map((option) => option.value);
-      let preferredEditor = normalizeEditor(state.preferredEditor);
-      function normalizeEditor(value) {
-        return editorValues.includes(value) ? value : "vscode";
-      }
-      function editorLabel(editor) {
-        return editorOptions.find((option) => option.value === editor)?.label || "VS Code";
-      }
-      function editorIconHtml(editor) {
-        const normalized = normalizeEditor(editor);
-        return '<span class="editor-icon editor-icon-' + normalized + '">' + (editorIconMap[normalized] || "") + '</span>';
-      }
-      function editorTriggerHtml(editor) {
-        const normalized = normalizeEditor(editor);
-        return editorIconHtml(normalized) + '<span class="editor-picker-sr">Preferred editor: ' + editorLabel(normalized) + '</span><span class="editor-picker-caret" aria-hidden="true"></span>';
-      }
-      function editorSelectOptionsHtml() {
-        return editorOptions.map(({ value, label }) => '<option value="' + value + '">' + label + '</option>').join("");
-      }
-      function editorMenuHtml(activeEditor) {
-        const active = normalizeEditor(activeEditor);
-        return editorOptions.map(({ value, label }) => {
-          const selected = value === active;
-          return '<button type="button" class="editor-picker-option' + (selected ? " is-active" : "") + '" data-agent-native-editor-option="' + value + '" role="menuitemradio" aria-checked="' + (selected ? "true" : "false") + '">' + editorIconHtml(value) + '<span>' + label + '</span></button>';
-        }).join("");
-      }
-      function closeEditorMenus(exceptPicker) {
-        for (const picker of document.querySelectorAll("[data-agent-native-editor-picker]")) {
-          if (picker !== exceptPicker) {
-            picker.removeAttribute("data-open");
-            picker.querySelector("[data-agent-native-editor-trigger]")?.setAttribute("aria-expanded", "false");
-          }
-        }
-      }
-      function setPreferredEditor(editor, notifyParent) {
-        preferredEditor = normalizeEditor(editor);
-        for (const picker of document.querySelectorAll("[data-agent-native-editor-picker]")) {
-          picker.dataset.editor = preferredEditor;
-          const trigger = picker.querySelector("[data-agent-native-editor-trigger]");
-          if (trigger) {
-            trigger.innerHTML = editorTriggerHtml(preferredEditor);
-            trigger.setAttribute("aria-label", "Choose editor. Current: " + editorLabel(preferredEditor));
-          }
-          const select = picker.querySelector("[data-agent-native-editor-select]");
-          if (select) select.value = preferredEditor;
-          const menu = picker.querySelector("[data-agent-native-editor-menu]");
-          if (menu) menu.innerHTML = editorMenuHtml(preferredEditor);
-        }
-        if (notifyParent) {
-          window.parent.postMessage({ type: "agent-native-plan-editor-preference", editor: preferredEditor }, "*");
-        }
-      }
-      function splitFileLocation(filePath, explicitLine) {
-        const value = filePath || "";
-        const match = value.match(/^(.*?)(?::(\\d+)(?::(\\d+))?)?$/);
-        return {
-          path: match?.[1] || value,
-          line: explicitLine || match?.[2] || "",
-          column: match?.[3] || "1"
-        };
-      }
-      function openFileFromHref(href) {
-        const match = String(href || "").match(/^(?:vscode|cursor):\\/\\/file(.+)$/);
-        return match?.[1] ? decodeURI(match[1]) : "";
-      }
-      function directoryForPath(filePath) {
-        const index = filePath.lastIndexOf("/");
-        return index > 0 ? filePath.slice(0, index) : filePath;
-      }
-      function hrefForEditor(editor, filePath, line) {
-        if (!filePath) return "";
-        const normalized = normalizeEditor(editor);
-        const location = splitFileLocation(filePath, line);
-        const lineSuffix = location.line ? ":" + location.line + ":" + location.column : "";
-        if (normalized === "finder") return "file://" + encodeURI(location.path);
-        if (normalized === "xcode") {
-          return "xcode://open?url=" + encodeURIComponent("file://" + location.path) + (location.line ? "&line=" + encodeURIComponent(location.line) : "");
-        }
-        if (normalized === "terminal") {
-          return "terminal://open?path=" + encodeURIComponent(directoryForPath(location.path));
-        }
-        if (normalized === "ghostty") {
-          return "ghostty://open?path=" + encodeURIComponent(directoryForPath(location.path));
-        }
-        return normalized + "://file" + encodeURI(location.path) + lineSuffix;
-      }
-      function createEditorPicker(openFile, hrefs = {}, line = "") {
-        const picker = document.createElement("div");
-        picker.className = "editor-picker";
-        picker.dataset.agentNativeEditorPicker = "true";
-        picker.dataset.editor = preferredEditor;
-        const trigger = document.createElement("button");
-        trigger.type = "button";
-        trigger.className = "editor-picker-trigger";
-        trigger.dataset.agentNativeEditorTrigger = "true";
-        trigger.setAttribute("aria-haspopup", "menu");
-        trigger.setAttribute("aria-expanded", "false");
-        trigger.setAttribute("aria-label", "Choose editor. Current: " + editorLabel(preferredEditor));
-        trigger.innerHTML = editorTriggerHtml(preferredEditor);
-        const select = document.createElement("select");
-        select.className = "editor-picker-select";
-        select.dataset.agentNativeEditorSelect = "true";
-        select.setAttribute("aria-hidden", "true");
-        select.setAttribute("tabindex", "-1");
-        select.innerHTML = editorSelectOptionsHtml();
-        const menu = document.createElement("div");
-        menu.className = "editor-picker-menu";
-        menu.dataset.agentNativeEditorMenu = "true";
-        menu.setAttribute("role", "menu");
-        menu.innerHTML = editorMenuHtml(preferredEditor);
-        const open = document.createElement("button");
-        open.type = "button";
-        open.className = "editor-picker-open";
-        open.textContent = "Open";
-        open.dataset.agentNativeOpenSelectedEditor = "true";
-        if (openFile) open.dataset.agentNativeOpenFile = openFile;
-        if (line) open.dataset.agentNativeOpenLine = line;
-        if (hrefs.vscode) open.dataset.agentNativeOpenVscode = hrefs.vscode;
-        if (hrefs.cursor) open.dataset.agentNativeOpenCursor = hrefs.cursor;
-        picker.append(trigger, select, menu, open);
-        return picker;
-      }
-      function upgradeEditorPickerElement(picker) {
-        if (picker.querySelector("[data-agent-native-editor-trigger]")) return;
-        const select = picker.querySelector("[data-agent-native-editor-select]");
-        const open = picker.querySelector("[data-agent-native-open-selected-editor], [data-agent-native-open-file]") || document.createElement("button");
-        const editor = normalizeEditor(select?.value || picker.dataset.editor || preferredEditor);
-        const openFile = open.getAttribute?.("data-agent-native-open-file") || "";
-        const openLine = open.getAttribute?.("data-agent-native-open-line") || "";
-        const vscode = open.getAttribute?.("data-agent-native-open-vscode") || "";
-        const cursor = open.getAttribute?.("data-agent-native-open-cursor") || "";
-        const upgraded = createEditorPicker(openFile, { vscode, cursor }, openLine);
-        picker.replaceChildren(...Array.from(upgraded.childNodes));
-        picker.className = "editor-picker";
-        picker.dataset.agentNativeEditorPicker = "true";
-        picker.dataset.editor = editor;
-      }
-      function initializeEditorPickers() {
-        const actionGroups = Array.from(document.querySelectorAll(".file-actions"));
-        for (const actions of actionGroups) {
-          if (actions.querySelector("[data-agent-native-editor-picker]")) {
-            for (const picker of Array.from(actions.querySelectorAll("[data-agent-native-editor-picker]"))) {
-              upgradeEditorPickerElement(picker);
-            }
-            continue;
-          }
-          const legacyButtons = Array.from(actions.querySelectorAll("[data-agent-native-open-editor]"));
-          if (legacyButtons.length === 0) continue;
-          const hrefs = {};
-          for (const button of legacyButtons) {
-            const href = button.getAttribute("data-agent-native-open-editor") || "";
-            if (href.startsWith("cursor://file/")) hrefs.cursor = href;
-            if (href.startsWith("vscode://file/")) hrefs.vscode = href;
-            button.remove();
-          }
-          const openFile = openFileFromHref(hrefs.vscode || hrefs.cursor);
-          if (!openFile && !hrefs.cursor && !hrefs.vscode) continue;
-          actions.appendChild(createEditorPicker(openFile, hrefs));
-        }
-        for (const picker of Array.from(document.querySelectorAll("[data-agent-native-editor-picker]"))) {
-          upgradeEditorPickerElement(picker);
-        }
-        setPreferredEditor(preferredEditor, false);
-      }
-      function escapeCodeHtml(value) {
-        return String(value || "")
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")
-          .replace(/"/g, "&quot;")
-          .replace(/'/g, "&#39;");
-      }
-      function highlightPlainCodeBlocks() {
-        const blocks = Array.from(document.querySelectorAll(".code-preview pre, .inline-code-preview pre"));
-        for (const pre of blocks) {
-          const target = pre.querySelector("code") || pre;
-          if (target.querySelector(".syntax-keyword,.syntax-string,.syntax-literal,.syntax-comment")) continue;
-          const text = target.textContent || "";
-          if (!text.trim()) continue;
-          let html = escapeCodeHtml(text);
-          html = html
-            .replace(/(&quot;[^&]*(?:&quot;)|&#39;[^&]*(?:&#39;)|\`[^\`]*\`)/g, '<span class="syntax-string">$1</span>')
-            .replace(/\\b(import|export|from|const|let|var|function|return|type|interface|class|extends|async|await|if|else|for|while|new|throw|try|catch|switch|case|default)\\b/g, '<span class="syntax-keyword">$1</span>')
-            .replace(/\\b(true|false|null|undefined)\\b/g, '<span class="syntax-literal">$1</span>')
-            .replace(/(^|\\n)(\\s*\\/\\/.*)/g, '$1<span class="syntax-comment">$2</span>');
-          target.innerHTML = html;
-        }
-      }
-      function setRuntimeAnnotateMode(value) {
-        state.annotateMode = Boolean(value);
-        root.classList.toggle("an-plan-annotating", state.annotateMode);
-        if (state.annotateMode) {
-          closeEditorMenus();
-          hideCodePopover();
-          hideSelectionToolbar();
-        } else {
-          hideSelectionToolbar();
-        }
-        postDocState();
-      }
-      function setRuntimeTheme(theme) {
-        state.theme = theme === "light" ? "light" : "dark";
-        root.dataset.agentNativeTheme = state.theme;
-      }
-      function restoreDocumentScroll(savedState) {
-        if (!savedState) return;
-        const doc = document.documentElement;
-        const scrollWidth = Math.max(doc.scrollWidth, document.body?.scrollWidth || 0);
-        const scrollHeight = Math.max(doc.scrollHeight, document.body?.scrollHeight || 0);
-        const x =
-          typeof savedState.scrollX === "number"
-            ? savedState.scrollX * (scrollWidth / Math.max(savedState.scrollWidth || scrollWidth, 1))
-            : 0;
-        const y =
-          typeof savedState.scrollY === "number"
-            ? savedState.scrollY * (scrollHeight / Math.max(savedState.scrollHeight || scrollHeight, 1))
-            : 0;
-        requestAnimationFrame(() => {
-          window.scrollTo(x, y);
-          syncAnnotationMarkers();
-          postDocState();
-          requestAnimationFrame(postDocState);
-        });
-      }
-      window.addEventListener("message", (event) => {
-        const data = event.data || {};
-        if (data.type !== "agent-native-plan-runtime-state") return;
-        if (typeof data.parentOrigin === "string" && data.parentOrigin && data.parentOrigin !== "null") {
-          window.__agentNativePlanParentOrigin = data.parentOrigin;
-        }
-        if (typeof data.theme === "string") setRuntimeTheme(data.theme);
-        if (typeof data.preferredEditor === "string") {
-          setPreferredEditor(data.preferredEditor, false);
-        }
-        if (typeof data.annotateMode === "boolean") {
-          setRuntimeAnnotateMode(data.annotateMode);
-        }
-        if (data.restoreScroll) restoreDocumentScroll(data.restoreScroll);
-      });
-      function postDocState() {
-        const doc = document.documentElement;
-        window.parent.postMessage({
-          type: "agent-native-plan-doc-state",
-          state: {
-            scrollX: window.scrollX || doc.scrollLeft || 0,
-            scrollY: window.scrollY || doc.scrollTop || 0,
-            scrollWidth: Math.max(doc.scrollWidth, document.body?.scrollWidth || 0),
-            scrollHeight: Math.max(doc.scrollHeight, document.body?.scrollHeight || 0),
-            clientWidth: doc.clientWidth,
-            clientHeight: doc.clientHeight
-          }
-        }, "*");
-      }
-      let annotationMarkerSyncFrame = 0;
-      function scheduleAnnotationMarkerSync() {
-        if (annotationMarkerSyncFrame) return;
-        annotationMarkerSyncFrame = requestAnimationFrame(() => {
-          annotationMarkerSyncFrame = 0;
-          syncAnnotationMarkers();
-        });
-      }
-      function markerAuthorFromItem(item) {
-        return {
-          authorName: item.authorName,
-          authorEmail: item.authorEmail,
-          authorAvatarUrl: item.authorAvatarUrl,
-          authorColor: item.authorColor,
-          authorInitials: item.authorInitials
-        };
-      }
-      function createMarkerFace(author) {
-        const face = document.createElement("span");
-        face.className = "an-plan-marker-face";
-        face.style.setProperty("--author-color", author.authorColor || "#00B5FF");
-        const fallback = document.createElement("span");
-        fallback.className = "an-plan-marker-initials";
-        fallback.textContent = author.authorInitials || "?";
-        if (author.authorAvatarUrl) {
-          const image = document.createElement("img");
-          image.className = "an-plan-marker-avatar";
-          image.src = author.authorAvatarUrl;
-          image.alt = author.authorName || "Comment author";
-          image.addEventListener("error", () => {
-            image.replaceWith(fallback);
-          });
-          face.appendChild(image);
-        } else {
-          face.appendChild(fallback);
-        }
-        return face;
-      }
-      function setMarkerThreadFaces(marker, item) {
-        const participants = Array.isArray(item.participants) && item.participants.length
-          ? item.participants
-          : [markerAuthorFromItem(item)];
-        const count = Math.max(1, Number(item.commentCount || 1));
-        const single = participants.length <= 1 && count <= 1;
-        marker.dataset.single = String(single);
-        marker.style.setProperty("--author-color", participants[0]?.authorColor || item.authorColor || "#00B5FF");
-        const stack = document.createElement("span");
-        stack.className = "an-plan-marker-stack";
-        for (const author of participants.slice(0, 2)) {
-          stack.appendChild(createMarkerFace(author));
-        }
-        marker.replaceChildren(stack);
-        if (!single) {
-          const countLabel = document.createElement("span");
-          countLabel.className = "an-plan-marker-count";
-          countLabel.textContent = count > 99 ? "99+" : String(count);
-          marker.appendChild(countLabel);
-        }
-      }
-      removeEmptyPlanSections();
-      upgradeImplementationFileMaps();
-      initializePlanTabs();
-      initializeEditorPickers();
-      highlightPlainCodeBlocks();
-      postDocState();
-      window.addEventListener("scroll", postDocState, { passive: true });
-      window.addEventListener("resize", () => {
-        scheduleAnnotationMarkerSync();
-        postDocState();
-      });
-      window.addEventListener("agent-native-plan-board-layout-change", () => {
-        scheduleAnnotationMarkerSync();
-        postDocState();
-      });
-      function pct(value, total) {
-        return Math.max(0, Math.min(100, Number(((value / Math.max(total, 1)) * 100).toFixed(3))));
-      }
-      function closestSection(target) {
-        if (!(target instanceof Element)) return null;
-        return target.closest("[data-plan-section-id], section[id], article[id], [id]");
-      }
-      function normalizeText(value) {
-        return String(value || "").replace(/\\s+/g, " ").trim();
-      }
-      function textSnippet(target) {
-        if (!(target instanceof Element)) return "";
-        const text = normalizeText(target.innerText || target.textContent || "");
-        return text.slice(0, 90);
-      }
-      function closestTextContext(target) {
-        if (!(target instanceof Element)) return "";
-        const selector = [
-          "p",
-          "li",
-          "h1",
-          "h2",
-          "h3",
-          "h4",
-          "td",
-          "th",
-          "blockquote",
-          "figcaption",
-          "summary",
-          "button",
-          "a",
-          "label",
-          "pre",
-          "code",
-          "[data-plan-text]"
-        ].join(",");
-        const direct = target.matches(selector) ? target : target.closest(selector);
-        const candidates = [direct, target, target.parentElement, closestSection(target)].filter(Boolean);
-        for (const candidate of candidates) {
-          const text = normalizeText(candidate.innerText || candidate.textContent || "");
-          if (text.length >= 8) return text.slice(0, 220);
-        }
-        return "";
-      }
-      function closestVisualContext(target) {
-        if (!(target instanceof Element)) return null;
-        return target.closest(".wireframe-shell,.mock-browser,.mock-plan,.mock-sidebar,.diagram-card,.flow-diagram,svg,canvas,img,figure,[data-plan-visual],[data-visual]");
-      }
-      function visualLabel(visual, section) {
-        if (!(visual instanceof Element)) return "";
-        return normalizeText(
-          visual.getAttribute("aria-label") ||
-            visual.getAttribute("data-label") ||
-            visual.querySelector?.("strong,h3,h4")?.textContent ||
-            sectionTitle(section) ||
-            "Visual"
-        );
-      }
-      function clamp(value, min, max) {
-        return Math.max(min, Math.min(max, value));
-      }
-      function cssEscape(value) {
-        if (window.CSS?.escape) return window.CSS.escape(String(value));
-        return String(value).replace(/[^a-zA-Z0-9_-]/g, (char) => "\\\\" + char);
-      }
-      function cssAttr(value) {
-        return String(value || "").replace(/\\\\/g, "\\\\\\\\").replace(/"/g, '\\"');
-      }
-      function uniqueSelector(selector) {
-        try {
-          return document.querySelectorAll(selector).length === 1;
-        } catch {
-          return false;
-        }
-      }
-      function selectorForElement(element) {
-        if (!(element instanceof Element)) return "";
-        if (element.id) {
-          const selector = "#" + cssEscape(element.id);
-          if (uniqueSelector(selector)) return selector;
-        }
-        for (const attr of ["data-plan-section-id", "data-tab-panel", "data-file-path"]) {
-          const value = element.getAttribute(attr);
-          if (!value) continue;
-          const selector = element.tagName.toLowerCase() + "[" + attr + '="' + cssAttr(value) + '"]';
-          if (uniqueSelector(selector)) return selector;
-        }
-        const parts = [];
-        let current = element;
-        while (current && current !== document.body && current !== document.documentElement) {
-          let part = current.tagName.toLowerCase();
-          const parent = current.parentElement;
-          if (!parent) break;
-          const sameTagSiblings = Array.from(parent.children).filter((child) => child.tagName === current.tagName);
-          if (sameTagSiblings.length > 1) {
-            part += ":nth-of-type(" + (sameTagSiblings.indexOf(current) + 1) + ")";
-          }
-          parts.unshift(part);
-          const selector = "body > " + parts.join(" > ");
-          if (uniqueSelector(selector)) return selector;
-          current = parent;
-        }
-        return parts.length ? "body > " + parts.join(" > ") : "";
-      }
-      function anchorTargetForElement(element) {
-        if (!(element instanceof Element)) return null;
-        const visual = closestVisualContext(element);
-        if (visual) return visual;
-        return closestTextElement(element) || element.closest("[data-tab-panel], [data-plan-section-id], section[id], article[id]") || element;
-      }
-      function withTargetAnchor(anchor, target, clientX, clientY) {
-        const targetElement = anchorTargetForElement(target);
-        const rect = targetElement?.getBoundingClientRect?.();
-        if (!targetElement || !rect || (!rect.width && !rect.height)) return anchor;
-        return {
-          ...anchor,
-          targetSelector: selectorForElement(targetElement) || undefined,
-          targetX: pct(clamp(clientX, rect.left, rect.right) - rect.left, rect.width),
-          targetY: pct(clamp(clientY, rect.top, rect.bottom) - rect.top, rect.height)
-        };
-      }
-      function ensureLayer() {
-        let layer = document.querySelector(".an-plan-annotation-layer");
-        if (!layer) {
-          layer = document.createElement("div");
-          layer.className = "an-plan-annotation-layer";
-          document.body.style.position = document.body.style.position || "relative";
-          document.body.appendChild(layer);
-        }
-        return layer;
-      }
-      function sectionForNode(node) {
-        const element = node instanceof Element ? node : node?.parentElement;
-        return closestSection(element);
-      }
-      function sectionTitle(section) {
-        return section?.querySelector?.("h1,h2,h3,[data-plan-section-title]")?.textContent?.replace(/\\s+/g, " ").trim() || "";
-      }
-      function tabContextForElement(element) {
-        if (!(element instanceof Element)) return {};
-        const panel = element.closest("[data-tab-panel]");
-        const tabPanelId = panel?.getAttribute("data-tab-panel") || "";
-        if (!tabPanelId) return {};
-        const tabset = panel.closest("[data-plan-tabs]");
-        const tabButton = Array.from(tabset?.querySelectorAll("[data-tab-target]") || []).find((button) => button.getAttribute("data-tab-target") === tabPanelId);
-        const tabLabel = normalizeText(tabButton?.textContent || panel.getAttribute("aria-label") || "");
-        return {
-          tabPanelId,
-          tabLabel: tabLabel || undefined
-        };
-      }
-      function tabContextForPoint(anchor) {
-        if (!anchor || anchor.tabPanelId) return {};
-        const doc = document.documentElement;
-        const clientX = (anchor.x / 100) * doc.scrollWidth - window.scrollX;
-        const clientY = (anchor.y / 100) * Math.max(doc.scrollHeight, document.body.scrollHeight) - window.scrollY;
-        const element = document.elementFromPoint(clientX, clientY);
-        return tabContextForElement(element);
-      }
-      function isTabContextActive(tabPanelId) {
-        if (!tabPanelId) return true;
-        const panel = Array.from(document.querySelectorAll("[data-tab-panel]")).find((candidate) => candidate.getAttribute("data-tab-panel") === tabPanelId);
-        return Boolean(panel?.classList.contains("is-active"));
-      }
-      function elementTabPanelId(element) {
-        if (!(element instanceof Element)) return "";
-        return element.closest("[data-tab-panel]")?.getAttribute("data-tab-panel") || "";
-      }
-      function isElementTabActive(element) {
-        const tabPanelId = elementTabPanelId(element);
-        return !tabPanelId || isTabContextActive(tabPanelId);
-      }
-      function resolveAnchorTarget(anchor) {
-        if (!anchor) return null;
-        if (anchor.targetSelector) {
-          try {
-            const target = document.querySelector(anchor.targetSelector);
-            if (target) return target;
-          } catch {
-            // Ignore stale selectors and fall back to quote matching.
-          }
-        }
-        const quote = normalizeText(anchor.textQuote || anchor.snippet || "");
-        if (!quote) return null;
-        const needle = quote.slice(0, 120);
-        const scopes = [];
-        if (anchor.sectionId) {
-          const escapedSection = cssEscape(anchor.sectionId);
-          scopes.push(
-            document.querySelector('[data-plan-section-id="' + cssAttr(anchor.sectionId) + '"]'),
-            document.getElementById(anchor.sectionId),
-            document.querySelector("#" + escapedSection)
-          );
-        }
-        scopes.push(document);
-        for (const scope of scopes.filter(Boolean)) {
-          const candidates = Array.from(scope.querySelectorAll?.([
-            "p",
-            "li",
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-            "td",
-            "th",
-            "blockquote",
-            "figcaption",
-            "summary",
-            "button",
-            "a",
-            "label",
-            "pre",
-            "code",
-            "[data-plan-text]"
-          ].join(",")) || []);
-          const match = candidates.find((candidate) => normalizeText(candidate.textContent || "").includes(needle));
-          if (match) return anchorTargetForElement(match);
-        }
-        return null;
-      }
-      function pointForAnchor(anchor) {
-        const doc = document.documentElement;
-        const docHeight = Math.max(doc.scrollHeight, document.body.scrollHeight);
-        const target = resolveAnchorTarget(anchor);
-        if (target) {
-          if (!isElementTabActive(target)) return null;
-          const rect = target.getBoundingClientRect();
-          if (rect && (rect.width || rect.height)) {
-            return {
-              left: rect.left + window.scrollX + ((anchor.targetX ?? anchor.visualX ?? 50) / 100) * rect.width,
-              top: rect.top + window.scrollY + ((anchor.targetY ?? anchor.visualY ?? 50) / 100) * rect.height
-            };
-          }
-        }
-        const tabContext = anchor.tabPanelId ? { tabPanelId: anchor.tabPanelId } : tabContextForPoint(anchor);
-        if (!isTabContextActive(tabContext.tabPanelId)) return null;
-        return {
-          left: (anchor.x / 100) * doc.scrollWidth,
-          top: (anchor.y / 100) * docHeight
-        };
-      }
-      function setMarkerVisibility(marker, visible) {
-        marker.style.display = visible ? "inline-flex" : "none";
-        marker.setAttribute("aria-hidden", String(!visible));
-      }
-      function positionMarker(marker, item) {
-        const point = pointForAnchor(item.anchor);
-        if (!point) {
-          setMarkerVisibility(marker, false);
-          return;
-        }
-        marker.style.left = point.left + "px";
-        marker.style.top = point.top + "px";
-        setMarkerVisibility(marker, true);
-      }
-      function anchorWithCurrentPoint(anchor) {
-        const point = pointForAnchor(anchor);
-        if (!point) return anchor;
-        const doc = document.documentElement;
-        return {
-          ...anchor,
-          x: pct(point.left, doc.scrollWidth),
-          y: pct(point.top, Math.max(doc.scrollHeight, document.body.scrollHeight))
-        };
-      }
-      function rangeFromPoint(clientX, clientY) {
-        if (document.caretPositionFromPoint) {
-          const position = document.caretPositionFromPoint(clientX, clientY);
-          if (!position?.offsetNode) return null;
-          const range = document.createRange();
-          range.setStart(position.offsetNode, position.offset);
-          range.collapse(true);
-          return range;
-        }
-        if (document.caretRangeFromPoint) {
-          return document.caretRangeFromPoint(clientX, clientY);
-        }
-        return null;
-      }
-      function expandRangeToWord(range) {
-        if (!range || range.startContainer.nodeType !== Node.TEXT_NODE) return null;
-        const node = range.startContainer;
-        const text = node.textContent || "";
-        if (!text.trim()) return null;
-        let index = Math.min(range.startOffset, Math.max(0, text.length - 1));
-        if (/\\s/.test(text[index] || "")) {
-          let left = index - 1;
-          let right = index + 1;
-          while (left >= 0 || right < text.length) {
-            if (left >= 0 && !/\\s/.test(text[left])) {
-              index = left;
-              break;
-            }
-            if (right < text.length && !/\\s/.test(text[right])) {
-              index = right;
-              break;
-            }
-            left -= 1;
-            right += 1;
-          }
-        }
-        if (/\\s/.test(text[index] || "")) return null;
-        let start = index;
-        let end = index + 1;
-        while (start > 0 && !/\\s/.test(text[start - 1])) start -= 1;
-        while (end < text.length && !/\\s/.test(text[end])) end += 1;
-        const selectedText = text.slice(start, end).trim();
-        if (selectedText.length < 2) return null;
-        const wordRange = document.createRange();
-        wordRange.setStart(node, start);
-        wordRange.setEnd(node, end);
-        return { range: wordRange, selectedText };
-      }
-      function closestTextElement(target) {
-        if (!(target instanceof Element)) return null;
-        const selector = [
-          "p",
-          "li",
-          "h1",
-          "h2",
-          "h3",
-          "h4",
-          "td",
-          "th",
-          "blockquote",
-          "figcaption",
-          "summary",
-          "button",
-          "a",
-          "label",
-          "pre",
-          "code",
-          "[data-plan-text]"
-        ].join(",");
-        return target.matches(selector) ? target : target.closest(selector);
-      }
-      function anchorFromPoint(clientX, clientY, target) {
-        const word = expandRangeToWord(rangeFromPoint(clientX, clientY));
-        if (word) {
-          const anchor = anchorFromRange(word.range, word.selectedText);
-          if (anchor) return anchor;
-        }
-        const textElement = closestTextElement(target);
-        if (!(textElement instanceof Element)) return null;
-        const rect = textElement.getBoundingClientRect();
-        if (!rect || (!rect.width && !rect.height)) return null;
-        const doc = document.documentElement;
-        const textQuote = closestTextContext(textElement);
-        const section = closestSection(textElement);
-        const anchor = {
-          x: pct(clamp(clientX, rect.left, rect.right) + window.scrollX, doc.scrollWidth),
-          y: pct(clamp(clientY, rect.top, rect.bottom) + window.scrollY, Math.max(doc.scrollHeight, document.body.scrollHeight)),
-          sectionId: section?.getAttribute("data-plan-section-id") || section?.id || undefined,
-          sectionTitle: sectionTitle(section) || undefined,
-          ...tabContextForElement(textElement),
-          snippet: textQuote || textSnippet(textElement),
-          textQuote: textQuote || undefined,
-          anchorKind: textQuote ? "text" : "point",
-          tagName: textElement.tagName.toLowerCase()
-        };
-        return withTargetAnchor(anchor, textElement, clientX, clientY);
-      }
-      function anchorFromRange(range, selectedText) {
-        const rect = range.getBoundingClientRect();
-        if (!rect || (!rect.width && !rect.height)) return null;
-        const doc = document.documentElement;
-        const section = sectionForNode(range.commonAncestorContainer);
-        const rangeElement = range.commonAncestorContainer instanceof Element ? range.commonAncestorContainer : range.commonAncestorContainer.parentElement;
-        const anchor = {
-          x: pct(rect.left + window.scrollX + rect.width / 2, doc.scrollWidth),
-          y: pct(rect.top + window.scrollY + rect.height / 2, Math.max(doc.scrollHeight, document.body.scrollHeight)),
-          sectionId: section?.getAttribute("data-plan-section-id") || section?.id || undefined,
-          sectionTitle: sectionTitle(section) || undefined,
-          ...tabContextForElement(rangeElement),
-          snippet: selectedText.slice(0, 160),
-          textQuote: selectedText.slice(0, 220),
-          anchorKind: "text",
-          tagName: "selection"
-        };
-        return withTargetAnchor(anchor, rangeElement, rect.left + rect.width / 2, rect.top + rect.height / 2);
-      }
-      function ensureSelectionToolbar() {
-        let toolbar = document.querySelector(".an-plan-selection-toolbar");
-        if (!toolbar) {
-          toolbar = document.createElement("div");
-          toolbar.className = "an-plan-selection-toolbar";
-          toolbar.innerHTML = '<button type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 9h8"/><path d="M8 13h6"/><path d="M12 20l-3-3H7a4 4 0 0 1-4-4V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4v4.5"/><path d="M19 16v6"/><path d="M16 19h6"/></svg><span>Comment</span></button>';
-          const button = toolbar.querySelector("button");
-          button?.addEventListener("mousedown", (event) => event.preventDefault());
-          button?.addEventListener("click", (event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            const selection = window.getSelection();
-            if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return;
-            const selectedText = selection.toString().replace(/\\s+/g, " ").trim();
-            if (!selectedText) return;
-            const anchor = anchorFromRange(selection.getRangeAt(0), selectedText);
-            if (!anchor) return;
-            toolbar.style.display = "none";
-            window.parent.postMessage({ type: "agent-native-plan-annotate", anchor }, "*");
-          });
-          document.body.appendChild(toolbar);
-        }
-        return toolbar;
-      }
-      function hideSelectionToolbar() {
-        const toolbar = document.querySelector(".an-plan-selection-toolbar");
-        if (toolbar) toolbar.style.display = "none";
-      }
-      function hideCodePopover() {
-        document.querySelector(".an-plan-code-popover")?.remove();
-      }
-      function showCodePopover(button, templateId) {
-        const template = document.getElementById(templateId);
-        if (!(template instanceof HTMLTemplateElement)) return;
-        hideCodePopover();
-        const popover = document.createElement("div");
-        popover.className = "an-plan-code-popover";
-        popover.innerHTML = '<div class="an-plan-code-popover-header"><span class="an-plan-code-popover-title"></span><div class="an-plan-code-popover-actions"></div><button type="button" class="an-plan-code-popover-close" aria-label="Close code preview">×</button></div><div class="an-plan-code-popover-body"></div>';
-        const content = template.content.cloneNode(true);
-        const codePreview = content.querySelector?.(".code-preview");
-        const oldTitle = content.querySelector?.(".code-preview-title");
-        const fileTitle = codePreview?.getAttribute?.("data-file-path") || oldTitle?.querySelector?.("strong")?.textContent?.trim() || button.getAttribute("data-file-path") || button.closest(".implementation-file")?.getAttribute("data-file-path") || "Snippet";
-        const hrefs = {};
-        const fileActions = button.closest(".implementation-file")?.querySelector(".file-actions");
-        for (const openButton of Array.from(fileActions?.querySelectorAll("[data-agent-native-open-editor], [data-agent-native-open-selected-editor], [data-agent-native-open-file]") || [])) {
-          const vscode = openButton.getAttribute("data-agent-native-open-vscode") || "";
-          const cursor = openButton.getAttribute("data-agent-native-open-cursor") || "";
-          const legacy = openButton.getAttribute("data-agent-native-open-editor") || "";
-          if (vscode) hrefs.vscode = vscode;
-          if (cursor) hrefs.cursor = cursor;
-          if (legacy.startsWith("vscode://file/")) hrefs.vscode = legacy;
-          if (legacy.startsWith("cursor://file/")) hrefs.cursor = legacy;
-        }
-        const openFile = button.getAttribute("data-agent-native-open-file") || codePreview?.getAttribute?.("data-agent-native-open-file") || openFileFromHref(hrefs.vscode || hrefs.cursor);
-        const openLine = button.getAttribute("data-agent-native-open-line") || codePreview?.getAttribute?.("data-agent-native-open-line") || "";
-        oldTitle?.remove?.();
-        popover.querySelector(".an-plan-code-popover-title").textContent = fileTitle;
-        if (openFile || hrefs.vscode || hrefs.cursor) {
-          popover.querySelector(".an-plan-code-popover-actions")?.append(createEditorPicker(openFile, hrefs, openLine));
-          setPreferredEditor(preferredEditor, false);
-        }
-        popover.querySelector(".an-plan-code-popover-body")?.append(content);
-        popover.querySelector(".an-plan-code-popover-close")?.addEventListener("click", hideCodePopover);
-        document.body.appendChild(popover);
-        const rect = button.getBoundingClientRect();
-        const width = popover.offsetWidth || 640;
-        const height = popover.offsetHeight || 420;
-        const minLeft = window.scrollX + 12;
-        const maxLeft = window.scrollX + document.documentElement.clientWidth - width - 12;
-        popover.style.left = clamp(rect.left + window.scrollX, minLeft, maxLeft) + "px";
-        popover.style.top = clamp(rect.bottom + window.scrollY + 8, window.scrollY + 12, window.scrollY + document.documentElement.clientHeight - height - 12) + "px";
-      }
-      function updateSelectionToolbar() {
-        if (state.annotateMode) {
-          hideSelectionToolbar();
-          return;
-        }
-        const selection = window.getSelection();
-        if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
-          hideSelectionToolbar();
-          return;
-        }
-        const selectedText = selection.toString().replace(/\\s+/g, " ").trim();
-        if (!selectedText) {
-          hideSelectionToolbar();
-          return;
-        }
-        const rect = selection.getRangeAt(0).getBoundingClientRect();
-        if (!rect || (!rect.width && !rect.height)) {
-          hideSelectionToolbar();
-          return;
-        }
-        const toolbar = ensureSelectionToolbar();
-        toolbar.style.display = "flex";
-        const width = toolbar.offsetWidth || 124;
-        const left = clamp(rect.left + window.scrollX + rect.width / 2 - width / 2, window.scrollX + 10, window.scrollX + document.documentElement.clientWidth - width - 10);
-        const top = Math.max(window.scrollY + 10, rect.top + window.scrollY - (toolbar.offsetHeight || 44) - 10);
-        toolbar.style.left = left + "px";
-        toolbar.style.top = top + "px";
-      }
-      function syncAnnotationMarkers() {
-        for (const marker of document.querySelectorAll("[data-agent-native-plan-marker]")) {
-          if (marker.__agentNativePlanAnnotation) {
-            positionMarker(marker, marker.__agentNativePlanAnnotation);
-            continue;
-          }
-          const tabPanelId = marker.getAttribute("data-tab-panel-id") || "";
-          setMarkerVisibility(marker, isTabContextActive(tabPanelId));
-        }
-      }
-      const layer = ensureLayer();
-      for (const item of state.annotations) {
-        if (!item.anchor) continue;
-        const button = document.createElement("button");
-        const tabContext = item.anchor.tabPanelId ? { tabPanelId: item.anchor.tabPanelId, tabLabel: item.anchor.tabLabel } : tabContextForPoint(item.anchor);
-        button.type = "button";
-        button.className = "an-plan-marker";
-        button.dataset.status = item.status || "open";
-        button.dataset.agentNativePlanMarker = "true";
-        button.__agentNativePlanAnnotation = item;
-        if (tabContext.tabPanelId) {
-          button.dataset.tabPanelId = tabContext.tabPanelId;
-        }
-        if (tabContext.tabLabel) {
-          button.dataset.tabLabel = tabContext.tabLabel;
-        }
-        positionMarker(button, item);
-        setMarkerThreadFaces(button, item);
-        const participantNames = Array.isArray(item.participants)
-          ? item.participants.map((participant) => participant.authorName).filter(Boolean).slice(0, 3).join(", ")
-          : "";
-        const countLabel = (item.commentCount || 1) + " comment" + ((item.commentCount || 1) === 1 ? "" : "s");
-        button.title = participantNames
-          ? countLabel + " by " + participantNames + ": " + (item.message || "Plan comment")
-          : countLabel + ": " + (item.message || "Plan comment");
-        button.setAttribute("aria-label", button.title);
-        button.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          window.parent.postMessage({
-            type: "agent-native-plan-open-comment",
-            comment: {
-              ...item,
-              anchor: anchorWithCurrentPoint(item.anchor)
-            }
-          }, "*");
-        });
-        layer.appendChild(button);
-      }
-      document.addEventListener("selectionchange", () => requestAnimationFrame(updateSelectionToolbar));
-      document.addEventListener("mouseup", () => setTimeout(updateSelectionToolbar, 0));
-      document.addEventListener("keyup", updateSelectionToolbar);
-      document.addEventListener("keydown", (event) => {
-        if (event.key === "Escape") {
-          closeEditorMenus();
-          if (state.annotateMode) {
-            event.preventDefault();
-            event.stopPropagation();
-            setRuntimeAnnotateMode(false);
-            window.parent.postMessage({ type: "agent-native-plan-exit-comment-mode" }, "*");
-          }
-        }
-      });
-      document.addEventListener("change", (event) => {
-        const editorSelect = event.target instanceof Element ? event.target.closest("[data-agent-native-editor-select]") : null;
-        if (!editorSelect) return;
-        setPreferredEditor(editorSelect.value, true);
-      });
-      document.addEventListener("click", (event) => {
-        const editorOption = event.target instanceof Element ? event.target.closest("[data-agent-native-editor-option]") : null;
-        if (editorOption) {
-          event.preventDefault();
-          event.stopPropagation();
-          setPreferredEditor(editorOption.getAttribute("data-agent-native-editor-option"), true);
-          closeEditorMenus();
-          return;
-        }
-        const editorTrigger = event.target instanceof Element ? event.target.closest("[data-agent-native-editor-trigger]") : null;
-        if (editorTrigger) {
-          event.preventDefault();
-          event.stopPropagation();
-          const picker = editorTrigger.closest("[data-agent-native-editor-picker]");
-          const willOpen = picker?.getAttribute("data-open") !== "true";
-          closeEditorMenus(picker);
-          if (picker && willOpen) {
-            picker.setAttribute("data-open", "true");
-            editorTrigger.setAttribute("aria-expanded", "true");
-          } else {
-            picker?.removeAttribute("data-open");
-            editorTrigger.setAttribute("aria-expanded", "false");
-          }
-          return;
-        }
-        const previewButton = event.target instanceof Element ? event.target.closest("[data-agent-native-code-preview]") : null;
-        if (previewButton) {
-          event.preventDefault();
-          event.stopPropagation();
-          showCodePopover(previewButton, previewButton.getAttribute("data-agent-native-code-preview") || "");
-          return;
-        }
-        const editorButton = event.target instanceof Element ? event.target.closest("[data-agent-native-open-file], [data-agent-native-open-selected-editor]") : null;
-        if (editorButton) {
-          event.preventDefault();
-          event.stopPropagation();
-          const picker = editorButton.closest("[data-agent-native-editor-picker]");
-          const select = picker?.querySelector?.("[data-agent-native-editor-select]");
-          const editor = normalizeEditor(picker?.getAttribute("data-editor") || select?.value || preferredEditor);
-          const directHref = editorButton.getAttribute("data-agent-native-open-" + editor) || "";
-          const filePath = editorButton.getAttribute("data-agent-native-open-file") || "";
-          const line = editorButton.getAttribute("data-agent-native-open-line") || "";
-          const href = directHref || hrefForEditor(editor, filePath, line);
-          closeEditorMenus();
-          window.parent.postMessage({ type: "agent-native-plan-open-editor", href }, "*");
-          return;
-        }
-        const link = event.target instanceof Element ? event.target.closest("a[href]") : null;
-        if (!state.annotateMode && link) {
-          const href = link.getAttribute("href") || "";
-          if (href === "#" || href.trim() === "") {
-            event.preventDefault();
-            event.stopPropagation();
-            window.parent.postMessage({ type: "agent-native-plan-link-blocked", href }, "*");
-            return;
-          }
-          if (href && !href.startsWith("#")) {
-            event.preventDefault();
-            event.stopPropagation();
-            window.parent.postMessage({ type: "agent-native-plan-link-blocked", href }, "*");
-            return;
-          }
-        }
-        if (!state.annotateMode) {
-          if (event.target instanceof Element && event.target.closest(".an-plan-selection-toolbar")) return;
-          if (event.target instanceof Element && event.target.closest(".an-plan-code-popover")) return;
-          closeEditorMenus();
-          hideCodePopover();
-          window.parent.postMessage({ type: "agent-native-plan-close-comment-popover" }, "*");
-          return;
-        }
-        if (!state.annotateMode) return;
-        if (event.target instanceof Element && event.target.closest("[data-agent-native-plan-marker]")) return;
-        hideSelectionToolbar();
-        event.preventDefault();
-        event.stopPropagation();
-        const doc = document.documentElement;
-        const target = event.target instanceof Element ? event.target : null;
-        const section = closestSection(target);
-        const visual = closestVisualContext(target);
-        const visualRect = visual?.getBoundingClientRect?.();
-        const tabContext = tabContextForElement(visual || target || section);
-        const textAnchor = visual ? null : anchorFromPoint(event.clientX, event.clientY, target);
-        const textQuote = visual ? "" : closestTextContext(target);
-        const visualX = visualRect ? pct(event.clientX - visualRect.left, visualRect.width) : undefined;
-        const visualY = visualRect ? pct(event.clientY - visualRect.top, visualRect.height) : undefined;
-        const fallbackAnchor = {
-          x: pct(event.pageX, doc.scrollWidth),
-          y: pct(event.pageY, Math.max(doc.scrollHeight, document.body.scrollHeight)),
-          sectionId: section?.getAttribute("data-plan-section-id") || section?.id || undefined,
-          sectionTitle: sectionTitle(section) || undefined,
-          ...tabContext,
-          snippet: textQuote || (target ? textSnippet(target) : ""),
-          textQuote: textQuote || undefined,
-          anchorKind: visual ? "visual" : textQuote ? "text" : "point",
-          visualLabel: visual ? visualLabel(visual, section) : undefined,
-          visualX,
-          visualY,
-          tagName: target ? target.tagName.toLowerCase() : undefined
-        };
-        const anchoredFallback = withTargetAnchor(fallbackAnchor, visual || target, event.clientX, event.clientY);
-        window.parent.postMessage({
-          type: "agent-native-plan-annotate",
-          anchor: textAnchor ? { ...textAnchor, ...tabContext } : anchoredFallback
-        }, "*");
-      }, true);
-    })();
-  </script>`;
-  if (html.includes("</body>")) {
-    return html.replace("</body>", `${runtime}</body>`);
-  }
-  return `${html}${runtime}`;
-}
-
-function buildClientPlanHtml(bundle: PlanBundle) {
   const escape = (value: unknown) =>
     String(value ?? "")
       .replace(/&/g, "&amp;")
@@ -11603,7 +10321,7 @@ function buildClientPlanHtml(bundle: PlanBundle) {
     bundle.plan.title,
   )}</title><style>
   :root{color-scheme:dark;--bg:#0a0a0b;--paper:#111113;--line:#28282c;--text:#f2f2f3;--muted:#a4a4aa;--accent:#00B5FF}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.55}main{width:min(1080px,calc(100vw - 48px));margin:0 auto;padding:96px 0 96px}h1{max-width:760px;margin:0;font-size:clamp(36px,5vw,58px);line-height:1.03;letter-spacing:-.04em}.lede{max-width:760px;margin:20px 0 0;color:#d7d7da;font-size:clamp(18px,2vw,23px);line-height:1.45}.meta{display:grid;gap:7px;margin:24px 0 0;padding-left:20px;color:var(--muted);font-size:13px}.meta li::marker{color:var(--accent)}.section{margin-top:70px;padding-top:46px;border-top:1px solid var(--line)}.type{margin:0 0 12px;color:var(--accent);font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase}.section h2{margin:0;font-size:clamp(26px,4vw,42px);letter-spacing:-.035em}.section p{max-width:760px;color:#d7d7da;font-size:17px}.visual{margin:24px 0;display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.visual i{display:block;height:120px;border:1px solid rgba(0,181,255,.25);border-radius:14px;background:rgba(0,181,255,.12)}@media(max-width:760px){.visual{grid-template-columns:1fr}main{width:min(100vw - 24px,980px);padding-top:72px}}
-  </style></head><body><main><p class="type">Working plan</p><h1>${escape(
+  </style></head><body><main><p class="type">${escape(labels.workingPlan)}</p><h1>${escape(
     bundle.plan.title,
   )}</h1><p class="lede">${escape(
     bundle.plan.brief,

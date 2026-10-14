@@ -1,8 +1,8 @@
-import { useQuery } from "@tanstack/react-query";
-import { appApiPath } from "@/lib/api-path";
 import type { Settings, AvailabilityConfig, BookingLink } from "@shared/api";
+import { useQuery } from "@tanstack/react-query";
 
-/** Fetches settings from the public (unauthenticated) endpoint */
+import { appApiPath } from "@/lib/api-path";
+
 export function usePublicSettings() {
   return useQuery<Settings>({
     queryKey: ["public-settings"],
@@ -14,13 +14,13 @@ export function usePublicSettings() {
   });
 }
 
-/** Fetches availability from the public (unauthenticated) endpoint */
-export function usePublicAvailability(slug?: string) {
+export function usePublicAvailability(slug?: string, username?: string) {
   return useQuery<AvailabilityConfig>({
-    queryKey: ["public-availability", slug],
+    queryKey: ["public-availability", slug, username],
     queryFn: async () => {
       const params = new URLSearchParams();
       if (slug) params.set("slug", slug);
+      if (username) params.set("username", username);
       const path = params.size
         ? `/api/public/availability?${params}`
         : "/api/public/availability";

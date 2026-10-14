@@ -1,3 +1,5 @@
+import { useT } from "@agent-native/core/client/i18n";
+import { IconChevronDown, IconChevronUp } from "@tabler/icons-react";
 import {
   useEffect,
   useLayoutEffect,
@@ -5,7 +7,7 @@ import {
   useState,
   type KeyboardEvent,
 } from "react";
-import { IconChevronDown, IconChevronUp } from "@tabler/icons-react";
+
 import {
   isHtml,
   linkifyText,
@@ -16,10 +18,6 @@ import { cn } from "@/lib/utils";
 
 const COLLAPSED_MAX_CHARS = 600;
 
-/**
- * Render an event description as sanitized HTML with clickable links and
- * optional "Show more"/"Show less" collapse when the content is very long.
- */
 export function RenderedDescription({
   description,
   onClick,
@@ -31,6 +29,7 @@ export function RenderedDescription({
   editable?: boolean;
   className?: string;
 }) {
+  const t = useT();
   const descIsHtml = isHtml(description);
   const html = descIsHtml
     ? stripGcalInviteHtml(sanitizeHtml(description))
@@ -48,7 +47,7 @@ export function RenderedDescription({
       <div
         onClick={onClick}
         className={cn(
-          "text-sm leading-relaxed text-foreground/80 whitespace-pre-wrap break-words prose prose-sm dark:prose-invert prose-p:my-1 prose-a:text-primary prose-a:underline",
+          "text-[13px] leading-[18px] text-foreground/80 whitespace-pre-wrap break-words prose prose-sm dark:prose-invert prose-p:my-1 prose-a:text-primary prose-a:underline",
           editable && "cursor-text rounded -mx-1 px-1 hover:bg-muted/30",
           isCollapsed && "line-clamp-6",
           className,
@@ -66,11 +65,11 @@ export function RenderedDescription({
         >
           {expanded ? (
             <>
-              Show less <IconChevronUp className="h-3 w-3" />
+              {t("eventForm.showLess")} <IconChevronUp className="h-3 w-3" />
             </>
           ) : (
             <>
-              Show more <IconChevronDown className="h-3 w-3" />
+              {t("eventForm.showMore")} <IconChevronDown className="h-3 w-3" />
             </>
           )}
         </button>
@@ -79,10 +78,6 @@ export function RenderedDescription({
   );
 }
 
-/**
- * Textarea that auto-grows to fit its content — no fixed row count, no
- * inner scrollbar. Use for the edit mode of event descriptions.
- */
 export function AutoGrowTextarea({
   value,
   onChange,
@@ -141,7 +136,7 @@ export function AutoGrowTextarea({
       onKeyDown={handleKeyDown}
       placeholder={placeholder}
       rows={1}
-      className="flex-1 w-full bg-transparent border-none outline-none text-sm text-foreground placeholder:text-muted-foreground/40 focus:ring-0 resize-none overflow-hidden"
+      className="flex-1 w-full bg-transparent border-none outline-none text-[13px] leading-[18px] text-foreground placeholder:text-muted-foreground/40 focus:ring-0 resize-none overflow-hidden"
     />
   );
 }

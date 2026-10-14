@@ -1,10 +1,8 @@
 import { createHash } from "node:crypto";
-import {
-  applyText,
-  hasCollabState,
-  seedFromText,
-} from "@agent-native/core/collab";
+
 import { getUserSetting, putUserSetting } from "@agent-native/core/settings";
+
+import { queueDashboardCollabSync } from "./dashboard-collab-sync";
 import { loadDashboardSeed } from "./dashboard-seeds";
 import { getDashboard, upsertDashboard } from "./dashboards-store";
 
@@ -60,7 +58,7 @@ function demoDashboardPath(dashboardId: string): string {
   const params = new URLSearchParams({
     tab: DEMO_NODE_EXPORTER_DEFAULT_TAB,
   });
-  return `/adhoc/${dashboardId}?${params.toString()}`;
+  return `/dashboards/${dashboardId}?${params.toString()}`;
 }
 
 function nowIso(): string {
@@ -100,6 +98,15 @@ function publicState(state: DemoDashboardState): Record<string, unknown> {
     dashboards: state.dashboards ?? {},
     deleted: state.deleted ?? {},
   };
+}
+
+function stateContent(state: DemoDashboardState): string {
+  return JSON.stringify({
+    version: state.version,
+    initializedAt: state.initializedAt,
+    dashboards: state.dashboards ?? {},
+    deleted: state.deleted ?? {},
+  });
 }
 
 export function demoDashboardIdForUser(
@@ -176,23 +183,6 @@ function applyDemoMetadata(
   };
 }
 
-async function syncToCollab(
-  dashboardId: string,
-  config: Record<string, unknown>,
-): Promise<void> {
-  const docId = `dash-${dashboardId}`;
-  const configStr = JSON.stringify(config);
-  try {
-    if (await hasCollabState(docId)) {
-      await applyText(docId, configStr, "content", "agent");
-    } else {
-      await seedFromText(docId, configStr);
-    }
-  } catch {
-    // SQL is the source of truth; collab can seed lazily later.
-  }
-}
-
 async function readDemoState(email: string): Promise<DemoDashboardState> {
   return normalizeState(await getUserSetting(email, DEMO_DASHBOARD_STATE_KEY));
 }
@@ -263,7 +253,15 @@ export async function ensureDemoDashboardsForUser(
         throw new Error(`Demo dashboard seed not found: ${demo.seedId}`);
       const config = applyDemoMetadata(seed, demo.id);
       const row = await upsertDashboard(dashboardId, "sql", config, privateCtx);
-      await syncToCollab(dashboardId, config);
+      // SQL is the source of truth and collab state can seed lazily. Do not
+      // hold first-open installation (and the whole app shell) behind a remote
+      // collab read/write that may be slow or temporarily unavailable.
+      void queueDashboardCollabSync(
+        dashboardId,
+        row.updatedAt,
+        () => getDashboard(dashboardId, privateCtx),
+        "agent",
+      );
       archivedAt = row.archivedAt;
       created = !existing;
     }
@@ -286,14 +284,18 @@ export async function ensureDemoDashboardsForUser(
     });
   }
 
-  const updatedState: DemoDashboardState = {
+  const updatedStateContent: DemoDashboardState = {
     version: DEMO_DASHBOARD_VERSION,
     initializedAt: state.initializedAt ?? nowIso(),
-    updatedAt: nowIso(),
     dashboards,
     deleted,
   };
-  await writeDemoState(ctx.email, updatedState);
+  if (reset || stateContent(state) !== stateContent(updatedStateContent)) {
+    await writeDemoState(ctx.email, {
+      ...updatedStateContent,
+      updatedAt: nowIso(),
+    });
+  }
 
   const firstActive = results.find((row) => row.installed && !row.archivedAt);
   return {

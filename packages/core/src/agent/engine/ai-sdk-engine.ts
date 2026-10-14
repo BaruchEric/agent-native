@@ -1,17 +1,45 @@
-/**
- * AISDKEngine — wraps the Vercel AI SDK (ai package) for multi-provider support.
- *
- * Supports Anthropic, OpenAI, Google Gemini, Groq, and any provider with an
- * @ai-sdk/* package. Provider is selected via the `provider` config option.
- *
- * When provider is "anthropic", Anthropic-native features (thinking, cacheControl)
- * are forwarded through the AI SDK's providerOptions mechanism — no fidelity loss
- * compared to the native AnthropicEngine.
- *
- * The ai package is an OPTIONAL peer dependency. This engine uses dynamic import()
- * so the core package remains installable without the AI SDK.
- */
-
+import { ssrfSafeFetch } from "../../extensions/url-safety.js";
+import {
+  clearProviderCredentialAuthFailure,
+  readDeployCredentialEnv,
+  recordProviderCredentialAuthFailure,
+} from "../../server/credential-provider.js";
+import {
+  allowsSamplingParams,
+  anthropicManualThinkingBudget,
+  normalizeReasoningEffortForModel,
+  supportsClaudeAdaptiveThinking,
+} from "../../shared/reasoning-effort.js";
+import { isNodeRuntime } from "../../shared/runtime.js";
+import { AI_SDK_MODEL_CONFIG, type AISDKProvider } from "../model-config.js";
+import {
+  LLM_MISSING_CREDENTIALS_ERROR_CODE,
+  LLM_MISSING_CREDENTIALS_MESSAGE,
+} from "./credential-errors.js";
+import {
+  classifyProviderError,
+  describeErrorWithCauses,
+} from "./error-detail.js";
+import { createFirstEventAbortController } from "./first-event-timeout.js";
+import { limitProviderTools } from "./limit-provider-tools.js";
+import { isCustomOpenAiBaseUrl } from "./openai-compatible-endpoint.js";
+import { createOpenRouterToolFetch } from "./openrouter-tool-fetch.js";
+import {
+  clampThinkingBudgetTokens,
+  resolveMaxOutputTokensForEngine,
+} from "./output-tokens.js";
+import { createProviderToolNameMap } from "./tool-name.js";
+import {
+  engineToolsToAISDK,
+  engineMessagesToAISDK,
+  aiSdkPartToEngineEvents,
+  aiSdkStepToAssistantContent,
+} from "./translate-ai-sdk.js";
+import {
+  createStreamedToolInputState,
+  finalizeStreamedToolInputs,
+  observeStreamedToolInput,
+} from "./translate-anthropic.js";
 import type {
   AgentEngine,
   EngineCapabilities,
@@ -19,22 +47,8 @@ import type {
   EngineEvent,
   EngineContentPart,
 } from "./types.js";
-import {
-  engineToolsToAISDK,
-  engineMessagesToAISDK,
-  aiSdkPartToEngineEvents,
-  aiSdkStepToAssistantContent,
-} from "./translate-ai-sdk.js";
-import { AI_SDK_MODEL_CONFIG, type AISDKProvider } from "../model-config.js";
-import { readDeployCredentialEnv } from "../../server/credential-provider.js";
-import { normalizeReasoningEffortForModel } from "../../shared/reasoning-effort.js";
-import { resolveMaxOutputTokensForEngine } from "./output-tokens.js";
 
 export type { AISDKProvider } from "../model-config.js";
-
-// ---------------------------------------------------------------------------
-// Provider definitions
-// ---------------------------------------------------------------------------
 
 const PROVIDER_CAPABILITIES: Record<AISDKProvider, EngineCapabilities> = {
   anthropic: {
@@ -135,7 +149,6 @@ const PROVIDER_PACKAGES: Record<AISDKProvider, string> = {
   ollama: "ai-sdk-ollama",
 };
 
-/** Factory export name per provider (not all follow `create<Provider>`). */
 const PROVIDER_FACTORIES: Record<AISDKProvider, string> = {
   anthropic: "createAnthropic",
   openai: "createOpenAI",
@@ -149,9 +162,6 @@ const PROVIDER_FACTORIES: Record<AISDKProvider, string> = {
 
 function googleThinkingBudget(effort: string) {
   if (effort === "low") return 1024;
-  // "medium" is a normalized effort for Gemini models; without this case it
-  // fell through to the -1 ("dynamic/unlimited") fallback, so selecting
-  // medium effort silently uncapped the thinking budget.
   if (effort === "medium") return 4096;
   if (effort === "high") return 8000;
   if (effort === "xhigh") return 16_000;
@@ -159,37 +169,90 @@ function googleThinkingBudget(effort: string) {
   return -1;
 }
 
-/**
- * Map a reasoning effort level to Gemini 3.x thinkingLevel string.
- * Gemini 3 models (gemini-3.*) reject thinkingBudget and require thinkingLevel
- * with values 'low' | 'medium' | 'high'. Gemini 3.0 only supports 'low'/'high';
- * Gemini 3.1+ adds 'medium'. We always emit 'medium' for medium effort since it
- * is accepted by 3.1+, and 3.0 is expected to be phased out quickly.
- */
 function gemini3ThinkingLevel(effort: string): string {
   if (effort === "low") return "low";
-  // medium/high/xhigh/max all map to the strongest available level for Gemini 3
+  if (effort === "medium") return "medium";
   return "high";
 }
 
-// ---------------------------------------------------------------------------
-// AISDKEngine implementation
-// ---------------------------------------------------------------------------
-
-/** Config accepted by every `ai-sdk:*` engine. */
 export interface AISDKEngineConfig {
-  /** Override the provider's default model (also becomes the engine's defaultModel). */
+  name?: string;
+  label?: string;
   model?: string;
-  /** API key — falls back to the provider-specific env var if omitted. */
+  supportedModels?: readonly string[];
+  capabilities?: EngineCapabilities;
+  acceptsCustomModels?: boolean;
+  requestFetch?: typeof fetch;
+  forceResponses?: boolean;
+  omitMaxOutputTokens?: boolean;
+  skipCredentialFailureTracking?: boolean;
   apiKey?: string;
-  /** Set false in request-scoped multi-tenant runs so provider packages cannot fall back to process.env. */
   allowEnvFallback?: boolean;
-  /** Override the provider base URL (useful for proxies or OpenAI-compatible gateways). */
   baseUrl?: string;
-  /** OpenRouter: `X-OpenRouter-Title` header for dashboard attribution. */
   appName?: string;
-  /** OpenRouter: `HTTP-Referer` header for dashboard attribution. */
   appUrl?: string;
+}
+
+export function createProviderEndpointFetch(
+  endpoint: string,
+  allowedPrivateOrigins: readonly string[] = [],
+): typeof fetch {
+  return async (input, init) => {
+    const endpointOrigin = new URL(endpoint).origin;
+    const request = input instanceof Request ? new Request(input, init) : null;
+    const url =
+      request?.url ??
+      (typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url);
+    const targetOrigin = new URL(url).origin;
+    if (targetOrigin !== endpointOrigin) {
+      throw new Error(
+        `SSRF blocked: provider request escaped its configured origin (${targetOrigin}).`,
+      );
+    }
+
+    const requestInit = request
+      ? ({
+          ...(init ?? {}),
+          method: request.method,
+          headers: request.headers,
+          body: request.body ?? undefined,
+          signal: request.signal,
+          cache: request.cache,
+          credentials: request.credentials,
+          integrity: request.integrity,
+          keepalive: request.keepalive,
+          mode: request.mode,
+          redirect: request.redirect,
+          referrer: request.referrer,
+          referrerPolicy: request.referrerPolicy,
+          ...(request.body ? { duplex: "half" as const } : {}),
+        } as RequestInit)
+      : init;
+
+    const response = await ssrfSafeFetch(url, requestInit, {
+      allowedPrivateOrigins,
+      assertUrlAllowed(candidate) {
+        if (new URL(candidate).origin !== endpointOrigin) {
+          throw new Error(
+            `SSRF blocked: provider endpoint redirected outside its configured origin (${candidate}).`,
+          );
+        }
+      },
+      followRedirects: false,
+      requireDispatcher: isNodeRuntime(),
+    });
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error(
+        "SSRF blocked: provider endpoint redirects are disabled.",
+      );
+    }
+    return response;
+  };
 }
 
 class AISDKEngine implements AgentEngine {
@@ -197,30 +260,81 @@ class AISDKEngine implements AgentEngine {
   readonly label: string;
   readonly defaultModel: string;
   readonly supportedModels: readonly string[];
+  readonly acceptsCustomModels: boolean;
+  readonly preserveCustomModels: boolean;
   readonly capabilities: EngineCapabilities;
 
   private readonly provider: AISDKProvider;
   private readonly apiKey?: string;
   private readonly baseUrl?: string;
+  private readonly requiredEnvVars: readonly string[];
   private readonly appName?: string;
   private readonly appUrl?: string;
+  private readonly requestFetch?: typeof fetch;
+  private readonly forceResponses: boolean;
+  private readonly omitMaxOutputTokens: boolean;
+  private readonly skipCredentialFailureTracking: boolean;
 
   constructor(provider: AISDKProvider, config: AISDKEngineConfig) {
     this.provider = provider;
-    this.name = `ai-sdk:${provider}`;
-    this.label = `${capitalize(provider)} (AI SDK)`;
+    this.name = config.name ?? `ai-sdk:${provider}`;
+    this.label = config.label ?? `${capitalize(provider)} (AI SDK)`;
     this.defaultModel = config.model ?? PROVIDER_DEFAULT_MODELS[provider];
-    this.supportedModels = PROVIDER_SUPPORTED_MODELS[provider];
-    this.capabilities = PROVIDER_CAPABILITIES[provider];
+    this.supportedModels =
+      config.supportedModels ?? PROVIDER_SUPPORTED_MODELS[provider];
+    this.acceptsCustomModels = config.acceptsCustomModels ?? true;
+    this.preserveCustomModels =
+      config.acceptsCustomModels === false
+        ? false
+        : provider === "ollama" ||
+          provider === "openrouter" ||
+          (provider === "openai" && isCustomOpenAiBaseUrl(config.baseUrl));
+    this.capabilities = config.capabilities ?? PROVIDER_CAPABILITIES[provider];
     this.apiKey =
       config.apiKey ??
       (config.allowEnvFallback === false ? "" : getProviderApiKey(provider));
+    this.requiredEnvVars = PROVIDER_ENV_VARS[provider];
     this.baseUrl = config.baseUrl;
     this.appName = config.appName;
     this.appUrl = config.appUrl;
+    this.requestFetch =
+      config.requestFetch ??
+      (this.baseUrl ? createProviderEndpointFetch(this.baseUrl) : undefined);
+    this.forceResponses = config.forceResponses === true;
+    this.omitMaxOutputTokens = config.omitMaxOutputTokens === true;
+    this.skipCredentialFailureTracking =
+      config.skipCredentialFailureTracking === true;
   }
 
   async *stream(opts: EngineStreamOptions): AsyncIterable<EngineEvent> {
+    // An absent key is not an anonymous request. Without this the provider
+    // factory is constructed with no `apiKey`, the SDK omits the Authorization
+    // header entirely, and the gateway's 401 comes back as
+    // "Missing Authentication header" — which `classifyProviderError` codes
+    // `http_401`, a transport failure naming the wrong cause. A scheduled job
+    // then repeats that doomed unauthenticated request on every tick forever.
+    // `builder-engine` and `anthropic-engine` already fail closed here; this
+    // engine was the only one that did not.
+    //
+    // A LOCAL `baseUrl` is exempt: a self-hosted gateway on the same machine or
+    // private network may legitimately accept unauthenticated requests. A public
+    // one may not — every hosted provider requires a key, so exempting any
+    // baseUrl at all reopened the same doomed unauthenticated request this
+    // guard exists to stop, just for anyone pointing at a remote gateway.
+    if (
+      !this.apiKey &&
+      !isLocalBaseUrl(this.baseUrl) &&
+      this.requiredEnvVars.length > 0
+    ) {
+      yield {
+        type: "stop",
+        reason: "error",
+        error: `${LLM_MISSING_CREDENTIALS_MESSAGE} (engine "${this.name}" has no ${this.requiredEnvVars.join(" or ")})`,
+        errorCode: LLM_MISSING_CREDENTIALS_ERROR_CODE,
+      };
+      return;
+    }
+
     let aiModule: any;
     try {
       aiModule = await import("ai");
@@ -247,13 +361,23 @@ class AISDKEngine implements AgentEngine {
       return;
     }
 
+    const toolNameMap = createProviderToolNameMap(opts.tools, opts.messages);
+    const providerTools = limitProviderTools(opts.tools);
     const aiSdkTools =
-      opts.tools.length > 0
-        ? engineToolsToAISDK(opts.tools, jsonSchema)
+      providerTools.length > 0
+        ? engineToolsToAISDK(providerTools, jsonSchema, toolNameMap)
         : undefined;
-    const messages = engineMessagesToAISDK(opts.messages);
+    const messages = engineMessagesToAISDK(opts.messages, {
+      toolResultImages: this.capabilities.vision,
+      toolNameMap,
+    });
 
-    // Build providerOptions for Anthropic-native features when using Anthropic provider
+    const resolvedMaxOutputTokens = resolveMaxOutputTokensForEngine(
+      this.name,
+      opts.maxOutputTokens,
+      opts.model,
+    );
+
     const providerOpts: Record<string, unknown> = {};
     if (this.provider === "anthropic" && opts.providerOptions?.anthropic) {
       const anthropicOpts = opts.providerOptions.anthropic;
@@ -262,7 +386,13 @@ class AISDKEngine implements AgentEngine {
           ...((providerOpts.anthropic as object) ?? {}),
           thinking: {
             type: "enabled",
-            budgetTokens: anthropicOpts.thinking.budgetTokens,
+            budgetTokens:
+              typeof anthropicOpts.thinking.budgetTokens === "number"
+                ? clampThinkingBudgetTokens(
+                    anthropicOpts.thinking.budgetTokens,
+                    resolvedMaxOutputTokens,
+                  )
+                : anthropicOpts.thinking.budgetTokens,
           },
         };
       }
@@ -279,17 +409,37 @@ class AISDKEngine implements AgentEngine {
     );
     if (reasoningEffort) {
       if (this.provider === "anthropic") {
-        providerOpts.anthropic = {
-          ...((providerOpts.anthropic as object) ?? {}),
-          thinking: (
-            providerOpts.anthropic as { thinking?: unknown } | undefined
-          )?.thinking ?? { type: "adaptive" },
-          outputConfig: { effort: reasoningEffort },
-        };
+        const explicitThinking = (
+          providerOpts.anthropic as { thinking?: unknown } | undefined
+        )?.thinking;
+        if (explicitThinking || supportsClaudeAdaptiveThinking(opts.model)) {
+          providerOpts.anthropic = {
+            ...((providerOpts.anthropic as object) ?? {}),
+            thinking: explicitThinking ?? { type: "adaptive" },
+            ...(explicitThinking
+              ? {}
+              : { outputConfig: { effort: reasoningEffort } }),
+          };
+        } else {
+          const budgetTokens = clampThinkingBudgetTokens(
+            anthropicManualThinkingBudget(reasoningEffort),
+            resolvedMaxOutputTokens,
+          );
+          providerOpts.anthropic = {
+            ...((providerOpts.anthropic as object) ?? {}),
+            ...(budgetTokens === undefined
+              ? {}
+              : { thinking: { type: "enabled", budgetTokens } }),
+          };
+        }
       } else if (this.provider === "openai") {
+        const forcedChatCompletionsWithTools =
+          isCustomOpenAiBaseUrl(this.baseUrl) && aiSdkTools !== undefined;
         providerOpts.openai = {
           ...((providerOpts.openai as object) ?? {}),
-          reasoningEffort,
+          reasoningEffort: forcedChatCompletionsWithTools
+            ? "none"
+            : reasoningEffort,
         };
       } else if (this.provider === "openrouter") {
         providerOpts.openrouter = {
@@ -300,16 +450,37 @@ class AISDKEngine implements AgentEngine {
         // Gemini 3.x models reject thinkingBudget — they require thinkingLevel.
         // Gemini 2.5.x models use thinkingBudget (integer token count or -1).
         const isGemini3 = /^gemini-3/.test(opts.model);
+        const thinkingBudget = googleThinkingBudget(reasoningEffort);
         providerOpts.google = {
           ...((providerOpts.google as object) ?? {}),
           thinkingConfig: isGemini3
             ? { thinkingLevel: gemini3ThinkingLevel(reasoningEffort) }
-            : { thinkingBudget: googleThinkingBudget(reasoningEffort) },
+            : {
+                thinkingBudget:
+                  thinkingBudget > 0
+                    ? clampThinkingBudgetTokens(
+                        thinkingBudget,
+                        resolvedMaxOutputTokens,
+                      )
+                    : thinkingBudget,
+              },
         };
       }
     }
 
+    const samplingAllowed = allowsSamplingParams({
+      model: opts.model,
+      thinkingEnabled:
+        this.provider === "anthropic" &&
+        Boolean(
+          (providerOpts.anthropic as { thinking?: unknown } | undefined)
+            ?.thinking,
+        ),
+    });
+
     let assistantContent: EngineContentPart[] = [];
+    const firstEventAbort = createFirstEventAbortController(opts.abortSignal);
+    const toolInputs = createStreamedToolInputState();
 
     try {
       const result = streamText({
@@ -317,28 +488,49 @@ class AISDKEngine implements AgentEngine {
         system: opts.systemPrompt,
         messages,
         tools: aiSdkTools,
-        maxOutputTokens: resolveMaxOutputTokensForEngine(
-          this.name,
-          opts.maxOutputTokens,
-        ),
-        ...(opts.temperature !== undefined
+        ...(this.omitMaxOutputTokens
+          ? {}
+          : { maxOutputTokens: resolvedMaxOutputTokens }),
+        maxRetries: 1,
+        ...(samplingAllowed && opts.temperature !== undefined
           ? { temperature: opts.temperature }
           : {}),
-        abortSignal: opts.abortSignal,
+        abortSignal: firstEventAbort.signal,
         onStepFinish: (step: any) => {
-          assistantContent = aiSdkStepToAssistantContent(step);
+          assistantContent = aiSdkStepToAssistantContent(step, toolNameMap);
         },
         ...(Object.keys(providerOpts).length > 0
           ? { providerOptions: providerOpts }
           : {}),
       });
 
-      // Buffer the terminal stop so assistant-content can be emitted just
-      // before it, regardless of where `finish` arrives in the stream.
       let bufferedStop: EngineEvent | undefined;
+      let sawFirstEvent = false;
+      let credentialFailureRecorded = false;
 
       for await (const part of result.fullStream) {
-        for (const event of aiSdkPartToEngineEvents(part)) {
+        if (!sawFirstEvent && part?.type !== "start") {
+          sawFirstEvent = true;
+          firstEventAbort.markFirstEvent();
+        }
+        for (const event of aiSdkPartToEngineEvents(part, toolNameMap)) {
+          observeStreamedToolInput(toolInputs, event);
+          if (
+            event.type === "stop" &&
+            event.reason === "error" &&
+            event.statusCode === 401 &&
+            !this.skipCredentialFailureTracking
+          ) {
+            await recordProviderCredentialAuthFailure({
+              key: PROVIDER_ENV_VARS[this.provider][0],
+              value: this.apiKey,
+              status: event.statusCode,
+              code: event.errorCode ?? "http_401",
+              message:
+                event.error || "The model provider rejected the saved API key.",
+            });
+            credentialFailureRecorded = true;
+          }
           if (event.type === "stop") {
             bufferedStop = event;
           } else {
@@ -347,24 +539,73 @@ class AISDKEngine implements AgentEngine {
         }
       }
 
+      if (firstEventAbort.didTimeout()) {
+        throw new Error(
+          `${firstEventAbort.timeoutMessage()}; the connection appears wedged.`,
+        );
+      }
+
+      for (const part of assistantContent) {
+        if (part.type === "tool-call") {
+          observeStreamedToolInput(toolInputs, part);
+        }
+      }
+      for (const recovered of finalizeStreamedToolInputs(
+        toolInputs,
+        assistantContent.flatMap((part) =>
+          part.type === "tool-call" ? [part.id] : [],
+        ),
+      )) {
+        if (recovered.type === "tool-call") {
+          assistantContent.push({
+            type: "tool-call",
+            id: recovered.id,
+            name: recovered.name,
+            input: recovered.input,
+          });
+        }
+        yield recovered;
+      }
+
       yield { type: "assistant-content", parts: assistantContent };
+      const stoppedWithError =
+        bufferedStop?.type === "stop" && bufferedStop.reason === "error";
+      if (
+        !this.skipCredentialFailureTracking &&
+        !credentialFailureRecorded &&
+        !stoppedWithError
+      ) {
+        await clearProviderCredentialAuthFailure({
+          key: PROVIDER_ENV_VARS[this.provider][0],
+          value: this.apiKey,
+        });
+      }
       yield bufferedStop ?? { type: "stop", reason: "end_turn" };
     } catch (err: any) {
-      // Surface structured fields from AI SDK's APICallError so
-      // isRetryableError can check statusCode/providerRetryable directly
-      // rather than keyword-matching the message string.
-      const statusCode: number | undefined =
-        typeof err?.statusCode === "number" ? err.statusCode : undefined;
-      const providerRetryable: boolean | undefined =
-        typeof err?.isRetryable === "boolean" ? err.isRetryable : undefined;
+      const timedOut = firstEventAbort.didTimeout();
+      const errorMessage = describeErrorWithCauses(err);
+      const classification = classifyProviderError(err, timedOut);
+      if (
+        classification.statusCode === 401 &&
+        !this.skipCredentialFailureTracking
+      ) {
+        await recordProviderCredentialAuthFailure({
+          key: PROVIDER_ENV_VARS[this.provider][0],
+          value: this.apiKey,
+          status: classification.statusCode,
+          code: "http_401",
+          message: errorMessage,
+        });
+      }
       yield {
         type: "stop",
         reason: "error",
-        error: err?.message ?? String(err),
-        ...(statusCode !== undefined ? { statusCode } : {}),
-        ...(providerRetryable !== undefined ? { providerRetryable } : {}),
+        error: errorMessage,
+        ...classification,
       };
       throw err;
+    } finally {
+      firstEventAbort.cleanup();
     }
   }
 
@@ -388,26 +629,21 @@ class AISDKEngine implements AgentEngine {
     const config: Record<string, unknown> = {};
     if (this.apiKey !== undefined) config.apiKey = this.apiKey;
     if (this.baseUrl) config.baseURL = this.baseUrl;
-    // Scoped to openrouter — other providers' factories may reject unknown keys.
+    if (this.requestFetch) config.fetch = this.requestFetch;
     if (this.provider === "openrouter") {
+      config.fetch = createOpenRouterToolFetch(this.requestFetch);
       if (this.appName) config.appName = this.appName;
       if (this.appUrl) config.appUrl = this.appUrl;
     }
 
     const provider = createFn(config);
-    // Let first-party OpenAI use the AI SDK's default Responses path so newer
-    // GPT reasoning models get the API OpenAI recommends. If someone points
-    // the OpenAI provider at an OpenAI-compatible gateway, keep using Chat
-    // Completions because many gateway base URLs do not implement Responses.
-    return this.provider === "openai" && this.baseUrl
+    return this.provider === "openai" &&
+      !this.forceResponses &&
+      isCustomOpenAiBaseUrl(this.baseUrl)
       ? provider.chat(model)
       : provider(model);
   }
 }
-
-// ---------------------------------------------------------------------------
-// Factory functions
-// ---------------------------------------------------------------------------
 
 export function createAISDKEngine(
   provider: AISDKProvider,
@@ -416,12 +652,6 @@ export function createAISDKEngine(
   return new AISDKEngine(provider, config as AISDKEngineConfig);
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// Static string-literal imports so bundlers (Nitro/Rollup/Vercel) can analyze
-// and include provider packages. A variable-based `import(pkg)` gets skipped.
 async function importProviderPackage(provider: AISDKProvider): Promise<any> {
   switch (provider) {
     case "anthropic":
@@ -443,6 +673,36 @@ async function importProviderPackage(provider: AISDKProvider): Promise<any> {
   }
 }
 
+/**
+ * True only for a gateway on this machine or a private network — the case the
+ * keyless exemption was written for. Anything routable on the public internet
+ * (openrouter.ai, an api.* host, a cloud proxy) needs credentials, so treating
+ * it as keyless just sends a request that cannot succeed.
+ *
+ * An unparseable value is NOT local: this gates a security-shaped decision, so
+ * the ambiguous case has to take the safe branch and require a key.
+ */
+function isLocalBaseUrl(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false;
+  let host: string;
+  try {
+    host = new URL(baseUrl).hostname.toLowerCase();
+  } catch (error) {
+    if (error instanceof TypeError) return false;
+    throw error;
+  }
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (host === "::1" || host === "[::1]") return true;
+  if (host.endsWith(".local") || host.endsWith(".internal")) return true;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!v4) return false;
+  const [a, b] = [Number(v4[1]), Number(v4[2])];
+  if (a === 127 || a === 10) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  return false;
+}
+
 function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
@@ -455,10 +715,6 @@ function getProviderApiKey(provider: AISDKProvider): string | undefined {
   }
   return undefined;
 }
-
-// ---------------------------------------------------------------------------
-// Exports for registry registration
-// ---------------------------------------------------------------------------
 
 export {
   PROVIDER_CAPABILITIES,

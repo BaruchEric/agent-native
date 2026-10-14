@@ -1,6 +1,6 @@
-import { useEffect, useRef } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { appApiPath } from "@agent-native/core/client";
+import { appApiPath } from "@agent-native/core/client/api-path";
+import { callAction, useActionQuery } from "@agent-native/core/client/hooks";
+import { useIsMcpAppWidgetEmbed } from "@agent-native/core/client/mcp-app-host";
 import type {
   CreateNotionPageRequest,
   Document,
@@ -10,83 +10,185 @@ import type {
   NotionSearchResponse,
   ResolveDocumentSyncConflictRequest,
 } from "@shared/api";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 
-async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(appApiPath(url), init);
+import { useLocalStorage } from "@/hooks/use-local-storage";
+
+import {
+  contentFilesCollectionFilter,
+  contentNavigationBranchFilter,
+  contentNavigationContextFilter,
+  documentScopedQueryFilter,
+  useContentActionMutation,
+  type ContentQueryTarget,
+} from "./use-content-action-mutation";
+import { documentQueryFilter } from "./use-documents";
+
+export function currentRedirectTarget(): string {
+  if (typeof window === "undefined") return "/";
+  const { pathname, search } = window.location;
+  return `${pathname}${search}` || "/";
+}
+
+async function fetchNotionAuthUrl(): Promise<string> {
+  const redirect = currentRedirectTarget();
+  const url = appApiPath(
+    `/api/notion/auth-url?redirect=${encodeURIComponent(redirect)}`,
+  );
+  const res = await fetch(url);
   if (!res.ok) {
     const body = await res.json().catch(() => null);
     throw new Error(
       body?.error || body?.message || `${res.status} ${res.statusText}`,
     );
   }
-  return res.json();
+  const body = (await res.json()) as { url?: string };
+  if (!body.url) throw new Error("Notion OAuth URL is unavailable");
+  return body.url;
 }
 
-function invalidateDocumentQueries(
+export function invalidateDocumentQueries(
   queryClient: ReturnType<typeof useQueryClient>,
   documentId: string,
 ) {
-  queryClient.invalidateQueries({ queryKey: ["action"] });
-  queryClient.invalidateQueries({ queryKey: ["document-sync", documentId] });
+  void queryClient.invalidateQueries(documentQueryFilter(documentId));
+  void queryClient.invalidateQueries({
+    queryKey: ["action", "list-documents"],
+  });
+  void queryClient.invalidateQueries({
+    queryKey: documentSyncStatusQueryKey(documentId),
+  });
 }
 
+/**
+ * Link-state writes touch the page and its sync status. A pull can also
+ * retitle it, create child pages, move children under it, and move children
+ * it no longer references to the top level.
+ */
+function notionDocumentTargets(
+  documentId: string,
+  { pulled }: { pulled: boolean },
+): ContentQueryTarget[] {
+  return pulled
+    ? [
+        documentScopedQueryFilter(documentId),
+        contentNavigationBranchFilter({
+          documentIds: [documentId],
+          parentIds: [documentId, null],
+        }),
+        contentNavigationContextFilter([documentId]),
+        contentFilesCollectionFilter(),
+        ["action", "get-content-recent"],
+        ["action", "list-documents"],
+      ]
+    : [
+        documentQueryFilter(documentId),
+        documentSyncStatusQueryKey(documentId),
+        ["action", "list-documents"],
+      ];
+}
+
+export function documentSyncStatusQueryKey(documentId: string) {
+  return [
+    "action",
+    "refresh-notion-sync-status",
+    { documentId: documentId.trim() },
+  ] as const;
+}
+
+// In an MCP App widget the query stays idle: `data` is undefined, not a
+// disconnected workspace, and the scoped session could not call it anyway.
 export function useNotionConnection() {
+  const inWidget = useIsMcpAppWidgetEmbed();
+  return useActionQuery<NotionConnectionStatus>(
+    "connect-notion-status",
+    undefined,
+    {
+      staleTime: 30_000,
+      enabled: !inWidget,
+    },
+  );
+}
+
+export function useNotionAuthUrl(enabled: boolean) {
   return useQuery({
-    queryKey: ["notion-connection"],
-    queryFn: () => fetchJson<NotionConnectionStatus>("/api/notion/status"),
+    queryKey: ["notion-auth-url"],
+    queryFn: fetchNotionAuthUrl,
+    enabled,
     staleTime: 30_000,
   });
 }
 
-export function useDocumentSyncStatus(
-  documentId: string | null,
-  options?: { autoSync?: boolean },
-) {
+export async function openNotionOAuthUrl() {
+  return fetchNotionAuthUrl();
+}
+
+const UNLINKED_SYNC_POLL_MS = 60_000;
+
+export function documentSyncRefetchIntervalMs(
+  data: DocumentSyncStatus | undefined,
+  autoSync: boolean,
+): number {
+  if (data && (!data.connected || !data.pageId)) return UNLINKED_SYNC_POLL_MS;
+  return autoSync ? 2_000 : 30_000;
+}
+
+export function useDocumentSyncStatus(documentId: string | null) {
   const queryClient = useQueryClient();
   const lastObservedSyncedAtRef = useRef<string | null>(null);
-  const query = useQuery({
-    queryKey: ["document-sync", documentId],
-    queryFn: () =>
-      fetchJson<DocumentSyncStatus>(
-        `/api/documents/${documentId}/notion/refresh`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ autoSync: !!options?.autoSync }),
-        },
-      ),
-    enabled: !!documentId,
-    // Poll Notion aggressively when auto-sync is on so remote changes appear
-    // within ~2s. Server throttles match (see REFRESH_THROTTLE_AUTO_SYNC_MS in
-    // notion-sync.ts) so we make at most one real Notion request per 2s per doc.
-    refetchInterval: options?.autoSync ? 2_000 : 30_000,
+  const normalizedDocumentId = documentId?.trim() || null;
+  const [autoSync] = useLocalStorage(
+    `notion-auto-sync:${normalizedDocumentId ?? ""}`,
+    false,
+  );
+  const query = useQuery<DocumentSyncStatus>({
+    queryKey: normalizedDocumentId
+      ? documentSyncStatusQueryKey(normalizedDocumentId)
+      : ["action", "refresh-notion-sync-status", null],
+    queryFn: () => {
+      if (!normalizedDocumentId) throw new Error("documentId is required");
+      return callAction<DocumentSyncStatus>("refresh-notion-sync-status", {
+        documentId: normalizedDocumentId,
+        autoSync,
+      });
+    },
+    enabled: !!normalizedDocumentId,
+    refetchInterval: (query) =>
+      documentSyncRefetchIntervalMs(query.state.data, autoSync),
   });
 
   useEffect(() => {
-    if (!documentId || !query.data?.lastSyncedAt) return;
+    if (!normalizedDocumentId || !query.data?.lastSyncedAt) return;
     if (lastObservedSyncedAtRef.current === query.data.lastSyncedAt) return;
 
     lastObservedSyncedAtRef.current = query.data.lastSyncedAt;
 
-    const cachedDocument = queryClient.getQueryData<Document>([
-      "action",
-      "get-document",
-      { id: documentId },
-    ]);
+    const cachedDocuments = queryClient
+      .getQueriesData<Document>(documentQueryFilter(normalizedDocumentId))
+      .map(([, document]) => document)
+      .filter((document): document is Document => !!document);
     const syncedLocalUpdatedAt = query.data.lastPushedLocalUpdatedAt;
 
     if (
-      cachedDocument?.updatedAt &&
+      cachedDocuments.some(
+        (cachedDocument) =>
+          !!cachedDocument.updatedAt &&
+          !!syncedLocalUpdatedAt &&
+          syncedLocalUpdatedAt > cachedDocument.updatedAt,
+      ) &&
       syncedLocalUpdatedAt &&
-      syncedLocalUpdatedAt > cachedDocument.updatedAt
+      cachedDocuments.length > 0
     ) {
-      queryClient.invalidateQueries({
-        queryKey: ["action", "get-document", { id: documentId }],
+      void queryClient.invalidateQueries(
+        documentQueryFilter(normalizedDocumentId),
+      );
+      void queryClient.invalidateQueries({
+        queryKey: ["action", "list-documents"],
       });
-      queryClient.invalidateQueries({ queryKey: ["action", "list-documents"] });
     }
   }, [
-    documentId,
+    normalizedDocumentId,
     query.data?.lastPushedLocalUpdatedAt,
     query.data?.lastSyncedAt,
     queryClient,
@@ -95,120 +197,99 @@ export function useDocumentSyncStatus(
   return query;
 }
 
+const AUTO_SYNC_STORAGE_PREFIX = "notion-auto-sync:";
+
+export function clearAllAutoSyncToggles() {
+  if (typeof window === "undefined") return;
+  try {
+    const staleKeys: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
+      if (key?.startsWith(AUTO_SYNC_STORAGE_PREFIX)) staleKeys.push(key);
+    }
+    for (const key of staleKeys) window.localStorage.removeItem(key);
+  } catch {
+    // Best-effort — localStorage may be unavailable (private mode, etc.).
+  }
+}
+
 export function useDisconnectNotion() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: () =>
-      fetchJson<{ success: boolean }>("/api/notion/disconnect", {
-        method: "POST",
-      }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["notion-connection"] });
-      queryClient.invalidateQueries({ queryKey: ["document-sync"] });
+  return useContentActionMutation<{ success: boolean; deleted: number }>(
+    "disconnect-notion",
+    {
+      onSuccess: () => clearAllAutoSyncToggles(),
+      invalidates: [
+        ["action", "connect-notion-status"],
+        ["action", "refresh-notion-sync-status"],
+        ["action", "list-notion-database-sources"],
+        ["action", "search-notion-pages"],
+      ],
     },
-  });
+  );
 }
 
 export function useLinkDocumentToNotion(documentId: string) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (data: LinkNotionPageRequest) =>
-      fetchJson<DocumentSyncStatus>(
-        `/api/documents/${documentId}/notion/link`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(data),
-        },
-      ),
-    onSuccess: () => invalidateDocumentQueries(queryClient, documentId),
+  return useContentActionMutation<
+    DocumentSyncStatus,
+    LinkNotionPageRequest & { documentId: string }
+  >("link-notion-page", {
+    invalidates: notionDocumentTargets(documentId, { pulled: true }),
   });
 }
 
 export function useUnlinkDocumentFromNotion(documentId: string) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: () =>
-      fetchJson<{ success: boolean }>(
-        `/api/documents/${documentId}/notion/unlink`,
-        {
-          method: "DELETE",
-        },
-      ),
-    onSuccess: () => invalidateDocumentQueries(queryClient, documentId),
-  });
+  return useContentActionMutation<{ success: boolean }, { documentId: string }>(
+    "unlink-notion-page",
+    {
+      method: "DELETE",
+      invalidates: notionDocumentTargets(documentId, { pulled: false }),
+    },
+  );
 }
 
 export function usePullDocumentFromNotion(documentId: string) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: () =>
-      fetchJson<DocumentSyncStatus>(
-        `/api/documents/${documentId}/notion/pull`,
-        {
-          method: "POST",
-        },
-      ),
-    onSuccess: () => invalidateDocumentQueries(queryClient, documentId),
-  });
+  return useContentActionMutation<DocumentSyncStatus, { documentId: string }>(
+    "pull-notion-page",
+    {
+      invalidates: notionDocumentTargets(documentId, { pulled: true }),
+    },
+  );
 }
 
 export function usePushDocumentToNotion(documentId: string) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: () =>
-      fetchJson<DocumentSyncStatus>(
-        `/api/documents/${documentId}/notion/push`,
-        {
-          method: "POST",
-        },
-      ),
-    onSuccess: () => invalidateDocumentQueries(queryClient, documentId),
+  return useContentActionMutation<
+    DocumentSyncStatus,
+    { documentId: string; flushOpenEditor?: boolean }
+  >("push-notion-page", {
+    invalidates: notionDocumentTargets(documentId, { pulled: false }),
   });
 }
 
 export function useResolveDocumentSyncConflict(documentId: string) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (data: ResolveDocumentSyncConflictRequest) =>
-      fetchJson<DocumentSyncStatus>(
-        `/api/documents/${documentId}/notion/resolve`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(data),
-        },
-      ),
-    onSuccess: () => invalidateDocumentQueries(queryClient, documentId),
+  return useContentActionMutation<
+    DocumentSyncStatus,
+    ResolveDocumentSyncConflictRequest & { documentId: string }
+  >("resolve-notion-sync-conflict", {
+    invalidates: notionDocumentTargets(documentId, { pulled: true }),
   });
 }
 
 export function useCreateAndLinkNotionPage(documentId: string) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (data?: CreateNotionPageRequest) =>
-      fetchJson<DocumentSyncStatus>(
-        `/api/documents/${documentId}/notion/create-and-link`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(data ?? {}),
-        },
-      ),
-    onSuccess: () => invalidateDocumentQueries(queryClient, documentId),
+  return useContentActionMutation<
+    DocumentSyncStatus,
+    CreateNotionPageRequest & { documentId: string }
+  >("create-and-link-notion-page", {
+    invalidates: notionDocumentTargets(documentId, { pulled: false }),
   });
 }
 
 export function useSearchNotionPages(query: string, enabled: boolean) {
-  return useQuery({
-    queryKey: ["notion-search", query],
-    queryFn: () =>
-      fetchJson<NotionSearchResponse>("/api/notion/search", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
-      }),
-    enabled,
-    staleTime: 10_000,
-  });
+  return useActionQuery<NotionSearchResponse>(
+    "search-notion-pages",
+    { query },
+    {
+      enabled,
+      staleTime: 10_000,
+    },
+  );
 }

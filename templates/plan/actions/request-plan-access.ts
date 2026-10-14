@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import {
   emailStrong,
   getAppProductionUrl,
@@ -13,6 +13,7 @@ import {
 import { currentAccess, resolveAccess } from "@agent-native/core/sharing";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import {
   isAnonymousPublicViewer,
@@ -20,6 +21,9 @@ import {
   resolvePlanAccessContext,
 } from "../server/lib/local-identity.js";
 import { newId, nowIso, planPath, writeEvent } from "../server/plans.js";
+import type { PlanKind } from "../shared/types.js";
+
+export const PLAN_ACCESS_REQUEST_EMAIL_ID = "plan.access-request";
 
 function httpError(message: string, statusCode: number): Error {
   return Object.assign(new Error(message), { statusCode });
@@ -38,7 +42,7 @@ function displayNameForEmail(email: string): string {
     .join(" ");
 }
 
-function absolutePlanUrl(planId: string, kind: "plan" | "recap"): string {
+function absolutePlanUrl(planId: string, kind: PlanKind): string {
   const appUrl = getAppProductionUrl().replace(/\/+$/, "");
   const path = planPath(planId, kind);
   try {
@@ -48,32 +52,51 @@ function absolutePlanUrl(planId: string, kind: "plan" | "recap"): string {
   }
 }
 
+export function renderPlanAccessRequestEmail(input: {
+  requesterName: string;
+  requesterEmail: string;
+  planTitle: string;
+  url: string;
+}) {
+  const subject = `${input.requesterName} requested access to "${input.planTitle}"`;
+  return {
+    subject,
+    ...renderEmail({
+      preheader: subject,
+      heading: "Access request",
+      paragraphs: [
+        `${emailStrong(input.requesterName)} (${emailStrong(input.requesterEmail)}) requested access to ${emailStrong(input.planTitle)}.`,
+        "Open the plan and use Share to grant access if this request should be approved.",
+      ],
+      cta: { label: "Open plan", url: input.url },
+      footer: "You received this because you own this Agent-Native Plan.",
+    }),
+  };
+}
+
 async function notifyOwner(input: {
   planId: string;
-  planKind: "plan" | "recap";
+  planKind: PlanKind;
   planTitle: string;
   ownerEmail: string | null;
   requesterEmail: string;
   requesterName: string;
 }): Promise<boolean> {
-  if (!isEmailConfigured()) return false;
+  if (!(await isEmailConfigured())) return false;
   if (!input.ownerEmail || input.ownerEmail === input.requesterEmail) {
     return false;
   }
 
-  const url = absolutePlanUrl(input.planId, input.planKind);
-  const subject = `${input.requesterName} requested access to "${input.planTitle}"`;
-  const { html, text } = renderEmail({
-    preheader: subject,
-    heading: "Access request",
-    paragraphs: [
-      `${emailStrong(input.requesterName)} (${emailStrong(input.requesterEmail)}) requested access to ${emailStrong(input.planTitle)}.`,
-      "Open the plan and use Share to grant access if this request should be approved.",
-    ],
-    cta: { label: "Open plan", url },
-    footer: "You received this because you own this Agent-Native Plan.",
+  await sendEmail({
+    ...renderPlanAccessRequestEmail({
+      requesterName: input.requesterName,
+      requesterEmail: input.requesterEmail,
+      planTitle: input.planTitle,
+      url: absolutePlanUrl(input.planId, input.planKind),
+    }),
+    to: input.ownerEmail,
+    templateId: PLAN_ACCESS_REQUEST_EMAIL_ID,
   });
-  await sendEmail({ to: input.ownerEmail, subject, html, text });
   return true;
 }
 

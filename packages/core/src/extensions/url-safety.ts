@@ -54,12 +54,9 @@ function isPrivateHost(hostname: string): boolean {
   }
   if (METADATA_HOSTS.includes(host)) return true;
 
-  // IPv6 ULA/link-local/multicast.
   if (/^f[cd]/.test(host) || /^fe[89ab]/.test(host)) return true;
   if (/^ff/i.test(host)) return true;
 
-  // IPv4-mapped IPv6. URL parsing may preserve dotted form in some runtimes
-  // or normalize it to hex, e.g. [::ffff:127.0.0.1] -> ::ffff:7f00:1.
   const v4mappedDotted = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
   if (v4mappedDotted) {
     const [a, b, c, d] = v4mappedDotted[1].split(".").map(Number);
@@ -67,15 +64,12 @@ function isPrivateHost(hostname: string): boolean {
   }
   if (isPrivateIpv4MappedHex(host)) return true;
 
-  // Dotted IPv4. URL parsing normalizes shorthand/octal/hex IPv4 forms to
-  // dotted decimal before we reach this point.
   const parts = host.split(".");
   if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p))) {
     const [a, b, c, d] = parts.map(Number);
     if (isPrivateIpv4(a, b, c, d)) return true;
   }
 
-  // Decimal integer IPv4.
   if (/^\d+$/.test(host)) {
     const num = Number(host);
     if (num >= 0 && num <= 0xffffffff) {
@@ -119,11 +113,6 @@ function isIpLiteralHost(hostname: string): boolean {
   return parts.length === 4 && parts.every((p) => /^\d+$/.test(p));
 }
 
-/**
- * Async SSRF guard for environments that can resolve DNS. The synchronous
- * guard catches literals and known rebinding domains; this closes the common
- * "public hostname resolves to a private address" gap before dispatch.
- */
 export async function isBlockedExtensionUrlWithDns(
   url: string,
 ): Promise<boolean> {
@@ -148,47 +137,126 @@ export async function isBlockedExtensionUrlWithDns(
   }
 }
 
-/**
- * Build an undici Dispatcher whose connect-time DNS lookup runs through a
- * private-IP guard. This closes the TOCTOU gap where:
- *   1. We resolve hostname → public IP and pass.
- *   2. Between that lookup and the actual connect, DNS rebinding flips the
- *      record to a private IP.
- *   3. fetch() resolves again and connects to the private IP.
- *
- * With a custom dispatcher, the same lookup that produces the IP also gates
- * the connect: if the IP is in the private set, the connect throws.
- *
- * Returns `null` if undici / node:dns are not available (e.g. some edge
- * runtimes); the caller should fall back to the regular `fetch` path —
- * `isBlockedExtensionUrlWithDns` will still have caught most rebinding cases.
- */
-export async function createSsrfSafeDispatcher(): Promise<unknown | null> {
-  // Keep the optional undici import opaque to Vite/Rolldown. A static
-  // `import("undici")` makes browser builds try to resolve and bundle undici
-  // even though this dispatcher is only useful in Node server runtimes.
+function normalizeLookupHostname(hostname: string): string {
+  return hostname.toLowerCase().replace(/^\[|\]$/g, "");
+}
+
+function loopbackHostnameVariants(hostname: string): string[] {
+  const normalized = normalizeLookupHostname(hostname);
+  if (
+    normalized !== "localhost" &&
+    normalized !== "127.0.0.1" &&
+    normalized !== "::1"
+  ) {
+    return [normalized];
+  }
+  return ["localhost", "127.0.0.1", "::1"];
+}
+
+function normalizeAllowedPrivateOriginKeys(
+  origins: readonly string[],
+): Set<string> {
+  const keys = new Set<string>();
+  for (const origin of origins) {
+    try {
+      const parsed = new URL(origin);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        continue;
+      }
+      const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+      for (const hostname of loopbackHostnameVariants(parsed.hostname)) {
+        keys.add(`${hostname}:${port}`);
+      }
+    } catch {
+      // coercion-ok: malformed deployment configuration is omitted, preserving the fail-closed private-IP guard.
+    }
+  }
+  return keys;
+}
+
+function normalizeAllowedPrivateOriginOriginKeys(
+  origins: readonly string[],
+): Set<string> {
+  const keys = new Set<string>();
+  for (const origin of origins) {
+    try {
+      const parsed = new URL(origin);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        continue;
+      }
+      const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+      for (const hostname of loopbackHostnameVariants(parsed.hostname)) {
+        keys.add(`${parsed.protocol}//${hostname}:${port}`);
+      }
+    } catch {
+      // Ignore malformed deployment configuration and retain the private-IP guard.
+    }
+  }
+  return keys;
+}
+
+function allowedPrivateOriginForDestination(
+  destinationUrl: string | undefined,
+  allowedPrivateOrigins: readonly string[],
+): string | undefined {
+  if (!destinationUrl) return undefined;
+  const destination = new URL(destinationUrl);
+  const port =
+    destination.port || (destination.protocol === "https:" ? "443" : "80");
+  const destinationKey = `${destination.protocol}//${normalizeLookupHostname(destination.hostname)}:${port}`;
+  return normalizeAllowedPrivateOriginOriginKeys(allowedPrivateOrigins).has(
+    destinationKey,
+  )
+    ? destination.origin
+    : undefined;
+}
+
+let sharedSsrfDispatcher: Promise<unknown> | undefined;
+const privateSsrfDispatchers = new Map<string, Promise<unknown>>();
+
+async function createSsrfSafeDispatcherUncached(
+  allowedPrivateOrigins: readonly string[] = [],
+  destinationUrl?: string,
+  options: { required?: boolean } = {},
+): Promise<unknown> {
   let undici: any;
   let dnsModule: any;
   try {
-    const runtimeImport = new Function(
-      "specifier",
-      "return import(specifier)",
-    ) as (specifier: string) => Promise<any>;
-    undici = await runtimeImport("undici");
+    const undiciSpecifier = "undici";
+    undici = await import(/* @vite-ignore */ undiciSpecifier);
     dnsModule = await import("node:dns");
-  } catch {
+  } catch (error) {
+    if (options.required) {
+      throw new Error(
+        "SSRF protection is unavailable because the server dispatcher could not be loaded.",
+        { cause: error },
+      );
+    }
     return null;
   }
 
   const { Agent } = undici;
   const { lookup } = dnsModule;
-  if (!Agent || !lookup) return null;
+  const allowedPrivateOriginKeys = normalizeAllowedPrivateOriginKeys(
+    allowedPrivateOrigins,
+  );
+  let destinationPort = "";
+  if (destinationUrl) {
+    const parsed = new URL(destinationUrl);
+    destinationPort =
+      parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+  }
+  if (!Agent || !lookup) {
+    if (options.required) {
+      throw new Error(
+        "SSRF protection is unavailable because the server dispatcher is incomplete.",
+      );
+    }
+    return null;
+  }
 
   return new Agent({
     connect: {
-      // Override DNS lookup at connect time so the IP we hand to undici's
-      // socket is the one we authorized. Reject any record in the private
-      // set BEFORE the TCP handshake.
       lookup: (
         hostname: string,
         options: any,
@@ -209,7 +277,10 @@ export async function createSsrfSafeDispatcher(): Promise<unknown | null> {
               ? addresses
               : [{ address: addresses, family: 4 }];
             for (const record of list) {
-              if (isPrivateHost(record.address)) {
+              const allowedOrigin = allowedPrivateOriginKeys.has(
+                `${normalizeLookupHostname(hostname)}:${destinationPort}`,
+              );
+              if (isPrivateHost(record.address) && !allowedOrigin) {
                 const e = new Error(
                   `Connect blocked: ${hostname} resolved to private address ${record.address}`,
                 ) as NodeJS.ErrnoException;
@@ -217,9 +288,6 @@ export async function createSsrfSafeDispatcher(): Promise<unknown | null> {
                 return callback(e);
               }
             }
-            // Mirror Node's lookup behavior: when `all` is true, return the
-            // array; otherwise the first entry. undici's connect honors
-            // `options.all`.
             if (options && options.all) {
               return callback(null, list as any);
             }
@@ -232,6 +300,50 @@ export async function createSsrfSafeDispatcher(): Promise<unknown | null> {
   });
 }
 
+export async function createSsrfSafeDispatcher(
+  allowedPrivateOrigins: readonly string[] = [],
+  destinationUrl?: string,
+  options: { required?: boolean } = {},
+): Promise<unknown> {
+  const allowedPrivateOrigin = allowedPrivateOriginForDestination(
+    destinationUrl,
+    allowedPrivateOrigins,
+  );
+  if (!allowedPrivateOrigin) {
+    sharedSsrfDispatcher ??= createSsrfSafeDispatcherUncached();
+    const dispatcher = await sharedSsrfDispatcher;
+    if (dispatcher || !options.required) return dispatcher;
+    return createSsrfSafeDispatcherUncached([], undefined, options);
+  }
+
+  const cacheKey = JSON.stringify([
+    allowedPrivateOrigin,
+    options.required === true,
+  ]);
+  let dispatcher = privateSsrfDispatchers.get(cacheKey);
+  if (!dispatcher) {
+    dispatcher = createSsrfSafeDispatcherUncached(
+      [allowedPrivateOrigin],
+      destinationUrl,
+      options,
+    );
+    privateSsrfDispatchers.set(cacheKey, dispatcher);
+  }
+
+  try {
+    const resolved = await dispatcher;
+    if (!resolved && privateSsrfDispatchers.get(cacheKey) === dispatcher) {
+      privateSsrfDispatchers.delete(cacheKey);
+    }
+    return resolved;
+  } catch (error) {
+    if (privateSsrfDispatchers.get(cacheKey) === dispatcher) {
+      privateSsrfDispatchers.delete(cacheKey);
+    }
+    throw error;
+  }
+}
+
 /**
  * SSRF-safe `fetch` for any server-side request to a user/agent-supplied URL.
  *
@@ -240,40 +352,121 @@ export async function createSsrfSafeDispatcher(): Promise<unknown | null> {
  *   1. Pre-flight DNS-aware private-address check (isBlockedExtensionUrlWithDns)
  *      on the initial URL and on every redirect hop.
  *   2. A connect-time dispatcher that re-checks the resolved IP at TCP-connect
- *      time (closes the DNS-rebinding TOCTOU) when undici is available.
+ *      time (closes the DNS-rebinding TOCTOU) when the runtime supports the
+ *      Node dispatcher. Edge runtimes retain preflight DNS checks, literal and
+ *      rebinding-domain rejection, and per-hop redirect validation.
  *   3. Manual redirect handling — a public URL cannot 30x-redirect into the
  *      private network because each hop is re-validated before it is followed.
  *
  * Throws an Error whose message starts with "SSRF blocked:" when a target
  * (initial or via redirect) resolves to a private/internal address, or when the
  * redirect limit is exceeded. Otherwise returns the final Response.
+ *
+ * `httpsOnly` extends the per-hop validation to the URL scheme: redirects are
+ * followed only to `https:` targets, so an HTTPS-only caller cannot be
+ * downgraded to plain HTTP by a 30x from the (untrusted) origin.
+ *
+ * `assertUrlAllowed` lets callers layer a stricter destination policy (for
+ * example, a credential's origin allowlist) on top of the SSRF checks. It runs
+ * before the initial request and before every redirect hop, so sensitive
+ * headers and bodies are never forwarded to a destination the caller rejects.
  */
 export async function ssrfSafeFetch(
   url: string,
   init: RequestInit = {},
-  options: { maxRedirects?: number } = {},
+  options: {
+    maxRedirects?: number;
+    followRedirects?: boolean;
+    requireDispatcher?: boolean;
+    httpsOnly?: boolean;
+    assertUrlAllowed?: (url: string) => void | Promise<void>;
+    allowedPrivateOrigins?: readonly string[];
+  } = {},
 ): Promise<Response> {
   const maxRedirects = options.maxRedirects ?? 3;
-  const dispatcher = (await createSsrfSafeDispatcher()) ?? undefined;
+  let currentInit = init;
+  const allowedPrivateOrigins = normalizeAllowedPrivateOriginOriginKeys(
+    options.allowedPrivateOrigins ?? [],
+  );
+  const isAllowedPrivateOrigin = (candidate: string): boolean => {
+    if (allowedPrivateOrigins.size === 0) return false;
+    try {
+      const parsed = new URL(candidate);
+      const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+      return allowedPrivateOrigins.has(
+        `${parsed.protocol}//${normalizeLookupHostname(parsed.hostname)}:${port}`,
+      );
+    } catch {
+      return false;
+    }
+  };
 
   let currentUrl = url;
   for (let hop = 0; hop <= maxRedirects; hop++) {
-    if (await isBlockedExtensionUrlWithDns(currentUrl)) {
+    await options.assertUrlAllowed?.(currentUrl);
+    if (options.httpsOnly && new URL(currentUrl).protocol !== "https:") {
+      throw new Error(
+        `SSRF blocked: refusing to fetch non-HTTPS address (${currentUrl})`,
+      );
+    }
+    if (
+      !isAllowedPrivateOrigin(currentUrl) &&
+      (await isBlockedExtensionUrlWithDns(currentUrl))
+    ) {
       throw new Error(
         `SSRF blocked: refusing to fetch private/internal address (${currentUrl})`,
       );
     }
     const fetchOpts: RequestInit & { dispatcher?: unknown } = {
-      ...init,
+      ...currentInit,
       redirect: "manual",
     };
+    const dispatcher = await createSsrfSafeDispatcher(
+      options.allowedPrivateOrigins,
+      currentUrl,
+      { required: options.requireDispatcher },
+    );
     if (dispatcher) fetchOpts.dispatcher = dispatcher;
 
     const response = await fetch(currentUrl, fetchOpts);
     if (response.status >= 300 && response.status < 400) {
+      if (options.followRedirects === false) return response;
       const location = response.headers.get("location");
       if (!location) return response;
-      currentUrl = new URL(location, currentUrl).href;
+      await response.body?.cancel().catch(() => {});
+      const nextUrl = new URL(location, currentUrl);
+      const method = currentInit.method?.toUpperCase() ?? "GET";
+      const rewritesToGet =
+        ((response.status === 301 || response.status === 302) &&
+          method === "POST") ||
+        (response.status === 303 && method !== "GET" && method !== "HEAD");
+      let headers = new Headers(currentInit.headers);
+      if (rewritesToGet) {
+        for (const name of [
+          "content-encoding",
+          "content-language",
+          "content-length",
+          "content-location",
+          "content-type",
+        ]) {
+          headers.delete(name);
+        }
+        currentInit = { ...currentInit, method: "GET", body: undefined };
+      }
+      if (nextUrl.origin !== new URL(currentUrl).origin) {
+        const redirectedMethod = currentInit.method?.toUpperCase() ?? "GET";
+        if (redirectedMethod !== "GET" && redirectedMethod !== "HEAD") {
+          throw new Error(
+            "Refusing to follow a cross-origin redirect with a non-GET request",
+          );
+        }
+        const safeHeaders = new Headers();
+        const accept = headers.get("accept");
+        if (accept !== null) safeHeaders.set("accept", accept);
+        headers = safeHeaders;
+      }
+      currentInit = { ...currentInit, headers };
+      currentUrl = nextUrl.href;
       continue;
     }
     return response;
@@ -282,12 +475,6 @@ export async function ssrfSafeFetch(
     `SSRF blocked: too many redirects (>${maxRedirects}) while fetching ${url}`,
   );
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Legacy aliases — predate the Tools → Extensions rename. Templates import
-// these via the legacy `@agent-native/core/tools/url-safety` subpath; keep
-// the names exported so they keep resolving until every consumer updates.
-// ─────────────────────────────────────────────────────────────────────────────
 
 export { isBlockedExtensionUrl as isBlockedToolUrl };
 export { isBlockedExtensionUrlWithDns as isBlockedToolUrlWithDns };

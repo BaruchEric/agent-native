@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+
+import { parseDatabaseViewConfig } from "./_property-utils";
 import action from "./update-content-database-view";
 
 describe("update content database view", () => {
@@ -13,7 +15,16 @@ describe("update content database view", () => {
             name: "Table",
             type: "table",
             sorts: [],
-            filters: [],
+            filters: [
+              {
+                key: "author",
+                label: "Author",
+                operator: "contains",
+                value: "Alice",
+                filterGroupId: "advanced-nested",
+                parentFilterGroupId: "advanced",
+              },
+            ],
             filterMode: "or",
             columnWidths: {},
             groupByPropertyId: "status",
@@ -21,12 +32,19 @@ describe("update content database view", () => {
             endDatePropertyId: "end-date",
             hiddenPropertyIds: ["hidden"],
             propertyOrderIds: ["name", "status"],
+            tableColumnOrderIds: ["status", "name"],
             collapsedGroupIds: ["status:done"],
             hideEmptyGroups: true,
             calculations: { status: "count_values" },
             wrapCells: true,
+            columnWrapOverrides: { status: false, name: true },
+            frozenThroughColumnId: "status",
             rowDensity: "comfortable",
             openPagesIn: "full_page",
+            formQuestions: [
+              { key: "name", enabled: true, required: true },
+              { key: "status", enabled: true, required: false },
+            ],
           },
         ],
       },
@@ -34,12 +52,171 @@ describe("update content database view", () => {
 
     expect(parsed.viewConfig.views[0]).toMatchObject({
       filterMode: "or",
+      filters: [
+        {
+          filterGroupId: "advanced-nested",
+          parentFilterGroupId: "advanced",
+        },
+      ],
       collapsedGroupIds: ["status:done"],
+      propertyOrderIds: ["name", "status"],
+      tableColumnOrderIds: ["status", "name"],
       hideEmptyGroups: true,
       calculations: { status: "count_values" },
       wrapCells: true,
+      columnWrapOverrides: { status: false, name: true },
+      frozenThroughColumnId: "status",
       rowDensity: "comfortable",
       openPagesIn: "full_page",
+      formQuestions: [
+        { key: "name", enabled: true, required: true },
+        { key: "status", enabled: true, required: false },
+      ],
     });
+  });
+
+  it("preserves explicit null freeze and rejects malformed presentation values", () => {
+    const parsed = action.schema.parse({
+      databaseId: "database",
+      viewConfig: {
+        views: [
+          {
+            id: "table",
+            name: "Table",
+            type: "table",
+            frozenThroughColumnId: null,
+          },
+        ],
+      },
+    });
+    expect(parsed.viewConfig.views[0]?.frozenThroughColumnId).toBeNull();
+
+    expect(() =>
+      action.schema.parse({
+        databaseId: "database",
+        viewConfig: {
+          views: [
+            {
+              id: "table",
+              name: "Table",
+              type: "table",
+              columnWrapOverrides: { status: "yes" },
+            },
+          ],
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      action.schema.parse({
+        databaseId: "database",
+        viewConfig: {
+          views: [
+            {
+              id: "table",
+              name: "Table",
+              type: "table",
+              frozenThroughColumnId: "",
+            },
+          ],
+        },
+      }),
+    ).toThrow();
+  });
+
+  it("normalizes retired sidebar saved views to tables", () => {
+    const parsed = action.schema.parse({
+      databaseId: "database",
+      viewConfig: {
+        activeViewId: "sidebar",
+        views: [
+          {
+            id: "sidebar",
+            name: "Navigation",
+            type: "sidebar",
+            sorts: [],
+            filters: [],
+            columnWidths: {},
+            groupByPropertyId: "status",
+          },
+        ],
+      },
+    });
+
+    expect(parsed.viewConfig.views[0]?.type).toBe("table");
+  });
+
+  it("keeps legacy JSON compatible and normalizes form questions on startup reads", () => {
+    const legacy = parseDatabaseViewConfig(
+      JSON.stringify({
+        activeViewId: "legacy",
+        views: [
+          {
+            id: "legacy",
+            name: "Legacy table",
+            type: "table",
+            sorts: [],
+            filters: [],
+            columnWidths: {},
+          },
+        ],
+      }),
+    );
+    expect(legacy.views[0].formQuestions).toEqual([]);
+
+    const form = parseDatabaseViewConfig(
+      JSON.stringify({
+        activeViewId: "form",
+        views: [
+          {
+            id: "form",
+            name: "Request",
+            type: "form",
+            formQuestions: [
+              { key: "name", enabled: true, required: true },
+              { key: "name", enabled: false, required: false },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(form.views[0]).toMatchObject({
+      type: "form",
+      formQuestions: [{ key: "name", enabled: true, required: true }],
+    });
+  });
+
+  it("fails loudly when stored column presentation state is malformed", () => {
+    expect(() =>
+      parseDatabaseViewConfig(
+        JSON.stringify({
+          activeViewId: "table",
+          views: [
+            {
+              id: "table",
+              name: "Table",
+              type: "table",
+              columnWrapOverrides: { status: "yes" },
+            },
+          ],
+        }),
+      ),
+    ).toThrow("Database column wrap overrides must be a boolean map.");
+    expect(() =>
+      parseDatabaseViewConfig(
+        JSON.stringify({
+          activeViewId: "table",
+          views: [
+            {
+              id: "table",
+              name: "Table",
+              type: "table",
+              frozenThroughColumnId: 42,
+            },
+          ],
+        }),
+      ),
+    ).toThrow(
+      "Database frozen-through column must be a non-empty column ID or null.",
+    );
   });
 });

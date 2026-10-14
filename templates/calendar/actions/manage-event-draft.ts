@@ -7,14 +7,20 @@ import {
 } from "@agent-native/core/application-state";
 import { buildDeepLink, getRequestUserEmail } from "@agent-native/core/server";
 import { z } from "zod";
+
 import type { CalendarEventDraft } from "../shared/api.js";
 import {
+  autoDeclineModeInput,
   attachmentsInput,
+  attendeesInput,
   availabilityInput,
   buildReminderOverrides,
   cliBoolean,
   eventTypeInput,
   googleColorIdInput,
+  normalizeAttendees,
+  normalizeCreateEventInput,
+  normalizeRecurrence,
   reminderMethodInput,
   reminderMinutesInput,
   remindersInput,
@@ -24,18 +30,6 @@ import {
 
 const DRAFT_PREFIX = "calendar-draft-";
 
-const attendeesInput = z
-  .union([
-    z.array(
-      z.object({
-        email: z.string(),
-        displayName: z.string().optional(),
-      }),
-    ),
-    z.string(),
-  ])
-  .optional();
-
 function sanitizeDraftId(id: string): string | null {
   return /^[a-zA-Z0-9_-]{1,64}$/.test(id) ? id : null;
 }
@@ -44,42 +38,11 @@ function draftKey(id: string) {
   return `${DRAFT_PREFIX}${id}`;
 }
 
-function normalizeAttendees(
-  input: z.infer<typeof attendeesInput>,
-): CalendarEventDraft["attendees"] | undefined {
-  if (input === undefined) return undefined;
-  if (typeof input === "string") {
-    const emails = input
-      .split(/[\s,;]+/)
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0 && s.includes("@"));
-    return emails.map((email) => ({ email }));
-  }
-  return input
-    .filter((a) => a.email && a.email.includes("@"))
-    .map((a) => ({
-      email: a.email,
-      ...(a.displayName ? { displayName: a.displayName } : {}),
-    }));
-}
-
-/**
- * Deep link that reopens an unsent calendar event draft.
- *
- * The link is an opaque pointer (draft id + date only). The full draft —
- * title, attendees, description, location — lives in the
- * `calendar-draft-{id}` app-state row written by this action, so the
- * calendar reads it from there on render. We deliberately do NOT inline the
- * draft contents into the URL: external MCP hosts (ChatGPT / Claude)
- * surface this link in their UI, the host LLM can see and remember query
- * strings, and shared / exported chat transcripts would otherwise leak
- * private meeting content.
- */
 function eventDraftDeepLink(draft: CalendarEventDraft): string {
   return buildDeepLink({
     app: "calendar",
     view: "calendar",
-    to: "/",
+    to: "/home",
     params: {
       eventDraftId: draft.id,
       date: draft.start?.slice(0, 10),
@@ -110,8 +73,18 @@ export default defineAction({
         "Draft ID (auto-generated for create; required for update/delete)",
       ),
     title: z.string().optional().describe("Event title"),
-    start: z.string().optional().describe("Start time, ISO format"),
-    end: z.string().optional().describe("End time, ISO format"),
+    start: z
+      .string()
+      .optional()
+      .describe(
+        "Start time in ISO format, or the first inclusive YYYY-MM-DD date for a full-day OOO draft.",
+      ),
+    end: z
+      .string()
+      .optional()
+      .describe(
+        "End time in ISO format, or the last inclusive YYYY-MM-DD date for a full-day OOO draft.",
+      ),
     startTimeZone: z
       .string()
       .optional()
@@ -123,6 +96,11 @@ export default defineAction({
     description: z.string().optional().describe("Event description"),
     location: z.string().optional().describe("Event location"),
     allDay: cliBoolean.optional().describe("Whether the event is all-day"),
+    fullDay: cliBoolean
+      .optional()
+      .describe(
+        "For an out-of-office draft, cover the full inclusive start/end dates while creating a Google-compatible timed event.",
+      ),
     eventType: eventTypeInput.describe(
       "Native Google Calendar event type: default, outOfOffice, focusTime, or workingLocation.",
     ),
@@ -132,6 +110,13 @@ export default defineAction({
     visibility: visibilityInput.describe(
       "Google Calendar visibility: default, public, private, or confidential.",
     ),
+    autoDeclineMode: autoDeclineModeInput.describe(
+      "For an out-of-office draft: decline all conflicts, only new conflicts, or none.",
+    ),
+    declineMessage: z
+      .string()
+      .optional()
+      .describe("For an out-of-office draft: decline response message."),
     remindersUseDefault: cliBoolean
       .optional()
       .describe(
@@ -140,6 +125,12 @@ export default defineAction({
     reminders: remindersInput.describe(
       "Custom reminder overrides, max 5, such as [{method:'popup', minutes:10}].",
     ),
+    recurrence: z
+      .union([z.string(), z.array(z.string())])
+      .optional()
+      .describe(
+        "Google recurrence rules, such as RRULE:FREQ=DAILY. Pass an empty string or [] to clear recurrence.",
+      ),
     reminderMinutes: reminderMinutesInput.describe(
       "Convenience field for a single reminder in minutes before the event.",
     ),
@@ -165,9 +156,11 @@ export default defineAction({
       .optional()
       .describe("Preselect Google Meet for this draft"),
     addZoom: cliBoolean.optional().describe("Preselect Zoom for this draft"),
-    attendees: attendeesInput.describe(
-      "Invitees — either an array of {email, displayName?} or a comma-separated string of emails",
-    ),
+    attendees: attendeesInput
+      .optional()
+      .describe(
+        "Invitees — either an array of {email, displayName?, optional?} or a comma-separated string of emails. Set optional:true to mark a guest optional.",
+      ),
     accountEmail: z
       .string()
       .optional()
@@ -236,16 +229,56 @@ export default defineAction({
     setIfPresent(draft, "endTimeZone", args.endTimeZone);
     setIfPresent(draft, "location", args.location);
     setIfPresent(draft, "allDay", args.allDay);
+    setIfPresent(draft, "fullDay", args.fullDay);
     setIfPresent(draft, "eventType", args.eventType);
     setIfPresent(draft, "transparency", args.transparency);
     setIfPresent(draft, "visibility", args.visibility);
     setIfPresent(draft, "colorId", args.colorId);
+    setIfPresent(draft, "recurrence", normalizeRecurrence(args.recurrence));
     setIfPresent(draft, "attachments", args.attachments);
     setIfPresent(draft, "workingLocationType", args.workingLocationType);
     setIfPresent(draft, "workingLocationLabel", args.workingLocationLabel);
     setIfPresent(draft, "addGoogleMeet", args.addGoogleMeet);
     setIfPresent(draft, "addZoom", args.addZoom);
     setIfPresent(draft, "accountEmail", args.accountEmail);
+    if (draft.fullDay === true) {
+      if (draft.eventType !== "outOfOffice") {
+        throw new Error("fullDay is only supported for out-of-office drafts.");
+      }
+      if (!draft.start || !draft.end) {
+        throw new Error(
+          "Full-day out-of-office drafts require start and end dates.",
+        );
+      }
+      normalizeCreateEventInput({
+        title: draft.title,
+        eventType: draft.eventType,
+        start: draft.start,
+        end: draft.end,
+        startTimeZone: draft.startTimeZone,
+        endTimeZone: draft.endTimeZone,
+        fullDay: true,
+      });
+      draft.allDay = false;
+    }
+    if (draft.eventType === "outOfOffice") {
+      draft.outOfOfficeProperties = {
+        autoDeclineMode:
+          args.autoDeclineMode ??
+          draft.outOfOfficeProperties?.autoDeclineMode ??
+          "declineAllConflictingInvitations",
+        declineMessage:
+          (args.autoDeclineMode ??
+            draft.outOfOfficeProperties?.autoDeclineMode) === "declineNone"
+            ? undefined
+            : (args.declineMessage ??
+              draft.outOfOfficeProperties?.declineMessage ??
+              "Declined because I am out of office"),
+      };
+    }
+    if (draft.eventType === "outOfOffice" && !draft.title?.trim()) {
+      draft.title = "Out of office";
+    }
 
     const attendees = normalizeAttendees(args.attendees);
     setIfPresent(draft, "attendees", attendees);

@@ -1,7 +1,20 @@
-import { useState, useCallback, useEffect, useRef, useMemo } from "react";
+import { sendToAgentChat } from "@agent-native/core/client/agent-chat";
+import {
+  isDesignSystemCodeIndexingAllowed,
+  isDesignSystemTierAtMax,
+  readDesignSystemTierLimitFailure,
+  type DesignSystemTierLimit,
+} from "@agent-native/core/client/design-system-tier-limit";
+import {
+  useActionQuery,
+  useActionMutation,
+} from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { withBuilderUtmTrackingParams } from "@agent-native/core/shared";
+import { openAgentSidebar } from "@agent-native/toolkit/app/shared";
 import {
   IconWorld,
-  IconPalette,
+  IconComponents,
   IconLoader2,
   IconBrandGithub,
   IconBrandFigma,
@@ -10,15 +23,25 @@ import {
   IconFileDescription,
   IconPhoto,
   IconCheck,
+  IconExternalLink,
+  IconChevronDown,
+  IconRefresh,
+  IconLock,
 } from "@tabler/icons-react";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
+import { toast } from "sonner";
+
 import {
-  useActionQuery,
-  useActionMutation,
-  sendToAgentChat,
-  openAgentSidebar,
-  appApiPath,
-} from "@agent-native/core/client";
-import { toast } from "@/hooks/use-toast";
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
@@ -26,17 +49,25 @@ import {
   DialogTitle,
   DialogDescription,
 } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Textarea } from "@/components/ui/textarea";
+import { useDesignSystemWorkflows } from "@/hooks/use-design-system-workflows";
+import { cn } from "@/lib/utils";
+
 import {
-  MAX_FIG_UPLOAD_BYTES,
+  uploadAndIndexFigmaFiles,
+  pollDecodeJobStatus,
+  type DecodeJobStatus,
+} from "./builder-design-system-upload";
+import {
+  MAX_BUILDER_INDEX_UPLOAD_BYTES,
   formatFileSize,
-  readFigImportResponse,
-  type FigImportResult,
-} from "./fig-import-response";
+  type BuilderIndexResult,
+} from "./builder-index-response";
 
 interface DesignSystemSetupProps {
   open: boolean;
@@ -48,6 +79,8 @@ interface DesignSystemSetupProps {
 interface GitHubLink {
   id: string;
   url: string;
+  ref?: string;
+  include?: string[];
 }
 
 interface UploadedFile {
@@ -57,6 +90,55 @@ interface UploadedFile {
   size: number;
   textContent?: string;
 }
+
+type BuilderSourceKind = "figma" | "code" | "github" | "mixed";
+
+interface BuilderSourceDetails {
+  builderDesignSystemId: string;
+  builderJobId: string;
+  builderUrl?: string;
+  builderStatus?: string;
+  sourceKind?: BuilderSourceKind;
+  tokenValues?: Record<string, string>;
+  docCount?: number | null;
+  warning?: string;
+  githubSources?: Array<{
+    repoUrl: string;
+    ref?: string;
+    include?: string[];
+    exclude?: string[];
+  }>;
+  syncedAt?: string;
+}
+
+interface ExistingDesignSystem {
+  title?: string;
+  description?: string;
+  data?: string | null;
+  customInstructions?: string;
+  builder?: BuilderSourceDetails | null;
+}
+
+interface BuilderIndexInput {
+  projectName?: string;
+  description?: string;
+  githubSources?: Array<{
+    repoUrl: string;
+    ref?: string;
+    include?: string[];
+    exclude?: string[];
+  }>;
+  githubRepoUrl?: string;
+  codeFiles?: Array<{
+    filename: string;
+    content: string;
+    mimeType?: string;
+    encoding?: "utf8" | "base64";
+  }>;
+  designMd?: string;
+}
+
+type OtherSource = "brand" | "code" | "files" | "existing" | "context";
 
 function normalizeWebsiteUrlInput(input: string): string | null {
   const trimmed = input.trim();
@@ -83,16 +165,31 @@ function normalizeWebsiteUrlInput(input: string): string | null {
   }
 }
 
-export function DesignSystemSetup({
+function isDesignMdFile(file: UploadedFile) {
+  const name = file.name.split(/[\\/]/).pop()?.toLowerCase() ?? file.name;
+  return name === "design.md" || name === "design.mdx";
+}
+
+export function DesignSystemSetup(props: DesignSystemSetupProps) {
+  const enabled = useDesignSystemWorkflows();
+  return enabled || props.editingId ? (
+    <DesignSystemSetupContent {...props} />
+  ) : null;
+}
+
+function DesignSystemSetupContent({
   open,
   onClose,
   onComplete,
   editingId,
 }: DesignSystemSetupProps) {
+  const t = useT();
   const [companyName, setCompanyName] = useState("");
   const [websiteUrl, setWebsiteUrl] = useState("");
   const [websiteUrls, setWebsiteUrls] = useState<string[]>([]);
   const [githubUrl, setGithubUrl] = useState("");
+  const [githubRef, setGithubRef] = useState("");
+  const [githubPaths, setGithubPaths] = useState("");
   const [githubLinks, setGithubLinks] = useState<GitHubLink[]>([]);
   const [codeFiles, setCodeFiles] = useState<UploadedFile[]>([]);
   const [docFiles, setDocFiles] = useState<UploadedFile[]>([]);
@@ -100,27 +197,100 @@ export function DesignSystemSetup({
   const [brandNotes, setBrandNotes] = useState("");
   const [customInstructions, setCustomInstructions] = useState("");
   const [generating, setGenerating] = useState(false);
-  const [figParsing, setFigParsing] = useState(false);
-  const [figResult, setFigResult] = useState<FigImportResult | null>(null);
-  const [figError, setFigError] = useState<string | null>(null);
-  const [figTitle, setFigTitle] = useState("");
-  const [figCreating, setFigCreating] = useState(false);
+  const [builderIndexing, setBuilderIndexing] = useState(false);
+  const [builderUploadProgress, setBuilderUploadProgress] = useState<
+    number | null
+  >(null);
+  const [builderIndexResult, setBuilderIndexResult] =
+    useState<BuilderIndexResult | null>(null);
+  const [builderIndexError, setBuilderIndexError] = useState<string | null>(
+    null,
+  );
+  const [sourcePanel, setSourcePanel] = useState<"figma" | "other">("figma");
+  const [otherSource, setOtherSource] = useState<OtherSource | null>(null);
+  const [decodeStatus, setDecodeStatus] = useState<DecodeJobStatus | null>(
+    null,
+  );
+  const decodePollRef = useRef<AbortController | null>(null);
+
+  const stopDecodePolling = useCallback(() => {
+    decodePollRef.current?.abort();
+    decodePollRef.current = null;
+  }, []);
+
+  const startDecodePolling = useCallback(
+    (jobId: string, indexResult: BuilderIndexResult) => {
+      decodePollRef.current?.abort();
+      const controller = new AbortController();
+      decodePollRef.current = controller;
+      setDecodeStatus({
+        status: "pending",
+        branchUrl: null,
+        error: null,
+        framesProcessed: 0,
+        totalFrames: 0,
+      });
+      pollDecodeJobStatus(jobId, {
+        signal: controller.signal,
+        onUpdate: (status) => {
+          if (!controller.signal.aborted) setDecodeStatus(status);
+        },
+      })
+        .then((status) => {
+          if (controller.signal.aborted) return;
+          setDecodeStatus(status);
+          setBuilderIndexResult(
+            status.branchUrl
+              ? { ...indexResult, builderUrl: status.branchUrl }
+              : indexResult,
+          );
+          setBuilderIndexing(false);
+        })
+        .catch((err: unknown) => {
+          if (controller.signal.aborted) return;
+          if (err instanceof DOMException && err.name === "AbortError") return;
+          setDecodeStatus((prev) => ({
+            status: "error",
+            branchUrl: prev?.branchUrl ?? null,
+            error: err instanceof Error ? err.message : String(err),
+            framesProcessed: prev?.framesProcessed ?? 0,
+            totalFrames: prev?.totalFrames ?? 0,
+          }));
+          setBuilderIndexResult(indexResult);
+          setBuilderIndexing(false);
+        });
+    },
+    [],
+  );
+
+  useEffect(() => stopDecodePolling, [stopDecodePolling]);
 
   const codeInputRef = useRef<HTMLInputElement>(null);
   const docInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const figInputRef = useRef<HTMLInputElement>(null);
-  const createSystemMutation = useActionMutation("create-design-system");
   const updateSystemMutation = useActionMutation("update-design-system");
+  const syncSystemMutation = useActionMutation(
+    "sync-design-system-with-builder",
+  );
+  const indexSystemMutation = useActionMutation<
+    BuilderIndexResult,
+    BuilderIndexInput
+  >("index-design-system-with-builder");
 
-  const { data: existingDs } = useActionQuery<{
-    title?: string;
-    description?: string;
-    data?: string | null;
-    customInstructions?: string;
-  }>("get-design-system", editingId ? { id: editingId } : undefined, {
-    enabled: !!editingId && open,
-  });
+  const {
+    data: existingDs,
+    isLoading: existingDsLoading,
+    isError: existingDsError,
+  } = useActionQuery<ExistingDesignSystem>(
+    "get-design-system",
+    editingId ? { id: editingId } : undefined,
+    {
+      enabled: !!editingId && open,
+      refetchInterval: (query) =>
+        query.state.data?.builder?.docCount === 0 ? 5_000 : false,
+    },
+  );
 
   const { data: designSystemsData } = useActionQuery<{
     designSystems: Array<{ id: string; title: string }>;
@@ -129,17 +299,40 @@ export function DesignSystemSetup({
   const existingSystems = designSystemsData?.designSystems ?? [];
   const [selectedSystemId, setSelectedSystemId] = useState("");
 
+  const { data: tierLimit } = useActionQuery<DesignSystemTierLimit>(
+    "get-design-system-tier-limit",
+    undefined,
+    { enabled: open && !editingId },
+  );
+  const atMax = isDesignSystemTierAtMax(tierLimit);
+  const codeIndexingAllowed = isDesignSystemCodeIndexingAllowed(tierLimit);
+  const [tierLimitUpgradeUrl, setTierLimitUpgradeUrl] = useState<string | null>(
+    null,
+  );
+
   useEffect(() => {
     if (existingDs && editingId) {
+      const builder = existingDs.builder;
       setCompanyName(existingDs.title ?? "");
-      setBrandNotes(existingDs.description ?? "");
-      setCustomInstructions(existingDs.customInstructions ?? "");
-      try {
-        const parsed = existingDs.data ? JSON.parse(existingDs.data) : null;
-        if (parsed?.notes) setBrandNotes(parsed.notes);
-      } catch {
-        // ignore
-      }
+      const parsed = parseDesignSystemData(existingDs.data);
+      const generatedDescription = builder
+        ? `Builder indexed design system ${builder.builderDesignSystemId}`
+        : null;
+      setBrandNotes(
+        builder
+          ? existingDs.description !== generatedDescription
+            ? (existingDs.description ?? "")
+            : ""
+          : parsed.ok && typeof parsed.value.notes === "string"
+            ? parsed.value.notes
+            : (existingDs.description ?? ""),
+      );
+      setCustomInstructions(
+        builder &&
+          isGeneratedBuilderInstructions(existingDs.customInstructions, builder)
+          ? ""
+          : (existingDs.customInstructions ?? ""),
+      );
     }
   }, [existingDs, editingId]);
 
@@ -149,6 +342,8 @@ export function DesignSystemSetup({
       setWebsiteUrl("");
       setWebsiteUrls([]);
       setGithubUrl("");
+      setGithubRef("");
+      setGithubPaths("");
       setGithubLinks([]);
       setCodeFiles([]);
       setDocFiles([]);
@@ -156,13 +351,13 @@ export function DesignSystemSetup({
       setBrandNotes("");
       setCustomInstructions("");
       setSelectedSystemId("");
-      setFigParsing(false);
-      setFigResult(null);
-      setFigError(null);
-      setFigTitle("");
-      setFigCreating(false);
+      setBuilderIndexing(false);
+      setBuilderIndexResult(null);
+      setBuilderIndexError(null);
+      stopDecodePolling();
+      setDecodeStatus(null);
     }
-  }, [open]);
+  }, [open, stopDecodePolling]);
 
   const hasAnySources = useMemo(() => {
     return (
@@ -170,6 +365,7 @@ export function DesignSystemSetup({
       websiteUrls.length > 0 ||
       githubLinks.length > 0 ||
       codeFiles.length > 0 ||
+      builderIndexResult ||
       docFiles.length > 0 ||
       imageFiles.length > 0 ||
       selectedSystemId ||
@@ -181,12 +377,18 @@ export function DesignSystemSetup({
     websiteUrls,
     githubLinks,
     codeFiles,
+    builderIndexResult,
     docFiles,
     imageFiles,
     selectedSystemId,
     brandNotes,
     customInstructions,
   ]);
+
+  const selectOtherSource = useCallback((source: OtherSource) => {
+    setSourcePanel("other");
+    setOtherSource((current) => (current === source ? null : source));
+  }, []);
 
   const addWebsiteUrl = useCallback(() => {
     const url = normalizeWebsiteUrlInput(websiteUrl);
@@ -198,9 +400,23 @@ export function DesignSystemSetup({
   const addGithubLink = useCallback(() => {
     const url = githubUrl.trim();
     if (!url) return;
-    setGithubLinks((prev) => [...prev, { id: crypto.randomUUID(), url }]);
+    const include = githubPaths
+      .split(/[\n,]/)
+      .map((path) => path.trim().replace(/^\/+|\/+$/g, ""))
+      .filter(Boolean);
+    setGithubLinks((prev) => [
+      ...prev,
+      {
+        id: crypto.randomUUID(),
+        url,
+        ...(githubRef.trim() ? { ref: githubRef.trim() } : {}),
+        ...(include.length > 0 ? { include: [...new Set(include)] } : {}),
+      },
+    ]);
     setGithubUrl("");
-  }, [githubUrl]);
+    setGithubRef("");
+    setGithubPaths("");
+  }, [githubPaths, githubRef, githubUrl]);
 
   const readTextFiles = useCallback(
     (
@@ -231,112 +447,200 @@ export function DesignSystemSetup({
         }
         newFiles.push(file);
       });
-      Promise.all(promises).then(() => {
+      void Promise.all(promises).then(() => {
         setter((prev) => [...prev, ...newFiles]);
       });
     },
     [],
   );
 
-  const handleFigImport = useCallback(
-    async (event: React.ChangeEvent<HTMLInputElement>) => {
-      const file = event.target.files?.[0];
-      event.target.value = "";
+  const processBuilderIndexFile = useCallback(
+    async (file: File | undefined) => {
       if (!file) return;
       if (!file.name.toLowerCase().endsWith(".fig")) {
-        setFigError(
-          "Please choose a .fig file (in Figma: File > Save local copy).",
-        );
+        setBuilderIndexError(t("designSystemSetup.figFileRequired"));
         return;
       }
-      if (file.size > MAX_FIG_UPLOAD_BYTES) {
-        setFigError(
-          `File too large (max ${formatFileSize(MAX_FIG_UPLOAD_BYTES)}).`,
+      if (file.size > MAX_BUILDER_INDEX_UPLOAD_BYTES) {
+        setBuilderIndexError(
+          t("designSystemSetup.figFileTooLarge", {
+            maxSize: formatFileSize(MAX_BUILDER_INDEX_UPLOAD_BYTES),
+          }),
         );
         return;
       }
 
-      setFigError(null);
-      setFigResult(null);
-      setFigParsing(true);
+      setBuilderIndexError(null);
+      setBuilderIndexResult(null);
+      setBuilderUploadProgress(null);
+      stopDecodePolling();
+      setDecodeStatus(null);
+      setBuilderIndexing(true);
       try {
-        const body = new FormData();
-        body.append("file", file);
-        const res = await fetch(appApiPath("/api/import-figma-system"), {
-          method: "POST",
-          body,
+        const suggestedTitle =
+          file.name
+            .replace(/\.fig$/i, "")
+            .replace(/[-_]+/g, " ")
+            .trim() || "Imported brand";
+        const parsed = await uploadAndIndexFigmaFiles([file], {
+          projectName: companyName.trim() || suggestedTitle,
+          onProgress: setBuilderUploadProgress,
         });
-        const parsed = await readFigImportResponse(res);
-        setFigResult(parsed);
-        setFigTitle(parsed.suggestedTitle || "Imported brand");
+        setBuilderUploadProgress(null);
+        if (parsed.jobId) {
+          setBuilderIndexResult(parsed);
+          startDecodePolling(parsed.jobId, parsed);
+        } else {
+          setBuilderIndexResult(parsed);
+          setBuilderIndexing(false);
+        }
       } catch (err) {
-        setFigError(
+        setBuilderUploadProgress(null);
+        setBuilderIndexError(
           err instanceof Error
             ? err.message
-            : "Could not parse that Figma file.",
+            : t("designSystemSetup.figParseFailed"),
         );
-      } finally {
-        setFigParsing(false);
+        setBuilderIndexing(false);
       }
     },
-    [],
+    [companyName, t, startDecodePolling, stopDecodePolling],
   );
 
-  const handleCreateFromFig = useCallback(async () => {
-    if (!figResult) return;
-    const title =
-      figTitle.trim() || figResult.suggestedTitle || "Imported brand";
-    setFigCreating(true);
-    try {
-      await createSystemMutation.mutateAsync({
-        title,
-        data: JSON.stringify(figResult.data),
-        customInstructions: figResult.customInstructions || "",
-      } as any);
-      toast({ title: "Design system created from Figma" });
-      onComplete();
-    } catch (err) {
-      setFigCreating(false);
-      toast({
-        title: "Could not create the design system",
-        description:
-          err instanceof Error ? err.message : "Something went wrong",
-        variant: "destructive",
-      });
-    }
-  }, [figResult, figTitle, createSystemMutation, onComplete]);
+  const handleBuilderIndexUpload = useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      void processBuilderIndexFile(event.target.files?.[0]);
+      event.target.value = "";
+    },
+    [processBuilderIndexFile],
+  );
+
+  const handleBuilderIndexDrop = useCallback(
+    (event: React.DragEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void processBuilderIndexFile(event.dataTransfer.files?.[0]);
+    },
+    [processBuilderIndexFile],
+  );
+
+  const addImageFiles = useCallback((files: FileList) => {
+    const newFiles = Array.from(files).map((file) => ({
+      id: crypto.randomUUID(),
+      name: file.name,
+      type: file.type,
+      size: file.size,
+    }));
+    setImageFiles((previous) => [...previous, ...newFiles]);
+  }, []);
 
   const handleEditSave = async () => {
-    if (!editingId) return;
+    if (!editingId || !existingDs) return;
     setGenerating(true);
     try {
       await updateSystemMutation.mutateAsync({
         id: editingId,
         title: companyName || "My Brand",
-        description: brandNotes || undefined,
+        description: brandNotes,
         customInstructions,
       });
       onComplete();
-      toast({ title: "Design system updated" });
+      toast.success(t("designSystemSetup.updated"));
     } catch {
-      toast({
-        title: "Failed to update",
-        variant: "destructive",
-      });
+      toast.error(t("designSystemSetup.updateFailed"));
     } finally {
       setGenerating(false);
     }
   };
 
-  const handleGenerate = useCallback(() => {
+  const handleSync = useCallback(async () => {
+    if (!editingId || !existingDs?.builder?.githubSources?.length) return;
+    setGenerating(true);
+    try {
+      await syncSystemMutation.mutateAsync({ id: editingId });
+      toast.success(t("designSystemSetup.syncStarted"));
+    } catch (error) {
+      toast.error(t("designSystemSetup.syncFailed"), {
+        description:
+          error instanceof Error
+            ? error.message
+            : t("designSystemSetup.syncFailed"),
+      });
+    } finally {
+      setGenerating(false);
+    }
+  }, [editingId, existingDs, syncSystemMutation, t]);
+
+  const handleGenerate = useCallback(async () => {
     if (editingId) {
-      handleEditSave();
+      await handleEditSave();
       return;
     }
 
-    // Cap inlined file content so a giant pasted README doesn't blow the
-    // prompt budget. Append a marker so the agent doesn't treat the
-    // truncation point as the end of the document.
+    const isGithubOnlySource =
+      githubLinks.length > 0 &&
+      websiteUrls.length === 0 &&
+      codeFiles.length === 0 &&
+      !builderIndexResult &&
+      docFiles.length === 0 &&
+      imageFiles.length === 0 &&
+      !selectedSystemId &&
+      !brandNotes.trim() &&
+      !customInstructions.trim();
+    if (isGithubOnlySource) {
+      setGenerating(true);
+      setTierLimitUpgradeUrl(null);
+      try {
+        await indexSystemMutation.mutateAsync({
+          projectName: companyName.trim() || undefined,
+          githubSources: githubLinks.map((link) => ({
+            repoUrl: link.url,
+            ...(link.ref ? { ref: link.ref } : {}),
+            ...(link.include?.length ? { include: link.include } : {}),
+          })),
+        });
+        toast.success(t("designSystemSetup.generationStarted"));
+        onComplete();
+      } catch (error) {
+        const tierFailure = readDesignSystemTierLimitFailure(
+          error,
+          t("designSystemSetup.updateFailed"),
+        );
+        if (tierFailure) {
+          setTierLimitUpgradeUrl(tierFailure.upgradeUrl);
+        }
+        toast.error(t("designSystemSetup.updateFailed"), {
+          description:
+            tierFailure?.message ??
+            (error instanceof Error
+              ? error.message
+              : t("designSystemSetup.updateFailed")),
+        });
+      } finally {
+        setGenerating(false);
+      }
+      return;
+    }
+
+    const requestedTitle = companyName.trim();
+    const localDesignSystemId = builderIndexResult?.localDesignSystemId;
+    if (requestedTitle && localDesignSystemId) {
+      try {
+        await updateSystemMutation.mutateAsync({
+          id: localDesignSystemId,
+          title: requestedTitle,
+        });
+      } catch (error) {
+        toast.error(t("designSystemSetup.updateFailed"), {
+          description:
+            error instanceof Error
+              ? error.message
+              : t("designSystemSetup.updateFailed"),
+        });
+        return;
+      }
+    }
+
     const TEXT_INLINE_MAX = 5000;
     const inlineText = (text: string) =>
       text.length > TEXT_INLINE_MAX
@@ -345,30 +649,46 @@ export function DesignSystemSetup({
 
     const parts: string[] = [];
     parts.push(
-      "Set up a design system from the following sources. Analyze each source, extract design tokens (colors, fonts, spacing, borders), and create a cohesive design system for my slide decks.",
+      "Set up a design system from the following sources. Use Builder Design System Intelligence (DSI) as the source of truth for reusable Figma/code/design.md indexing. Analyze each source, extract design tokens (colors, fonts, spacing, borders), and create a cohesive design system for my slide decks.",
     );
 
     if (companyName.trim()) {
-      parts.push(`\n## Company / Brand\n${companyName.trim()}`);
+      parts.push(
+        `\n## Company / Brand\n${companyName.trim()}\n\nUse exactly this as the design system name. Never replace it with the uploaded Figma filename.`,
+      );
     }
 
     if (websiteUrls.length > 0) {
       parts.push(
-        `\n## Website URLs\nAnalyze these websites for design tokens. Call \`import-from-url\` for each:\n${websiteUrls.map((u) => `- ${u}`).join("\n")}`,
+        `\n## Website URLs\nAnalyze these websites for design tokens. Call \`import-from-url\` for each:\n${websiteUrls.map((u) => `- ${u}`).join("\n")}\n\nThe shared action uses the layered real-browser renderer so hydrated React, CSS-in-JS, Tailwind, SPA content, loaded fonts, computed colors, component styles, CSS variables, and desktop/mobile screenshot evidence are captured consistently. It falls back explicitly to SSRF-safe static extraction only when a browser is unavailable. Use its design.md-style result as the source of truth for the deck style.`,
       );
     }
 
     if (githubLinks.length > 0) {
       parts.push(
-        `\n## GitHub Repositories\nExtract design tokens from code. Call \`import-github\` for each:\n${githubLinks.map((l) => `- ${l.url}`).join("\n")}`,
+        `\n## Connect Code: GitHub Repositories\nMake one call to \`index-design-system-with-builder\` with \`githubSources\` set to this JSON array:\n\n\`\`\`json\n${JSON.stringify(
+          githubLinks.map((link) => ({
+            repoUrl: link.url,
+            ...(link.ref ? { ref: link.ref } : {}),
+            ...(link.include?.length ? { include: link.include } : {}),
+          })),
+          null,
+          2,
+        )}\n\`\`\`\n\nBuilder is the source of truth for repo/code design-system indexing. The action creates one local selectable proxy design system for Slides flows. If Builder is not connected, stop and tell me to use Builder.io (free tier available) from Settings.`,
       );
     }
 
+    const designMdFiles = [...codeFiles, ...docFiles].filter(
+      (file) => file.textContent && isDesignMdFile(file),
+    );
+
     if (codeFiles.length > 0) {
-      const withContent = codeFiles.filter((f) => f.textContent);
+      const withContent = codeFiles.filter(
+        (f) => f.textContent && !isDesignMdFile(f),
+      );
       if (withContent.length > 0) {
         parts.push(
-          `\n## Code Files (${withContent.length} files)\nCall \`import-code\` with these files:`,
+          `\n## Connect Code: Code Files (${withContent.length} files)\nStart Builder DSI indexing with \`index-design-system-with-builder\` using these files as the \`codeFiles\` argument:`,
         );
         for (const f of withContent) {
           parts.push(
@@ -378,8 +698,27 @@ export function DesignSystemSetup({
       }
     }
 
+    if (designMdFiles.length > 0) {
+      parts.push(
+        `\n## Optional design.md (${designMdFiles.length} file${designMdFiles.length === 1 ? "" : "s"})\nPass this content as the \`designMd\` argument to \`index-design-system-with-builder\` alongside any Figma/code sources:`,
+      );
+      for (const f of designMdFiles) {
+        parts.push(
+          `\n### ${f.name}\n\`\`\`md\n${inlineText(f.textContent!)}\n\`\`\``,
+        );
+      }
+    }
+
+    if (builderIndexResult) {
+      parts.push(
+        `\n## Connect Figma: Builder-Indexed Figma File\nBuilder DSI indexing has already started.\n- Design system: ${builderIndexResult.designSystemId}\n- Local selectable design system: ${builderIndexResult.localDesignSystemId ?? "(not returned)"}\n- Project: ${builderIndexResult.projectId}\n- Job: ${builderIndexResult.jobId}\n- URL: ${builderIndexResult.builderUrl}\n\nUse Builder as the source of truth for indexed tokens, assets, components, and guidance. Do not call \`create-design-system\` again for this Builder-indexed source.`,
+      );
+    }
+
     if (docFiles.length > 0) {
-      const inlined = docFiles.filter((f) => f.textContent);
+      const inlined = docFiles.filter(
+        (f) => f.textContent && !isDesignMdFile(f),
+      );
       const binary = docFiles.filter((f) => !f.textContent);
       if (inlined.length > 0) {
         parts.push(
@@ -419,24 +758,29 @@ export function DesignSystemSetup({
 
     if (customInstructions.trim()) {
       parts.push(
-        `\n## Custom Instructions (durable — store on the design system)\nWhen you call \`create-design-system\`, pass these verbatim as the \`customInstructions\` argument. They will be re-applied every time the design system is used to generate slides:\n\n${customInstructions.trim()}`,
+        `\n## Custom Instructions (durable — store on the design system)\nIf you create a local design system from non-Builder sources, pass these verbatim as the \`customInstructions\` argument. They will be re-applied every time the design system is used to generate slides:\n\n${customInstructions.trim()}`,
       );
     }
 
     parts.push(
-      `\n---\nAfter processing all sources, call \`create-design-system\` with the combined tokens${
+      `\n---\nAfter processing all sources, if you started Builder DSI indexing, report the Builder job/design-system URL plus the local selectable design-system id returned by \`index-design-system-with-builder\`. Do not call \`create-design-system\` again for sources Builder indexed successfully. If \`index-design-system-with-builder\` fails or reports Builder DSI unavailable, do not finish with nothing created: call \`create-design-system\` with tokens and guidance derived from those same sources, and tell me Builder indexing was skipped and why. If you processed non-Builder sources into concrete tokens, call \`create-design-system\` with the combined tokens${
         customInstructions.trim()
           ? " AND the verbatim --customInstructions string from above"
           : ""
       }. Present a summary for review.`,
     );
 
+    const message =
+      parts[0] ?? "Set up a design system from the selected sources.";
+    const contextParts = parts.slice(1);
     openAgentSidebar();
-    sendToAgentChat({ message: parts.join("\n"), submit: true });
-    toast({
-      title: "Design system generation started",
-      description:
-        "You can keep working while the agent processes the sources.",
+    sendToAgentChat({
+      message,
+      context: contextParts.join("\n"),
+      submit: true,
+    });
+    toast(t("designSystemSetup.generationStarted"), {
+      description: t("designSystemSetup.generationStartedDescription"),
     });
     onComplete();
   }, [
@@ -445,6 +789,7 @@ export function DesignSystemSetup({
     websiteUrls,
     githubLinks,
     codeFiles,
+    builderIndexResult,
     docFiles,
     imageFiles,
     selectedSystemId,
@@ -452,354 +797,681 @@ export function DesignSystemSetup({
     brandNotes,
     customInstructions,
     onComplete,
+    t,
+    updateSystemMutation,
+    indexSystemMutation,
+    existingDs,
   ]);
+
+  if (!editingId && atMax) {
+    return (
+      <AlertDialog open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t("designSystems.tierLimitTitle")}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {tierLimit?.current != null &&
+              tierLimit?.max != null &&
+              tierLimit?.plan
+                ? t("designSystems.tierLimitDescriptionWithCount", {
+                    current: tierLimit.current,
+                    max: tierLimit.max,
+                    plan: tierLimit.plan,
+                  })
+                : t("designSystems.tierLimitDescription")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="cursor-pointer">
+              {t("designSystemSetup.cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction asChild>
+              <a
+                href={
+                  tierLimit?.upgradeUrl ??
+                  "https://builder.io/account/subscription"
+                }
+                target="_blank"
+                rel="noopener noreferrer"
+                className="cursor-pointer"
+              >
+                <IconExternalLink className="w-3.5 h-3.5" />
+                {t("designSystems.tierLimitUpgrade")}
+              </a>
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    );
+  }
+
+  const brandNotesForm = (
+    <div
+      className={cn(
+        "space-y-2 rounded-lg border border-border bg-card p-4",
+        !editingId &&
+          (sourcePanel !== "other" || otherSource !== "context") &&
+          "hidden",
+      )}
+    >
+      {editingId && (
+        <Label
+          htmlFor="slides-design-system-brand-notes"
+          className="text-foreground/80"
+        >
+          {t("designSystemSetup.brandNotes")}
+        </Label>
+      )}
+      <Textarea
+        id="slides-design-system-brand-notes"
+        aria-label={t(
+          editingId
+            ? "designSystemSetup.brandNotes"
+            : "designSystemSetup.additionalNotes",
+        )}
+        value={brandNotes}
+        onChange={(e) => setBrandNotes(e.target.value)}
+        placeholder={t("designSystemSetup.notesPlaceholder")}
+        rows={3}
+        className="bg-accent border-border text-foreground placeholder:text-foreground/70 resize-none"
+      />
+    </div>
+  );
+  const customInstructionsForm = (
+    <div
+      className={cn(
+        "space-y-2 rounded-lg border border-border bg-card p-4",
+        !editingId &&
+          (sourcePanel !== "other" || otherSource !== "context") &&
+          "hidden",
+      )}
+    >
+      <Label
+        htmlFor="slides-design-system-custom-instructions"
+        className="text-foreground/80"
+      >
+        {t("designSystemSetup.customInstructions")}
+      </Label>
+      <Textarea
+        id="slides-design-system-custom-instructions"
+        value={customInstructions}
+        onChange={(e) => setCustomInstructions(e.target.value)}
+        placeholder={t("designSystemSetup.customInstructionsPlaceholder")}
+        rows={4}
+        className="bg-accent border-border text-foreground placeholder:text-foreground/70 resize-none"
+      />
+      <p className="text-xs text-foreground/80">
+        {t("designSystemSetup.customInstructionsDescription")}
+      </p>
+    </div>
+  );
 
   return (
     <Dialog open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
       <DialogContent className="sm:max-w-2xl max-h-[85vh] p-0 bg-card border-border">
         <DialogHeader className="px-6 pt-6 pb-0">
-          <DialogTitle className="text-foreground flex items-center gap-2">
-            <IconPalette className="w-5 h-5 text-[#609FF8]" />
-            {editingId ? "Edit Design System" : "New Design System"}
-          </DialogTitle>
-          <DialogDescription className="text-muted-foreground">
+          <DialogTitle className="text-foreground">
             {editingId
-              ? "Update your brand identity."
-              : "Provide any combination of sources — the more context, the better the result."}
+              ? t("designSystemSetup.editTitle")
+              : t("designSystemSetup.newTitle")}
+          </DialogTitle>
+          <DialogDescription className="text-foreground/80">
+            {editingId
+              ? t("designSystemSetup.editDescription")
+              : t("designSystemSetup.newDescription")}
           </DialogDescription>
         </DialogHeader>
 
         <ScrollArea className="max-h-[calc(85vh-160px)] px-6">
-          <div className="space-y-5 py-4">
-            {/* Company Name */}
-            <div className="space-y-2">
-              <Label className="text-foreground/80">Company / Brand</Label>
-              <Input
-                value={companyName}
-                onChange={(e) => setCompanyName(e.target.value)}
-                placeholder="Acme Inc. — We build developer tools..."
-                className="bg-accent border-border text-foreground placeholder:text-muted-foreground"
-              />
-            </div>
-
-            {!editingId && (
-              <>
-                {/* Figma .fig */}
+          {editingId &&
+          (existingDsLoading || (!existingDs && !existingDsError)) ? (
+            <DesignSystemEditSkeleton />
+          ) : editingId && existingDsError ? (
+            <DesignSystemEditError />
+          ) : (
+            <div className="space-y-5 py-4">
+              {/* Company Name */}
+              {editingId && (
                 <div className="space-y-2">
-                  <Label className="text-foreground/80 flex items-center gap-1.5">
-                    <IconBrandFigma className="w-3.5 h-3.5" />
-                    Figma file
+                  <Label
+                    htmlFor="slides-design-system-company-name"
+                    className="text-foreground/80"
+                  >
+                    {t("designSystemSetup.companyBrand")}
                   </Label>
-                  {!figResult ? (
-                    <>
-                      <button
-                        type="button"
-                        onClick={() => figInputRef.current?.click()}
-                        disabled={figParsing}
-                        className="w-full border border-dashed border-border rounded-lg p-4 text-center hover:border-foreground/20 cursor-pointer disabled:cursor-wait disabled:opacity-70"
-                      >
-                        {figParsing ? (
-                          <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
-                            <IconLoader2 className="w-3.5 h-3.5 animate-spin" />
-                            Parsing Figma file...
-                          </span>
-                        ) : (
-                          <span className="text-xs text-muted-foreground">
-                            Upload a .fig local copy to create a slide design
-                            system
-                          </span>
-                        )}
-                      </button>
-                      <input
-                        ref={figInputRef}
-                        type="file"
-                        accept=".fig"
-                        onChange={handleFigImport}
-                        className="hidden"
-                      />
-                      {figError && (
-                        <div
-                          role="alert"
-                          className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+                  <Input
+                    id="slides-design-system-company-name"
+                    value={companyName}
+                    onChange={(e) => setCompanyName(e.target.value)}
+                    placeholder={t("designSystemSetup.companyBrandPlaceholder")}
+                    className="bg-accent border-border text-foreground placeholder:text-foreground/70"
+                  />
+                </div>
+              )}
+
+              {editingId && existingDs?.builder ? (
+                <BuilderSourceStatus
+                  builder={existingDs.builder}
+                  onSync={
+                    existingDs.builder.githubSources?.length &&
+                    existingDs.builder.sourceKind !== "mixed"
+                      ? handleSync
+                      : undefined
+                  }
+                  syncing={syncSystemMutation.isPending}
+                />
+              ) : null}
+
+              {!editingId && (
+                <>
+                  <SourceAccordionRow
+                    icon={IconBrandFigma}
+                    title={t("designSystemSetup.figmaFile")}
+                    description={t("designSystemSetup.uploadFigDescription")}
+                    expanded={sourcePanel === "figma"}
+                    onClick={() => setSourcePanel("figma")}
+                    panelId="slides-design-system-figma-source"
+                  />
+
+                  {/* Figma .fig */}
+                  <div
+                    id="slides-design-system-figma-source"
+                    className={cn(
+                      "space-y-2 rounded-lg border border-border bg-card p-4",
+                      sourcePanel !== "figma" && "hidden",
+                    )}
+                  >
+                    {!builderIndexResult ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => figInputRef.current?.click()}
+                          onDragOver={(event) => event.preventDefault()}
+                          onDrop={handleBuilderIndexDrop}
+                          disabled={builderIndexing}
+                          className="w-full border border-dashed border-border rounded-lg p-4 text-center hover:border-foreground/20 cursor-pointer disabled:cursor-wait"
                         >
-                          {figError}
-                        </div>
-                      )}
-                    </>
-                  ) : (
-                    <FigImportPreview
-                      result={figResult}
-                      title={figTitle}
-                      onTitleChange={setFigTitle}
-                      creating={figCreating}
-                      onCreate={handleCreateFromFig}
-                      onReset={() => {
-                        setFigResult(null);
-                        setFigError(null);
-                        setFigTitle("");
-                      }}
-                    />
-                  )}
-                </div>
-
-                {/* Website URL */}
-                <div className="space-y-2">
-                  <Label className="text-foreground/80 flex items-center gap-1.5">
-                    <IconWorld className="w-3.5 h-3.5" />
-                    Website URL
-                  </Label>
-                  <div className="flex gap-2">
-                    <Input
-                      value={websiteUrl}
-                      onChange={(e) => setWebsiteUrl(e.target.value)}
-                      placeholder="example.com or Nike"
-                      className="bg-accent border-border text-foreground placeholder:text-muted-foreground"
-                      onBlur={() => {
-                        const normalized = normalizeWebsiteUrlInput(websiteUrl);
-                        if (normalized) setWebsiteUrl(normalized);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") addWebsiteUrl();
-                      }}
-                    />
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={addWebsiteUrl}
-                      className="shrink-0 cursor-pointer"
-                    >
-                      Add
-                    </Button>
-                  </div>
-                  <TagList
-                    items={websiteUrls}
-                    onRemove={(i) =>
-                      setWebsiteUrls((p) => p.filter((_, j) => j !== i))
-                    }
-                  />
-                </div>
-
-                {/* GitHub */}
-                <div className="space-y-2">
-                  <Label className="text-foreground/80 flex items-center gap-1.5">
-                    <IconBrandGithub className="w-3.5 h-3.5" />
-                    GitHub Repository
-                  </Label>
-                  <div className="flex gap-2">
-                    <Input
-                      value={githubUrl}
-                      onChange={(e) => setGithubUrl(e.target.value)}
-                      placeholder="https://github.com/org/repo"
-                      className="bg-accent border-border text-foreground placeholder:text-muted-foreground"
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") addGithubLink();
-                      }}
-                    />
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={addGithubLink}
-                      className="shrink-0 cursor-pointer"
-                    >
-                      Add
-                    </Button>
-                  </div>
-                  <TagList
-                    items={githubLinks.map((l) => l.url)}
-                    onRemove={(i) =>
-                      setGithubLinks((p) => p.filter((_, j) => j !== i))
-                    }
-                  />
-                </div>
-
-                {/* Code Files */}
-                <div className="space-y-2">
-                  <Label className="text-foreground/80 flex items-center gap-1.5">
-                    <IconFolder className="w-3.5 h-3.5" />
-                    Code Files
-                  </Label>
-                  <button
-                    onClick={() => codeInputRef.current?.click()}
-                    onDrop={(e) => {
-                      e.preventDefault();
-                      if (e.dataTransfer.files)
-                        readTextFiles(e.dataTransfer.files, setCodeFiles);
-                    }}
-                    onDragOver={(e) => e.preventDefault()}
-                    className="w-full border border-dashed border-border rounded-lg p-4 text-center hover:border-foreground/20 cursor-pointer"
-                  >
-                    <p className="text-xs text-muted-foreground">
-                      CSS, Tailwind config, theme files — drop or click
-                    </p>
-                  </button>
-                  <input
-                    ref={codeInputRef}
-                    type="file"
-                    multiple
-                    accept=".css,.scss,.sass,.less,.ts,.tsx,.js,.jsx,.json,.html"
-                    onChange={(e) => {
-                      if (e.target.files)
-                        readTextFiles(e.target.files, setCodeFiles);
-                      e.target.value = "";
-                    }}
-                    className="hidden"
-                  />
-                  <FileList
-                    files={codeFiles}
-                    onRemove={(id) =>
-                      setCodeFiles((p) => p.filter((f) => f.id !== id))
-                    }
-                  />
-                </div>
-
-                {/* Documents */}
-                <div className="space-y-2">
-                  <Label className="text-foreground/80 flex items-center gap-1.5">
-                    <IconFileDescription className="w-3.5 h-3.5" />
-                    Documents & Presentations
-                  </Label>
-                  <button
-                    onClick={() => docInputRef.current?.click()}
-                    onDrop={(e) => {
-                      e.preventDefault();
-                      if (e.dataTransfer.files)
-                        readTextFiles(e.dataTransfer.files, setDocFiles);
-                    }}
-                    onDragOver={(e) => e.preventDefault()}
-                    className="w-full border border-dashed border-border rounded-lg p-4 text-center hover:border-foreground/20 cursor-pointer"
-                  >
-                    <p className="text-xs text-muted-foreground">
-                      PPTX, DOCX, PDF, Markdown, TXT — brand guides, design docs
-                    </p>
-                  </button>
-                  <input
-                    ref={docInputRef}
-                    type="file"
-                    accept=".pptx,.ppt,.docx,.doc,.pdf,.xlsx,.xls,.md,.markdown,.mdx,.txt"
-                    multiple
-                    onChange={(e) => {
-                      if (e.target.files)
-                        readTextFiles(e.target.files, setDocFiles);
-                      e.target.value = "";
-                    }}
-                    className="hidden"
-                  />
-                  <FileList
-                    files={docFiles}
-                    onRemove={(id) =>
-                      setDocFiles((p) => p.filter((f) => f.id !== id))
-                    }
-                  />
-                </div>
-
-                {/* Images */}
-                <div className="space-y-2">
-                  <Label className="text-foreground/80 flex items-center gap-1.5">
-                    <IconPhoto className="w-3.5 h-3.5" />
-                    Screenshots & Visual References
-                  </Label>
-                  <button
-                    onClick={() => imageInputRef.current?.click()}
-                    className="w-full border border-dashed border-border rounded-lg p-4 text-center hover:border-foreground/20 cursor-pointer"
-                  >
-                    <p className="text-xs text-muted-foreground">
-                      Product screenshots, mood boards, logos
-                    </p>
-                  </button>
-                  <input
-                    ref={imageInputRef}
-                    type="file"
-                    accept="image/*,.svg"
-                    multiple
-                    onChange={(e) => {
-                      if (!e.target.files) return;
-                      const newFiles = Array.from(e.target.files).map((f) => ({
-                        id: crypto.randomUUID(),
-                        name: f.name,
-                        type: f.type,
-                        size: f.size,
-                      }));
-                      setImageFiles((p) => [...p, ...newFiles]);
-                      e.target.value = "";
-                    }}
-                    className="hidden"
-                  />
-                  <FileList
-                    files={imageFiles}
-                    onRemove={(id) =>
-                      setImageFiles((p) => p.filter((f) => f.id !== id))
-                    }
-                  />
-                </div>
-
-                {/* Fork existing */}
-                {existingSystems.length > 0 && (
-                  <div className="space-y-2">
-                    <Label className="text-foreground/80">
-                      Fork an existing design system
-                    </Label>
-                    <div className="grid grid-cols-2 gap-2">
-                      {existingSystems
-                        .filter((s) => s.id !== editingId)
-                        .map((ds) => (
-                          <button
-                            key={ds.id}
-                            onClick={() =>
-                              setSelectedSystemId((prev) =>
-                                prev === ds.id ? "" : ds.id,
-                              )
-                            }
-                            className={`text-left p-3 rounded-lg border cursor-pointer ${
-                              selectedSystemId === ds.id
-                                ? "border-[#609FF8]/40 bg-[#609FF8]/5"
-                                : "border-border bg-accent hover:border-foreground/20"
-                            }`}
+                          {builderIndexing ? (
+                            <span className="inline-flex items-center gap-2 text-xs text-foreground/80">
+                              <IconLoader2 className="w-3.5 h-3.5 animate-spin" />
+                              {t("designSystemSetup.parsingFigmaFile")}
+                            </span>
+                          ) : (
+                            <span className="text-xs text-foreground/80">
+                              {t("designSystemSetup.uploadFigDescription")}
+                            </span>
+                          )}
+                        </button>
+                        {builderUploadProgress !== null && (
+                          <Progress
+                            aria-label={t("designSystemSetup.parsingFigmaFile")}
+                            value={Math.round(builderUploadProgress * 100)}
+                            className="h-1.5"
+                          />
+                        )}
+                        <input
+                          ref={figInputRef}
+                          type="file"
+                          accept=".fig"
+                          onChange={handleBuilderIndexUpload}
+                          className="hidden"
+                        />
+                        {builderIndexError && (
+                          <div
+                            role="alert"
+                            className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
                           >
-                            <div className="flex items-center gap-2">
-                              <IconPalette className="w-3.5 h-3.5 text-muted-foreground" />
-                              <span className="text-sm text-foreground/80 truncate">
-                                {ds.title}
-                              </span>
-                            </div>
-                          </button>
-                        ))}
-                    </div>
+                            {builderIndexError}
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <BuilderIndexPreview
+                        result={builderIndexResult}
+                        decodeStatus={decodeStatus}
+                        isIndexing={builderIndexing}
+                        displayTitle={companyName.trim()}
+                        onReset={() => {
+                          stopDecodePolling();
+                          setDecodeStatus(null);
+                          setBuilderIndexResult(null);
+                          setBuilderIndexError(null);
+                          setBuilderIndexing(false);
+                          setBuilderUploadProgress(null);
+                        }}
+                      />
+                    )}
                   </div>
-                )}
-              </>
-            )}
 
-            {/* Brand Notes */}
-            <div className="space-y-2">
-              <Label className="text-foreground/80">
-                {editingId ? "Brand Notes" : "Additional Notes"}
-              </Label>
-              <Textarea
-                value={brandNotes}
-                onChange={(e) => setBrandNotes(e.target.value)}
-                placeholder="Design preferences, constraints, brand guidelines..."
-                rows={3}
-                className="bg-accent border-border text-foreground placeholder:text-muted-foreground resize-none"
-              />
-            </div>
+                  <SourceAccordionRow
+                    icon={IconComponents}
+                    title={t("designSystemSetup.otherSources")}
+                    description={t("designSystemSetup.otherSourcesDescription")}
+                    expanded={sourcePanel === "other"}
+                    onClick={() => setSourcePanel("other")}
+                    panelId="slides-design-system-other-sources"
+                  />
+                  {sourcePanel === "other" && (
+                    <div
+                      id="slides-design-system-other-sources"
+                      className="space-y-2"
+                    >
+                      <p className="px-1 py-1 text-xs font-medium text-foreground/80">
+                        {t("designSystemSetup.chooseSourcePrompt")}
+                      </p>
+                      <div className="space-y-2">
+                        <SourceAccordionRow
+                          icon={IconComponents}
+                          title={t("designSystemSetup.companyBrand")}
+                          description={t(
+                            "designSystemSetup.companyBrandPlaceholder",
+                          )}
+                          expanded={otherSource === "brand"}
+                          onClick={() => selectOtherSource("brand")}
+                          panelId="slides-design-system-brand-source"
+                        />
+                        {otherSource === "brand" && (
+                          <div
+                            id="slides-design-system-brand-source"
+                            className={cn(
+                              "space-y-4 rounded-lg border border-border bg-card p-4",
+                              otherSource !== "brand" && "hidden",
+                            )}
+                          >
+                            <div className="space-y-2">
+                              <Input
+                                id="slides-design-system-company-name"
+                                aria-label={t("designSystemSetup.companyBrand")}
+                                value={companyName}
+                                onChange={(e) => setCompanyName(e.target.value)}
+                                placeholder={t(
+                                  "designSystemSetup.companyBrandPlaceholder",
+                                )}
+                                className="bg-accent border-border text-foreground placeholder:text-foreground/70"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label className="text-foreground/80 flex items-center gap-1.5">
+                                <IconWorld className="w-3.5 h-3.5" />
+                                {t("designSystemSetup.websiteUrl")}
+                              </Label>
+                              <div className="flex gap-2">
+                                <Input
+                                  value={websiteUrl}
+                                  onChange={(e) =>
+                                    setWebsiteUrl(e.target.value)
+                                  }
+                                  placeholder={t(
+                                    "designSystemSetup.websitePlaceholder",
+                                  )}
+                                  className="bg-accent border-border text-foreground placeholder:text-foreground/70"
+                                  onBlur={() => {
+                                    const normalized =
+                                      normalizeWebsiteUrlInput(websiteUrl);
+                                    if (normalized) setWebsiteUrl(normalized);
+                                  }}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") addWebsiteUrl();
+                                  }}
+                                />
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={addWebsiteUrl}
+                                  className="shrink-0 cursor-pointer"
+                                >
+                                  {t("designSystemSetup.add")}
+                                </Button>
+                              </div>
+                              <TagList
+                                items={websiteUrls}
+                                onRemove={(i) =>
+                                  setWebsiteUrls((p) =>
+                                    p.filter((_, j) => j !== i),
+                                  )
+                                }
+                              />
+                            </div>
+                          </div>
+                        )}
+                        <SourceAccordionRow
+                          icon={IconBrandGithub}
+                          title={t("designSystemSetup.githubRepository")}
+                          description={t("designSystemSetup.codeFilesDrop")}
+                          expanded={otherSource === "code"}
+                          onClick={() => selectOtherSource("code")}
+                          panelId="slides-design-system-code-source"
+                          locked={!codeIndexingAllowed}
+                          lockedMessage={t(
+                            "designSystemSetup.codeIndexingEnterpriseOnly",
+                          )}
+                        />
+                        {otherSource === "code" && (
+                          <>
+                            <div
+                              id="slides-design-system-code-source"
+                              className={cn(
+                                "space-y-2 rounded-lg border border-border bg-card p-4",
+                                otherSource !== "code" && "hidden",
+                              )}
+                            >
+                              <Label className="text-foreground/80 flex items-center gap-1.5">
+                                <IconBrandGithub className="w-3.5 h-3.5" />
+                                {t("designSystemSetup.githubRepository")}
+                              </Label>
+                              <div className="flex gap-2">
+                                <Input
+                                  value={githubUrl}
+                                  onChange={(e) => setGithubUrl(e.target.value)}
+                                  placeholder="https://github.com/org/repo"
+                                  className="bg-accent border-border text-foreground placeholder:text-foreground/70"
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") addGithubLink();
+                                  }}
+                                />
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={addGithubLink}
+                                  className="shrink-0 cursor-pointer"
+                                >
+                                  {t("designSystemSetup.add")}
+                                </Button>
+                              </div>
+                              <div className="grid gap-2 sm:grid-cols-2">
+                                <Input
+                                  value={githubRef}
+                                  onChange={(e) => setGithubRef(e.target.value)}
+                                  placeholder={t("designSystemSetup.githubRef")}
+                                  aria-label={t("designSystemSetup.githubRef")}
+                                  className="bg-accent border-border text-foreground placeholder:text-foreground/70"
+                                />
+                                <Input
+                                  value={githubPaths}
+                                  onChange={(e) =>
+                                    setGithubPaths(e.target.value)
+                                  }
+                                  placeholder={t(
+                                    "designSystemSetup.githubPaths",
+                                  )}
+                                  aria-label={t(
+                                    "designSystemSetup.githubPaths",
+                                  )}
+                                  className="bg-accent border-border text-foreground placeholder:text-foreground/70"
+                                />
+                              </div>
+                              <TagList
+                                items={githubLinks.map((l) =>
+                                  [l.url, l.ref, l.include?.join(", ")]
+                                    .filter(Boolean)
+                                    .join(" · "),
+                                )}
+                                onRemove={(i) =>
+                                  setGithubLinks((p) =>
+                                    p.filter((_, j) => j !== i),
+                                  )
+                                }
+                              />
+                            </div>
 
-            {/* Custom Instructions — durable, stored on the design system */}
-            <div className="space-y-2">
-              <Label className="text-foreground/80">Custom instructions</Label>
-              <Textarea
-                value={customInstructions}
-                onChange={(e) => setCustomInstructions(e.target.value)}
-                placeholder="e.g. Always open with a single-stat title slide. Never use bullet lists longer than 3 items. Keep slide titles under 6 words..."
-                rows={4}
-                className="bg-accent border-border text-foreground placeholder:text-muted-foreground resize-none"
-              />
-              <p className="text-[11px] text-muted-foreground">
-                Saved with the design system. Re-applied every time the agent
-                uses it to generate slides.
-              </p>
+                            <div
+                              className={cn(
+                                "space-y-2 rounded-lg border border-border bg-card p-4",
+                                otherSource !== "code" && "hidden",
+                              )}
+                            >
+                              <Label className="text-foreground/80 flex items-center gap-1.5">
+                                <IconFolder className="w-3.5 h-3.5" />
+                                {t("designSystemSetup.codeFiles")}
+                              </Label>
+                              <button
+                                onClick={() => codeInputRef.current?.click()}
+                                onDrop={(e) => {
+                                  e.preventDefault();
+                                  if (e.dataTransfer.files)
+                                    readTextFiles(
+                                      e.dataTransfer.files,
+                                      setCodeFiles,
+                                    );
+                                }}
+                                onDragOver={(e) => e.preventDefault()}
+                                className="w-full border border-dashed border-border rounded-lg p-4 text-center hover:border-foreground/20 cursor-pointer"
+                              >
+                                <p className="text-xs text-foreground/80">
+                                  {t("designSystemSetup.codeFilesDrop")}
+                                </p>
+                              </button>
+                              <input
+                                ref={codeInputRef}
+                                type="file"
+                                multiple
+                                accept=".css,.scss,.sass,.less,.ts,.tsx,.js,.jsx,.json,.html,.svg,.xml,.md,.markdown,.mdx,.txt"
+                                onChange={(e) => {
+                                  if (e.target.files)
+                                    readTextFiles(e.target.files, setCodeFiles);
+                                  e.target.value = "";
+                                }}
+                                className="hidden"
+                              />
+                              <FileList
+                                files={codeFiles}
+                                onRemove={(id) =>
+                                  setCodeFiles((p) =>
+                                    p.filter((f) => f.id !== id),
+                                  )
+                                }
+                              />
+                            </div>
+                          </>
+                        )}
+                        <SourceAccordionRow
+                          icon={IconFileDescription}
+                          title={t("designSystemSetup.documents")}
+                          description={t("designSystemSetup.documentsDrop")}
+                          expanded={otherSource === "files"}
+                          onClick={() => selectOtherSource("files")}
+                          panelId="slides-design-system-file-source"
+                        />
+                        {otherSource === "files" && (
+                          <>
+                            <div
+                              id="slides-design-system-file-source"
+                              className={cn(
+                                "space-y-2 rounded-lg border border-border bg-card p-4",
+                                otherSource !== "files" && "hidden",
+                              )}
+                            >
+                              <Label className="text-foreground/80 flex items-center gap-1.5">
+                                <IconFileDescription className="w-3.5 h-3.5" />
+                                {t("designSystemSetup.documents")}
+                              </Label>
+                              <button
+                                onClick={() => docInputRef.current?.click()}
+                                onDrop={(e) => {
+                                  e.preventDefault();
+                                  if (e.dataTransfer.files)
+                                    readTextFiles(
+                                      e.dataTransfer.files,
+                                      setDocFiles,
+                                    );
+                                }}
+                                onDragOver={(e) => e.preventDefault()}
+                                className="w-full border border-dashed border-border rounded-lg p-4 text-center hover:border-foreground/20 cursor-pointer"
+                              >
+                                <p className="text-xs text-foreground/80">
+                                  {t("designSystemSetup.documentsDrop")}
+                                </p>
+                              </button>
+                              <input
+                                ref={docInputRef}
+                                type="file"
+                                accept=".pptx,.ppt,.docx,.doc,.pdf,.xlsx,.xls,.md,.markdown,.mdx,.txt"
+                                multiple
+                                onChange={(e) => {
+                                  if (e.target.files)
+                                    readTextFiles(e.target.files, setDocFiles);
+                                  e.target.value = "";
+                                }}
+                                className="hidden"
+                              />
+                              <FileList
+                                files={docFiles}
+                                onRemove={(id) =>
+                                  setDocFiles((p) =>
+                                    p.filter((f) => f.id !== id),
+                                  )
+                                }
+                              />
+                            </div>
+
+                            <div
+                              className={cn(
+                                "space-y-2 rounded-lg border border-border bg-card p-4",
+                                otherSource !== "files" && "hidden",
+                              )}
+                            >
+                              <Label className="text-foreground/80 flex items-center gap-1.5">
+                                <IconPhoto className="w-3.5 h-3.5" />
+                                {t("designSystemSetup.visualReferences")}
+                              </Label>
+                              <button
+                                onClick={() => imageInputRef.current?.click()}
+                                onDragOver={(event) => event.preventDefault()}
+                                onDrop={(event) => {
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  addImageFiles(event.dataTransfer.files);
+                                }}
+                                className="w-full border border-dashed border-border rounded-lg p-4 text-center hover:border-foreground/20 cursor-pointer"
+                              >
+                                <p className="text-xs text-foreground/80">
+                                  {t("designSystemSetup.visualReferencesDrop")}
+                                </p>
+                              </button>
+                              <input
+                                ref={imageInputRef}
+                                type="file"
+                                accept="image/*,.svg"
+                                multiple
+                                onChange={(e) => {
+                                  if (e.target.files)
+                                    addImageFiles(e.target.files);
+                                  e.target.value = "";
+                                }}
+                                className="hidden"
+                              />
+                              <FileList
+                                files={imageFiles}
+                                onRemove={(id) =>
+                                  setImageFiles((p) =>
+                                    p.filter((f) => f.id !== id),
+                                  )
+                                }
+                              />
+                            </div>
+                          </>
+                        )}
+                        {existingSystems.length > 0 && (
+                          <>
+                            <SourceAccordionRow
+                              icon={IconComponents}
+                              title={t("designSystemSetup.forkExisting")}
+                              description={t(
+                                "designSystemSetup.customInstructionsDescription",
+                              )}
+                              expanded={otherSource === "existing"}
+                              onClick={() => selectOtherSource("existing")}
+                              panelId="slides-design-system-existing-source"
+                            />
+                            {otherSource === "existing" && (
+                              <div
+                                id="slides-design-system-existing-source"
+                                className="space-y-2 rounded-lg border border-border bg-card p-4"
+                              >
+                                <Label className="text-foreground/80">
+                                  {t("designSystemSetup.forkExisting")}
+                                </Label>
+                                <div className="grid grid-cols-2 gap-2">
+                                  {existingSystems
+                                    .filter((s) => s.id !== editingId)
+                                    .map((ds) => (
+                                      <button
+                                        key={ds.id}
+                                        onClick={() =>
+                                          setSelectedSystemId((prev) =>
+                                            prev === ds.id ? "" : ds.id,
+                                          )
+                                        }
+                                        className={`text-left p-3 rounded-lg border cursor-pointer ${
+                                          selectedSystemId === ds.id
+                                            ? "border-primary/40 bg-primary/5"
+                                            : "border-border bg-accent hover:border-foreground/20"
+                                        }`}
+                                      >
+                                        <div className="flex items-center gap-2">
+                                          <IconComponents className="w-3.5 h-3.5 text-muted-foreground" />
+                                          <span className="text-sm text-foreground/80 truncate">
+                                            {ds.title}
+                                          </span>
+                                        </div>
+                                      </button>
+                                    ))}
+                                </div>
+                              </div>
+                            )}
+                          </>
+                        )}
+                        <SourceAccordionRow
+                          icon={IconFileDescription}
+                          title={t("designSystemSetup.additionalNotes")}
+                          description={t(
+                            "designSystemSetup.customInstructionsDescription",
+                          )}
+                          expanded={otherSource === "context"}
+                          onClick={() => selectOtherSource("context")}
+                          panelId="slides-design-system-context-source"
+                        />
+                        {otherSource === "context" && (
+                          <div
+                            id="slides-design-system-context-source"
+                            className="space-y-2"
+                          >
+                            {brandNotesForm}
+                            {customInstructionsForm}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+
+              {editingId && (
+                <>
+                  {brandNotesForm}
+                  {customInstructionsForm}
+                </>
+              )}
             </div>
-          </div>
+          )}
         </ScrollArea>
+
+        {tierLimitUpgradeUrl && (
+          <div className="mx-6 mb-2 flex items-center justify-between gap-3 rounded-md border border-border bg-accent/40 px-3 py-2 text-sm text-foreground/80">
+            <span>{t("designSystems.tierLimitTitle")}</span>
+            <a
+              href={tierLimitUpgradeUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex shrink-0 items-center gap-1.5 font-medium text-primary hover:underline"
+            >
+              <IconExternalLink className="w-3.5 h-3.5" />
+              {t("designSystems.tierLimitUpgrade")}
+            </a>
+          </div>
+        )}
 
         {/* Actions */}
         <div className="flex justify-end gap-3 px-6 pb-6 pt-2 border-t border-border">
@@ -809,27 +1481,285 @@ export function DesignSystemSetup({
             disabled={generating}
             className="text-muted-foreground hover:text-foreground cursor-pointer"
           >
-            Cancel
+            {t("designSystemSetup.cancel")}
           </Button>
           <Button
             onClick={handleGenerate}
-            disabled={editingId ? generating : !hasAnySources}
+            disabled={
+              editingId
+                ? generating || !existingDs || existingDsLoading
+                : builderIndexing || !hasAnySources
+            }
             className="cursor-pointer"
           >
             {generating ? (
               <>
                 <IconLoader2 className="w-4 h-4 animate-spin" />
-                Saving...
+                {t("designSystemSetup.saving")}
               </>
             ) : editingId ? (
-              "Save Changes"
+              t("designSystemSetup.saveChanges")
             ) : (
-              "Continue to generation"
+              t("designSystemSetup.continueToGeneration")
             )}
           </Button>
         </div>
       </DialogContent>
     </Dialog>
+  );
+}
+
+function parseDesignSystemData(
+  data?: string | null,
+): { ok: true; value: Record<string, unknown> } | { ok: false } {
+  if (!data) return { ok: false };
+  try {
+    const parsed: unknown = JSON.parse(data);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { ok: false };
+    }
+    return { ok: true, value: parsed as Record<string, unknown> };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function isGeneratedBuilderInstructions(
+  value: string | undefined,
+  builder: BuilderSourceDetails,
+): boolean {
+  const instructions = value?.trim();
+  if (!instructions) return false;
+  return (
+    instructions.startsWith(
+      "This design system is indexed by Builder Design System Intelligence (DSI).",
+    ) &&
+    instructions.includes(
+      `Builder design system id: ${builder.builderDesignSystemId}`,
+    ) &&
+    instructions.includes("Call get-design-system for this local id")
+  );
+}
+
+function SourceAccordionRow({
+  icon: Icon,
+  title,
+  description,
+  expanded,
+  onClick,
+  panelId,
+  className,
+  locked,
+  lockedMessage,
+}: {
+  icon: React.ComponentType<{ className?: string }>;
+  title: string;
+  description: string;
+  expanded: boolean;
+  onClick: () => void;
+  panelId: string;
+  className?: string;
+  locked?: boolean;
+  lockedMessage?: string;
+}) {
+  return (
+    <button
+      type="button"
+      aria-controls={panelId}
+      aria-expanded={expanded}
+      aria-disabled={locked}
+      title={locked ? lockedMessage : undefined}
+      onClick={locked ? undefined : onClick}
+      className={cn(
+        "flex w-full items-center gap-3 rounded-lg border border-border px-4 py-3 text-left transition-[background-color,border-color] duration-150 hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        expanded && "bg-accent/40",
+        locked && "opacity-60 cursor-not-allowed hover:bg-transparent",
+        className,
+      )}
+    >
+      <Icon className="size-4 shrink-0 text-muted-foreground" />
+      <span className="min-w-0 flex-1">
+        <span className="block text-sm font-medium text-foreground/90">
+          {title}
+        </span>
+        <span className="mt-0.5 block truncate text-xs text-foreground/80">
+          {locked ? lockedMessage : description}
+        </span>
+      </span>
+      {locked ? (
+        <IconLock className="size-4 shrink-0 text-muted-foreground" />
+      ) : (
+        <IconChevronDown
+          className={cn(
+            "size-4 shrink-0 text-muted-foreground transition-transform duration-150",
+            expanded && "rotate-180",
+          )}
+        />
+      )}
+    </button>
+  );
+}
+
+function BuilderSourceStatus({
+  builder,
+  onSync,
+  syncing = false,
+}: {
+  builder: BuilderSourceDetails;
+  onSync?: () => void;
+  syncing?: boolean;
+}) {
+  const t = useT();
+  const docCount = builder.docCount;
+  const docs = docCount ?? 0;
+  const tokens = Object.keys(builder.tokenValues ?? {}).length;
+  const hasIndexedResults = docs > 0 || tokens > 0;
+  const state = hasIndexedResults
+    ? "indexed"
+    : builder.warning
+      ? "unavailable"
+      : "indexing";
+  const sourceKind = builder.sourceKind;
+  const SourceIcon =
+    sourceKind === "figma"
+      ? IconBrandFigma
+      : sourceKind === "github"
+        ? IconBrandGithub
+        : sourceKind === "code"
+          ? IconFolder
+          : IconComponents;
+  const sourceTitle =
+    sourceKind === "figma"
+      ? t("designSystemSetup.sourceFigma")
+      : sourceKind === "github"
+        ? t("designSystemSetup.sourceGitHub")
+        : sourceKind === "code"
+          ? t("designSystemSetup.sourceCode")
+          : sourceKind === "mixed"
+            ? t("designSystemSetup.sourceMixed")
+            : t("designSystemSetup.sourceBuilder");
+  const statusDescription =
+    state === "unavailable"
+      ? t("designSystemSetup.sourceUnavailableDescription")
+      : state === "indexing"
+        ? t("designSystemSetup.sourceIndexingDescription")
+        : docs > 0 && tokens > 0
+          ? t("designSystemSetup.sourceIndexedDescription", { docs, tokens })
+          : docs > 0
+            ? t("designSystemSetup.sourceIndexedDocsOnly", { docs })
+            : tokens > 0
+              ? t("designSystemSetup.sourceIndexedTokensOnly", { tokens })
+              : t("designSystemSetup.sourceIndexedDescription", {
+                  docs,
+                  tokens,
+                });
+
+  return (
+    <section
+      aria-label={t("designSystemSetup.sourceLabel")}
+      className="rounded-lg border border-border bg-accent/30 px-4 py-3"
+    >
+      <div className="flex items-start gap-3">
+        <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-background text-muted-foreground">
+          <SourceIcon className="size-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            {t("designSystemSetup.sourceLabel")}
+          </p>
+          <p className="mt-0.5 truncate text-sm font-medium text-foreground">
+            {sourceTitle}
+          </p>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            {statusDescription}
+          </p>
+        </div>
+      </div>
+      {builder.builderUrl || onSync ? (
+        <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-border pt-3">
+          {builder.builderUrl ? (
+            <a
+              href={withBuilderUtmTrackingParams(builder.builderUrl, {
+                campaign: "product",
+                content: "design_system_intelligence",
+              })}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1.5 text-xs font-medium text-foreground underline-offset-4 hover:underline"
+            >
+              {t("designSystemSetup.sourceOpenInBuilder")}
+              <IconExternalLink className="size-3.5" />
+            </a>
+          ) : null}
+          {onSync ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={onSync}
+              disabled={syncing}
+              className="h-7 gap-1.5 px-2 text-xs"
+            >
+              <IconRefresh
+                className={cn("size-3.5", syncing && "animate-spin")}
+              />
+              {syncing
+                ? t("designSystemSetup.syncingSource")
+                : t("designSystemSetup.syncSource")}
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function DesignSystemEditSkeleton() {
+  const t = useT();
+  return (
+    <div
+      aria-busy="true"
+      aria-label={t("designSystemSetup.loading")}
+      className="space-y-5 py-4"
+    >
+      <div className="space-y-2">
+        <Skeleton className="h-4 w-28" />
+        <Skeleton className="h-10 w-full rounded-md" />
+      </div>
+      <div className="space-y-3 rounded-lg border border-border bg-accent/30 px-4 py-3">
+        <div className="flex items-center gap-3">
+          <Skeleton className="size-9 rounded-md" />
+          <div className="flex-1 space-y-2">
+            <Skeleton className="h-3 w-16" />
+            <Skeleton className="h-4 w-32" />
+          </div>
+          <Skeleton className="h-4 w-24" />
+        </div>
+        <Skeleton className="h-3 w-4/5" />
+        <Skeleton className="h-3 w-24" />
+      </div>
+      <div className="space-y-2">
+        <Skeleton className="h-4 w-24" />
+        <Skeleton className="h-24 w-full rounded-md" />
+      </div>
+      <div className="space-y-2">
+        <Skeleton className="h-4 w-36" />
+        <Skeleton className="h-32 w-full rounded-md" />
+        <Skeleton className="h-3 w-64" />
+      </div>
+    </div>
+  );
+}
+
+function DesignSystemEditError() {
+  const t = useT();
+  return (
+    <div
+      role="alert"
+      className="flex min-h-64 items-center justify-center py-8 text-center text-sm text-destructive"
+    >
+      {t("designSystemSetup.loadFailed")}
+    </div>
   );
 }
 
@@ -840,6 +1770,7 @@ function TagList({
   items: string[];
   onRemove: (index: number) => void;
 }) {
+  const t = useT();
   if (items.length === 0) return null;
   return (
     <div className="space-y-1">
@@ -852,6 +1783,7 @@ function TagList({
           <span className="truncate flex-1">{item}</span>
           <button
             onClick={() => onRemove(i)}
+            aria-label={t("designSystemSetup.removeItem", { item })}
             className="text-muted-foreground hover:text-foreground/70 shrink-0 cursor-pointer"
           >
             <IconX className="w-3.5 h-3.5" />
@@ -862,139 +1794,108 @@ function TagList({
   );
 }
 
-function FigImportPreview({
+function BuilderIndexPreview({
   result,
-  title,
-  onTitleChange,
-  creating,
-  onCreate,
+  decodeStatus,
+  isIndexing,
+  displayTitle,
   onReset,
 }: {
-  result: FigImportResult;
-  title: string;
-  onTitleChange: (value: string) => void;
-  creating: boolean;
-  onCreate: () => void;
+  result: BuilderIndexResult;
+  decodeStatus: DecodeJobStatus | null;
+  isIndexing: boolean;
+  displayTitle?: string;
   onReset: () => void;
 }) {
-  const colors = result.data.colors;
-  const colorEntries = (
-    [
-      ["Accent", "accent"],
-      ["Primary", "primary"],
-      ["Secondary", "secondary"],
-      ["Background", "background"],
-      ["Text", "text"],
-    ] as const
-  ).filter(([, key]) => colors[key]);
-  const typography = result.data.typography;
-  const gradients = result.preview.gradients ?? [];
-
+  const t = useT();
+  const decodeDone =
+    decodeStatus == null
+      ? !result.jobId
+      : Boolean(decodeStatus.branchUrl) || decodeStatus.status === "complete";
+  const decodeFailed = decodeStatus?.status === "error";
+  const frameProgress =
+    decodeStatus && decodeStatus.totalFrames > 0
+      ? Math.min(
+          Math.round(
+            (decodeStatus.framesProcessed / decodeStatus.totalFrames) * 100,
+          ),
+          100,
+        )
+      : null;
+  const decodeText = decodeFailed
+    ? t("designSystemSetup.decodeFailed", { error: decodeStatus?.error ?? "" })
+    : null;
   return (
     <div className="space-y-4 rounded-lg border border-border bg-accent/40 p-4">
       <div className="flex items-start gap-3">
-        {result.preview.thumbnailDataUrl ? (
-          <img
-            src={result.preview.thumbnailDataUrl}
-            alt="Figma file thumbnail"
-            className="h-16 w-24 shrink-0 rounded-md border border-border object-cover"
-          />
-        ) : null}
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-[#609FF8]/10">
+          <IconBrandFigma className="h-5 w-5 text-[#609FF8]" />
+        </div>
         <div className="min-w-0 flex-1 space-y-1.5">
-          <Label className="text-xs text-muted-foreground">
-            Design system name
-          </Label>
-          <Input
-            value={title}
-            onChange={(event) => onTitleChange(event.target.value)}
-            className="bg-card border-border text-foreground"
-            placeholder="Brand name"
-          />
-          <p className="text-[11px] text-muted-foreground">
-            {result.preview.nodeCount.toLocaleString()} nodes,{" "}
-            {gradients.length} gradient{gradients.length === 1 ? "" : "s"},{" "}
-            {result.preview.imageCount} image
-            {result.preview.imageCount === 1 ? "" : "s"}
+          <h4 className="text-sm font-medium text-foreground">
+            {t("designSystemSetup.builderIndexingStarted")}
+          </h4>
+          <p className="text-xs text-foreground/80">
+            {t("designSystemSetup.builderIndexingDescription", {
+              title:
+                displayTitle ||
+                result.suggestedTitle ||
+                t("designSystemSetup.importedBrand"),
+            })}
           </p>
         </div>
       </div>
 
-      {colorEntries.length > 0 && (
-        <div className="flex flex-wrap gap-3">
-          {colorEntries.map(([label, key]) => (
-            <div key={key} className="flex items-center gap-2">
-              <div
-                className="h-7 w-7 rounded-md border border-border"
-                style={{ backgroundColor: colors[key] }}
-              />
-              <div className="text-xs">
-                <div className="text-foreground/80">{label}</div>
-                <div className="font-mono text-[10px] text-muted-foreground">
-                  {colors[key]}
-                </div>
-              </div>
-            </div>
-          ))}
+      {decodeText && (
+        <div className="border-t border-border pt-3 text-xs text-destructive">
+          {decodeText}
         </div>
       )}
 
-      {gradients.length > 0 && (
-        <div className="flex flex-wrap gap-2">
-          {gradients.slice(0, 4).map((gradient, index) => (
-            <div
-              key={index}
-              className="h-8 w-24 rounded-md border border-border"
-              style={{ backgroundImage: gradient }}
-              title={gradient}
-            />
-          ))}
-        </div>
-      )}
-
-      {(typography.headingFont || typography.bodyFont) && (
-        <div className="text-xs text-foreground/80">
-          {typography.headingFont && (
-            <span>
-              <span className="text-muted-foreground">Headings:</span>{" "}
-              {typography.headingFont}
-              {typography.headingWeight ? ` ${typography.headingWeight}` : ""}
-            </span>
-          )}
-          {typography.bodyFont && (
-            <span className="ml-3">
-              <span className="text-muted-foreground">Body:</span>{" "}
-              {typography.bodyFont}
-            </span>
-          )}
-        </div>
-      )}
-
-      <div className="flex flex-wrap items-center gap-2 border-t border-border pt-3">
-        <Button
-          size="sm"
-          onClick={onCreate}
-          disabled={creating || !title.trim()}
-          className="cursor-pointer"
-        >
-          {creating ? (
-            <>
+      {isIndexing && !decodeFailed && (
+        <div className="border-t border-border pt-3">
+          {frameProgress === null ? (
+            <span className="inline-flex items-center gap-2 text-xs text-foreground/80">
               <IconLoader2 className="w-3.5 h-3.5 animate-spin" />
-              Creating...
-            </>
+              {t("designSystemSetup.parsingFigmaFile")}
+            </span>
           ) : (
-            "Create design system"
+            <Progress
+              aria-label={t("designSystemSetup.parsingFigmaFile")}
+              value={frameProgress}
+              className="h-1.5"
+            />
           )}
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={onReset}
-          disabled={creating}
-          className="cursor-pointer"
-        >
-          Choose another file
-        </Button>
-      </div>
+        </div>
+      )}
+
+      {(decodeDone || decodeFailed) && (
+        <div className="flex flex-wrap items-center gap-2 border-t border-border pt-3">
+          {decodeDone && !decodeFailed && (
+            <Button size="sm" asChild className="cursor-pointer">
+              <a
+                href={withBuilderUtmTrackingParams(result.builderUrl, {
+                  campaign: "product",
+                  content: "design_system_intelligence",
+                })}
+                target="_blank"
+                rel="noreferrer"
+              >
+                <IconExternalLink className="w-3.5 h-3.5" />
+                {t("designSystemSetup.openInBuilder")}
+              </a>
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={onReset}
+            className="cursor-pointer"
+          >
+            {t("designSystemSetup.chooseAnotherFile")}
+          </Button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1006,6 +1907,7 @@ function FileList({
   files: UploadedFile[];
   onRemove: (id: string) => void;
 }) {
+  const t = useT();
   if (files.length === 0) return null;
   return (
     <div className="space-y-1">
@@ -1021,6 +1923,7 @@ function FileList({
           </span>
           <button
             onClick={() => onRemove(f.id)}
+            aria-label={t("designSystemSetup.removeItem", { item: f.name })}
             className="text-muted-foreground hover:text-foreground/70 shrink-0 cursor-pointer"
           >
             <IconX className="w-3.5 h-3.5" />

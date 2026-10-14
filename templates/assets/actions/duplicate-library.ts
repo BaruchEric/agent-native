@@ -1,18 +1,21 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { buildDeepLink } from "@agent-native/core/server";
 import {
   getRequestOrgId,
   getRequestUserEmail,
 } from "@agent-native/core/server/request-context";
 import { assertAccess } from "@agent-native/core/sharing";
-import { and, eq, inArray, ne } from "drizzle-orm";
+import { and, eq, inArray, ne, notInArray } from "drizzle-orm";
 import { nanoid } from "nanoid";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import { nowIso, parseJson, stringifyJson } from "../server/lib/json.js";
+import { normalizePresetReferences } from "../server/lib/preset-references.js";
+import { normalizePresetSkeletonSpec } from "../server/lib/preset-skeleton.js";
 import {
   serializeAsset,
-  serializeGenerationPreset,
+  serializeTemplate,
   serializeLibrary,
 } from "./_helpers.js";
 
@@ -29,10 +32,7 @@ function copyTitle(title: string): string {
   return /\(copy\)$/i.test(trimmed) ? trimmed : `${trimmed} (copy)`;
 }
 
-function remapJsonValue(
-  value: unknown,
-  ids: Map<string, string>,
-): JsonValue | unknown {
+function remapJsonValue(value: unknown, ids: Map<string, string>): unknown {
   if (typeof value === "string") {
     return ids.get(value) ?? value;
   }
@@ -54,6 +54,30 @@ function remapJsonText(
   ids: Map<string, string>,
 ) {
   return stringifyJson(remapJsonValue(parseJson(text, {}), ids));
+}
+
+function pinnedPresetAssetIds(
+  presets: Array<{ settings: string | null }>,
+): Set<string> {
+  const ids = new Set<string>();
+  for (const preset of presets) {
+    const settings = parseJson<{
+      skeletonSpec?: unknown;
+      presetReferences?: unknown;
+    }>(preset.settings, {});
+    for (const entry of normalizePresetReferences(settings.presetReferences)) {
+      for (const assetId of entry.assetIds) ids.add(assetId);
+    }
+    const skeleton = normalizePresetSkeletonSpec(settings.skeletonSpec);
+    if (skeleton) {
+      ids.add(skeleton.background.assetId);
+      if (skeleton.mask) ids.add(skeleton.mask.assetId);
+      for (const layer of skeleton.foreground ?? []) {
+        if (typeof layer.source === "object") ids.add(layer.source.assetId);
+      }
+    }
+  }
+  return ids;
 }
 
 export default defineAction({
@@ -88,6 +112,7 @@ export default defineAction({
 
     const ownerEmail = getRequestUserEmail();
     if (!ownerEmail) throw new Error("no authenticated user");
+    const orgId = getRequestOrgId();
 
     const db = getDb();
     const [source] = await db
@@ -112,8 +137,8 @@ export default defineAction({
         .where(eq(schema.assetFolders.libraryId, id)),
       db
         .select()
-        .from(schema.assetGenerationPresets)
-        .where(eq(schema.assetGenerationPresets.libraryId, id)),
+        .from(schema.assetTemplates)
+        .where(eq(schema.assetTemplates.libraryId, id)),
       db
         .select()
         .from(schema.assets)
@@ -125,6 +150,23 @@ export default defineAction({
           ),
         ),
     ]);
+
+    const missingPinnedAssetIds = [...pinnedPresetAssetIds(presets)].filter(
+      (assetId) => !assets.some((asset) => asset.id === assetId),
+    );
+    if (missingPinnedAssetIds.length) {
+      const pinnedAssets = await db
+        .select()
+        .from(schema.assets)
+        .where(
+          and(
+            eq(schema.assets.libraryId, id),
+            inArray(schema.assets.id, missingPinnedAssetIds),
+            notInArray(schema.assets.status, ["archived", "failed"]),
+          ),
+        );
+      assets.push(...pinnedAssets);
+    }
 
     const collectionIds = new Map(
       collections.map((collection) => [collection.id, nanoid()]),
@@ -185,6 +227,9 @@ export default defineAction({
       referencePolicy: preset.referencePolicy,
       settings: remapJsonText(preset.settings, allIds),
       sortOrder: preset.sortOrder,
+      ownerEmail,
+      orgId,
+      visibility: "private" as const,
       createdAt: now,
       updatedAt: now,
     }));
@@ -250,7 +295,7 @@ export default defineAction({
         await tx.insert(schema.assetFolders).values(copiedFolders);
       }
       if (copiedPresets.length) {
-        await tx.insert(schema.assetGenerationPresets).values(copiedPresets);
+        await tx.insert(schema.assetTemplates).values(copiedPresets);
       }
       if (copiedAssets.length) {
         await tx.insert(schema.assets).values(copiedAssets);
@@ -268,7 +313,7 @@ export default defineAction({
       },
       collections: copiedCollections,
       folders: copiedFolders,
-      generationPresets: copiedPresets.map(serializeGenerationPreset),
+      generationPresets: copiedPresets.map(serializeTemplate),
       assets: copiedAssets.map(serializeAsset),
     };
   },

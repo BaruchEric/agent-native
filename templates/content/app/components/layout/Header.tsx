@@ -1,14 +1,14 @@
-import { useLocation } from "react-router";
-import type { ReactNode } from "react";
-import { useHeaderTitle, useHeaderActions } from "./HeaderActions";
+import { useIsMcpAppWidgetEmbed } from "@agent-native/core/client/mcp-app-host";
 import {
-  AgentToggleButton,
-  NotificationsBell,
-} from "@agent-native/core/client";
+  useHeaderTitle,
+  useHeaderActions,
+} from "@agent-native/toolkit/app-shell";
+import { AgentToggleButton } from "@agent-native/toolkit/app/chat/AgentSidebar";
+import type { ReactNode } from "react";
+import { useLocation } from "react-router";
 
 const pageTitles: Record<string, string> = {
   "/": "Content",
-  "/team": "Team",
 };
 
 function resolveTitle(pathname: string): string {
@@ -28,6 +28,10 @@ export function Header({ sidebarTrigger }: HeaderProps) {
   const location = useLocation();
   const title = useHeaderTitle();
   const actions = useHeaderActions();
+  const inWidget = useIsMcpAppWidgetEmbed();
+
+  // The MCP App host owns the chrome around its widget.
+  if (inWidget) return null;
 
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-background px-4 lg:px-6">
@@ -41,7 +45,6 @@ export function Header({ sidebarTrigger }: HeaderProps) {
       </div>
       <div className="flex items-center gap-2 shrink-0">
         {actions}
-        <NotificationsBell />
         <AgentToggleButton />
       </div>
     </header>

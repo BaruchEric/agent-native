@@ -1,21 +1,31 @@
-import { useActionQuery } from "@agent-native/core/client";
+import { useActionQuery } from "@agent-native/core/client/hooks";
 
-export function useDesignSystems() {
-  const { data, isLoading, error, refetch } = useActionQuery<{
-    designSystems: Array<{
-      id: string;
-      title: string;
-      description: string | null;
-      data: string;
-      isDefault: boolean;
-      visibility?: "private" | "org" | "public" | null;
-      createdAt: string;
-    }>;
-  }>("list-design-systems");
+type DesignSystemSummary = {
+  id: string;
+  title: string;
+  description: string | null;
+  data: string;
+  isDefault: boolean;
+  visibility?: "private" | "org" | "public" | null;
+  accessRole?: "owner" | "admin" | "editor" | "commenter" | "viewer";
+  canManage?: boolean;
+  createdAt: string;
+};
 
-  const designSystems = data?.designSystems || [];
-  const defaultSystem =
-    designSystems.find((ds) => ds.isDefault) ?? designSystems[0];
+export function useDesignSystems(enabled = true) {
+  const { data, isLoading, isFetching, error, refetch } = useActionQuery<{
+    designSystems: DesignSystemSummary[];
+  }>("list-design-systems", undefined, { enabled });
 
-  return { designSystems, defaultSystem, isLoading, error, refetch };
+  const designSystems: DesignSystemSummary[] = data?.designSystems ?? [];
+  const defaultSystem = designSystems.find((ds) => ds.isDefault);
+
+  return {
+    designSystems,
+    defaultSystem,
+    isLoading,
+    isFetching,
+    error,
+    refetch,
+  };
 }

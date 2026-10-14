@@ -1,6 +1,11 @@
-// Shared UI primitives used by multiple database view modules.
-import type { ReactNode } from "react";
-import { useState } from "react";
+import type {
+  ContentDatabaseItem,
+  ContentDatabaseViewType,
+  Document,
+  DocumentProperty,
+  DocumentPropertyOption,
+  DocumentPropertyType,
+} from "@shared/api";
 import {
   IconCalendar,
   IconCheck,
@@ -9,17 +14,27 @@ import {
   IconDots,
   IconExternalLink,
   IconFileText,
+  IconForms,
   IconFilter,
   IconLayoutGrid,
   IconLayoutKanban,
+  IconLayoutSidebar,
   IconList,
   IconMinus,
   IconSearch,
+  IconStarOff,
   IconTable,
   IconTimeline,
   IconTrash,
   IconX,
 } from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
+// i18n-raw-literal-disable-file -- unused shared helper copy; live database editor owns localized UI.
+// Shared UI primitives used by multiple database view modules.
+import type { ReactNode } from "react";
+import { useState } from "react";
+import { toast } from "sonner";
+
 import {
   AlertDialog,
   AlertDialogAction,
@@ -39,26 +54,28 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import {
+  isContentDatabaseUnavailable,
+  useContentDatabase,
+  useDuplicateDatabaseItem,
+  useRemoveDatabaseItems,
+} from "@/hooks/use-content-database";
+import {
+  useContentSpaces,
+  useDeleteContentSpace,
+} from "@/hooks/use-content-spaces";
+import { useDocument } from "@/hooks/use-documents";
 import { cn } from "@/lib/utils";
-import type {
-  ContentDatabaseItem,
-  ContentDatabaseViewType,
-  Document,
-  DocumentProperty,
-  DocumentPropertyOption,
-  DocumentPropertyType,
-} from "@shared/api";
-import { useQueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
-import { OPTION_COLOR_CLASSES, TYPE_ICONS } from "../DocumentProperties";
-import { useDuplicateDatabaseItem } from "@/hooks/use-content-database";
-import { useDeleteDocument } from "@/hooks/use-documents";
-import type { DatabaseBoardGroup, DatabaseDropSide } from "./types";
-import { databaseDuplicatedItemFromResponse } from "./navigation-state";
 
-// ---------------------------------------------------------------------------
-// View icon (returns the React component constructor for a view type)
-// ---------------------------------------------------------------------------
+import { ContentIcon, contentIconValue } from "../../icons/ContentIcon";
+import { OPTION_COLOR_CLASSES, TYPE_ICONS } from "../DocumentProperties";
+import { databaseDuplicatedItemFromResponse } from "./navigation-state";
+import {
+  databaseItemCanDuplicate,
+  databaseItemCanRemoveFromDatabase,
+} from "./row-access";
+import { dbText } from "./text";
+import type { DatabaseBoardGroup, DatabaseDropSide } from "./types";
 
 export function databaseViewIcon(type: ContentDatabaseViewType) {
   if (type === "board") return IconLayoutKanban;
@@ -66,12 +83,10 @@ export function databaseViewIcon(type: ContentDatabaseViewType) {
   if (type === "gallery") return IconLayoutGrid;
   if (type === "calendar") return IconCalendar;
   if (type === "timeline") return IconTimeline;
+  if (type === "form") return IconForms;
+  if (type === "sidebar") return IconLayoutSidebar;
   return IconTable;
 }
-
-// ---------------------------------------------------------------------------
-// Drag preview / drop indicator
-// ---------------------------------------------------------------------------
 
 export type DatabaseDragPreviewState =
   | {
@@ -143,15 +158,11 @@ export function DatabaseDropIndicator({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Page icon
-// ---------------------------------------------------------------------------
-
 export function databaseItemPageIconText(
   document: Pick<Document, "icon"> | null | undefined,
 ) {
-  const icon = document?.icon?.trim();
-  return icon ? icon : null;
+  const icon = contentIconValue(document?.icon);
+  return icon?.kind === "emoji" ? icon.emoji : null;
 }
 
 export function DatabaseItemPageIcon({
@@ -163,18 +174,14 @@ export function DatabaseItemPageIcon({
   className?: string;
   fallbackClassName?: string;
 }) {
-  const icon = databaseItemPageIconText(document);
+  const icon = contentIconValue(document.icon);
   if (icon) {
     return (
-      <span
-        aria-hidden="true"
-        className={cn(
-          "inline-flex shrink-0 items-center justify-center leading-none",
-          className,
-        )}
-      >
-        {icon}
-      </span>
+      <ContentIcon
+        value={icon}
+        size={16}
+        className={cn("shrink-0", className)}
+      />
     );
   }
 
@@ -184,10 +191,6 @@ export function DatabaseItemPageIcon({
     />
   );
 }
-
-// ---------------------------------------------------------------------------
-// Group header (used by table, list, gallery grouped sections)
-// ---------------------------------------------------------------------------
 
 export function DatabaseGroupHeader({
   group,
@@ -220,10 +223,6 @@ export function DatabaseGroupHeader({
     </button>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Row selection control
-// ---------------------------------------------------------------------------
 
 export function DatabaseRowSelectionControl({
   checked,
@@ -279,10 +278,6 @@ export function DatabaseRowSelectionControl({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Bulk option pill
-// ---------------------------------------------------------------------------
-
 export function DatabaseBulkOptionPill({
   option,
 }: {
@@ -299,10 +294,6 @@ export function DatabaseBulkOptionPill({
     </span>
   );
 }
-
-// ---------------------------------------------------------------------------
-// DatabaseNoMatchingPages
-// ---------------------------------------------------------------------------
 
 export function DatabaseNoMatchingPages({
   label = "No pages match this view",
@@ -332,10 +323,6 @@ export function DatabaseNoMatchingPages({
   );
 }
 
-// ---------------------------------------------------------------------------
-// DatabaseConstraintChip
-// ---------------------------------------------------------------------------
-
 export function DatabaseConstraintChip({
   icon,
   label,
@@ -360,10 +347,6 @@ export function DatabaseConstraintChip({
     </span>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Property picker (shared by SortMenu, FilterMenu, settings panels)
-// ---------------------------------------------------------------------------
 
 export type DatabasePropertyPickerOption = {
   key: string;
@@ -478,10 +461,6 @@ export function DatabasePropertyPickerSubContent({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Toolbar button class helper
-// ---------------------------------------------------------------------------
-
 export function databaseToolbarIconButtonClass(active = false) {
   return cn(
     "h-7 w-7 p-0 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-45",
@@ -489,13 +468,7 @@ export function databaseToolbarIconButtonClass(active = false) {
   );
 }
 
-// Suppress unused-import lint warning for IconFilter — it's re-exported via
-// this module so callers can import it from one place.
 export { IconFilter };
-
-// ---------------------------------------------------------------------------
-// Row actions cell (used by all 6 views)
-// ---------------------------------------------------------------------------
 
 export function RowActionsCell({
   item,
@@ -511,13 +484,44 @@ export function RowActionsCell({
   onOpenPage: () => void;
 }) {
   const queryClient = useQueryClient();
-  const deleteDocument = useDeleteDocument();
+  const contentSpaces = useContentSpaces();
+  const { data: databaseDocument } = useDocument(databaseDocumentId);
+  const databaseQuery = useContentDatabase(databaseDocumentId);
   const duplicateItem = useDuplicateDatabaseItem(databaseDocumentId);
+  const removeItems = useRemoveDatabaseItems(databaseDocumentId);
+  const deleteContentSpace = useDeleteContentSpace();
   const [menuOpen, setMenuOpen] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const title = item.document.title || "Untitled";
+  const removesFavoriteMembership =
+    contentSpaces.data?.favoritesDocumentId === databaseDocumentId;
+  const isWorkspaceCatalog =
+    contentSpaces.data?.catalogDocumentId === databaseDocumentId;
+  const workspaceSpace = contentSpaces.data?.spaces.find(
+    (space) => space.catalogDocumentId === item.document.id,
+  );
+  const canDeleteWorkspace =
+    isWorkspaceCatalog && workspaceSpace?.kind === "user";
+  const databaseData = isContentDatabaseUnavailable(databaseQuery.data)
+    ? undefined
+    : databaseQuery.data;
+  const databaseSources =
+    databaseData?.sources ??
+    (databaseData?.source ? [databaseData.source] : []);
+  const canRemoveFromDatabase = removesFavoriteMembership
+    ? databaseDocument?.canEdit === true
+    : databaseData !== undefined &&
+      databaseItemCanRemoveFromDatabase({
+        item,
+        databaseCanManage: databaseDocument?.canManage === true,
+        databaseSystemRole: databaseData.database.systemRole,
+        isWorkspaceCatalog,
+        sources: databaseSources,
+      });
+  const canDuplicateRow = databaseItemCanDuplicate(item, isWorkspaceCatalog);
 
   async function duplicateRow() {
+    if (!canDuplicateRow) return;
     setMenuOpen(false);
     try {
       const response = await duplicateItem.mutateAsync({ itemId: item.id });
@@ -531,10 +535,21 @@ export function RowActionsCell({
     }
   }
 
-  async function deleteRow() {
+  async function removeRowOrDeleteWorkspace() {
+    if (!canRemoveFromDatabase && !canDeleteWorkspace) {
+      setConfirmDeleteOpen(false);
+      return;
+    }
     const previewMoved = onDeletedPreviewItem?.(item) ?? false;
     try {
-      await deleteDocument.mutateAsync({ id: item.document.id });
+      if (canDeleteWorkspace && workspaceSpace) {
+        await deleteContentSpace.mutateAsync({ spaceId: workspaceSpace.id });
+      } else {
+        await removeItems.mutateAsync({
+          documentId: databaseDocumentId,
+          documentIds: [item.document.id],
+        });
+      }
       await queryClient.invalidateQueries({
         queryKey: [
           "action",
@@ -547,10 +562,15 @@ export function RowActionsCell({
       });
     } catch (err) {
       if (previewMoved) onPreviewItem?.(item);
-      toast.error("Failed to delete row", {
-        description:
-          err instanceof Error ? err.message : "Something went wrong",
-      });
+      toast.error(
+        canDeleteWorkspace
+          ? "Failed to delete workspace"
+          : dbText("failedToRemoveRowFromDatabase"),
+        {
+          description:
+            err instanceof Error ? err.message : "Something went wrong",
+        },
+      );
     }
   }
 
@@ -577,48 +597,89 @@ export function RowActionsCell({
             <IconExternalLink className="mr-2 size-4 text-muted-foreground" />
             Open page
           </DropdownMenuItem>
-          <DropdownMenuItem
-            disabled={duplicateItem.isPending}
-            onSelect={(event) => {
-              event.preventDefault();
-              void duplicateRow();
-            }}
-          >
-            <IconCopy className="mr-2 size-4 text-muted-foreground" />
-            Duplicate row
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            className="text-destructive focus:bg-destructive/10 focus:text-destructive"
-            onSelect={(event) => {
-              event.preventDefault();
-              setMenuOpen(false);
-              setConfirmDeleteOpen(true);
-            }}
-          >
-            <IconTrash className="mr-2 size-4" />
-            Delete row
-          </DropdownMenuItem>
+          {canDuplicateRow ? (
+            <DropdownMenuItem
+              disabled={duplicateItem.isPending}
+              onSelect={(event) => {
+                event.preventDefault();
+                void duplicateRow();
+              }}
+            >
+              <IconCopy className="mr-2 size-4 text-muted-foreground" />
+              Duplicate row
+            </DropdownMenuItem>
+          ) : null}
+          {canRemoveFromDatabase || canDeleteWorkspace ? (
+            <DropdownMenuSeparator />
+          ) : null}
+          {canRemoveFromDatabase || canDeleteWorkspace ? (
+            <DropdownMenuItem
+              className="text-destructive focus:bg-destructive/10 focus:text-destructive"
+              onSelect={(event) => {
+                event.preventDefault();
+                setMenuOpen(false);
+                if (removesFavoriteMembership) {
+                  void removeRowOrDeleteWorkspace();
+                } else {
+                  setConfirmDeleteOpen(true);
+                }
+              }}
+            >
+              {removesFavoriteMembership ? (
+                <IconStarOff className="mr-2 size-4 text-muted-foreground" />
+              ) : (
+                <IconTrash className="mr-2 size-4" />
+              )}
+              {removesFavoriteMembership
+                ? "Remove from favorites"
+                : canDeleteWorkspace
+                  ? "Delete workspace"
+                  : dbText("removeFromDatabase")}
+            </DropdownMenuItem>
+          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
 
-      <AlertDialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
+      <AlertDialog
+        open={
+          !removesFavoriteMembership &&
+          (canRemoveFromDatabase || canDeleteWorkspace) &&
+          confirmDeleteOpen
+        }
+        onOpenChange={setConfirmDeleteOpen}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete row?</AlertDialogTitle>
+            <AlertDialogTitle>
+              {canDeleteWorkspace
+                ? "Delete workspace?"
+                : dbText("removeFromDatabaseQuestion")}
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              &ldquo;{title}&rdquo; and any sub-pages will be permanently
-              deleted. This cannot be undone.
+              {canDeleteWorkspace ? (
+                <>
+                  &ldquo;{title}&rdquo; and every page and database inside it
+                  will be permanently deleted. This cannot be undone.
+                </>
+              ) : (
+                dbText("removeFromDatabaseDescription", { title })
+              )}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteDocument.isPending}
-              onClick={() => void deleteRow()}
+              disabled={removeItems.isPending || deleteContentSpace.isPending}
+              onClick={() => void removeRowOrDeleteWorkspace()}
             >
-              {deleteDocument.isPending ? "Deleting..." : "Delete"}
+              {removeItems.isPending || deleteContentSpace.isPending
+                ? canDeleteWorkspace
+                  ? "Deleting..."
+                  : dbText("removing")
+                : canDeleteWorkspace
+                  ? "Delete"
+                  : dbText("remove")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

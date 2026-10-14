@@ -1,8 +1,8 @@
-import { useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
-import type { RefObject } from "react";
-import { toast } from "sonner";
-import { useActionMutation, useActionQuery } from "@agent-native/core/client";
-import type { PlanMdxFolder } from "@/lib/desktop-plan-files";
+import {
+  useActionMutation,
+  useActionQuery,
+} from "@agent-native/core/client/hooks";
+import type { PlanContent, PlanContentPatch } from "@shared/plan-content";
 import type {
   PlanAuthor,
   PlanBundle,
@@ -19,7 +19,10 @@ import type {
   PlanVersionDetail,
   PlanVersionListResponse,
 } from "@shared/types";
-import type { PlanContent, PlanContentPatch } from "@shared/plan-content";
+import { useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
+import { toast } from "sonner";
+
+import type { PlanMdxFolder } from "@/lib/desktop-plan-files";
 
 export type PlanSectionInput = {
   id?: string;
@@ -135,6 +138,8 @@ export type VisualizePlanInput = {
 
 export type UpdatePlanInput = {
   planId: string;
+  expectedUpdatedAt?: string;
+  allowDestructive?: boolean;
   title?: string;
   brief?: string;
   status?: PlanStatus;
@@ -336,23 +341,13 @@ export function localPlanBundleQueryKey(slug: string, path?: string | null) {
   ] as const;
 }
 
-export function usePlan(
-  id?: string,
-  pausePollRef?: RefObject<boolean> | { current: boolean },
-) {
+export function usePlan(id?: string) {
   return useActionQuery<PlanBundle & { html?: string }>(
     "get-visual-plan",
     planBundleQueryParams(id ?? ""),
     {
       enabled: !!id,
-      // Pause the 3-second poll while a comment mutation is in-flight so
-      // an optimistic comment inserted into the cache isn't evicted before
-      // the server write commits (Issue 4a).
-      refetchInterval: (query: { state: { status: string } }) => {
-        if (query.state.status === "error") return false;
-        if (pausePollRef?.current) return false;
-        return 3_000;
-      },
+      placeholderData: (previous) => previous,
     },
   );
 }
@@ -363,7 +358,7 @@ export type PlanAccessStatusResponse = {
   signedIn: boolean;
   viewerEmail: string | null;
   viewerName: string | null;
-  role: "owner" | "viewer" | "editor" | "admin" | null;
+  role: "owner" | "viewer" | "commenter" | "editor" | "admin" | null;
   orgId: string | null;
   orgName: string | null;
   visibility: "private" | "org" | "public" | null;
@@ -474,6 +469,17 @@ export function useUpdatePlan() {
   );
 }
 
+// The editor's autosave reports a failed save through its own "couldn't save"
+// pill and merges revision conflicts itself, so a toast here would announce
+// conflicts that were already resolved.
+export function useSavePlanBlocks() {
+  const invalidate = usePlanInvalidation();
+  return useActionMutation<PlanBundle & { html?: string }, UpdatePlanInput>(
+    "update-visual-plan",
+    { onSuccess: invalidate },
+  );
+}
+
 export function useUpdateLocalPlan() {
   const qc = useQueryClient();
   const invalidate = usePlanInvalidation();
@@ -503,8 +509,6 @@ export function useUpdateLocalPlan() {
   });
 }
 
-// Like useUpdatePlanComments, but persists to the local folder's comments.json
-// (DB-free) so comments survive a refresh in /local-plans/:slug.
 export function useUpdateLocalPlanComments() {
   const qc = useQueryClient();
   const invalidate = usePlanInvalidation();
@@ -570,12 +574,6 @@ export function usePromoteLocalPlan() {
   });
 }
 
-/**
- * A separate mutation instance used exclusively for status changes
- * (draft / review / approved / in_progress / complete). Keeping it separate
- * from the prose-autosave `useUpdatePlan` instance avoids any bleed between
- * save-pending and status-pending states.
- */
 export function useUpdatePlanStatus() {
   const invalidate = usePlanInvalidation();
   return useActionMutation<PlanBundle & { html?: string }, UpdatePlanInput>(
@@ -587,12 +585,6 @@ export function useUpdatePlanStatus() {
   );
 }
 
-/**
- * A separate mutation instance used exclusively for comment writes
- * (reply, resolve, reopen). Keeping it separate from the prose-autosave
- * `useUpdatePlan` instance means the autosave `isPending` state cannot
- * bleed into comment button disabled states (Issue 3).
- */
 export function useUpdatePlanComments() {
   const invalidate = usePlanInvalidation();
   return useActionMutation<PlanBundle & { html?: string }, UpdatePlanInput>(
@@ -673,11 +665,6 @@ export function useConvertVisualPlanToPrototype() {
   });
 }
 
-/**
- * Result of the `publish-visual-plan` action (owned by the plan server stream).
- * Either the plan is hosted and we get a shareable URL, or the user is in
- * local/no-account mode and must create an account / sign in first.
- */
 export type PublishVisualPlanResult =
   | {
       needsAuth?: false | undefined;
@@ -692,9 +679,7 @@ export type PublishVisualPlanResult =
       hostedPlanId?: undefined;
       hostedPlanUrl?: undefined;
       hostedUrl?: undefined;
-      /** CLI command that connects an account (shown for terminal users). */
       connectCommand?: string;
-      /** Browser sign-in / account-creation URL to open and then retry. */
       authUrl?: string;
     };
 

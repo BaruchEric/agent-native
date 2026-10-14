@@ -1,30 +1,29 @@
+import { readBody } from "@agent-native/core/server";
 import {
   defineEventHandler,
   getQuery,
   setResponseStatus,
   type H3Event,
 } from "h3";
-import { readBody } from "@agent-native/core/server";
+
 import {
   getIntegrationKey,
   saveIntegrationKey,
   deleteIntegrationKey,
 } from "../lib/integration-credentials.js";
 
-// GET /api/pylon/status — never returns the key, only connection state.
 export const pylonStatus = defineEventHandler(async (event: H3Event) => {
   return { connected: !!(await getIntegrationKey(event, "pylon")) };
 });
 
-// PUT /api/pylon/key — store the key in the encrypted per-user vault.
 export const pylonSaveKey = defineEventHandler(async (event: H3Event) => {
   const body = await readBody(event);
-  const { apiKey } = body;
+  const { apiKey, scope } = body;
   if (!apiKey || typeof apiKey !== "string") {
     setResponseStatus(event, 400);
     return { error: "apiKey is required" };
   }
-  const ok = await saveIntegrationKey(event, "pylon", apiKey);
+  const ok = await saveIntegrationKey(event, "pylon", apiKey, scope);
   if (!ok) {
     setResponseStatus(event, 401);
     return { error: "Sign in to connect Pylon" };
@@ -32,7 +31,6 @@ export const pylonSaveKey = defineEventHandler(async (event: H3Event) => {
   return { connected: true };
 });
 
-// DELETE /api/pylon/key
 export const pylonDeleteKey = defineEventHandler(async (event: H3Event) => {
   const ok = await deleteIntegrationKey(event, "pylon");
   if (!ok) {
@@ -42,7 +40,6 @@ export const pylonDeleteKey = defineEventHandler(async (event: H3Event) => {
   return { connected: false };
 });
 
-// GET /api/pylon/contact?email=...
 export const pylonContactLookup = defineEventHandler(async (event: H3Event) => {
   const { email } = getQuery(event);
   if (!email || typeof email !== "string") {
@@ -62,7 +59,6 @@ export const pylonContactLookup = defineEventHandler(async (event: H3Event) => {
   };
 
   try {
-    // Search for contact by email
     const contactRes = await fetch("https://api.usepylon.com/contacts/search", {
       method: "POST",
       headers,
@@ -79,7 +75,6 @@ export const pylonContactLookup = defineEventHandler(async (event: H3Event) => {
       const contact = contactData.data?.[0];
 
       if (contact?.account_id) {
-        // Fetch account details
         try {
           const accountRes = await fetch(
             `https://api.usepylon.com/accounts/${contact.account_id}`,
@@ -91,7 +86,6 @@ export const pylonContactLookup = defineEventHandler(async (event: H3Event) => {
           }
         } catch {}
 
-        // Search for issues related to this account
         try {
           const issuesRes = await fetch(
             "https://api.usepylon.com/issues/search",

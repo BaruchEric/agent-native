@@ -1,38 +1,287 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { createHmac } from "node:crypto";
+
 import type { H3Event } from "h3";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+const resolverMocks = vi.hoisted(() => ({
+  getSetting: vi.fn(),
+  getRequestOrgId: vi.fn(),
+  getRequestUserEmail: vi.fn(),
+  resolveSecret: vi.fn(),
+}));
+
+vi.mock("../settings/store.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../settings/store.js")>();
+  return {
+    ...actual,
+    getSetting: (...args: unknown[]) => resolverMocks.getSetting(...args),
+  };
+});
+
+vi.mock("./request-context.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./request-context.js")>();
+  return {
+    ...actual,
+    getRequestOrgId: () => resolverMocks.getRequestOrgId(),
+    getRequestUserEmail: () => resolverMocks.getRequestUserEmail(),
+  };
+});
+
+vi.mock("./credential-provider.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./credential-provider.js")>();
+  return {
+    ...actual,
+    resolveSecret: (...args: unknown[]) => resolverMocks.resolveSecret(...args),
+  };
+});
+
+import { ActionContractError } from "../action.js";
 import {
   appendBuilderConnectToken,
+  appendBuilderConnectStateCookie,
   buildBuilderCliAuthUrl,
+  buildBuilderAgentUserPrompt,
+  BUILDER_ACCOUNT_PROVISIONING_SECRET_ENV,
+  BUILDER_AGENT_NATIVE_APP_PARAM,
   BUILDER_AGENT_NATIVE_CONNECT_SOURCE_PARAM,
   BUILDER_AGENT_NATIVE_FLOW_PARAM,
+  BUILDER_AGENT_NATIVE_TEMPLATE_PARAM,
   BUILDER_CALLBACK_PATH,
   BUILDER_CONNECT_PARAM,
+  BUILDER_CONNECT_STATE_COOKIE,
+  signBuilderProvisioningToken,
+  verifyBuilderProvisioningToken,
+  BUILDER_RELAY_FLOW_HEADER,
+  BUILDER_RELAY_SECRET_ENV,
+  BUILDER_RELAY_SIGNATURE_HEADER,
+  BUILDER_RELAY_TIMESTAMP_HEADER,
   BUILDER_SIGNUP_SOURCE_PARAM,
   BUILDER_STATE_PARAM,
+  createBuilderConnectState,
+  createBuilderProject,
+  createBuilderRelayRequest,
+  ensureBuilderProject,
+  findBuilderProjectForRepo,
   getBuilderBranchProjectId,
   getBuilderCliAuthCallbackOriginForEvent,
   getBuilderBrowserConnectUrl,
   getBuilderBrowserConnectUrlForOwner,
   getBuilderBrowserOriginForEvent,
   getBuilderBrowserStatusForEvent,
+  withBuilderConnectTrackingParams,
+  BuilderAccountProvisioningError,
+  isBuilderAccountAlreadyExistsError,
+  isBuilderAccountProvisioningEnabled,
   isBuilderBranchingEnabled,
+  isBuilderConnectCallbackUrlAllowed,
+  isSignedBuilderConnectState,
+  normalizeBuilderAgentAttachments,
+  normalizeBuilderAgentContext,
   resolveBuilderCallbackReturnUrl,
+  resolveBuilderConnectCallbackUrl,
+  resolveBuilderConnectCallbackState,
+  resolveBuilderPreviewRelayParentOrigin,
+  resolveBuilderPreviewRelayTargetOrigin,
+  resolveBuilderBranchProjectId,
   runBuilderAgent,
+  removeBuilderConnectStateCookie,
+  provisionBuilderAccount,
   signBuilderConnectToken,
   signBuilderCallbackState,
+  signBuilderPreviewRelayState,
   verifyBuilderConnectToken,
   verifyBuilderCallbackState,
   verifyBuilderCallbackStateAndGetOwner,
   verifyBuilderConnectTokenAndGetOwner,
+  verifyBuilderRelayRequest,
+  type BuilderRelayCredentials,
 } from "./builder-browser.js";
 
-function createBuilderBrowserEvent(headers: Record<string, string>): H3Event {
+describe("Builder account provisioning", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
+  it("sends a signed server-to-server request and parses the returned credentials", async () => {
+    const secret = "test-builder-sso-secret-with-at-least-32-chars";
+    vi.stubEnv(BUILDER_ACCOUNT_PROVISIONING_SECRET_ENV, secret);
+    const fetchSpy = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            credentials: {
+              privateKey: "bpk-test-provisioned",
+              publicKey: "space-test-provisioned",
+              userId: "user-test-provisioned",
+              orgName: "Agent-Native Workspace",
+              orgKind: "vcp",
+              subscription: "vcp:v3:level1",
+            },
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const credentials = await provisionBuilderAccount({
+      email: "Owner@Example.com",
+      name: "Owner",
+    });
+
+    expect(credentials).toMatchObject({
+      privateKey: "bpk-test-provisioned",
+      publicKey: "space-test-provisioned",
+      isFreeAccount: true,
+    });
+    const [requestUrl, requestInit] = fetchSpy.mock.calls[0]!;
+    expect(String(requestUrl)).toBe(
+      "https://api.builder.io/api/v1/accounts/agent-native",
+    );
+    const headers = requestInit?.headers as Record<string, string>;
+    const timestamp = headers["x-agent-native-account-timestamp"];
+    const requestId = headers["x-agent-native-account-request-id"];
+    const expectedSignature = createHmac("sha256", secret)
+      .update(
+        [
+          "agent-native-account-v1",
+          timestamp,
+          requestId,
+          "owner@example.com",
+          "Owner",
+        ].join("\n"),
+      )
+      .digest("base64url");
+    expect(headers["x-agent-native-account-signature"]).toBe(expectedSignature);
+    expect(JSON.parse(String(requestInit?.body))).toEqual({
+      email: "owner@example.com",
+      name: "Owner",
+    });
+  });
+
+  it("signs app attribution into one-click account provisioning", async () => {
+    const secret = "test-builder-sso-secret-with-at-least-32-chars";
+    vi.stubEnv(BUILDER_ACCOUNT_PROVISIONING_SECRET_ENV, secret);
+    const fetchSpy = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            credentials: {
+              privateKey: "bpk-test-provisioned",
+              publicKey: "space-test-provisioned",
+            },
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+
+    await provisionBuilderAccount({
+      email: "owner@example.com",
+      name: "Owner",
+      agentNativeApp: " agent-native-clips ",
+      agentNativeTemplate: " clips ",
+    });
+
+    const [, requestInit] = fetchSpy.mock.calls[0]!;
+    const headers = requestInit?.headers as Record<string, string>;
+    const timestamp = headers["x-agent-native-account-timestamp"];
+    const requestId = headers["x-agent-native-account-request-id"];
+    const expectedSignature = createHmac("sha256", secret)
+      .update(
+        [
+          "agent-native-account-v2",
+          timestamp,
+          requestId,
+          "owner@example.com",
+          "Owner",
+          "agent-native-clips",
+          "clips",
+        ].join("\n"),
+      )
+      .digest("base64url");
+
+    expect(headers["x-agent-native-account-version"]).toBe(
+      "agent-native-account-v2",
+    );
+    expect(headers["x-agent-native-account-signature"]).toBe(expectedSignature);
+    expect(JSON.parse(String(requestInit?.body))).toEqual({
+      email: "owner@example.com",
+      name: "Owner",
+      agentNativeApp: "agent-native-clips",
+      agentNativeTemplate: "clips",
+    });
+  });
+
+  it("only advertises account provisioning for a valid deploy secret", () => {
+    expect(isBuilderAccountProvisioningEnabled()).toBe(false);
+
+    vi.stubEnv(BUILDER_ACCOUNT_PROVISIONING_SECRET_ENV, "too-short");
+    expect(isBuilderAccountProvisioningEnabled()).toBe(false);
+
+    vi.stubEnv(
+      BUILDER_ACCOUNT_PROVISIONING_SECRET_ENV,
+      "test-builder-sso-secret-with-at-least-32-chars",
+    );
+    expect(isBuilderAccountProvisioningEnabled()).toBe(true);
+  });
+
+  it("preserves Builder's existing-account code for the login fallback", async () => {
+    vi.stubEnv(
+      BUILDER_ACCOUNT_PROVISIONING_SECRET_ENV,
+      "test-builder-sso-secret-with-at-least-32-chars",
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              code: "account_incomplete",
+              message: "An account already exists for this email.",
+            }),
+            { status: 409, headers: { "Content-Type": "application/json" } },
+          ),
+      ),
+    );
+
+    await expect(
+      provisionBuilderAccount({ email: "owner@example.com" }),
+    ).rejects.toMatchObject({
+      name: "BuilderAccountProvisioningError",
+      message: "An account already exists for this email.",
+      code: "account_incomplete",
+    });
+  });
+
+  it("classifies existing-account errors across runtime boundaries", () => {
+    expect(
+      isBuilderAccountAlreadyExistsError({
+        name: "BuilderAccountProvisioningError",
+        code: "account_incomplete",
+      }),
+    ).toBe(true);
+    expect(
+      isBuilderAccountAlreadyExistsError({
+        name: "BuilderAccountProvisioningError",
+        code: "account_provisioning",
+      }),
+    ).toBe(false);
+  });
+});
+
+function createBuilderBrowserEvent(
+  headers: Record<string, string>,
+  remoteAddress = "127.0.0.1",
+): H3Event {
   const requestHeaders = new Headers(headers);
   return {
     req: {
       method: "GET",
       url: "https://agent-workspace.builder.io/_agent-native/builder/status",
       headers: requestHeaders,
+      context: { clientAddress: remoteAddress },
     },
     url: new URL(
       "https://agent-workspace.builder.io/_agent-native/builder/status",
@@ -44,6 +293,7 @@ function createBuilderBrowserEvent(headers: Record<string, string>): H3Event {
     node: {
       req: {
         headers,
+        socket: { remoteAddress },
         url: "/_agent-native/builder/status",
         method: "GET",
       },
@@ -54,12 +304,39 @@ function createBuilderBrowserEvent(headers: Record<string, string>): H3Event {
   } as unknown as H3Event;
 }
 
+const BUILDER_ORIGIN_ENV_KEYS = [
+  "WORKSPACE_OAUTH_ORIGIN",
+  "VITE_WORKSPACE_OAUTH_ORIGIN",
+  "APP_URL",
+  "VITE_APP_URL",
+  "BETTER_AUTH_URL",
+  "VITE_BETTER_AUTH_URL",
+  "URL",
+  "DEPLOY_URL",
+  "WORKSPACE_GATEWAY_URL",
+  "VITE_WORKSPACE_GATEWAY_URL",
+  "FUSION_ENV_ORIGIN",
+  "VITE_FUSION_ENV_ORIGIN",
+  "BUILDER_PREVIEW_URL",
+  "VITE_BUILDER_PREVIEW_URL",
+] as const;
+
+function clearBuilderOriginEnv(): void {
+  for (const key of BUILDER_ORIGIN_ENV_KEYS) delete process.env[key];
+}
+
+function setOnlyBuilderAppUrl(origin: string): void {
+  clearBuilderOriginEnv();
+  process.env.APP_URL = origin;
+}
+
 describe("Builder callback CSRF state", () => {
   const originalEnv = { ...process.env };
 
   beforeEach(() => {
     // Pin the secret so signed tokens are stable across calls and the
     // .env.local autogeneration in resolveAuthSecret never fires.
+    delete process.env.OAUTH_STATE_SECRET;
     process.env.BETTER_AUTH_SECRET = "test-secret-9f2a7c";
   });
 
@@ -127,7 +404,6 @@ describe("Builder callback CSRF state", () => {
     });
 
     it("rejects a token whose embedded email was swapped post-sign", () => {
-      // Forge attempt: keep the MAC but swap the encoded email field.
       const token = signBuilderCallbackState("alice@example.com");
       const [nonce, _emailEncoded, ts, mac] = token.split(".");
       const swappedEmail = Buffer.from("bob@example.com", "utf8").toString(
@@ -149,7 +425,6 @@ describe("Builder callback CSRF state", () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date("2026-04-24T12:00:00.000Z"));
       const token = signBuilderCallbackState("alice@example.com");
-      // 11 minutes later — past the 10-min TTL.
       vi.setSystemTime(new Date("2026-04-24T12:11:00.000Z"));
       expect(verifyBuilderCallbackState(token, "alice@example.com")).toBe(
         false,
@@ -160,7 +435,6 @@ describe("Builder callback CSRF state", () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date("2026-04-24T12:00:00.000Z"));
       const token = signBuilderCallbackState("alice@example.com");
-      // 9 minutes later — still inside the 10-min TTL.
       vi.setSystemTime(new Date("2026-04-24T12:09:00.000Z"));
       expect(verifyBuilderCallbackState(token, "alice@example.com")).toBe(true);
     });
@@ -176,8 +450,6 @@ describe("Builder callback CSRF state", () => {
     it("rejects a token whose timestamp is far in the future", () => {
       const token = signBuilderCallbackState("alice@example.com");
       const [nonce, email, _ts, mac] = token.split(".");
-      // Pretend the token was minted an hour from now — an attacker
-      // trying to give a leaked state arbitrary lifetime.
       const futureTs = Date.now() + 60 * 60 * 1000;
       const forged = `${nonce}.${email}.${futureTs}.${mac}`;
       expect(verifyBuilderCallbackState(forged, "alice@example.com")).toBe(
@@ -287,11 +559,422 @@ describe("Builder callback CSRF state", () => {
     });
   });
 
+  describe("signBuilderProvisioningToken / verifyBuilderProvisioningToken", () => {
+    it("binds the provisioning proof to the verified email and auth session", () => {
+      const token = signBuilderProvisioningToken(
+        "alice@example.com",
+        "session-alice",
+      );
+
+      expect(
+        verifyBuilderProvisioningToken(
+          token,
+          "alice@example.com",
+          "session-alice",
+        ),
+      ).toBe(true);
+      expect(
+        verifyBuilderProvisioningToken(
+          token,
+          "alice@example.com",
+          "session-bob",
+        ),
+      ).toBe(false);
+      expect(
+        verifyBuilderProvisioningToken(
+          token,
+          "bob@example.com",
+          "session-alice",
+        ),
+      ).toBe(false);
+    });
+
+    it("rejects an expired provisioning proof", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-04-24T12:00:00.000Z"));
+      const token = signBuilderProvisioningToken(
+        "alice@example.com",
+        "session-alice",
+      );
+      vi.setSystemTime(new Date("2026-04-24T12:11:00.000Z"));
+
+      expect(
+        verifyBuilderProvisioningToken(
+          token,
+          "alice@example.com",
+          "session-alice",
+        ),
+      ).toBe(false);
+    });
+  });
+
+  describe("Builder connect OAuth state", () => {
+    it("uses the stable OAuth state secret when auth secret is absent", () => {
+      delete process.env.BETTER_AUTH_SECRET;
+      process.env.OAUTH_STATE_SECRET = "oauth-state-secret-for-tests";
+
+      const state = createBuilderConnectState();
+
+      delete process.env.OAUTH_STATE_SECRET;
+      process.env.OAUTH_STATE_SECRET = "oauth-state-secret-for-tests";
+      expect(isSignedBuilderConnectState(state)).toBe(true);
+    });
+
+    it("accepts an in-flight state signed with the previous auth secret", () => {
+      const state = createBuilderConnectState();
+      process.env.OAUTH_STATE_SECRET = "oauth-state-secret-for-tests";
+
+      expect(isSignedBuilderConnectState(state)).toBe(true);
+    });
+
+    it("creates a signed OAuth state", () => {
+      expect(isSignedBuilderConnectState(createBuilderConnectState())).toBe(
+        true,
+      );
+      expect(isSignedBuilderConnectState("not-a-state")).toBe(false);
+    });
+
+    it("allows Railway HTTPS same-origin callback URLs", () => {
+      const event = createBuilderBrowserEvent({
+        host: "myapp.up.railway.app",
+        "x-forwarded-proto": "https",
+      });
+      expect(
+        isBuilderConnectCallbackUrlAllowed(
+          "https://myapp.up.railway.app/_agent-native/builder/callback",
+          event,
+        ),
+      ).toBe(true);
+    });
+
+    it("rejects foreign-origin callback URLs", () => {
+      const event = createBuilderBrowserEvent({
+        host: "myapp.up.railway.app",
+        "x-forwarded-proto": "https",
+      });
+      expect(
+        isBuilderConnectCallbackUrlAllowed(
+          "https://evil.example.com/_agent-native/builder/callback",
+          event,
+        ),
+      ).toBe(false);
+    });
+
+    it("rejects production HTTP callback URLs", () => {
+      process.env.NODE_ENV = "production";
+      const event = createBuilderBrowserEvent({
+        host: "myapp.up.railway.app",
+        "x-forwarded-proto": "http",
+      });
+      expect(
+        isBuilderConnectCallbackUrlAllowed(
+          "http://myapp.up.railway.app/_agent-native/builder/callback",
+          event,
+        ),
+      ).toBe(false);
+    });
+
+    it("allows loopback HTTP outside production", () => {
+      process.env.NODE_ENV = "development";
+      const event = createBuilderBrowserEvent({
+        host: "127.0.0.1:3000",
+        "x-forwarded-proto": "http",
+      });
+      expect(
+        isBuilderConnectCallbackUrlAllowed(
+          "http://127.0.0.1:3000/_agent-native/builder/callback",
+          event,
+        ),
+      ).toBe(true);
+    });
+
+    it("builds the fixed same-origin OAuth callback URL", () => {
+      const event = createBuilderBrowserEvent({
+        host: "myapp.up.railway.app",
+        "x-forwarded-proto": "https",
+      });
+      expect(resolveBuilderConnectCallbackUrl(event)).toBe(
+        "https://myapp.up.railway.app/_agent-native/builder/callback",
+      );
+    });
+
+    it("binds the OAuth state into the registered callback URL", () => {
+      const event = createBuilderBrowserEvent({
+        host: "myapp.up.railway.app",
+        "x-forwarded-proto": "https",
+      });
+      expect(resolveBuilderConnectCallbackUrl(event, "<STATE_EXAMPLE>")).toBe(
+        "https://myapp.up.railway.app/_agent-native/builder/callback?state=%3CSTATE_EXAMPLE%3E",
+      );
+    });
+
+    it("keeps Builder-hosted app connect callbacks on the active app origin", () => {
+      process.env.NODE_ENV = "production";
+      setOnlyBuilderAppUrl("https://default-template.netlify.app");
+      const event = createBuilderBrowserEvent({
+        host: "127.0.0.1:8080",
+        "x-forwarded-host": "the-grand-tour.builder.cloud",
+        "x-forwarded-proto": "https",
+      });
+
+      const callbackUrl = resolveBuilderConnectCallbackUrl(
+        event,
+        "<STATE_EXAMPLE>",
+      );
+
+      expect(getBuilderBrowserStatusForEvent(event).connectUrl).toBe(
+        "https://the-grand-tour.builder.cloud/_agent-native/builder/connect",
+      );
+      expect(callbackUrl).toBe(
+        "https://the-grand-tour.builder.cloud/_agent-native/builder/callback?state=%3CSTATE_EXAMPLE%3E",
+      );
+      expect(isBuilderConnectCallbackUrlAllowed(callbackUrl!, event)).toBe(
+        true,
+      );
+      expect(
+        isBuilderConnectCallbackUrlAllowed(
+          "https://other.builder.cloud/_agent-native/builder/callback",
+          event,
+        ),
+      ).toBe(false);
+    });
+
+    it("ignores a spoofed Builder Cloud forwarded host from a direct request", () => {
+      process.env.NODE_ENV = "production";
+      setOnlyBuilderAppUrl("https://default-template.netlify.app");
+      const event = createBuilderBrowserEvent({
+        host: "app.example.com",
+        "x-forwarded-host": "attacker.builder.cloud",
+        "x-forwarded-proto": "https",
+      });
+
+      expect(getBuilderBrowserStatusForEvent(event).connectUrl).toBe(
+        "https://default-template.netlify.app/_agent-native/builder/connect",
+      );
+      expect(resolveBuilderConnectCallbackUrl(event, "<STATE_EXAMPLE>")).toBe(
+        "https://default-template.netlify.app/_agent-native/builder/callback?state=%3CSTATE_EXAMPLE%3E",
+      );
+    });
+
+    it("ignores a forwarded Builder Cloud host without a proxy host", () => {
+      process.env.NODE_ENV = "production";
+      setOnlyBuilderAppUrl("https://default-template.netlify.app");
+      const event = createBuilderBrowserEvent({
+        "x-forwarded-host": "attacker.builder.cloud",
+        "x-forwarded-proto": "https",
+      });
+
+      expect(getBuilderBrowserStatusForEvent(event).connectUrl).toBe(
+        "https://default-template.netlify.app/_agent-native/builder/connect",
+      );
+      expect(getBuilderCliAuthCallbackOriginForEvent(event)).toBe(
+        "https://default-template.netlify.app",
+      );
+    });
+
+    it("ignores a forwarded Builder Cloud host from an untrusted loopback host", () => {
+      process.env.NODE_ENV = "production";
+      setOnlyBuilderAppUrl("https://default-template.netlify.app");
+      const event = createBuilderBrowserEvent(
+        {
+          host: "127.0.0.1:8080",
+          "x-forwarded-host": "attacker.builder.cloud",
+          "x-forwarded-proto": "https",
+        },
+        "203.0.113.10",
+      );
+
+      expect(getBuilderBrowserStatusForEvent(event).connectUrl).toBe(
+        "https://default-template.netlify.app/_agent-native/builder/connect",
+      );
+      expect(getBuilderCliAuthCallbackOriginForEvent(event)).toBe(
+        "https://default-template.netlify.app",
+      );
+    });
+
+    it("ignores an unconfigured direct Builder Cloud host", () => {
+      process.env.NODE_ENV = "production";
+      setOnlyBuilderAppUrl("https://default-template.netlify.app");
+      const event = createBuilderBrowserEvent(
+        {
+          host: "attacker.builder.cloud",
+          "x-forwarded-proto": "https",
+        },
+        "203.0.113.10",
+      );
+
+      expect(getBuilderBrowserStatusForEvent(event).connectUrl).toBe(
+        "https://default-template.netlify.app/_agent-native/builder/connect",
+      );
+      expect(getBuilderCliAuthCallbackOriginForEvent(event)).toBe(
+        "https://default-template.netlify.app",
+      );
+      expect(resolveBuilderConnectCallbackUrl(event, "<STATE_EXAMPLE>")).toBe(
+        "https://default-template.netlify.app/_agent-native/builder/callback?state=%3CSTATE_EXAMPLE%3E",
+      );
+    });
+
+    it("fails closed for a direct Builder Cloud host without origin config", () => {
+      process.env.NODE_ENV = "production";
+      clearBuilderOriginEnv();
+      const event = createBuilderBrowserEvent(
+        {
+          host: "attacker.builder.cloud",
+          "x-forwarded-proto": "https",
+        },
+        "203.0.113.10",
+      );
+
+      expect(getBuilderBrowserOriginForEvent(event)).toBe("");
+      expect(getBuilderBrowserStatusForEvent(event).connectUrl).toBe("");
+      expect(getBuilderCliAuthCallbackOriginForEvent(event)).toBe("");
+      expect(resolveBuilderConnectCallbackUrl(event, "<STATE_EXAMPLE>")).toBe(
+        null,
+      );
+    });
+
+    it("does not reuse a rejected forwarded host without a configured origin", () => {
+      process.env.NODE_ENV = "production";
+      clearBuilderOriginEnv();
+      const event = createBuilderBrowserEvent(
+        {
+          host: "127.0.0.1:8080",
+          "x-forwarded-host": "attacker.builder.cloud",
+          "x-forwarded-proto": "https",
+        },
+        "203.0.113.10",
+      );
+
+      expect(getBuilderBrowserStatusForEvent(event).connectUrl).toBe(
+        "https://127.0.0.1:8080/_agent-native/builder/connect",
+      );
+      expect(getBuilderCliAuthCallbackOriginForEvent(event)).toBe(
+        "https://127.0.0.1:8080",
+      );
+    });
+
+    it("recovers state from the callback cookie when Builder omits query state", () => {
+      const state = createBuilderConnectState();
+      const otherState = createBuilderConnectState();
+
+      expect(resolveBuilderConnectCallbackState(null, state)).toEqual({
+        state,
+        resetStateCookie: false,
+      });
+      expect(resolveBuilderConnectCallbackState(state, state)).toEqual({
+        state,
+        resetStateCookie: false,
+      });
+      expect(
+        resolveBuilderConnectCallbackState("returned-state", null),
+      ).toEqual({ state: "returned-state", resetStateCookie: false });
+      expect(resolveBuilderConnectCallbackState(null, null)).toEqual({
+        state: null,
+        resetStateCookie: false,
+      });
+      expect(BUILDER_CONNECT_STATE_COOKIE).toBe("an_builder_connect_state");
+
+      const concurrentCookie = appendBuilderConnectStateCookie(
+        appendBuilderConnectStateCookie(null, state),
+        otherState,
+      );
+      expect(
+        resolveBuilderConnectCallbackState(state, concurrentCookie),
+      ).toEqual({ state, resetStateCookie: false });
+      expect(removeBuilderConnectStateCookie(concurrentCookie, state)).toBe(
+        otherState,
+      );
+    });
+
+    it("resets the cookie when ambiguity is why the callback cannot resolve", () => {
+      const state = createBuilderConnectState();
+      const otherState = createBuilderConnectState();
+      const concurrentCookie = appendBuilderConnectStateCookie(
+        appendBuilderConnectStateCookie(null, state),
+        otherState,
+      );
+
+      expect(
+        resolveBuilderConnectCallbackState(null, concurrentCookie),
+      ).toEqual({ state: null, resetStateCookie: true });
+
+      expect(
+        resolveBuilderConnectCallbackState(
+          "unexpected-state",
+          concurrentCookie,
+        ),
+      ).toEqual({ state: null, resetStateCookie: false });
+    });
+
+    it("lets the next restart succeed after a failed attempt instead of poisoning it", () => {
+      const first = createBuilderConnectState();
+      let cookie = appendBuilderConnectStateCookie(null, first);
+
+      cookie = removeBuilderConnectStateCookie(cookie, first);
+      expect(cookie).toBe("");
+
+      const second = createBuilderConnectState();
+      cookie = appendBuilderConnectStateCookie(cookie, second);
+      expect(resolveBuilderConnectCallbackState(null, cookie)).toEqual({
+        state: second,
+        resetStateCookie: false,
+      });
+    });
+
+    it("recovers on the restart after an ambiguous callback clears the cookie", () => {
+      const first = createBuilderConnectState();
+      const second = createBuilderConnectState();
+      let cookie = appendBuilderConnectStateCookie(
+        appendBuilderConnectStateCookie(null, first),
+        second,
+      );
+
+      const ambiguous = resolveBuilderConnectCallbackState(null, cookie);
+      expect(ambiguous.state).toBeNull();
+      expect(ambiguous.resetStateCookie).toBe(true);
+      if (ambiguous.resetStateCookie) cookie = "";
+
+      const third = createBuilderConnectState();
+      cookie = appendBuilderConnectStateCookie(cookie, third);
+      expect(cookie).toBe(third);
+      expect(resolveBuilderConnectCallbackState(null, cookie)).toEqual({
+        state: third,
+        resetStateCookie: false,
+      });
+    });
+
+    it("still fails closed for poisoned and oversized state cookies", () => {
+      const state = createBuilderConnectState();
+      const poisoned = `${state},not-a-signed-state`;
+      expect(resolveBuilderConnectCallbackState(null, poisoned)).toEqual({
+        state: null,
+        resetStateCookie: true,
+      });
+      expect(resolveBuilderConnectCallbackState(state, poisoned)).toEqual({
+        state: null,
+        resetStateCookie: true,
+      });
+
+      const oversized = Array.from({ length: 5 }, () =>
+        createBuilderConnectState(),
+      ).join(",");
+      expect(resolveBuilderConnectCallbackState(null, oversized)).toEqual({
+        state: null,
+        resetStateCookie: true,
+      });
+    });
+
+    it("rejects building a callback URL when the request origin is HTTP in production", () => {
+      process.env.NODE_ENV = "production";
+      const event = createBuilderBrowserEvent({
+        host: "myapp.up.railway.app",
+        "x-forwarded-proto": "http",
+      });
+      expect(resolveBuilderConnectCallbackUrl(event)).toBeNull();
+    });
+  });
+
   describe("buildBuilderCliAuthUrl", () => {
-    // The callback state is optional because legacy /builder/connect clients
-    // can still rely on the server-side pending-connect row. New clients get a
-    // ready-to-open /cli-auth URL from /builder/status with _an_state embedded
-    // in redirect_url so the popup can skip the app trampoline entirely.
     it("builds a clean redirect_url (no _an_state) when state is null", () => {
       const cliAuthUrl = buildBuilderCliAuthUrl(
         "https://alice.agent-native.com",
@@ -302,7 +985,7 @@ describe("Builder callback CSRF state", () => {
       expect(redirectUrl).toBeTruthy();
       const parsedRedirect = new URL(redirectUrl!);
       expect(parsedRedirect.pathname).toBe(BUILDER_CALLBACK_PATH);
-      // No _an_state — Builder can safely append its own params.
+      expect(parsed.searchParams.get("cli")).toBe("true");
       expect(parsedRedirect.searchParams.has(BUILDER_STATE_PARAM)).toBe(false);
     });
 
@@ -318,7 +1001,6 @@ describe("Builder callback CSRF state", () => {
       finalUrl.searchParams.set("user-id", "user-123");
       finalUrl.searchParams.set("org-name", "Acme");
       finalUrl.searchParams.set("kind", "team");
-      // State param is absent — callback authenticates via server-side row.
       expect(finalUrl.searchParams.has(BUILDER_STATE_PARAM)).toBe(false);
       expect(finalUrl.searchParams.get("p-key")).toBe("bpk-test-private-key");
       expect(finalUrl.searchParams.get("api-key")).toBe("test-api-key");
@@ -378,7 +1060,7 @@ describe("Builder callback CSRF state", () => {
       );
     });
 
-    it("adds Agent Native signup attribution to cli-auth and callback URLs", () => {
+    it("adds Agent-Native signup attribution to cli-auth and callback URLs", () => {
       const cliAuthUrl = buildBuilderCliAuthUrl(
         "https://alice.agent-native.com",
         signBuilderCallbackState("alice@example.com"),
@@ -386,6 +1068,8 @@ describe("Builder callback CSRF state", () => {
           tracking: {
             agentNativeFlow: "background_agent",
             agentNativeConnectSource: "connect_builder_card",
+            agentNativeApp: "agent-native-clips",
+            agentNativeTemplate: "clips",
           },
         },
       );
@@ -400,7 +1084,42 @@ describe("Builder callback CSRF state", () => {
         expect(params.get(BUILDER_AGENT_NATIVE_CONNECT_SOURCE_PARAM)).toBe(
           "connect_builder_card",
         );
+        expect(params.get(BUILDER_AGENT_NATIVE_APP_PARAM)).toBe(
+          "agent-native-clips",
+        );
+        expect(params.get(BUILDER_AGENT_NATIVE_TEMPLATE_PARAM)).toBe("clips");
       }
+      expect(parsed.searchParams.get("utm_source")).toBe("agent-native");
+      expect(parsed.searchParams.get("utm_medium")).toBe("product");
+      expect(parsed.searchParams.get("utm_campaign")).toBe("onboarding");
+      expect(parsed.searchParams.get("utm_content")).toBe(
+        "connect_builder_card",
+      );
+      expect(redirectUrl.searchParams.has("utm_source")).toBe(false);
+    });
+
+    it("adds Agent-Native signup attribution to standard OAuth URLs", () => {
+      const authorizationUrl = withBuilderConnectTrackingParams(
+        "https://mcp.builder.io/oauth/authorize?client_id=test#consent",
+        {
+          agentNativeFlow: "connect_llm",
+          agentNativeConnectSource: "first_run_onboarding",
+          agentNativeApp: "agent-native-clips",
+          agentNativeTemplate: "clips",
+        },
+      );
+      const params = new URL(authorizationUrl).searchParams;
+
+      expect(params.get(BUILDER_SIGNUP_SOURCE_PARAM)).toBe("agent-native");
+      expect(params.get(BUILDER_AGENT_NATIVE_FLOW_PARAM)).toBe("connect_llm");
+      expect(params.get(BUILDER_AGENT_NATIVE_CONNECT_SOURCE_PARAM)).toBe(
+        "first_run_onboarding",
+      );
+      expect(params.get(BUILDER_AGENT_NATIVE_APP_PARAM)).toBe(
+        "agent-native-clips",
+      );
+      expect(params.get(BUILDER_AGENT_NATIVE_TEMPLATE_PARAM)).toBe("clips");
+      expect(new URL(authorizationUrl).hash).toBe("#consent");
     });
 
     it("preserves APP_BASE_PATH in the surfaced connect URL", () => {
@@ -415,11 +1134,12 @@ describe("Builder callback CSRF state", () => {
     it("uses a Builder-accepted gateway callback for preview-host cli-auth redirects", () => {
       process.env.NODE_ENV = "production";
       process.env.AGENT_NATIVE_WORKSPACE = "1";
-      process.env.APP_URL = "https://agent-workspace.builder.io";
+      setOnlyBuilderAppUrl("https://agent-workspace.builder.io");
       process.env.WORKSPACE_GATEWAY_URL = "https://agent-workspace.builder.io";
       process.env.APP_BASE_PATH = "/dispatch";
 
       const event = createBuilderBrowserEvent({
+        host: "127.0.0.1:8080",
         "x-forwarded-host":
           "940ebc5a83164aa6a37dde445e494f3a-fluid-crack-ctnhvsyb.builderio.xyz",
         "x-forwarded-proto": "https",
@@ -439,14 +1159,9 @@ describe("Builder callback CSRF state", () => {
       expect(redirectUrl).toContain(
         "https://agent-workspace.builder.io/dispatch/_agent-native/builder/callback",
       );
-      // The callback origin (the part Builder validates against its allow-list)
-      // must be the gateway, not the preview host.
       expect(new URL(redirectUrl!).origin).toBe(
         "https://agent-workspace.builder.io",
       );
-      // The original preview origin must still ride along inside the
-      // redirect_url query string so the callback can use it as the
-      // postMessage targetOrigin for the opener tab.
       expect(new URL(redirectUrl!).searchParams.get("_an_opener")).toBe(
         "https://940ebc5a83164aa6a37dde445e494f3a-fluid-crack-ctnhvsyb.builderio.xyz",
       );
@@ -458,10 +1173,12 @@ describe("Builder callback CSRF state", () => {
     it("keeps Builder preview connect URLs on the preview deployment in workspace mode", () => {
       process.env.NODE_ENV = "production";
       process.env.AGENT_NATIVE_WORKSPACE = "1";
+      clearBuilderOriginEnv();
       process.env.WORKSPACE_GATEWAY_URL = "https://agent-workspace.builder.io";
       process.env.APP_BASE_PATH = "/dispatch";
 
       const event = createBuilderBrowserEvent({
+        host: "127.0.0.1:8080",
         "x-forwarded-host":
           "940ebc5a83164aa6a37dde445e494f3a-fluid-crack-ctnhvsyb.builderio.xyz",
         "x-forwarded-proto": "https",
@@ -475,12 +1192,14 @@ describe("Builder callback CSRF state", () => {
     it("uses Fusion's public preview origin instead of a loopback gateway for Builder connect", () => {
       process.env.NODE_ENV = "production";
       process.env.AGENT_NATIVE_WORKSPACE = "1";
+      clearBuilderOriginEnv();
       process.env.WORKSPACE_GATEWAY_URL = "http://127.0.0.1:8080";
       process.env.FUSION_ENV_ORIGIN =
         "https://940ebc5a83164aa6a37dde445e494f3a-fluid-crack-ctnhvsyb.builderio.xyz";
       process.env.APP_BASE_PATH = "/dispatch";
 
       const event = createBuilderBrowserEvent({
+        host: "127.0.0.1:8080",
         "x-forwarded-host": "127.0.0.1:8080",
         "x-forwarded-proto": "http",
       });
@@ -493,10 +1212,142 @@ describe("Builder callback CSRF state", () => {
       );
     });
 
+    it("derives the relay requestOrigin from x-forwarded-host so verification passes behind the preview proxy", () => {
+      process.env.NODE_ENV = "production";
+      process.env[BUILDER_RELAY_SECRET_ENV] =
+        "builder-relay-secret-example-at-least-32-characters";
+
+      const previewOrigin = "https://preview-example.builderio.xyz";
+
+      const event = createBuilderBrowserEvent({
+        host: "127.0.0.1:8094",
+        "x-forwarded-host": "preview-example.builderio.xyz",
+        "x-forwarded-proto": "https",
+      });
+
+      expect(getBuilderBrowserOriginForEvent(event)).toBe(previewOrigin);
+
+      const now = Date.UTC(2026, 6, 14, 18, 0, 0);
+      const relay = signBuilderPreviewRelayState({
+        ownerEmail: "owner@example.com",
+        targetOrigin: previewOrigin,
+        basePath: "/clips",
+        now,
+      });
+      const credentials: BuilderRelayCredentials = {
+        privateKey: "private-key-example",
+        publicKey: "public-key-example",
+        userId: "user-example",
+        orgName: "Example Organization",
+        orgKind: "space",
+        subscription: null,
+        subscriptionLevel: null,
+        subscriptionName: null,
+        isEnterprise: null,
+        isFreeAccount: null,
+      };
+      const request = createBuilderRelayRequest(relay.state, credentials, {
+        now,
+      });
+      const relayHeaders = {
+        timestamp: request.headers[BUILDER_RELAY_TIMESTAMP_HEADER],
+        flowId: request.headers[BUILDER_RELAY_FLOW_HEADER],
+        signature: request.headers[BUILDER_RELAY_SIGNATURE_HEADER],
+      };
+
+      expect(
+        verifyBuilderRelayRequest({
+          body: request.body,
+          ...relayHeaders,
+          requestOrigin: getBuilderBrowserOriginForEvent(event),
+          requestBasePath: "/clips",
+          now,
+        }),
+      ).not.toBeNull();
+
+      expect(
+        verifyBuilderRelayRequest({
+          body: request.body,
+          ...relayHeaders,
+          requestOrigin: "http://127.0.0.1:8094",
+          requestBasePath: "/clips",
+          now,
+        }),
+      ).toBeNull();
+    });
+
+    it("uses the immutable Netlify deploy URL as the relay destination", () => {
+      process.env.AGENT_NATIVE_BUILD_ID = "6a62ed72f518f00008436fa3";
+      process.env.SITE_NAME = "agent-native-content";
+
+      expect(
+        resolveBuilderPreviewRelayTargetOrigin(
+          "https://deploy-preview-2382--agent-native-content.netlify.app",
+        ),
+      ).toBe(
+        "https://6a62ed72f518f00008436fa3--agent-native-content.netlify.app",
+      );
+    });
+
+    it("rejects an immutable Netlify deploy URL for a different site", () => {
+      process.env.AGENT_NATIVE_BUILD_ID = "6a62ed72f518f00008436fa3";
+      process.env.SITE_NAME = "different-site";
+      const previewOrigin =
+        "https://deploy-preview-2382--agent-native-content.netlify.app";
+
+      expect(resolveBuilderPreviewRelayTargetOrigin(previewOrigin)).toBe(
+        previewOrigin,
+      );
+    });
+
+    it("leaves non-Netlify preview origins unchanged", () => {
+      process.env.AGENT_NATIVE_BUILD_ID = "6a62ed72f518f00008436fa3";
+      process.env.SITE_NAME = "agent-native-content";
+      const previewOrigin = "https://preview-example.builderio.xyz";
+
+      expect(resolveBuilderPreviewRelayTargetOrigin(previewOrigin)).toBe(
+        previewOrigin,
+      );
+    });
+
+    it("keeps the visible preview opener separate from the immutable relay target", () => {
+      expect(
+        resolveBuilderPreviewRelayParentOrigin({
+          openerOrigin:
+            "https://deploy-preview-2382--agent-native-content.netlify.app",
+          targetOrigin:
+            "https://6a62ed72f518f00008436fa3--agent-native-content.netlify.app",
+        }),
+      ).toBe("https://deploy-preview-2382--agent-native-content.netlify.app");
+    });
+
+    it("falls back to the signed relay target for an unsafe opener", () => {
+      const targetOrigin =
+        "https://6a62ed72f518f00008436fa3--agent-native-content.netlify.app";
+      expect(
+        resolveBuilderPreviewRelayParentOrigin({
+          openerOrigin: "https://attacker.example",
+          targetOrigin,
+        }),
+      ).toBe(targetOrigin);
+    });
+
+    it("rejects an unsigned Netlify opener for a different site", () => {
+      const targetOrigin =
+        "https://6a62ed72f518f00008436fa3--agent-native-content.netlify.app";
+      expect(
+        resolveBuilderPreviewRelayParentOrigin({
+          openerOrigin:
+            "https://deploy-preview-2382--attacker-site.netlify.app",
+          targetOrigin,
+        }),
+      ).toBe(targetOrigin);
+    });
+
     it("returns users to the preview opener after a gateway callback", () => {
       process.env.NODE_ENV = "production";
       process.env.AGENT_NATIVE_WORKSPACE = "1";
-      process.env.APP_URL = "https://agent-workspace.builder.io";
+      setOnlyBuilderAppUrl("https://agent-workspace.builder.io");
       process.env.WORKSPACE_GATEWAY_URL = "https://agent-workspace.builder.io";
       process.env.APP_BASE_PATH = "/dispatch";
 
@@ -520,6 +1371,7 @@ describe("Builder callback CSRF state", () => {
     it("falls back to the configured public origin for untrusted hosts", () => {
       process.env.NODE_ENV = "production";
       process.env.AGENT_NATIVE_WORKSPACE = "1";
+      clearBuilderOriginEnv();
       process.env.WORKSPACE_GATEWAY_URL = "https://agent-workspace.builder.io";
 
       const event = createBuilderBrowserEvent({
@@ -533,24 +1385,12 @@ describe("Builder callback CSRF state", () => {
     });
 
     it("uses the app's localhost origin for cli-auth when reached via a tunnel Builder rejects (local dev)", () => {
-      // Reproduces the ngrok/tunnel dev case: the preview host is trusted by us
-      // but not by Builder's /cli-auth allow-list, and no public gateway env is
-      // set. Without the fallback the app hands Builder the rejected origin and
-      // Builder redirects to its own dead http://localhost:10110/auth.
       delete process.env.NODE_ENV;
       process.env.PORT = "8080";
-      for (const key of [
-        "APP_URL",
-        "VITE_APP_URL",
-        "BETTER_AUTH_URL",
-        "VITE_BETTER_AUTH_URL",
-        "WORKSPACE_GATEWAY_URL",
-        "VITE_WORKSPACE_GATEWAY_URL",
-      ]) {
-        delete process.env[key];
-      }
+      clearBuilderOriginEnv();
 
       const event = createBuilderBrowserEvent({
+        host: "127.0.0.1:8080",
         "x-forwarded-host": "alice.builderio.xyz",
         "x-forwarded-proto": "https",
       });
@@ -563,24 +1403,14 @@ describe("Builder callback CSRF state", () => {
     it("does not use the localhost cli-auth fallback in production", () => {
       process.env.NODE_ENV = "production";
       process.env.PORT = "8080";
-      for (const key of [
-        "APP_URL",
-        "VITE_APP_URL",
-        "BETTER_AUTH_URL",
-        "VITE_BETTER_AUTH_URL",
-        "WORKSPACE_GATEWAY_URL",
-        "VITE_WORKSPACE_GATEWAY_URL",
-      ]) {
-        delete process.env[key];
-      }
+      clearBuilderOriginEnv();
 
       const event = createBuilderBrowserEvent({
+        host: "127.0.0.1:8080",
         "x-forwarded-host": "alice.builderio.xyz",
         "x-forwarded-proto": "https",
       });
 
-      // Unchanged production behavior: with no gateway configured it returns the
-      // preview origin (never a localhost callback).
       expect(getBuilderCliAuthCallbackOriginForEvent(event)).toBe(
         "https://alice.builderio.xyz",
       );
@@ -588,6 +1418,17 @@ describe("Builder callback CSRF state", () => {
   });
 
   describe("Builder branch project configuration", () => {
+    beforeEach(() => {
+      resolverMocks.getSetting.mockReset();
+      resolverMocks.getRequestOrgId.mockReset();
+      resolverMocks.getRequestUserEmail.mockReset();
+      resolverMocks.resolveSecret.mockReset();
+      resolverMocks.getSetting.mockResolvedValue(null);
+      resolverMocks.getRequestOrgId.mockReturnValue(undefined);
+      resolverMocks.getRequestUserEmail.mockReturnValue(undefined);
+      resolverMocks.resolveSecret.mockResolvedValue(null);
+    });
+
     it("does not default to a workspace-specific project id", () => {
       delete process.env.DISPATCH_BUILDER_PROJECT_ID;
       delete process.env.BUILDER_BRANCH_PROJECT_ID;
@@ -605,6 +1446,88 @@ describe("Builder callback CSRF state", () => {
 
       expect(getBuilderBranchProjectId()).toBe("project-123");
       expect(isBuilderBranchingEnabled()).toBe(true);
+    });
+
+    it("uses the org-scoped Dispatch setting before env or secret fallbacks", async () => {
+      resolverMocks.getRequestOrgId.mockReturnValue("org-123");
+      resolverMocks.getSetting.mockResolvedValue({
+        builderProjectId: " dispatch-project ",
+      });
+      process.env.BUILDER_BRANCH_PROJECT_ID = "env-project";
+
+      await expect(resolveBuilderBranchProjectId()).resolves.toBe(
+        "dispatch-project",
+      );
+      expect(resolverMocks.getSetting).toHaveBeenCalledWith(
+        "dispatch-app-creation-settings:org:org-123",
+      );
+      expect(resolverMocks.resolveSecret).not.toHaveBeenCalled();
+    });
+
+    it("uses the authenticated user-scoped Dispatch setting without an org", async () => {
+      resolverMocks.getRequestUserEmail.mockReturnValue("user@example.test");
+      resolverMocks.getSetting.mockResolvedValue({
+        builderProjectId: "user-project",
+      });
+
+      await expect(resolveBuilderBranchProjectId()).resolves.toBe(
+        "user-project",
+      );
+      expect(resolverMocks.getSetting).toHaveBeenCalledWith(
+        "dispatch-app-creation-settings:user:user@example.test",
+      );
+    });
+
+    it("treats an explicit null or empty Dispatch project as disabled", async () => {
+      resolverMocks.getRequestOrgId.mockReturnValue("org-123");
+      process.env.BUILDER_BRANCH_PROJECT_ID = "stale-env-project";
+      resolverMocks.resolveSecret.mockResolvedValue("stale-secret-project");
+
+      resolverMocks.getSetting.mockResolvedValue({ builderProjectId: null });
+      await expect(resolveBuilderBranchProjectId()).resolves.toBe("");
+
+      resolverMocks.getSetting.mockResolvedValue({ builderProjectId: "  " });
+      await expect(resolveBuilderBranchProjectId()).resolves.toBe("");
+      expect(resolverMocks.resolveSecret).not.toHaveBeenCalled();
+    });
+
+    it("fails closed when the scoped Dispatch setting cannot be read", async () => {
+      resolverMocks.getRequestOrgId.mockReturnValue("org-123");
+      resolverMocks.getSetting.mockRejectedValue(new Error("settings down"));
+      process.env.BUILDER_BRANCH_PROJECT_ID = "stale-env-project";
+      resolverMocks.resolveSecret.mockResolvedValue("stale-secret-project");
+
+      await expect(resolveBuilderBranchProjectId()).resolves.toBe("");
+      expect(resolverMocks.resolveSecret).not.toHaveBeenCalled();
+    });
+
+    it("keeps legacy fallbacks when no scoped Dispatch row exists", async () => {
+      resolverMocks.getRequestOrgId.mockReturnValue("org-123");
+      resolverMocks.resolveSecret.mockImplementation(async (key: string) =>
+        key === "BUILDER_BRANCH_PROJECT_ID" ? " secret-project " : null,
+      );
+
+      await expect(resolveBuilderBranchProjectId()).resolves.toBe(
+        "secret-project",
+      );
+      expect(resolverMocks.getSetting).toHaveBeenCalledWith(
+        "dispatch-app-creation-settings:org:org-123",
+      );
+      expect(resolverMocks.resolveSecret).toHaveBeenCalledWith(
+        "DISPATCH_BUILDER_PROJECT_ID",
+      );
+      expect(resolverMocks.resolveSecret).toHaveBeenCalledWith(
+        "BUILDER_BRANCH_PROJECT_ID",
+      );
+    });
+
+    it("keeps the env fallback when the request has no org or user context", async () => {
+      process.env.BUILDER_BRANCH_PROJECT_ID = "env-project";
+
+      await expect(resolveBuilderBranchProjectId()).resolves.toBe(
+        "env-project",
+      );
+      expect(resolverMocks.getSetting).not.toHaveBeenCalled();
     });
   });
 
@@ -626,7 +1549,87 @@ describe("Builder callback CSRF state", () => {
       expect(fetchSpy).not.toHaveBeenCalled();
     });
 
-    it("uses the configured Builder user id instead of caller email", async () => {
+    it("returns a client-visible error when legacy credentials lack a public key", async () => {
+      process.env.BUILDER_PRIVATE_KEY = "bpk-test";
+      process.env.BUILDER_PUBLIC_KEY = "";
+      process.env.BUILDER_USER_ID = "builder-user-123";
+
+      await expect(
+        runBuilderAgent({
+          prompt: "Create an app",
+          projectId: "project-123",
+          userEmail: "dispatch+slack@integration.local",
+        }),
+      ).rejects.toMatchObject({
+        actionContractError: true,
+        errorCode: "builder_legacy_public_key_required",
+        message:
+          "Builder legacy credentials require BUILDER_PUBLIC_KEY for this request.",
+        statusCode: 400,
+      });
+    });
+
+    // A rejected credential is not a transient outage. Without a typed code,
+    // callers see a plain Error and tell the user to retry something that
+    // cannot succeed until they reconnect.
+    it("raises a reconnectable error when Builder rejects the credential", async () => {
+      process.env.BUILDER_PRIVATE_KEY = "bpk-test";
+      process.env.BUILDER_PUBLIC_KEY = "pub-test";
+      process.env.BUILDER_USER_ID = "builder-user-123";
+      process.env.BUILDER_API_HOST = "https://api.test.builder.io";
+
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(
+          new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      );
+
+      await expect(
+        runBuilderAgent({
+          prompt: "Create an app",
+          projectId: "project-123",
+          userEmail: "brent@builder.io",
+        }),
+      ).rejects.toMatchObject({
+        actionContractError: true,
+        errorCode: "builder_not_connected",
+        message: "Unauthorized",
+      });
+    });
+
+    // 403 is Space membership, not a bad credential. Reconnect is the wrong
+    // advice, so it must stay an ordinary error.
+    it("keeps a membership rejection as an ordinary error", async () => {
+      process.env.BUILDER_PRIVATE_KEY = "bpk-test";
+      process.env.BUILDER_PUBLIC_KEY = "pub-test";
+      process.env.BUILDER_USER_ID = "builder-user-123";
+      process.env.BUILDER_API_HOST = "https://api.test.builder.io";
+
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(
+          new Response(JSON.stringify({ error: "Not a member" }), {
+            status: 403,
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      );
+
+      const error = await runBuilderAgent({
+        prompt: "Create an app",
+        projectId: "project-123",
+        userEmail: "brent@builder.io",
+      }).catch((err: unknown) => err);
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toHaveProperty("actionContractError");
+    });
+
+    it("attributes the branch to the requesting user, not the connected credential", async () => {
       process.env.BUILDER_PRIVATE_KEY = "bpk-test";
       process.env.BUILDER_PUBLIC_KEY = "pub-test";
       process.env.BUILDER_USER_ID = "builder-user-123";
@@ -648,12 +1651,298 @@ describe("Builder callback CSRF state", () => {
       await runBuilderAgent({
         prompt: "Create an app",
         projectId: "project-123",
-        userEmail: "dispatch+slack@integration.local",
+        userEmail: "brent@builder.io",
+      });
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(body.userEmail).toBe("brent@builder.io");
+      expect(body.userId).toBeUndefined();
+    });
+
+    it("includes staged chat context in Builder's userPrompt", async () => {
+      process.env.BUILDER_PRIVATE_KEY = "bpk-test";
+      process.env.BUILDER_PUBLIC_KEY = "pub-test";
+      process.env.BUILDER_API_HOST = "https://api.test.builder.io";
+
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            branchName: "qa-branch",
+            projectId: "project-123",
+            url: "https://builder.io/app/projects/project-123/branch/qa-branch",
+            status: "processing",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+      vi.stubGlobal("fetch", fetchSpy);
+
+      await runBuilderAgent({
+        prompt: "Add an organization filter",
+        context:
+          "## Dashboard: Customer Credit Usage Review\nDashboard id: dash-123",
+        projectId: "project-123",
+        userEmail: "brent@builder.io",
       });
 
       const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
-      expect(body.userId).toBe("builder-user-123");
-      expect(body.userEmail).toBeUndefined();
+      expect(body.userMessage).toEqual({
+        userPrompt:
+          "Add an organization filter\n\n<context>\n## Dashboard: Customer Credit Usage Review\nDashboard id: dash-123\n</context>",
+      });
+      expect(body.context).toBeUndefined();
+    });
+
+    it("rejects malformed or oversized staged context", () => {
+      expect(() => normalizeBuilderAgentContext(42)).toThrow(
+        "context must be a string",
+      );
+      expect(() =>
+        buildBuilderAgentUserPrompt("Update the dashboard", "x".repeat(32_001)),
+      ).toThrow("context must be 32000 characters or fewer");
+    });
+
+    it("forwards upload and URL attachments in the user message", async () => {
+      process.env.BUILDER_PRIVATE_KEY = "bpk-test";
+      process.env.BUILDER_PUBLIC_KEY = "pub-test";
+      process.env.BUILDER_API_HOST = "https://api.test.builder.io";
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            branchName: "qa-branch",
+            projectId: "project-123",
+            url: "https://builder.io/app/projects/project-123/branch/qa-branch",
+            status: "processing",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+      vi.stubGlobal("fetch", fetchSpy);
+      const attachments = [
+        {
+          type: "upload" as const,
+          contentType: "text/plain" as const,
+          name: "notes.txt",
+          dataUrl: "",
+          text: "Read these notes",
+          id: "file-notes",
+        },
+        { type: "url" as const, value: "https://example.com/spec" },
+      ];
+
+      await runBuilderAgent({
+        prompt: "Use the attached requirements",
+        attachments,
+        projectId: "project-123",
+        userEmail: "brent@builder.io",
+      });
+
+      const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(body.userMessage).toEqual({
+        userPrompt: "Use the attached requirements",
+        attachments: [
+          {
+            ...attachments[0],
+            size: Buffer.byteLength("Read these notes", "utf8"),
+          },
+          attachments[1],
+        ],
+      });
+    });
+
+    it("accepts image, PDF, JSON, and text attachment formats", () => {
+      expect(
+        normalizeBuilderAgentAttachments([
+          {
+            type: "upload",
+            contentType: "image/png",
+            name: "preview.png",
+            dataUrl: "data:image/png;charset=binary;base64,ZmFrZQ==",
+            id: "file-image",
+          },
+          {
+            type: "upload",
+            contentType: "application/pdf",
+            name: "requirements.pdf",
+            dataUrl: "data:application/pdf;base64,ZmFrZQ==",
+            id: "file-pdf",
+          },
+          {
+            type: "upload",
+            contentType: "application/json",
+            name: "config.json",
+            dataUrl: "",
+            text: '{"enabled":true}',
+            id: "file-json",
+          },
+        ]),
+      ).toHaveLength(3);
+    });
+
+    it("validates supported attachment content", () => {
+      expect(() =>
+        normalizeBuilderAgentAttachments([
+          {
+            type: "upload",
+            contentType: "application/octet-stream" as never,
+            name: "data.bin",
+            dataUrl: "",
+            id: "file-bin",
+          },
+        ]),
+      ).toThrow("Unsupported Builder attachment content type");
+    });
+
+    it("derives each upload's byte size on the server", () => {
+      const text = "“Curly” – quotes";
+      const sizes = normalizeBuilderAgentAttachments([
+        {
+          type: "upload",
+          contentType: "text/plain",
+          name: "notes.md",
+          dataUrl: "",
+          text,
+          id: "file-text",
+        },
+        {
+          type: "upload",
+          contentType: "application/pdf",
+          name: "spec.pdf",
+          dataUrl: "data:application/pdf;base64,ZmFrZQ==",
+          id: "file-pdf",
+        },
+      ])?.map((attachment) =>
+        attachment.type === "upload" ? attachment.size : null,
+      );
+
+      expect(sizes).toEqual([Buffer.byteLength(text, "utf8"), 4]);
+    });
+
+    it("rejects invalid attachments with a typed error", () => {
+      expect(() =>
+        normalizeBuilderAgentAttachments([
+          {
+            type: "upload",
+            contentType: "application/pdf",
+            name: "spec.pdf",
+            dataUrl: "data:image/png;base64,ZmFrZQ==",
+            id: "file-pdf",
+          },
+        ]),
+      ).toThrow(ActionContractError);
+      expect(() =>
+        normalizeBuilderAgentAttachments([
+          { type: "url", value: "ftp://example.test/a.txt" },
+        ]),
+      ).toThrow(ActionContractError);
+      for (const data of ["@@@@", "ab=c", "abcde", "ab="]) {
+        expect(() =>
+          normalizeBuilderAgentAttachments([
+            {
+              type: "upload",
+              contentType: "application/pdf",
+              name: "spec.pdf",
+              dataUrl: `data:application/pdf;base64,${data}`,
+              id: "file-pdf",
+            },
+          ]),
+        ).toThrow(ActionContractError);
+      }
+    });
+
+    it("omits attachments when none are supplied", async () => {
+      process.env.BUILDER_PRIVATE_KEY = "bpk-test";
+      process.env.BUILDER_PUBLIC_KEY = "pub-test";
+      process.env.BUILDER_API_HOST = "https://api.test.builder.io";
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            branchName: "qa-branch",
+            projectId: "project-123",
+            url: "https://builder.io/app/projects/project-123/branch/qa-branch",
+            status: "processing",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+      vi.stubGlobal("fetch", fetchSpy);
+
+      await runBuilderAgent({
+        prompt: "Create an app",
+        projectId: "project-123",
+        userEmail: "brent@builder.io",
+      });
+
+      const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(body.userMessage).toEqual({ userPrompt: "Create an app" });
+    });
+
+    it("bounds a stalled agent run instead of leaving the MCP request hanging", async () => {
+      process.env.BUILDER_PRIVATE_KEY = "bpk-test";
+      process.env.BUILDER_PUBLIC_KEY = "pub-test";
+      process.env.BUILDER_API_HOST = "https://api.test.builder.io";
+
+      const fetchSpy = vi
+        .fn()
+        .mockRejectedValue(
+          new DOMException("request timed out", "TimeoutError"),
+        );
+      vi.stubGlobal("fetch", fetchSpy);
+
+      await expect(
+        runBuilderAgent({
+          prompt: "Create an app",
+          projectId: "project-123",
+          userEmail: "brent@builder.io",
+        }),
+      ).rejects.toThrow("Builder agent run timed out after 30000ms");
+      expect(fetchSpy).toHaveBeenCalledWith(
+        expect.any(URL),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    });
+
+    it("falls back to the credential user when the caller email is not a Space member", async () => {
+      process.env.BUILDER_PRIVATE_KEY = "bpk-test";
+      process.env.BUILDER_PUBLIC_KEY = "pub-test";
+      process.env.BUILDER_USER_ID = "builder-user-123";
+      process.env.BUILDER_API_HOST = "https://api.test.builder.io";
+
+      const fetchSpy = vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ error: "User not found" }), {
+            status: 404,
+            headers: { "Content-Type": "application/json" },
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              branchName: "qa-branch",
+              projectId: "project-123",
+              url: "https://builder.io/app/projects/project-123/branch/qa-branch",
+              status: "processing",
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      vi.stubGlobal("fetch", fetchSpy);
+
+      const result = await runBuilderAgent({
+        prompt: "Create an app",
+        projectId: "project-123",
+        userEmail: "dispatch+slack@integration.local",
+      });
+
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      const first = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(first.userEmail).toBe("dispatch+slack@integration.local");
+      const second = JSON.parse(fetchSpy.mock.calls[1][1].body);
+      expect(second.userId).toBe("builder-user-123");
+      expect(second.userEmail).toBeUndefined();
+      expect(result.branchName).toBe("qa-branch");
     });
 
     it("rejects a blank branchName from Builder instead of returning an unusable run", async () => {
@@ -741,6 +2030,128 @@ describe("Builder callback CSRF state", () => {
           userEmail: "dispatch+slack@integration.local",
         }),
       ).rejects.toThrow("Builder agent run returned a non-Builder url");
+    });
+  });
+
+  describe("Builder project API", () => {
+    beforeEach(() => {
+      process.env.BUILDER_PRIVATE_KEY = "bpk-test";
+      process.env.BUILDER_PUBLIC_KEY = "pub-test";
+      process.env.BUILDER_API_HOST = "https://api.test.builder.io";
+      process.env.BUILDER_APP_HOST = "https://builder.io";
+    });
+
+    it("creates a project from the default template", async () => {
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            status: "success",
+            project: {
+              id: "project-123",
+              name: "Agent-Native Workspace",
+              repoUrl:
+                "https://github.com/BuilderIO/builder-agent-native-workspace",
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+      vi.stubGlobal("fetch", fetchSpy);
+
+      const result = await createBuilderProject({
+        name: "Agent-Native Workspace",
+      });
+
+      expect(result).toEqual({
+        projectId: "project-123",
+        name: "Agent-Native Workspace",
+        repoUrl: "https://github.com/BuilderIO/builder-agent-native-workspace",
+        browserUrl: "https://builder.io/app/projects/project-123",
+        created: true,
+      });
+      expect(String(fetchSpy.mock.calls[0]?.[0])).toBe(
+        "https://api.test.builder.io/projects/create?apiKey=pub-test",
+      );
+      expect(JSON.parse(fetchSpy.mock.calls[0]?.[1].body)).toEqual({
+        source: {
+          kind: "template",
+          templateId: "agent-native-starter",
+        },
+        name: "Agent-Native Workspace",
+      });
+    });
+
+    it("finds a project connected to a repository through the deprecated API", async () => {
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            projects: [
+              {
+                id: "project-123",
+                name: "Agent-Native Workspace",
+                repoUrl:
+                  "https://github.com/BuilderIO/builder-agent-native-workspace.git",
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+      vi.stubGlobal("fetch", fetchSpy);
+
+      await expect(
+        findBuilderProjectForRepo({
+          repoUrl:
+            "https://github.com/BuilderIO/builder-agent-native-workspace",
+        }),
+      ).resolves.toMatchObject({
+        projectId: "project-123",
+        created: false,
+      });
+      expect(String(fetchSpy.mock.calls[0]?.[0])).toBe(
+        "https://api.test.builder.io/projects?apiKey=pub-test&includeHidden=true",
+      );
+    });
+
+    it("creates a repository-backed project through the deprecated ensure API", async () => {
+      const fetchSpy = vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ projects: [] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              project: {
+                id: "project-created",
+                name: "Agent-Native Workspace",
+              },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      vi.stubGlobal("fetch", fetchSpy);
+
+      const result = await ensureBuilderProject({
+        name: "Agent-Native Workspace",
+        repoUrl: "https://github.com/BuilderIO/legacy-workspace",
+      });
+
+      expect(result).toMatchObject({
+        projectId: "project-created",
+        repoUrl: "https://github.com/BuilderIO/legacy-workspace",
+        created: true,
+      });
+      expect(JSON.parse(fetchSpy.mock.calls[1]?.[1].body)).toEqual({
+        source: {
+          kind: "repo",
+          repoUrl: "https://github.com/BuilderIO/legacy-workspace",
+        },
+        name: "Agent-Native Workspace",
+      });
     });
   });
 });

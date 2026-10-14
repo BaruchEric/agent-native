@@ -1,5 +1,6 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
+
 import { runQuery } from "../server/lib/bigquery";
 
 export default defineAction({

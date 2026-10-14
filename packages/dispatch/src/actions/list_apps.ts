@@ -1,5 +1,6 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
+
 import { listGrantedDispatchMcpApps } from "../server/lib/mcp-gateway.js";
 
 export default defineAction({
@@ -11,17 +12,21 @@ export default defineAction({
   parallelSafe: true,
   run: async () => {
     const apps = await listGrantedDispatchMcpApps();
+    const appSummaries = apps.map((app) => ({
+      id: app.id,
+      name: app.name,
+      description: app.description,
+      url: app.url,
+      running: true,
+      source: "dispatch-mcp-grant",
+    }));
     return {
       workspace: true,
       gateway: "dispatch",
-      apps: apps.map((app) => ({
-        id: app.id,
-        name: app.name,
-        description: app.description,
-        url: app.url,
-        running: true,
-        source: "dispatch-mcp-grant",
-      })),
+      apps: appSummaries,
+      message: JSON.stringify({
+        apps: appSummaries.map(({ id, name }) => ({ id, name })),
+      }),
     };
   },
 });

@@ -1,6 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { setClientAppState } from "@agent-native/core/client";
-import { useQueryClient } from "@tanstack/react-query";
+import { setClientAppState } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
 import {
   IconAlertCircle,
   IconCircleCheck,
@@ -8,7 +7,10 @@ import {
   IconRefresh,
   IconX,
 } from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
+
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -62,6 +64,7 @@ function statusClasses(kind: SyncState["kind"]) {
 }
 
 export function LocalCodebasePicker() {
+  const t = useT();
   const queryClient = useQueryClient();
   const supported = useMemo(supportsLocalCodebasePicker, []);
   const [active, setActive] = useState<RestoredLocalCodebase | null>(null);
@@ -105,8 +108,17 @@ export function LocalCodebasePicker() {
       if (removedCount > 0) {
         await queryClient.invalidateQueries({ queryKey: ["resources"] });
       }
+
+      const failedResult = results.find(
+        (result) => result.status === "rejected",
+      );
+      if (failedResult?.status === "rejected") {
+        throw failedResult.reason instanceof Error
+          ? failedResult.reason
+          : new Error(t("raw.localCodebase.codebaseSyncFailed"));
+      }
     },
-    [queryClient],
+    [queryClient, t],
   );
 
   useEffect(() => {
@@ -155,9 +167,11 @@ export function LocalCodebasePicker() {
       await queryClient.invalidateQueries({ queryKey: ["resources"] });
       setSyncState({
         kind: "success",
-        message: `${fileCountLabel(nextSummary)} synced`,
+        message: t("raw.localCodebase.filesSynced", {
+          count: fileCountLabel(nextSummary),
+        }),
       });
-      toast.success("Codebase synced", {
+      toast.success(t("raw.localCodebase.codebaseSynced"), {
         description: `${selection.name} is ready for Ask Plan.`,
       });
     },
@@ -169,7 +183,7 @@ export function LocalCodebasePicker() {
     if (chosen.ok === false) {
       if (!chosen.canceled) {
         setSyncState({ kind: "error", message: chosen.error });
-        toast.error("Could not choose folder", {
+        toast.error(t("raw.localCodebase.chooseFolderFailed"), {
           description: chosen.error,
         });
       }
@@ -182,32 +196,49 @@ export function LocalCodebasePicker() {
       handle: chosen.handle,
       latest: null,
     };
-    if (active && active.id !== selection.id) {
-      await cleanupLocalResources(active);
-    }
-    setActive(selection);
+    setSyncState({ kind: "syncing" });
     try {
+      if (active && active.id !== selection.id) {
+        await cleanupLocalResources(active);
+      }
+      setActive(selection);
       await syncSelection(selection);
     } catch (err) {
       const message =
-        err instanceof Error ? err.message : "Could not sync local codebase.";
+        err instanceof Error
+          ? err.message
+          : t("raw.localCodebase.syncLocalFailed");
       setSyncState({ kind: "error", message });
-      toast.error("Codebase sync failed", { description: message });
+      toast.error(t("raw.localCodebase.codebaseSyncFailed"), {
+        description: message,
+      });
     }
   }, [active, cleanupLocalResources, syncSelection]);
 
   const clearSelection = useCallback(async () => {
     const previous = active;
-    await clearLocalCodebaseSelection();
-    setActive(null);
-    setSummary(null);
-    setSyncState({ kind: "idle" });
-    await syncAppState(null);
-    if (previous) {
-      await cleanupLocalResources(previous);
+    setSyncState({ kind: "syncing" });
+    try {
+      if (previous) {
+        await cleanupLocalResources(previous);
+      }
+      await clearLocalCodebaseSelection();
+      setActive(null);
+      setSummary(null);
+      await syncAppState(null);
+      setSyncState({ kind: "idle" });
+      toast(t("raw.localCodebase.codebaseUnlinked"));
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : t("raw.localCodebase.codebaseSyncFailed");
+      setSyncState({ kind: "error", message });
+      toast.error(t("raw.localCodebase.codebaseSyncFailed"), {
+        description: message,
+      });
     }
-    toast("Codebase unlinked");
-  }, [active, cleanupLocalResources, syncAppState]);
+  }, [active, cleanupLocalResources, syncAppState, t]);
 
   const resync = useCallback(async () => {
     if (!active) return;
@@ -215,9 +246,13 @@ export function LocalCodebasePicker() {
       await syncSelection(active);
     } catch (err) {
       const message =
-        err instanceof Error ? err.message : "Could not sync local codebase.";
+        err instanceof Error
+          ? err.message
+          : t("raw.localCodebase.syncLocalFailed");
       setSyncState({ kind: "error", message });
-      toast.error("Codebase sync failed", { description: message });
+      toast.error(t("raw.localCodebase.codebaseSyncFailed"), {
+        description: message,
+      });
     }
   }, [active, syncSelection]);
 
@@ -230,15 +265,15 @@ export function LocalCodebasePicker() {
               type="button"
               variant="outline"
               size="sm"
-              className="h-8 gap-2 rounded-md"
+              className="gap-2 rounded-md"
               disabled
             >
               <IconFolderOpen className="size-4" />
-              Choose codebase
+              {t("raw.localCodebase.chooseCodebase")}
             </Button>
           </TooltipTrigger>
           <TooltipContent>
-            Folder access is unavailable in this browser.
+            {t("raw.localCodebase.folderUnavailable")}
           </TooltipContent>
         </Tooltip>
       </TooltipProvider>
@@ -252,13 +287,13 @@ export function LocalCodebasePicker() {
           type="button"
           variant={summary ? "outline" : "secondary"}
           size="sm"
-          className="h-8 max-w-full gap-2 rounded-md"
+          className="max-w-full gap-2 rounded-md"
           onClick={chooseFolder}
           disabled={syncState.kind === "syncing"}
         >
           <IconFolderOpen className="size-4 shrink-0" />
           <span className="truncate">
-            {summary ? summary.name : "Choose codebase"}
+            {summary ? summary.name : t("raw.localCodebase.chooseCodebase")}
           </span>
         </Button>
 
@@ -275,7 +310,9 @@ export function LocalCodebasePicker() {
                 </Badge>
               </TooltipTrigger>
               <TooltipContent>
-                Last synced {updatedLabel(summary)}
+                {t("raw.localCodebase.lastSynced", {
+                  date: updatedLabel(summary),
+                })}
               </TooltipContent>
             </Tooltip>
 
@@ -284,11 +321,11 @@ export function LocalCodebasePicker() {
                 <Button
                   type="button"
                   variant="ghost"
-                  size="icon"
-                  className="size-8 rounded-md"
+                  size="icon-sm"
+                  className="rounded-md"
                   onClick={resync}
                   disabled={syncState.kind === "syncing"}
-                  aria-label="Sync codebase"
+                  aria-label={t("raw.localCodebase.syncCodebase")}
                 >
                   <IconRefresh
                     className={cn(
@@ -298,7 +335,9 @@ export function LocalCodebasePicker() {
                   />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>Sync codebase</TooltipContent>
+              <TooltipContent>
+                {t("raw.localCodebase.syncCodebase")}
+              </TooltipContent>
             </Tooltip>
 
             <Tooltip>
@@ -306,17 +345,34 @@ export function LocalCodebasePicker() {
                 <Button
                   type="button"
                   variant="ghost"
-                  size="icon"
-                  className="size-8 rounded-md"
+                  size="icon-sm"
+                  className="rounded-md"
                   onClick={clearSelection}
-                  aria-label="Clear codebase"
+                  disabled={syncState.kind === "syncing"}
+                  aria-label={t("raw.localCodebase.clearCodebase")}
                 >
                   <IconX className="size-4" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>Clear codebase</TooltipContent>
+              <TooltipContent>
+                {t("raw.localCodebase.clearCodebase")}
+              </TooltipContent>
             </Tooltip>
           </>
+        )}
+
+        {syncState.kind === "syncing" && (
+          <span
+            className={cn(
+              "inline-flex min-h-8 max-w-[280px] items-center gap-1.5 truncate text-xs",
+              statusClasses(syncState.kind),
+            )}
+          >
+            <IconRefresh className="size-3.5 shrink-0 animate-spin" />
+            <span className="truncate">
+              {t("raw.localCodebase.clearCodebase")}
+            </span>
+          </span>
         )}
 
         {syncState.kind === "error" && (

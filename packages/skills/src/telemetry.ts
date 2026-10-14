@@ -1,7 +1,7 @@
 /**
  * Best-effort install-funnel telemetry for the skills CLI.
  *
- * Events are POSTed to the first-party Agent Native Analytics endpoint
+ * Events are POSTed to the first-party Agent-Native Analytics endpoint
  * (analytics.agent-native.com/track) using a PUBLIC, write-only key — the same
  * mechanism every agent-native app uses to report client-side events. Nothing
  * here ever blocks or throws into the install flow: sends are fire-and-forget
@@ -19,6 +19,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { canonicalTrackingEvent } from "@agent-native/core/shared";
+
 // Public, write-only analytics key. Safe to embed (revocable from the Analytics
 // settings UI). Override with AGENT_NATIVE_ANALYTICS_PUBLIC_KEY for testing or
 // to point telemetry at a different first-party analytics instance.
@@ -29,7 +31,6 @@ const DEFAULT_ENDPOINT = "https://analytics.agent-native.com/track";
 const FLUSH_TIMEOUT_MS = 1500;
 
 export interface CliTelemetryOptions {
-  /** Stable identifier for the emitting CLI, e.g. "skills-installer". */
   cli: string;
   cliVersion: string;
   command: string;
@@ -38,7 +39,15 @@ export interface CliTelemetryOptions {
 
 export interface CliTelemetry {
   track(event: string, properties?: Record<string, unknown>): void;
+  captureException(error: unknown, context?: CliExceptionContext): void;
   flush(): Promise<void>;
+}
+
+export interface CliExceptionContext {
+  handled?: boolean;
+  level?: "fatal" | "error" | "warning" | "info" | "debug";
+  tags?: Record<string, string | number | boolean | null | undefined>;
+  extra?: Record<string, unknown>;
 }
 
 function resolvePublicKey(): string {
@@ -60,11 +69,133 @@ function telemetryDisabled(): boolean {
   );
 }
 
-/**
- * Read (or lazily create) a stable per-machine install id, shared across both
- * skills CLIs so one developer counts once. Best-effort: an unwritable home
- * directory just yields an ephemeral id for this run.
- */
+const MAX_EXCEPTION_MESSAGE_LENGTH = 1000;
+const MAX_EXCEPTION_STACK_LENGTH = 8000;
+const MAX_EXCEPTION_TAGS = 30;
+const MAX_EXCEPTION_EXTRA_KEYS = 30;
+const MAX_EXCEPTION_VALUE_LENGTH = 1000;
+const SECRET_RE = /\b(?:bearer|basic)\s+[^\s]+/gi;
+const SECRET_KEY_RE =
+  /(?:authorization|cookie|set[-_]?cookie|token|secret|password|passwd|pwd|api[-_]?key|apikey|credential)/i;
+
+function redactExceptionText(value: string): string {
+  return value
+    .replace(SECRET_RE, (match) => `${match.split(/\s+/, 1)[0]} <redacted>`)
+    .replace(
+      /([A-Za-z0-9_$.-]*(?:authorization|cookie|token|secret|password|passwd|pwd|api[-_]?key|apikey|credential)[A-Za-z0-9_$.-]*\s*[:=]\s*)([^\s,;}]+)/gi,
+      "$1<redacted>",
+    );
+}
+
+function boundedExceptionText(value: unknown, max: number): string {
+  const text =
+    typeof value === "string"
+      ? value
+      : value == null
+        ? "Unknown error"
+        : typeof value === "number" ||
+            typeof value === "boolean" ||
+            typeof value === "bigint" ||
+            typeof value === "symbol"
+          ? String(value)
+          : (JSON.stringify(value) ?? "Unknown error");
+  const safe = redactExceptionText(text);
+  return safe.length > max ? safe.slice(0, max) : safe;
+}
+
+function safeExceptionValue(value: unknown, depth = 2): unknown {
+  if (
+    value == null ||
+    typeof value === "boolean" ||
+    typeof value === "number"
+  ) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return boundedExceptionText(value, MAX_EXCEPTION_VALUE_LENGTH);
+  }
+  if (depth <= 0)
+    return boundedExceptionText(value, MAX_EXCEPTION_VALUE_LENGTH);
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, 20)
+      .map((item) => safeExceptionValue(item, depth - 1));
+  }
+  if (typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value)) {
+      if (Object.keys(out).length >= MAX_EXCEPTION_EXTRA_KEYS) break;
+      const safeKey = boundedExceptionText(key, 100);
+      out[safeKey] = SECRET_KEY_RE.test(safeKey)
+        ? "<redacted>"
+        : safeExceptionValue(child, depth - 1);
+    }
+    return out;
+  }
+  return boundedExceptionText(value, MAX_EXCEPTION_VALUE_LENGTH);
+}
+
+// A fuzz or test harness stubs `process.exit` with a function that throws this
+// label; running the CLI under one is not a production failure.
+function isTestHarnessError(error: unknown): boolean {
+  const value = error instanceof Error ? error.message : String(error ?? "");
+  const stack = error instanceof Error ? (error.stack ?? "") : "";
+  return (
+    value.trim() === "fuzz-intercepted-process-exit" ||
+    /fuzzInterceptedProcessExit|fuzz-exports\.js/.test(stack)
+  );
+}
+
+function captureException(
+  error: unknown,
+  context: CliExceptionContext,
+  trackEvent: (event: string, properties?: Record<string, unknown>) => void,
+  release: string,
+): void {
+  if (isTestHarnessError(error)) return;
+  const exception =
+    error instanceof Error
+      ? {
+          type: boundedExceptionText(error.name || "Error", 200),
+          message: boundedExceptionText(
+            error.message || error.name || "Error",
+            MAX_EXCEPTION_MESSAGE_LENGTH,
+          ),
+          stack: error.stack
+            ? boundedExceptionText(error.stack, MAX_EXCEPTION_STACK_LENGTH)
+            : undefined,
+        }
+      : {
+          type: "Error",
+          message: boundedExceptionText(error, MAX_EXCEPTION_MESSAGE_LENGTH),
+          stack: undefined,
+        };
+  const tags: Record<string, string> = {};
+  for (const [key, value] of Object.entries(context.tags ?? {})) {
+    if (Object.keys(tags).length >= MAX_EXCEPTION_TAGS || value == null) break;
+    const safeKey = boundedExceptionText(key, 100);
+    tags[safeKey] = SECRET_KEY_RE.test(safeKey)
+      ? "<redacted>"
+      : boundedExceptionText(value, 200);
+  }
+  const extra = safeExceptionValue(context.extra);
+  trackEvent("$exception", {
+    app: "agent-native-cli",
+    template: "cli",
+    runtime: "cli",
+    source: "cli",
+    exceptionType: exception.type,
+    exceptionMessage: exception.message,
+    ...(exception.stack ? { exceptionStack: exception.stack } : {}),
+    handled: context.handled ?? false,
+    level: context.level ?? "error",
+    occurredAt: new Date().toISOString(),
+    release,
+    ...(Object.keys(tags).length ? { exceptionTags: tags } : {}),
+    ...(extra && typeof extra === "object" ? { exceptionExtra: extra } : {}),
+  });
+}
+
 function resolveInstallId(): string {
   try {
     const dir = path.join(os.homedir(), ".agent-native");
@@ -86,7 +217,7 @@ export function createCliTelemetry(options: CliTelemetryOptions): CliTelemetry {
   const publicKey = resolvePublicKey();
   const disabled = telemetryDisabled() || !publicKey;
   const endpoint = resolveEndpoint();
-  const installId = disabled ? "" : resolveInstallId();
+  let installId: string | undefined = disabled ? "" : undefined;
   const runId = crypto.randomUUID();
   const inFlight = new Set<Promise<void>>();
 
@@ -99,29 +230,38 @@ export function createCliTelemetry(options: CliTelemetryOptions): CliTelemetry {
     ci: process.env.CI === "true",
     interactive: options.interactive,
     runId,
-    installId,
   };
 
   function track(event: string, properties?: Record<string, unknown>): void {
     if (disabled) return;
-    const body = JSON.stringify({
-      publicKey,
-      event,
-      anonymousId: installId,
-      sessionId: runId,
-      timestamp: new Date().toISOString(),
-      properties: { ...base, ...properties },
-    });
-    const promise = fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-      keepalive: true,
-    })
-      .then(() => undefined)
-      .catch(() => undefined);
-    inFlight.add(promise);
-    void promise.finally(() => inFlight.delete(promise));
+    installId ??= resolveInstallId();
+    const legacyProperties = { ...base, installId, ...properties };
+    const events: Array<{
+      name: string;
+      properties: Record<string, unknown>;
+    }> = [{ name: event, properties: legacyProperties }];
+    const canonical = canonicalTrackingEvent(event, legacyProperties);
+    if (canonical) events.push(canonical);
+    for (const emitted of events) {
+      const body = JSON.stringify({
+        publicKey,
+        event: emitted.name,
+        anonymousId: installId,
+        sessionId: runId,
+        timestamp: new Date().toISOString(),
+        properties: emitted.properties,
+      });
+      const promise = fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        keepalive: true,
+      })
+        .then(() => undefined)
+        .catch(() => undefined);
+      inFlight.add(promise);
+      void promise.finally(() => inFlight.delete(promise));
+    }
   }
 
   async function flush(): Promise<void> {
@@ -132,5 +272,15 @@ export function createCliTelemetry(options: CliTelemetryOptions): CliTelemetry {
     ]);
   }
 
-  return { track, flush };
+  return {
+    track,
+    captureException: (error, context = {}) =>
+      captureException(
+        error,
+        context,
+        track,
+        `agent-native-cli@${options.cliVersion}`,
+      ),
+    flush,
+  };
 }

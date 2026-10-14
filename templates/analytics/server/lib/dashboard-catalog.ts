@@ -1,6 +1,12 @@
 import type { SqlDashboardConfig } from "../../app/pages/adhoc/sql-dashboard/types";
+import { repairCanonicalFirstPartyDashboardQueries } from "./canonical-first-party-dashboard-repair";
 import { loadDashboardSeed } from "./dashboard-seeds";
-import { listDashboards, type DashboardRecord } from "./dashboards-store";
+import {
+  listDashboardSummaries,
+  type DashboardRecord,
+  type DashboardSummaryRecord,
+} from "./dashboards-store";
+import { FIRST_PARTY_DASHBOARD_ID } from "./first-party-metric-catalog";
 
 export type DashboardTemplateCategory =
   | "Acquisition"
@@ -31,6 +37,7 @@ export type CatalogDashboardConfig = SqlDashboardConfig & {
 
 export type DashboardCatalogEntry = DashboardCatalogMetadata & {
   buildConfig: () => SqlDashboardConfig;
+  visibleInCatalog?: boolean;
 };
 
 export type InstalledDashboardSummary = {
@@ -56,7 +63,11 @@ const CATALOG_VERSION = "2026-06-08";
 function seedConfig(id: string): SqlDashboardConfig {
   const seed = loadDashboardSeed(id);
   if (!seed) throw new Error(`Dashboard seed not found: ${id}`);
-  return seed as unknown as SqlDashboardConfig;
+  if (id !== FIRST_PARTY_DASHBOARD_ID) {
+    return seed as unknown as SqlDashboardConfig;
+  }
+  return repairCanonicalFirstPartyDashboardQueries(seed)
+    .config as unknown as SqlDashboardConfig;
 }
 
 function promPanelSql(
@@ -906,7 +917,7 @@ export const dashboardCatalogEntries: DashboardCatalogEntry[] = [
     id: "demo-node-exporter",
     name: "Demo Node Exporter Full",
     description:
-      "The full Node Exporter dashboard, backed by the built-in demo Prometheus endpoint without consuming the Prometheus source slot.",
+      "Explore CPU, memory, disk, network, filesystem, and load metrics using built-in sample Prometheus data, with no data source setup required.",
     category: "Observability",
     defaultDashboardId: "demo-node-exporter",
     dataSources: ["demo"],
@@ -920,14 +931,27 @@ export const dashboardCatalogEntries: DashboardCatalogEntry[] = [
     id: "first-party-template-traffic",
     name: "First-party Template Traffic",
     description:
-      "Template signups, clicks, demo starts, CLI copies, and first-party session activity.",
+      "Template signups, activation and onboarding step/choice funnels, sharing actions, clicks, demo starts, CLI copies, activity, top URLs, top clips, retention by template, and active users over time.",
     category: "Product",
     defaultDashboardId: "agent-native-templates-first-party",
     dataSources: ["first-party"],
-    tags: ["templates", "traffic", "signups", "sessions"],
-    panelCount: 14,
+    tags: [
+      "templates",
+      "traffic",
+      "signups",
+      "sessions",
+      "retention",
+      "active users",
+      "pageviews",
+      "urls",
+      "clips",
+      "referrals",
+      "virality",
+    ],
+    panelCount: 48,
     version: CATALOG_VERSION,
     recommended: true,
+    visibleInCatalog: false,
     buildConfig: () => seedConfig("agent-native-templates-first-party"),
   },
   {
@@ -942,13 +966,14 @@ export const dashboardCatalogEntries: DashboardCatalogEntry[] = [
     panelCount: 12,
     version: CATALOG_VERSION,
     recommended: true,
+    visibleInCatalog: false,
     buildConfig: () => seedConfig("skills-cli-funnel"),
   },
   {
     id: "google-analytics-web",
     name: "Google Analytics Website",
     description:
-      "GA4 traffic, engagement, acquisition, top pages, and geography.",
+      "Track GA4 website traffic, engagement, acquisition channels, top pages, geography, and browser/device mix.",
     category: "Acquisition",
     defaultDashboardId: "google-analytics",
     dataSources: ["ga4"],
@@ -961,7 +986,7 @@ export const dashboardCatalogEntries: DashboardCatalogEntry[] = [
     id: "node-exporter-macos",
     name: "Node Exporter macOS",
     description:
-      "A comprehensive Darwin/macOS Prometheus host dashboard for Homebrew node_exporter metrics.",
+      "Monitor macOS host CPU, memory, disk, filesystem, network, load, and Homebrew node_exporter health from Prometheus.",
     category: "Observability",
     defaultDashboardId: "node-exporter-macos",
     dataSources: ["prometheus"],
@@ -975,7 +1000,7 @@ export const dashboardCatalogEntries: DashboardCatalogEntry[] = [
     id: "node-exporter-full",
     name: "Node Exporter Full",
     description:
-      "Linux node_exporter host observability plus Prometheus demo-app traffic, latency, and workload panels.",
+      "Monitor Linux host CPU, memory, disk, filesystem, network, and load, plus Prometheus demo-app traffic and latency panels.",
     category: "Observability",
     defaultDashboardId: "node-exporter-full",
     dataSources: ["prometheus"],
@@ -998,33 +1023,13 @@ export function cloneDashboardConfig(
   return JSON.parse(JSON.stringify(entry.buildConfig())) as SqlDashboardConfig;
 }
 
-function templateIdFromConfig(config: Record<string, unknown>): string | null {
-  const catalog = config.catalog;
-  if (!catalog || typeof catalog !== "object" || Array.isArray(catalog)) {
-    return null;
-  }
-  const templateId = (catalog as Record<string, unknown>).templateId;
-  return typeof templateId === "string" && templateId ? templateId : null;
-}
-
-function demoIdFromConfig(config: Record<string, unknown>): string | null {
-  const demo = config.demo;
-  if (!demo || typeof demo !== "object" || Array.isArray(demo)) {
-    return null;
-  }
-  const demoId = (demo as Record<string, unknown>).id;
-  return typeof demoId === "string" && demoId ? demoId : null;
-}
-
 function installedDashboardForTemplate(
-  row: DashboardRecord,
+  row: DashboardSummaryRecord,
   entry: DashboardCatalogEntry,
 ): boolean {
-  const templateId = templateIdFromConfig(row.config);
-  const demoId = demoIdFromConfig(row.config);
   return (
-    templateId === entry.id ||
-    demoId === entry.id ||
+    row.catalogTemplateId === entry.id ||
+    row.demoId === entry.id ||
     row.id === entry.defaultDashboardId
   );
 }
@@ -1032,37 +1037,41 @@ function installedDashboardForTemplate(
 export async function listDashboardCatalog(
   ctx: AccessCtx,
 ): Promise<DashboardCatalogTemplate[]> {
-  const dashboards = await listDashboards(ctx, {
+  const dashboards = await listDashboardSummaries(ctx, {
     kind: "sql",
     archived: "all",
     hidden: "all",
+    includeCatalogMetadata: true,
   });
 
-  return dashboardCatalogEntries.map((entry) => {
-    const installedDashboards = dashboards
-      .filter((row) => installedDashboardForTemplate(row, entry))
-      .map((row) => ({
-        id: row.id,
-        name:
-          typeof row.config.name === "string" && row.config.name.trim()
-            ? row.config.name
-            : row.title,
-        visibility: row.visibility,
-        updatedAt: row.updatedAt,
-        archivedAt: row.archivedAt,
-      }))
-      .sort(
-        (a, b) =>
-          new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
-      );
+  return dashboardCatalogEntries
+    .filter((entry) => entry.visibleInCatalog !== false)
+    .map((entry) => {
+      const installedDashboards = dashboards
+        .filter((row) => installedDashboardForTemplate(row, entry))
+        .map((row) => ({
+          id: row.id,
+          name: row.configName?.trim() || row.name,
+          visibility: row.visibility,
+          updatedAt: row.updatedAt,
+          archivedAt: row.archivedAt,
+        }))
+        .sort(
+          (a, b) =>
+            new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+        );
 
-    const { buildConfig: _buildConfig, ...metadata } = entry;
-    return {
-      ...metadata,
-      installedDashboards,
-      installed: installedDashboards.length > 0,
-    };
-  });
+      const {
+        buildConfig: _buildConfig,
+        visibleInCatalog: _visibleInCatalog,
+        ...metadata
+      } = entry;
+      return {
+        ...metadata,
+        installedDashboards,
+        installed: installedDashboards.length > 0,
+      };
+    });
 }
 
 export function applyCatalogMetadata(

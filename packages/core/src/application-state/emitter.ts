@@ -1,6 +1,5 @@
-import { EventEmitter } from "events";
-
 export interface AppStateEvent {
+  [key: string]: unknown;
   source: "app-state";
   type: "change" | "delete";
   key: string;
@@ -8,13 +7,42 @@ export interface AppStateEvent {
   requestSource?: string;
 }
 
-/**
- * Singleton EventEmitter for application-state DB changes.
- * The SSE handler subscribes to this via extraEmitters.
- */
-const _emitter = new EventEmitter();
+export type AppStateEventListener = (event: AppStateEvent) => void;
 
-export function getAppStateEmitter(): EventEmitter {
+export interface AppStateEmitter {
+  on(event: "app-state", listener: AppStateEventListener): this;
+  off(event: "app-state", listener: AppStateEventListener): this;
+  removeListener(event: "app-state", listener: AppStateEventListener): this;
+  emit(event: "app-state", payload: AppStateEvent): boolean;
+}
+
+class SimpleAppStateEmitter implements AppStateEmitter {
+  private readonly listeners = new Set<AppStateEventListener>();
+
+  on(event: "app-state", listener: AppStateEventListener): this {
+    if (event === "app-state") this.listeners.add(listener);
+    return this;
+  }
+
+  off(event: "app-state", listener: AppStateEventListener): this {
+    if (event === "app-state") this.listeners.delete(listener);
+    return this;
+  }
+
+  removeListener(event: "app-state", listener: AppStateEventListener): this {
+    return this.off(event, listener);
+  }
+
+  emit(event: "app-state", payload: AppStateEvent): boolean {
+    if (event !== "app-state") return false;
+    for (const listener of this.listeners) listener(payload);
+    return this.listeners.size > 0;
+  }
+}
+
+const _emitter = new SimpleAppStateEmitter();
+
+export function getAppStateEmitter(): AppStateEmitter {
   return _emitter;
 }
 

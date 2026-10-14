@@ -1,8 +1,30 @@
-import { useMemo, useState } from "react";
+import { useT } from "@agent-native/core/client/i18n";
+import type { Booking, CustomField } from "@shared/api";
+import { IconCircleX, IconVideo } from "@tabler/icons-react";
 import { format, parseISO } from "date-fns";
-import { IconCircleX } from "@tabler/icons-react";
+import { useMemo, useState } from "react";
+import { toast } from "sonner";
+
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import {
   Table,
   TableBody,
@@ -11,33 +33,27 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Badge } from "@/components/ui/badge";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
-import { useBookings, useDeleteBooking } from "@/hooks/use-bookings";
 import { useBookingLinks } from "@/hooks/use-booking-links";
-import { toast } from "sonner";
-import type { Booking, CustomField } from "@shared/api";
+import { useBookings, useDeleteBooking } from "@/hooks/use-bookings";
+import { sortBookingsNewestFirst } from "@/lib/booking-sorting";
 
 type FilterStatus = "all" | "confirmed" | "cancelled";
 
 export default function BookingsList() {
-  const { data: bookings = [] } = useBookings();
-  const { data: bookingLinks = [] } = useBookingLinks();
+  const t = useT();
+  const bookingsQuery = useBookings();
+  const bookingLinksQuery = useBookingLinks();
+  const bookings = bookingsQuery.data ?? [];
+  const bookingLinks = bookingLinksQuery.data ?? [];
   const deleteBooking = useDeleteBooking();
   const [filter, setFilter] = useState<FilterStatus>("all");
 
-  // Build a map of slug -> custom fields for resolving field labels
   const fieldsBySlug = useMemo(() => {
     const map: Record<string, CustomField[]> = {};
     for (const link of bookingLinks) {
@@ -46,49 +62,85 @@ export default function BookingsList() {
     return map;
   }, [bookingLinks]);
 
-  const filtered = bookings.filter((b) => {
-    if (filter === "all") return true;
-    return b.status === filter;
-  });
+  const filtered = sortBookingsNewestFirst(
+    bookings.filter(
+      (b) =>
+        filter === "all" ||
+        (filter === "confirmed"
+          ? b.status === "confirmed" && !b.zoomNeedsReview
+          : b.status === filter),
+    ),
+  );
 
-  function handleCancel(booking: Booking) {
-    deleteBooking.mutate(booking.id, {
-      onSuccess: () => toast.success("Booking cancelled"),
-      onError: () => toast.error("Failed to cancel booking"),
-    });
+  function handleCancel(booking: Booking, zoomMeetingResolved = false) {
+    deleteBooking.mutate(
+      {
+        id: booking.id,
+        ...(zoomMeetingResolved ? { zoomMeetingResolved } : {}),
+      },
+      {
+        onSuccess: () => toast.success(t("bookingLinks.bookingCancelled")),
+        onError: () => toast.error(t("bookingLinks.failedToCancelBooking")),
+      },
+    );
   }
 
   return (
     <div className="space-y-6">
       <Tabs value={filter} onValueChange={(v) => setFilter(v as FilterStatus)}>
         <TabsList>
-          <TabsTrigger value="all">All ({bookings.length})</TabsTrigger>
+          <TabsTrigger value="all">
+            {t("bookingLinks.allCount", { count: bookings.length })}
+          </TabsTrigger>
           <TabsTrigger value="confirmed">
-            Confirmed ({bookings.filter((b) => b.status === "confirmed").length}
-            )
+            {t("bookingLinks.confirmedCount", {
+              count: bookings.filter(
+                (b) => b.status === "confirmed" && !b.zoomNeedsReview,
+              ).length,
+            })}
           </TabsTrigger>
           <TabsTrigger value="cancelled">
-            Cancelled ({bookings.filter((b) => b.status === "cancelled").length}
-            )
+            {t("bookingLinks.cancelledCount", {
+              count: bookings.filter((b) => b.status === "cancelled").length,
+            })}
           </TabsTrigger>
         </TabsList>
       </Tabs>
 
-      {filtered.length === 0 ? (
+      {bookingsQuery.isError || bookingLinksQuery.isError ? (
+        <div className="flex flex-col items-center justify-center gap-3 rounded-lg border border-destructive/30 py-12 text-center">
+          <p className="text-sm text-destructive">{t("common.loadFailed")}</p>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              void bookingsQuery.refetch();
+              void bookingLinksQuery.refetch();
+            }}
+            disabled={bookingsQuery.isFetching || bookingLinksQuery.isFetching}
+          >
+            {t("common.retry")}
+          </Button>
+        </div>
+      ) : filtered.length === 0 ? (
         <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border py-12">
-          <p className="text-sm text-muted-foreground">No bookings found.</p>
+          <p className="text-sm text-muted-foreground">
+            {t("bookingLinks.noBookingsFound")}
+          </p>
         </div>
       ) : (
         <div className="overflow-x-auto rounded-lg border border-border">
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>Name</TableHead>
-                <TableHead>Email</TableHead>
-                <TableHead>Event</TableHead>
-                <TableHead>Date & Time</TableHead>
-                <TableHead>Details</TableHead>
-                <TableHead>Status</TableHead>
+                <TableHead>{t("bookingLinks.name")}</TableHead>
+                <TableHead>{t("bookingLinks.email")}</TableHead>
+                <TableHead>{t("eventForm.event")}</TableHead>
+                <TableHead className="min-w-[180px]">
+                  {t("bookingLinks.dateAndTime")}
+                </TableHead>
+                <TableHead>{t("bookingLinks.details")}</TableHead>
+                <TableHead>{t("bookingLinks.status")}</TableHead>
                 <TableHead className="w-[80px]" />
               </TableRow>
             </TableHeader>
@@ -100,7 +152,7 @@ export default function BookingsList() {
                     {booking.email}
                   </TableCell>
                   <TableCell>{booking.eventTitle}</TableCell>
-                  <TableCell className="text-muted-foreground">
+                  <TableCell className="min-w-[180px] whitespace-nowrap text-muted-foreground">
                     <div>{format(parseISO(booking.start), "MMM d, yyyy")}</div>
                     <div className="text-xs">
                       {format(parseISO(booking.start), "h:mm a")} -{" "}
@@ -114,30 +166,113 @@ export default function BookingsList() {
                     />
                   </TableCell>
                   <TableCell>
-                    <Badge
-                      variant={
-                        booking.status === "confirmed" ? "default" : "secondary"
-                      }
-                    >
-                      {booking.status}
-                    </Badge>
+                    <div className="flex items-center gap-1.5">
+                      <Badge
+                        variant={
+                          (booking.zoomNeedsReview ||
+                            booking.zoomCancellationNeedsReview) &&
+                          booking.status === "confirmed"
+                            ? "destructive"
+                            : booking.status === "confirmed"
+                              ? "default"
+                              : "secondary"
+                        }
+                      >
+                        {booking.status === "confirmed" &&
+                        booking.zoomCancellationNeedsReview
+                          ? t("bookingLinks.zoomCancellationNeedsReview")
+                          : booking.status === "confirmed" &&
+                              booking.zoomNeedsReview
+                            ? t("bookingLinks.zoomNeedsReview")
+                            : booking.status === "confirmed"
+                              ? t("bookingLinks.confirmed")
+                              : t("bookingLinks.cancelled")}
+                      </Badge>
+                      {booking.meetingLinkPending && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span
+                              role="img"
+                              aria-label={t(
+                                "bookingLinks.meetingDetailsPending",
+                              )}
+                              tabIndex={0}
+                              className="inline-flex text-muted-foreground"
+                            >
+                              <IconVideo
+                                className="h-4 w-4"
+                                aria-hidden="true"
+                              />
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            {t("bookingLinks.meetingDetailsPending")}
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
+                    </div>
                   </TableCell>
                   <TableCell>
-                    {booking.status === "confirmed" && (
+                    {booking.status === "confirmed" &&
+                    booking.zoomCancellationNeedsReview ? (
+                      <AlertDialog>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <AlertDialogTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label={t("bookingLinks.cancelBooking")}
+                                disabled={deleteBooking.isPending}
+                              >
+                                <IconCircleX className="h-4 w-4 text-destructive" />
+                              </Button>
+                            </AlertDialogTrigger>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            {t("bookingLinks.cancelBooking")}
+                          </TooltipContent>
+                        </Tooltip>
+                        <AlertDialogContent>
+                          <AlertDialogHeader>
+                            <AlertDialogTitle>
+                              {t("bookingLinks.zoomCancelTitle")}
+                            </AlertDialogTitle>
+                            <AlertDialogDescription>
+                              {t("bookingLinks.zoomCancelDescription")}
+                            </AlertDialogDescription>
+                          </AlertDialogHeader>
+                          <AlertDialogFooter>
+                            <AlertDialogCancel>
+                              {t("eventDialog.cancel")}
+                            </AlertDialogCancel>
+                            <AlertDialogAction
+                              onClick={() => handleCancel(booking, true)}
+                              disabled={deleteBooking.isPending}
+                            >
+                              {t("bookingLinks.zoomCancelConfirm")}
+                            </AlertDialogAction>
+                          </AlertDialogFooter>
+                        </AlertDialogContent>
+                      </AlertDialog>
+                    ) : booking.status === "confirmed" ? (
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <Button
                             variant="ghost"
                             size="icon"
+                            aria-label={t("bookingLinks.cancelBooking")}
                             onClick={() => handleCancel(booking)}
                             disabled={deleteBooking.isPending}
                           >
                             <IconCircleX className="h-4 w-4 text-destructive" />
                           </Button>
                         </TooltipTrigger>
-                        <TooltipContent>Cancel booking</TooltipContent>
+                        <TooltipContent>
+                          {t("bookingLinks.cancelBooking")}
+                        </TooltipContent>
                       </Tooltip>
-                    )}
+                    ) : null}
                   </TableCell>
                 </TableRow>
               ))}
@@ -156,6 +291,7 @@ function BookingDetails({
   booking: Booking;
   customFields?: CustomField[];
 }) {
+  const t = useT();
   const responses = booking.fieldResponses;
   const hasResponses = responses && Object.keys(responses).length > 0;
   const hasNotes = !!booking.notes;
@@ -166,7 +302,7 @@ function BookingDetails({
 
   const lines: { label: string; value: string }[] = [];
   if (hasNotes) {
-    lines.push({ label: "Notes", value: booking.notes! });
+    lines.push({ label: t("bookingLinks.notes"), value: booking.notes! });
   }
   if (hasResponses && customFields) {
     for (const field of customFields) {
@@ -174,7 +310,7 @@ function BookingDetails({
       if (val !== undefined && val !== "" && val !== false) {
         lines.push({
           label: field.label,
-          value: typeof val === "boolean" ? "Yes" : String(val),
+          value: typeof val === "boolean" ? t("bookingLinks.yes") : String(val),
         });
       }
     }
@@ -193,12 +329,12 @@ function BookingDetails({
           size="sm"
           className="h-auto px-0 py-0 text-xs text-muted-foreground underline decoration-dotted"
         >
-          {lines.length} {lines.length === 1 ? "detail" : "details"}
+          {t("bookingLinks.detailCount", { count: lines.length })}
         </Button>
       </DialogTrigger>
       <DialogContent className="max-h-[80vh] overflow-hidden sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Booking Details</DialogTitle>
+          <DialogTitle>{t("bookingLinks.bookingDetails")}</DialogTitle>
         </DialogHeader>
         <div className="space-y-4 overflow-y-auto pr-1 text-sm">
           {lines.map((line) => (

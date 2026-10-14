@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
-import type { ComponentType } from "react";
+import { useT } from "@agent-native/core/client/i18n";
+import { gmailCooldownFromError } from "@shared/gmail-freshness";
+import type { ManagedGmailFilter } from "@shared/types";
 import {
   IconArchive,
   IconFilter,
@@ -11,18 +12,9 @@ import {
   IconTag,
   IconTrash,
 } from "@tabler/icons-react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Switch } from "@/components/ui/switch";
-import { Textarea } from "@/components/ui/textarea";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { useMemo, useState } from "react";
+import type { ComponentType } from "react";
+
 import {
   AlertDialog,
   AlertDialogAction,
@@ -33,6 +25,18 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Tooltip,
   TooltipContent,
@@ -45,7 +49,6 @@ import {
   useReplaceGmailFilter,
   type ManageGmailFiltersInput,
 } from "@/hooks/use-gmail-filters";
-import type { ManagedGmailFilter } from "@shared/types";
 
 type FilterFormState = {
   account: string;
@@ -220,6 +223,7 @@ function FilterEditRow({
   onCancel: () => void;
   isPending?: boolean;
 }) {
+  const t = useT();
   const [state, setState] = useState(() => initialState(accounts, filter));
   const canSave = hasCriteria(state) && hasAction(state) && !isPending;
 
@@ -233,15 +237,15 @@ function FilterEditRow({
       <div className="grid gap-3 sm:grid-cols-2">
         <div>
           <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-            Account
+            {t("mail.gmailFilters.account")}
           </label>
           <Select
             value={state.account}
             disabled={Boolean(filter) || accounts.length <= 1}
             onValueChange={(value) => setField("account", value)}
           >
-            <SelectTrigger className="h-8 text-[13px]">
-              <SelectValue placeholder="Select account" />
+            <SelectTrigger size="sm" className="text-[13px]">
+              <SelectValue placeholder={t("mail.gmailFilters.selectAccount")} />
             </SelectTrigger>
             <SelectContent>
               {accounts.map((account) => (
@@ -254,43 +258,46 @@ function FilterEditRow({
         </div>
         <div>
           <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-            From
+            {t("mail.gmailFilters.from")}
           </label>
           <Input
+            size="sm"
             autoFocus
             value={state.from}
             onChange={(event) => setField("from", event.target.value)}
             placeholder="alerts@example.com"
-            className="h-8 px-3 text-[13px]"
+            className="px-3 text-[13px]"
           />
         </div>
         <div>
           <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-            To
+            {t("mail.gmailFilters.to")}
           </label>
           <Input
+            size="sm"
             value={state.to}
             onChange={(event) => setField("to", event.target.value)}
             placeholder="me@example.com"
-            className="h-8 px-3 text-[13px]"
+            className="px-3 text-[13px]"
           />
         </div>
         <div>
           <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-            Subject
+            {t("mail.gmailFilters.subject")}
           </label>
           <Input
+            size="sm"
             value={state.subject}
             onChange={(event) => setField("subject", event.target.value)}
             placeholder="Invoice"
-            className="h-8 px-3 text-[13px]"
+            className="px-3 text-[13px]"
           />
         </div>
       </div>
 
       <div>
         <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-          Gmail search
+          {t("mail.gmailFilters.gmailSearch")}
         </label>
         <Textarea
           value={state.query}
@@ -304,25 +311,25 @@ function FilterEditRow({
       <div className="grid gap-2 sm:grid-cols-2">
         <FilterSwitch
           icon={IconArchive}
-          label="Archive"
+          label={t("mail.gmailFilters.archive")}
           checked={state.archive}
           onChange={(value) => setField("archive", value)}
         />
         <FilterSwitch
           icon={IconFilter}
-          label="Mark read"
+          label={t("mail.gmailFilters.markRead")}
           checked={state.markRead}
           onChange={(value) => setField("markRead", value)}
         />
         <FilterSwitch
           icon={IconShieldCheck}
-          label="Never spam"
+          label={t("mail.gmailFilters.neverSpam")}
           checked={state.neverSpam}
           onChange={(value) => setField("neverSpam", value)}
         />
         <FilterSwitch
           icon={IconShieldCheck}
-          label="Never important"
+          label={t("mail.gmailFilters.neverImportant")}
           checked={state.neverImportant}
           onChange={(value) =>
             setState((current) => ({
@@ -334,7 +341,7 @@ function FilterEditRow({
         />
         <FilterSwitch
           icon={IconStar}
-          label="Important"
+          label={t("mail.gmailFilters.important")}
           checked={state.important}
           onChange={(value) =>
             setState((current) => ({
@@ -346,13 +353,13 @@ function FilterEditRow({
         />
         <FilterSwitch
           icon={IconStar}
-          label="Star"
+          label={t("mail.gmailFilters.star")}
           checked={state.starred}
           onChange={(value) => setField("starred", value)}
         />
         <FilterSwitch
           icon={IconTrash}
-          label="Trash"
+          label={t("mail.gmailFilters.trash")}
           checked={state.trash}
           onChange={(value) => setField("trash", value)}
         />
@@ -361,13 +368,14 @@ function FilterEditRow({
       <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
         <div>
           <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-            Apply label
+            {t("mail.gmailFilters.applyLabel")}
           </label>
           <Input
+            size="sm"
             value={state.label}
             onChange={(event) => setField("label", event.target.value)}
             placeholder="Receipts"
-            className="h-8 px-3 text-[13px]"
+            className="px-3 text-[13px]"
           />
         </div>
         <label className="flex items-center gap-2 self-end pb-1.5 text-[12px] text-muted-foreground">
@@ -375,19 +383,20 @@ function FilterEditRow({
             checked={state.createLabel}
             onCheckedChange={(value) => setField("createLabel", value)}
           />
-          Create label
+          {t("mail.gmailFilters.createLabel")}
         </label>
       </div>
 
       <div>
         <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-          Forward to
+          {t("mail.gmailFilters.forwardTo")}
         </label>
         <Input
+          size="sm"
           value={state.forward}
           onChange={(event) => setField("forward", event.target.value)}
           placeholder="verified-address@example.com"
-          className="h-8 px-3 text-[13px]"
+          className="px-3 text-[13px]"
         />
       </div>
 
@@ -398,10 +407,10 @@ function FilterEditRow({
           onClick={() => onSave(toPayload(state, filter))}
         >
           {isPending && <IconLoader2 className="h-3.5 w-3.5 animate-spin" />}
-          Save
+          {t("mail.gmailFilters.save")}
         </Button>
         <Button size="sm" variant="ghost" onClick={onCancel}>
-          Cancel
+          {t("mail.gmailFilters.cancel")}
         </Button>
       </div>
     </div>
@@ -421,6 +430,7 @@ function FilterRow({
   onEdit: () => void;
   onCancelEdit: () => void;
 }) {
+  const t = useT();
   const replaceFilter = useReplaceGmailFilter();
   const deleteFilter = useDeleteGmailFilter();
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -470,7 +480,7 @@ function FilterRow({
                 <IconPencil className="h-3.5 w-3.5" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Edit filter</TooltipContent>
+            <TooltipContent>{t("mail.gmailFilters.editFilter")}</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
@@ -488,7 +498,9 @@ function FilterRow({
                 )}
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Delete filter</TooltipContent>
+            <TooltipContent>
+              {t("mail.gmailFilters.deleteFilter")}
+            </TooltipContent>
           </Tooltip>
         </div>
       </div>
@@ -496,14 +508,19 @@ function FilterRow({
       <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete Gmail filter</AlertDialogTitle>
+            <AlertDialogTitle>
+              {t("mail.gmailFilters.deleteGmailFilter")}
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              Delete this filter from {filter.accountEmail}? This changes Gmail
-              directly.
+              {t("mail.gmailFilters.deleteGmailFilterDescription", {
+                account: filter.accountEmail,
+              })}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogCancel>
+              {t("mail.gmailFilters.cancel")}
+            </AlertDialogCancel>
             <AlertDialogAction
               onClick={() =>
                 deleteFilter.mutate(
@@ -517,7 +534,7 @@ function FilterRow({
                 )
               }
             >
-              Delete
+              {t("mail.gmailFilters.deleteFilter")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -527,6 +544,7 @@ function FilterRow({
 }
 
 export function GmailFiltersSection() {
+  const t = useT();
   const { data, isLoading, error } = useGmailFilters();
   const createFilter = useCreateGmailFilter();
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -541,32 +559,25 @@ export function GmailFiltersSection() {
     [data?.accounts],
   );
 
-  return (
-    <div className="flex-1 overflow-y-auto p-4 sm:p-8">
-      <div className="mb-6 flex items-center justify-between">
-        <div>
-          <h2 className="text-[16px] font-semibold text-foreground">
-            Gmail Filters
-          </h2>
-          <p className="mt-0.5 text-[13px] text-muted-foreground">
-            Server-side Gmail rules for simple sender, subject, and search
-            patterns.
-          </p>
-        </div>
-        <Button
-          size="sm"
-          disabled={accounts.length === 0}
-          onClick={() => {
-            setShowNewForm(true);
-            setEditingId(null);
-          }}
-        >
-          <IconPlus className="h-3.5 w-3.5" />
-          New filter
-        </Button>
-      </div>
+  const newFilterButton = (
+    <Button
+      size="sm"
+      disabled={accounts.length === 0}
+      onClick={() => {
+        setShowNewForm(true);
+        setEditingId(null);
+      }}
+    >
+      <IconPlus className="h-3.5 w-3.5" />
+      {t("mail.gmailFilters.newFilter")}
+    </Button>
+  );
 
-      <div className="max-w-2xl space-y-2">
+  return (
+    <div>
+      <div className="mb-4 flex justify-end">{newFilterButton}</div>
+
+      <div className="space-y-2">
         {showNewForm && (
           <FilterEditRow
             accounts={accounts}
@@ -597,7 +608,9 @@ export function GmailFiltersSection() {
 
         {error && !isLoading && (
           <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-[13px] text-destructive">
-            {(error as Error).message}
+            {gmailCooldownFromError(error, Date.now())
+              ? t("mail.error.rateLimitDescription")
+              : (error as Error).message}
           </div>
         )}
 
@@ -605,7 +618,7 @@ export function GmailFiltersSection() {
           <div className="rounded-lg border border-border/20 bg-card/50 py-12 text-center">
             <IconTag className="mx-auto mb-3 h-8 w-8 text-muted-foreground/20" />
             <p className="text-[13px] text-muted-foreground/50">
-              No Gmail filters yet.
+              {t("mail.gmailFilters.noFilters")}
             </p>
           </div>
         )}

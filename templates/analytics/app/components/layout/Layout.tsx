@@ -1,21 +1,48 @@
-import { useMemo } from "react";
-import { useLocation, useNavigate } from "react-router";
-import { Sidebar } from "./Sidebar";
-import { MobileNav } from "./MobileNav";
-import { Header } from "./Header";
-import { HeaderActionsProvider } from "./HeaderActions";
 import {
-  AgentSidebar,
-  GuidedQuestionFlow,
-  focusAgentChat,
+  isAgentChatHomeHandoffActive,
+  markAgentChatHomeHandoff,
   navigateWithAgentChatViewTransition,
   useAgentChatHomeHandoff,
   useAgentChatHomeHandoffLinks,
+  isAssistantChatHistoryVersion,
+  type AssistantChatHistoryVersion,
+} from "@agent-native/core/client/agent-chat";
+import { useT } from "@agent-native/core/client/i18n";
+import {
+  CreativeContextComposerChip,
+  useCreativeContextLab,
+} from "@agent-native/creative-context/client";
+import { AgentSidebar, focusAgentChat } from "@agent-native/toolkit/app/chat";
+import {
+  GuidedQuestionFlow,
   useGuidedQuestionFlow,
-} from "@agent-native/core/client";
-import { InvitationBanner } from "@agent-native/core/client/org";
+} from "@agent-native/toolkit/app/chat/agentkit-chat";
+import { type AssistantChatHistoryConfig } from "@agent-native/toolkit/app/chat/chat/history-types";
+import { InvitationBanner } from "@agent-native/toolkit/app/org";
+import { isSettingsPathname } from "@agent-native/toolkit/app/settings";
+import { analyticsAskThreadPath, isAnalyticsAskPath } from "@shared/ask-route";
+import { useEffect, useMemo, useRef } from "react";
+import { useLocation, useNavigate } from "react-router";
+
 import { useNavigationState } from "@/hooks/use-navigation-state";
+import {
+  ANALYTICS_CHAT_STORAGE_KEY,
+  ANALYTICS_RECENT_CHAT_HANDOFF_TTL_MS,
+  discardAnalyticsChatHandoffOnSettings,
+  hasTrackedAnalyticsChatRun,
+  isAnalyticsSettingsPath,
+  markAnalyticsChatActivity,
+  updateAnalyticsChatHandoffForRun,
+  type AnalyticsChatRunningRuns,
+} from "@/lib/chat-handoff";
 import { TAB_ID } from "@/lib/tab-id";
+
+import { AgentCompletionSound } from "../AgentCompletionSound";
+import { Header } from "./Header";
+import { HeaderActionsProvider } from "./HeaderActions";
+import { isSessionReplayRoute } from "./layout-route-policy";
+import { MobileNav } from "./MobileNav";
+import { Sidebar } from "./Sidebar";
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -24,19 +51,26 @@ interface LayoutProps {
 const BARE_ROUTES = new Set(["/chart"]);
 
 export function Layout({ children }: LayoutProps) {
+  return <InteractiveLayout>{children}</InteractiveLayout>;
+}
+
+function InteractiveLayout({ children }: LayoutProps) {
   useNavigationState();
   const location = useLocation();
   const navigate = useNavigate();
+  const t = useT();
+  const creativeContextEnabled = useCreativeContextLab();
 
-  // Analytics has two distinct "primary resources" — dashboards
-  // (`/adhoc/:id`) and ad-hoc analyses (`/analyses/:id`). Each binds the
-  // chat to that artifact so a dashboard chat doesn't leak into a
-  // different analysis (and vice versa). The list pages and overview
-  // leave scope null so general data questions still work.
   const analyticsScope = useMemo(() => {
-    const dashMatch = location.pathname.match(/^\/adhoc\/([^/]+)/);
+    const dashMatch = location.pathname.match(
+      /^\/(?:adhoc|dashboards)\/([^/]+)/,
+    );
     if (dashMatch?.[1]) {
-      return { type: "dashboard" as const, id: dashMatch[1] };
+      return {
+        type: "dashboard" as const,
+        id: dashMatch[1],
+        contextKey: "analytics-selected-dashboard",
+      };
     }
     const analysisMatch = location.pathname.match(/^\/analyses\/([^/]+)/);
     if (analysisMatch?.[1]) {
@@ -44,6 +78,60 @@ export function Layout({ children }: LayoutProps) {
     }
     return null;
   }, [location.pathname]);
+  const analyticsChatHistory = useMemo<
+    AssistantChatHistoryConfig | undefined
+  >(() => {
+    if (!analyticsScope) return undefined;
+    if (analyticsScope.type === "dashboard") {
+      const dashboardId = analyticsScope.id;
+      return {
+        list: {
+          action: "list-dashboard-revisions",
+          args: { dashboardId },
+          getVersions: (result: unknown) => {
+            const revisions =
+              result && typeof result === "object"
+                ? (result as { revisions?: unknown }).revisions
+                : undefined;
+            return Array.isArray(revisions)
+              ? revisions.filter(isAssistantChatHistoryVersion)
+              : null;
+          },
+        },
+        restore: {
+          action: "restore-dashboard-revision",
+          args: (version: AssistantChatHistoryVersion) => ({
+            dashboardId,
+            revisionId: version.id,
+          }),
+        },
+      };
+    }
+
+    const analysisId = analyticsScope.id;
+    return {
+      list: {
+        action: "list-analysis-revisions",
+        args: { analysisId },
+        getVersions: (result: unknown) => {
+          const revisions =
+            result && typeof result === "object"
+              ? (result as { revisions?: unknown }).revisions
+              : undefined;
+          return Array.isArray(revisions)
+            ? revisions.filter(isAssistantChatHistoryVersion)
+            : null;
+        },
+      },
+      restore: {
+        action: "restore-analysis-revision",
+        args: (version: AssistantChatHistoryVersion) => ({
+          analysisId,
+          revisionId: version.id,
+        }),
+      },
+    };
+  }, [analyticsScope]);
 
   const {
     questions: guidedQuestions,
@@ -51,6 +139,9 @@ export function Layout({ children }: LayoutProps) {
     description: guidedDescription,
     skipLabel: guidedSkipLabel,
     submitLabel: guidedSubmitLabel,
+    isSubmissionBlocked: guidedSubmissionBlocked,
+    providerStatus: guidedProviderStatus,
+    retryProviderStatus: retryGuidedProviderStatus,
     handleSubmit: handleGuidedSubmit,
     handleSkip: handleGuidedSkip,
   } = useGuidedQuestionFlow({
@@ -63,50 +154,108 @@ export function Layout({ children }: LayoutProps) {
         "Answers:",
         formattedAnswers,
         "",
-        "Use these answers to choose the dashboard scope, data source, metrics, breakdowns, and layout. For dashboards, consult the data dictionary before writing SQL and only ask another question if a required source/table/metric is still genuinely ambiguous.",
+        "Use these answers to choose the dashboard scope, data source, metrics, breakdowns, and layout. For dashboards, consult the data dictionary before writing SQL.",
       ].join("\n"),
     buildSkipContext: () =>
       "The user skipped the guided analytics questions. Proceed with reasonable defaults, consult the data dictionary before writing SQL, and ask again only if a required source/table/metric is still genuinely ambiguous.",
   });
-  // Extensions list (`/extensions`) and viewer (`/extensions/:id`) render their own h-12
-  // toolbar with NotificationsBell + AgentToggleButton. Skip the framework
-  // Header so there's no double-header.
   const isExtensionsRoute =
     location.pathname === "/extensions" ||
     location.pathname.startsWith("/extensions/");
-  const isAskRoute = location.pathname === "/ask";
+  const isSessionDetailRoute = isSessionReplayRoute(location.pathname);
+  const isMonitoringRoute =
+    location.pathname === "/monitoring" ||
+    location.pathname.startsWith("/monitoring/");
+  const isAskRoute = isAnalyticsAskPath(location.pathname);
+  // Settings brings its own navigation, header, and agent toggle, so it
+  // renders full width.
+  const settingsOwnsChrome = isSettingsPathname(location.pathname);
+  const isSettingsRoute = isAnalyticsSettingsPath(location.pathname);
+  const runningRuns = useRef<AnalyticsChatRunningRuns>(new Map());
   const chatHomeHandoffActive = useAgentChatHomeHandoff({
-    storageKey: "analytics",
+    storageKey: ANALYTICS_CHAT_STORAGE_KEY,
     activePath: location.pathname,
-    enabled: !isAskRoute,
+    ttlMs: ANALYTICS_RECENT_CHAT_HANDOFF_TTL_MS,
+    enabled: !isAskRoute && !isSettingsRoute,
   });
+  const chatHomeHandoffPending =
+    !isSettingsRoute &&
+    isAgentChatHomeHandoffActive(ANALYTICS_CHAT_STORAGE_KEY, {
+      ttlMs: ANALYTICS_RECENT_CHAT_HANDOFF_TTL_MS,
+    });
   useAgentChatHomeHandoffLinks({
-    storageKey: "analytics",
-    chatPath: "/ask",
+    storageKey: ANALYTICS_CHAT_STORAGE_KEY,
+    isChatPath: isAnalyticsAskPath,
+    ttlMs: ANALYTICS_RECENT_CHAT_HANDOFF_TTL_MS,
+    enabled: true,
+    requireActiveHandoff: true,
   });
-  const sidebarScope = chatHomeHandoffActive ? null : analyticsScope;
+  useEffect(() => {
+    discardAnalyticsChatHandoffOnSettings(location.pathname);
+  }, [location.pathname]);
+  useEffect(() => {
+    if (!isAskRoute) return;
+    const refreshHandoff = () => {
+      if (!hasTrackedAnalyticsChatRun(runningRuns.current)) return;
+      markAgentChatHomeHandoff(ANALYTICS_CHAT_STORAGE_KEY);
+    };
+    refreshHandoff();
+    const interval = window.setInterval(
+      refreshHandoff,
+      ANALYTICS_RECENT_CHAT_HANDOFF_TTL_MS / 2,
+    );
+    return () => window.clearInterval(interval);
+  }, [isAskRoute]);
+  useEffect(() => {
+    function handleChatRunning(event: Event) {
+      const detail = (event as CustomEvent).detail;
+      if (typeof detail?.isRunning !== "boolean") return;
+      if (isAnalyticsAskPath(location.pathname)) markAnalyticsChatActivity();
+      updateAnalyticsChatHandoffForRun(
+        runningRuns.current,
+        detail,
+        location.pathname,
+      );
+    }
 
-  function openAskAgentFullscreen() {
+    window.addEventListener("agentNative.chatRunning", handleChatRunning);
+    return () =>
+      window.removeEventListener("agentNative.chatRunning", handleChatRunning);
+  }, [location.pathname]);
+
+  function openAskAgentFullscreen(threadId?: string) {
     focusAgentChat();
-    navigateWithAgentChatViewTransition(navigate, "/ask");
+    navigateWithAgentChatViewTransition(
+      navigate,
+      analyticsAskThreadPath(threadId ?? null),
+    );
   }
 
   if (BARE_ROUTES.has(location.pathname)) {
-    return <>{children}</>;
+    return (
+      <>
+        <AgentCompletionSound />
+        {children}
+      </>
+    );
   }
 
   const contentFrame = (
     <div className="flex h-full flex-1 flex-col overflow-hidden">
-      <MobileNav />
-      {!isExtensionsRoute && !isAskRoute && <Header />}
+      {!settingsOwnsChrome && <MobileNav showNewChat={isAskRoute} />}
+      {!isExtensionsRoute &&
+        !isAskRoute &&
+        !isSessionDetailRoute &&
+        !isMonitoringRoute &&
+        !settingsOwnsChrome && <Header />}
       <InvitationBanner />
       <main
         className={
           isExtensionsRoute
-            ? "flex-1 overflow-y-auto"
-            : isAskRoute
-              ? "flex-1 overflow-hidden p-0"
-              : "flex-1 overflow-y-auto p-4 md:p-6 lg:p-8"
+            ? "agent-native-app-main flex-1 overflow-y-auto"
+            : isAskRoute || settingsOwnsChrome
+              ? "agent-native-app-main flex-1 overflow-hidden p-0"
+              : "agent-native-app-main flex-1 overflow-y-auto p-6 pt-2"
         }
       >
         {children}
@@ -117,13 +266,13 @@ export function Layout({ children }: LayoutProps) {
             questions={guidedQuestions}
             onSubmit={handleGuidedSubmit}
             onSkip={handleGuidedSkip}
-            title={guidedTitle ?? "Clarify the dashboard"}
-            description={
-              guidedDescription ??
-              "A few choices help the agent pick the right source, metrics, cuts, and layout before it writes SQL."
-            }
+            title={guidedTitle ?? t("guidedQuestions.title")}
+            description={guidedDescription ?? t("guidedQuestions.description")}
             skipLabel={guidedSkipLabel}
             submitLabel={guidedSubmitLabel}
+            isSubmissionBlocked={guidedSubmissionBlocked}
+            providerStatus={guidedProviderStatus}
+            onRetryProviderStatus={retryGuidedProviderStatus}
           />
         </div>
       )}
@@ -131,35 +280,50 @@ export function Layout({ children }: LayoutProps) {
   );
 
   return (
-    <HeaderActionsProvider>
-      <div className="flex h-screen w-full overflow-hidden bg-background text-foreground">
-        <div className="hidden shrink-0 md:block">
-          <Sidebar />
+    <>
+      <AgentCompletionSound />
+      <HeaderActionsProvider>
+        <div className="agent-layout-shell flex h-screen w-full overflow-hidden bg-background text-foreground">
+          {!settingsOwnsChrome && (
+            <div className="agent-layout-left-drawer hidden shrink-0 md:block">
+              <Sidebar />
+            </div>
+          )}
+          {isAskRoute ? (
+            <div className="agent-layout-main-surface flex min-w-0 flex-1 overflow-hidden">
+              {contentFrame}
+            </div>
+          ) : (
+            <AgentSidebar
+              position="right"
+              defaultOpen={false}
+              chatViewTransition
+              chatViewTransitionHandoff={chatHomeHandoffPending}
+              storageKey={ANALYTICS_CHAT_STORAGE_KEY}
+              browserTabId={TAB_ID}
+              openOnChatRunning={chatHomeHandoffActive}
+              onFullscreenRequest={openAskAgentFullscreen}
+              emptyStateText={t("chat.emptyState")}
+              agentPageHref="/settings/agent"
+              suggestions={[
+                t("chat.suggestionArrGrowth"),
+                t("chat.suggestionChurn"),
+                t("chat.suggestionAnomalies"),
+                t("chat.suggestionMrr"),
+              ]}
+              scope={analyticsScope}
+              chatHistory={analyticsChatHistory}
+              composerSlot={
+                creativeContextEnabled ? (
+                  <CreativeContextComposerChip />
+                ) : undefined
+              }
+            >
+              {contentFrame}
+            </AgentSidebar>
+          )}
         </div>
-        {isAskRoute ? (
-          contentFrame
-        ) : (
-          <AgentSidebar
-            position="right"
-            defaultOpen
-            chatViewTransition
-            storageKey="analytics"
-            browserTabId={TAB_ID}
-            openOnChatRunning={chatHomeHandoffActive}
-            onFullscreenRequest={openAskAgentFullscreen}
-            emptyStateText="Ask me to analyze a dashboard, compare trends, or dig into data..."
-            suggestions={[
-              "What's driving ARR growth this quarter?",
-              "Show me churn trends over the last 6 months",
-              "Analyze the HubSpot Sales dashboard for anomalies",
-              "Compare MRR between enterprise and SMB",
-            ]}
-            scope={sidebarScope}
-          >
-            {contentFrame}
-          </AgentSidebar>
-        )}
-      </div>
-    </HeaderActionsProvider>
+      </HeaderActionsProvider>
+    </>
   );
 }

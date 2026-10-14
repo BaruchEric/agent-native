@@ -1,6 +1,9 @@
+import { readFileSync } from "node:fs";
+
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  buildCurrentTimeUserContext,
   buildRuntimeContextPrompt,
   MAX_SUBAGENT_DELEGATION_DEPTH,
   resolveMaxSubagentDelegationDepth,
@@ -14,8 +17,7 @@ describe("buildRuntimeContextPrompt", () => {
     });
 
     expect(prompt).toContain("<runtime-context>");
-    expect(prompt).toContain("currentUtc: 2026-05-03T18:30:00.000Z");
-    expect(prompt).toContain("currentDateUtc: 2026-05-03");
+    expect(prompt).toContain("currentDate: 2026-05-03");
     expect(prompt).toContain("currentTimezone: America/New_York");
     expect(prompt).toContain("currentDateInTimezone: 2026-05-03");
     expect(prompt).toContain("relative dates");
@@ -29,6 +31,29 @@ describe("buildRuntimeContextPrompt", () => {
 
     expect(prompt).toContain("currentTimezone: UTC");
     expect(prompt).toContain("currentDateInTimezone: 2026-05-03");
+  });
+
+  it("carries no sub-day-granularity timestamp so the cached system-prompt prefix stays stable", () => {
+    const prompt = buildRuntimeContextPrompt({
+      now: new Date("2026-05-03T18:30:45.123Z"),
+      timezone: "America/New_York",
+    });
+
+    expect(prompt).not.toMatch(/\d{2}:\d{2}/);
+    expect(prompt).not.toContain("2026-05-03T");
+    expect(prompt).not.toContain("currentUtc");
+  });
+
+  it("is byte-identical for any two instants within the same calendar day", () => {
+    const morning = buildRuntimeContextPrompt({
+      now: new Date("2026-05-03T00:00:01Z"),
+      timezone: "UTC",
+    });
+    const night = buildRuntimeContextPrompt({
+      now: new Date("2026-05-03T23:59:59.999Z"),
+      timezone: "UTC",
+    });
+    expect(morning).toBe(night);
   });
 
   it("omits delegation lines for the top-level agent (depth 0 / unset)", () => {
@@ -59,6 +84,54 @@ describe("buildRuntimeContextPrompt", () => {
       `delegationDepth: ${MAX_SUBAGENT_DELEGATION_DEPTH}`,
     );
     expect(prompt).toContain("cannot spawn further sub-agents");
+  });
+});
+
+describe("buildCurrentTimeUserContext", () => {
+  it("carries the precise current time for per-turn user-message injection", () => {
+    const block = buildCurrentTimeUserContext({
+      now: new Date("2026-05-03T18:30:45.123Z"),
+      timezone: "America/New_York",
+    });
+
+    expect(block).toContain("<current-time>");
+    expect(block).toContain("currentUtc: 2026-05-03T18:30:45.123Z");
+    expect(block).toContain("currentTimezone: America/New_York");
+    expect(block).toMatch(/currentTimeInTimezone: .*2:30/);
+  });
+
+  it("falls back to UTC when the timezone is invalid", () => {
+    const block = buildCurrentTimeUserContext({
+      now: new Date("2026-05-03T18:30:45.123Z"),
+      timezone: "not/a-zone",
+    });
+
+    expect(block).toContain("currentTimezone: UTC");
+    expect(block).toContain("currentUtc: 2026-05-03T18:30:45.123Z");
+  });
+});
+
+describe("prompt-caching wiring guards", () => {
+  it("production-agent injects the precise per-turn time into the user message", () => {
+    const source = readFileSync("src/agent/production-agent.ts", {
+      encoding: "utf-8",
+    });
+    expect(source).toContain(
+      'import { buildCurrentTimeUserContext } from "./runtime-context.js"',
+    );
+    expect(source).toContain('presendCap("time", timeContextThunk, "", 9000)');
+    expect(source).toContain(
+      "const screenContext = timeBlock + screenBlock + urlBlock + selectionBlock;",
+    );
+  });
+
+  it("agent-chat-plugin appends the runtime-context block last at every assembly site", () => {
+    const source = readFileSync("src/server/agent-chat-plugin.ts", {
+      encoding: "utf-8",
+    });
+    expect(source).not.toMatch(/\bruntimeContext\b\s*\+/);
+    expect(source).not.toMatch(/runtimeContextForEvent\([^)]*\)\s*\+/);
+    expect(source).not.toMatch(/buildRuntimeContextPrompt\([^)]*\)\s*\+/);
   });
 });
 

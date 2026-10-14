@@ -1,3 +1,7 @@
+import { type H3Event } from "h3";
+
+import { getSession } from "./auth.js";
+import { registerErrorCaptureProvider } from "./capture-error.js";
 /**
  * Nitro plugin that initializes server-side Sentry and attaches per-request
  * user context.
@@ -5,12 +9,16 @@
  * Wires three pieces:
  *   1. On startup, `initServerSentry()` reads `SENTRY_SERVER_DSN`/`SENTRY_DSN` and arms
  *      the SDK (no-op when the env var is unset).
- *   2. On every request, hook into Nitro's `request` event: resolve the
+ *   2. Registers Sentry as a `captureError()` backend, so route errors and
+ *      explicit captures alike reach it through the shared registry.
+ *   3. On every request, hook into Nitro's `request` event: resolve the
  *      session via `getSession(event)` and tag the per-request isolation
  *      scope with the user's id/email/orgId. Wrapped in try/catch so a
  *      session-resolution failure can never 500 the request.
- *   3. On every Nitro `error` event, capture the exception with the route,
- *      method, and user-agent attached as searchable tags.
+ *
+ * It does NOT hook Nitro's `error` event — that is provider-agnostic and lives
+ * in `core-routes-plugin.ts`, so error reporting works with PostHog (or any
+ * other backend) configured and no Sentry DSN set at all.
  *
  * Mounted as a default plugin from `framework-request-handler.ts` —
  * templates that don't define `server/plugins/sentry.ts` get this for
@@ -21,7 +29,7 @@ import {
   awaitBootstrap,
   markDefaultPluginProvided,
 } from "./framework-request-handler.js";
-import { getSession } from "./auth.js";
+import { addRequestContextObserver } from "./request-context.js";
 import {
   captureRouteError,
   initServerSentry,
@@ -29,9 +37,6 @@ import {
   setSentryRequestContext,
   setSentryUserForRequest,
 } from "./sentry.js";
-import { registerErrorCaptureProvider } from "./capture-error.js";
-import { addRequestContextObserver } from "./request-context.js";
-import { getHeader, getMethod, type H3Event } from "h3";
 
 type NitroPluginDef = (nitroApp: any) => void | Promise<void>;
 
@@ -43,22 +48,8 @@ function readRoute(event: H3Event): string | undefined {
   }
 }
 
-function readUserAgent(event: H3Event): string | undefined {
-  try {
-    return getHeader(event, "user-agent");
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Skip session resolution for paths that obviously don't need one. Avoids
- * a DB round-trip on every static-asset / favicon / public-share request
- * while keeping API + framework routes covered.
- */
 function shouldResolveSession(path: string | undefined): boolean {
   if (!path) return false;
-  // Vite / React Router static assets and similar.
   if (
     path.startsWith("/assets/") ||
     path.startsWith("/_build/") ||
@@ -75,10 +66,8 @@ export function createSentryPlugin(): NitroPluginDef {
     markDefaultPluginProvided(nitroApp, "sentry");
     await awaitBootstrap(nitroApp);
 
-    initServerSentry();
+    await initServerSentry();
     if (!isServerSentryEnabled()) {
-      // No DSN — skip wiring per-request hooks. We'd just be paying the
-      // call-site overhead for every request to no effect.
       return;
     }
 
@@ -108,30 +97,12 @@ export function createSentryPlugin(): NitroPluginDef {
       setSentryRequestContext({ userEmail: ctx.userEmail, orgId: ctx.orgId });
     });
 
-    // Per-error: capture with route/method/UA tags. Nitro's `error` hook
-    // signature is (error, { event, tags }) — we forward what we can.
-    nitroApp.hooks?.hook?.(
-      "error",
-      (error: unknown, ctx?: { event?: H3Event }) => {
-        try {
-          const event = ctx?.event;
-          captureRouteError(error, {
-            route: event ? readRoute(event) : undefined,
-            method: event ? getMethod(event) : undefined,
-            userAgent: event ? readUserAgent(event) : undefined,
-          });
-        } catch {
-          // Sentry capture must never escape into Nitro's error path.
-        }
-      },
-    );
+    // Route errors are NOT hooked here. `core-routes-plugin.ts` owns the
+    // provider-agnostic Nitro `error` hook and routes it through
+    // `captureError()`, which reaches Sentry via the registration above along
+    // with every other configured backend. Hooking it here too would report
+    // each route error to Sentry twice.
   };
 }
 
-/**
- * Default Sentry plugin — auto-mounts when a template doesn't define its
- * own `server/plugins/sentry.ts`. Reads `SENTRY_SERVER_DSN`/`SENTRY_DSN` from env and
- * silently no-ops when it's unset, so this is safe to default-mount in
- * every template (including local dev with no DSN configured).
- */
 export const defaultSentryPlugin: NitroPluginDef = createSentryPlugin();

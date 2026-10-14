@@ -1,8 +1,6 @@
-/**
- * Disconnect the current user's Zoom account(s).
- */
-import { defineEventHandler, setResponseStatus, type H3Event } from "h3";
 import { getSession } from "@agent-native/core/server";
+import { defineEventHandler, setResponseStatus, type H3Event } from "h3";
+
 import { disconnectZoom } from "../../../lib/zoom.js";
 
 export default defineEventHandler(async (event: H3Event) => {

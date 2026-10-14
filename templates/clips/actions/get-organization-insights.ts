@@ -1,22 +1,11 @@
-/**
- * Aggregate analytics across an entire organization.
- *
- * Produces:
- *   - totals for the period (views, reactions, comments, recordings)
- *   - top videos by counted views / reactions / comments
- *   - top creators (by recordings, views, engagement)
- *   - day-by-day engagement trend (views + reactions + comments per day)
- *
- * Usage:
- *   pnpm action get-organization-insights
- *   pnpm action get-organization-insights --organizationId=<id> --days=14
- */
-
-import { defineAction } from "@agent-native/core";
-import { and, eq, gte, inArray } from "drizzle-orm";
+import { defineAction } from "@agent-native/core/action";
+import { getUserProfiles } from "@agent-native/core/user-profile/server";
+import { and, desc, eq, gte, inArray } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import { requireOrganizationAccess } from "../server/lib/recordings.js";
+import { profileNameFor } from "../server/lib/user-identities.js";
 
 function startOfDay(d: Date): Date {
   const out = new Date(d);
@@ -27,6 +16,9 @@ function startOfDay(d: Date): Date {
 function isoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
+
+const MAX_RECORDINGS = 2000;
+const MAX_ENGAGEMENT_ROWS = 20000;
 
 export default defineAction({
   description:
@@ -56,18 +48,25 @@ export default defineAction({
     const startIso = start.toISOString();
     const endIso = now.toISOString();
 
-    // All recordings in this organization. Filter engagement down to this set.
     const recordings = await db
-      .select()
+      .select({
+        id: schema.recordings.id,
+        title: schema.recordings.title,
+        ownerEmail: schema.recordings.ownerEmail,
+        createdAt: schema.recordings.createdAt,
+        trashedAt: schema.recordings.trashedAt,
+      })
       .from(schema.recordings)
-      .where(eq(schema.recordings.organizationId, organizationId));
+      .where(eq(schema.recordings.organizationId, organizationId))
+      .orderBy(desc(schema.recordings.createdAt))
+      .limit(MAX_RECORDINGS);
+    const truncatedRecordings = recordings.length >= MAX_RECORDINGS;
     const recordingIds = recordings.map((r) => r.id);
     const titleById = new Map(recordings.map((r) => [r.id, r.title] as const));
     const ownerById = new Map(
       recordings.map((r) => [r.id, r.ownerEmail] as const),
     );
 
-    // Totals for the period.
     const totals = {
       views: 0,
       reactions: 0,
@@ -77,10 +76,12 @@ export default defineAction({
       ).length,
     };
 
-    // Views: counted viewers first-viewed within the period.
     const viewerRows = recordingIds.length
       ? await db
-          .select()
+          .select({
+            recordingId: schema.recordingViewers.recordingId,
+            firstViewedAt: schema.recordingViewers.firstViewedAt,
+          })
           .from(schema.recordingViewers)
           .where(
             and(
@@ -89,12 +90,17 @@ export default defineAction({
               gte(schema.recordingViewers.firstViewedAt, startIso),
             ),
           )
+          .limit(MAX_ENGAGEMENT_ROWS)
       : [];
     totals.views = viewerRows.length;
+    const truncatedViewers = viewerRows.length >= MAX_ENGAGEMENT_ROWS;
 
     const reactionRows = recordingIds.length
       ? await db
-          .select()
+          .select({
+            recordingId: schema.recordingReactions.recordingId,
+            createdAt: schema.recordingReactions.createdAt,
+          })
           .from(schema.recordingReactions)
           .where(
             and(
@@ -102,12 +108,17 @@ export default defineAction({
               gte(schema.recordingReactions.createdAt, startIso),
             ),
           )
+          .limit(MAX_ENGAGEMENT_ROWS)
       : [];
     totals.reactions = reactionRows.length;
+    const truncatedReactions = reactionRows.length >= MAX_ENGAGEMENT_ROWS;
 
     const commentRows = recordingIds.length
       ? await db
-          .select()
+          .select({
+            recordingId: schema.recordingComments.recordingId,
+            createdAt: schema.recordingComments.createdAt,
+          })
           .from(schema.recordingComments)
           .where(
             and(
@@ -115,10 +126,11 @@ export default defineAction({
               gte(schema.recordingComments.createdAt, startIso),
             ),
           )
+          .limit(MAX_ENGAGEMENT_ROWS)
       : [];
     totals.comments = commentRows.length;
+    const truncatedComments = commentRows.length >= MAX_ENGAGEMENT_ROWS;
 
-    // Top videos.
     const viewsByRec: Record<string, number> = {};
     for (const v of viewerRows) {
       viewsByRec[v.recordingId] = (viewsByRec[v.recordingId] ?? 0) + 1;
@@ -148,7 +160,6 @@ export default defineAction({
       byComments: mk(commentsByRec),
     };
 
-    // Top creators — combine views + reactions + comments per owner, over the period.
     const creatorStats: Record<
       string,
       { email: string; recordings: number; views: number; engagement: number }
@@ -178,8 +189,14 @@ export default defineAction({
     const topCreators = Object.values(creatorStats)
       .sort((a, b) => b.views + b.engagement - (a.views + a.engagement))
       .slice(0, args.topN);
+    const creatorProfiles = await getUserProfiles(
+      topCreators.map((creator) => creator.email),
+    );
+    const topCreatorsWithProfiles = topCreators.map((creator) => ({
+      ...creator,
+      name: profileNameFor(creator.email, null, creatorProfiles),
+    }));
 
-    // Trend: per-day tallies for the period.
     const trendMap = new Map<
       string,
       { date: string; views: number; reactions: number; comments: number }
@@ -204,8 +221,13 @@ export default defineAction({
       period: { days: args.days, start: startIso, end: endIso },
       totals,
       topVideos,
-      topCreators,
+      topCreators: topCreatorsWithProfiles,
       trend,
+      truncated:
+        truncatedRecordings ||
+        truncatedViewers ||
+        truncatedReactions ||
+        truncatedComments,
     };
   },
 });

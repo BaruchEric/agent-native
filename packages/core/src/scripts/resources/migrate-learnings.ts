@@ -1,17 +1,7 @@
-/**
- * Core script: migrate-learnings
- *
- * Migrate a learnings.md file from the project root into the SQL resource store.
- *
- * Usage:
- *   pnpm action migrate-learnings
- */
-
 import fs from "fs";
 import path from "path";
-import { resourcePut } from "../../resources/store.js";
-import { getRequestUserEmail } from "../../server/request-context.js";
-import { fail } from "../utils.js";
+
+import { resourcePut, SHARED_OWNER } from "../../resources/store.js";
 
 export default async function migrateLearningsScript(
   _args: string[],
@@ -24,20 +14,14 @@ export default async function migrateLearningsScript(
   }
 
   const content = fs.readFileSync(filePath, "utf-8");
-  const owner = getRequestUserEmail() ?? process.env.AGENT_USER_EMAIL;
-  if (!owner) {
-    fail(
-      "migrate-learnings requires an authenticated user (request context or AGENT_USER_EMAIL env var).",
-    );
-  }
 
   const resource = await resourcePut(
-    owner,
-    "learnings.md",
+    SHARED_OWNER,
+    "LEARNINGS.md",
     content,
     "text/markdown",
   );
   console.log(
-    `Migrated learnings.md to resource store (${resource.size} bytes)`,
+    `Migrated learnings.md to shared resource store as LEARNINGS.md (${resource.size} bytes)`,
   );
 }

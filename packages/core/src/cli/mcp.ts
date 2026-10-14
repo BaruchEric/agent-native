@@ -1,23 +1,16 @@
-/**
- * `agent-native mcp <subcommand>` — connect external coding agents (Claude
- * Code desktop & CLI, Claude Cowork, Codex, Cursor, OpenCode, GitHub Copilot /
- * VS Code) to this agent-native app/workspace over MCP.
- *
- *   serve      Run the MCP stdio transport (this is what client configs spawn).
- *   install    Provision a token + write the client's MCP config idempotently.
- *   uninstall  Remove the named entry from a client's MCP config.
- *   status     Print resolved MCP URL/port, token state, and per-client entries.
- *   token      Print or rotate the local ACCESS_TOKEN in the workspace .env.
- *
- * Node-only CLI module. Hand-rolled `.env` upsert + minimal TOML block merge
- * keep this dependency-free (no new npm deps).
- */
-
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
+import { MCP_PUBLIC_ROUTE_PREFIX } from "../mcp/route-paths.js";
+import { runScreenMemoryMCPStdio } from "../mcp/screen-memory-stdio.js";
 import { runMCPStdio } from "../mcp/stdio.js";
+import {
+  findWorkspaceRoot,
+  resolveLocalAppOrigin,
+  resolveWorkspace,
+} from "../mcp/workspace-resolve.js";
 import {
   CLIENTS,
   type ClientId,
@@ -33,19 +26,16 @@ import {
   writeFileAtomic,
   writeJsonMcpEntryForClient,
 } from "./mcp-config-writers.js";
-import {
-  findWorkspaceRoot,
-  resolveLocalAppOrigin,
-  resolveWorkspace,
-} from "../mcp/workspace-resolve.js";
 
 const SERVER_NAME_PREFIX = "agent-native";
+const SCREEN_MEMORY_SERVER_NAME = "clips-screen-memory";
 
 interface ParsedArgs {
   _: string[];
   client?: string;
   app?: string;
   port?: number;
+  screenMemoryDir?: string;
   scope?: string;
   standalone: boolean;
   rotate: boolean;
@@ -64,6 +54,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     if ((v = eat("--client")) !== undefined) out.client = v;
     else if ((v = eat("--app")) !== undefined) out.app = v;
     else if ((v = eat("--port")) !== undefined) out.port = Number(v);
+    else if ((v = eat("--dir")) !== undefined) out.screenMemoryDir = v;
     else if ((v = eat("--scope")) !== undefined) out.scope = v;
     else if (a === "--standalone") out.standalone = true;
     else if (a === "--rotate") out.rotate = true;
@@ -79,16 +70,67 @@ function logOut(msg: string): void {
   process.stdout.write(`${msg}\n`);
 }
 
-// ---------------------------------------------------------------------------
-// .env token provisioning (local dev) — hand-rolled idempotent upsert
-// ---------------------------------------------------------------------------
+export interface ScreenMemoryStoreResolutionOptions {
+  explicitDir?: string;
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  homeDir?: string;
+}
 
-/** Workspace root (or cwd for a standalone app) — where .env lives. */
+function existingScreenMemoryStore(candidate: string): string | undefined {
+  const resolved = path.resolve(candidate);
+  try {
+    return fs.statSync(resolved).isDirectory() ? resolved : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function resolveScreenMemoryStoreDir(
+  options: ScreenMemoryStoreResolutionOptions = {},
+): string | undefined {
+  if (options.explicitDir)
+    return existingScreenMemoryStore(options.explicitDir);
+  const env = options.env ?? process.env;
+  const override =
+    env.CLIPS_SCREEN_MEMORY_DIR || env.AGENT_NATIVE_SCREEN_MEMORY_DIR;
+  if (override) return existingScreenMemoryStore(override);
+
+  const platform = options.platform ?? process.platform;
+  const home = options.homeDir ?? os.homedir();
+  const appDataRoot =
+    platform === "darwin"
+      ? path.join(home, "Library", "Application Support")
+      : platform === "win32"
+        ? env.APPDATA || path.join(home, "AppData", "Roaming")
+        : env.XDG_DATA_HOME || path.join(home, ".local", "share");
+  return ["com.clips.tray", "com.clips.tray.alpha"]
+    .map((bundleId) => path.join(appDataRoot, bundleId, "screen-memory"))
+    .filter((candidate) => existingScreenMemoryStore(candidate))
+    .map((candidate) => ({
+      candidate,
+      modifiedAt: Math.max(
+        fs.statSync(candidate).mtimeMs,
+        ...["feature-config.json", "chapters.json"]
+          .map((name) =>
+            name === "feature-config.json"
+              ? path.join(path.dirname(candidate), name)
+              : path.join(candidate, name),
+          )
+          .filter((file) => fs.existsSync(file))
+          .map((file) => fs.statSync(file).mtimeMs),
+      ),
+    }))
+    .sort(
+      (a, b) =>
+        b.modifiedAt - a.modifiedAt || a.candidate.localeCompare(b.candidate),
+    )[0]?.candidate;
+}
+
 function envBaseDir(cwd = process.cwd()): string {
   return findWorkspaceRoot(cwd) ?? path.resolve(cwd);
 }
 
-/** Prefer .env.local, else .env. Returns the path we should write to. */
 function envFilePath(baseDir: string): string {
   const local = path.join(baseDir, ".env.local");
   if (fs.existsSync(local)) return local;
@@ -103,7 +145,6 @@ function readEnvFile(file: string): string {
   }
 }
 
-/** Read a single key from a dotenv-format string (last assignment wins). */
 function getEnvValue(content: string, key: string): string | undefined {
   let found: string | undefined;
   for (const line of content.split(/\r?\n/)) {
@@ -148,10 +189,6 @@ function generateToken(): string {
   return crypto.randomBytes(24).toString("base64url");
 }
 
-/**
- * Ensure a local ACCESS_TOKEN exists in the workspace .env and return it.
- * Existing tokens are reused (never clobbered). Set `rotate` to replace it.
- */
 function ensureLocalToken(
   cwd: string,
   rotate = false,
@@ -168,16 +205,6 @@ function ensureLocalToken(
   return { token, file, created: true };
 }
 
-// ---------------------------------------------------------------------------
-// Hosted vs local detection
-// ---------------------------------------------------------------------------
-
-/**
- * Detect a hosted deployment URL. When the workspace .env points at a hosted
- * origin (APP_URL / BETTER_AUTH_URL with a non-localhost host) we write an
- * `http` client entry pointing at `<origin>/_agent-native/mcp` with a JWT
- * bearer instead of a stdio entry.
- */
 function detectHostedUrl(cwd: string): string | undefined {
   const baseDir = envBaseDir(cwd);
   const content =
@@ -190,7 +217,8 @@ function detectHostedUrl(cwd: string): string | undefined {
     try {
       const u = new URL(v);
       if (!/^(localhost|127\.0\.0\.1|\[::1\])$/.test(u.hostname)) {
-        return `${u.origin}/_agent-native/mcp`;
+        const appPath = u.pathname.replace(/\/+$/, "");
+        return `${u.origin}${appPath === "/" ? "" : appPath}${MCP_PUBLIC_ROUTE_PREFIX}`;
       }
     } catch {
       // not a URL — skip
@@ -200,26 +228,30 @@ function detectHostedUrl(cwd: string): string | undefined {
 }
 
 async function mintHostedJwt(cwd: string): Promise<string | undefined> {
-  // Reuse the existing A2A signer — do not reinvent JWT minting.
   const owner =
     process.env.AGENT_NATIVE_OWNER_EMAIL ||
     process.env.OWNER_EMAIL ||
     "owner@localhost";
+  let fileA2ASecret: string | undefined;
   if (!process.env.A2A_SECRET) {
     const baseDir = envBaseDir(cwd);
     const content =
       readEnvFile(path.join(baseDir, ".env.local")) +
       "\n" +
       readEnvFile(path.join(baseDir, ".env"));
-    const secret = getEnvValue(content, "A2A_SECRET");
-    if (secret) process.env.A2A_SECRET = secret;
+    fileA2ASecret = getEnvValue(content, "A2A_SECRET");
   }
   try {
     const { signA2AToken } = await import("../a2a/client.js");
-    return await signA2AToken(owner, undefined, undefined, {
-      preferGlobalSecret: true,
-      expiresIn: "30d",
-    });
+    return await signA2AToken(
+      owner,
+      undefined,
+      process.env.A2A_SECRET || fileA2ASecret,
+      {
+        preferGlobalSecret: true,
+        expiresIn: "30d",
+      },
+    );
   } catch (err: any) {
     logErr(
       `  Could not mint a hosted JWT (${err?.message ?? err}). ` +
@@ -228,10 +260,6 @@ async function mintHostedJwt(cwd: string): Promise<string | undefined> {
     return undefined;
   }
 }
-
-// ---------------------------------------------------------------------------
-// Client config entries
-// ---------------------------------------------------------------------------
 
 interface ServerEntryInputs {
   serverName: string;
@@ -273,10 +301,6 @@ function buildCodexBlock(name: string, i: ServerEntryInputs): string {
   return buildCodexLocalBlock(name, mcpServeArgs(i), mcpServeEnv(i));
 }
 
-// ---------------------------------------------------------------------------
-// Per-client install/uninstall/status
-// ---------------------------------------------------------------------------
-
 function configPathFor(
   client: ClientId,
   cwd: string,
@@ -289,9 +313,6 @@ function serverNameFor(appId: string): string {
   return `${SERVER_NAME_PREFIX}-${appId}`;
 }
 
-// Clients advertised in usage/help and listed by status. Excludes the legacy
-// `claude-code-cli` alias so only a single "Claude Code" appears (it is still
-// accepted via --client and collapses to claude-code).
 const SELECTABLE_CLIENTS: ClientId[] = CLIENTS.filter(
   (c) => c !== "claude-code-cli",
 );
@@ -328,6 +349,38 @@ function installForClient(
       file,
       name,
       buildJsonServerEntry(client, inputs),
+    );
+  }
+  return file;
+}
+
+export function installScreenMemoryForClient(
+  client: ClientId,
+  storeDir: string,
+  cwd: string,
+  scope: string | undefined,
+): string {
+  const file = configPathFor(client, cwd, scope);
+  const args = [
+    "-y",
+    "@agent-native/core@latest",
+    "mcp",
+    "screen-memory",
+    "--dir",
+    path.resolve(storeDir),
+  ];
+  if (client === "codex") {
+    writeCodexBlock(
+      file,
+      SCREEN_MEMORY_SERVER_NAME,
+      buildCodexLocalBlock(SCREEN_MEMORY_SERVER_NAME, args, {}, "npx"),
+    );
+  } else {
+    writeJsonMcpEntryForClient(
+      client,
+      file,
+      SCREEN_MEMORY_SERVER_NAME,
+      buildLocalMcpEntryForClient(client, args, {}, "npx"),
     );
   }
   return file;
@@ -371,10 +424,6 @@ function clientHasEntry(client: ClientId, appId: string, cwd: string): boolean {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Subcommands
-// ---------------------------------------------------------------------------
-
 async function cmdServe(p: ParsedArgs): Promise<void> {
   await runMCPStdio({
     appId: p.app,
@@ -394,7 +443,6 @@ async function cmdInstall(p: ParsedArgs): Promise<void> {
   }
   const cwd = process.cwd();
 
-  // Resolve which app this entry targets (default = workspace default app).
   let appId = p.app;
   if (!appId) {
     try {
@@ -442,6 +490,36 @@ async function cmdInstall(p: ParsedArgs): Promise<void> {
         })`,
   );
   logOut(`  Restart ${client} to pick up the new MCP server.`);
+}
+
+function cmdInstallScreenMemory(p: ParsedArgs): void {
+  const client = normalizeClientId(p.client);
+  if (!client) {
+    logErr(
+      `Usage: npx @agent-native/core@latest mcp install-screen-memory --client ${SELECTABLE_CLIENTS.join("|")} [--dir <path>] [--scope user|project]`,
+    );
+    process.exit(1);
+  }
+  const screenMemoryDir = resolveScreenMemoryStoreDir({
+    explicitDir: p.screenMemoryDir,
+  });
+  if (!screenMemoryDir) {
+    logErr(
+      "No local Clips Screen Memory store was found. Turn Rewind on in Clips, or pass --dir <path>.",
+    );
+    process.exit(1);
+  }
+  const file = installScreenMemoryForClient(
+    client,
+    screenMemoryDir,
+    process.cwd(),
+    p.scope,
+  );
+  logOut(`Installed \"${SCREEN_MEMORY_SERVER_NAME}\" for ${client} → ${file}`);
+  logOut("  Store: current local Clips Rewind memory");
+  logOut(
+    `  Restart ${client} to pick up the repaired Screen Memory MCP server.`,
+  );
 }
 
 function cmdUninstall(p: ParsedArgs): void {
@@ -493,9 +571,7 @@ async function cmdStatus(): Promise<void> {
   logOut(
     hostedUrl
       ? `  MCP URL:    ${hostedUrl} (hosted)`
-      : `  MCP URL:    ${origin}/_agent-native/mcp${
-          port ? ` (port ${port})` : ""
-        }`,
+      : `  MCP URL:    ${origin}/mcp${port ? ` (port ${port})` : ""}`,
   );
   logOut(`  ACCESS_TOKEN: ${hasToken ? "set" : "not set"} (.env)`);
   logOut(`  A2A_SECRET:   ${hasA2A ? "set" : "not set"}`);
@@ -532,6 +608,15 @@ Usage:
       Run the MCP stdio transport (what client configs spawn).
       Default: proxy to the running local app; --standalone builds from disk.
 
+  npx @agent-native/core@latest mcp screen-memory [--dir <path>]
+      Run the local Clips Screen Memory stdio server.
+      Defaults to the Clips app-data screen-memory folder.
+
+  npx @agent-native/core@latest mcp install-screen-memory --client <c> [--dir <path>] [--scope user|project]
+      Install or repair the dedicated local Screen Memory MCP. The active Clips
+      or Clips Alpha store is discovered automatically; --dir is an override.
+      Clients: claude-code, codex, cowork, cursor, opencode, github-copilot
+
   npx @agent-native/core@latest mcp install --client <c> [--app <id>] [--scope user|project]
       Provision a token and write the client's MCP config (idempotent).
       Clients: claude-code, codex, cowork, cursor, opencode, github-copilot
@@ -553,8 +638,14 @@ export async function runMcp(args: string[]): Promise<void> {
     case "serve":
       await cmdServe(p);
       return;
+    case "screen-memory":
+      await runScreenMemoryMCPStdio({ storeDir: p.screenMemoryDir });
+      return;
     case "install":
       await cmdInstall(p);
+      return;
+    case "install-screen-memory":
+      cmdInstallScreenMemory(p);
       return;
     case "uninstall":
       cmdUninstall(p);

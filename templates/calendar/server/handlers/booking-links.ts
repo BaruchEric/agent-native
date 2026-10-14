@@ -1,4 +1,15 @@
 import {
+  getSession,
+  readBody,
+  runWithRequestContext,
+} from "@agent-native/core/server";
+import {
+  getRequestUserEmail,
+  getRequestOrgId,
+} from "@agent-native/core/server/request-context";
+import { accessFilter, assertAccess } from "@agent-native/core/sharing";
+import { desc, eq } from "drizzle-orm";
+import {
   createError,
   defineEventHandler,
   getQuery,
@@ -7,24 +18,21 @@ import {
   type H3Event,
 } from "h3";
 import { nanoid } from "nanoid";
-import { desc, eq } from "drizzle-orm";
-import { accessFilter, assertAccess } from "@agent-native/core/sharing";
-import {
-  getRequestUserEmail,
-  getRequestOrgId,
-} from "@agent-native/core/server/request-context";
+
 import { getDb, schema } from "../db/index.js";
-import {
-  getSession,
-  readBody,
-  runWithRequestContext,
-} from "@agent-native/core/server";
-import { ensureBookingUsername } from "./booking-usernames.js";
 import { normalizeBookingDurationInput } from "../lib/booking-durations.js";
 import {
+  getEligibleHostAvailability,
+  withHostTimezones,
+} from "../lib/booking-host-availability.js";
+import {
+  getBookingLinkRequiredHostEmails,
   rowToBookingLink,
   serializeBookingHosts,
 } from "../lib/booking-link-utils.js";
+import { displayNameFromIdentifier } from "../lib/booking-og-image.js";
+import { getOwnerBookingTimeZone } from "../lib/booking-timezone.js";
+import { ensureBookingUsername } from "./booking-usernames.js";
 
 async function requireRequestContext<T>(
   event: H3Event,
@@ -122,6 +130,7 @@ export const createBookingLink = defineEventHandler(async (event: H3Event) => {
           isActive: body.isActive ?? true,
           ownerEmail,
           orgId: getRequestOrgId(),
+          visibility: "private",
           createdAt: now,
           updatedAt: now,
         });
@@ -138,36 +147,41 @@ export const createBookingLink = defineEventHandler(async (event: H3Event) => {
   });
 });
 
+export async function deleteBookingLinkById(id: string) {
+  if (!id)
+    throw createError({ statusCode: 400, statusMessage: "id is required" });
+
+  await assertAccess("booking-link", id, "admin");
+
+  const toDelete = await getDb()
+    .select({
+      slug: schema.bookingLinks.slug,
+      title: schema.bookingLinks.title,
+      duration: schema.bookingLinks.duration,
+    })
+    .from(schema.bookingLinks)
+    .where(eq(schema.bookingLinks.id, id));
+  await getDb()
+    .delete(schema.bookingLinks)
+    .where(eq(schema.bookingLinks.id, id));
+
+  if (toDelete.length > 0) {
+    await getDb()
+      .delete(schema.bookingSlugRedirects)
+      .where(eq(schema.bookingSlugRedirects.newSlug, toDelete[0].slug));
+  }
+  return {
+    ok: true,
+    ...(toDelete[0]
+      ? { title: toDelete[0].title, duration: toDelete[0].duration }
+      : {}),
+  };
+}
+
 export const deleteBookingLink = defineEventHandler(async (event: H3Event) => {
   return requireRequestContext(event, async () => {
     try {
-      const id = getRouterParam(event, "id");
-      if (!id) {
-        setResponseStatus(event, 400);
-        return { error: "id is required" };
-      }
-
-      // Sharing: only owner / admin grantees can delete.
-      await assertAccess("booking-link", id, "admin");
-
-      // Get the slug before deleting so we can clean up redirects
-      const toDelete = await getDb()
-        .select({ slug: schema.bookingLinks.slug })
-        .from(schema.bookingLinks)
-        .where(eq(schema.bookingLinks.id, id));
-
-      await getDb()
-        .delete(schema.bookingLinks)
-        .where(eq(schema.bookingLinks.id, id));
-
-      // Clean up redirects that point to the deleted link's slug
-      if (toDelete.length > 0) {
-        await getDb()
-          .delete(schema.bookingSlugRedirects)
-          .where(eq(schema.bookingSlugRedirects.newSlug, toDelete[0].slug));
-      }
-
-      return { ok: true };
+      return await deleteBookingLinkById(getRouterParam(event, "id") ?? "");
     } catch (error: any) {
       const status = error?.statusCode ?? 500;
       setResponseStatus(event, status);
@@ -176,10 +190,6 @@ export const deleteBookingLink = defineEventHandler(async (event: H3Event) => {
   });
 });
 
-// PUBLIC booking page — unauthenticated visitors fetch a link by slug to book.
-// This is the anonymous-booking axis and MUST NOT apply the sharing filter.
-// Sharing controls who can MANAGE the link; the public slug controls who can
-// BOOK via the link (gated only by `isActive` + explicit publish).
 export const getPublicBookingLink = defineEventHandler(
   async (event: H3Event) => {
     try {
@@ -199,7 +209,6 @@ export const getPublicBookingLink = defineEventHandler(
         .where(eq(schema.bookingLinks.slug, slug));
 
       if (rows.length === 0 || !rows[0].isActive) {
-        // Check if there's a redirect for this slug
         const redirect = await getDb()
           .select({ newSlug: schema.bookingSlugRedirects.newSlug })
           .from(schema.bookingSlugRedirects)
@@ -234,7 +243,22 @@ export const getPublicBookingLink = defineEventHandler(
         };
       }
 
-      return rowToBookingLink(rows[0]);
+      const bookingLink = rowToBookingLink(rows[0]);
+      const [ownerTimezone, eligibleHosts] = await Promise.all([
+        getOwnerBookingTimeZone(rows[0].ownerEmail),
+        getEligibleHostAvailability(
+          rows[0].ownerEmail,
+          getBookingLinkRequiredHostEmails(rows[0]),
+        ),
+      ]);
+
+      return {
+        ...withHostTimezones(bookingLink, ownerTimezone, eligibleHosts),
+        ownerName: displayNameFromIdentifier(
+          canonicalUsername,
+          rows[0].ownerEmail,
+        ),
+      };
     } catch (error: any) {
       setResponseStatus(event, 500);
       return { error: error.message };

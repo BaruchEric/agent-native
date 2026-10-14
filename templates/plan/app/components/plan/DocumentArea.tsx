@@ -1,3 +1,20 @@
+import { useT } from "@agent-native/core/client/i18n";
+import {
+  BlockView,
+  SchemaBlockEditor,
+  blockEditSurface,
+  useOptionalBlockRegistry,
+} from "@agent-native/toolkit/app/blocks";
+import { type RichMarkdownCollabUser } from "@agent-native/toolkit/editor";
+import { imageDataSchema, type PlanBlock } from "@shared/plan-content";
+import {
+  IconAlertTriangle,
+  IconCheck,
+  IconCode,
+  IconEdit,
+  IconPhoto,
+  IconX,
+} from "@tabler/icons-react";
 import {
   Component,
   lazy,
@@ -7,32 +24,17 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import {
-  IconAlertTriangle,
-  IconCheck,
-  IconCode,
-  IconEdit,
-  IconPhoto,
-  IconX,
-} from "@tabler/icons-react";
 import { toast } from "sonner";
+
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  uploadEditorImage,
-  type RichMarkdownCollabUser,
-} from "@agent-native/core/client";
-import {
-  BlockView,
-  SchemaBlockEditor,
-  blockEditSurface,
-  useOptionalBlockRegistry,
-} from "@agent-native/core/blocks";
 import { cn } from "@/lib/utils";
-import { imageDataSchema, type PlanBlock } from "@shared/plan-content";
-import { Wireframe } from "./wireframe/Wireframe";
-import { PlanMarkdownReader } from "./PlanMarkdownReader";
+
+import { usePlanImageUpload } from "../../hooks/use-plan-image-upload";
+import { updatePlanBlocks } from "./plan-block-structure";
 import { PlanImageViewer } from "./PlanImageViewer";
+import { PlanMarkdownReader } from "./PlanMarkdownReader";
+import { Wireframe } from "./wireframe/Wireframe";
 
 const LazyPlanMarkdownEditor = lazy(() =>
   import("./PlanMarkdownEditor").then((mod) => ({
@@ -40,17 +42,8 @@ const LazyPlanMarkdownEditor = lazy(() =>
   })),
 );
 
-/**
- * Marker prefix embedded in salvaged "unknown-block" callout bodies by the
- * server-side per-block salvage path in parsePlanContent. The renderer detects
- * this prefix and shows a "Unsupported block" placeholder card rather than a
- * generic callout.
- *
- * Format: `__unknown_block__:<originalType>\n<errorSummary>`
- */
 const UNKNOWN_BLOCK_MARKER = "​__unknown_block__:";
 
-/** React error boundary that catches render errors from a single block. */
 class BlockErrorBoundary extends Component<
   { blockId: string; blockType: string; children: ReactNode },
   { error: Error | null }
@@ -87,7 +80,6 @@ class BlockErrorBoundary extends Component<
   }
 }
 
-/** Muted "Unsupported block" card for unknown/salvaged/errored blocks. */
 function UnknownBlockPlaceholder({
   blockId,
   originalType,
@@ -97,30 +89,47 @@ function UnknownBlockPlaceholder({
   originalType: string;
   errorSummary: string;
 }) {
+  const t = useT();
   return (
     <section
       className="plan-block"
       data-block-id={blockId}
       data-unknown-block-type={originalType}
     >
-      <div className="flex items-start gap-2 rounded-lg border border-plan-line bg-plan-block/40 px-3 py-2.5 text-plan-muted">
+      <div className="flex items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3.5 py-3 text-plan-muted">
         <IconAlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
-        <span className="min-w-0 text-sm">
-          <span className="font-medium text-plan-text">
-            Unsupported block: {originalType}
-          </span>
-          <details className="mt-1">
-            <summary className="cursor-pointer text-xs opacity-60 hover:opacity-80">
-              Show details
-            </summary>
-            <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono text-xs opacity-70">
-              {errorSummary}
-            </pre>
-          </details>
-        </span>
+        <div className="min-w-0 text-sm">
+          <div className="font-medium text-plan-text">
+            Invalid {originalType} block
+          </div>
+          <p className="mt-1 leading-5">
+            {t("raw.document.invalidBlockDescription")}
+          </p>
+          {errorSummary && (
+            <details className="mt-2">
+              <summary className="cursor-pointer text-xs opacity-70 hover:opacity-90">
+                {t("raw.document.validationDetails")}
+              </summary>
+              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded border border-plan-line bg-plan-bg/60 p-2 font-mono text-xs opacity-80">
+                {errorSummary}
+              </pre>
+            </details>
+          )}
+        </div>
       </div>
     </section>
   );
+}
+
+function parseUnknownBlockMarker(block: PlanBlock) {
+  if (block.type !== "callout") return null;
+  if (!block.data.body.startsWith(UNKNOWN_BLOCK_MARKER)) return null;
+  const rest = block.data.body.slice(UNKNOWN_BLOCK_MARKER.length);
+  const newline = rest.indexOf("\n");
+  return {
+    originalType: newline >= 0 ? rest.slice(0, newline) : rest,
+    errorSummary: newline >= 0 ? rest.slice(newline + 1) : "",
+  };
 }
 
 type PlanBlockViewProps = {
@@ -138,12 +147,6 @@ type PlanBlockViewProps = {
   collabUser?: RichMarkdownCollabUser | null;
 };
 
-/**
- * Renders the document flow: dispatches a single plan block to its block
- * component. `compactVisuals` tightens embedded wireframes/diagrams in dense
- * contexts (e.g. tab panes). Wrapped in a per-block error boundary so one
- * crashing renderer shows an inline error card instead of blanking the document.
- */
 export function PlanBlockView(props: PlanBlockViewProps) {
   return (
     <BlockErrorBoundary blockId={props.block.id} blockType={props.block.type}>
@@ -163,12 +166,18 @@ function PlanBlockViewInner({
   planId,
   collabUser,
 }: PlanBlockViewProps) {
-  // Registry-first dispatch. If the block type is registered, render through the
-  // block registry (`BlockView` → spec `Read`, or in edit mode the spec `Edit`
-  // or the schema-driven auto-editor). Unregistered types fall through to the
-  // legacy branches below unchanged, so existing blocks keep working. The spec's
-  // `Read` owns its own block container; the editor path is wrapped in a titled
-  // `plan-block` section here so editing matches the document chrome.
+  const t = useT();
+  const unknownBlock = parseUnknownBlockMarker(block);
+  if (unknownBlock) {
+    return (
+      <UnknownBlockPlaceholder
+        blockId={block.id}
+        originalType={unknownBlock.originalType}
+        errorSummary={unknownBlock.errorSummary}
+      />
+    );
+  }
+
   const blockRegistry = useOptionalBlockRegistry();
   const spec = blockRegistry?.registry.get(block.type);
   if (blockRegistry && spec) {
@@ -192,13 +201,10 @@ function PlanBlockViewInner({
           } as PlanBlock)
         }
         ctx={blockRegistry.ctx}
+        compactVisuals={compactVisuals}
+        interactive
       />
     );
-    // In INLINE / CONTAINER edit mode the auto-editor / custom Edit often renders
-    // bare fields — wrap them in the standard titled block section. In read mode
-    // (and in PANEL edit mode, where `BlockView` renders the spec's own `Read`
-    // plus a corner edit button) the spec already provides its own section, so
-    // render it directly to avoid double-nesting.
     const surface = blockEditSurface(spec);
     const wrapInline =
       editing && spec.placement.includes("block") && surface !== "panel";
@@ -229,22 +235,6 @@ function PlanBlockViewInner({
     );
   }
   if (block.type === "callout") {
-    // Detect the server-side per-block salvage marker. The marker starts with a
-    // zero-width-space followed by `__unknown_block__:<type>` to avoid collision
-    // with real callout content (real callouts never start with a ZWSP).
-    if (block.data.body.startsWith(UNKNOWN_BLOCK_MARKER)) {
-      const rest = block.data.body.slice(UNKNOWN_BLOCK_MARKER.length);
-      const newline = rest.indexOf("\n");
-      const originalType = newline >= 0 ? rest.slice(0, newline) : rest;
-      const errorSummary = newline >= 0 ? rest.slice(newline + 1) : "";
-      return (
-        <UnknownBlockPlaceholder
-          blockId={block.id}
-          originalType={originalType}
-          errorSummary={errorSummary}
-        />
-      );
-    }
     return (
       <section className="plan-block plan-callout" data-block-id={block.id}>
         {block.title && <div className="plan-block-label">{block.title}</div>}
@@ -328,9 +318,6 @@ function PlanBlockViewInner({
     );
   }
   if (block.type === "code-tabs") {
-    // Display-time migration: render code-tabs as a tabs block with inline code
-    // children so old stored plans get the richer tabs UX. Storage stays intact
-    // (no write-back); the block re-converts on every render.
     const migratedTabs: Extract<PlanBlock, { type: "tabs" }> = {
       id: block.id,
       type: "tabs",
@@ -367,10 +354,6 @@ function PlanBlockViewInner({
     );
   }
   if (block.type === "implementation-map") {
-    // Display-time migration: render implementation-map as a file-tree block so
-    // old plans use the modern file explorer rather than the deprecated layout.
-    // The block-level `title` and each file's `note` and `snippet` carry over.
-    // Storage stays intact.
     const migratedFileTree: Extract<PlanBlock, { type: "file-tree" }> = {
       id: block.id,
       type: "file-tree",
@@ -433,8 +416,6 @@ function PlanBlockViewInner({
   if (block.type === "custom-html") {
     return <CustomHtmlBlock block={block} onChange={onChange} />;
   }
-  // Unregistered block type — show a muted placeholder so the rest of the
-  // document stays visible instead of silently swallowing the block.
   return (
     <UnknownBlockPlaceholder
       blockId={block.id}
@@ -495,9 +476,6 @@ function RichTextBlock({
           />
         </Suspense>
       ) : (
-        // Read-only path (public / shared-reviewer / review mode / SSR): render
-        // markdown without mounting Tiptap so comment clicks hit stable text.
-        // Pass blockId so headings get stable anchor ids for deep-linking.
         <PlanMarkdownReader markdown={block.data.markdown} blockId={block.id} />
       )}
     </section>
@@ -515,8 +493,8 @@ function CodeTabsBlock({
   return (
     <section className="plan-block" data-block-id={block.id}>
       {block.title && <div className="plan-block-label">{block.title}</div>}
-      <div className="grid overflow-hidden border-y border-plan-line md:grid-cols-[300px_minmax(0,1fr)]">
-        <div className="border-plan-line md:border-r">
+      <div className="plan-code-tabs-layout grid overflow-hidden border-y border-plan-line">
+        <div className="plan-code-tabs-nav border-plan-line">
           {block.data.tabs.map((tab) => (
             <button
               key={tab.id}
@@ -583,17 +561,13 @@ function ImplementationMapBlock({
 }: {
   block: Extract<PlanBlock, { type: "implementation-map" }>;
 }) {
-  // Track the active file by INDEX, not by path. A single file legitimately
-  // appears in multiple rows (e.g. one workflow file touched three different
-  // ways), so keying selection AND the React list key on `file.path` made every
-  // row sharing a path highlight together and select as one. Index is unique.
   const [activeIndex, setActiveIndex] = useState(0);
   const active = block.data.files[activeIndex] ?? block.data.files[0];
   return (
     <section className="plan-block" data-block-id={block.id}>
       {block.title && <div className="plan-block-label">{block.title}</div>}
-      <div className="grid overflow-hidden lg:grid-cols-[360px_minmax(0,1fr)]">
-        <div className="border-plan-line lg:border-r">
+      <div className="plan-implementation-map-layout grid overflow-hidden">
+        <div className="plan-implementation-map-nav border-plan-line">
           {block.data.files.map((file, index) => (
             <button
               key={index}
@@ -670,19 +644,24 @@ function TabsBlock({
   const orientation =
     block.data.orientation === "vertical" ? "vertical" : "horizontal";
   const vertical = orientation === "vertical";
+  const wideLayout = tabsBlockUsesWideLayout(block);
   return (
-    <section className="plan-block" data-block-id={block.id}>
+    <section
+      className="plan-block"
+      data-block-id={block.id}
+      data-tabs-orientation={orientation}
+      data-wide-layout-block={wideLayout ? "" : undefined}
+    >
       {block.title && <div className="plan-block-label">{block.title}</div>}
       <div
         className={cn(
-          vertical &&
-            "grid min-w-0 gap-5 md:grid-cols-[minmax(10rem,14rem)_minmax(0,1fr)] md:items-start",
+          vertical && "plan-vertical-tabs-layout grid min-w-0 gap-5",
         )}
       >
         <div
           className={cn(
             vertical
-              ? "mb-5 flex w-full min-w-0 max-w-full flex-nowrap gap-1 overflow-x-auto md:mb-0 md:max-h-[62vh] md:flex-col md:overflow-x-hidden md:overflow-y-auto md:pr-2"
+              ? "plan-vertical-tabs-list mb-5 flex w-full min-w-0 max-w-full flex-nowrap gap-1 overflow-x-auto"
               : "mb-8 inline-flex max-w-full gap-1 overflow-x-auto",
           )}
           role="tablist"
@@ -737,7 +716,7 @@ function TabsBlock({
                         tab.id === active.id
                           ? {
                               ...tab,
-                              blocks: updateBlocks(
+                              blocks: updatePlanBlocks(
                                 tab.blocks,
                                 child.id,
                                 () => nextChild,
@@ -757,6 +736,32 @@ function TabsBlock({
   );
 }
 
+function tabsBlockUsesWideLayout(
+  block: Extract<PlanBlock, { type: "tabs" }>,
+): boolean {
+  return (
+    block.data.orientation === "vertical" ||
+    block.data.tabs.some((tab) => blocksContainDiffLike(tab.blocks))
+  );
+}
+
+function blocksContainDiffLike(blocks: PlanBlock[]): boolean {
+  return blocks.some(blockContainsDiffLike);
+}
+
+function blockContainsDiffLike(block: PlanBlock): boolean {
+  if (block.type === "diff" || block.type === "annotated-code") return true;
+  if (block.type === "tabs") {
+    return block.data.tabs.some((tab) => blocksContainDiffLike(tab.blocks));
+  }
+  if (block.type === "columns") {
+    return block.data.columns.some((column) =>
+      blocksContainDiffLike(column.blocks),
+    );
+  }
+  return false;
+}
+
 function CustomHtmlBlock({
   block,
   onChange,
@@ -764,12 +769,11 @@ function CustomHtmlBlock({
   block: Extract<PlanBlock, { type: "custom-html" }>;
   onChange?: (block: PlanBlock) => Promise<void> | void;
 }) {
+  const t = useT();
   const [editing, setEditing] = useState(false);
   const [html, setHtml] = useState(block.data.html);
   const [css, setCss] = useState(block.data.css ?? "");
 
-  // Resync drafts from block.data when not actively editing so agent/poll
-  // updates are reflected without clobbering in-progress manual edits.
   useEffect(() => {
     if (!editing) {
       setHtml(block.data.html);
@@ -777,16 +781,12 @@ function CustomHtmlBlock({
     }
   }, [editing, block.data.html, block.data.css]);
 
-  // Re-seed from the current block data each time edit mode is ENTERED so
-  // stale mount-time state can never clobber a newer agent edit on save.
   const openEditing = () => {
     setHtml(block.data.html);
     setCss(block.data.css ?? "");
     setEditing(true);
   };
 
-  // Use prefers-color-scheme so the iframe ink matches the host theme even
-  // though the iframe document is isolated and can't inherit CSS variables.
   const srcDoc = `<!doctype html><html><head><style>body{margin:0;min-height:100%;font-family:Inter,system-ui,sans-serif;color:#1f1f1d;background:transparent;}*{box-sizing:border-box}@media(prefers-color-scheme:dark){body{color:#e8e8e6}}${block.data.css ?? ""}</style></head><body>${block.data.html}</body></html>`;
   return (
     <section className="plan-block group" data-block-id={block.id}>
@@ -800,10 +800,10 @@ function CustomHtmlBlock({
           <Button
             type="button"
             variant="ghost"
-            size="icon"
+            size="icon-sm"
             data-plan-interactive
             aria-label={editing ? "Cancel editing source" : "Edit source"}
-            className="size-8 text-plan-muted hover:bg-transparent hover:text-plan-text"
+            className="text-plan-muted hover:bg-transparent hover:text-plan-text"
             onClick={() => (editing ? setEditing(false) : openEditing())}
           >
             {editing ? (
@@ -820,13 +820,13 @@ function CustomHtmlBlock({
             value={html}
             onChange={(event) => setHtml(event.target.value)}
             className="min-h-48 font-mono text-sm"
-            placeholder="HTML fragment"
+            placeholder={t("raw.document.htmlFragment")}
           />
           <Textarea
             value={css}
             onChange={(event) => setCss(event.target.value)}
             className="min-h-32 font-mono text-sm"
-            placeholder="Optional CSS"
+            placeholder={t("raw.document.optionalCss")}
           />
           <div className="flex justify-end gap-2">
             <Button
@@ -868,7 +868,6 @@ function CustomHtmlBlock({
   );
 }
 
-/* ── Shiki syntax highlighting (lazy-loaded, light/dark themes) ─────────── */
 type ShikiHighlighter = {
   codeToHtml: (
     code: string,
@@ -969,8 +968,6 @@ function HighlightedCode({
   }, [code, language]);
 
   if (html) {
-    // Shiki output is generated from plain text by the highlighter itself —
-    // it is NOT agent-authored HTML, so this is safe (mirrors core chat).
     return (
       <div className="plan-shiki" dangerouslySetInnerHTML={{ __html: html }} />
     );
@@ -983,8 +980,6 @@ function HighlightedCode({
     </pre>
   );
 }
-
-/* ── Image block ───────────────────────────────────────────────────────── */
 
 type PlanImageData = Extract<PlanBlock, { type: "image" }>["data"];
 
@@ -999,6 +994,9 @@ function ImageBlock({
   editingDisabled?: boolean;
   planId?: string | null;
 }) {
+  const t = useT();
+  const { canUploadImages, requestUpload, uploadImage, storagePrompt } =
+    usePlanImageUpload();
   const blockRegistry = useOptionalBlockRegistry();
   const ctx = blockRegistry?.ctx;
   const src = block.data.url ?? imageSrcForAsset(block.data.assetId);
@@ -1006,11 +1004,6 @@ function ImageBlock({
   const [editOpen, setEditOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Opening the edit popover from the ⋯ dropdown item hits a Radix race: closing
-  // the dropdown restores focus to its trigger, which the just-opened popover
-  // reads as a focus-outside and instantly dismisses. Defer the open one
-  // macrotask (so the dropdown closes first) AND ignore any close that arrives in
-  // the first moments after opening (the focus-restore bounce).
   const editOpenedAtRef = useRef(0);
   const openEdit = () => {
     window.setTimeout(() => {
@@ -1023,17 +1016,14 @@ function ImageBlock({
     setEditOpen(open);
   };
 
-  // Auto-focus the "Describe a change…" prompt once the edit popover mounts. The
-  // popover portals out and the deferred/guarded open can race Radix's own
-  // auto-focus, so focus it explicitly (a few retries to win the open animation).
   useEffect(() => {
     if (!editOpen) return;
-    const focusPrompt = () =>
-      document
-        .querySelector<HTMLTextAreaElement>(
-          ".an-block-edit-popover textarea[placeholder^='Describe a change']",
-        )
-        ?.focus();
+    const focusPrompt = () => {
+      const prompt = document.querySelector<HTMLTextAreaElement>( // i18n-ignore DOM selector, not UI copy
+        ".an-block-edit-popover textarea[data-plan-block-edit-prompt]",
+      );
+      prompt?.focus();
+    };
     const timers = [40, 140, 280].map((ms) =>
       window.setTimeout(focusPrompt, ms),
     );
@@ -1045,28 +1035,22 @@ function ImageBlock({
   async function handleReplaceFile(event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.currentTarget.files?.[0];
     event.currentTarget.value = "";
-    if (!file) return;
-    const toastId = toast.loading("Replacing image…");
+    if (!file || !requestUpload()) return;
+    const toastId = toast.loading(t("raw.document.replacingImage"));
     try {
-      const { src: nextSrc, alt: nextAlt } = await uploadEditorImage(file);
+      const { src: nextSrc, alt: nextAlt } = await uploadImage(file);
       commitData({
         ...block.data,
         url: nextSrc,
         alt: block.data.alt || nextAlt || "image",
       });
-      toast.success("Image replaced.", { id: toastId });
+      toast.success(t("raw.document.imageReplaced"), { id: toastId });
     } catch (error) {
       console.error("Image replace failed:", error);
-      toast.error("Could not replace the image.", { id: toastId });
+      toast.error(t("raw.document.replaceImageFailed"), { id: toastId });
     }
   }
 
-  // Reuse the EXACT edit surface registry blocks use — the shared
-  // `renderEditSurface` popover (the schema form + the auto-focusing top-right
-  // "Edit with AI" prompt) — pulled from the block-render context. No bespoke
-  // edit UI and no `planBlocks` import (so no module cycle). It's opened from the
-  // image's own ⋯ overlay, so the block keeps a single hover overlay with no
-  // separate corner pencil.
   const editSurface =
     editable && ctx?.renderEditSurface
       ? ctx.renderEditSurface({
@@ -1106,11 +1090,13 @@ function ImageBlock({
           type="file"
           accept="image/*"
           className="hidden"
+          disabled={!canUploadImages}
           tabIndex={-1}
           aria-hidden="true"
           onChange={handleReplaceFile}
         />
       )}
+      {storagePrompt}
       {src ? (
         <PlanImageViewer
           src={src}
@@ -1123,7 +1109,13 @@ function ImageBlock({
             block.data.fit === "cover" ? "object-cover" : "object-contain",
           )}
           onEdit={editable ? openEdit : undefined}
-          onReplace={editable ? () => fileInputRef.current?.click() : undefined}
+          onReplace={
+            editable
+              ? () => {
+                  if (requestUpload()) fileInputRef.current?.click();
+                }
+              : undefined
+          }
         />
       ) : (
         <div className="mt-4 flex h-48 items-center justify-center rounded-lg border border-dashed border-plan-line bg-plan-block text-plan-muted">
@@ -1141,29 +1133,5 @@ function ImageBlock({
 
 function imageSrcForAsset(assetId?: string): string | undefined {
   if (!assetId) return undefined;
-  // Encode the asset ID into the plan-asset serving route.
-  // The filename segment is omitted here since the route handler uses only the
-  // asset ID for lookup; a trailing slash is added for compatibility.
   return `/_agent-native/plan-asset/${encodeURIComponent(assetId)}/image`;
-}
-
-function updateBlocks(
-  blocks: PlanBlock[],
-  id: string,
-  updater: (block: PlanBlock) => PlanBlock,
-): PlanBlock[] {
-  return blocks.map((block) => {
-    if (block.id === id) return updater(block);
-    if (block.type !== "tabs") return block;
-    return {
-      ...block,
-      data: {
-        ...block.data,
-        tabs: block.data.tabs.map((tab) => ({
-          ...tab,
-          blocks: updateBlocks(tab.blocks, id, updater),
-        })),
-      },
-    };
-  });
 }

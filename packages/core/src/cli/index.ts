@@ -1,171 +1,70 @@
 #!/usr/bin/env node
 
-import { execSync, spawn } from "child_process";
-import path from "path";
+import { execFileSync, execSync, spawn } from "child_process";
 import fs from "fs";
+import { createRequire } from "module";
+import path from "path";
 import { fileURLToPath } from "url";
-import * as Sentry from "@sentry/node";
 
-// Resolve version once at module scope — used by both --version and --help
+import {
+  clearAgentNativeNitroPresetMarker,
+  resolveAgentNativeNitroPreset,
+} from "../deploy/nitro-preset.js";
+import { loadOptionalPeer } from "../shared/optional-peer.js";
+import { buildStepFailureReport } from "./build-failure-report.js";
+import { resolveDeployPostBuildInvocation } from "./deploy-build.js";
+import { cliSpawnOptions, runDevServer } from "./process.js";
+import {
+  findBinUpwards,
+  findReactRouterInvocation,
+  reactRouterTypegenEnv,
+} from "./react-router-command.js";
+import {
+  captureSentryException as captureOptionalSentryException,
+  flushSentryTelemetry,
+  setCliSentryVersion,
+} from "./sentry-telemetry.js";
+import { shouldTrackCliRun } from "./telemetry-routing.js";
+import { createCliTelemetry } from "./telemetry.js";
+
 let _version = "unknown";
 try {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  // dist/cli/index.js → ../../package.json
   const pkg = JSON.parse(
     fs.readFileSync(path.resolve(__dirname, "../../package.json"), "utf-8"),
   );
   _version = pkg.version;
 } catch {}
+setCliSentryVersion(_version);
 
-// Fail fast on unsupported Node versions. `engines.node: ">=22"` is only
-// advisory — npx/pnpm merely warn — so without this an older Node (18/20)
-// first fails deep inside a scaffold dynamic import with a cryptic
-// ERR_MODULE / syntax error that `handleScaffoldImportError` misreports as a
-// corrupt npx cache. A clear up-front message saves that whole detour.
 const REQUIRED_NODE_MAJOR = 22;
-const _nodeMajor = Number(process.versions.node.split(".")[0]);
-if (Number.isFinite(_nodeMajor) && _nodeMajor < REQUIRED_NODE_MAJOR) {
+const REQUIRED_NODE_MINOR = 22;
+const _nodeVersion = process.versions.node;
+const _nodeIsStable = /^\d+\.\d+\.\d+$/.test(_nodeVersion);
+const [_nodeMajor, _nodeMinor] = _nodeVersion.split(".").map(Number);
+const _unsupportedNode =
+  !_nodeIsStable ||
+  _nodeMajor < REQUIRED_NODE_MAJOR ||
+  (_nodeMajor === REQUIRED_NODE_MAJOR && _nodeMinor < REQUIRED_NODE_MINOR);
+if (_unsupportedNode) {
   console.error(
-    `agent-native requires Node.js ${REQUIRED_NODE_MAJOR} or newer, but you're on Node ${process.versions.node}.\n` +
+    `agent-native requires Node.js ${REQUIRED_NODE_MAJOR}.${REQUIRED_NODE_MINOR}.0 or newer, but you're on Node ${process.versions.node}.\n` +
       `Upgrade Node (https://nodejs.org) and re-run. With nvm: \`nvm install ${REQUIRED_NODE_MAJOR}\`.`,
   );
   process.exit(1);
 }
-
-/**
- * Build a redacted "command" tag from process.argv. Strips the value that
- * follows any --token / --key / --secret / --password / --api-key flag so
- * we don't ship developer secrets to Sentry alongside the crash.
- *
- * Supports both `--token foo` (separate argv item) and `--token=foo`
- * (combined argv item) forms.
- */
-const SECRET_FLAG_RE = /^--?(token|key|secret|password|api[_-]?key)$/i;
-const SECRET_FLAG_EQ_RE =
-  /^(--?(token|key|secret|password|api[_-]?key))=(.*)$/i;
-function buildRedactedCommandTag(argv: string[]): string {
-  const out: string[] = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (SECRET_FLAG_RE.test(a)) {
-      out.push(a);
-      // Consume the next argv item as the secret value
-      if (i + 1 < argv.length) {
-        out.push("<redacted>");
-        i++;
-      }
-      continue;
-    }
-    const m = a.match(SECRET_FLAG_EQ_RE);
-    if (m) {
-      out.push(`${m[1]}=<redacted>`);
-      continue;
-    }
-    out.push(a);
-  }
-  return out.join(" ");
-}
-
-Sentry.init({
-  dsn: "https://0d384e9eff2f6542af468b92769f2f5b@o117565.ingest.us.sentry.io/4511270386466816",
-  release: `agent-native-cli@${_version}`,
-  // Sentry's Http integration wraps outgoing fetch in a way that breaks the
-  // hosted Plan MCP route negotiation used by recap CI smoke checks.
-  integrations: (integrations) =>
-    integrations.filter((integration) => integration.name !== "Http"),
-  // sendDefaultPii MUST stay false — the CLI runs in third-party developer
-  // environments and we never want to ship request headers, IPs, cookies,
-  // or process env contents to Sentry without explicit consent.
-  sendDefaultPii: false,
-  beforeSend(event) {
-    // Drop expected user-input rejections (validateRepoName, etc.) so they
-    // don't pollute Sentry with non-bug noise.
-    const exceptionType = event.exception?.values?.[0]?.type;
-    if (
-      exceptionType === "ValidationError" ||
-      event.tags?.handled === "validation"
-    ) {
-      return null;
-    }
-
-    // Defense in depth: strip any sensitive fields that may have been
-    // attached to the event despite sendDefaultPii: false (e.g. integrations
-    // that capture request metadata).
-    if (event.request) {
-      if (event.request.headers) {
-        const headers = event.request.headers as Record<string, string>;
-        for (const k of Object.keys(headers)) {
-          const lk = k.toLowerCase();
-          if (
-            lk === "cookie" ||
-            lk === "authorization" ||
-            lk === "set-cookie" ||
-            lk === "proxy-authorization"
-          ) {
-            delete headers[k];
-          }
-        }
-      }
-      // Cookies are also exposed via event.request.cookies as a separate field
-      delete (event.request as Record<string, unknown>).cookies;
-    }
-    // Keep user info that was explicitly set via Sentry.setUser (id/email)
-    // so we can attribute crashes back to the operator. Always strip
-    // ip_address — the CLI runs on third-party machines and the IP is auto-
-    // collected without consent. If only auto-collected fields remain,
-    // drop the user object entirely.
-    if (event.user) {
-      const user = event.user as Record<string, unknown>;
-      delete user.ip_address;
-      const hasIdentity =
-        typeof user.id === "string" ||
-        typeof user.email === "string" ||
-        typeof user.username === "string";
-      if (!hasIdentity) {
-        delete event.user;
-      }
-    }
-    // Sentry's contexts can carry process.env snapshots — strip env-shaped
-    // contexts so we don't leak deployment secrets.
-    if (event.contexts && typeof event.contexts === "object") {
-      delete (event.contexts as Record<string, unknown>).runtime_env;
-    }
-
-    event.tags = {
-      ...event.tags,
-      // Build the command tag from process.argv with secrets redacted so
-      // `agent-native ... --token foo` doesn't leak `foo` to Sentry.
-      command: buildRedactedCommandTag(process.argv.slice(2)),
-      subcommand: process.argv[2] ?? "none",
-      nodeVersion: process.version,
-      platform: process.platform,
-    };
-    return event;
-  },
-});
-
-// Identify the operator so future CLI errors carry spaceId / builderUserId
-// that we can map back to a real Builder user. The CLI doesn't have a real
-// email today — only the env-managed identifiers from the workspace's .env.
-{
-  const builderUserId = process.env.BUILDER_USER_ID;
-  const builderPublicKey = process.env.BUILDER_PUBLIC_KEY;
-  if (builderUserId) {
-    Sentry.setUser({ id: builderUserId });
-    Sentry.setTag("builderUserId", builderUserId);
-  }
-  if (builderPublicKey) {
-    Sentry.setTag("spaceId", builderPublicKey);
-  }
-}
-
 const FEEDBACK_URL =
   "https://forms.agent-native.com/f/agent-native-feedback/_16ewV?source=cli";
 const BUGS_URL = "https://github.com/BuilderIO/agent-native/issues";
 
 const command = process.argv[2];
-// Filter out bare "--" separators that pnpm inserts between its args and script args
 const args = process.argv.slice(3).filter((a) => a !== "--");
+const cliTelemetry = createCliTelemetry({
+  cli: "core",
+  cliVersion: _version,
+  command: command ?? "none",
+  interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+});
 
 function parseScaffoldArgs(argv: string[]): {
   name?: string;
@@ -196,26 +95,56 @@ function parseScaffoldArgs(argv: string[]): {
   return { name, template, standalone, headless };
 }
 
-// Track CLI usage (best-effort, non-blocking)
+const CREATE_HELP = `agent-native create — set up a project
+
+Usage:
+  agent-native create [name] [options]
+
+With a terminal, create opens a guided setup for a Chat workspace, standalone
+app, headless app, first-party templates, or a community template.
+
+Options:
+  --template <names>  Comma-separated first-party templates or a community GitHub URL
+  --standalone        Create one app without Dispatch
+  --headless          Create an actions-and-CLI app without a UI
+  --help, -h          Show this help
+
+Examples:
+  agent-native create
+  agent-native create my-platform --template chat,forms
+  agent-native create my-app --standalone --template chat
+  agent-native create my-app --headless`;
+
 function trackCli(event: string, props?: Record<string, unknown>): void {
   try {
-    import("../tracking/registry.js").then((m) => {
-      m.track(event, { command, ...props });
-    });
-    import("../tracking/providers.js").then((m) =>
-      m.registerBuiltinProviders(),
-    );
+    cliTelemetry.track(event, { command, ...props });
   } catch {}
 }
 
-// Global error handler — show feedback link on unhandled crashes
+function captureCliException(
+  error: unknown,
+  context?: Parameters<typeof cliTelemetry.captureException>[1],
+): void {
+  try {
+    cliTelemetry.captureException(error, context);
+  } catch {}
+}
+
+function flushTelemetryAndExit(code: number): void {
+  void Promise.allSettled([
+    cliTelemetry.flush(),
+    flushSentryTelemetry(2000),
+  ]).finally(() => process.exit(code));
+}
+
 process.on("uncaughtException", (err) => {
   console.error(`\n  Unexpected error: ${err.message}\n`);
   console.error(`  Report this bug: ${BUGS_URL}`);
   console.error(`  Send feedback:   ${FEEDBACK_URL}\n`);
   trackCli("cli.crash", { error: err.message });
-  Sentry.captureException(err);
-  Sentry.flush(2000).finally(() => process.exit(1));
+  captureCliException(err, { handled: false, tags: { source: "process" } });
+  void captureOptionalSentryException(err);
+  flushTelemetryAndExit(1);
 });
 
 process.on("unhandledRejection", (reason: any) => {
@@ -223,14 +152,15 @@ process.on("unhandledRejection", (reason: any) => {
   console.error(`  Report this bug: ${BUGS_URL}`);
   console.error(`  Send feedback:   ${FEEDBACK_URL}\n`);
   trackCli("cli.crash", { error: reason?.message ?? String(reason) });
-  Sentry.captureException(reason);
-  Sentry.flush(2000).finally(() => process.exit(1));
+  captureCliException(reason, {
+    handled: false,
+    tags: { source: "unhandled-rejection" },
+  });
+  void captureOptionalSentryException(reason);
+  flushTelemetryAndExit(1);
 });
 
-// Surface a self-heal hint when an interrupted `npx @agent-native/core@latest ...`
-// leaves a half-extracted package in the npx cache and a follow-up run fails
-// to load one of our own sub-modules.
-function handleScaffoldImportError(err: any): never {
+function handleScaffoldImportError(err: any): void {
   const msg = err?.message ?? String(err);
   const looksLikeCorruptCache =
     err?.code === "ERR_MODULE_NOT_FOUND" ||
@@ -247,16 +177,32 @@ function handleScaffoldImportError(err: any): never {
     console.error(`\n  Failed to load the scaffolder: ${msg}\n`);
   }
   trackCli("cli.scaffold.import_error", { error: msg });
-  Sentry.captureException(err);
-  Sentry.flush(2000).finally(() => process.exit(1));
-  throw err;
+  captureCliException(err, {
+    handled: false,
+    tags: { source: "scaffold-import" },
+  });
+  void captureOptionalSentryException(err);
+  flushTelemetryAndExit(1);
 }
 
 function findViteBin(): string {
-  // Look for vite in node_modules/.bin
-  const localVite = path.resolve("node_modules/.bin/vite");
-  if (fs.existsSync(localVite)) return localVite;
-  return "vite"; // fallback to PATH
+  return findBinUpwards("vite") ?? "vite";
+}
+
+function findViteJsEntry(): string | null {
+  try {
+    const require = createRequire(path.join(process.cwd(), "package.json"));
+    const pkgJsonPath = require.resolve("vite/package.json");
+    const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8")) as {
+      bin?: string | Record<string, string>;
+    };
+    const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.vite;
+    if (!rel) return null;
+    const entry = path.join(path.dirname(pkgJsonPath), rel);
+    return fs.existsSync(entry) ? entry : null;
+  } catch {
+    return null;
+  }
 }
 
 function findTsxBin(): string {
@@ -265,18 +211,88 @@ function findTsxBin(): string {
   return "tsx";
 }
 
-function findReactRouterBin(): string {
-  const localBin = path.resolve("node_modules/.bin/react-router");
-  if (fs.existsSync(localBin)) return localBin;
-  return "react-router";
+function findTypeScriptCompilerBin(): string {
+  const localTsc = path.resolve("node_modules/.bin/tsc");
+  if (fs.existsSync(localTsc)) return localTsc;
+
+  const localTsgo = path.resolve("node_modules/.bin/tsgo");
+  if (fs.existsSync(localTsgo)) return localTsgo;
+
+  return "tsc";
 }
 
-/** Check if the project uses React Router framework mode (has react-router.config.ts) */
 function isReactRouterFramework(): boolean {
   return (
     fs.existsSync(path.resolve("react-router.config.ts")) ||
     fs.existsSync(path.resolve("react-router.config.js"))
   );
+}
+
+function canResolveFromProject(specifier: string): boolean {
+  try {
+    const requireFromProject = createRequire(path.resolve("package.json"));
+    requireFromProject.resolve(specifier);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function projectUsesFsRoutes(): boolean {
+  for (const file of [
+    path.resolve("app/routes.ts"),
+    path.resolve("app/routes.tsx"),
+    path.resolve("routes.ts"),
+    path.resolve("routes.tsx"),
+  ]) {
+    try {
+      if (
+        fs.existsSync(file) &&
+        fs.readFileSync(file, "utf-8").includes("@react-router/fs-routes")
+      ) {
+        return true;
+      }
+    } catch {}
+  }
+  return false;
+}
+
+function validateReactRouterBuildDependencies(): void {
+  const required: Array<[packageName: string, specifier: string]> = [
+    ["react-router", "react-router"],
+    ["@react-router/dev", "@react-router/dev/vite"],
+    ["vite", "vite"],
+  ];
+  if (projectUsesFsRoutes()) {
+    required.push(["@react-router/fs-routes", "@react-router/fs-routes"]);
+  }
+
+  const missing = required
+    .filter(([, specifier]) => !canResolveFromProject(specifier))
+    .map(([packageName]) => packageName);
+
+  if (missing.length === 0) return;
+
+  const packageManager = fs.existsSync(path.resolve("pnpm-lock.yaml"))
+    ? "pnpm"
+    : fs.existsSync(path.resolve("yarn.lock"))
+      ? "yarn"
+      : "npm";
+  const installCommand =
+    packageManager === "pnpm"
+      ? `pnpm add ${missing.join(" ")}`
+      : packageManager === "yarn"
+        ? `yarn add ${missing.join(" ")}`
+        : `npm install ${missing.join(" ")}`;
+
+  console.error(
+    [
+      "React Router framework mode requires build packages that are not installed from this app root.",
+      `Missing: ${missing.join(", ")}`,
+      `Install them with: ${installCommand}`,
+    ].join("\n"),
+  );
+  process.exit(1);
 }
 
 function isWorkspaceRoot(): boolean {
@@ -293,18 +309,33 @@ function isWorkspaceRoot(): boolean {
   }
 }
 
+function extractNodeInspectFlag(args: string[]): {
+  inspectFlag: string | null;
+  rest: string[];
+} {
+  const rest: string[] = [];
+  let inspectFlag: string | null = null;
+  for (const arg of args) {
+    if (/^--inspect(-brk)?(=.+)?$/.test(arg)) {
+      inspectFlag = arg;
+      continue;
+    }
+    rest.push(arg);
+  }
+  return { inspectFlag, rest };
+}
+
 function run(
   cmd: string,
   cmdArgs: string[],
-  opts?: { stdio?: "inherit" | "pipe" },
+  opts?: {
+    stdio?: "inherit" | "pipe";
+    env?: NodeJS.ProcessEnv;
+    shell?: boolean;
+  },
 ) {
-  const child = spawn(cmd, cmdArgs, {
-    stdio: opts?.stdio ?? "inherit",
-    shell: process.platform === "win32",
-    env: process.env,
-  });
+  const child = spawn(cmd, cmdArgs, cliSpawnOptions(opts));
   child.on("exit", (code) => process.exit(code ?? 0));
-  // Forward signals to child so Cmd+C doesn't leave zombie processes holding ports
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
     process.on(sig, () => {
       child.kill(sig);
@@ -319,16 +350,6 @@ function run(
   return child;
 }
 
-/**
- * Walk up from `cwd` and try to figure out which template / app this build
- * is running for. We look for two patterns:
- *
- *   - `templates/<name>/...` — building inside the framework monorepo
- *   - `apps/<name>/...`      — building inside a scaffolded workspace
- *
- * Both, neither, or one may match. Used purely as Sentry tags so we can
- * filter the noisy "Command failed: react-router build" issues by template.
- */
 function inferBuildContext(cwd: string): {
   template?: string;
   app?: string;
@@ -345,19 +366,10 @@ function inferBuildContext(cwd: string): {
   return { template, app };
 }
 
-/**
- * Run a build subcommand, streaming its stdout/stderr to the user's terminal
- * in real time while also capturing bounded tails for Sentry. On non-zero
- * exit we report a structured event (template, app, exit code, stderr/stdout
- * tails) and exit with the child's code. We deliberately do NOT throw — the
- * global uncaughtException handler would re-capture with a generic
- * "Error: Command failed" title, collapsing every template's failure into
- * one issue (which is exactly what we're trying to fix here).
- */
 function runBuildStep(
   cmd: string,
   cmdArgs: string[],
-  opts: { label: string; env?: NodeJS.ProcessEnv },
+  opts: { label: string; env?: NodeJS.ProcessEnv; shell?: boolean },
 ): Promise<void> {
   return new Promise<void>((resolve) => {
     const STDERR_TAIL_BYTES = 8000;
@@ -367,7 +379,7 @@ function runBuildStep(
 
     const child = spawn(cmd, cmdArgs, {
       stdio: ["inherit", "pipe", "pipe"],
-      shell: process.platform === "win32",
+      shell: opts.shell ?? process.platform === "win32",
       env: opts.env ?? process.env,
     });
 
@@ -385,10 +397,9 @@ function runBuildStep(
     });
 
     child.on("error", (err) => {
-      // Failure to spawn (ENOENT, etc.).
       const cwd = process.cwd();
       const { template, app } = inferBuildContext(cwd);
-      Sentry.captureException(err, {
+      void captureOptionalSentryException(err, {
         tags: {
           buildStep: opts.label,
           ...(template ? { template } : {}),
@@ -400,7 +411,17 @@ function runBuildStep(
           stage: "spawn",
         },
       });
-      Sentry.flush(2000).finally(() => process.exit(1));
+      captureCliException(err, {
+        handled: false,
+        tags: {
+          source: "build-step",
+          buildStep: opts.label,
+          ...(template ? { template } : {}),
+          ...(app ? { app } : {}),
+        },
+        extra: { stage: "spawn" },
+      });
+      flushTelemetryAndExit(1);
     });
 
     child.on("exit", (code, signal) => {
@@ -412,12 +433,16 @@ function runBuildStep(
       const cwd = process.cwd();
       const { template, app } = inferBuildContext(cwd);
       const childCommand = `${cmd} ${cmdArgs.join(" ")}`;
-      const err = new Error(
-        `Build step "${opts.label}" failed with exit code ${exitCode}` +
-          (template ? ` (template=${template})` : "") +
-          (app ? ` (app=${app})` : ""),
-      );
-      Sentry.captureException(err, {
+      const report = buildStepFailureReport({
+        label: opts.label,
+        exitCode,
+        signal: signal ?? null,
+        stderrTail: stderrBuf,
+        template,
+        app,
+      });
+      const err = report.error;
+      void captureOptionalSentryException(err, {
         tags: {
           buildStep: opts.label,
           ...(template ? { template } : {}),
@@ -432,13 +457,17 @@ function runBuildStep(
           stdoutTail: stdoutBuf,
         },
       });
-      // Don't throw — see comment on runBuildStep above.
-      Sentry.flush(2000).finally(() => process.exit(exitCode));
+      captureCliException(err, {
+        handled: false,
+        tags: report.tags,
+        extra: report.extra,
+      });
+      flushTelemetryAndExit(exitCode);
     });
   });
 }
 
-trackCli("cli.run");
+if (shouldTrackCliRun(command, args)) trackCli("cli.run");
 
 switch (command) {
   case "dev": {
@@ -452,7 +481,42 @@ switch (command) {
       break;
     }
     const vite = findViteBin();
-    run(vite, args);
+    const { inspectFlag, rest } = extractNodeInspectFlag(args);
+    if (!inspectFlag) {
+      runDevServer(vite, rest);
+      break;
+    }
+    const viteJsEntry = findViteJsEntry();
+    if (!viteJsEntry) {
+      console.warn(
+        "[agent-native] Could not resolve Vite's JS entry; starting dev " +
+          "server without the debugger.",
+      );
+      runDevServer(vite, rest);
+      break;
+    }
+    const parsed = inspectFlag.match(/^--(inspect(?:-brk)?)(?:=(.+))?$/);
+    const kind = parsed?.[1] ?? "inspect";
+    const target = parsed?.[2] ?? "9229";
+    const directive = `--${kind}=${target}`;
+    const preload =
+      "data:text/javascript," +
+      encodeURIComponent(
+        `process.env.NODE_OPTIONS=((process.env.NODE_OPTIONS??"")+" ${directive}").trim();`,
+      );
+    const env = {
+      ...process.env,
+      NITRO_DEV_RUNNER: process.env.NITRO_DEV_RUNNER ?? "node-process",
+    };
+    console.log(`[agent-native] API server debugger listening on ${target}`);
+    runDevServer(
+      process.execPath,
+      ["--import", preload, viteJsEntry, ...rest],
+      {
+        env,
+        shell: false,
+      },
+    );
     break;
   }
 
@@ -467,56 +531,80 @@ switch (command) {
   }
 
   case "build": {
-    // React Router framework mode uses `react-router build` which
-    // internally runs `vite build` with proper environment orchestration.
-    // Legacy SPA mode uses `vite build` directly.
-    //
-    // Each step uses runBuildStep so that on failure we get a Sentry event
-    // tagged with template/app and including stderr/stdout tails. If the
-    // child exits non-zero, runBuildStep calls process.exit itself; the
-    // continuation only runs on success.
     (async () => {
+      try {
+        const { runDoctorBuildHook } = await import("./doctor.js");
+        const hook = await runDoctorBuildHook({
+          cwd: process.cwd(),
+          strict: args.includes("--strict"),
+        });
+        if (!hook.ok) {
+          console.error(
+            "\nBuild aborted by `agent-native doctor` (see findings above).",
+          );
+          process.exit(1);
+        }
+      } catch (err) {
+        console.error(
+          `[doctor] pre-build scan failed, so the build is blocked: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        process.exit(1);
+      }
+
       if (isReactRouterFramework()) {
-        const rr = findReactRouterBin();
+        clearAgentNativeNitroPresetMarker();
+        const { clearAgentNativeBuildConfigMarker } =
+          await import("../vite/agent-native-config-loader.js");
+        clearAgentNativeBuildConfigMarker(process.cwd());
+        validateReactRouterBuildDependencies();
+        const rr = findReactRouterInvocation(["build"]);
         console.log("Building (React Router framework mode)...");
-        await runBuildStep(rr, ["build"], { label: "react-router-build" });
+        await runBuildStep(rr.command, rr.args, {
+          label: "react-router-build",
+          shell: rr.shell,
+        });
       } else {
         const vite = findViteBin();
         console.log("Building...");
         await runBuildStep(vite, ["build"], { label: "vite-build" });
       }
 
-      // Post-build: framework-mode apps also need a Nitro server bundle for
-      // `agent-native start` and for serverless presets.
       if (isReactRouterFramework()) {
+        const configuredNitroPreset = resolveAgentNativeNitroPreset();
+        const deployEnv = configuredNitroPreset
+          ? { ...process.env, NITRO_PRESET: configuredNitroPreset }
+          : process.env;
         const __dirname = path.dirname(fileURLToPath(import.meta.url));
-        const deployBuild = path.resolve(__dirname, "../deploy/build.js");
-        if (fs.existsSync(deployBuild)) {
-          await runBuildStep("node", [deployBuild], {
+        const deployBuild = resolveDeployPostBuildInvocation({
+          cliDir: __dirname,
+          env: deployEnv,
+          findTsxBin,
+        });
+        if (deployBuild) {
+          await runBuildStep(deployBuild.command, deployBuild.args, {
             label: "deploy-build",
-            env: process.env,
+            env: deployEnv,
           });
         } else {
           console.warn(
-            `[build] Deploy build script not found at ${deployBuild}. Skipping post-build step.`,
+            "[build] Deploy build script not found and no deploy preset is configured. Skipping post-build step.",
           );
         }
       }
 
       console.log("\nBuild complete.");
     })().catch((err) => {
-      // runBuildStep handles its own failures and exits, so reaching here
-      // implies a programming error in the orchestration above. Capture
-      // and exit so the global unhandledRejection handler doesn't double-
-      // report with a generic title.
-      Sentry.captureException(err);
-      Sentry.flush(2000).finally(() => process.exit(1));
+      captureCliException(err, {
+        handled: false,
+        tags: { source: "orchestration" },
+      });
+      void captureOptionalSentryException(err);
+      flushTelemetryAndExit(1);
     });
     break;
   }
 
   case "start": {
-    // Like `next start` — runs Nitro production server
     const serverEntry = path.resolve(".output/server/index.mjs");
     if (!fs.existsSync(serverEntry)) {
       console.error(
@@ -524,23 +612,47 @@ switch (command) {
       );
       process.exit(1);
     }
-    run("node", [serverEntry, ...args]);
+    run(process.execPath, [serverEntry, ...args]);
     break;
   }
 
   case "action": {
-    // Run an action from actions/ (or scripts/ for backwards compat)
     const actionName = args[0];
     if (!actionName) {
-      console.error("Usage: agent-native action <name> [--args]");
+      console.error(
+        `Usage: agent-native action <name> ['{"arg":"value"}'] [--args]`,
+      );
       process.exit(1);
     }
     const tsxAction = findTsxBin();
-    // Try actions/run.ts first, fall back to scripts/run.ts
     const actionsRun = path.resolve("actions/run.ts");
     const scriptsRun = path.resolve("scripts/run.ts");
     const runFile = fs.existsSync(actionsRun) ? actionsRun : scriptsRun;
     run(tsxAction, [runFile, ...args]);
+    break;
+  }
+
+  case "identity": {
+    const [operation, ...identityArgs] = args;
+    if (operation !== "rekey") {
+      console.error(
+        "Usage: agent-native identity rekey --from <old-email> --to <new-email> [--yes] | --resume",
+      );
+      process.exit(1);
+    }
+    const cliDir = path.dirname(fileURLToPath(import.meta.url));
+    const script = path.resolve(cliDir, "../scripts/identity-rekey.js");
+    // Apps declare their identity columns from the module graph of their
+    // database plugin. Without it the rekey refuses every app-owned column.
+    const declarations = path.resolve("server/plugins/db.ts");
+    if (fs.existsSync(declarations))
+      run(findTsxBin(), [
+        script,
+        "--identity-declarations",
+        declarations,
+        ...identityArgs,
+      ]);
+    else run(process.execPath, [script, ...identityArgs]);
     break;
   }
 
@@ -565,7 +677,6 @@ switch (command) {
       process.exit(1);
     }
     const tsx = findTsxBin();
-    // Try actions/run.ts first, fall back to scripts/run.ts
     const actionsRunScript = path.resolve("actions/run.ts");
     const scriptsRunScript = path.resolve("scripts/run.ts");
     const runFileScript = fs.existsSync(actionsRunScript)
@@ -576,31 +687,36 @@ switch (command) {
   }
 
   case "typecheck": {
-    // Run TypeScript type checking
-    // React Router framework mode generates route types first
     if (isReactRouterFramework()) {
-      const rr = findReactRouterBin();
+      validateReactRouterBuildDependencies();
+      const rr = findReactRouterInvocation(["typegen"]);
+      const env = reactRouterTypegenEnv();
       try {
-        execSync(`${rr} typegen`, { stdio: "inherit" });
+        if (rr.shell) {
+          execSync(`${rr.command} ${rr.args.join(" ")}`, {
+            stdio: "inherit",
+            env,
+          });
+        } else {
+          execFileSync(rr.command, rr.args, { stdio: "inherit", env });
+        }
       } catch {
-        // typegen may fail if routes aren't set up yet — continue to tsc
+        // typegen may fail if routes aren't set up yet; continue to TypeScript.
       }
     }
-    const tsc = path.resolve("node_modules/.bin/tsc");
-    const tscBin = fs.existsSync(tsc) ? tsc : "tsc";
-    run(tscBin, ["--noEmit", ...args]);
+    run(findTypeScriptCompilerBin(), ["--noEmit", ...args]);
     break;
   }
 
   case "create": {
-    // Defaults to creating a workspace with a multi-select template picker.
-    // Use --standalone for the old single-app flow.
-    //   --template foo,bar         Pre-select multiple templates in the picker
-    //   --standalone               Scaffold a single standalone app
+    if (args.includes("--help") || args.includes("-h")) {
+      console.log(CREATE_HELP);
+      break;
+    }
     const parsed = parseScaffoldArgs(args);
     import("./create.js")
       .then((m) =>
-        m.createApp(parsed.name, {
+        m.runCreateCommand(parsed.name, {
           template: parsed.headless ? "headless" : parsed.template,
           standalone: parsed.standalone,
         }),
@@ -613,7 +729,7 @@ switch (command) {
     import("./invoke.js")
       .then(async (m) => {
         const code = await m.runInvoke(args);
-        if (code !== 0) process.exit(code);
+        process.exit(code);
       })
       .catch((err) => {
         console.error(err?.message ?? err);
@@ -626,7 +742,7 @@ switch (command) {
     import("./agents.js")
       .then(async (m) => {
         const code = await m.runAgents(args);
-        if (code !== 0) process.exit(code);
+        process.exit(code);
       })
       .catch((err) => {
         console.error(err?.message ?? err);
@@ -642,6 +758,71 @@ switch (command) {
     break;
   }
 
+  case "upgrade": {
+    import("./upgrade.js")
+      .then(async (m) => {
+        const code = await m.runUpgrade(args);
+        process.exit(code);
+      })
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
+  case "template": {
+    import("./template-sync.js")
+      .then(async (m) => {
+        const code = await m.runTemplate(args);
+        process.exit(code);
+      })
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
+  case "doctor": {
+    import("./doctor.js")
+      .then(async (m) => {
+        const code = await m.runDoctor(args);
+        process.exit(code);
+      })
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
+  case "db-migrate": {
+    import("./db-migrate.js")
+      .then(async (m) => {
+        const code = await m.runDbMigrate(args);
+        process.exit(code);
+      })
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
+  case "clean": {
+    import("./clean.js")
+      .then(async (m) => {
+        const code = await m.runClean(args);
+        process.exit(code);
+      })
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
   case "code": {
     import("./code.js")
       .then((m) => m.runCode(args))
@@ -650,9 +831,6 @@ switch (command) {
   }
 
   case "mcp": {
-    // Connect external coding agents (Claude Code, Cowork, Codex) over MCP.
-    // `mcp serve` runs the stdio transport; install/uninstall/status/token
-    // manage client configs + the local token.
     import("./mcp.js")
       .then((m) => m.runMcp(args))
       .catch((err) => {
@@ -663,11 +841,11 @@ switch (command) {
   }
 
   case "connect": {
-    // Wire your local coding agent to a DEPLOYED agent-native app via a
-    // browser device-code flow (no token copying). `--all` connects every
-    // first-party hosted app; `--token` is the no-browser fallback.
     import("./connect.js")
-      .then((m) => m.runConnect(args))
+      .then(async (m) => {
+        await m.runConnect(args);
+        process.exit(process.exitCode ?? 0);
+      })
       .catch((err) => {
         console.error(err?.message ?? err);
         process.exit(1);
@@ -677,8 +855,6 @@ switch (command) {
 
   case "reconnect":
   case "reauth": {
-    // Refresh an existing remote MCP auth/config entry without reinstalling
-    // app skills or running the broader connector setup path.
     import("./connect.js")
       .then((m) => m.runConnect(["reconnect", ...args]))
       .catch((err) => {
@@ -689,7 +865,6 @@ switch (command) {
   }
 
   case "app-skill": {
-    // Package or install an agent-native app as a skill-backed MCP/app bundle.
     import("./app-skill.js")
       .then((m) => m.runAppSkill(args))
       .catch((err) => {
@@ -699,8 +874,17 @@ switch (command) {
     break;
   }
 
+  case "plugin": {
+    import("./agent-plugin.js")
+      .then((m) => m.runAgentPlugin(args))
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
   case "skills": {
-    // Friendly skill install surface. Wraps open skills installation plus MCP.
     import("./skills.js")
       .then((m) => m.runSkills(args))
       .catch((err) => {
@@ -710,12 +894,51 @@ switch (command) {
     break;
   }
 
+  case "content": {
+    import("./content-local.js")
+      .then(async (m) => {
+        const code = await m.runContentLocal(args);
+        process.exit(code);
+      })
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
+  case "visualize-repo": {
+    import("./visualize-repo.js")
+      .then(async (m) => {
+        const code = await m.runVisualizeRepo(args);
+        process.exit(code);
+      })
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
+  case "design": {
+    import("./design-connect.js")
+      .then(async (m) => {
+        const code = await m.runDesign(args);
+        process.exit(code);
+      })
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
   case "recap": {
-    // PR visual recap helpers used by the GitHub Action. Promoted to the CLI
-    // so an installed repo's workflow can call `agent-native recap …` instead
-    // of copying helper scripts. Run `agent-native recap help` for the full
-    // subcommand list.
-    import("./recap.js")
+    loadOptionalPeer(
+      "@agent-native/recap-cli",
+      () => import("@agent-native/recap-cli"),
+    )
+      .then(() => import("./recap.js"))
       .then((m) => m.runRecap(args))
       .catch((err) => {
         console.error(err?.message ?? err);
@@ -725,9 +948,11 @@ switch (command) {
   }
 
   case "plan": {
-    // Plan authoring helpers: local MDX preview plus a no-auth block catalog
-    // fetcher for text-only/local installs.
-    import("./plan-local.js")
+    loadOptionalPeer(
+      "@agent-native/recap-cli",
+      () => import("@agent-native/recap-cli"),
+    )
+      .then(() => import("./plan-local.js"))
       .then((m) => m.runPlan(args))
       .catch((err) => {
         console.error(err?.message ?? err);
@@ -737,7 +962,6 @@ switch (command) {
   }
 
   case "create-workspace": {
-    // Deprecated alias for `create` (since workspace is now the default).
     const parsed = parseScaffoldArgs(args);
     import("./create-workspace.js")
       .then((m) =>
@@ -748,7 +972,6 @@ switch (command) {
   }
 
   case "add-app": {
-    // Add one or more apps to the current workspace.
     const parsed = parseScaffoldArgs(args);
     import("./create.js")
       .then((m) =>
@@ -759,8 +982,6 @@ switch (command) {
   }
 
   case "deploy": {
-    // Build and deploy the entire workspace as one unit. Each app is served
-    // at /<app>/* under the same origin.
     import("../deploy/workspace-deploy.js")
       .then((m) => m.runWorkspaceDeploy({ args }))
       .catch((err) => {
@@ -770,27 +991,61 @@ switch (command) {
     break;
   }
 
+  case "amplify-stream": {
+    import("./amplify-stream.js")
+      .then((m) => m.runAmplifyStream(args))
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
   case "setup-agents": {
-    import("./setup-agents.js").then((m) => m.runSetupAgents());
+    import("./setup-agents.js")
+      .then((m) => m.runSetupAgents())
+      .catch(handleScaffoldImportError);
     break;
   }
 
   case "info": {
-    // Print read-only info about an installable package (e.g. @agent-native/scheduling).
-    // Lists subpath exports, source paths in node_modules, and docs pointers.
-    import("./info.js").then((m) => m.runInfo(args[0]));
+    import("./info.js")
+      .then((m) => m.runInfo(args[0]))
+      .catch(handleScaffoldImportError);
     break;
   }
 
   case "add": {
-    // Blueprint installer (à la Flue's `flue add`): instead of scaffolding
-    // files, emit a curated Markdown integration blueprint to stdout so it can
-    // be piped into a coding agent — `agent-native add provider stripe | claude`.
-    // A URL instead of a name yields a generic research-and-integrate blueprint.
     import("./add.js")
       .then((m) => {
         const code = m.runAdd(args);
-        if (code !== 0) process.exit(code);
+        process.exit(code);
+      })
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
+  case "package": {
+    import("./package-lifecycle.js")
+      .then(async (m) => {
+        const code = await m.runPackageLifecycle(args);
+        process.exit(code);
+      })
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
+  case "eject": {
+    import("./eject.js")
+      .then(async (m) => {
+        const code = await m.runEject(args);
+        process.exit(code);
       })
       .catch((err) => {
         console.error(err?.message ?? err);
@@ -810,11 +1065,21 @@ switch (command) {
   }
 
   case "eval": {
-    // Discover and run the app's evals (**/*.eval.ts, evals/*.ts), score the
-    // agent's output, and exit non-zero if any eval falls below its threshold.
-    // Doubles as a CI deploy gate. `--json` emits a machine-readable report.
     import("./eval.js")
       .then((m) => m.runEval(args))
+      .catch((err) => {
+        console.error(err?.message ?? err);
+        process.exit(1);
+      });
+    break;
+  }
+
+  case "changelog": {
+    import("./changelog.js")
+      .then(async (m) => {
+        const code = await m.runChangelog(args);
+        process.exit(code);
+      })
       .catch((err) => {
         console.error(err?.message ?? err);
         process.exit(1);
@@ -852,9 +1117,9 @@ Usage:
                                 Call another agent-native app over A2A
   agent-native script <name>    Run an action (deprecated alias for 'action')
   agent-native typecheck        Run TypeScript type checking
-  agent-native create [name]    Scaffold a new agent-native workspace with a
-                                multi-select template picker. Use --standalone
-                                for a single-app scaffold.
+  agent-native doctor           Scan app/workspace source for guard violations
+  agent-native create [name]    Set up a Chat workspace, standalone app,
+                                headless app, or first-party/community template.
   agent-native code             Launch Agent-Native Code workspace. Type a task or
                                 use goals like /migrate and /audit.
   agent-native code serve       Run the Agent-Native Code remote connector.
@@ -872,13 +1137,22 @@ Usage:
                                 reinstalling app skills/connectors.
   agent-native app-skill <cmd>  Install, launch, or package app-backed skills.
                                 cmds: ensure | launch | pack
-  agent-native skills add assets|design-exploration|visual-plan|visual-recap|context-xray
+  agent-native plugin import <path> [--into <workspace>] [--yes] [--force]
+                                Import standard Agent Plugin Skills and remote MCP servers.
+  agent-native skills add assets|content|design-exploration|visual-edit|visual-plan|visual-recap|context-xray
                                 Install the skill instructions, register the MCP
                                 connector, AND authenticate it in one step.
                                 --no-connect skips auth (run 'connect' later);
                                 non-interactive shells print the connect command.
                                 --with-github-action also writes the PR Visual
                                 Recap workflow into .github/workflows/.
+  agent-native content local-files <file-or-folder>
+                                Connect a local docs/content folder to normal
+                                database-backed Content. Use --no-open, --port N,
+                                or --profile docs/no-bookkeeping as needed.
+  agent-native design connect  Start a localhost Design bridge for a running
+                                dev server. Use --url, --port, --root, or
+                                --json to print the route/source manifest.
   agent-native recap <cmd>      PR visual recap setup and GitHub Action helpers.
                                 Run 'agent-native recap help' for subcommands.
   agent-native plan <cmd>       Plan helpers for block catalogs and local files.
@@ -886,10 +1160,22 @@ Usage:
                                 local serve | local verify | local preview
   agent-native migrate <source> Create an Agent-Native Code /migrate session, or use
                                 --emit for a portable own-agent dossier.
+  agent-native upgrade          Bring an existing app/workspace to current
+                                @agent-native/* packages, refresh scaffold
+                                skills, and typecheck. Prefer this over
+                                patching core/dispatch. 'upgrade check' is
+                                doctor-only.
+  agent-native template <cmd>   Pull later upstream template changes into an
+                                app generated from a first-party template, via
+                                a 3-way merge against the tree it was
+                                scaffolded from. cmds: status | diff | sync |
+                                baseline | accept. Run after 'upgrade'.
   agent-native add-app [name]   Add one or more apps to the current workspace
   agent-native workspace-dev    Start the multi-app workspace gateway
   agent-native deploy           Build & deploy every app in the workspace to
                                 a single origin (your-agents.com/<app>/*)
+  agent-native amplify-stream   Build a Nitro streaming Lambda and connect it
+                                to an AWS Amplify branch
   agent-native setup-agents     Create symlinks for all agent tools
   agent-native info <pkg>       Print info about an installed package:
                                 exports, source paths, and docs links.
@@ -901,26 +1187,52 @@ Usage:
                                 Pass a URL instead of a name for a generic
                                 research-and-integrate blueprint. --list to
                                 browse available blueprints.
+  agent-native package <cmd> <package>
+                                Manifest package lifecycle: inspect | add | eject.
+                                add/eject are dry-run unless --apply; --json emits
+                                a machine-readable compatibility/change report.
+  agent-native eject <unit>    Copy a supported feature into app-owned source.
+                                --list discovers units; inspect/diff are read-only;
+                                eject/restore are dry-run unless --apply.
+  agent-native changelog <cmd>  Author the app's user-facing changelog.
+                                cmds: add "<summary>" [--type added|fixed|...] |
+                                release | list. Pending entries live in
+                                changelog/; 'release' rolls them into CHANGELOG.md.
+  agent-native db-migrate       Apply drizzle migrations. With PGlite and a running
+                                dev server, applies them through that server
+                                (reads drizzle.config.ts, or --config <path>);
+                                otherwise runs drizzle-kit migrate.
+  agent-native clean            Reclaim disk by deleting regenerable build
+                                caches (node_modules/.vite, .nitro). Dry-run
+                                unless --apply; --builds also selects build/,
+                                dist/, .output/ and .netlify bundles.
   agent-native audit-agent-web  Audit a public URL for agent-readable surfaces
   agent-native eval [pattern]   Run the app's evals (**/*.eval.ts, evals/*.ts)
                                 and exit non-zero if any scores below its
                                 threshold. A CI deploy gate. --json for CI,
                                 --threshold N to override all thresholds.
+                                eval promote <runId> [--write path] [--json]
+                                turns a completed production trace into a
+                                defineEval case (SQL dataset; --write emits
+                                the *.eval.ts CI already discovers).
 
 Options:
   -h, --help                    Show this help message
   -v, --version                 Show version number
   --template <names>            Comma-separated templates to pre-select
-                                (mail,calendar,analytics,...) — or
-                                github:user/repo for community templates
+                                (mail,calendar,analytics,...), or install a
+                                community repo from a plain GitHub URL or
+                                community:owner/repo[?app=id][#ref]
   --headless                    Create the primitive-first action-only scaffold
   --standalone                  Scaffold a single standalone app (no workspace)
   --emit [dir]                  With migrate, emit an own-agent dossier
   --describe <text>             With migrate, describe URL/prose-only sources
-  --preset <name>               Workspace deploy preset:
-                                cloudflare_pages (default), netlify, or vercel
+  --preset <name>               Workspace deploy preset: netlify (default) or vercel
   --build-only                  Build workspace deploy artifacts without publishing
   --eager                       With workspace dev, start every app immediately
+  --prewarm                     With workspace dev, warm non-default apps in the background
+  --no-prewarm                  With workspace dev, keep non-default apps lazy
+  --no-open                     With workspace dev, do not open a browser
   --url <url>                   URL to audit with audit-agent-web
 
 Feedback:  ${FEEDBACK_URL}
@@ -929,14 +1241,6 @@ Bugs:      ${BUGS_URL}`);
 
   default:
     if (command && !command.startsWith("-")) {
-      // A bare, single command-like token with no further args is almost
-      // always a mistyped subcommand (e.g. `agent-native destory`). Silently
-      // forwarding it to the coding agent would run an LLM with file-write
-      // powers on a typo — a real footgun on a code-modifying tool. Refuse it
-      // and point at the explicit forms. Intentional natural-language tasks
-      // are still dispatched: a quoted phrase (`agent-native "fix tests"`,
-      // which arrives as one argv token containing a space) or multi-word
-      // input (`agent-native fix the tests`, which has trailing args).
       const looksLikeMistypedSubcommand =
         args.length === 0 && /^[a-z][a-z0-9-]*$/i.test(command);
       if (!looksLikeMistypedSubcommand) {

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   getDashboard: vi.fn(),
-  upsertDashboard: vi.fn(async () => ({ archivedAt: null })),
+  upsertDashboard: vi.fn(async (..._args: unknown[]) => ({ archivedAt: null })),
   dryRunQuery: vi.fn(),
   hasCollabState: vi.fn(async () => false),
   applyText: vi.fn(async () => undefined),
@@ -38,13 +38,19 @@ vi.mock("@agent-native/core/server", () => ({
 
 vi.mock("@agent-native/core/collab", () => ({
   applyText: mocks.applyText,
+  getText: vi.fn(async () => ""),
   hasCollabState: mocks.hasCollabState,
   seedFromText: mocks.seedFromText,
 }));
 
 vi.mock("../server/lib/dashboards-store", () => ({
+  assertDashboardEditable: vi.fn(async () => undefined),
   getDashboard: mocks.getDashboard,
-  upsertDashboard: mocks.upsertDashboard,
+  upsertDashboardOutcome: async (...args: unknown[]) => ({
+    dashboard: await mocks.upsertDashboard(...args),
+    didWrite: true,
+  }),
+  DashboardConflictError: class DashboardConflictError extends Error {},
 }));
 
 vi.mock("../server/lib/bigquery", () => ({
@@ -91,6 +97,56 @@ describe("update-dashboard demo source validation", () => {
       expect.objectContaining({ name: "Demo test" }),
       { email: "alice@example.com", orgId: null },
     );
+  });
+
+  it("accepts stored data program panels without treating their descriptor as SQL", async () => {
+    await updateDashboard.run({
+      dashboardId: "program-test",
+      config: {
+        name: "Program test",
+        panels: [
+          {
+            id: "risk-cohort",
+            title: "Risk cohort",
+            source: "program",
+            sql: JSON.stringify({ programId: "dp_risk_cohort" }),
+            chartType: "table",
+            width: 1,
+          },
+        ],
+      },
+    });
+
+    expect(mocks.dryRunQuery).not.toHaveBeenCalled();
+    expect(mocks.upsertDashboard).toHaveBeenCalledWith(
+      "program-test",
+      "sql",
+      expect.objectContaining({ name: "Program test" }),
+      { email: "alice@example.com", orgId: null },
+    );
+  });
+
+  it("rejects a plain data program id before saving a panel", async () => {
+    await expect(
+      updateDashboard.run({
+        dashboardId: "program-test",
+        config: {
+          name: "Program test",
+          panels: [
+            {
+              id: "risk-cohort",
+              title: "Risk cohort",
+              source: "program",
+              sql: "dp_risk_cohort",
+              chartType: "table",
+              width: 1,
+            },
+          ],
+        },
+      }),
+    ).rejects.toThrow(/program descriptor is invalid/);
+
+    expect(mocks.upsertDashboard).not.toHaveBeenCalled();
   });
 
   it("rejects malformed demo descriptors", async () => {

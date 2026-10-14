@@ -1,12 +1,4 @@
 #!/usr/bin/env node
-/**
- * guard-no-one-off-mcp-app-html.mjs
- *
- * Template MCP Apps must reuse the real app UI. Use embedApp() to launch the
- * app at a focused route instead of hand-writing product surfaces in inline
- * HTML. This catches the old _mcp-apps helper pattern and direct mcpApp HTML
- * blocks in template actions.
- */
 
 import { readFileSync } from "node:fs";
 import { readdir } from "node:fs/promises";
@@ -18,14 +10,31 @@ const REPO_ROOT = path.resolve(
   "..",
 );
 const TEMPLATES_DIR = path.join(REPO_ROOT, "templates");
+const SKIP_DIRS = new Set([
+  "node_modules",
+  "dist",
+  "build",
+  ".cache",
+  ".generated",
+  ".netlify",
+  ".react-router",
+  "coverage",
+]);
 
 const failures = [];
 
 async function walk(dir, files = []) {
-  const entries = await readdir(dir, { withFileTypes: true });
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (err) {
+    if (err?.code === "ENOENT") return files;
+    throw err;
+  }
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) continue;
       await walk(full, files);
     } else if (entry.isFile() && /\.(ts|tsx)$/.test(entry.name)) {
       files.push(full);
@@ -103,7 +112,13 @@ const files = await walk(TEMPLATES_DIR);
 
 for (const file of files) {
   const rel = relative(file);
-  const source = readFileSync(file, "utf8");
+  let source;
+  try {
+    source = readFileSync(file, "utf8");
+  } catch (err) {
+    if (err?.code === "ENOENT") continue;
+    throw err;
+  }
 
   if (/\/actions\/_mcp-apps\.ts$/.test(rel)) {
     failures.push({
@@ -130,8 +145,6 @@ for (const file of files) {
         reason: "defines direct MCP App HTML instead of embedApp()",
       });
     }
-    // Catalog-only configs (e.g. `{ compactCatalog: true }`) define no UI
-    // surface, so the full-app embed helper is not required for them.
     if (/\bresource\s*:/.test(block) && !block.includes("embedApp(")) {
       failures.push({
         file: rel,

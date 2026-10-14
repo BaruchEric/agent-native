@@ -31,6 +31,66 @@ expose.
   counts, and column names.
 - `delete-staged-dataset` — remove a staged dataset to free scratch storage.
 
+## Custom API sources
+
+Use `provider-api-register` when a public HTTPS API is not in the built-in
+catalog. Registration stores the provider label, base URL, docs URL, auth mode,
+and credential key names only. Save the actual key in Analytics Settings before
+testing or querying it. Org-scoped registration is restricted to organization
+owners/admins; use user scope for a personal source.
+
+The Analytics Data Sources page provides a bounded GET test with an optional
+query and response items path. It returns status, row count, columns, and a few
+sample rows without returning raw headers or response bodies. After the test
+passes, use the handoff to save a manual-refresh Data Program with
+`providerFetch` and `emit(rows, schema)`. Keep pagination and scheduled refresh
+inside the Data Program rather than inventing a second cache.
+
+Custom provider base URLs must be public HTTPS. Hosted Analytics cannot resolve
+the user's localhost or private LAN; use a deployed endpoint or an approved
+secure tunnel. Never bypass the provider runtime's DNS-aware SSRF protection.
+
+## Clay
+
+Clay is a credentialed GTM data and enrichment provider, not a messaging
+channel. Use the `clay` provider for its Public API:
+
+- Authentication is the configured `CLAY_PUBLIC_API_KEY`, injected server-side
+  in the `clay-api-key` header. Never pass the key in action arguments.
+- Provider requests are restricted to the exact `https://api.clay.com` origin,
+  with `/public/v0` as the default base path. Read the registered official docs
+  or OpenAPI spec on `developers.clay.com` through `provider-api-docs`; do not
+  try to send an authenticated provider request to that documentation host.
+- Searches cover companies and people and use a stateful forward-only iterator:
+  create the search, then repeat its run endpoint while `has_more` is true.
+- Routines are asynchronous. Start the routine, then poll its results endpoint
+  or use a separately verified completion webhook.
+- Tables are query-only, require Enterprise access, and require a known table
+  id. The Public API cannot list, create, or update tables.
+
+The optional local Clay CLI/MCP plugin uses a separate browser-login session.
+It is not required for hosted Agent-Native provider access. Do not install or
+vendor that plugin by default; its public repository currently declares no
+license.
+
+## Gong
+
+Gong's UI has indexed Words or phrases search, but the public REST endpoints
+used here do not expose an arbitrary transcript-text filter. The efficient API
+path is a configured keyword tracker: request `content.trackers` from
+`POST /calls/extensive`, stage the paginated calls, and flatten/filter tracker
+hits with `query-staged-dataset` or a Data Program. This only works for terms
+already configured as trackers and exposed in API results.
+
+For an arbitrary term, use Gong native Search when that connected surface is
+available. If raw transcript evidence is required, stage call IDs with the raw
+API and use `provider-corpus-job`'s 20-call transcript batches. Do not loop over
+`gong-calls(transcript: id)` from `run-code` or a delegated agent. A corpus job
+improves durability and checkpointing, but it still scans transcript bodies and
+should be described as an expensive fallback. For recurring tracker-based
+reports, save the staged fetch and reduction as a Data Program instead of
+creating a new provider-specific action.
+
 ## Workflow
 
 1. Use a first-class action when it exactly fits the request.
@@ -38,7 +98,9 @@ expose.
    shape, or pagination mode, switch to `provider-api-catalog` for that
    provider. Check `corpusRecipes` first when the user asks for broad body-text
    searches across transcripts, messages, tickets, issues, notes, documents, or
-   conversation logs.
+   conversation logs. For Gong, use the configured keyword-tracker recipe when
+   it covers the requested term; otherwise use the raw transcript recipe only
+   when the provider's native search surface is unavailable or insufficient.
 3. If the endpoint or payload is not obvious, use `provider-api-docs` to fetch
    the official docs/spec URL from the catalog.
 4. Call `provider-api-request` with the exact provider method, path, query, and
@@ -49,8 +111,10 @@ expose.
      charge history), **add `stageAs`** to avoid context-window truncation.
    - For multi-page results, **also add `pagination`** config to fetch all pages
      server-side in one call (cursor / page / offset modes supported).
-5. After staging, call `query-staged-dataset` to aggregate. Only the compact
-   summary (counts, sums, sample rows) needs to flow into the context window.
+5. After staging, call `query-staged-dataset` to aggregate, or save a Data
+   Program when the provider pull should become a cached, refreshable source.
+   Only the compact summary (counts, sums, sample rows) needs to flow into the
+   context window. Treat the raw request as ingestion, not the final analysis.
 6. For source-record body searches, use the raw body endpoint or native search
    endpoint for that record type. Parent/container metadata such as call lists,
    channel lists, ticket titles, summaries, or briefs is discovery evidence, not
@@ -173,6 +237,16 @@ provider-api-request(
   pagination: { offsetParam: "offset", pageSize: 100, maxPages: 30 }
 )
 ```
+
+## Turning a one-off pull into a dashboard panel
+
+When an ad-hoc `provider-api-request` call or `run-code` fetch/join/aggregate
+script answers a question well enough that it should become a live,
+refreshable dashboard panel other users can see — not just a one-time chat
+answer — save it as a data program with `save-data-program` instead of
+re-running the same script by hand on every visit. See the `data-programs`
+skill for the `emit(rows, schema)` contract, caching/refresh model, and a
+worked HubSpot x Pylon join example.
 
 ## Guardrails
 

@@ -1,3 +1,17 @@
+import {
+  isValidWorkspaceAppIdFormat,
+  normalizeTrackingDimension,
+} from "@agent-native/core/shared";
+
+export function normalizeCallerAppId(value: unknown): string | undefined {
+  const normalized = normalizeTrackingDimension(value);
+  return normalized &&
+    normalized.length <= 64 &&
+    isValidWorkspaceAppIdFormat(normalized)
+    ? normalized
+    : undefined;
+}
+
 export const IMAGE_CATEGORIES = [
   "hero",
   "landing",
@@ -8,10 +22,12 @@ export const IMAGE_CATEGORIES = [
   "social",
   "campaign",
   "style-only",
+  "skeleton",
   "other",
 ] as const;
 
 export const MAX_ASSET_UPLOAD_FILES = 20;
+export const MAX_ASSET_UPLOAD_BATCH_BYTES = 4 * 1024 * 1024 - 256 * 1024;
 
 export const ASPECT_RATIOS = [
   "1:1",
@@ -38,7 +54,22 @@ export const IMAGE_MODELS = [
   "gemini-3.1-flash-image-preview",
   "gemini-3-pro-image-preview",
   "gemini-2.5-flash-image",
+  "gpt-image-1",
+  "gpt-image-2",
 ] as const;
+
+export const MODEL_ASPECT_RATIOS: Partial<
+  Record<ImageModel, readonly AspectRatio[]>
+> = {
+  "gpt-image-1": ["1:1", "2:3", "3:2"],
+  "gpt-image-2": ["1:1", "2:3", "3:2"],
+};
+
+export function supportedAspectRatiosForModel(
+  model: ImageModel,
+): readonly AspectRatio[] {
+  return MODEL_ASPECT_RATIOS[model] ?? ASPECT_RATIOS;
+}
 
 export const GENERATION_INTENTS = ["generate", "restyle", "edit"] as const;
 
@@ -79,6 +110,7 @@ export type ImageRole =
   | "product_reference"
   | "diagram_reference"
   | "video_reference"
+  | "background_reference"
   | "subject_reference"
   | "edit_target"
   | "generated";
@@ -106,14 +138,84 @@ export type GenerationSessionStatus =
 export interface StyleBrief {
   description?: string;
   palette?: string[];
+  sourceUrl?: string;
+  rendered?: boolean;
+  designMd?: string;
+  semanticColors?: Record<string, string>;
+  spacing?: string[];
+  radii?: string[];
+  shadows?: string[];
+  backgrounds?: string[];
+  componentStyles?: Array<Record<string, unknown>>;
+  cssVariables?: Record<string, string>;
+  brandKit?: Record<string, unknown>;
+  warnings?: string[];
   medium?: string;
   mood?: string;
   subjectMatter?: string;
   texture?: string;
   composition?: string;
   lighting?: string;
+  fontFamilies?: string[];
+  fontWeights?: string[];
+  letterforms?: string;
+  caseStyle?: string;
   typographyPolicy?: string;
   doNot?: string[];
+}
+
+export type PresetSkeletonBackground = { type: "asset"; assetId: string };
+export type PresetSkeletonMask = { type: "asset"; assetId: string };
+
+export type PresetSkeletonForegroundSource =
+  | "canonicalLogo"
+  | { assetId: string };
+
+export interface PresetSkeletonForegroundLayer {
+  source: PresetSkeletonForegroundSource;
+  x: number;
+  y: number;
+  w: number;
+}
+
+export interface PresetSkeletonSpec {
+  background: PresetSkeletonBackground;
+  mask?: PresetSkeletonMask;
+  contentMode: "cutout" | "fill";
+  contentRegion?: { x: number; y: number; w: number; h: number };
+  dropShadow?: boolean;
+  foreground?: PresetSkeletonForegroundLayer[];
+}
+
+export const PRESET_REFERENCE_ROLES = [
+  "subject",
+  "style",
+  "product",
+  "background",
+  "composition",
+] as const;
+
+export type PresetReferenceRole = (typeof PRESET_REFERENCE_ROLES)[number];
+
+export interface PresetReference {
+  id: string;
+  label: string;
+  role: PresetReferenceRole;
+  description?: string;
+  assetIds: string[];
+  variable: boolean;
+  required: boolean;
+}
+
+export type AssetAccessRole =
+  | "viewer"
+  | "commenter"
+  | "editor"
+  | "admin"
+  | "owner";
+
+export function canApproveWithRole(role: unknown): boolean {
+  return role === "editor" || role === "admin" || role === "owner";
 }
 
 export interface ImageLibrarySummary {
@@ -126,6 +228,7 @@ export interface ImageLibrarySummary {
   canonicalLogoAssetId?: string | null;
   coverAssetId?: string | null;
   visibility?: string;
+  accessRole?: "owner" | "admin" | "editor" | "commenter" | "viewer";
   archivedAt?: string | null;
   createdAt?: string;
   updatedAt?: string;
@@ -134,6 +237,7 @@ export interface ImageLibrarySummary {
   videoCount?: number;
   coverAsset?: ImageAssetPreview | null;
   previewAssets?: ImageAssetPreview[];
+  folders?: AssetFolderSummary[];
 }
 
 export interface ImageAssetPreview {
@@ -160,7 +264,7 @@ export interface ImageAssetMetadata {
   colors?: string[];
   contentHash?: string;
   generated?: boolean;
-  intent?: "subject" | string;
+  intent?: "subject" | (string & {});
   sourceAssetId?: string;
   referenceAssetIds?: string[];
   prompt?: string;
@@ -199,10 +303,13 @@ export interface AssetVariantState {
   collectionId?: string | null;
   presetId?: string | null;
   sessionId?: string | null;
+  threadId?: string | null;
+  variantScopeId?: string | null;
   prompt: string;
   slots: Array<{
     slotId: string;
     runId?: string;
+    ownerEmail?: string | null;
     status: "pending" | "ready" | "failed";
     assetId?: string;
     previewUrl?: string;
@@ -225,15 +332,28 @@ export interface GenerationPresetSummary {
   category: ImageCategory;
   mediaType: AssetMediaType;
   promptTemplate?: string | null;
-  aspectRatio: AspectRatio;
-  imageSize: ImageSize;
-  model: ImageModel;
+  aspectRatio: AspectRatio | VideoAspectRatio;
+  imageSize: ImageSize | VideoResolution;
+  model: ImageModel | VideoModel;
   textPolicy: string;
   referencePolicy: GenerationPresetReferencePolicy;
+  includeLogo: boolean;
   settings: Record<string, unknown>;
   sortOrder: number;
   createdAt?: string;
   updatedAt?: string;
+}
+
+export interface TemplateSummary extends Omit<
+  GenerationPresetSummary,
+  "libraryId"
+> {
+  libraryId: string | null;
+  scope: "global" | "library";
+  visibility: "private" | "org" | "public";
+  ownerEmail: string;
+  accessRole?: "viewer" | "commenter" | "editor" | "admin" | "owner";
+  libraryTitle?: string | null;
 }
 
 export interface GenerationSessionSummary {

@@ -1,27 +1,28 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
-import { getDbExec, isPostgres } from "../../db/client.js";
+
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+
+import { getDbExec } from "../../db/client.js";
 import { createGetDb } from "../../db/create-get-db.js";
-import { accessFilter, assertAccess } from "../../sharing/access.js";
+import { retainRequestDbPoolScope } from "../../db/request-pool-context.js";
 import {
   getRequestUserEmail,
   getRequestOrgId,
 } from "../../server/request-context.js";
+import { accessFilter, assertAccess } from "../../sharing/access.js";
+import { getLocalExtension, listLocalExtensions } from "../local.js";
 import { extensions, extensionShares } from "../schema.js";
 import {
   extensionSlots,
   extensionSlotInstalls,
   EXTENSION_SLOTS_CREATE_SQL,
-  EXTENSION_SLOTS_CREATE_SQL_PG,
   EXTENSION_SLOTS_BY_SLOT_INDEX_SQL,
   EXTENSION_SLOTS_BY_EXTENSION_INDEX_SQL,
   EXTENSION_SLOTS_UNIQUE_INDEX_SQL,
   EXTENSION_SLOT_INSTALLS_CREATE_SQL,
-  EXTENSION_SLOT_INSTALLS_CREATE_SQL_PG,
   EXTENSION_SLOT_INSTALLS_BY_USER_SLOT_INDEX_SQL,
   EXTENSION_SLOT_INSTALLS_UNIQUE_INDEX_SQL,
 } from "./schema.js";
-import { getLocalExtension, listLocalExtensions } from "../local.js";
 
 const getDb = createGetDb({
   extensions,
@@ -34,27 +35,20 @@ let _initPromise: Promise<void> | undefined;
 
 export async function ensureSlotTables(): Promise<void> {
   if (!_initPromise) {
-    _initPromise = (async () => {
+    const _initPromiseWithRequestDbPoolScope = (async () => {
       const client = getDbExec();
-      const pg = isPostgres();
-      await client.execute(
-        pg ? EXTENSION_SLOTS_CREATE_SQL_PG : EXTENSION_SLOTS_CREATE_SQL,
-      );
+      await client.execute(EXTENSION_SLOTS_CREATE_SQL);
       await client.execute(EXTENSION_SLOTS_BY_SLOT_INDEX_SQL);
       await client.execute(EXTENSION_SLOTS_BY_EXTENSION_INDEX_SQL);
       await client.execute(EXTENSION_SLOTS_UNIQUE_INDEX_SQL);
-      await client.execute(
-        pg
-          ? EXTENSION_SLOT_INSTALLS_CREATE_SQL_PG
-          : EXTENSION_SLOT_INSTALLS_CREATE_SQL,
-      );
+      await client.execute(EXTENSION_SLOT_INSTALLS_CREATE_SQL);
       await client.execute(EXTENSION_SLOT_INSTALLS_BY_USER_SLOT_INDEX_SQL);
       await client.execute(EXTENSION_SLOT_INSTALLS_UNIQUE_INDEX_SQL);
     })().catch((err) => {
-      // Retry init on the next call after a failed startup.
       _initPromise = undefined;
       throw err;
     });
+    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
   }
   return _initPromise;
 }
@@ -79,10 +73,6 @@ export interface ExtensionSlotInstallRow {
   updatedAt: string;
 }
 
-/**
- * Declare that a extension can render in a slot. Caller must have editor access on
- * the extension (only people who can edit a extension can change its slot targets).
- */
 export async function addExtensionSlotTarget(
   extensionId: string,
   slotId: string,
@@ -108,11 +98,11 @@ export async function addExtensionSlotTarget(
   try {
     await db.insert(extensionSlots).values(row);
   } catch (err: any) {
-    // Unique index hit — already declared. Treat as idempotent: return existing.
     if (
       String(err?.message ?? err)
         .toLowerCase()
-        .includes("unique")
+        .includes("unique") ||
+      err?.cause?.code === "23505"
     ) {
       const existing = await db
         .select()
@@ -177,10 +167,6 @@ export async function listSlotsForExtension(
   return rows as ExtensionSlotRow[];
 }
 
-/**
- * List extensions that declare a slot — but only extensions the current user has access
- * to. Joins through the extensions access filter.
- */
 export async function listExtensionsForSlot(slotId: string): Promise<
   Array<{
     extensionId: string;
@@ -192,7 +178,6 @@ export async function listExtensionsForSlot(slotId: string): Promise<
 > {
   await ensureSlotTables();
   const db = getDb();
-  // Pull extensions the user can see, then narrow to ones declaring this slot.
   const accessible = await db
     .select({
       id: extensions.id,
@@ -201,7 +186,12 @@ export async function listExtensionsForSlot(slotId: string): Promise<
       icon: extensions.icon,
     })
     .from(extensions)
-    .where(accessFilter(extensions, extensionShares));
+    .where(
+      and(
+        accessFilter(extensions, extensionShares),
+        isNull(extensions.archivedAt),
+      ),
+    );
   const localRows = (await listLocalExtensions())
     .filter((extension) => extension.source.slots.includes(slotId))
     .map((extension) => ({
@@ -223,7 +213,16 @@ export async function listExtensionsForSlot(slotId: string): Promise<
         inArray(extensionSlots.extensionId, ids),
       ),
     );
-  const byId = new Map(accessible.map((t: any) => [t.id, t]));
+  const byId = new Map(
+    (
+      accessible as Array<{
+        id: string;
+        name: string;
+        description: string;
+        icon: string | null;
+      }>
+    ).map((t) => [t.id, t]),
+  );
   const sqlRows = (declarations as ExtensionSlotRow[]).map((d) => {
     const t = byId.get(d.extensionId)!;
     return {
@@ -237,11 +236,6 @@ export async function listExtensionsForSlot(slotId: string): Promise<
   return [...sqlRows, ...localRows];
 }
 
-/**
- * Install a extension into a slot for the current user. Verifies the user has at
- * least viewer access to the extension. Idempotent — re-installing returns the
- * existing row.
- */
 export async function installExtensionSlot(
   extensionId: string,
   slotId: string,
@@ -341,12 +335,6 @@ export async function uninstallExtensionSlot(
   return true;
 }
 
-/**
- * List the current user's installs for a slot. Joins with `extensions` so the
- * caller gets extension name/description/icon/updatedAt without a second query.
- * Extensions the user has lost access to are silently skipped (lazy garbage
- * collection).
- */
 export async function listSlotInstallsForUser(slotId: string): Promise<
   Array<{
     installId: string;
@@ -395,8 +383,23 @@ export async function listSlotInstallsForUser(slotId: string): Promise<
       updatedAt: extensions.updatedAt,
     })
     .from(extensions)
-    .where(accessFilter(extensions, extensionShares));
-  const byId = new Map(accessible.map((t: any) => [t.id, t]));
+    .where(
+      and(
+        accessFilter(extensions, extensionShares),
+        isNull(extensions.archivedAt),
+      ),
+    );
+  const byId = new Map(
+    (
+      accessible as Array<{
+        id: string;
+        name: string;
+        description: string;
+        icon: string | null;
+        updatedAt: string;
+      }>
+    ).map((t) => [t.id, t]),
+  );
 
   const sqlInstalls = (installs as ExtensionSlotInstallRow[])
     .filter((i) => byId.has(i.extensionId))
@@ -417,7 +420,6 @@ export async function listSlotInstallsForUser(slotId: string): Promise<
   return [...localInstalls, ...sqlInstalls];
 }
 
-/** Delete every slot/install row referencing a extension. Called from deleteExtension. */
 export async function cascadeDeleteExtensionSlots(
   extensionId: string,
 ): Promise<void> {

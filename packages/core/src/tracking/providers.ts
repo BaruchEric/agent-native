@@ -1,18 +1,8 @@
-/**
- * Built-in tracking providers that auto-register from env vars.
- *
- * No SDK dependencies — uses raw HTTP to keep core lightweight.
- * Set the env var and tracking starts automatically.
- *
- * POSTHOG_API_KEY + POSTHOG_HOST  → PostHog
- * MIXPANEL_TOKEN                  → Mixpanel
- * AMPLITUDE_API_KEY               → Amplitude
- * AGENT_NATIVE_ANALYTICS_PUBLIC_KEY → Agent Native Analytics
- *
- * Call `registerBuiltinProviders()` at server startup (done
- * automatically by the core-routes plugin).
- */
-
+import { getAppConfig } from "../app-config/index.js";
+import { getRequestContext } from "../server/request-context.js";
+import { isTestIdentity } from "../server/test-identity.js";
+import { resolveLaneEndpoint } from "../shared/environment-lanes.js";
+import { reshapeTrackedExceptionProperties } from "./posthog-exception.js";
 import { registerTrackingProvider } from "./registry.js";
 import type { TrackingProvider, TrackingEvent } from "./types.js";
 
@@ -22,16 +12,16 @@ const AGENT_NATIVE_ANALYTICS_DEFAULT_ENDPOINT =
 const BATCH_INTERVAL_MS = 10_000;
 const MAX_BATCH_SIZE = 50;
 
-// ─── Batched sender ────────────────────────────────────────────────────────
-
 interface QueuedEvent {
   url: string;
   body: string;
   headers?: Record<string, string>;
 }
 
-// Use globalThis so multiple ESM graph instances (Vite dev + Nitro symlinks)
-// share one queue, matching the same pattern as the tracking registry.
+interface EnqueueOptions {
+  flushImmediately?: boolean;
+}
+
 const QUEUE_KEY = Symbol.for("@agent-native/core/tracking.queue");
 const TIMER_KEY = Symbol.for("@agent-native/core/tracking.timer");
 
@@ -59,17 +49,23 @@ function enqueue(
   url: string,
   body: string,
   headers?: Record<string, string>,
+  options?: EnqueueOptions,
 ): void {
   const queue = getQueue();
   queue.push({ url, body, headers });
-  if (queue.length >= MAX_BATCH_SIZE) {
-    drainQueue();
+  const flushImmediately = options?.flushImmediately ?? isServerlessRuntime();
+  if (flushImmediately || queue.length >= MAX_BATCH_SIZE) {
+    void drainQueue();
   } else if (!getTimer()) {
-    setTimer(setTimeout(drainQueue, BATCH_INTERVAL_MS));
+    const timer = setTimeout(() => {
+      void drainQueue();
+    }, BATCH_INTERVAL_MS);
+    if (timer.unref) timer.unref();
+    setTimer(timer);
   }
 }
 
-function drainQueue(): void {
+function drainQueue(): Promise<void[]> {
   const t = getTimer();
   if (t) {
     clearTimeout(t);
@@ -77,13 +73,18 @@ function drainQueue(): void {
   }
   const queue = getQueue();
   const batch = queue.splice(0, queue.length);
-  for (const item of batch) {
-    fetch(item.url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...item.headers },
-      body: item.body,
-    }).catch(() => {});
-  }
+  return Promise.all(
+    batch.map((item) =>
+      fetch(item.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...item.headers },
+        body: item.body,
+      }).then(
+        () => undefined,
+        () => undefined,
+      ),
+    ),
+  );
 }
 
 function isLocalhostUrl(value: string | undefined): boolean {
@@ -108,6 +109,16 @@ function isLocalhostUrl(value: string | undefined): boolean {
   }
 }
 
+function hostnameOf(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    return new URL(url).hostname;
+  } catch {
+    // coercion-ok: An unparseable app URL names no lane, so the endpoint stays as configured.
+    return undefined;
+  }
+}
+
 function shouldSkipAgentNativeAnalyticsForLocalhost(): boolean {
   if (process.env.AGENT_NATIVE_ANALYTICS_ALLOW_LOCALHOST === "true") {
     return false;
@@ -123,21 +134,99 @@ function shouldSkipAgentNativeAnalyticsForLocalhost(): boolean {
   ].some(isLocalhostUrl);
 }
 
-// ─── PostHog ───────────────────────────────────────────────────────────────
+function isServerlessRuntime(): boolean {
+  return Boolean(
+    process.env.NETLIFY ||
+    process.env.VERCEL ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.AWS_EXECUTION_ENV ||
+    process.env.LAMBDA_TASK_ROOT ||
+    process.env.FUNCTION_NAME,
+  );
+}
 
-function createPostHogProvider(apiKey: string, host: string): TrackingProvider {
+function agentNativeAnalyticsFlushesImmediately(): boolean {
+  const mode =
+    process.env.AGENT_NATIVE_ANALYTICS_FLUSH_MODE?.trim().toLowerCase();
+  if (mode === "batch") return false;
+  if (mode === "immediate") return true;
+  return isServerlessRuntime();
+}
+
+function isPostHogAiObservabilityEvent(eventName: string): boolean {
+  return eventName.startsWith("$ai_");
+}
+
+function postHogAiEndTimestamp(event: TrackingEvent): string | undefined {
+  const latencySeconds = Number(event.properties?.["$ai_latency"]);
+  if (
+    !event.timestamp ||
+    !Number.isFinite(latencySeconds) ||
+    latencySeconds <= 0
+  ) {
+    return event.timestamp;
+  }
+  const startedAt = Date.parse(event.timestamp);
+  if (Number.isNaN(startedAt)) return event.timestamp;
+  return new Date(startedAt + Math.round(latencySeconds * 1000)).toISOString();
+}
+
+function createPostHogProvider(
+  apiKey: string,
+  host: string,
+  errorTracking: boolean,
+): TrackingProvider {
+  const sendToEventsEndpoint = (
+    event: TrackingEvent,
+    properties: Record<string, unknown> | undefined,
+    distinctId: string,
+  ): void => {
+    enqueue(
+      `${host}/i/v0/e/`,
+      JSON.stringify({
+        api_key: apiKey,
+        event: event.name,
+        timestamp: postHogAiEndTimestamp(event),
+        properties: {
+          distinct_id: distinctId,
+          ...properties,
+          ...(event.sessionId ? { $session_id: event.sessionId } : {}),
+        },
+      }),
+    );
+  };
+
   return {
     name: "posthog",
     track(event: TrackingEvent) {
+      const distinctId = event.userId || "anonymous";
+      if (isPostHogAiObservabilityEvent(event.name)) {
+        sendToEventsEndpoint(event, event.properties, distinctId);
+        return;
+      }
+
+      if (event.name === "$exception") {
+        if (!errorTracking) return;
+        const reshaped = reshapeTrackedExceptionProperties(event.properties);
+        if (reshaped) {
+          sendToEventsEndpoint(event, reshaped, distinctId);
+          return;
+        }
+        // No recognizable exception fields. Fall through to `/capture/` so the
+        // event is still recorded as-is rather than becoming an issue with
+        // nothing in it.
+      }
+
       enqueue(
         `${host}/capture/`,
         JSON.stringify({
           api_key: apiKey,
           event: event.name,
-          distinct_id: event.userId || "anonymous",
+          distinct_id: distinctId,
+          timestamp: event.timestamp,
           properties: {
             ...event.properties,
-            timestamp: event.timestamp,
+            ...(event.sessionId ? { $session_id: event.sessionId } : {}),
           },
         }),
       );
@@ -154,13 +243,47 @@ function createPostHogProvider(apiKey: string, host: string): TrackingProvider {
       );
     },
     flush: () => {
-      drainQueue();
-      return Promise.resolve();
+      return drainQueue().then(() => undefined);
     },
   };
 }
 
-// ─── Mixpanel ──────────────────────────────────────────────────────────────
+export function sendPostHogEvent(
+  name: string,
+  properties: Record<string, unknown>,
+  distinctId: string,
+): boolean {
+  const requestContext = getRequestContext();
+  if (
+    requestContext?.isSyntheticTraffic === true ||
+    [
+      distinctId,
+      requestContext?.userEmail,
+      properties.email,
+      properties.userEmail,
+      properties.user_email,
+    ].some(isTestIdentity)
+  ) {
+    return false;
+  }
+  const apiKey = process.env.POSTHOG_API_KEY;
+  if (!apiKey) return false;
+  const host = (process.env.POSTHOG_HOST || POSTHOG_DEFAULT_HOST).replace(
+    /\/+$/,
+    "",
+  );
+  enqueue(
+    `${host}/capture/`,
+    JSON.stringify({
+      api_key: apiKey,
+      event: name,
+      distinct_id: distinctId,
+      timestamp: new Date().toISOString(),
+      properties,
+    }),
+  );
+  return true;
+}
 
 function createMixpanelProvider(token: string): TrackingProvider {
   return {
@@ -175,6 +298,7 @@ function createMixpanelProvider(token: string): TrackingProvider {
             ? new Date(event.timestamp).getTime() / 1000
             : undefined,
           ...event.properties,
+          ...(event.sessionId ? { session_id: event.sessionId } : {}),
         },
       };
       enqueue("https://api.mixpanel.com/track", JSON.stringify([data]));
@@ -188,13 +312,32 @@ function createMixpanelProvider(token: string): TrackingProvider {
       enqueue("https://api.mixpanel.com/engage", JSON.stringify([data]));
     },
     flush: () => {
-      drainQueue();
-      return Promise.resolve();
+      return drainQueue().then(() => undefined);
     },
   };
 }
 
-// ─── Amplitude ─────────────────────────────────────────────────────────────
+function stripExceptionContextForAmplitude(
+  properties: Record<string, unknown>,
+): Record<string, unknown> {
+  const {
+    exceptionTags: _exceptionTags,
+    exceptionExtra: _exceptionExtra,
+    ...stableProperties
+  } = properties;
+  return stableProperties;
+}
+
+function amplitudeEventProperties(
+  event: TrackingEvent,
+): Record<string, unknown> | undefined {
+  const properties =
+    event.name === "$exception" && event.properties
+      ? stripExceptionContextForAmplitude(event.properties)
+      : event.properties;
+  if (!event.sessionId) return properties;
+  return { ...(properties ?? {}), session_id: event.sessionId };
+}
 
 function createAmplitudeProvider(apiKey: string): TrackingProvider {
   return {
@@ -206,7 +349,7 @@ function createAmplitudeProvider(apiKey: string): TrackingProvider {
           {
             event_type: event.name,
             user_id: event.userId || "anonymous",
-            event_properties: event.properties,
+            event_properties: amplitudeEventProperties(event),
             time: event.timestamp
               ? new Date(event.timestamp).getTime()
               : undefined,
@@ -229,13 +372,10 @@ function createAmplitudeProvider(apiKey: string): TrackingProvider {
       enqueue("https://api2.amplitude.com/2/httpapi", JSON.stringify(data));
     },
     flush: () => {
-      drainQueue();
-      return Promise.resolve();
+      return drainQueue().then(() => undefined);
     },
   };
 }
-
-// ─── Webhook (custom HTTP endpoint) ───────────────────────────────────────
 
 function createWebhookProvider(
   url: string,
@@ -251,6 +391,8 @@ function createWebhookProvider(
           event: event.name,
           properties: event.properties,
           userId: event.userId,
+          anonymousId: event.anonymousId,
+          sessionId: event.sessionId,
           timestamp: event.timestamp,
         }),
         extra,
@@ -269,20 +411,19 @@ function createWebhookProvider(
       );
     },
     flush: () => {
-      drainQueue();
-      return Promise.resolve();
+      return drainQueue().then(() => undefined);
     },
   };
 }
-
-// ─── Agent Native Analytics ───────────────────────────────────────────────
 
 function createAgentNativeAnalyticsProvider(
   publicKey: string,
   endpoint: string,
 ): TrackingProvider {
+  const flushImmediately = agentNativeAnalyticsFlushesImmediately();
   return {
     name: "agent-native-analytics",
+    acceptsTestIdentityExceptions: true,
     track(event: TrackingEvent) {
       enqueue(
         endpoint,
@@ -291,8 +432,12 @@ function createAgentNativeAnalyticsProvider(
           event: event.name,
           properties: event.properties ?? {},
           userId: event.userId,
+          anonymousId: event.anonymousId,
+          sessionId: event.sessionId,
           timestamp: event.timestamp,
         }),
+        undefined,
+        { flushImmediately },
       );
     },
     identify(userId, traits) {
@@ -305,16 +450,15 @@ function createAgentNativeAnalyticsProvider(
           properties: traits ?? {},
           timestamp: new Date().toISOString(),
         }),
+        undefined,
+        { flushImmediately },
       );
     },
     flush: () => {
-      drainQueue();
-      return Promise.resolve();
+      return drainQueue().then(() => undefined);
     },
   };
 }
-
-// ─── Auto-registration ────────────────────────────────────────────────────
 
 let _registered = false;
 
@@ -328,7 +472,13 @@ export function registerBuiltinProviders(): void {
       /\/+$/,
       "",
     );
-    registerTrackingProvider(createPostHogProvider(posthogKey, host));
+    registerTrackingProvider(
+      createPostHogProvider(
+        posthogKey,
+        host,
+        process.env.POSTHOG_ERROR_TRACKING?.trim().toLowerCase() !== "false",
+      ),
+    );
   }
 
   const mixpanelToken = process.env.MIXPANEL_TOKEN;
@@ -341,18 +491,18 @@ export function registerBuiltinProviders(): void {
     registerTrackingProvider(createAmplitudeProvider(amplitudeKey));
   }
 
-  const agentNativeAnalyticsKey = process.env.AGENT_NATIVE_ANALYTICS_PUBLIC_KEY;
-  if (
-    agentNativeAnalyticsKey &&
-    !shouldSkipAgentNativeAnalyticsForLocalhost()
-  ) {
+  const { agentNativePublicKey, agentNativeEndpoint } =
+    getAppConfig().analytics;
+  if (agentNativePublicKey && !shouldSkipAgentNativeAnalyticsForLocalhost()) {
     registerTrackingProvider(
       createAgentNativeAnalyticsProvider(
-        agentNativeAnalyticsKey,
-        (
-          process.env.AGENT_NATIVE_ANALYTICS_ENDPOINT ||
-          AGENT_NATIVE_ANALYTICS_DEFAULT_ENDPOINT
-        ).replace(/\/+$/, ""),
+        agentNativePublicKey,
+        resolveLaneEndpoint(
+          (
+            agentNativeEndpoint || AGENT_NATIVE_ANALYTICS_DEFAULT_ENDPOINT
+          ).replace(/\/+$/, ""),
+          hostnameOf(getAppConfig().app.url),
+        ),
       ),
     );
   }

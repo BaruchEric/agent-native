@@ -3,6 +3,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { assertValidComputerCommandEnvelope } from "../integrations/computer-supervision.js";
+import { serializeBoundedRemoteJson } from "../integrations/remote-json-safety.js";
+import type {
+  ComputerCommandEnvelope,
+  RemoteComputerCapabilities,
+  RemoteExecutionCapabilities,
+} from "../integrations/remote-types.js";
+import {
+  executeDenyCodeAgentApproval,
+  executePendingCodeAgentApproval,
+} from "./code-agent-executor.js";
 import {
   appendCodeAgentTranscriptEvent,
   codeAgentRunTranscriptPath,
@@ -18,15 +29,24 @@ import {
   type CodeAgentTranscriptEvent,
 } from "./code-agent-runs.js";
 import {
-  executeDenyCodeAgentApproval,
-  executePendingCodeAgentApproval,
-} from "./code-agent-executor.js";
+  appendPortalTransferTranscript,
+  parsePortalTransferContext,
+  type PortalTransferContext,
+} from "./portal-transfer.js";
+import {
+  loadPortalEnvironment,
+  preparePortalWorkspace,
+  parsePortalHandoff,
+  type PortalEnvironment,
+  type PortalWorkspace,
+} from "./portal-workspace.js";
 
 export interface RemoteCodeAgentDeviceConfig {
   token: string;
   relayUrl?: string;
   deviceId?: string;
   deviceName?: string;
+  workspacePath?: string;
   pollIntervalMs?: number;
 }
 
@@ -35,6 +55,12 @@ export interface RunCodeAgentConnectorOptions {
   output?: NodeJS.WritableStream;
   signal?: AbortSignal;
   once?: boolean;
+}
+
+export interface LocalComputerBridgeConfig {
+  url: string;
+  token: string;
+  capabilities: RemoteComputerCapabilities;
 }
 
 interface RemoteCommand {
@@ -58,11 +84,26 @@ interface RunnerProcess {
 }
 
 const DEVICE_PATH_ENV = "AGENT_NATIVE_REMOTE_DEVICE_PATH";
+const COMPUTER_BRIDGE_URL_ENV = "AGENT_NATIVE_COMPUTER_BRIDGE_URL";
+const COMPUTER_BRIDGE_TOKEN_ENV = "AGENT_NATIVE_COMPUTER_BRIDGE_TOKEN";
+const COMPUTER_CAPABILITIES_ENV = "AGENT_NATIVE_COMPUTER_CAPABILITIES";
+const REMOTE_ENGINES_ENV = "AGENT_NATIVE_REMOTE_ENGINES";
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
 const MAX_POLL_INTERVAL_MS = 30_000;
 const MAX_TRANSCRIPT_EVENTS_PER_BATCH = 50;
 
 const activeRunners = new Map<string, RunnerProcess>();
+
+export const DEFAULT_REMOTE_EXECUTION_CAPABILITIES: RemoteExecutionCapabilities =
+  {
+    backend: "desktop",
+    workloads: ["code-agent", "scheduled-code"],
+    engines: ["codex-cli", "claude-cli", "pi-cli", "opencode-cli"],
+    acceptsScheduledWork: true,
+    acceptsPortalHandoffs: true,
+    persistence: "local-files",
+    adapters: ["agent-native-code"],
+  };
 
 export function remoteDeviceConfigPath(): string {
   return path.resolve(
@@ -91,6 +132,12 @@ export function loadRemoteCodeAgentDeviceConfig(
       relayUrl: firstStringValue(raw.relayUrl, raw.url, raw.baseUrl),
       deviceId: firstStringValue(raw.deviceId, raw.id),
       deviceName: firstStringValue(raw.deviceName, raw.name),
+      workspacePath: firstStringValue(
+        raw.workspacePath,
+        raw.workspace,
+        raw.cwd,
+        raw.projectPath,
+      ),
       pollIntervalMs:
         Number.isFinite(pollIntervalMs) && pollIntervalMs > 0
           ? Math.min(Math.max(pollIntervalMs, 500), MAX_POLL_INTERVAL_MS)
@@ -113,7 +160,7 @@ export async function runCodeAgentConnector(
         "Agent-Native Code remote connector is not paired.",
         "",
         `Expected device config: ${configPath}`,
-        "Pair this device from Agent Native, or set AGENT_NATIVE_REMOTE_DEVICE_PATH to a JSON file containing a device token.",
+        "Pair this device from Agent-Native, or set AGENT_NATIVE_REMOTE_DEVICE_PATH to a JSON file containing a device token.",
         "Then run: agent-native code serve --relay-url <relay-url>",
         "",
       ].join("\n"),
@@ -143,7 +190,9 @@ export async function runCodeAgentConnector(
 class RemoteCodeAgentConnector {
   private readonly transcriptCursors = new Map<string, TranscriptCursor>();
   private readonly remoteRunIds = new Set<string>();
+  private readonly terminalCommandIds = new Set<string>();
   private stopped = false;
+  private readonly computerBridge = loadLocalComputerBridgeConfig();
 
   constructor(
     private readonly config: RemoteCodeAgentDeviceConfig,
@@ -188,6 +237,13 @@ class RemoteCodeAgentConnector {
       }
     } finally {
       options.signal?.removeEventListener("abort", onAbort);
+      if (this.computerBridge) {
+        await callLocalComputerBridgeTool(
+          this.computerBridge,
+          "computer_revoke_control",
+          { reason: "connector-stopped" },
+        ).catch(() => undefined);
+      }
     }
   }
 
@@ -206,6 +262,8 @@ class RemoteCodeAgentConnector {
           "status",
           "run-events",
         ],
+        computerCapabilities: this.computerBridge?.capabilities ?? {},
+        executionCapabilities: remoteExecutionCapabilities(),
         activeRunIds: Array.from(this.remoteRunIds),
       },
     );
@@ -215,6 +273,11 @@ class RemoteCodeAgentConnector {
         ok: false,
         error: err instanceof Error ? err.message : String(err),
       }));
+      if (result.ok === false) {
+        this.output.write(
+          `Remote command ${command.id} failed: ${typeof result.error === "string" ? result.error : "Unknown connector error."}\n`,
+        );
+      }
       await this.postCommandResult(command, result);
     }
   }
@@ -234,6 +297,8 @@ class RemoteCodeAgentConnector {
         return this.deny(command);
       case "stop":
         return this.stop(command);
+      case "computer-operation":
+        return this.computerOperation(command);
       case "status":
         return this.status(command);
       default:
@@ -244,7 +309,14 @@ class RemoteCodeAgentConnector {
     }
   }
 
-  private createRun(command: RemoteCommand) {
+  private async computerOperation(command: RemoteCommand) {
+    return dispatchComputerOperationToLocalBridge(
+      this.computerBridge,
+      command.params.envelope,
+    );
+  }
+
+  private async createRun(command: RemoteCommand) {
     const prompt = firstTextValue(
       command.params.prompt,
       command.params.message,
@@ -254,7 +326,94 @@ class RemoteCodeAgentConnector {
       return { ok: false, error: "Missing prompt." };
     }
     const goalId = firstStringValue(command.params.goalId) ?? "task";
-    const cwd = resolveCommandCwd(command.params.cwd);
+    const metadata = isObject(command.params.metadata)
+      ? command.params.metadata
+      : {};
+    let portalTransfer: PortalTransferContext | null = null;
+    try {
+      portalTransfer = parsePortalTransferContext(metadata.portalTransfer);
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+    let cwd = resolveCommandCwd(
+      command.params.cwd ?? this.config.workspacePath,
+    );
+    let portalWorkspace: PortalWorkspace | undefined;
+    let portalEnvironment: PortalEnvironment | undefined;
+    if (metadata.portal !== undefined) {
+      try {
+        portalWorkspace = await preparePortalWorkspace({
+          handoff: parsePortalHandoff(metadata.portal),
+          workspacePath: this.config.workspacePath,
+        });
+        portalEnvironment = loadPortalEnvironment(
+          portalWorkspace.environmentRoot,
+        );
+        cwd = portalWorkspace.workspacePath;
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+    const requestedRunId = firstStringValue(command.params.runId);
+    if (portalWorkspace && requestedRunId && !isSafeRunId(requestedRunId)) {
+      return { ok: false, error: "Portal run id is invalid." };
+    }
+    if (portalTransfer && (!portalWorkspace || !requestedRunId)) {
+      return {
+        ok: false,
+        error:
+          "Portal transfer context requires a Portal run id and workspace.",
+      };
+    }
+    if (portalWorkspace && requestedRunId) {
+      const existing = getCodeAgentRunRecord(requestedRunId);
+      const existingRemote = isObject(existing?.metadata?.remote)
+        ? existing.metadata.remote
+        : {};
+      if (
+        existing &&
+        firstStringValue(existingRemote.commandId) === command.id
+      ) {
+        this.remoteRunIds.add(existing.id);
+        this.transcriptCursors.set(existing.id, { offset: 0, seq: 0 });
+        if (!activeRunners.has(existing.id)) {
+          this.spawnRunner(
+            existing.id,
+            existing.cwd,
+            existing.permissionMode,
+            portalEnvironment?.values,
+          );
+        }
+        return { ok: true, runId: existing.id, run: existing, resumed: true };
+      }
+      const existingTransfer = isObject(existing?.metadata?.portalTransfer)
+        ? existing.metadata.portalTransfer
+        : undefined;
+      if (
+        portalTransfer &&
+        existing &&
+        firstStringValue(existingTransfer?.sourceRunId) ===
+          portalTransfer.sourceRunId
+      ) {
+        this.remoteRunIds.add(existing.id);
+        this.transcriptCursors.set(existing.id, { offset: 0, seq: 0 });
+        if (!activeRunners.has(existing.id)) {
+          this.spawnRunner(
+            existing.id,
+            existing.cwd,
+            existing.permissionMode,
+            portalEnvironment?.values,
+          );
+        }
+        return { ok: true, runId: existing.id, run: existing, resumed: true };
+      }
+    }
     const permissionMode =
       normalizeCodeAgentPermissionMode(command.params.permissionMode) ??
       "full-auto";
@@ -264,13 +423,15 @@ class RemoteCodeAgentConnector {
       command.params.effort,
       command.params.reasoningEffort,
     );
-    const metadata = isObject(command.params.metadata)
-      ? command.params.metadata
-      : {};
+    const metadataWithoutTransfer = { ...metadata };
+    delete metadataWithoutTransfer.portalTransfer;
     const run = createCodeAgentRunRecord({
+      ...(portalWorkspace && requestedRunId ? { id: requestedRunId } : {}),
       goalId,
       title: firstStringValue(command.params.title) ?? titleFromPrompt(prompt),
-      subtitle: "Remote coding task",
+      subtitle: portalWorkspace
+        ? `Portal on ${this.config.deviceName ?? "paired computer"}`
+        : "Remote coding task",
       status: "queued",
       phase: "queued",
       permissionMode,
@@ -285,9 +446,31 @@ class RemoteCodeAgentConnector {
         { label: "Prompt", value: truncateForDisplay(prompt, 160) },
         { label: "Agent", value: "Remote connector" },
         { label: "Mode", value: permissionMode },
+        ...(portalTransfer
+          ? [
+              {
+                label: "Context",
+                value: `Imported ${portalTransfer.events.length} transcript events`,
+              },
+            ]
+          : []),
+        ...(portalWorkspace
+          ? [
+              {
+                label: "Workspace",
+                value: `Portal · ${portalWorkspace.workspacePath}`,
+              },
+              {
+                label: "Environment",
+                value: portalEnvironment?.files.length
+                  ? `Loaded ${portalEnvironment.files.join(", ")}`
+                  : "Using paired computer environment",
+              },
+            ]
+          : []),
       ],
       metadata: {
-        ...metadata,
+        ...metadataWithoutTransfer,
         prompt,
         source: "remote-connector",
         engine,
@@ -297,16 +480,67 @@ class RemoteCodeAgentConnector {
           commandId: command.id,
           deviceId: this.config.deviceId,
           relayUrl: this.relayUrl,
+          ...(portalWorkspace && requestedRunId
+            ? { remoteRunId: requestedRunId }
+            : {}),
         },
+        ...(portalWorkspace
+          ? {
+              portal: portalWorkspace.handoff,
+              executionResidence: {
+                schemaVersion: 1,
+                kind: "portal",
+                hostId: this.config.deviceId,
+                hostLabel: this.config.deviceName ?? os.hostname(),
+                workspacePath: portalWorkspace.workspacePath,
+                sourceBranch: portalWorkspace.handoff.sourceBranch,
+                sourceCommit: portalWorkspace.handoff.commit,
+                handoffId: portalWorkspace.handoff.handoffId,
+                envPolicy: portalWorkspace.handoff.envPolicy,
+                environmentFiles: portalEnvironment?.files ?? [],
+                environmentLoadedAt: new Date().toISOString(),
+              },
+            }
+          : {}),
+        ...(portalTransfer
+          ? {
+              portalTransfer: {
+                schemaVersion: 1,
+                sourceRunId: portalTransfer.sourceRunId,
+                ...(portalTransfer.sourceStatus
+                  ? { sourceStatus: portalTransfer.sourceStatus }
+                  : {}),
+                ...(portalTransfer.sourcePhase
+                  ? { sourcePhase: portalTransfer.sourcePhase }
+                  : {}),
+                eventCount: portalTransfer.events.length,
+                transferredAt: new Date().toISOString(),
+              },
+            }
+          : {}),
       },
     });
 
-    appendCodeAgentTranscriptEvent({
-      runId: run.id,
-      kind: "user",
-      message: prompt,
-      metadata: { source: "remote-initial-prompt", commandId: command.id },
-    });
+    if (portalTransfer) {
+      appendPortalTransferTranscript(portalTransfer, run.id);
+      appendCodeAgentTranscriptEvent({
+        runId: run.id,
+        kind: "user",
+        message: prompt,
+        metadata: {
+          source: "portal-transfer-continuation",
+          commandId: command.id,
+          sourceRunId: portalTransfer.sourceRunId,
+        },
+      });
+    } else {
+      appendCodeAgentTranscriptEvent({
+        runId: run.id,
+        kind: "user",
+        message: prompt,
+        metadata: { source: "remote-initial-prompt", commandId: command.id },
+      });
+    }
     appendCodeAgentTranscriptEvent({
       runId: run.id,
       kind: "status",
@@ -315,7 +549,7 @@ class RemoteCodeAgentConnector {
     });
     this.remoteRunIds.add(run.id);
     this.transcriptCursors.set(run.id, { offset: 0, seq: 0 });
-    this.spawnRunner(run.id, cwd, permissionMode);
+    this.spawnRunner(run.id, cwd, permissionMode, portalEnvironment?.values);
     return { ok: true, runId: run.id, run };
   }
 
@@ -376,8 +610,6 @@ class RemoteCodeAgentConnector {
     if (!runId) return { ok: false, error: "Missing runId." };
     const run = getCodeAgentRunRecord(runId);
     if (!run) return { ok: false, error: `Run not found: ${runId}` };
-    // executePendingCodeAgentApproval now auto-resumes inline after running the
-    // approved command, so no separate spawnRunner call is needed.
     const result = await executePendingCodeAgentApproval(runId);
     return { ok: true, runId, run: result ?? getCodeAgentRunRecord(runId) };
   }
@@ -393,16 +625,46 @@ class RemoteCodeAgentConnector {
       message: "Remote approval denied.",
       metadata: { source: "remote-connector", commandId: command.id },
     });
-    // Auto-resume so the model can adapt its plan after the denial.
     const result = await executeDenyCodeAgentApproval(runId);
     return { ok: true, runId, run: result ?? getCodeAgentRunRecord(runId) };
   }
 
-  private stop(command: RemoteCommand) {
+  private async stop(command: RemoteCommand) {
     const runId = firstStringValue(command.params.runId);
-    if (!runId) return { ok: false, error: "Missing runId." };
+    const taskId = firstStringValue(command.params.taskId);
+    let revokeError: string | undefined;
+    if (this.computerBridge) {
+      try {
+        await callLocalComputerBridgeTool(
+          this.computerBridge,
+          "computer_revoke_control",
+          { taskId, runId, reason: "remote-stop" },
+        );
+      } catch (error) {
+        revokeError = error instanceof Error ? error.message : String(error);
+      }
+    } else if (taskId || command.params.computer === true) {
+      revokeError = "Local authenticated computer bridge is unavailable.";
+    }
+    if (!runId) {
+      return taskId
+        ? {
+            ok: !revokeError,
+            taskId,
+            revoked: !revokeError,
+            error: revokeError,
+          }
+        : { ok: false, error: "Missing runId." };
+    }
     const run = getCodeAgentRunRecord(runId);
-    if (!run) return { ok: false, error: `Run not found: ${runId}` };
+    if (!run) {
+      return {
+        ok: !revokeError && Boolean(this.computerBridge),
+        runId,
+        revoked: !revokeError && Boolean(this.computerBridge),
+        error: revokeError ?? `Run not found: ${runId}`,
+      };
+    }
     const active = activeRunners.get(runId);
     const pid = active?.child.pid ?? Number(run.metadata?.runnerPid);
     let killed = false;
@@ -447,7 +709,14 @@ class RemoteCodeAgentConnector {
         stopError: killError,
       },
     });
-    return { ok: !killError, runId, run: updated, killed, error: killError };
+    return {
+      ok: !killError && !revokeError,
+      runId,
+      run: updated,
+      killed,
+      controlRevoked: !revokeError && Boolean(this.computerBridge),
+      error: revokeError ?? killError,
+    };
   }
 
   private status(command: RemoteCommand) {
@@ -469,6 +738,7 @@ class RemoteCodeAgentConnector {
     runId: string,
     cwd: string,
     permissionMode?: CodeAgentPermissionMode,
+    portalEnvironment?: Record<string, string>,
   ) {
     if (activeRunners.has(runId)) return;
     const invocation = resolveCodeAgentCliInvocation();
@@ -481,6 +751,7 @@ class RemoteCodeAgentConnector {
         stdio: ["ignore", "pipe", "pipe"],
         env: {
           ...process.env,
+          ...portalEnvironment,
           AGENT_NATIVE_CODE_AGENTS_HOME: codeAgentStoreRoot(),
           ...(permissionMode
             ? { AGENT_NATIVE_CODE_AGENT_PERMISSION_MODE: permissionMode }
@@ -535,41 +806,87 @@ class RemoteCodeAgentConnector {
     for (const runId of this.remoteRunIds) {
       const cursor = this.transcriptCursors.get(runId) ?? { offset: 0, seq: 0 };
       const batch = readTranscriptBatch(runId, cursor.offset);
-      if (batch.events.length === 0) {
-        this.transcriptCursors.set(runId, {
-          offset: batch.nextOffset,
-          seq: cursor.seq,
+      if (batch.events.length > 0) {
+        await this.postJson("/_agent-native/integrations/remote/run-events", {
+          deviceId: this.config.deviceId,
+          remoteRunId: runId,
+          cursor: { offset: batch.nextOffset },
+          events: batch.events.map((event, index) => ({
+            seq: cursor.seq + index,
+            event,
+          })),
         });
-        continue;
       }
-      await this.postJson("/_agent-native/integrations/remote/run-events", {
-        deviceId: this.config.deviceId,
-        remoteRunId: runId,
-        cursor: { offset: batch.nextOffset },
-        events: batch.events.map((event, index) => ({
-          seq: cursor.seq + index,
-          event,
-        })),
-      });
       this.transcriptCursors.set(runId, {
         offset: batch.nextOffset,
         seq: cursor.seq + batch.events.length,
       });
+      await this.reportRemoteRunTerminal(runId);
     }
+  }
+
+  private async reportRemoteRunTerminal(runId: string): Promise<void> {
+    const run = getCodeAgentRunRecord(runId);
+    if (!run || (run.status !== "completed" && run.status !== "errored")) {
+      return;
+    }
+    const remote = isObject(run.metadata?.remote) ? run.metadata.remote : {};
+    const commandId = firstStringValue(remote.commandId);
+    if (!commandId || this.terminalCommandIds.has(commandId)) return;
+    const errorMessage = firstStringValue(
+      run.metadata?.error,
+      run.metadata?.runnerError,
+    );
+    await this.postJson("/_agent-native/integrations/remote/result", {
+      deviceId: this.config.deviceId,
+      commandId,
+      kind: "create-run",
+      ok: run.status === "completed",
+      status: run.status === "completed" ? "completed" : "failed",
+      result: {
+        ok: run.status === "completed",
+        run,
+      },
+      errorMessage:
+        run.status === "errored"
+          ? (errorMessage ?? "Remote code-agent run failed.")
+          : undefined,
+    });
+    this.terminalCommandIds.add(commandId);
   }
 
   private async postCommandResult(
     command: RemoteCommand,
     result: Record<string, unknown>,
   ) {
+    let safeResult: Record<string, unknown>;
+    try {
+      safeResult = boundedConnectorResult(result);
+    } catch (error) {
+      safeResult = {
+        ok: false,
+        error:
+          error instanceof Error
+            ? `Connector result rejected: ${error.message}`
+            : "Connector result rejected as unsafe.",
+      };
+    }
+    const isAcceptedCreateRun =
+      normalizeKind(command.kind) === "create-run" && safeResult.ok !== false;
     await this.postJson("/_agent-native/integrations/remote/result", {
       deviceId: this.config.deviceId,
       commandId: command.id,
       kind: command.kind,
-      ok: result.ok !== false,
-      status: result.ok === false ? "failed" : "completed",
-      result,
-      errorMessage: typeof result.error === "string" ? result.error : undefined,
+      ok: safeResult.ok !== false,
+      status:
+        safeResult.ok === false
+          ? "failed"
+          : isAcceptedCreateRun
+            ? "running"
+            : "completed",
+      result: safeResult,
+      errorMessage:
+        typeof safeResult.error === "string" ? safeResult.error : undefined,
     });
   }
 
@@ -579,6 +896,7 @@ class RemoteCodeAgentConnector {
       method: "POST",
       headers: {
         authorization: `Bearer ${this.config.token}`,
+        "x-agent-native-device-token": this.config.token,
         "content-type": "application/json",
       },
       body: JSON.stringify(body),
@@ -785,6 +1103,23 @@ function resolveCommandCwd(value: unknown): string {
   return cwd ? path.resolve(cwd) : process.cwd();
 }
 
+function isSafeRunId(value: string): boolean {
+  return value.length <= 160 && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value);
+}
+
+function remoteExecutionCapabilities(): RemoteExecutionCapabilities {
+  const configured = process.env[REMOTE_ENGINES_ENV]
+    ?.split(",")
+    .map((engine) => engine.trim())
+    .filter(Boolean);
+  return {
+    ...DEFAULT_REMOTE_EXECUTION_CAPABILITIES,
+    ...(configured?.length
+      ? { engines: [...new Set(configured)].slice(0, 32) }
+      : {}),
+  };
+}
+
 function normalizeRelayUrl(value: string | undefined): string | null {
   if (!value) return null;
   try {
@@ -794,6 +1129,177 @@ function normalizeRelayUrl(value: string | undefined): string | null {
   } catch {
     return null;
   }
+}
+
+export function loadLocalComputerBridgeConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): LocalComputerBridgeConfig | null {
+  const rawUrl = firstStringValue(env[COMPUTER_BRIDGE_URL_ENV]);
+  const token = firstStringValue(env[COMPUTER_BRIDGE_TOKEN_ENV]);
+  const rawCapabilities = firstStringValue(env[COMPUTER_CAPABILITIES_ENV]);
+  if (!rawUrl || !token || !rawCapabilities) return null;
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  const host = url.hostname.toLowerCase();
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    (host !== "localhost" && host !== "127.0.0.1" && host !== "[::1]")
+  ) {
+    return null;
+  }
+  try {
+    const value = JSON.parse(rawCapabilities) as unknown;
+    const capabilities = normalizeComputerCapabilities(value);
+    if (!hasComputerCapability(capabilities)) return null;
+    return { url: url.toString(), token, capabilities };
+  } catch {
+    return null;
+  }
+}
+
+export async function callLocalComputerBridgeTool(
+  config: LocalComputerBridgeConfig,
+  toolName: "computer_operation" | "computer_revoke_control",
+  args: Record<string, unknown>,
+  fetchImpl: typeof fetch = fetch,
+): Promise<unknown> {
+  const response = await fetchImpl(config.url, {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/event-stream",
+      authorization: `Bearer ${config.token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: `computer-bridge-${Date.now()}`,
+      method: "tools/call",
+      params: { name: toolName, arguments: args },
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) {
+    throw new Error(`Local computer bridge returned ${response.status}`);
+  }
+  const text = await response.text();
+  const payload = parseMcpResponse(text);
+  if (!isObject(payload)) {
+    throw new Error("Local computer bridge returned an invalid response");
+  }
+  if (payload.error) {
+    const error = isObject(payload.error) ? payload.error : {};
+    throw new Error(
+      firstStringValue(error.message) ?? "Local computer bridge rejected call",
+    );
+  }
+  return boundedJsonValue(payload.result, "Local computer bridge result");
+}
+
+export async function dispatchComputerOperationToLocalBridge(
+  config: LocalComputerBridgeConfig | null,
+  rawEnvelope: unknown,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Record<string, unknown>> {
+  if (!config) {
+    throw new Error("Local authenticated computer bridge is unavailable.");
+  }
+  const envelope = await assertValidComputerCommandEnvelope(rawEnvelope);
+  const result = await callLocalComputerBridgeTool(
+    config,
+    "computer_operation",
+    { envelope },
+    fetchImpl,
+  );
+  return boundedConnectorResult({
+    ok: true,
+    taskId: envelope.taskId,
+    runId: envelope.runId,
+    sequence: envelope.sequence,
+    idempotencyKey: envelope.idempotencyKey,
+    actionHash: envelope.approval.actionHash,
+    operationClass: envelope.operationClass,
+    bridgeResult: result,
+  });
+}
+
+function normalizeComputerCapabilities(
+  value: unknown,
+): RemoteComputerCapabilities {
+  if (!isObject(value)) return {};
+  const browser = isObject(value.browser) ? value.browser : null;
+  const desktop = isObject(value.desktop) ? value.desktop : null;
+  return {
+    ...(browser
+      ? {
+          browser: {
+            observe: browser.observe === true,
+            control: browser.control === true,
+            provider: firstStringValue(browser.provider) ?? null,
+            version: firstStringValue(browser.version) ?? null,
+          },
+        }
+      : {}),
+    ...(desktop
+      ? {
+          desktop: {
+            observe: desktop.observe === true,
+            control: desktop.control === true,
+            accessibility: desktop.accessibility === true,
+            screenCapture: desktop.screenCapture === true,
+            provider: firstStringValue(desktop.provider) ?? null,
+            version: firstStringValue(desktop.version) ?? null,
+          },
+        }
+      : {}),
+  };
+}
+
+function hasComputerCapability(
+  capabilities: RemoteComputerCapabilities,
+): boolean {
+  return Boolean(
+    capabilities.browser?.observe ||
+    capabilities.browser?.control ||
+    capabilities.desktop?.observe ||
+    capabilities.desktop?.control,
+  );
+}
+
+function parseMcpResponse(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) throw new Error("Local computer bridge returned no response");
+  if (!trimmed.startsWith("data:")) return JSON.parse(trimmed);
+  const data = trimmed
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trim())
+    .filter((line) => line && line !== "[DONE]")
+    .at(-1);
+  if (!data) throw new Error("Local computer bridge returned no MCP result");
+  return JSON.parse(data);
+}
+
+function boundedJsonValue(value: unknown, label: string): unknown {
+  return JSON.parse(
+    serializeBoundedRemoteJson(value ?? null, {
+      label,
+      maxBytes: 128_000,
+    }),
+  );
+}
+
+function boundedConnectorResult(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  const parsed = boundedJsonValue(value, "Remote connector result");
+  if (!isObject(parsed)) {
+    throw new Error("Remote connector result must be an object");
+  }
+  return parsed;
 }
 
 function firstStringValue(...values: unknown[]): string | undefined {

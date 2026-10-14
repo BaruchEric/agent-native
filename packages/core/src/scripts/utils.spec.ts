@@ -1,10 +1,37 @@
+import fs from "fs";
+import os from "os";
+import path from "path";
+
 import { describe, it, expect } from "vitest";
+
+import { isActionContractError } from "../action.js";
 import {
   parseArgs,
+  serializeCliArgs,
   camelCaseArgs,
+  fail,
   isValidPath,
   isValidProjectPath,
+  loadEnv,
 } from "./utils.js";
+
+const ENV_TEST_KEYS = [
+  "DATABASE_URL",
+  "AN_TEST_SHARED",
+  "AN_TEST_LOCAL_ONLY",
+  "AN_TEST_WORKSPACE_ONLY",
+];
+
+function restoreEnv(snapshot: Record<string, string | undefined>) {
+  for (const key of ENV_TEST_KEYS) {
+    const value = snapshot[key];
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+}
 
 describe("parseArgs", () => {
   it("parses --key value format", () => {
@@ -17,6 +44,15 @@ describe("parseArgs", () => {
 
   it("parses --key=value format", () => {
     expect(parseArgs(["--name=hello"])).toEqual({ name: "hello" });
+  });
+
+  it("preserves values that begin with option syntax", () => {
+    const content = "---\nname: spell-check\n---\n# Spell check";
+
+    const args = serializeCliArgs({ title: "Hi there", content });
+
+    expect(args).toEqual(["--title", "Hi there", `--content=${content}`]);
+    expect(parseArgs(args)).toEqual({ title: "Hi there", content });
   });
 
   it("parses --flag as boolean true", () => {
@@ -61,6 +97,68 @@ describe("camelCaseArgs", () => {
 
   it("returns empty object for empty input", () => {
     expect(camelCaseArgs({})).toEqual({});
+  });
+});
+
+describe("loadEnv", () => {
+  it("lets app .env.local override app .env while preserving shell env", () => {
+    const snapshot = Object.fromEntries(
+      ENV_TEST_KEYS.map((key) => [key, process.env[key]]),
+    );
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "an-load-env-"));
+    const appDir = path.join(tmp, "apps", "analytics");
+
+    try {
+      for (const key of ENV_TEST_KEYS) delete process.env[key];
+      fs.mkdirSync(appDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(tmp, "package.json"),
+        JSON.stringify({
+          "agent-native": {
+            workspaceCore: "packages/core",
+          },
+        }),
+      );
+      fs.writeFileSync(
+        path.join(tmp, ".env"),
+        ["AN_TEST_WORKSPACE_ONLY=workspace", "AN_TEST_SHARED=workspace"].join(
+          "\n",
+        ),
+      );
+      fs.writeFileSync(
+        path.join(tmp, ".env.local"),
+        "AN_TEST_WORKSPACE_ONLY=workspace-local\n",
+      );
+      fs.writeFileSync(
+        path.join(appDir, ".env"),
+        ["DATABASE_URL=postgres://production", "AN_TEST_SHARED=app"].join("\n"),
+      );
+      fs.writeFileSync(
+        path.join(appDir, ".env.local"),
+        ["DATABASE_URL=pglite:./data/pglite", "AN_TEST_LOCAL_ONLY=local"].join(
+          "\n",
+        ),
+      );
+
+      loadEnv(path.join(appDir, ".env"));
+
+      expect(process.env.DATABASE_URL).toBe("pglite:./data/pglite");
+      expect(process.env.AN_TEST_SHARED).toBe("app");
+      expect(process.env.AN_TEST_LOCAL_ONLY).toBe("local");
+      expect(process.env.AN_TEST_WORKSPACE_ONLY).toBe("workspace-local");
+
+      process.env.DATABASE_URL = "postgres://shell";
+      delete process.env.AN_TEST_SHARED;
+      delete process.env.AN_TEST_LOCAL_ONLY;
+      delete process.env.AN_TEST_WORKSPACE_ONLY;
+
+      loadEnv(path.join(appDir, ".env"));
+
+      expect(process.env.DATABASE_URL).toBe("postgres://shell");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+      restoreEnv(snapshot);
+    }
   });
 });
 
@@ -113,5 +211,46 @@ describe("isValidProjectPath", () => {
 
   it("rejects uppercase characters", () => {
     expect(isValidProjectPath("MyProject")).toBe(false);
+  });
+});
+
+describe("fail", () => {
+  it("raises a typed contract error so the message survives the action route", () => {
+    const error = (() => {
+      try {
+        fail("Meeting not found");
+      } catch (err) {
+        return err;
+      }
+    })();
+
+    expect(error).toBeInstanceOf(Error);
+    expect(isActionContractError(error)).toBe(true);
+    expect(error).toMatchObject({
+      message: "Meeting not found",
+      errorCode: "action_failed",
+      statusCode: 400,
+    });
+  });
+
+  it("carries an explicit code, status, and details", () => {
+    const error = (() => {
+      try {
+        fail("No such meeting", {
+          errorCode: "not_found",
+          statusCode: 404,
+          details: { meetingId: "m_1" },
+        });
+      } catch (err) {
+        return err;
+      }
+    })();
+
+    expect(error).toMatchObject({
+      message: "No such meeting",
+      errorCode: "not_found",
+      statusCode: 404,
+      details: { meetingId: "m_1" },
+    });
   });
 });

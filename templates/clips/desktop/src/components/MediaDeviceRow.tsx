@@ -1,40 +1,48 @@
+import {
+  IconCamera,
+  IconChevronDown,
+  IconMicrophone,
+  IconRefresh,
+  IconVolume2,
+} from "@tabler/icons-react";
 import { useMemo } from "react";
-import { CameraIcon, CheckIcon, ChevronDown, MicIcon } from "./Icons";
+
+import { useMicMeter } from "../hooks/useMicMeter";
 import { Switch } from "./Switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./Tooltip";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 import { useRowMenu } from "./useRowMenu";
 
-function Toggle({
-  on,
-  onChange,
-  label,
-}: {
-  on: boolean;
-  onChange: (v: boolean) => void;
-  label: string;
-}) {
-  return (
-    <button
-      className={`toggle ${on ? "toggle-on" : "toggle-off"}`}
-      role="switch"
-      aria-checked={on}
-      aria-label={label}
-      onClick={() => onChange(!on)}
-    >
-      {on ? "On" : "Off"}
-    </button>
-  );
-}
+function MicWave({ deviceId, active }: { deviceId: string; active: boolean }) {
+  const pathRef = useMicMeter({ deviceId, active });
 
-function MicWave() {
   return (
     <span className="mic-wave" aria-hidden>
-      <span className="bar b1" />
-      <span className="bar b2" />
-      <span className="bar b3" />
-      <span className="bar b4" />
+      <svg
+        className="mic-wave-svg"
+        viewBox="0 0 100 24"
+        preserveAspectRatio="none"
+      >
+        <path
+          ref={pathRef}
+          className="mic-wave-path"
+          d="M 0 12 L 100 12"
+          fill="none"
+        />
+      </svg>
     </span>
   );
 }
+
+const DEFAULT_VALUE = "__default__";
 
 export function MediaDeviceRow({
   kind,
@@ -47,6 +55,7 @@ export function MediaDeviceRow({
   onToggle,
   systemAudio,
   onSystemAudioToggle,
+  meterActive = true,
 }: {
   kind: "camera" | "mic";
   devices: MediaDeviceInfo[];
@@ -58,6 +67,7 @@ export function MediaDeviceRow({
   onToggle: (v: boolean) => void;
   systemAudio?: boolean;
   onSystemAudioToggle?: (v: boolean) => void;
+  meterActive?: boolean;
 }) {
   const current = useMemo(
     () =>
@@ -66,137 +76,140 @@ export function MediaDeviceRow({
         : null,
     [devices, selectedId],
   );
-  const label =
-    // Prefer the live label from the enumerated device.
+  const activeLabel =
     current?.label ||
     (selectedId
       ? devices.length > 0
-        ? // List is loaded but the saved device isn't in it — genuinely gone.
-          kind === "camera"
+        ? kind === "camera"
           ? "Selected camera unavailable"
           : "Selected mic unavailable"
-        : // List is still locked (no getUserMedia grant yet this session,
-          // e.g. a cold launch). Fall back to the label we persisted with
-          // the id last time so the user still sees their device by name.
-          selectedLabel || (kind === "camera" ? "Camera" : "Microphone")
+        : selectedLabel || (kind === "camera" ? "Camera" : "Microphone")
       : kind === "camera"
         ? "Default camera"
         : "Default mic");
-  const Icon = kind === "camera" ? CameraIcon : MicIcon;
-
-  const { open, setOpen, rowRef } = useRowMenu();
-
-  const disabled = !on;
+  const label = on ? activeLabel : kind === "camera" ? "Camera" : "Microphone";
+  const Icon = kind === "camera" ? IconCamera : IconMicrophone;
+  const { open, onOpenChange } = useRowMenu();
   const defaultLabel = kind === "camera" ? "Default camera" : "Default mic";
   const accessLabel =
     kind === "camera" ? "Allow camera access" : "Allow microphone access";
   const refreshLabel =
     kind === "camera" ? "Refresh cameras" : "Refresh microphones";
+  const selectedValue = selectedId || DEFAULT_VALUE;
+  const mediaKindLabel = kind === "camera" ? "camera" : "microphone";
 
   return (
-    <div className={`row ${on ? "row-on" : "row-off"}`} ref={rowRef}>
-      <span className="row-icon">
-        <Icon />
-      </span>
-      <button
-        type="button"
-        className="row-button"
-        onClick={() => {
-          if (!disabled) setOpen((v) => !v);
-        }}
-        disabled={disabled}
-        title={label}
-      >
-        <span className="row-label">{label}</span>
-        <span className="row-chev" aria-hidden>
-          <ChevronDown />
+    <div className={`media-device-row ${!on ? "media-device-row-off" : ""}`}>
+      <div className={`row ${on ? "row-on" : "row-off"}`}>
+        <span className="row-icon" aria-hidden>
+          <Icon size={20} stroke={1.75} />
         </span>
-      </button>
-      <Toggle
-        on={on}
-        onChange={onToggle}
-        label={kind === "camera" ? "Camera" : "Microphone"}
-      />
-      {kind === "mic" && on ? <MicWave /> : null}
-      {open ? (
-        <div className="row-menu" role="menu">
-          <button
-            type="button"
-            className={`row-menu-item ${!selectedId ? "selected" : ""}`}
-            role="menuitemradio"
-            aria-checked={!selectedId}
-            onClick={() => {
-              onSelect("", "");
-              setOpen(false);
-            }}
-          >
-            <span className="row-menu-check" aria-hidden>
-              {!selectedId ? <CheckIcon /> : null}
-            </span>
-            <span className="row-menu-label">{defaultLabel}</span>
-          </button>
-          {devices.length === 0 ? (
-            <button
-              type="button"
-              className="row-menu-item row-menu-action"
-              role="menuitem"
-              onClick={() => {
-                onRefresh();
-                setOpen(false);
-              }}
-            >
-              <span className="row-menu-check" aria-hidden />
-              <span className="row-menu-label">{accessLabel}</span>
-            </button>
-          ) : (
-            <>
-              {devices.map((d) => {
-                const isSelected = !!selectedId && d.deviceId === selectedId;
-                return (
-                  <button
-                    key={d.deviceId}
-                    type="button"
-                    className={`row-menu-item ${isSelected ? "selected" : ""}`}
-                    role="menuitemradio"
-                    aria-checked={isSelected}
-                    onClick={() => {
-                      onSelect(d.deviceId, d.label);
-                      setOpen(false);
-                    }}
-                  >
-                    <span className="row-menu-check" aria-hidden>
-                      {isSelected ? <CheckIcon /> : null}
-                    </span>
-                    <span className="row-menu-label">
-                      {d.label || (kind === "camera" ? "Camera" : "Microphone")}
-                    </span>
-                  </button>
-                );
-              })}
-              <button
-                type="button"
-                className="row-menu-item row-menu-action"
-                role="menuitem"
-                onClick={() => {
-                  onRefresh();
-                  setOpen(false);
-                }}
+        <div className="row-main">
+          <DropdownMenu open={open} onOpenChange={onOpenChange}>
+            {on ? (
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className="row-button"
+                  aria-label={`Choose ${kind}: ${activeLabel}`}
+                >
+                  <span className="row-label">{activeLabel}</span>
+                  {kind === "mic" ? (
+                    <MicWave deviceId={selectedId} active={meterActive} />
+                  ) : (
+                    <span className="row-flex" aria-hidden />
+                  )}
+                  <IconChevronDown
+                    className="row-chev"
+                    size={16}
+                    stroke={1.75}
+                    aria-hidden
+                  />
+                </button>
+              </DropdownMenuTrigger>
+            ) : (
+              <span
+                className="row-button row-button-placeholder"
+                aria-disabled="true"
               >
-                <span className="row-menu-check" aria-hidden />
-                <span className="row-menu-label">{refreshLabel}</span>
-              </button>
-            </>
-          )}
-          {kind === "mic" && onSystemAudioToggle ? (
-            <div className="row-menu-toggle">
-              <span className="row-menu-toggle-label">Record System audio</span>
+                {label}
+              </span>
+            )}
+            {on ? (
+              <DropdownMenuContent
+                align="start"
+                sideOffset={6}
+                data-popover-resize-overlay="true"
+                className="recorder-menu w-[216px] rounded-[10px]"
+              >
+                <DropdownMenuRadioGroup
+                  value={selectedValue}
+                  onValueChange={(value) => {
+                    if (value === DEFAULT_VALUE) onSelect("", "");
+                    else {
+                      const device = devices.find((d) => d.deviceId === value);
+                      if (device) onSelect(device.deviceId, device.label);
+                    }
+                  }}
+                >
+                  <DropdownMenuRadioItem value={DEFAULT_VALUE}>
+                    {defaultLabel}
+                  </DropdownMenuRadioItem>
+                  {devices.map((device) => (
+                    <DropdownMenuRadioItem
+                      key={device.deviceId}
+                      value={device.deviceId}
+                    >
+                      {device.label || label}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onSelect={onRefresh}>
+                  <IconRefresh size={16} stroke={1.75} aria-hidden />
+                  {devices.length === 0 ? accessLabel : refreshLabel}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            ) : null}
+          </DropdownMenu>
+        </div>
+        <div className="row-trailing-control">
+          <Tooltip>
+            <TooltipTrigger asChild>
               <Switch
-                on={!!systemAudio}
-                onChange={onSystemAudioToggle}
-                label="Record system audio"
+                checked={on}
+                onCheckedChange={onToggle}
+                label={kind === "camera" ? "Camera" : "Microphone"}
               />
-            </div>
-          ) : null}
+            </TooltipTrigger>
+            <TooltipContent side="left">
+              {`${on ? "Turn off" : "Turn on"} ${mediaKindLabel}`}
+            </TooltipContent>
+          </Tooltip>
+        </div>
+      </div>
+      {kind === "mic" && onSystemAudioToggle ? (
+        <div
+          className={`row ${systemAudio ? "row-on" : "row-off"} system-audio-row`}
+        >
+          <span className="row-icon system-audio-icon" aria-hidden>
+            <IconVolume2 size={20} stroke={1.75} />
+          </span>
+          <span className="system-audio-label">Record system audio</span>
+          <div className="row-trailing-control">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Switch
+                  checked={!!systemAudio}
+                  onCheckedChange={onSystemAudioToggle}
+                  label="Record system audio"
+                />
+              </TooltipTrigger>
+              <TooltipContent side="left">{`${
+                systemAudio ? "Turn off" : "Turn on"
+              } system audio`}</TooltipContent>
+            </Tooltip>
+          </div>
         </div>
       ) : null}
     </div>

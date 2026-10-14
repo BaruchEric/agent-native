@@ -1,10 +1,10 @@
-import { nextjsSourceAdapter } from "./nextjs.js";
-import { inferMigrationInputKind } from "./agent-introspection.js";
 import type {
   MigrationInputKind,
   MigrationRun,
   SourceAdapter,
 } from "../types.js";
+import { inferMigrationInputKind } from "./agent-introspection.js";
+import { nextjsSourceAdapter } from "./nextjs.js";
 
 export type SourceAdapterRegistry = readonly SourceAdapter[];
 
@@ -14,7 +14,7 @@ export const sourceAdapterRegistry: SourceAdapterRegistry = [
 
 export interface SelectSourceAdapterOptions {
   sourceRoot: string;
-  inputKind?: MigrationInputKind | string;
+  inputKind?: MigrationInputKind | (string & {});
   inputDescription?: string;
   registry?: SourceAdapterRegistry;
 }

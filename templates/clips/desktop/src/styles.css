@@ -1,23 +1,19 @@
-/* Clips tray popover — Loom-style layout, Clips brand, dark/light modes. */
-
 :root {
   color-scheme: light dark;
 
-  /* Clips brand */
-  --brand: #18181b;
-  --brand-hover: #27272a;
-  --brand-ring: rgba(24, 24, 27, 0.28);
+  --brand: #1a1a1a;
+  --brand-hover: #2e2e2e;
+  --brand-ring: rgba(26, 26, 26, 0.28);
 
-  /* Light palette */
   --bg: #ffffff;
-  --surface: #f5f6f9;
-  --surface-hover: #eef0f5;
-  --surface-strong: #e8ebf2;
-  --fg: #0f172a;
-  --fg-muted: #64748b;
-  --fg-subtle: #94a3b8;
-  --border: #e2e6ef;
-  --border-strong: #d4d9e4;
+  --surface: #f7f7f7;
+  --surface-hover: #f0f0f0;
+  --surface-strong: #ebebeb;
+  --fg: #171717;
+  --fg-muted: #737373;
+  --fg-subtle: #a3a3a3;
+  --border: #e5e5e5;
+  --border-strong: #d9d9d9;
 
   --status-ok: #22c55e;
   --status-warn: #f97316;
@@ -25,12 +21,11 @@
   --radius: 12px;
   --radius-sm: 8px;
   --radius-pill: 999px;
-  --popover-shadow-gutter: 12px;
   --overlay-shadow-gutter: 18px;
 
-  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-sm: 0 1px 2px rgba(23, 23, 23, 0.06);
   --shadow-md:
-    0 4px 16px rgba(15, 23, 42, 0.08), 0 2px 4px rgba(15, 23, 42, 0.04);
+    0 4px 16px rgba(23, 23, 23, 0.08), 0 2px 4px rgba(23, 23, 23, 0.04);
 
   font-family:
     -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
@@ -40,21 +35,20 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0f1115;
-    --surface: #181b23;
-    --surface-hover: #1e2230;
-    --surface-strong: #252938;
-    --fg: #f1f5f9;
-    --fg-muted: #94a3b8;
-    --fg-subtle: #64748b;
-    --border: #252938;
-    --border-strong: #323747;
+    --bg: #212121;
+    --surface: #262626;
+    --surface-hover: #2e2e2e;
+    --surface-strong: #3d3d3d;
+    --fg: #f5f5f5;
+    --fg-muted: #a3a3a3;
+    --fg-subtle: #737373;
+    --border: #3d3d3d;
+    --border-strong: #4d4d4d;
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.3);
-    /* Invert brand on dark bg: zinc-900 would disappear, use zinc-100. */
-    --brand: #f4f4f5;
-    --brand-hover: #e4e4e7;
-    --brand-ring: rgba(244, 244, 245, 0.28);
+    --brand: #f5f5f5;
+    --brand-hover: #e5e5e5;
+    --brand-ring: rgba(245, 245, 245, 0.28);
   }
 }
 
@@ -62,10 +56,6 @@
   box-sizing: border-box;
 }
 
-/* Tauri window is `transparent: true` + `decorations: false`, so the HTML
-   paints the visible shape. A padded transparent outer, with a rounded
-   inner panel that carries the actual background + shadow, gives us the
-   round-cornered chromeless popover. */
 html,
 body {
   margin: 0;
@@ -104,21 +94,13 @@ button {
 
 body[data-clips-route="popover"] #root {
   min-height: 100vh;
-  padding: var(--popover-shadow-gutter);
+  padding: 0;
 }
 
 body[data-clips-route]:not([data-clips-route="popover"]) #root {
   height: 100vh;
   overflow: hidden;
 }
-
-body[data-clips-route="recording-pill"] #root {
-  padding: var(--overlay-shadow-gutter);
-}
-
-/* ------------------------------------------------------------------------- */
-/* App shell                                                                  */
-/* ------------------------------------------------------------------------- */
 
 .app {
   margin: 0;
@@ -129,24 +111,46 @@ body[data-clips-route="recording-pill"] #root {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 14px;
-  /* Subtle drop shadow so the popover visually detaches from the menu bar. */
-  box-shadow: var(--shadow-md);
-  /* No fixed height — the Tauri window is resized to match the rendered
-     content via resize_popover, so the shell just flows naturally. */
-  max-height: calc(
-    100vh - var(--popover-shadow-gutter) - var(--popover-shadow-gutter)
-  );
+  max-height: 100vh;
   overflow-y: auto;
+  overflow-x: hidden;
   overscroll-behavior: contain;
 }
 
 .app-settings {
   gap: 0;
   padding: 0;
-  overflow-y: auto;
+  max-height: none;
+  overflow: hidden;
 }
 
-/* Header — logo + mode toggle + close */
+.app-recorder {
+  position: relative;
+  gap: 0;
+  padding: 0;
+  width: 320px;
+  max-width: 320px;
+  overflow: hidden;
+}
+
+.recorder-home-content {
+  min-height: 0;
+  padding: 14px;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+}
+
+.app-recorder > .bottom-row {
+  flex: 0 0 auto;
+  padding: 7px 14px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+}
 
 .header {
   display: grid;
@@ -156,41 +160,16 @@ body[data-clips-route="recording-pill"] #root {
   padding: 0 2px;
 }
 
-/* Mode toggle lives in the first column — center it horizontally so the
-   close button on the right doesn't make the layout look lopsided. */
 .header .mode-toggle {
   justify-self: center;
 }
 
-/* Variant: truly-centered mode-toggle with an absolutely positioned close X.
-   Using a grid column for the close button nudges the mode tabs left by the
-   close button's width, which read as "off center" in Steve's screenshot.
-   Absolute positioning keeps the X in the top-right corner while the tabs
-   occupy the visual center of the popover. */
 .header.header-centered {
   position: relative;
   display: flex;
   justify-content: center;
   align-items: center;
-  min-height: 28px;
-}
-
-.header.header-centered .header-close {
-  position: absolute;
-  right: 0;
-  top: 50%;
-  transform: translateY(-50%);
-}
-
-.header.header-centered .header-feedback {
-  position: absolute;
-  left: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  width: auto;
-  padding: 0 9px;
-  font-size: 12px;
-  font-weight: 500;
+  min-height: 36px;
 }
 
 .logo {
@@ -211,7 +190,7 @@ body[data-clips-route="recording-pill"] #root {
 .mode-toggle {
   display: inline-flex;
   background: var(--surface);
-  border-radius: var(--radius-pill);
+  border-radius: var(--recorder-mode-toggle-radius);
   padding: 3px;
   justify-self: center;
   border: 1px solid var(--border);
@@ -222,18 +201,17 @@ body[data-clips-route="recording-pill"] #root {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  min-width: 34px;
+  width: 64px;
+  min-width: 64px;
   height: 28px;
   border: none;
   background: transparent;
   color: var(--fg-muted);
-  border-radius: var(--radius-pill);
+  border-radius: var(--recorder-mode-option-radius);
   cursor: pointer;
-  transition:
-    background 120ms,
-    color 120ms,
-    box-shadow 120ms;
+  transition-property: background-color, color, box-shadow, transform;
+  transition-duration: 120ms;
+  transition-timing-function: ease-out;
 }
 
 .mode-toggle button:hover {
@@ -241,9 +219,18 @@ body[data-clips-route="recording-pill"] #root {
 }
 
 .mode-toggle button.active {
-  background: var(--bg);
-  color: var(--brand);
+  background: var(--brand);
+  color: var(--bg);
   box-shadow: var(--shadow-sm);
+}
+
+.mode-toggle button:focus-visible {
+  outline: 2px solid hsl(var(--ui-ring));
+  outline-offset: 1px;
+}
+
+.mode-toggle button:active {
+  transform: scale(0.96);
 }
 
 .mode-tooltip {
@@ -304,10 +291,6 @@ body[data-clips-route="recording-pill"] #root {
   box-shadow: 0 0 0 2px var(--brand-ring);
 }
 
-/* ------------------------------------------------------------------------- */
-/* Feedback popover                                                           */
-/* ------------------------------------------------------------------------- */
-
 .feedback-popover-content {
   width: min(320px, calc(100vw - 36px));
   z-index: 50;
@@ -326,7 +309,7 @@ body[data-clips-route="recording-pill"] #root {
 }
 
 .feedback-popover-content[data-state="closed"] {
-  animation: feedback-popover-out 90ms ease-in;
+  animation: feedback-popover-out 90ms ease-out;
 }
 
 .feedback-form {
@@ -475,14 +458,10 @@ body[data-clips-route="recording-pill"] #root {
   }
 }
 
-/* ------------------------------------------------------------------------- */
-/* Source / device rows                                                       */
-/* ------------------------------------------------------------------------- */
-
 .panel {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 0;
 }
 
 .row {
@@ -490,18 +469,25 @@ body[data-clips-route="recording-pill"] #root {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 12px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  min-height: 30px;
+  padding: 5px 10px;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
   cursor: default;
-  transition:
-    background 120ms,
-    border-color 120ms;
+  transition: background 120ms;
+}
+
+.row:hover {
+  background: hsl(var(--ui-muted) / 0.55);
+}
+
+.row-on {
+  color: var(--fg);
 }
 
 .row-off {
-  opacity: 0.6;
+  color: var(--fg-subtle);
 }
 
 .row-icon {
@@ -510,267 +496,163 @@ body[data-clips-route="recording-pill"] #root {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--fg-muted);
+  color: inherit;
   flex-shrink: 0;
 }
 
-.row-on .row-icon {
-  color: var(--fg);
+.media-device-row .row,
+.system-audio-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) 44px;
+  column-gap: 10px;
 }
 
-/* Custom device picker — button + popover menu (replaces native <select>). */
+.row-main {
+  min-width: 0;
+}
+
+.row-trailing-control {
+  display: flex;
+  width: 44px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.system-audio-row {
+  align-items: center;
+  min-height: 30px;
+  padding: 5px 10px;
+}
+
+.system-audio-icon {
+  transform: translateX(2px);
+}
+
+.system-audio-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
 .row-button {
-  flex: 1;
+  width: 100%;
   min-width: 0;
   display: flex;
   align-items: center;
   gap: 6px;
   border: none;
   background: transparent;
-  color: var(--fg);
+  color: inherit;
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 400;
   padding: 0;
   margin: 0;
   cursor: pointer;
-  outline: none;
   text-align: left;
-}
-
-.row-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.6;
+  transition-property: color, background-color;
+  transition-duration: 120ms;
+  transition-timing-function: ease-out;
 }
 
 .row-button:focus-visible {
-  box-shadow: 0 0 0 2px var(--brand-ring);
   border-radius: 4px;
+  outline: 2px solid hsl(var(--ui-ring));
+  outline-offset: 2px;
 }
 
 .row-label {
-  flex: 1;
-  min-width: 0;
+  flex: 0 0 auto;
+  max-width: 60%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.row-button-placeholder {
+  display: flex;
+  align-items: center;
+  cursor: default;
+}
+
+.rewind-off-popover-reveal {
+  display: grid;
+  grid-template-rows: 1fr;
+}
+
+.rewind-off-popover-reveal[data-state="open"] {
+  animation: rewind-off-popover-expand 180ms ease-out both;
+}
+
+.rewind-off-popover-reveal__content {
+  min-height: 0;
+  overflow: hidden;
+}
+
+@keyframes rewind-off-popover-expand {
+  from {
+    grid-template-rows: 0fr;
+  }
+
+  to {
+    grid-template-rows: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rewind-off-popover-reveal[data-state="open"] {
+    animation: none;
+  }
+}
+
+.row-flex {
+  flex: 1 1 auto;
 }
 
 .row-chev {
   display: inline-flex;
-  color: var(--fg-muted);
+  color: var(--fg-subtle);
   flex-shrink: 0;
 }
 
-/* Popover menu rendered below a device row. */
-.row-menu {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  right: 0;
-  background: var(--bg);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-md);
-  padding: 4px;
-  z-index: 10;
-  max-height: 240px;
-  overflow-y: auto;
-}
-
-.row-menu-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  background: transparent;
-  border: none;
-  padding: 8px 10px;
-  border-radius: var(--radius-sm);
-  color: var(--fg);
-  font-size: 13px;
-  cursor: pointer;
-  text-align: left;
-}
-
-.row-menu-item:hover {
-  background: var(--surface-hover);
-}
-
-.row-menu-item.selected {
-  color: var(--fg);
-  font-weight: 600;
-  background: var(--surface-hover);
-}
-
-/* System-audio toggle sits below the device list, separated by a divider. */
-.row-menu-toggle {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-top: 4px;
-  padding: 10px 10px 8px 34px;
-  border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
-}
-
-.row-menu-toggle-label {
-  font-size: 13px;
-  color: var(--fg);
-}
-
-.row-menu-check {
-  width: 16px;
-  display: inline-flex;
-  justify-content: center;
-  color: var(--fg);
-  flex-shrink: 0;
-}
-
-.row-menu-label {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.row-menu-empty {
-  padding: 10px 12px;
-  color: var(--fg-muted);
-  font-size: 13px;
-}
-
-/* Toggle chip — mirrors Loom's On/Off pill. Green when on, subtle when off. */
-.toggle {
-  border: none;
-  border-radius: var(--radius-pill);
-  padding: 4px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  line-height: 1;
-  height: 22px;
-  display: inline-flex;
-  align-items: center;
-  transition:
-    background 120ms,
-    color 120ms;
-}
-
-.toggle-on {
-  background: #16a34a;
-  color: white;
-}
-
-.toggle-on:hover {
-  background: #15803d;
-}
-
-.toggle-off {
-  background: var(--surface-strong);
-  color: var(--fg-muted);
-}
-
-.toggle-off:hover {
-  color: var(--fg);
-}
-
-/* Shadcn-style switch — slim track + sliding thumb. Used in Settings for the
-   Voice dictation enable/disable toggle. */
-.switch {
-  position: relative;
-  display: inline-flex;
-  width: 32px;
-  height: 18px;
-  padding: 0;
-  border: none;
-  border-radius: 9999px;
-  cursor: pointer;
-  transition: background 120ms;
-  flex-shrink: 0;
-}
-
-.switch:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 2px var(--brand-ring);
-}
-
-.switch-on {
-  background: #16a34a;
-}
-
-.switch-off {
-  background: var(--surface-strong);
-}
-
-.switch-thumb {
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: white;
-  transition: transform 120ms;
-  pointer-events: none;
-}
-
-.switch-on .switch-thumb {
-  transform: translateX(14px);
-}
-
-/* Mic level indicator — animated bars under the mic row. */
 .mic-wave {
-  position: absolute;
-  left: 12px;
-  right: 12px;
-  bottom: 4px;
-  height: 3px;
-  display: flex;
-  gap: 2px;
-  align-items: flex-end;
+  flex: 1 1 auto;
+  min-width: 0;
+  align-self: stretch;
+  margin: 0 4px;
   pointer-events: none;
-  opacity: 0.55;
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 12%,
+    #000 88%,
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 12%,
+    #000 88%,
+    transparent 100%
+  );
 }
 
-.mic-wave .bar {
-  flex: 1;
-  background: var(--brand);
-  border-radius: 1px;
-  animation: mic-pulse 1.2s ease-in-out infinite;
-  height: 60%;
+.mic-wave-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
 }
 
-.mic-wave .b1 {
-  animation-delay: 0s;
-  height: 40%;
+.mic-wave-path {
+  fill: none;
+  stroke: rgba(74, 222, 128, 0.95);
+  stroke-width: 1.25;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
 }
-.mic-wave .b2 {
-  animation-delay: 0.15s;
-  height: 80%;
-}
-.mic-wave .b3 {
-  animation-delay: 0.3s;
-  height: 55%;
-}
-.mic-wave .b4 {
-  animation-delay: 0.45s;
-  height: 70%;
-}
-
-@keyframes mic-pulse {
-  0%,
-  100% {
-    transform: scaleY(1);
-  }
-  50% {
-    transform: scaleY(0.4);
-  }
-}
-
-/* ------------------------------------------------------------------------- */
-/* Primary CTA                                                                */
-/* ------------------------------------------------------------------------- */
 
 .primary {
   width: 100%;
@@ -831,28 +713,52 @@ body[data-clips-route="recording-pill"] #root {
   cursor: not-allowed;
 }
 
+.setup-connect-button {
+  height: 38px;
+  margin-top: 2px;
+}
+
 .primary.start {
   margin-top: 2px;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Readiness disclosure                                                       */
-/* ------------------------------------------------------------------------- */
+.primary.start.start-loading {
+  position: relative;
+  overflow: hidden;
+  cursor: progress;
+}
+
+.primary.start.start-loading .start-label {
+  position: relative;
+  z-index: 1;
+}
+
+.start-loading-shimmer {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  filter: invert(1);
+}
+
+.recorder-disclosures {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
 
 .readiness {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
+  border: none;
+  border-radius: 0;
+  background: transparent;
   overflow: hidden;
   flex-shrink: 0;
-  transition:
-    border-color 120ms,
-    background 120ms;
 }
 
 .readiness-open {
-  border-color: var(--border-strong);
-  background: var(--bg);
+  border-color: transparent;
+  background: transparent;
 }
 
 .readiness-summary {
@@ -861,19 +767,20 @@ body[data-clips-route="recording-pill"] #root {
   align-items: center;
   gap: 8px;
   width: 100%;
-  min-height: 42px;
+  min-height: 36px;
   border: none;
   background: transparent;
   border-radius: var(--radius-sm);
-  color: var(--fg);
+  color: var(--fg-muted);
   cursor: pointer;
-  padding: 10px 12px;
+  padding: 7px 12px;
   text-align: left;
-  transition: background 120ms;
+  transition: color 120ms;
 }
 
-.readiness-summary:hover {
-  background: var(--surface-hover);
+.readiness-summary:hover,
+.readiness-summary:focus-visible {
+  color: var(--fg);
 }
 
 .readiness-summary:focus-visible {
@@ -882,36 +789,40 @@ body[data-clips-route="recording-pill"] #root {
 }
 
 .readiness-open .readiness-summary {
-  min-height: 42px;
-  border-radius: 0;
-  padding: 10px 12px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
+  min-height: 36px;
+  border-radius: var(--radius-sm);
+  padding: 7px 12px;
+  background: transparent;
 }
 
 .readiness-title {
-  color: var(--fg);
+  color: inherit;
   font-size: 13px;
   font-weight: 500;
   line-height: 1;
 }
 
 .readiness-open .readiness-title {
-  color: var(--fg);
+  color: inherit;
 }
 
 .readiness-action {
   display: flex;
   align-items: center;
   gap: 3px;
-  color: var(--brand);
+  color: inherit;
   font-size: 11px;
   font-weight: 600;
   line-height: 1;
 }
 
+.readiness-action svg {
+  width: 11px;
+  height: 11px;
+}
+
 .readiness-open .readiness-action {
-  color: var(--fg-muted);
+  color: inherit;
 }
 
 .readiness-list {
@@ -1016,9 +927,17 @@ body[data-clips-route="recording-pill"] #root {
   cursor: pointer;
   border-radius: var(--radius-sm);
   transition:
+    opacity 120ms,
     color 120ms,
     background 120ms;
   flex-shrink: 0;
+  opacity: 0;
+}
+
+.readiness-item:hover .readiness-refresh,
+.readiness-item:focus-within .readiness-refresh,
+.readiness-item .readiness-refresh-rotating {
+  opacity: 1;
 }
 
 .readiness-refresh:hover {
@@ -1031,13 +950,19 @@ body[data-clips-route="recording-pill"] #root {
   cursor: default;
 }
 
-.readiness-refresh-spinning svg {
-  animation: readiness-spin 0.8s linear infinite;
+.readiness-refresh-rotating svg {
+  animation: readiness-spin 420ms ease-out;
 }
 
 @keyframes readiness-spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .readiness-refresh-rotating svg {
+    animation: none;
   }
 }
 
@@ -1052,15 +977,111 @@ body[data-clips-route="recording-pill"] #root {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #ef4444;
-  box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.3);
+  flex: 0 0 auto;
+  transform: translateY(1px);
+  background: hsl(var(--ui-destructive));
 }
 
-/* Active-recording state on the primary button: softened orange-red
-   (Tailwind orange-700) — semantic "recording is live" without the harsh
-   pure-red assault. White square icon + live pulsing dot still read as
-   "stop". Hover stays the same shade (no brighten-on-hover) to keep the
-   affordance calm. */
+.active-recording-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.active-recording-dot {
+  margin-top: 4px;
+}
+
+.active-recording-copy strong {
+  display: block;
+  font-size: 13px;
+}
+
+.active-recording-copy p {
+  margin: 3px 0 0;
+  color: var(--fg-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.active-recording-stop {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+}
+
+.active-recording-card-compact {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+}
+
+.active-recording-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 22px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: #dc2626;
+  color: #fff;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  line-height: 1;
+}
+
+.active-recording-live-dot {
+  position: relative;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.active-recording-live-dot::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: inherit;
+  animation: active-recording-pulse 1.2s ease-out infinite;
+}
+
+@keyframes active-recording-pulse {
+  0% {
+    transform: scale(0.8);
+    opacity: 1;
+  }
+  75%,
+  100% {
+    transform: scale(1.8);
+    opacity: 0;
+  }
+}
+
+.active-recording-card-compact .active-recording-stop {
+  grid-column: auto;
+  margin-top: 0;
+  min-height: 28px;
+  height: 28px;
+  padding: 5px 10px;
+  font-size: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .active-recording-live-dot::after {
+    animation: none;
+    opacity: 0.65;
+    transform: none;
+  }
+}
+
 .primary.start.rec-active {
   background: #c2410c;
   color: #fff;
@@ -1070,46 +1091,64 @@ body[data-clips-route="recording-pill"] #root {
 }
 
 .rec-dot-live {
+  position: relative;
   background: white;
+}
+
+.rec-dot-live::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.6);
   animation: rec-live-pulse 1.2s ease-out infinite;
+  pointer-events: none;
 }
 
 @keyframes rec-live-pulse {
   0% {
-    box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.6);
+    transform: scale(1);
+    opacity: 1;
   }
   70% {
-    box-shadow: 0 0 0 6px rgba(255, 255, 255, 0);
+    transform: scale(2.4);
+    opacity: 0;
   }
   100% {
-    box-shadow: 0 0 0 0 rgba(255, 255, 255, 0);
+    transform: scale(2.4);
+    opacity: 0;
   }
 }
 
-/* ------------------------------------------------------------------------- */
-/* Bottom quick-actions row                                                   */
-/* ------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .rec-dot-live::after {
+    animation: none;
+    opacity: 0.6;
+    transform: none;
+  }
+}
 
 .bottom-row {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
 }
 
 .bottom-btn {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 4px;
-  padding: 8px 4px;
+  gap: 10px;
+  min-height: 30px;
+  padding: 5px 10px;
   border: none;
   background: transparent;
   border-radius: var(--radius-sm);
-  color: var(--fg-muted);
+  color: var(--fg);
   cursor: pointer;
-  transition:
-    background 120ms,
-    color 120ms;
+  text-align: left;
+  transition-property: background-color, color, transform;
+  transition-duration: 120ms;
+  transition-timing-function: ease-out;
 }
 
 .bottom-btn:hover {
@@ -1118,20 +1157,475 @@ body[data-clips-route="recording-pill"] #root {
 }
 
 .bottom-icon {
-  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   color: var(--fg-muted);
+  width: 20px;
+  flex-shrink: 0;
 }
 
 .bottom-btn:hover .bottom-icon {
   color: var(--fg);
 }
 
+.bottom-btn:active {
+  transform: scale(0.96);
+}
+
+.bottom-btn-hint {
+  cursor: default;
+}
+
+.bottom-btn-hint:hover {
+  background: transparent;
+}
+
+.bottom-btn-hint:hover .bottom-icon {
+  color: var(--fg-muted);
+}
+
+.bottom-btn-hint:active {
+  transform: none;
+}
+
 .bottom-label {
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.bottom-shortcut {
+  margin-inline-start: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--fg-subtle);
   font-size: 11px;
-  font-weight: 500;
+}
+
+.bottom-shortcut-separator {
+  margin-inline: 2px;
+  color: var(--fg-subtle);
+}
+
+.bottom-external {
+  margin-inline-start: auto;
+  color: var(--fg-subtle);
+}
+
+.imminent-meeting {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid hsl(var(--ui-success) / 0.2);
+  border-radius: 8px;
+  background: hsl(var(--ui-success) / 0.08);
+  color: hsl(var(--ui-success));
+}
+
+.imminent-meeting-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.imminent-meeting-copy strong,
+.imminent-meeting-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.imminent-meeting-copy strong {
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.imminent-meeting-copy span {
+  color: hsl(var(--ui-success) / 0.85);
+  font-size: 11px;
+}
+
+.app-popover-view {
+  gap: 0;
+  padding: 0;
+}
+
+.popover-view {
+  min-height: 260px;
+}
+
+.popover-view-header {
+  margin-bottom: 2px;
+}
+
+.popover-view-header-spacer {
+  flex: 1;
+}
+
+.popover-view-link {
+  font-size: 11px;
+}
+
+.rewind-settings-entry-main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+}
+
+.rewind-consent-primary:focus-visible,
+.rewind-quiet-button:focus-visible,
+.rewind-search-row input:focus-visible,
+.rewind-search-row button:focus-visible,
+.rewind-settings-entry .secondary:focus-visible,
+.rewind-evidence-card .secondary:focus-visible,
+.rewind-memory-empty .secondary:focus-visible,
+.setup-back:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--brand-ring);
+}
+
+.rewind-surface-lede {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.rewind-local-promise {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 9px;
+  width: 100%;
+  padding: 11px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--fg-muted);
+  text-align: left;
+}
+
+.rewind-local-promise p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.rewind-local-promise strong {
+  color: var(--fg);
+}
+
+.rewind-consent-primary {
+  width: 100%;
+  min-height: 42px;
+}
+
+.rewind-quiet-button {
+  border: none;
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.rewind-memory-surface,
+.rewind-settings-surface {
+  gap: 14px;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+.rewind-settings-surface {
+  padding-bottom: 18px;
+}
+
+.rewind-search-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  padding-left: 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: 11px;
+  background: var(--bg);
+}
+
+.rewind-search-row input {
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--fg);
+}
+
+.rewind-search-row button {
+  align-self: stretch;
+  border: none;
+  border-left: 1px solid var(--border);
+  border-radius: 0 10px 10px 0;
+  background: var(--surface);
+  padding: 0 12px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.rewind-search-row button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.rewind-search-results {
+  display: grid;
+  gap: 8px;
+}
+
+.rewind-result-summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--fg-muted);
+  font-size: 10.5px;
+}
+
+.rewind-result-summary strong {
+  color: var(--fg);
+}
+
+.rewind-evidence-card {
+  display: grid;
+  gap: 9px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.rewind-evidence-card p {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.rewind-evidence-meta {
+  color: var(--fg-muted);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.rewind-memory-empty {
+  margin-top: 4px;
+}
+
+.rewind-coverage-details {
+  margin-top: 2px;
+}
+
+.rewind-agent-guide {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 9px;
+  padding: 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--surface) 78%, var(--bg));
+}
+
+.rewind-agent-guide-icon {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--bg);
+}
+
+.rewind-agent-guide p {
+  margin: 2px 0 5px;
+  line-height: 1.45;
+}
+
+.rewind-detail-label {
+  font-size: 11px;
+}
+
+.setup .rewind-settings-entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.rewind-settings-entry .secondary {
+  width: auto;
+}
+
+.setup .setup-rewind-legacy {
+  display: none;
+}
+
+.popover-empty-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.popover-empty-card strong {
+  font-size: 13px;
+  color: var(--fg);
+}
+
+.popover-card-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.popover-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 4px;
+  max-height: 420px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+}
+
+.popover-list::-webkit-scrollbar {
+  width: 4px;
+}
+
+.popover-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.popover-list::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 999px;
+}
+
+.popover-list::-webkit-scrollbar-thumb:hover {
+  background: var(--fg-subtle);
+}
+
+.popover-list-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.popover-list-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-muted);
+  flex-shrink: 0;
+}
+
+.popover-list-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.popover-list-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.popover-list-sub {
+  margin-top: 1px;
+  font-size: 11px;
+  color: var(--fg-subtle);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.popover-list-action {
+  flex-shrink: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg);
+  padding: 6px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.popover-list-action:hover {
+  background: var(--surface-hover);
+}
+
+.popover-list-action-primary {
+  border-color: var(--brand);
+  background: var(--brand);
+  color: var(--bg);
+}
+
+.popover-list-action-primary:hover {
+  background: var(--brand-hover);
+}
+
+.popover-list-action-active {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-color: rgba(34, 197, 94, 0.36);
+  background: rgba(34, 197, 94, 0.12);
+  color: #4ade80;
+}
+
+.popover-list-action-active:hover {
+  background: rgba(34, 197, 94, 0.18);
+}
+
+.popover-list-action-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: currentColor;
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.12);
+}
+
+.popover-kv {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+}
+
+.popover-kv span {
+  color: var(--fg-subtle);
+}
+
+.popover-kv strong {
+  min-width: 0;
+  text-align: right;
+  font-size: 11px;
 }
 
 .badge {
@@ -1151,10 +1645,6 @@ body[data-clips-route="recording-pill"] #root {
   justify-content: center;
   box-shadow: 0 0 0 2px var(--bg);
 }
-
-/* ------------------------------------------------------------------------- */
-/* Recent list (collapsible)                                                  */
-/* ------------------------------------------------------------------------- */
 
 .recent-list {
   display: flex;
@@ -1219,10 +1709,6 @@ body[data-clips-route="recording-pill"] #root {
   margin-top: 1px;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Footer                                                                     */
-/* ------------------------------------------------------------------------- */
-
 .footer {
   display: flex;
   align-items: center;
@@ -1254,10 +1740,6 @@ body[data-clips-route="recording-pill"] #root {
   text-decoration: underline;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Setup overlay (server URL change)                                          */
-/* ------------------------------------------------------------------------- */
-
 .setup {
   width: 100%;
   background: var(--bg);
@@ -1269,6 +1751,10 @@ body[data-clips-route="recording-pill"] #root {
   max-height: none;
   overflow: visible;
   overscroll-behavior: contain;
+}
+
+.setup.popover-view {
+  padding-bottom: 32px;
 }
 
 .setup h2 {
@@ -1283,9 +1769,7 @@ body[data-clips-route="recording-pill"] #root {
   color: var(--fg-muted);
 }
 
-.setup input,
-.setup-select,
-.setup-textarea {
+.setup input {
   width: 100%;
   padding: 10px 12px;
   border: 1px solid var(--border-strong);
@@ -1297,9 +1781,7 @@ body[data-clips-route="recording-pill"] #root {
   transition: border-color 120ms;
 }
 
-.setup input:focus,
-.setup-select:focus,
-.setup-textarea:focus {
+.setup input:focus {
   border-color: var(--brand);
   box-shadow: 0 0 0 3px var(--brand-ring);
 }
@@ -1374,53 +1856,9 @@ body[data-clips-route="recording-pill"] #root {
   box-shadow: 0 0 0 2px var(--brand-ring);
 }
 
-.setup-label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--fg-muted);
-}
-
-.setup-help {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  margin: 0;
-  padding: 0;
-  border: none;
-  background: none;
-  font: inherit;
-  color: var(--fg-muted);
-  opacity: 0.6;
-  cursor: pointer;
-  transition: opacity 120ms;
-}
-
-.setup-help:hover,
-.setup-help:focus-visible,
-.setup-help[data-state="delayed-open"],
-.setup-help[data-state="instant-open"] {
-  opacity: 1;
-}
-
-.setup-help:focus-visible {
-  outline: none;
-  border-radius: 4px;
-  box-shadow: 0 0 0 2px var(--brand-ring);
-}
-
-/* ------------------------------------------------------------------------- */
-/* Tooltip (shadcn-style, Radix-backed)                                       */
-/* ------------------------------------------------------------------------- */
-
 .tooltip-content {
   z-index: 60;
-  max-width: 260px;
-  /* No border: shadcn's tooltip is borderless (solid bg + shadow). A border
-     would also detach visually from the Radix arrow, whose flush base can't
-     carry a matching CSS border. Shadow alone gives separation in both
-     themes. */
+  max-width: min(260px, calc(100vw - 16px));
   border-radius: var(--radius-sm);
   background: var(--bg);
   color: var(--fg);
@@ -1429,17 +1867,25 @@ body[data-clips-route="recording-pill"] #root {
   font-size: 12px;
   line-height: 1.45;
   text-align: left;
+  overflow-wrap: anywhere;
   user-select: none;
   transform-origin: var(--radix-tooltip-content-transform-origin);
 }
 
-.tooltip-content[data-state="delayed-open"],
-.tooltip-content[data-state="instant-open"] {
+.tooltip-content-wide {
+  max-width: 320px;
+}
+
+.tooltip-content[data-state="delayed-open"] {
   animation: tooltip-in 120ms ease-out;
 }
 
+.tooltip-content[data-state="instant-open"] {
+  animation: none;
+}
+
 .tooltip-content[data-state="closed"] {
-  animation: tooltip-out 90ms ease-in;
+  animation: tooltip-out 90ms ease-out;
 }
 
 .tooltip-arrow {
@@ -1470,6 +1916,129 @@ body[data-clips-route="recording-pill"] #root {
   }
 }
 
+.alert-dialog-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 70;
+  /* guard:allow-raw-color — modal scrim is theme-invariant black, same as shadcn's own bg-black/80 overlay */
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.alert-dialog-overlay[data-state="open"] {
+  animation: alert-dialog-overlay-in 120ms ease-out;
+}
+
+.alert-dialog-overlay[data-state="closed"] {
+  animation: alert-dialog-overlay-out 100ms ease-in;
+}
+
+.alert-dialog-content {
+  position: absolute;
+  z-index: 71;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: calc(100% - 32px);
+  max-width: 320px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  box-shadow: var(--shadow-md);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.alert-dialog-content[data-state="open"] {
+  animation: alert-dialog-content-in 120ms ease-out;
+}
+
+.alert-dialog-content[data-state="closed"] {
+  animation: alert-dialog-content-out 100ms ease-in;
+}
+
+.alert-dialog-header {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.alert-dialog-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.alert-dialog-description {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fg-muted);
+}
+
+.alert-dialog-footer {
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+}
+
+.alert-dialog-footer .primary,
+.alert-dialog-footer .secondary {
+  width: auto;
+  flex: 1;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+@keyframes alert-dialog-overlay-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes alert-dialog-overlay-out {
+  from {
+    opacity: 1;
+  }
+
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes alert-dialog-content-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.96);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+@keyframes alert-dialog-content-out {
+  from {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+
+  to {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.96);
+  }
+}
+
 .setup-toggle-row {
   display: flex;
   align-items: center;
@@ -1477,19 +2046,6 @@ body[data-clips-route="recording-pill"] #root {
   gap: 12px;
 }
 
-.setup-shortcut-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
-}
-
-.setup-shortcut-row .setup-warning,
-.setup-shortcut-row .setup-success {
-  grid-column: 1 / -1;
-}
-
-.setup-shortcut-recorder,
-.setup-shortcut-clear,
 .setup-permission-button {
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
@@ -1503,42 +2059,14 @@ body[data-clips-route="recording-pill"] #root {
     box-shadow 120ms;
 }
 
-.setup-shortcut-recorder {
-  min-width: 0;
-  height: 38px;
-  padding: 0 12px;
-  text-align: left;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 600;
-}
-
-.setup-shortcut-recorder:hover,
-.setup-shortcut-clear:hover,
 .setup-permission-button:hover {
   background: var(--surface-hover);
 }
 
-.setup-shortcut-recorder:focus-visible,
-.setup-shortcut-clear:focus-visible,
 .setup-permission-button:focus-visible {
   outline: none;
   border-color: var(--brand);
   box-shadow: 0 0 0 3px var(--brand-ring);
-}
-
-.setup-shortcut-recorder.recording {
-  border-color: var(--brand);
-  background: var(--bg);
-  color: var(--brand);
-}
-
-.setup-shortcut-clear {
-  height: 38px;
-  padding: 0 12px;
-  font-size: 12px;
-  font-weight: 600;
 }
 
 .setup-permission-grid {
@@ -1578,24 +2106,19 @@ body[data-clips-route="recording-pill"] #root {
   line-height: 1.4;
 }
 
-.setup-select {
-  appearance: none;
-  background-image:
-    linear-gradient(45deg, transparent 50%, var(--fg-muted) 50%),
-    linear-gradient(135deg, var(--fg-muted) 50%, transparent 50%);
-  background-position:
-    calc(100% - 16px) 50%,
-    calc(100% - 11px) 50%;
-  background-size:
-    5px 5px,
-    5px 5px;
-  background-repeat: no-repeat;
+.setup-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
 }
 
-.setup-textarea {
-  min-height: 86px;
-  resize: vertical;
-  line-height: 1.4;
+.setup-mini-field {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .setup-key-row {
@@ -1606,7 +2129,7 @@ body[data-clips-route="recording-pill"] #root {
 
 .setup-button-row {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(94px, 1fr));
   gap: 8px;
 }
 
@@ -1634,6 +2157,11 @@ body[data-clips-route="recording-pill"] #root {
   font-size: 12px;
 }
 
+.setup-account--no-border {
+  border-top: none;
+  padding-top: 0;
+}
+
 .setup-account-email {
   color: var(--fg-muted);
   overflow: hidden;
@@ -1654,6 +2182,73 @@ body[data-clips-route="recording-pill"] #root {
 
 .link-button:hover {
   background: var(--surface-hover);
+}
+
+.storage-flow-banner {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #bfdbfe;
+  border-radius: var(--radius);
+  background: #eff6ff;
+  color: #1e3a8a;
+}
+
+.storage-flow-icon {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: rgba(59, 130, 246, 0.12);
+  color: #1d4ed8;
+  flex-shrink: 0;
+}
+
+.storage-flow-copy {
+  min-width: 0;
+}
+
+.storage-flow-title {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.storage-flow-sub {
+  margin-top: 3px;
+  color: #3b5f9a;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.storage-flow-connect {
+  grid-column: 2;
+  justify-self: start;
+  height: 28px;
+  border: 1px solid #bfdbfe;
+  border-radius: var(--radius-sm);
+  background: white;
+  color: #1d4ed8;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 9px;
+  font-size: 11px;
+  font-weight: 700;
+  transition:
+    background 120ms,
+    border-color 120ms;
+}
+
+.storage-flow-connect:hover {
+  background: #dbeafe;
+  border-color: #93c5fd;
 }
 
 .pending-upload-banner {
@@ -1700,12 +2295,38 @@ body[data-clips-route="recording-pill"] #root {
   white-space: nowrap;
 }
 
+.pending-upload-sub-wrap {
+  overflow: visible;
+  white-space: normal;
+}
+
+.pending-upload-why {
+  margin-top: 3px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #737373;
+  cursor: help;
+  font-size: 11px;
+  line-height: 1.2;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 3px;
+}
+
+.pending-upload-why:hover,
+.pending-upload-why:focus-visible {
+  color: #334155;
+  outline: none;
+}
+
 .pending-upload-actions {
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
 
+.pending-upload-connect,
 .pending-upload-retry {
   height: 28px;
   border: 1px solid #bfdbfe;
@@ -1726,21 +2347,23 @@ body[data-clips-route="recording-pill"] #root {
     opacity 120ms;
 }
 
-.pending-upload-discard {
+.pending-upload-connect {
+  padding: 0 8px;
+}
+
+.pending-upload-dismiss {
   width: 28px;
   height: 28px;
-  border: 1px solid #bfdbfe;
+  border: 0;
   border-radius: var(--radius-sm);
-  background: rgba(255, 255, 255, 0.76);
-  color: #2563eb;
+  background: transparent;
+  color: #3b5f9a;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
   transition:
-    background 120ms,
-    border-color 120ms,
     color 120ms,
     opacity 120ms;
 }
@@ -1769,26 +2392,31 @@ body[data-clips-route="recording-pill"] #root {
   border-color: #93c5fd;
 }
 
+.pending-upload-connect:hover {
+  background: #dbeafe;
+  border-color: #93c5fd;
+}
+
 .pending-upload-folder:hover {
   background: #dbeafe;
   border-color: #93c5fd;
 }
 
-.pending-upload-discard:hover {
-  background: #fee2e2;
-  border-color: #fecaca;
-  color: #b91c1c;
+.pending-upload-dismiss:hover {
+  color: #1e3a8a;
 }
 
 .pending-upload-retry:disabled,
+.pending-upload-connect:disabled,
 .pending-upload-folder:disabled,
-.pending-upload-discard:disabled {
+.pending-upload-dismiss:disabled {
   cursor: default;
   opacity: 0.6;
 }
 
 .local-recording-banner,
-.local-save-banner {
+.local-save-banner,
+.share-link-banner {
   display: flex;
   align-items: center;
   gap: 9px;
@@ -1807,7 +2435,8 @@ body[data-clips-route="recording-pill"] #root {
   color: var(--fg-muted);
 }
 
-.local-save-banner {
+.local-save-banner,
+.share-link-banner {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
 }
@@ -1830,7 +2459,8 @@ body[data-clips-route="recording-pill"] #root {
   white-space: nowrap;
 }
 
-.local-save-banner button {
+.local-save-banner button,
+.share-link-banner button {
   height: 28px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
@@ -1845,17 +2475,20 @@ body[data-clips-route="recording-pill"] #root {
     border-color 120ms;
 }
 
-.local-save-banner button:hover {
+.local-save-banner button:hover,
+.share-link-banner button:hover {
   background: var(--brand-hover);
   border-color: transparent;
 }
 
-.local-save-banner .local-save-dismiss {
+.local-save-banner .local-save-dismiss,
+.share-link-banner .local-save-dismiss {
   background: transparent;
   color: var(--fg-muted);
 }
 
-.local-save-banner .local-save-dismiss:hover {
+.local-save-banner .local-save-dismiss:hover,
+.share-link-banner .local-save-dismiss:hover {
   background: var(--surface-hover);
   border-color: var(--border-strong);
   color: var(--fg);
@@ -1872,60 +2505,56 @@ body[data-clips-route="recording-pill"] #root {
   overflow-wrap: anywhere;
 }
 
-.permission-banner {
+.recovery-alert {
   display: flex;
-  flex-direction: column;
+  align-items: start;
   gap: 8px;
-}
-
-.permission-copy {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  line-height: 1.35;
-  min-width: 0;
-}
-
-.permission-title {
-  color: #991b1b;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
   font-size: 12px;
-  font-weight: 700;
+  line-height: 1.35;
+}
+
+.recovery-alert-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.recovery-alert-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.recovery-alert-copy > h5 {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.recovery-alert-description {
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .permission-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  min-width: 0;
 }
 
-.permission-actions button {
-  border: 1px solid #fecaca;
-  border-radius: var(--radius-sm);
-  background: rgba(255, 255, 255, 0.65);
-  color: #991b1b;
-  cursor: pointer;
+.permission-actions .permission-action {
+  min-height: 28px;
+  height: 28px;
+  padding-inline: 8px;
+  border-radius: 6px;
   font-size: 12px;
-  font-weight: 600;
-  padding: 5px 8px;
-  transition:
-    background 120ms,
-    border-color 120ms;
-}
-
-.permission-actions button:hover {
-  background: white;
-  border-color: #fca5a5;
-}
-
-.permission-actions .permission-retry {
-  background: #991b1b;
-  border-color: #991b1b;
-  color: white;
-}
-
-.permission-actions .permission-retry:hover {
-  background: #7f1d1d;
-  border-color: #7f1d1d;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -1952,20 +2581,28 @@ body[data-clips-route="recording-pill"] #root {
     color: #93c5fd;
   }
 
+  .pending-upload-why {
+    color: #a3a3a3;
+  }
+
+  .pending-upload-why:hover,
+  .pending-upload-why:focus-visible {
+    color: #cbd5e1;
+  }
+
+  .pending-upload-connect,
   .pending-upload-retry {
-    background: rgba(15, 23, 42, 0.7);
+    background: rgba(23, 23, 23, 0.7);
     border-color: rgba(96, 165, 250, 0.38);
     color: #dbeafe;
   }
 
-  .pending-upload-discard {
-    background: rgba(15, 23, 42, 0.58);
-    border-color: rgba(96, 165, 250, 0.38);
-    color: #bfdbfe;
+  .pending-upload-dismiss {
+    color: #93c5fd;
   }
 
   .pending-upload-folder {
-    background: rgba(15, 23, 42, 0.58);
+    background: rgba(23, 23, 23, 0.58);
     border-color: rgba(96, 165, 250, 0.38);
     color: #dbeafe;
   }
@@ -1975,15 +2612,18 @@ body[data-clips-route="recording-pill"] #root {
     border-color: rgba(147, 197, 253, 0.62);
   }
 
+  .pending-upload-connect:hover {
+    background: rgba(30, 64, 175, 0.34);
+    border-color: rgba(147, 197, 253, 0.62);
+  }
+
   .pending-upload-folder:hover {
     background: rgba(30, 64, 175, 0.34);
     border-color: rgba(147, 197, 253, 0.62);
   }
 
-  .pending-upload-discard:hover {
-    background: rgba(127, 29, 29, 0.34);
-    border-color: rgba(248, 113, 113, 0.62);
-    color: #fecaca;
+  .pending-upload-dismiss:hover {
+    color: #dbeafe;
   }
 
   .error-banner {
@@ -1991,37 +2631,7 @@ body[data-clips-route="recording-pill"] #root {
     border-color: rgba(239, 68, 68, 0.5);
     color: #fca5a5;
   }
-
-  .permission-title {
-    color: #fecaca;
-  }
-
-  .permission-actions button {
-    background: rgba(239, 68, 68, 0.1);
-    border-color: rgba(239, 68, 68, 0.4);
-    color: #fecaca;
-  }
-
-  .permission-actions button:hover {
-    background: rgba(239, 68, 68, 0.18);
-    border-color: rgba(248, 113, 113, 0.6);
-  }
-
-  .permission-actions .permission-retry {
-    background: #fecaca;
-    border-color: #fecaca;
-    color: #7f1d1d;
-  }
-
-  .permission-actions .permission-retry:hover {
-    background: white;
-    border-color: white;
-  }
 }
-
-/* ------------------------------------------------------------------------- */
-/* Overlay: countdown                                                         */
-/* ------------------------------------------------------------------------- */
 
 .countdown-root {
   position: fixed;
@@ -2029,7 +2639,69 @@ body[data-clips-route="recording-pill"] #root {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: transparent;
+  background: rgba(0, 0, 0, 0.42);
+  pointer-events: none;
+}
+
+.countdown-controls {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.countdown-control {
+  position: absolute;
+  top: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  margin: 0;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 50%;
+  background: rgba(10, 12, 16, 0.42);
+  color: #ffffff;
+  cursor: pointer;
+  pointer-events: auto;
+  backdrop-filter: blur(8px);
+  transform: translateY(-50%);
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.1s ease;
+}
+
+.countdown-control-cancel {
+  left: -232px;
+}
+
+.countdown-control-skip {
+  left: 168px;
+}
+
+.countdown-control:hover {
+  background: rgba(255, 255, 255, 0.92);
+  border-color: rgba(255, 255, 255, 0.95);
+  color: #0b0d12;
+}
+
+.countdown-control:active {
+  transform: translateY(-50%) scale(0.94);
+}
+
+.countdown-control:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.9);
+  outline-offset: 2px;
+}
+
+.countdown-number-wrap {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  transform: translate(-50%, -50%);
   pointer-events: none;
 }
 
@@ -2038,54 +2710,8 @@ body[data-clips-route="recording-pill"] #root {
   font-weight: 800;
   font-variant-numeric: tabular-nums;
   color: #ffffff;
-  -webkit-text-stroke: 1px rgba(17, 24, 39, 0.22);
-  text-shadow:
-    0 2px 4px rgba(0, 0, 0, 0.48),
-    0 12px 34px rgba(0, 0, 0, 0.36),
-    0 0 2px rgba(0, 0, 0, 0.72);
   animation: cd-pop 1s ease-out forwards;
   line-height: 1;
-}
-
-.countdown-hint {
-  position: fixed;
-  left: 50%;
-  bottom: 34px;
-  display: inline-flex;
-  align-items: center;
-  gap: 14px;
-  padding: 7px 10px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: var(--radius-pill);
-  background: rgba(10, 12, 16, 0.28);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.24);
-  color: rgba(255, 255, 255, 0.58);
-  font-size: 11px;
-  font-weight: 500;
-  line-height: 1;
-  transform: translateX(-50%);
-  backdrop-filter: blur(8px);
-}
-
-.countdown-hint span {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  white-space: nowrap;
-}
-
-.countdown-hint kbd {
-  min-width: 24px;
-  padding: 3px 5px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 5px;
-  background: rgba(255, 255, 255, 0.08);
-  color: rgba(255, 255, 255, 0.74);
-  font-family: inherit;
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1;
-  text-align: center;
 }
 
 @keyframes cd-pop {
@@ -2102,57 +2728,70 @@ body[data-clips-route="recording-pill"] #root {
     opacity: 1;
   }
   100% {
-    transform: scale(0.8);
-    opacity: 0;
+    transform: scale(1);
+    opacity: 1;
   }
 }
 
-/* ------------------------------------------------------------------------- */
-/* Overlay: finalizing spinner                                                */
-/* ------------------------------------------------------------------------- */
+.preparing-root {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
 
-/*
- * Full-screen transparent overlay shown after the user clicks Stop and
- * before the browser opens at /r/:id. The Tauri window is transparent +
- * decorations-less (see `show_finalizing` in lib.rs), so we paint a
- * compact card tucked into the bottom-left with a spinner and caption.
- * The window also has ignore_cursor_events(true), so clicks pass through
- * to whatever is beneath and the progress card stays out of the way.
- */
+.preparing-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  color: white;
+}
+
+.preparing-label {
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1;
+}
+
+.preparing-spinner {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 3px solid color-mix(in srgb, currentColor 18%, transparent);
+  border-top-color: currentColor;
+  animation: finalizing-spin 0.9s linear infinite;
+}
+
 .finalizing-root {
   position: fixed;
   inset: 0;
   display: flex;
   align-items: flex-end;
   justify-content: flex-start;
-  padding: 24px;
+  padding: 10px;
   background: transparent;
-  pointer-events: none;
 }
 
 .finalizing-card {
   display: grid;
-  grid-template-columns: 20px minmax(0, 1fr);
+  grid-template-columns: 20px minmax(0, 1fr) auto;
   align-items: center;
   gap: 7px 10px;
-  width: min(320px, calc(100vw - 48px));
+  width: 100%;
   padding: 12px 14px;
   border-radius: 16px;
   background: rgba(20, 22, 28, 0.94);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  box-shadow:
-    0 14px 40px rgba(0, 0, 0, 0.45),
-    0 2px 6px rgba(0, 0, 0, 0.3);
   color: white;
 }
 
-/*
- * CSS-only spinner — no dependency on @tabler/icons-react (the desktop
- * bundle doesn't pull that in). A ring with one highlighted quadrant is
- * rotated continuously.
- */
 .finalizing-spinner {
   width: 18px;
   height: 18px;
@@ -2160,6 +2799,20 @@ body[data-clips-route="recording-pill"] #root {
   border: 2px solid rgba(255, 255, 255, 0.18);
   border-top-color: #ffffff;
   animation: finalizing-spin 0.9s linear infinite;
+}
+
+.finalizing-status-icon {
+  width: 18px;
+  height: 18px;
+  stroke-width: 2.2;
+}
+
+.finalizing-status-icon-success {
+  color: #8ce99a;
+}
+
+.finalizing-status-icon-failed {
+  color: #ffb4a8;
 }
 
 @keyframes finalizing-spin {
@@ -2175,6 +2828,45 @@ body[data-clips-route="recording-pill"] #root {
   letter-spacing: 0.1px;
   color: white;
   text-align: left;
+}
+
+.finalizing-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.finalizing-action {
+  display: inline-flex;
+  width: 26px;
+  height: 26px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.64);
+  cursor: pointer;
+  transition:
+    color 140ms ease-out,
+    background-color 140ms ease-out;
+}
+
+.finalizing-action:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: white;
+}
+
+.finalizing-action:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.9);
+  outline-offset: 1px;
+}
+
+.finalizing-action svg {
+  width: 15px;
+  height: 15px;
+  stroke-width: 2;
 }
 
 .finalizing-progress {
@@ -2207,10 +2899,6 @@ body[data-clips-route="recording-pill"] #root {
     transform: translateX(250%);
   }
 }
-
-/* ------------------------------------------------------------------------- */
-/* Overlay: toolbar                                                           */
-/* ------------------------------------------------------------------------- */
 
 .toolbar-root {
   position: fixed;
@@ -2308,29 +2996,37 @@ body[data-clips-route="recording-pill"] #root {
 }
 
 .rec-pulse {
+  position: relative;
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: #ef4444;
-  box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6);
-  animation: rec-pulse 1.4s ease-out infinite;
+}
+
+.rec-pulse::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  border: 1px solid rgba(239, 68, 68, 0.6);
+  animation: rec-live-pulse 1.4s ease-out infinite;
+  pointer-events: none;
 }
 
 .rec-pulse-paused {
   background: #f59e0b;
-  animation: none;
-  box-shadow: none;
 }
 
-@keyframes rec-pulse {
-  0% {
-    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55);
-  }
-  70% {
-    box-shadow: 0 0 0 7px rgba(239, 68, 68, 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+.rec-pulse-paused::after {
+  animation: none;
+  opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rec-pulse::after {
+    animation: none;
+    opacity: 0.6;
+    transform: none;
   }
 }
 
@@ -2339,273 +3035,25 @@ body[data-clips-route="recording-pill"] #root {
   border-color: rgba(245, 158, 11, 0.35);
 }
 
-/* ------------------------------------------------------------------------- */
-/* Vertical Loom-style recording pill                                         */
-/* ------------------------------------------------------------------------- */
-
-.toolbar-v {
-  position: fixed;
-  left: var(--overlay-shadow-gutter);
-  top: var(--overlay-shadow-gutter);
-  width: 72px;
-  height: 150px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  /* Equal inset on all four sides from the pill edge to the buttons. */
-  padding: 10px;
-  overflow: hidden;
-  border-radius: 24px;
-  background: rgba(20, 22, 28, 0.94);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  user-select: none;
-  -webkit-user-select: none;
-  cursor: grab;
-  transition:
-    height 170ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    border-radius 170ms cubic-bezier(0.2, 0.8, 0.2, 1);
-}
-
-.toolbar-v:hover,
-.toolbar-v:focus-within {
-  height: 234px;
-  justify-content: flex-start;
-  border-radius: 26px;
-}
-
-.toolbar-v:active {
-  cursor: grabbing;
-}
-
-.toolbar-v-stop {
-  width: 30px;
-  height: 30px;
-  min-width: 30px;
-  min-height: 30px;
-  flex: 0 0 30px;
-  aspect-ratio: 1 / 1;
-  border-radius: 50%;
-  border: none;
-  /* orange-500 — a touch softer than the red-orange we had before. */
-  background: #f97316;
-  color: white;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-}
-
-.toolbar-v-stop:hover {
-  background: #ea580c;
-}
-
-.toolbar-v-stop:active {
-  transform: scale(0.94);
-}
-
-.toolbar-v-stop-square {
-  width: 14px;
-  height: 14px;
-  background: currentColor;
-  border-radius: 2px;
-  display: inline-block;
-}
-
-.toolbar-v-spinner {
-  animation: toolbar-v-spin 0.8s linear infinite;
-}
-
-@keyframes toolbar-v-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-.toolbar-v-time {
-  flex: 0 0 auto;
-  font-variant-numeric: tabular-nums;
-  font-size: 14px;
-  font-weight: 600;
-  color: white;
-  letter-spacing: 0.3px;
-}
-
-.toolbar-v-pause {
-  width: 30px;
-  height: 30px;
-  min-width: 30px;
-  min-height: 30px;
-  flex: 0 0 30px;
-  aspect-ratio: 1 / 1;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.08);
-  color: rgba(255, 255, 255, 0.9);
-  border: none;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-}
-
-.toolbar-v-pause:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: white;
-}
-
-.toolbar-v-hover-actions {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 8px;
-  height: 0;
-  margin-top: 0;
-  overflow: hidden;
-  opacity: 0;
-  transform: translateY(-6px);
-  pointer-events: none;
-  visibility: hidden;
-  transition:
-    height 170ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    margin-top 170ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    opacity 130ms ease-out,
-    transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1);
-}
-
-.toolbar-v:hover .toolbar-v-hover-actions,
-.toolbar-v:focus-within .toolbar-v-hover-actions {
-  height: 88px;
-  margin-top: 2px;
-  opacity: 1;
-  transform: translateY(0);
-  pointer-events: auto;
-  visibility: visible;
-}
-
-.toolbar-v-action {
-  width: 40px;
-  height: 40px;
-  min-width: 40px;
-  min-height: 40px;
-  flex: 0 0 40px;
-  aspect-ratio: 1 / 1;
-  border-radius: 999px;
-  border: none;
-  background: transparent;
-  color: rgba(255, 255, 255, 0.95);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  transition:
-    background-color 120ms ease-out,
-    color 120ms ease-out,
-    transform 120ms ease-out;
-}
-
-.toolbar-v-action:hover {
-  background: rgba(255, 255, 255, 0.12);
-  color: white;
-}
-
-.toolbar-v-action:active {
-  transform: scale(0.94);
-}
-
-.toolbar-v-action-danger:hover {
-  background: rgba(255, 255, 255, 0.14);
-}
-
-.toolbar-v-paused {
-  border-color: rgba(245, 158, 11, 0.35);
-}
-
-/* Pre-record state: the toolbar is visible during the bubble session so the
-   user can drag + position it before hitting Start. Buttons are disabled
-   (no recorder to drive yet). Greyed out + not-allowed cursor makes the
-   "not yet" affordance obvious. */
-.toolbar-v-disabled .toolbar-v-stop,
-.toolbar-v-disabled .toolbar-v-pause,
-.toolbar-v-disabled .toolbar-v-action {
-  background: rgba(255, 255, 255, 0.06);
-  color: rgba(255, 255, 255, 0.35);
-  cursor: not-allowed;
-  pointer-events: auto;
-}
-.toolbar-v-disabled .toolbar-v-stop:hover,
-.toolbar-v-disabled .toolbar-v-pause:hover,
-.toolbar-v-disabled .toolbar-v-action:hover {
-  background: rgba(255, 255, 255, 0.06);
-  color: rgba(255, 255, 255, 0.35);
-}
-.toolbar-v-stop:disabled,
-.toolbar-v-pause:disabled,
-.toolbar-v-action:disabled {
-  cursor: not-allowed;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .toolbar-v,
-  .toolbar-v-hover-actions,
-  .toolbar-v-action {
-    transition: none;
-  }
-}
-
-/* ------------------------------------------------------------------------- */
-/* Overlay: camera bubble                                                     */
-/* ------------------------------------------------------------------------- */
-
-/*
- * The Tauri bubble window is sized (in Rust) to exactly the circle diameter
- * PLUS a `--bubble-controls-budget` strip at the bottom, so the hover pill
- * has real window real-estate to render into. Everything outside window
- * bounds is invisible no matter the CSS `overflow` — you can't paint where
- * the OS hasn't given you pixels — so we build in the budget up front.
- *
- *   ┌──────────────┐
- *   │ .bubble-root │  ← circle (drag region, data-tauri-drag-region)
- *   │     ◯        │    Canvas lives here with pointer-events: none so
- *   │              │    drags reach the drag-region parent.
- *   └──────────────┘
- *   ┌──────────────┐
- *   │  ·  ●        │  ← .bubble-controls pill (hover-faded)
- *   └──────────────┘
- */
 .bubble-wrapper {
   position: fixed;
   inset: var(--overlay-shadow-gutter);
   display: flex;
-  flex-direction: column;
+  flex-direction: column-reverse;
   align-items: center;
-  /* Transparent background — the Tauri window is `transparent: true`,
-     so the circular camera surface below paints through. */
   background: transparent;
   user-select: none;
   -webkit-user-select: none;
 }
 
 .bubble-root {
-  /* Circle fills the top of the wrapper. We use `flex: 0 0 auto` + a
-     1:1 aspect-ratio so the circle is always square regardless of the
-     actual window height (which includes the controls budget). */
   flex: 0 0 auto;
   aspect-ratio: 1 / 1;
-  /* Width = 100% of wrapper → the wrapper is exactly bubble-diameter
-     wide (Rust sizes the window that way). */
   width: 100%;
   border-radius: 50%;
   overflow: hidden;
   background: #000;
-  /* Position context for absolute children (close X, canvas). */
   position: relative;
-  /* Cursor hint — the drag region is here. */
   cursor: grab;
 }
 
@@ -2622,12 +3070,9 @@ body[data-clips-route="recording-pill"] #root {
   object-fit: cover;
   border-radius: 50%;
   transform: scaleX(-1); /* Mirror — feels more natural for selfie view. */
+  /* compositing-ok: live <video> is composited regardless. */
   will-change: transform, opacity;
   backface-visibility: hidden;
-  /* CRITICAL: clicks MUST pass through the canvas to the
-     `data-tauri-drag-region` parent. Without this, the canvas swallows
-     mousedown and the bubble can't be dragged — cursor shows the grab
-     affordance but the window never moves. */
   pointer-events: none;
 }
 
@@ -2656,11 +3101,8 @@ body[data-clips-route="recording-pill"] #root {
   padding: 12px;
 }
 
-/* Hover controls — close X + size-toggle pill. */
-
 .bubble-close,
 .bubble-controls {
-  /* Snappy fade — per Steve's 150ms-max rule for decorative transitions. */
   opacity: 0;
   pointer-events: none;
   transition: opacity 150ms ease-out;
@@ -2669,14 +3111,9 @@ body[data-clips-route="recording-pill"] #root {
 .bubble-close.is-visible,
 .bubble-controls.is-visible {
   opacity: 1;
-  /* Close button and pill MUST receive clicks — they sit over the
-     drag region / inside the hover wrapper but must not be treated as
-     drag surfaces. */
   pointer-events: auto;
 }
 
-/* Top-right X close button. Small circle with a subtle dark backdrop so it
-   reads against any camera feed (light or dark subjects). */
 .bubble-close {
   position: absolute;
   top: 6px;
@@ -2702,15 +3139,9 @@ body[data-clips-route="recording-pill"] #root {
   color: white;
 }
 
-/* Size-control pill — lives in the bottom strip of the wrapper (beneath
-   the circle). Centered horizontally, fades in on hover, matches Loom's
-   visual weight. Because it's a sibling of `.bubble-root` (not a child),
-   the border-radius clipping on the circle can't eat it. */
 .bubble-controls {
-  /* `flex: 0 0 auto` + margin-top creates the small gap between the
-     circle and the pill. */
   flex: 0 0 auto;
-  margin-top: 8px;
+  margin-bottom: 8px;
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -2721,16 +3152,11 @@ body[data-clips-route="recording-pill"] #root {
   -webkit-backdrop-filter: blur(14px);
   border: 1px solid rgba(255, 255, 255, 0.08);
   z-index: 3;
-  /* Cursor over the pill should not be a grab cursor (we're not dragging
-     the bubble when clicking its controls). */
   cursor: default;
   user-select: none;
   -webkit-user-select: none;
 }
 
-/* Dot buttons — filled circles sized to convey Small vs Medium at a glance,
-   matching Loom's tiny / slightly-larger dots. Active dot gets a white ring
-   so the current size is always legible. */
 .bubble-dot {
   border: none;
   background: rgba(255, 255, 255, 0.55);
@@ -2741,9 +3167,7 @@ body[data-clips-route="recording-pill"] #root {
   justify-content: center;
   flex-shrink: 0;
   border-radius: 50%;
-  transition:
-    background 120ms,
-    box-shadow 120ms;
+  transition: background 120ms;
 }
 
 .bubble-control-button {
@@ -2775,7 +3199,6 @@ body[data-clips-route="recording-pill"] #root {
 
 .bubble-dot.is-active {
   background: white;
-  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.25);
 }
 
 .bubble-dot-small {
@@ -2788,10 +3211,6 @@ body[data-clips-route="recording-pill"] #root {
   height: 16px;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Inline sign-in form                                                        */
-/* ------------------------------------------------------------------------- */
-
 .signin {
   display: flex;
   flex-direction: column;
@@ -2799,15 +3218,48 @@ body[data-clips-route="recording-pill"] #root {
   padding: 4px 2px 0;
 }
 
-.signin-title {
-  font-size: 13px;
-  font-weight: 600;
+.signin-mark {
+  display: block;
+  width: 26px;
+  height: auto;
+  margin: 2px auto 8px;
   color: var(--fg);
+}
+
+.signin-title {
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--fg);
+  text-align: center;
+  margin-bottom: 3px;
+}
+
+.signin-subtitle {
+  color: var(--fg-muted);
+  font-size: 12px;
   text-align: center;
   margin-bottom: 2px;
 }
 
-.signin input {
+.signin-success {
+  align-items: center;
+  text-align: center;
+}
+
+.signin-success-copy {
+  color: var(--fg-muted);
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 0;
+}
+
+.signin-success-copy strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.signin input:not([data-tw-surface] *) {
   width: 100%;
   padding: 10px 12px;
   border: 1px solid var(--border-strong);
@@ -2818,7 +3270,7 @@ body[data-clips-route="recording-pill"] #root {
   outline: none;
 }
 
-.signin input:focus {
+.signin input:not([data-tw-surface] *):focus {
   border-color: var(--brand);
   box-shadow: 0 0 0 3px var(--brand-ring);
 }
@@ -2839,6 +3291,16 @@ body[data-clips-route="recording-pill"] #root {
   font-size: 11px;
   text-align: center;
   cursor: pointer;
+}
+
+.signin-mode-link {
+  color: var(--fg-muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.signin-mode-link:hover {
+  color: var(--fg);
 }
 
 .signin-divider {
@@ -2881,130 +3343,76 @@ body[data-clips-route="recording-pill"] #root {
   border-color: var(--border-strong, var(--border));
 }
 
-/* --- Pending Google sign-in state ---------------------------------------- */
-.signin-pending {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  padding: 24px 16px;
-  flex: 1;
-}
-
-.signin-pending-spinner {
-  width: 24px;
-  height: 24px;
-  border: 2.5px solid var(--border);
-  border-top-color: var(--fg-muted, #888);
-  border-radius: 50%;
-  animation: signin-spin 0.8s linear infinite;
-}
-
-@keyframes signin-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-.signin-pending-text {
-  font-size: 13px;
-  color: var(--fg-muted, #888);
-  margin: 0;
-  text-align: center;
-}
-
-.signin-pending-cancel {
-  font-size: 12px;
-  color: var(--fg-muted, #888);
-  background: none;
-  border: none;
-  cursor: pointer;
-  text-decoration: underline;
-  padding: 2px 4px;
-}
-
-.signin-pending-cancel:hover {
-  color: var(--fg);
-}
-
-/* --- Update banner -------------------------------------------------------
- * Slots into the top of the popover when an update is in flight or ready.
- * Two visual states:
- *  - pending: subtle inline row, just keeps the user informed.
- *  - ready:   accent color + actions (Later / Restart) since clicking
- *             Restart is the thing we actually want them to do.
- */
 .update-banner {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 0 12px 8px;
-  padding: 8px 10px;
+  margin: 0;
+  min-height: 42px;
+  padding: 8px;
   border-radius: 8px;
   font-size: 12px;
   line-height: 1.3;
 }
 
+.update-banner-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+}
+
+.update-banner-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.update-banner-copy > h5 {
+  margin: 0;
+  line-height: 1.2;
+}
+
+.update-banner-description {
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
 .update-banner--pending {
-  background: var(--surface);
-  color: var(--fg-muted);
-  border: 1px solid var(--border);
+  border-color: hsl(var(--ui-info) / 0.3);
+  background: hsl(var(--ui-info) / 0.07);
+  color: hsl(var(--ui-info));
 }
 
 .update-banner--ready {
-  background: var(--surface-strong);
+  border-color: var(--border);
+  background: var(--surface);
   color: var(--fg);
-  border: 1px solid var(--border-strong, var(--border));
-  flex-wrap: wrap;
 }
 
 .update-banner--error {
-  background: color-mix(in srgb, var(--error, #dc2626) 10%, transparent);
-  color: var(--error, #dc2626);
-  border: 1px solid color-mix(in srgb, var(--error, #dc2626) 40%, transparent);
-  flex-wrap: wrap;
-}
-
-.update-banner-text {
-  flex: 1;
-  min-width: 0;
+  border-color: hsl(var(--ui-destructive) / 0.35);
+  background: hsl(var(--ui-destructive) / 0.07);
 }
 
 .update-banner-actions {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  margin-left: auto;
+  gap: 4px;
+  flex: 0 0 auto;
+  margin-inline-start: 2px;
 }
 
-.update-banner-btn {
-  padding: 4px 10px;
-  border-radius: 6px;
-  border: 1px solid transparent;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
+.update-banner--error {
+  align-items: flex-start;
 }
 
-.update-banner-btn--ghost {
-  background: transparent;
-  color: var(--fg-muted);
-  border-color: var(--border);
-}
-
-.update-banner-btn--ghost:hover {
-  background: var(--surface-hover, var(--surface));
-  color: var(--fg);
-}
-
-.update-banner-btn--primary {
-  background: var(--brand);
-  color: var(--bg);
-}
-
-.update-banner-btn--primary:hover {
-  background: var(--brand-hover, var(--brand));
+.update-banner--error .update-banner-actions {
+  align-self: center;
 }
 
 .update-spinner {
@@ -3020,127 +3428,21 @@ body[data-clips-route="recording-pill"] #root {
   }
 }
 
-/* ------------------------------------------------------------------------- */
-/* Overlay: onboarding                                                        */
-/* ------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .mode-toggle button,
+  .bottom-btn {
+    transition: none;
+  }
 
-.onboarding-root {
-  position: fixed;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: #0f1115;
-  color: #f1f5f9;
+  .mode-toggle button:active,
+  .bottom-btn:active {
+    transform: none;
+  }
+
+  .update-banner .animate-spin {
+    animation: none;
+  }
 }
-
-.onboarding-card {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 20px;
-  padding: 40px 36px;
-  max-width: 380px;
-  width: 100%;
-}
-
-.onboarding-title {
-  font-size: 22px;
-  font-weight: 700;
-  color: white;
-  margin: 0;
-  letter-spacing: -0.3px;
-}
-
-.onboarding-subtitle {
-  font-size: 14px;
-  color: #94a3b8;
-  margin: -8px 0 0;
-}
-
-.onboarding-features {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  width: 100%;
-}
-
-.onboarding-feature {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  padding: 14px 16px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 12px;
-  cursor: pointer;
-  user-select: none;
-}
-
-.onboarding-feature:hover {
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.onboarding-checkbox {
-  width: 18px;
-  height: 18px;
-  margin: 1px 0 0;
-  accent-color: #16a34a;
-  cursor: pointer;
-  flex-shrink: 0;
-}
-
-.onboarding-feature-text {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.onboarding-feature-name {
-  font-size: 14px;
-  font-weight: 600;
-  color: white;
-}
-
-.onboarding-feature-desc {
-  font-size: 12px;
-  color: #94a3b8;
-  line-height: 1.4;
-}
-
-.onboarding-cta {
-  width: 100%;
-  border: none;
-  border-radius: 12px;
-  padding: 12px 16px;
-  background: #f4f4f5;
-  color: #0f1115;
-  font-size: 14px;
-  font-weight: 600;
-  cursor: pointer;
-  height: 44px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  margin-top: 4px;
-}
-
-.onboarding-cta:hover {
-  background: #e4e4e7;
-}
-
-.onboarding-cta:active {
-  transform: translateY(1px);
-}
-
-.onboarding-cta:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-/* ------------------------------------------------------------------------- */
-/* Overlay: meeting notification                                              */
-/* ------------------------------------------------------------------------- */
 
 .meeting-notification-root {
   position: fixed;
@@ -3148,7 +3450,7 @@ body[data-clips-route="recording-pill"] #root {
   display: flex;
   align-items: flex-start;
   justify-content: flex-end;
-  padding: 8px;
+  padding: 12px 32px;
   background: transparent;
   pointer-events: none;
 }
@@ -3157,37 +3459,17 @@ body[data-clips-route="recording-pill"] #root {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   padding: 12px 14px;
   border-radius: 14px;
   background: rgba(20, 22, 28, 0.94);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  box-shadow:
-    0 10px 30px rgba(0, 0, 0, 0.35),
-    0 2px 6px rgba(0, 0, 0, 0.3);
   color: white;
   pointer-events: auto;
-  min-width: 280px;
-  max-width: 320px;
-}
-
-.meeting-notification-bar {
-  width: 3px;
-  height: 40px;
-  border-radius: 2px;
-  flex-shrink: 0;
-}
-
-.meeting-notification-bar-calendar {
-  background: #16a34a;
-}
-
-.meeting-notification-bar-adhoc {
-  background: transparent;
-  border-left: 3px dashed #94a3b8;
-  width: 3px;
+  min-width: 320px;
+  max-width: 440px;
 }
 
 .meeting-notification-content {
@@ -3196,6 +3478,7 @@ body[data-clips-route="recording-pill"] #root {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  padding-right: 4px;
 }
 
 .meeting-notification-title {
@@ -3212,51 +3495,140 @@ body[data-clips-route="recording-pill"] #root {
   color: rgba(255, 255, 255, 0.55);
 }
 
-.meeting-notification-btn {
-  border: none;
-  border-radius: 8px;
-  padding: 6px 12px;
-  background: rgba(255, 255, 255, 0.1);
-  color: white;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  white-space: nowrap;
+.meeting-notification-split {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
   flex-shrink: 0;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  overflow: visible;
+  background: rgba(255, 255, 255, 0.04);
 }
 
-.meeting-notification-btn:hover {
-  background: rgba(255, 255, 255, 0.16);
+.meeting-notification-split-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: none;
+  background: transparent;
+  color: white;
+  padding: 6px 10px;
+  cursor: pointer;
+  text-align: left;
+  min-height: 40px;
 }
 
-.meeting-notification-btn:active {
-  transform: scale(0.96);
+.meeting-notification-split-main:hover {
+  background: rgba(255, 255, 255, 0.06);
 }
 
-.meeting-notification-btn:disabled {
-  opacity: 0.6;
+.meeting-notification-split-main:disabled {
+  opacity: 0.65;
   cursor: progress;
 }
 
-.meeting-notification-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
+.meeting-notification-split-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  line-height: 1.15;
 }
 
-.meeting-notification-btn-secondary {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 6px 8px;
-  background: rgba(255, 255, 255, 0.06);
-  color: rgba(255, 255, 255, 0.85);
-}
-
-.meeting-notification-btn-secondary:hover {
-  background: rgba(255, 255, 255, 0.12);
+.meeting-notification-split-primary {
+  font-size: 12px;
+  font-weight: 600;
   color: white;
+  white-space: nowrap;
+}
+
+.meeting-notification-split-secondary {
+  font-size: 10px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.55);
+  white-space: nowrap;
+}
+
+.meeting-notification-split-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  border: none;
+  border-left: 1px solid rgba(255, 255, 255, 0.12);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.75);
+  cursor: pointer;
+  border-radius: 0 10px 10px 0;
+}
+
+.meeting-notification-split-chevron:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: white;
+}
+
+.meeting-notification-provider {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: white;
+}
+
+.meeting-notification-provider-zoom {
+  background: #2d8cff;
+}
+
+.meeting-notification-provider-meet {
+  background: #34a853;
+}
+
+.meeting-notification-provider-teams {
+  background: #6264a7;
+}
+
+.meeting-notification-provider-other {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.meeting-notification-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 160px;
+  padding: 4px;
+  border-radius: 10px;
+  background: rgba(24, 26, 32, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.meeting-notification-menu-item {
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.9);
+  text-align: left;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 8px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.meeting-notification-menu-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.meeting-notification-menu-item:disabled {
+  opacity: 0.5;
+  cursor: progress;
 }
 
 .meeting-notification-error {
@@ -3270,29 +3642,26 @@ body[data-clips-route="recording-pill"] #root {
 
 .meeting-notification-close {
   position: absolute;
-  top: 6px;
-  right: 6px;
-  width: 18px;
-  height: 18px;
+  top: -8px;
+  left: -8px;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
-  border: none;
-  background: rgba(255, 255, 255, 0.1);
-  color: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(28, 30, 38, 0.98);
+  color: rgba(255, 255, 255, 0.75);
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
+  z-index: 6;
 }
 
 .meeting-notification-close:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: rgba(48, 50, 60, 0.98);
   color: white;
 }
-
-/* ------------------------------------------------------------------------- */
-/* Overlay: meeting nub                                                       */
-/* ------------------------------------------------------------------------- */
 
 .meeting-nub-root {
   position: fixed;
@@ -3317,18 +3686,34 @@ body[data-clips-route="recording-pill"] #root {
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   border: 1px solid rgba(255, 255, 255, 0.06);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
   cursor: pointer;
   color: white;
 }
 
 .meeting-nub-dot {
+  position: relative;
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: #16a34a;
-  box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.55);
-  animation: rec-pulse 1.4s ease-out infinite;
+}
+
+.meeting-nub-dot::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  border: 1px solid rgba(22, 163, 74, 0.55);
+  animation: rec-live-pulse 1.4s ease-out infinite;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .meeting-nub-dot::after {
+    animation: none;
+    opacity: 0.6;
+    transform: none;
+  }
 }
 
 .meeting-nub-initial {
@@ -3359,61 +3744,17 @@ body[data-clips-route="recording-pill"] #root {
   cursor: grabbing;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Overlay: flow bar (voice dictation)                                        */
-/* ------------------------------------------------------------------------- */
-
-/* Wispr Flow-style dictation pill: small capsule anchored to the bottom
-   of its (transparent) overlay window. The window itself is positioned
-   bottom-center on the primary display by show_flow_bar in Rust. We
-   stack the live transcript above the pill in a column so the user sees
-   the words being recognized in real time. */
 .flow-bar-root {
   position: fixed;
-  inset: var(--overlay-shadow-gutter);
+  inset: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: flex-end;
-  padding-bottom: 8px;
   gap: 6px;
+  padding-bottom: 8px;
   background: transparent;
   pointer-events: none;
-}
-
-/* Live partial-transcript chip floating above the pill. Same dark glass
-   look as the pill, smaller, only there when transcript is non-empty.
-   Caps width and clips from the left so the newest words stay visible
-   when a long sentence reaches the edge of the transparent window. */
-.flow-bar-transcript {
-  max-width: 360px;
-  padding: 4px 10px;
-  border-radius: 12px;
-  background: rgba(18, 18, 20, 0.92);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  color: rgba(255, 255, 255, 0.92);
-  font-size: 12px;
-  line-height: 1.35;
-  text-align: left;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  /* RTL on the OUTER box so overflow clips from the visual left
-     (older text), keeping the newest characters pinned to the right.
-     `unicode-bidi: plaintext` on the inner <bdi> makes the actual
-     transcript text follow its own (LTR) direction — without it,
-     bidi reordering pushes the last few Latin characters past the
-     visible right edge and they get clipped a few chars short. */
-  direction: rtl;
-  pointer-events: none;
-  animation: flow-bar-in 100ms ease-out;
-}
-
-.flow-bar-transcript > bdi {
-  unicode-bidi: plaintext;
-  direction: ltr;
 }
 
 .flow-bar {
@@ -3422,26 +3763,29 @@ body[data-clips-route="recording-pill"] #root {
   justify-content: center;
   height: 32px;
   border-radius: 16px;
-  background: rgba(18, 18, 20, 0.92);
+  background: var(--pill-chrome);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  color: white;
+  border: 1px solid color-mix(in srgb, var(--pill-on-chrome) 6%, transparent);
+  color: var(--pill-on-chrome);
   pointer-events: auto;
-  /* Subtle fade-in so the pill doesn't hard-pop on appear. */
   animation: flow-bar-in 140ms ease-out;
-  /* Fade out to opacity 0 when state goes idle (after Fn release).
-     Keeping the pill in the DOM means the transcript chip above
-     doesn't reflow when the pill "goes away" — important for the
-     linger UX where the chip stays put while the pill dissolves. */
   transition: opacity 220ms ease-out;
 }
 
-/* When the dictation engine reports idle (e.g. mid-linger after Fn
-   release on the browser path), fade the pill out without unmounting
-   it. The canvas keeps its last-frame so the user sees the waveform
-   smoothly fade rather than pop into nothing. Pointer-events go off
-   so the now-invisible chip can't catch clicks. */
+.flow-bar-listening {
+  position: relative;
+  width: 112px;
+  overflow: hidden;
+  transition:
+    width 160ms ease-out,
+    opacity 220ms ease-out;
+}
+
+.flow-bar-listening:hover {
+  width: 148px;
+}
+
 .flow-bar-idle {
   opacity: 0;
   pointer-events: none;
@@ -3452,10 +3796,134 @@ body[data-clips-route="recording-pill"] #root {
   display: flex;
   align-items: center;
   justify-content: center;
+  transition:
+    opacity 120ms ease-out,
+    transform 120ms ease-out,
+    padding 120ms ease-out;
 }
 
-.flow-bar-canvas {
-  display: block;
+.flow-bar-listening:hover .flow-bar-recording {
+  padding-inline: 0;
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(0.82);
+}
+
+.flow-bar-controls {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(0.92);
+  transition:
+    opacity 120ms ease-out,
+    transform 120ms ease-out;
+}
+
+.flow-bar-listening:hover .flow-bar-controls {
+  opacity: 1;
+  pointer-events: auto;
+  transform: scale(1);
+}
+
+.flow-bar-time {
+  min-width: 38px;
+  color: var(--pill-q-ink);
+  font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+  font-size: 14px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  text-align: center;
+}
+
+.flow-bar-control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  margin: 0;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--pill-on-chrome) 12%, transparent);
+  border-radius: 50%;
+  background: var(--pill-soft);
+  color: var(--pill-q-ink);
+  cursor: pointer;
+  pointer-events: auto;
+  transition:
+    background 100ms ease-out,
+    color 100ms ease-out;
+}
+
+.flow-bar-control:hover {
+  background: color-mix(in srgb, var(--pill-on-chrome) 28%, transparent);
+  color: var(--pill-on-chrome);
+}
+
+.flow-bar-control:active {
+  background: color-mix(in srgb, var(--pill-on-chrome) 36%, transparent);
+}
+
+.flow-bar-accept {
+  border-color: var(--status-ok);
+  background: var(--status-ok);
+  color: var(--pill-on-chrome);
+}
+
+.flow-bar-accept:hover {
+  background: var(--status-ok);
+  filter: brightness(1.08);
+}
+
+.flow-bar-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  width: 100%;
+  padding: 0 2px;
+}
+
+.flow-bar-notice-dot {
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--status-warn);
+}
+
+.flow-bar-notice-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.flow-bar-notice-copy strong,
+.flow-bar-notice-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-bar-notice-copy strong {
+  color: var(--pill-q-ink);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.flow-bar-notice-copy span {
+  color: var(--pill-ghost-ink);
+  font-size: 11px;
+}
+
+.flow-bar-meter {
+  height: 18px;
 }
 
 .flow-bar-processing {
@@ -3465,10 +3933,29 @@ body[data-clips-route="recording-pill"] #root {
   justify-content: center;
 }
 
+.flow-bar-complete {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 14px;
+  color: var(--pill-q-ink);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.flow-bar-copied {
+  width: 260px;
+  min-height: 48px;
+  height: auto;
+  padding: 8px 12px;
+  border-radius: 14px;
+  justify-content: flex-start;
+}
+
 .flow-bar-shimmer {
   font-size: 12px;
   font-weight: 500;
-  color: rgba(255, 255, 255, 0.85);
+  color: var(--pill-q-ink);
   letter-spacing: 0.1px;
   animation: flow-shimmer 1.2s ease-in-out infinite;
 }
@@ -3476,51 +3963,46 @@ body[data-clips-route="recording-pill"] #root {
 .flow-bar-error {
   font-size: 12px;
   font-weight: 500;
-  color: #fecaca;
+  color: var(--status-warn);
 }
 
-/* Right-edge cancel — subtle monochrome chip, only there if the user
-   needs it. Reads as a quiet utility affordance, not an alarm. Hover
-   ramps up so the button still registers as clickable. */
 .flow-bar-cancel {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 18px;
   height: 18px;
-  /* Tight against the right edge — the chip should feel like it lives
-     at the pill's perimeter, not inset. Vertical centering is automatic
-     via flex (pill 32px ÷ chip 18px → 7px above/below). */
   margin: 0 4px 0 6px;
   padding: 0;
   border: none;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.12);
-  color: rgba(255, 255, 255, 0.6);
+  background: var(--pill-soft);
+  color: var(--pill-ghost-ink);
   cursor: pointer;
-  /* Override the root's `pointer-events: none` so the click registers. */
   pointer-events: auto;
   transition:
     background 100ms ease-out,
     color 100ms ease-out;
 }
 
+.flow-bar-controls .flow-bar-cancel {
+  width: 30px;
+  height: 30px;
+  margin: 0;
+}
+
 .flow-bar-cancel:hover {
-  background: rgba(255, 255, 255, 0.22);
-  color: rgba(255, 255, 255, 0.95);
+  background: color-mix(in srgb, var(--pill-on-chrome) 22%, transparent);
+  color: var(--pill-on-chrome);
 }
 
 .flow-bar-cancel:active {
-  background: rgba(255, 255, 255, 0.3);
+  background: color-mix(in srgb, var(--pill-on-chrome) 30%, transparent);
 }
 
 .flow-bar-cancel svg {
   display: block;
 }
-
-/* ------------------------------------------------------------------------- */
-/* Overlay: private screen region guides                                      */
-/* ------------------------------------------------------------------------- */
 
 .region-guides-layer,
 .region-guides-editor {
@@ -3539,18 +4021,32 @@ body[data-clips-route="recording-pill"] #root {
   cursor: crosshair;
   user-select: none;
   background: rgba(0, 0, 0, 0.015);
+  isolation: isolate;
   touch-action: none;
+}
+
+.region-guide-selection-mask {
+  position: absolute;
+  z-index: 0;
+  box-sizing: border-box;
+  /* guard:allow-raw-color — selection bounds need fixed contrast over arbitrary captured pixels. */
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  /* guard:allow-raw-color — selection fill is a capture-surface affordance, not app chrome. */
+  background: rgba(255, 255, 255, 0.035);
+  /* The spread creates one cheap, click-through cutout for the selected area. */
+  /* guard:allow-raw-color — dimming must remain legible over light and dark desktop content. */
+  box-shadow: 0 0 0 100vmax rgba(5, 8, 14, 0.64);
+  pointer-events: none;
 }
 
 .region-guide-rect {
   position: absolute;
+  z-index: 1;
+  box-sizing: border-box;
   border: 1.5px solid rgba(255, 255, 255, 0.62);
   border-radius: 7px;
   background: rgba(255, 255, 255, 0.018);
-  box-shadow:
-    0 0 120px 42px rgba(0, 0, 0, 0.075),
-    inset 0 0 34px rgba(0, 0, 0, 0.06),
-    0 0 0 1px rgba(0, 0, 0, 0.12);
 }
 
 .region-guide-rect-editable {
@@ -3561,26 +4057,43 @@ body[data-clips-route="recording-pill"] #root {
 
 .region-guide-rect-editable:hover,
 .region-guide-rect-editable.selected {
-  border-color: rgba(255, 255, 255, 0.92);
+  border-width: 2px;
+  /* guard:allow-raw-color — selected bounds need fixed contrast over arbitrary captured pixels. */
+  border-color: rgba(255, 255, 255, 0.98);
+}
+
+.region-guide-rect-editable.selected {
   box-shadow:
-    0 0 150px 50px rgba(0, 0, 0, 0.105),
-    inset 0 0 36px rgba(0, 0, 0, 0.08),
-    0 0 0 1px rgba(0, 0, 0, 0.2);
+    /* guard:allow-raw-color — selected bounds need fixed contrast over arbitrary captured pixels. */
+    0 0 0 1px rgba(8, 11, 18, 0.92),
+    /* guard:allow-raw-color — selected bounds need fixed contrast over arbitrary captured pixels. */
+    0 0 0 4px rgba(255, 255, 255, 0.72);
 }
 
 .region-guide-rect-editable:focus-visible {
   outline: none;
+  /* guard:allow-raw-color — focused bounds need fixed contrast over arbitrary captured pixels. */
   border-color: rgba(255, 255, 255, 0.98);
   box-shadow:
-    0 0 0 2px rgba(15, 23, 42, 0.5),
-    0 0 150px 50px rgba(0, 0, 0, 0.12),
-    inset 0 0 36px rgba(0, 0, 0, 0.08);
+    /* guard:allow-raw-color — focused bounds need fixed contrast over arbitrary captured pixels. */
+    0 0 0 1px rgba(8, 11, 18, 0.92),
+    /* guard:allow-raw-color — focused bounds need fixed contrast over arbitrary captured pixels. */
+    0 0 0 4px rgba(255, 255, 255, 0.72);
 }
 
 .region-guide-rect-draft {
+  z-index: 2;
   border-style: dashed;
-  border-color: rgba(255, 255, 255, 0.86);
+  border-width: 2px;
+  /* guard:allow-raw-color — draft bounds need fixed contrast over arbitrary captured pixels. */
+  border-color: rgba(255, 255, 255, 0.98);
+  /* guard:allow-raw-color — draft fill is a capture-surface affordance, not app chrome. */
   background: rgba(255, 255, 255, 0.035);
+  box-shadow:
+    /* guard:allow-raw-color — draft bounds need fixed contrast over arbitrary captured pixels. */
+    0 0 0 1px rgba(8, 11, 18, 0.92),
+    /* guard:allow-raw-color — draft bounds need fixed contrast over arbitrary captured pixels. */
+    0 0 0 4px rgba(255, 255, 255, 0.58);
 }
 
 .region-guide-handle {
@@ -3588,12 +4101,9 @@ body[data-clips-route="recording-pill"] #root {
   z-index: 2;
   width: 12px;
   height: 12px;
-  border: 1px solid rgba(15, 23, 42, 0.38);
+  border: 1px solid rgba(23, 23, 23, 0.38);
   border-radius: 4px;
   background: rgba(255, 255, 255, 0.96);
-  box-shadow:
-    0 3px 12px rgba(0, 0, 0, 0.18),
-    0 0 0 1px rgba(255, 255, 255, 0.35);
 }
 
 .region-guide-handle-nw {
@@ -3632,21 +4142,24 @@ body[data-clips-route="recording-pill"] #root {
   display: flex;
   align-items: center;
   gap: 12px;
-  max-width: min(760px, calc(100vw - 36px));
+  width: min(760px, calc(100vw - 36px));
+  min-height: 48px;
+  box-sizing: border-box;
   padding: 9px 10px 9px 12px;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 12px;
   background: rgba(15, 17, 21, 0.74);
   color: #f8fafc;
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.22);
   transform: translateX(-50%);
   backdrop-filter: blur(18px);
+  pointer-events: auto;
 }
 
 .region-guide-editor-title {
   display: inline-flex;
   align-items: center;
   gap: 7px;
+  flex: 1 1 auto;
   min-width: 0;
   font-size: 12px;
   font-weight: 700;
@@ -3663,6 +4176,7 @@ body[data-clips-route="recording-pill"] #root {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex: 0 0 auto;
 }
 
 .region-guide-editor-button,
@@ -3720,12 +4234,26 @@ body[data-clips-route="recording-pill"] #root {
 }
 
 .region-guide-editor-message {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 12px;
+  max-width: min(260px, calc(100vw - 60px));
   min-width: 78px;
+  overflow: hidden;
   color: rgba(248, 250, 252, 0.68);
   font-size: 11px;
   font-weight: 600;
   text-align: right;
+  text-overflow: ellipsis;
   white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.region-guide-editor-message.is-visible {
+  opacity: 1;
+  visibility: visible;
 }
 
 .region-guide-editor-hint {
@@ -3733,16 +4261,59 @@ body[data-clips-route="recording-pill"] #root {
   left: 50%;
   bottom: 18px;
   z-index: 10;
-  max-width: min(420px, calc(100vw - 36px));
+  width: min(520px, calc(100vw - 36px));
+  box-sizing: border-box;
   padding: 7px 10px;
   border-radius: 999px;
   background: rgba(15, 17, 21, 0.6);
   color: rgba(248, 250, 252, 0.76);
   font-size: 12px;
   font-weight: 600;
+  line-height: 1.3;
   text-align: center;
   transform: translateX(-50%);
   backdrop-filter: blur(14px);
+  pointer-events: none;
+}
+
+@media (max-width: 640px) {
+  .region-guide-editor-bar {
+    gap: 8px;
+    padding-right: 8px;
+    padding-left: 10px;
+  }
+
+  .region-guide-editor-count {
+    display: none;
+  }
+
+  .region-guide-editor-button {
+    min-width: auto;
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+}
+
+.region-record-border-layer {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.region-record-border-frame {
+  position: absolute;
+  box-sizing: border-box;
+  border-radius: 5px;
+  box-shadow:
+    /* guard:allow-raw-color — recording frame uses fixed capture-safe contrast. */
+    0 0 0 1px rgba(255, 255, 255, 0.96),
+    /* guard:allow-raw-color — recording frame uses fixed capture-safe contrast. */
+    0 0 0 3px rgba(220, 38, 38, 0.98),
+    /* guard:allow-raw-color — recording frame uses fixed capture-safe contrast. */
+    0 0 0 6px rgba(17, 24, 39, 0.84);
 }
 
 @keyframes flow-bar-in {
@@ -3768,16 +4339,12 @@ body[data-clips-route="recording-pill"] #root {
   }
 }
 
-/* ------------------------------------------------------------------------- */
-/* Overlay: recording pill                                                    */
-/* ------------------------------------------------------------------------- */
-
 .pill-outer {
   display: flex;
   height: 100%;
   width: 100%;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: center;
 }
 
 .pill-inner {
@@ -3787,20 +4354,44 @@ body[data-clips-route="recording-pill"] #root {
   height: 100%;
   width: 100%;
   border-radius: 16px;
-  background: rgba(24, 24, 27, 0.95);
+  background: rgba(26, 26, 26, 0.95);
   color: white;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1);
+  cursor: grab;
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
 }
 
-/* Collapsed (not expanded). Shrinks to dot + waveform; controls revealed via
-   CSS :hover which works at the WebKit level even when the app is unfocused. */
+.pill-inner:active {
+  cursor: grabbing;
+}
+
+.pill-inner:not(.pill-inner-compact) {
+  animation: pill-transcript-in 180ms ease-out;
+}
+
+@keyframes pill-transcript-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
 .pill-inner-compact {
   width: fit-content;
   height: fit-content;
-  align-self: center;
-  border-radius: 18px;
+  align-self: flex-start;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.pill-inner-compact:hover,
+.pill-inner-compact.pill-hovered {
+  background: rgba(42, 42, 42, 0.97);
 }
 
 .pill-controls {
@@ -3817,11 +4408,8 @@ body[data-clips-route="recording-pill"] #root {
     opacity 120ms ease;
 }
 
-/* Reveal on hover. CSS :hover covers the focused case; .pill-hovered is the
-   Rust-polled fallback for when another app is focused (see clips:pill-hover). */
-.pill-inner:hover .pill-controls,
-.pill-inner.pill-hovered .pill-controls,
-/* Always visible when expanded. */
+.pill-inner-compact:hover .pill-controls,
+.pill-inner-compact.pill-hovered .pill-controls,
 .pill-inner:not(.pill-inner-compact) .pill-controls {
   max-width: 160px;
   opacity: 1;
@@ -3858,43 +4446,112 @@ body[data-clips-route="recording-pill"] #root {
   height: 12px;
 }
 
-/* Collapsed = vertical capsule: clips logo on top, waveform below, whole
-   pill clickable to expand. Detached mode keeps its own horizontal layout, so
-   this only applies to the non-detached collapsed pill. */
 .pill-inner-compact .pill-header.pill-vertical {
   flex-direction: column;
   gap: 0;
   height: auto;
   width: auto;
-  padding: 11px 7px 7px;
+  padding: 9px 8px;
   cursor: pointer;
 }
 
 .pill-vertical .pill-logo {
-  height: 11px;
+  width: 21px;
+  height: auto;
 }
 
-/* Controls (timer / pause / stop / chevron) live in the expanded view — the
-   collapsed capsule is just logo + waveform and expands on click. */
 .pill-vertical .pill-controls {
+  display: flex;
+  flex-direction: column;
+  align-self: center;
+  margin-left: 0;
+  gap: 8px;
+  margin-top: 0;
+  height: 0;
+  min-height: 0;
+  max-width: none;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    height 220ms var(--ease-drawer),
+    margin-top 220ms var(--ease-drawer),
+    opacity 160ms var(--ease-out-strong);
+}
+
+.pill-vertical .pill-controls[data-open="true"] {
+  pointer-events: auto;
+}
+
+.pill-vertical .pill-controls > * {
+  transform: translateY(-4px);
+  transition: transform 200ms var(--ease-out-strong);
+  transition-delay: 60ms;
+}
+
+.pill-vertical .pill-controls[data-open="true"] > * {
+  transform: translateY(0);
+}
+
+.pill-vertical .pill-timer,
+.pill-vertical .pill-expand-btn,
+.pill-vertical .pill-copy-btn {
   display: none;
 }
 
-.pill-vertical .pill-wave-canvas {
-  height: 18px;
-  width: 18px;
+.pill-vertical .pill-pause-btn,
+.pill-vertical .pill-stop-btn {
+  position: relative;
+  width: 14px;
+  height: 14px;
+  min-width: 14px;
+  margin: 0;
+  padding: 0;
+  border-radius: 50%;
+  background: transparent;
 }
 
-/* Dual-stream (mic + system audio) stacked in the collapsed capsule. */
-.pill-vertical .pill-wave-dual {
-  height: 26px;
-  width: 18px;
-  gap: 1px;
+.pill-vertical .pill-pause-btn::after,
+.pill-vertical .pill-stop-btn::after {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  border-radius: 50%;
 }
 
-/* Wrapper around logo + waveform. Transparent in row layouts (expanded /
-   detached); a real, clickable box only in the collapsed vertical capsule —
-   clicking it expands the pill, and hovering tints it. */
+.pill-inner-compact .pill-header.pill-vertical .pill-pause-btn {
+  background: transparent;
+  /* guard:allow-raw-color — pill chrome is theme-invariant, like the recorder */
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.pill-inner-compact .pill-header.pill-vertical .pill-pause-btn:hover {
+  background: transparent;
+  /* guard:allow-raw-color — pill chrome is theme-invariant, like the recorder */
+  color: #ffffff;
+}
+
+.pill-inner-compact .pill-header.pill-vertical .pill-stop-btn,
+.pill-inner-compact
+  .pill-header.pill-vertical
+  .pill-stop-btn:hover:not(:disabled) {
+  background: transparent;
+  /* guard:allow-raw-color — recording indicator red, shared with the record pill */
+  color: #e0473f;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pill-vertical .pill-controls,
+  .pill-vertical .pill-controls > * {
+    transition-duration: 1ms;
+    transition-delay: 0ms;
+  }
+}
+
+.pill-vertical .pill-wave-meter {
+  height: 14px;
+}
+
 .pill-media {
   display: contents;
 }
@@ -3903,54 +4560,7 @@ body[data-clips-route="recording-pill"] #root {
   display: flex;
   flex-direction: column;
   align-items: center;
-  align-self: stretch;
-  gap: 5px;
-  /* Padding + equal negative margin: the hover highlight covers the whole
-     upper region (to the top + side edges of the capsule) while leaving the
-     logo/waveform in their original positions. */
-  padding: 11px 7px 4px;
-  margin: -11px -7px 0;
-  border-radius: 18px 18px 0 0;
-  cursor: pointer;
-  transition: background 120ms ease;
-}
-
-.pill-vertical .pill-media:hover,
-.pill-hovered .pill-vertical .pill-media {
-  background: rgba(255, 255, 255, 0.08);
-}
-
-/* Drag grip revealed at the bottom of the collapsed capsule on hover. The
-   pill grows downward to fit it (window is sized with headroom for this).
-   Dragging the pill is wired on the whole window; this is the visible
-   affordance and gets its own hover tint. */
-.pill-vertical .pill-vgrip {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 0;
-  margin-top: 0;
-  overflow: hidden;
-  opacity: 0;
-  border-radius: 8px;
-  color: rgba(255, 255, 255, 0.45);
-  cursor: grab;
-  transition:
-    height 140ms ease,
-    margin-top 140ms ease,
-    background 120ms ease,
-    opacity 120ms ease;
-}
-
-.pill-inner-compact:hover .pill-vertical .pill-vgrip,
-.pill-inner-compact.pill-hovered .pill-vertical .pill-vgrip {
-  height: 14px;
-  margin-top: 3px;
-  opacity: 1;
-}
-
-.pill-vertical .pill-vgrip:active {
-  cursor: grabbing;
+  gap: 8px;
 }
 
 .pill-timer {
@@ -3959,28 +4569,14 @@ body[data-clips-route="recording-pill"] #root {
   font-variant-numeric: tabular-nums;
 }
 
-.pill-wave-dual {
-  display: flex;
-  height: 26px;
-  width: 48px;
-  flex-shrink: 0;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 2px;
+.pill-media-spinner {
+  flex: none;
+  color: currentColor;
+  opacity: 0.7;
 }
 
-.pill-wave-canvas-half {
-  width: 100%;
-  flex: 1;
-  min-height: 0;
-  display: block;
-}
-
-.pill-wave-canvas {
-  height: 26px;
-  width: 48px;
-  flex-shrink: 0;
-  display: block;
+.pill-wave-meter {
+  height: 14px;
 }
 
 .pill-stop-btn {
@@ -4010,7 +4606,8 @@ body[data-clips-route="recording-pill"] #root {
   opacity: 0.6;
 }
 
-.pill-expand-btn {
+.pill-expand-btn,
+.pill-close-btn {
   margin-left: 4px;
   display: inline-flex;
   height: 28px;
@@ -4019,133 +4616,16 @@ body[data-clips-route="recording-pill"] #root {
   align-items: center;
   justify-content: center;
   border-radius: 50%;
-  color: #e4e4e7;
+  color: #e5e5e5;
   border: none;
   background: transparent;
   transition: background 120ms;
 }
 
-.pill-expand-btn:hover {
+.pill-expand-btn:hover,
+.pill-close-btn:hover {
   background: rgba(255, 255, 255, 0.1);
 }
-
-.pill-drag-handle {
-  position: absolute;
-  bottom: 4px;
-  left: 50%;
-  transform: translateX(-50%);
-  height: 4px;
-  width: 40px;
-  cursor: pointer;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.3);
-  border: none;
-  transition: background 120ms;
-}
-
-.pill-drag-handle:hover {
-  background: rgba(255, 255, 255, 0.5);
-}
-
-/* Whisper model status row in Settings */
-
-.whisper-status {
-  display: flex;
-  align-items: flex-start;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 6px;
-  font-size: 11px;
-  line-height: 1.4;
-  color: var(--fg-muted);
-}
-
-.whisper-status-icon {
-  flex-shrink: 0;
-  margin-top: 1px;
-}
-
-.whisper-status-ready {
-  color: #16a34a;
-}
-
-@media (prefers-color-scheme: dark) {
-  .whisper-status-ready {
-    color: #4ade80;
-  }
-}
-
-.whisper-status-disabled,
-.whisper-status-missing {
-  color: #b45309;
-}
-
-@media (prefers-color-scheme: dark) {
-  .whisper-status-disabled,
-  .whisper-status-missing {
-    color: #fbbf24;
-  }
-}
-
-.whisper-status-path {
-  display: block;
-  margin-top: 2px;
-  font-size: 10px;
-  color: var(--fg-subtle);
-  word-break: break-all;
-}
-
-.whisper-status-downloading {
-  flex-direction: column;
-  align-items: stretch;
-}
-
-.whisper-progress-bar {
-  height: 4px;
-  width: 100%;
-  border-radius: 999px;
-  background: var(--surface-strong);
-  overflow: hidden;
-  margin-top: 4px;
-}
-
-.whisper-progress-fill {
-  height: 100%;
-  border-radius: inherit;
-  background: #16a34a;
-  transition: width 300ms ease;
-}
-
-@media (prefers-color-scheme: dark) {
-  .whisper-progress-fill {
-    background: #4ade80;
-  }
-}
-
-.whisper-progress-label {
-  font-size: 11px;
-  color: var(--fg-muted);
-}
-
-.whisper-download-btn {
-  flex-shrink: 0;
-  height: 22px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--fg);
-  cursor: pointer;
-  font-size: 11px;
-  font-weight: 600;
-  padding: 0 8px;
-  transition: background 120ms;
-}
-
-.whisper-download-btn:hover {
-  background: var(--surface-hover);
-}
-
-/* ---- */
 
 .pill-error {
   margin: 0 10px 6px;
@@ -4160,40 +4640,56 @@ body[data-clips-route="recording-pill"] #root {
 }
 
 .pill-divider {
-  margin: 0 12px;
+  margin: 0 14px;
   height: 1px;
   flex-shrink: 0;
   background: rgba(255, 255, 255, 0.1);
+}
+
+.pill-finished-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  margin: 8px 12px 2px;
+  padding: 8px 10px;
+  border: 1px solid rgba(34, 197, 94, 0.45);
+  border-radius: 8px;
+  background: rgba(34, 197, 94, 0.16);
+}
+
+.pill-finished-text {
+  min-width: 0;
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: #86efac;
+}
+
+.pill-finished-open {
+  flex-shrink: 0;
+  padding: 5px 9px;
+  border: none;
+  border-radius: 6px;
+  background: #22c55e;
+  color: #052e16;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 120ms;
+}
+
+.pill-finished-open:hover {
+  background: #4ade80;
 }
 
 .pill-transcript-area {
   min-height: 0;
   flex: 1;
   display: flex;
-  overflow: hidden;
-}
-
-/* Meeting mode: transcript + notes side by side. */
-.pill-split {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.pill-split-pane {
-  display: flex;
   flex-direction: column;
-  flex: 1 1 50%;
-  min-width: 0;
-  min-height: 0;
-}
-
-.pill-split-divider {
-  width: 1px;
-  flex-shrink: 0;
-  margin: 8px 0;
-  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
 }
 
 .pill-pane-label {
@@ -4203,7 +4699,7 @@ body[data-clips-route="recording-pill"] #root {
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: rgba(244, 244, 245, 0.4);
+  color: rgba(245, 245, 245, 0.4);
 }
 
 .pill-pane-label-row {
@@ -4221,7 +4717,7 @@ body[data-clips-route="recording-pill"] #root {
   border: none;
   border-radius: 5px;
   background: transparent;
-  color: rgba(244, 244, 245, 0.5);
+  color: rgba(245, 245, 245, 0.5);
   cursor: pointer;
   transition:
     background 120ms,
@@ -4230,7 +4726,7 @@ body[data-clips-route="recording-pill"] #root {
 
 .pill-copy-btn:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.1);
-  color: #f4f4f5;
+  color: #f5f5f5;
 }
 
 .pill-copy-btn:disabled {
@@ -4238,73 +4734,109 @@ body[data-clips-route="recording-pill"] #root {
   cursor: default;
 }
 
-/* In the split, the transcript area should fill its pane below the label. */
-.pill-split-pane .pill-transcript-area {
-  flex: 1;
-  min-height: 0;
-}
-
-.pill-notes-area {
-  min-height: 0;
-  flex: 1;
-  display: flex;
-  overflow: hidden;
-  padding: 4px 12px 8px;
-}
-
-.pill-notes-textarea {
-  flex: 1;
-  background: transparent;
-  border: none;
-  outline: none;
-  resize: none;
-  color: #f4f4f5;
-  font-size: 12px;
-  line-height: 1.5;
-  font-family: inherit;
-}
-
-.pill-notes-textarea::placeholder {
-  color: #71717a;
-}
-
-.pill-saved-bar {
+.pill-ask-bar {
   flex-shrink: 0;
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-  min-height: 18px;
-  padding: 2px 12px 8px;
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  color: rgba(244, 244, 245, 0.4);
-}
-
-.pill-saved-status {
-  margin-left: auto;
-}
-
-.pill-open-web-btn {
-  display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 6px;
-  border: none;
-  border-radius: 6px;
+  padding: 6px 10px 10px;
+}
+
+.pill-ask-provider-status {
+  display: flex;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 12px 0;
+  color: hsl(var(--ui-muted-foreground));
+  font-size: 11px;
+}
+
+.pill-ask-provider-status > button,
+.pill-ask-provider-actions > button {
+  border: 0;
   background: transparent;
-  color: rgba(244, 244, 245, 0.6);
-  font-size: 10px;
-  font-weight: 500;
+  color: hsl(var(--ui-foreground));
+  cursor: pointer;
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.pill-ask-provider-status > button:focus-visible,
+.pill-ask-provider-actions > button:focus-visible {
+  outline: 2px solid hsl(var(--ui-ring));
+  outline-offset: 2px;
+}
+
+.pill-ask-provider-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.pill-ask-input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #f5f5f5;
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+  transition:
+    background 120ms,
+    border-color 120ms;
+}
+
+.pill-ask-input::placeholder {
+  color: rgba(245, 245, 245, 0.35);
+}
+
+.pill-ask-input:focus {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.pill-ask-input:disabled {
+  opacity: 0.5;
+}
+
+.pill-ask-send {
+  display: inline-flex;
+  height: 28px;
+  width: 28px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: rgba(245, 245, 245, 0.6);
   cursor: pointer;
   transition:
     background 120ms,
-    color 120ms;
+    color 120ms,
+    opacity 120ms;
 }
 
-.pill-open-web-btn:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: #f4f4f5;
+.pill-ask-send:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  color: #f5f5f5;
+}
+
+.pill-ask-send:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.pill-ask-send:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 .lt-chat {
@@ -4318,7 +4850,7 @@ body[data-clips-route="recording-pill"] #root {
   padding: 8px 12px;
   font-size: 12px;
   line-height: 1.35;
-  color: #f4f4f5;
+  color: #f5f5f5;
 }
 
 .lt-empty {
@@ -4361,11 +4893,11 @@ body[data-clips-route="recording-pill"] #root {
 }
 
 .lt-row-you .lt-label {
-  color: rgba(252, 211, 77, 0.8);
+  color: rgba(245, 245, 245, 0.5);
 }
 
 .lt-row-them .lt-label {
-  color: rgba(125, 211, 252, 0.8);
+  color: rgba(245, 245, 245, 0.38);
 }
 
 .lt-bubble {
@@ -4376,15 +4908,620 @@ body[data-clips-route="recording-pill"] #root {
 }
 
 .lt-row-you .lt-bubble {
-  background: rgba(245, 158, 11, 0.2);
-  color: #fffbeb;
+  background: rgba(255, 255, 255, 0.13);
+  color: #fafafa;
   border-bottom-right-radius: 4px;
 }
 
 .lt-row-them .lt-bubble {
-  background: rgba(14, 165, 233, 0.2);
-  color: #f0f9ff;
+  background: rgba(255, 255, 255, 0.06);
+  color: #e5e5e5;
   border-bottom-left-radius: 4px;
+}
+
+.pill-inner:not(.pill-inner-compact) {
+  background: hsl(var(--ui-popover) / 0.98);
+  color: hsl(var(--ui-foreground));
+  border: 0.5px solid hsl(var(--ui-border));
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-header {
+  gap: 6px;
+  padding: 0 8px 0 14px;
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-controls {
+  transform: translateY(var(--header-ink-shift, 0px));
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-wave-meter {
+  transform: translateY(var(--header-meter-shift, 0px));
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-media {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+}
+
+.pill-title {
+  line-height: 30px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  color: hsl(var(--ui-foreground));
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-timer {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: hsl(var(--ui-foreground));
+  transition: color 150ms;
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-timer-live {
+  /* guard:allow-raw-color — recording indicator red, shared with the record pill */
+  color: #e0473f;
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-stop-btn {
+  width: 30px;
+  height: 30px;
+  background: transparent;
+  /* guard:allow-raw-color — recording indicator red, shared with the record pill */
+  color: #e0473f;
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-stop-btn:hover:not(:disabled) {
+  background: hsl(var(--ui-accent));
+}
+
+.pill-stop-square {
+  display: block;
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background: currentColor;
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-pause-btn,
+.pill-inner:not(.pill-inner-compact) .pill-expand-btn,
+.pill-inner:not(.pill-inner-compact) .pill-close-btn,
+.pill-inner:not(.pill-inner-compact) .pill-copy-btn {
+  height: 30px;
+  width: 30px;
+  margin: 0;
+  padding: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: hsl(var(--ui-muted-foreground));
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-pause-btn:hover,
+.pill-inner:not(.pill-inner-compact) .pill-expand-btn:hover,
+.pill-inner:not(.pill-inner-compact) .pill-close-btn:hover,
+.pill-inner:not(.pill-inner-compact) .pill-copy-btn:hover:not(:disabled) {
+  background: hsl(var(--ui-accent));
+  color: hsl(var(--ui-foreground));
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-copy-btn:disabled {
+  opacity: 0.4;
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-divider {
+  background: hsl(var(--ui-border));
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-error {
+  background: hsl(var(--ui-destructive) / 0.1);
+  border-color: hsl(var(--ui-destructive) / 0.3);
+  color: hsl(var(--ui-destructive));
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-finished-banner {
+  border-color: hsl(var(--ui-success) / 0.35);
+  background: hsl(var(--ui-success) / 0.1);
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-finished-text {
+  color: hsl(var(--ui-success));
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-finished-open {
+  background: hsl(var(--ui-primary));
+  color: hsl(var(--ui-primary-foreground));
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-finished-open:hover {
+  opacity: 0.9;
+  background: hsl(var(--ui-primary));
+}
+
+.pill-inner:not(.pill-inner-compact) .lt-chat {
+  gap: 10px;
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: hsl(var(--ui-foreground));
+}
+
+.pill-inner:not(.pill-inner-compact) .lt-empty {
+  color: hsl(var(--ui-muted-foreground));
+}
+
+.pill-inner:not(.pill-inner-compact) .lt-row-you,
+.pill-inner:not(.pill-inner-compact) .lt-row-them {
+  align-items: flex-start;
+}
+
+.pill-inner:not(.pill-inner-compact) .lt-label {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0;
+  padding: 0 2px 2px;
+}
+
+.pill-inner:not(.pill-inner-compact) .lt-row-you .lt-label,
+.pill-inner:not(.pill-inner-compact) .lt-row-them .lt-label {
+  color: hsl(var(--ui-muted-foreground));
+}
+
+.pill-inner:not(.pill-inner-compact) .lt-bubble {
+  max-width: 100%;
+  padding: 7px 11px;
+  border-radius: 10px;
+}
+
+.pill-inner:not(.pill-inner-compact) .lt-row-you .lt-bubble,
+.pill-inner:not(.pill-inner-compact) .lt-row-them .lt-bubble {
+  background: hsl(var(--ui-muted));
+  color: hsl(var(--ui-foreground));
+  border-bottom-right-radius: 10px;
+  border-bottom-left-radius: 10px;
+}
+
+.pill-stop-inline-square {
+  display: block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2.5px;
+  /* guard:allow-raw-color — recording indicator red, shared with the record pill */
+  background: #e0473f;
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-ask-bar {
+  gap: 6px;
+  padding: 8px 14px 12px;
+}
+
+.pill-ask-sheet {
+  flex: none;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-top: 0.5px solid hsl(var(--ui-border));
+  border-radius: 14px 14px 0 0;
+  background: hsl(var(--ui-popover));
+  box-shadow: var(--elevation-sheet);
+  animation: pill-ask-sheet-in 320ms var(--ease-drawer);
+}
+
+.pill-ask-sheet[data-state="closing"] {
+  animation: pill-ask-sheet-out 200ms var(--ease-collapse) forwards;
+  pointer-events: none;
+}
+
+.pill-ask-sheet > * {
+  animation: pill-ask-sheet-content 260ms var(--ease-out-strong) both;
+  animation-delay: 90ms;
+}
+
+.pill-ask-sheet[data-state="closing"] > * {
+  animation: none;
+}
+
+@keyframes pill-ask-sheet-in {
+  from {
+    opacity: 0;
+    transform: translateY(100%);
+  }
+  60% {
+    opacity: 1;
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pill-ask-sheet-out {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(100%);
+  }
+}
+
+@keyframes pill-ask-sheet-content {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pill-ask-sheet,
+  .pill-ask-sheet[data-state="closing"],
+  .pill-ask-sheet > * {
+    animation-duration: 1ms;
+    animation-delay: 0ms;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pill-ask-sheet {
+    animation: none;
+  }
+}
+
+.pill-ask-sheet-grip {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 0 6px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.pill-ask-sheet-grip:active {
+  cursor: grabbing;
+}
+
+.pill-ask-sheet-handle {
+  display: block;
+  width: 32px;
+  height: 4px;
+  border-radius: 999px;
+  background: hsl(var(--ui-muted-foreground) / 0.35);
+  transition:
+    background 160ms var(--ease-collapse),
+    transform 160ms var(--ease-collapse);
+}
+
+.pill-ask-sheet-grip:active .pill-ask-sheet-handle {
+  transform: scaleX(1.12);
+  background: hsl(var(--ui-muted-foreground) / 0.7);
+}
+
+.pill-ask-sheet-grip:hover .pill-ask-sheet-handle {
+  background: hsl(var(--ui-muted-foreground) / 0.55);
+}
+
+.pill-ask-sheet-scroll {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 11px;
+  overflow-y: auto;
+  padding: 6px 16px 12px;
+}
+
+.pill-ask-msg-user {
+  align-self: flex-end;
+  max-width: 88%;
+  padding: 9px 17px;
+  border-radius: 999px;
+  background: hsl(var(--ui-primary));
+  color: hsl(var(--ui-primary-foreground));
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.pill-ask-msg-assistant {
+  align-self: stretch;
+  font-size: 13px;
+  line-height: 1.5;
+  color: hsl(var(--ui-foreground));
+  white-space: pre-line;
+}
+
+.pill-ask-suggestions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding: 4px 16px 10px;
+  mask-image: linear-gradient(
+    to right,
+    /* guard:allow-raw-color — a mask stop is an alpha channel, not a color */
+    #000 calc(100% - 22px),
+    transparent 100%
+  );
+}
+
+.pill-ask-suggestions::-webkit-scrollbar {
+  display: none;
+}
+
+.pill-timer-starting {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: hsl(var(--ui-muted-foreground));
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.pill-ask-work {
+  margin-bottom: 7px;
+}
+
+.pill-ask-work-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.pill-ask-chips {
+  display: flex;
+  align-items: center;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding: 4px 0;
+}
+
+.pill-ask-chips[data-scrolled="true"] {
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    /* guard:allow-raw-color — a mask stop is an alpha channel, not a color */
+    #000 14px
+  );
+}
+
+.pill-ask-chips::-webkit-scrollbar {
+  display: none;
+}
+
+.pill-ask-chip-icon {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  margin-right: -5px;
+  border: 1px solid hsl(var(--ui-border));
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px hsl(var(--ui-popover));
+  color: hsl(var(--ui-muted-foreground));
+  background: hsl(var(--ui-popover));
+  opacity: 0.5;
+  transition:
+    opacity 160ms var(--ease-out-strong),
+    transform 160ms var(--ease-out-strong),
+    border-color 160ms var(--ease-out-strong);
+}
+
+.pill-ask-chip-icon:last-child {
+  margin-right: 0;
+}
+
+.pill-ask-chip-icon[data-active="true"] {
+  z-index: 2;
+  transform: scale(1.1);
+  opacity: 1;
+  color: hsl(var(--ui-foreground));
+  border-color: hsl(var(--ui-foreground) / 0.4);
+}
+
+.pill-ask-chip-icon[data-status="error"] {
+  z-index: 1;
+  opacity: 1;
+  color: hsl(var(--ui-destructive));
+  border-color: hsl(var(--ui-destructive) / 0.4);
+}
+
+.pill-ask-chip-icon[data-status="running"][data-active="true"],
+.pill-ask-chip-icon[data-status="blocked"][data-active="true"] {
+  animation: pill-ask-chip-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes pill-ask-chip-pulse {
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.pill-ask-work-label {
+  flex: none;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 16px;
+  color: hsl(var(--ui-foreground));
+}
+
+.pill-ask-work-toggle {
+  display: grid;
+  place-items: center;
+  flex: none;
+  margin-left: auto;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: hsl(var(--ui-muted-foreground));
+  cursor: default;
+}
+
+.pill-ask-work-toggle:hover {
+  color: hsl(var(--ui-foreground));
+  background: hsl(var(--ui-muted) / 0.6);
+}
+
+.pill-ask-work-now,
+.pill-ask-work-list {
+  margin: 5px 0 0;
+  padding: 0 0 0 9px;
+  border-left: 1.5px solid hsl(var(--ui-border));
+  font-size: 12px;
+  line-height: 17px;
+  color: hsl(var(--ui-muted-foreground));
+}
+
+.pill-ask-work-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  list-style: none;
+}
+
+.pill-ask-work-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+
+.pill-ask-work-list li[data-status="error"] {
+  color: hsl(var(--ui-destructive));
+}
+
+.pill-ask-work-item-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pill-ask-work-item-detail {
+  flex: none;
+  opacity: 0.7;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pill-ask-chip-icon[data-status="running"][data-active="true"],
+  .pill-ask-chip-icon[data-status="blocked"][data-active="true"] {
+    animation: none;
+  }
+}
+
+.pill-ask-thread-caret {
+  display: inline-block;
+  width: 7px;
+  height: 13px;
+  margin-left: 3px;
+  vertical-align: -2px;
+  border-radius: 1.5px;
+  background: hsl(var(--ui-muted-foreground));
+  animation: pill-ask-caret 900ms steps(2) infinite;
+}
+
+@keyframes pill-ask-caret {
+  to {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pill-ask-activity {
+    display: block;
+    margin: 2px 0;
+    font-size: 12px;
+    font-style: italic;
+    color: hsl(var(--ui-muted-foreground));
+    animation: pill-ask-activity-pulse 1.6s ease-in-out infinite;
+  }
+
+  @keyframes pill-ask-activity-pulse {
+    50% {
+      opacity: 0.55;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pill-ask-activity {
+      animation: none;
+    }
+  }
+
+  .pill-ask-thread-caret {
+    animation: none;
+  }
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-ask-field {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  height: 34px;
+  padding: 0 4px 0 0;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: hsl(var(--ui-muted));
+  transition: border-color 120ms;
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-ask-field:focus-within {
+  border-color: hsl(var(--ui-ring) / 0.35);
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-ask-input {
+  height: 100%;
+  min-width: 0;
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: hsl(var(--ui-foreground));
+  font-size: 13px;
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-ask-input::placeholder {
+  color: hsl(var(--ui-muted-foreground));
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-ask-send {
+  height: 26px;
+  width: 26px;
+  border-radius: 999px;
+  background: hsl(var(--ui-primary));
+  color: hsl(var(--ui-primary-foreground));
+  transition:
+    opacity 120ms,
+    background 120ms;
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-ask-send:disabled {
+  background: transparent;
+  color: hsl(var(--ui-muted-foreground));
+  opacity: 0.6;
+}
+
+.pill-inner:not(.pill-inner-compact) .pill-ask-send:hover:not(:disabled) {
+  opacity: 0.85;
 }
 
 .pill-pause-btn {
@@ -4397,7 +5534,7 @@ body[data-clips-route="recording-pill"] #root {
   justify-content: center;
   border-radius: 50%;
   background: rgba(255, 255, 255, 0.1);
-  color: #e4e4e7;
+  color: #e5e5e5;
   border: none;
   transition: background 120ms;
 }
@@ -4414,4 +5551,62 @@ body[data-clips-route="recording-pill"] #root {
   to {
     transform: rotate(360deg);
   }
+}
+
+.monitor-picker-root {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  background: transparent;
+}
+
+.monitor-picker-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  height: 100%;
+  padding: 16px;
+  border-radius: 20px;
+  background: rgba(20, 22, 28, 0.94);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  color: white;
+  text-align: center;
+  cursor: pointer;
+  transition:
+    background 120ms,
+    border-color 120ms;
+}
+
+.monitor-picker-card:hover,
+.monitor-picker-card:focus-visible {
+  background: rgba(32, 35, 43, 0.96);
+  border-color: rgba(255, 255, 255, 0.24);
+  outline: none;
+}
+
+.monitor-picker-title {
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.monitor-picker-subtitle {
+  font-size: 13px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.monitor-picker-hint {
+  margin-top: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.45);
 }

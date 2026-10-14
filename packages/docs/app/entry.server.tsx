@@ -1,17 +1,29 @@
-import type { AppLoadContext, EntryContext } from "react-router";
-import { ServerRouter } from "react-router";
 import ReactDOMServer from "react-dom/server.browser";
+import type { EntryContext, RouterContextProvider } from "react-router";
+import { ServerRouter } from "react-router";
 const { renderToReadableStream } = ReactDOMServer;
 import { isbot } from "isbot";
 
+import { wrapWithAnalytics } from "../../core/src/server/analytics";
+
 export const streamTimeout = 5_000;
+
+function isDocsRequest(request: Request): boolean {
+  const segments = new URL(request.url).pathname.split("/").filter(Boolean);
+  if (segments[0] === "docs") return true;
+  return (
+    segments.length > 1 &&
+    segments[1] === "docs" &&
+    /^[A-Za-z]{2}(?:-[A-Za-z]{2})?$/.test(segments[0])
+  );
+}
 
 export default async function handleRequest(
   request: Request,
   responseStatusCode: number,
   responseHeaders: Headers,
   routerContext: EntryContext,
-  _loadContext: AppLoadContext,
+  _loadContext: RouterContextProvider,
 ) {
   if (request.method.toUpperCase() === "HEAD") {
     return new Response(null, {
@@ -21,7 +33,10 @@ export default async function handleRequest(
   }
 
   const userAgent = request.headers.get("user-agent");
-  const waitForAll = (userAgent && isbot(userAgent)) || routerContext.isSpaMode;
+  const waitForAll =
+    Boolean(userAgent && isbot(userAgent)) ||
+    routerContext.isSpaMode ||
+    isDocsRequest(request);
 
   const abortController = new AbortController();
   const timeoutId = setTimeout(() => abortController.abort(), streamTimeout);
@@ -45,7 +60,10 @@ export default async function handleRequest(
     }
 
     responseHeaders.set("Content-Type", "text/html");
-    return new Response(body, {
+    // Prerendering calls this handler directly, never the Nitro page route,
+    // so the analytics tags must be injected here or every static page ships
+    // without them.
+    return new Response(wrapWithAnalytics(body), {
       headers: responseHeaders,
       status: responseStatusCode,
     });

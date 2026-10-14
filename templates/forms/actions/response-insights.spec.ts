@@ -1,12 +1,20 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ACTION_CHAT_UI_DATA_WIDGET_RENDERER } from "@agent-native/core/action-ui";
 import {
   DATA_CHART_WIDGET,
   DATA_INSIGHTS_WIDGET,
   DATA_TABLE_WIDGET,
 } from "@agent-native/core/data-widgets";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@agent-native/core/server/request-context", () => ({
+  getRequestContext: () => undefined,
+  getRequestUserEmail: () => "owner@example.com",
+  getRequestOrgId: () => undefined,
+}));
 
 const dbMock = vi.hoisted(() => {
   let results: unknown[][] = [];
+  const selectCalls: unknown[] = [];
 
   function query() {
     const result = results.shift() ?? [];
@@ -21,16 +29,24 @@ const dbMock = vi.hoisted(() => {
   }
 
   return {
+    selectCalls,
     setResults(next: unknown[][]) {
       results = [...next];
     },
+    clearSelectCalls() {
+      selectCalls.length = 0;
+    },
     getDb: () => ({
-      select: vi.fn(() => query()),
+      select: vi.fn((projection: unknown) => {
+        selectCalls.push(projection);
+        return query();
+      }),
     }),
   };
 });
 
 const sharingMock = vi.hoisted(() => ({
+  resolveAccess: vi.fn(async () => ({ role: "owner", resource: {} })),
   accessFilter: vi.fn(() => true),
   assertAccess: vi.fn(async () => ({ resource: form })),
 }));
@@ -82,22 +98,28 @@ const responses = [
   },
 ];
 
-async function runInsights(displayMode?: "chart" | "table" | "insights") {
+async function runInsights(
+  displayMode?: "chart" | "table" | "insights",
+  responseRows = responses,
+) {
   dbMock.setResults([
-    [form],
-    responses,
-    [{ formId: "form_1", count: responses.length }],
+    responseRows,
+    [{ formId: "form_1", count: responseRows.length }],
   ]);
 
-  return responseInsights.run({
-    formId: "form_1",
-    ...(displayMode ? { displayMode } : {}),
-  });
+  return responseInsights.run(
+    {
+      formId: "form_1",
+      ...(displayMode ? { displayMode } : {}),
+    },
+    { caller: "frontend", userEmail: form.ownerEmail, orgId: form.orgId },
+  );
 }
 
 describe("response-insights action", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    dbMock.clearSelectCalls();
     sharingMock.assertAccess.mockResolvedValue({ resource: form });
   });
 
@@ -132,6 +154,24 @@ describe("response-insights action", () => {
     expect("table" in result).toBe(false);
   });
 
+  it("does not load unused delivery or request metadata for insights", async () => {
+    await runInsights("chart");
+
+    expect(dbMock.selectCalls[0]).toEqual({
+      id: expect.anything(),
+      formId: expect.anything(),
+      data: expect.anything(),
+      submittedAt: expect.anything(),
+      submitterEmail: expect.anything(),
+    });
+    expect(dbMock.selectCalls[0]).not.toHaveProperty("deliverySnapshot");
+    expect(dbMock.selectCalls[0]).not.toHaveProperty("deliveryStatus");
+    expect(dbMock.selectCalls[0]).not.toHaveProperty("idempotencyKey");
+    expect(dbMock.selectCalls[0]).not.toHaveProperty("pageUrl");
+    expect(dbMock.selectCalls[0]).not.toHaveProperty("clientSurface");
+    expect(dbMock.selectCalls[0]).not.toHaveProperty("ip");
+  });
+
   it("returns only a table widget for table requests", async () => {
     const result = await runInsights("table");
 
@@ -141,10 +181,38 @@ describe("response-insights action", () => {
     expect(result.display?.primaryAction?.href).toBe("/forms/form_1/responses");
   });
 
+  it("does not add an email column for synthetic anonymous submitters", async () => {
+    const result = await runInsights("table", [
+      {
+        ...responses[0]!,
+        submitterEmail:
+          "anon-ee79aaee-98e2-452a-9476-5205713803c0@agent-native.com",
+      },
+    ]);
+
+    expect(result.table?.columns.map((column) => column.key)).not.toContain(
+      "submitterEmail",
+    );
+  });
+
+  it("keeps the email column for real submitters", async () => {
+    const result = await runInsights("table", [
+      { ...responses[0]!, submitterEmail: "user@example.com" },
+    ]);
+
+    expect(result.table?.columns.map((column) => column.key)).toContain(
+      "submitterEmail",
+    );
+    expect(result.table?.rows[0]?.submitterEmail).toBe("user@example.com");
+  });
+
   it("keeps the combined insights widget as the default", async () => {
     const result = await runInsights();
 
     expect(result.widget).toBe(DATA_INSIGHTS_WIDGET);
+    expect(responseInsights.chatUI?.renderer).toBe(
+      ACTION_CHAT_UI_DATA_WIDGET_RENDERER,
+    );
     expect(result.chartSeries).toBeDefined();
     expect(result.table).toBeDefined();
   });

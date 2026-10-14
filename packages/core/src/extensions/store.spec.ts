@@ -19,9 +19,9 @@ describe("extensions/store", () => {
 
     vi.doMock("../db/client.js", () => ({
       getDbExec: () => client,
-      getDialect: () => "sqlite",
-      intType: () => "INTEGER",
-      isPostgres: () => false,
+      isProductionServerlessFunctionRuntime: () => false,
+      isConnectionError: () => false,
+      isLocalDatabase: () => true,
       retryOnDdlRace: <T>(fn: () => Promise<T>) => fn(),
     }));
     vi.doMock("../db/create-get-db.js", () => ({
@@ -51,6 +51,13 @@ describe("extensions/store", () => {
       ),
     ).toBe(true);
     expect(
+      statements.some((sql) =>
+        /ALTER\s+TABLE\s+tool_shares\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+notified_at/i.test(
+          sql,
+        ),
+      ),
+    ).toBe(true);
+    expect(
       statements.some((sql) => /RENAME\s+TO\s+tool_data_old/i.test(sql)),
     ).toBe(false);
     expect(
@@ -64,7 +71,7 @@ describe("extensions/store", () => {
         async (input: string | { sql: string; args: unknown[] }) => {
           const sql = typeof input === "string" ? input : input.sql;
           if (/\bFROM\s+extensions\b/i.test(sql)) {
-            throw new Error("SQLITE_ERROR: no such table: extensions");
+            throw new Error('relation "extensions" does not exist');
           }
           return { rows: [], rowsAffected: 0 };
         },
@@ -73,9 +80,9 @@ describe("extensions/store", () => {
 
     vi.doMock("../db/client.js", () => ({
       getDbExec: () => client,
-      getDialect: () => "sqlite",
-      intType: () => "INTEGER",
-      isPostgres: () => false,
+      isProductionServerlessFunctionRuntime: () => false,
+      isConnectionError: () => false,
+      isLocalDatabase: () => true,
       retryOnDdlRace: <T>(fn: () => Promise<T>) => fn(),
     }));
     vi.doMock("../db/create-get-db.js", () => ({
@@ -103,7 +110,7 @@ describe("extensions/store", () => {
             /CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+tools/i.test(sql)
           ) {
             failCreateToolsOnce = false;
-            throw new Error("SQLITE_BUSY: database is locked");
+            throw new Error("database setup failed");
           }
           return { rows: [], rowsAffected: 0 };
         },
@@ -112,9 +119,9 @@ describe("extensions/store", () => {
 
     vi.doMock("../db/client.js", () => ({
       getDbExec: () => client,
-      getDialect: () => "sqlite",
-      intType: () => "INTEGER",
-      isPostgres: () => false,
+      isProductionServerlessFunctionRuntime: () => false,
+      isConnectionError: () => false,
+      isLocalDatabase: () => true,
       retryOnDdlRace: <T>(fn: () => Promise<T>) => fn(),
     }));
     vi.doMock("../db/create-get-db.js", () => ({
@@ -126,7 +133,9 @@ describe("extensions/store", () => {
 
     const { ensureExtensionsTables } = await import("./store.js");
 
-    await expect(ensureExtensionsTables()).rejects.toThrow("SQLITE_BUSY");
+    await expect(ensureExtensionsTables()).rejects.toThrow(
+      "database setup failed",
+    );
     await expect(ensureExtensionsTables()).resolves.toBeUndefined();
     expect(
       statements.filter((sql) =>
@@ -150,9 +159,9 @@ describe("extensions/store", () => {
 
     vi.doMock("../db/client.js", () => ({
       getDbExec: () => client,
-      getDialect: () => "sqlite",
-      intType: () => "INTEGER",
-      isPostgres: () => false,
+      isProductionServerlessFunctionRuntime: () => false,
+      isConnectionError: () => false,
+      isLocalDatabase: () => true,
       retryOnDdlRace: <T>(fn: () => Promise<T>) => fn(),
     }));
     vi.doMock("../db/create-get-db.js", () => ({
@@ -213,9 +222,9 @@ describe("extensions/store", () => {
     }));
     vi.doMock("../db/client.js", () => ({
       getDbExec: () => client,
-      getDialect: () => "sqlite",
-      intType: () => "INTEGER",
-      isPostgres: () => false,
+      isProductionServerlessFunctionRuntime: () => false,
+      isConnectionError: () => false,
+      isLocalDatabase: () => true,
       retryOnDdlRace: <T>(fn: () => Promise<T>) => fn(),
     }));
     vi.doMock("../db/create-get-db.js", () => ({
@@ -248,28 +257,49 @@ describe("extensions/store", () => {
 
   it("excludes globally-hidden extensions by default and includes them on request", async () => {
     const allRows = [
-      { id: "ext-visible", name: "Visible", hiddenAt: null },
+      {
+        id: "ext-visible",
+        name: "Visible",
+        archivedAt: null,
+        hiddenAt: null,
+      },
       {
         id: "ext-hidden",
         name: "Hidden",
+        archivedAt: null,
         hiddenAt: "2026-06-08T00:00:00.000Z",
       },
+      {
+        id: "ext-archived",
+        name: "Archived",
+        archivedAt: "2026-07-22T00:00:00.000Z",
+        hiddenAt: null,
+      },
     ];
-    // The helper combines accessFilter() with isNull(hiddenAt) via and() for
-    // the default case, and skips it when includeGloballyHidden is true. We
-    // spy on and()/isNull() (keeping the real drizzle module intact so
-    // schema.ts's sql`` template still works) to detect which branch ran and
-    // emulate the DB-side filter deterministically.
-    const andSpy = vi.fn(() => ({ __hidesVisible: true }));
-    const isNullSpy = vi.fn(() => ({}));
+    const andSpy = vi.fn((...args: unknown[]) => ({
+      __filter: args.some(
+        (arg) => (arg as { kind?: string } | null)?.kind === "hidden",
+      )
+        ? "default"
+        : "global",
+      args,
+    }));
+    let isNullCall = 0;
+    const isNullSpy = vi.fn(() => ({
+      kind: ++isNullCall <= 2 ? "hidden" : "archived",
+    }));
     const db = {
       select: vi.fn(() => ({
         from: vi.fn(() => ({
           where: vi.fn((where: unknown) =>
             Promise.resolve(
-              where && (where as any).__hidesVisible
-                ? allRows.filter((row) => row.hiddenAt == null)
-                : allRows,
+              (where as any).__filter === "default"
+                ? allRows.filter(
+                    (row) => row.archivedAt == null && row.hiddenAt == null,
+                  )
+                : (where as any).__filter === "global"
+                  ? allRows.filter((row) => row.archivedAt == null)
+                  : allRows,
             ),
           ),
         })),
@@ -281,9 +311,9 @@ describe("extensions/store", () => {
 
     vi.doMock("../db/client.js", () => ({
       getDbExec: () => client,
-      getDialect: () => "sqlite",
-      intType: () => "INTEGER",
-      isPostgres: () => false,
+      isProductionServerlessFunctionRuntime: () => false,
+      isConnectionError: () => false,
+      isLocalDatabase: () => true,
       retryOnDdlRace: <T>(fn: () => Promise<T>) => fn(),
     }));
     vi.doMock("../db/create-get-db.js", () => ({
@@ -325,6 +355,60 @@ describe("extensions/store", () => {
     ]);
   });
 
+  it("does not recover an archived extension as a recent duplicate", async () => {
+    const andSpy = vi.fn((...args: unknown[]) => ({ args }));
+    const isNullSpy = vi.fn((column: { name?: string }) => ({
+      kind: column.name,
+    }));
+    const where = vi.fn(() => ({ limit: vi.fn(async () => []) }));
+    const db = {
+      select: vi.fn(() => ({
+        from: vi.fn(() => ({ where })),
+      })),
+    };
+    const client = {
+      execute: vi.fn(async () => ({ rows: [], rowsAffected: 0 })),
+    };
+
+    vi.doMock("../db/client.js", () => ({
+      getDbExec: () => client,
+      isProductionServerlessFunctionRuntime: () => false,
+      isConnectionError: () => false,
+      isLocalDatabase: () => true,
+      retryOnDdlRace: <T>(fn: () => Promise<T>) => fn(),
+    }));
+    vi.doMock("../db/create-get-db.js", () => ({
+      createGetDb: () => () => db,
+    }));
+    vi.doMock("../sharing/registry.js", () => ({
+      registerShareableResource: vi.fn(),
+    }));
+    vi.doMock("drizzle-orm", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("drizzle-orm")>();
+      return { ...actual, and: andSpy, isNull: isNullSpy };
+    });
+
+    const { runWithRequestContext } =
+      await import("../server/request-context.js");
+    const { findRecentDuplicateExtension } = await import("./store.js");
+
+    await expect(
+      runWithRequestContext({ userEmail: "owner@example.com" }, () =>
+        findRecentDuplicateExtension({
+          name: "Foobar",
+          content: "<div>Foobar</div>",
+        }),
+      ),
+    ).resolves.toBeNull();
+
+    expect(
+      andSpy.mock.calls[0]?.some(
+        (arg) => (arg as { kind?: string }).kind === "archived_at",
+      ),
+    ).toBe(true);
+    expect(where).toHaveBeenCalledOnce();
+  });
+
   it("globally hides and unhides an extension on the tools row", async () => {
     const statements: { sql: string; args: unknown[] }[] = [];
     const db = {
@@ -353,9 +437,9 @@ describe("extensions/store", () => {
     }));
     vi.doMock("../db/client.js", () => ({
       getDbExec: () => client,
-      getDialect: () => "sqlite",
-      intType: () => "INTEGER",
-      isPostgres: () => false,
+      isProductionServerlessFunctionRuntime: () => false,
+      isConnectionError: () => false,
+      isLocalDatabase: () => true,
       retryOnDdlRace: <T>(fn: () => Promise<T>) => fn(),
     }));
     vi.doMock("../db/create-get-db.js", () => ({
@@ -399,10 +483,6 @@ describe("extensions/store", () => {
   });
 
   it("refuses to flip an existing extension to public visibility", async () => {
-    // Defense in depth — the framework `set-resource-visibility` action
-    // already rejects 'public' for extensions, but `updateExtension` is also
-    // called directly from the HTTP `PUT /extensions/:id` handler, so the
-    // store helper must enforce the rule independently.
     const client = {
       execute: vi.fn(async () => ({ rows: [], rowsAffected: 0 })),
     };
@@ -410,9 +490,9 @@ describe("extensions/store", () => {
 
     vi.doMock("../db/client.js", () => ({
       getDbExec: () => client,
-      getDialect: () => "sqlite",
-      intType: () => "INTEGER",
-      isPostgres: () => false,
+      isProductionServerlessFunctionRuntime: () => false,
+      isConnectionError: () => false,
+      isLocalDatabase: () => true,
       retryOnDdlRace: <T>(fn: () => Promise<T>) => fn(),
     }));
     vi.doMock("../db/create-get-db.js", () => ({
@@ -434,5 +514,40 @@ describe("extensions/store", () => {
     await expect(
       updateExtension("ext-1", { visibility: "public" }),
     ).rejects.toThrow(/cannot be made public/i);
+  });
+
+  it("refuses full content replacement without explicit opt-in", async () => {
+    const client = {
+      execute: vi.fn(async () => ({ rows: [], rowsAffected: 0 })),
+    };
+
+    vi.doMock("../db/client.js", () => ({
+      getDbExec: () => client,
+      isProductionServerlessFunctionRuntime: () => false,
+      isConnectionError: () => false,
+      isLocalDatabase: () => true,
+      retryOnDdlRace: <T>(fn: () => Promise<T>) => fn(),
+    }));
+    vi.doMock("../db/create-get-db.js", () => ({
+      createGetDb: () => () => ({}),
+    }));
+    vi.doMock("../sharing/registry.js", () => ({
+      registerShareableResource: vi.fn(),
+    }));
+    vi.doMock("../sharing/access.js", () => ({
+      accessFilter: vi.fn(() => null),
+      assertAccess: vi.fn(async () => ({ role: "owner", resource: {} })),
+      resolveAccess: vi.fn(async () => ({ role: "owner", resource: {} })),
+      ForbiddenError: class ForbiddenError extends Error {
+        statusCode = 403;
+      },
+    }));
+
+    const { updateExtensionContent } = await import("./store.js");
+    await expect(
+      updateExtensionContent("ext-1", {
+        content: "<div>replacement</div>",
+      }),
+    ).rejects.toThrow(/allowFullReplacement=true/i);
   });
 });

@@ -1,20 +1,11 @@
-import { useMemo } from "react";
-import Team from "@/pages/Team";
-import { useAppHeaderControls } from "@/components/layout/AppLayout";
+import { Navigate } from "react-router";
+
+import enUSMessages from "@/i18n/en-US";
 
 export function meta() {
-  return [{ title: "Team — Calendar" }];
+  return [{ title: enUSMessages.routeTitles.team }];
 }
 
 export default function TeamRoute() {
-  const controls = useMemo(
-    () => ({
-      left: (
-        <h1 className="text-lg font-semibold tracking-tight truncate">Team</h1>
-      ),
-    }),
-    [],
-  );
-  useAppHeaderControls(controls);
-  return <Team />;
+  return <Navigate to="/settings/organization" replace />;
 }

@@ -1,9 +1,11 @@
-import { ExtensionsListPage } from "@agent-native/core/client/extensions";
+import { Navigate } from "react-router";
+
+import enUSMessages from "@/i18n/en-US";
 
 export function meta() {
-  return [{ title: "Extensions — Analytics" }];
+  return [{ title: enUSMessages.routeTitles.extensions }];
 }
 
 export default function ExtensionsRoute() {
-  return <ExtensionsListPage />;
+  return <Navigate to="/settings/extensions" replace />;
 }

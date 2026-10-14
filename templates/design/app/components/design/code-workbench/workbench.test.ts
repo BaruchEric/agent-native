@@ -1,0 +1,61 @@
+import { readFileSync } from "node:fs";
+
+import { describe, expect, it } from "vitest";
+
+import { readDesignEditorSource } from "../../../pages/design-editor/read-design-editor-source";
+import { normalizeMonacoThemeColor } from "../code-workbench-theme";
+import { CODE_WORKBENCH_SHELL_CLASSNAME } from "./code-workbench-shell";
+
+describe("code workbench shell", () => {
+  it("themes from native workbench tokens and suppresses design hotkeys", () => {
+    const source = readFileSync(
+      "app/components/design/code-workbench/CodeWorkbench.tsx",
+      "utf8",
+    );
+    expect(source).toContain("readCodeWorkbenchTheme");
+    expect(source).toContain('data-hotkeys-scope="text"');
+    expect(source).toContain("--workbench-bg");
+    expect(source).not.toContain("srcDoc=");
+    expect(source).not.toContain("#0f1115");
+  });
+
+  it("keeps a full-height edge between the workbench and canvas", () => {
+    expect(CODE_WORKBENCH_SHELL_CLASSNAME).toContain("border-r");
+    expect(CODE_WORKBENCH_SHELL_CLASSNAME).toContain("--workbench-border");
+    expect(CODE_WORKBENCH_SHELL_CLASSNAME).toContain("shadow-[4px_0_12px");
+  });
+
+  it("keeps the per-design workbench mounted while another panel is visible", () => {
+    const source = readDesignEditorSource();
+    const workbenchIndex = source.indexOf("<CodeWorkbenchLoader");
+    expect(workbenchIndex).toBeGreaterThan(0);
+    const mountGate = source.slice(workbenchIndex - 120, workbenchIndex);
+    expect(mountGate).toContain("{id");
+    expect(mountGate).toContain("!shellMode");
+    expect(mountGate).not.toContain('activeLeftPanel === "code"');
+    expect(mountGate).not.toContain("activeCodeFile");
+  });
+
+  it("normalizes computed CSS colors before passing them to Monaco", () => {
+    expect(normalizeMonacoThemeColor("rgb(230, 230, 230)")).toBe("#e6e6e6");
+    expect(normalizeMonacoThemeColor("rgba(14, 165, 233, 0.4)")).toBe(
+      "#0ea5e966",
+    );
+    expect(normalizeMonacoThemeColor("rgb(90% 90% 90% / 50%)")).toBe(
+      "#e6e6e680",
+    );
+    expect(normalizeMonacoThemeColor("#fff")).toBe("#ffffff");
+    expect(normalizeMonacoThemeColor("var(--workbench-fg)")).toBeUndefined();
+  });
+
+  it("routes saves through the versioned preview→apply source actions", () => {
+    const source = readFileSync(
+      "app/components/design/code-workbench/workspace/inline-provider.ts",
+      "utf8",
+    );
+    expect(source).toContain('"preview-source-edit"');
+    expect(source).toContain('"apply-source-edit"');
+    expect(source).toContain("expectedVersionHash");
+    expect(source).toContain("WorkspaceStaleVersionError");
+  });
+});

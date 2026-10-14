@@ -1,28 +1,74 @@
-/**
- * Force the canonical `padding: 80px 110px` on the outer `.fmd-slide` wrapper
- * when the agent supplies slide HTML. Models drift on numeric values during
- * regeneration — most often dropping the second padding arg, which collapses
- * horizontal padding from 110px to 80px and looks like the right margin
- * shrunk. AGENTS.md treats `80px 110px` as canonical for every layout, so we
- * normalize server-side rather than trusting the model's output.
- */
-export function normalizeSlidePadding(html: string): string {
-  if (!html.includes('class="fmd-slide"')) return html;
+// A second style attribute is dropped by the HTML parser in favor of the first, so
+// a missed match on the existing one shadows the wrapper's whole style.
+const DIV_OPENING_TAG = /<div\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi;
 
-  return html.replace(
-    /(<div\b[^>]*\bclass="fmd-slide"[^>]*\bstyle=")([^"]*)(")/,
-    (_match, before, style, after) => {
-      const hasPadding = /(?:^|;)\s*padding\s*:/i.test(style);
-      let nextStyle: string;
-      if (hasPadding) {
-        nextStyle = style.replace(
-          /(^|;)\s*padding\s*:\s*[^;]*/i,
-          `$1${style.startsWith("padding") ? "" : " "}padding: 80px 110px`,
-        );
-      } else {
-        nextStyle = `padding: 80px 110px;${style.startsWith(" ") ? "" : " "}${style}`;
-      }
-      return `${before}${nextStyle}${after}`;
-    },
-  );
+function fmdSlideClass(openingTag: string): RegExpExecArray | null {
+  const classMatch = /\sclass\s*=\s*(["'])([\s\S]*?)\1/i.exec(openingTag);
+  return classMatch && /\bfmd-slide\b/i.test(classMatch[2]) ? classMatch : null;
+}
+
+function fmdSlideStartTag(html: string): string | null {
+  for (const match of html.matchAll(DIV_OPENING_TAG)) {
+    if (fmdSlideClass(match[0])) return match[0];
+  }
+  return null;
+}
+
+export function normalizeSlidePadding(html: string): string {
+  for (const match of html.matchAll(DIV_OPENING_TAG)) {
+    const openingTag = match[0];
+    const classMatch = fmdSlideClass(openingTag);
+
+    if (!classMatch) continue;
+
+    const styleMatch = /\sstyle\s*=\s*(["'])([\s\S]*?)\1/i.exec(openingTag);
+    if (styleMatch) {
+      const style = styleMatch[2];
+      if (/(?:^|;)\s*padding\s*:/i.test(style)) return html;
+
+      const nextStyle = `padding: 64px 80px;${
+        style.startsWith(" ") ? "" : " "
+      }${style}`;
+      // Splice by index: String.replace misplaces an empty value and expands `$` patterns.
+      const valueStart =
+        styleMatch.index + styleMatch[0].indexOf(styleMatch[1]) + 1;
+      const nextOpeningTag =
+        openingTag.slice(0, valueStart) +
+        nextStyle +
+        openingTag.slice(valueStart + style.length);
+
+      return (
+        html.slice(0, match.index) +
+        nextOpeningTag +
+        html.slice(match.index + openingTag.length)
+      );
+    }
+
+    const classEnd = classMatch.index + classMatch[0].length;
+    const nextOpeningTag =
+      openingTag.slice(0, classEnd) +
+      ' style="padding: 64px 80px;"' +
+      openingTag.slice(classEnd);
+
+    return (
+      html.slice(0, match.index) +
+      nextOpeningTag +
+      html.slice(match.index + openingTag.length)
+    );
+  }
+
+  return html;
+}
+
+export function normalizeSlidePaddingForWrite(
+  previous: string | undefined,
+  next: string,
+): string {
+  if (
+    previous !== undefined &&
+    fmdSlideStartTag(previous) === fmdSlideStartTag(next)
+  ) {
+    return next;
+  }
+  return normalizeSlidePadding(next);
 }

@@ -1,5 +1,4 @@
 import type { H3Event } from "h3";
-import { getH3App } from "../server/framework-request-handler.js";
 import {
   defineEventHandler,
   setResponseStatus,
@@ -7,15 +6,32 @@ import {
   getMethod,
   getRequestHeader,
 } from "h3";
-import { readBody } from "../server/h3-helpers.js";
-import { isLoopbackRequest } from "../server/auth.js";
+
+import { getAppConfig } from "../app-config/store.js";
 import { getConfiguredAppBasePath } from "../server/app-base-path.js";
+import { isLoopbackRequest } from "../server/auth.js";
+import {
+  describeBearerCredentialRefusal,
+  type BearerCredentialRefusal,
+} from "../server/bearer-credential-refusal.js";
+import { CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE } from "../server/credential-membership-unavailable.js";
+import { getH3App } from "../server/framework-request-handler.js";
+import { getOrigin } from "../server/google-oauth.js";
+import { readBody } from "../server/h3-helpers.js";
+import { trackMcpInitialize } from "./analytics.js";
 import {
   createMCPServerForRequest,
   verifyAuth,
+  McpIdentityVerificationUnavailableError,
   getAccessTokens,
   resolveOrgIdFromDomain,
   buildLinkArtifacts,
+  McpDirectoryProfileValidationError,
+  validateMcpDirectoryProfile,
+  validateMcpDirectoryWidgetDomain,
+  selectMcpActionSurface,
+  selectMcpDirectoryWidgetReadActions,
+  selectMcpDirectoryWidgetWriteActions,
   type MCPConfig,
   type MCPCallerIdentity,
   type MCPRequestMeta,
@@ -27,52 +43,24 @@ import {
   getMcpOAuthProtectedResourceMetadataUrl,
   getMcpOAuthResource,
 } from "./oauth-route.js";
+import {
+  MCP_DIRECTORY_ROUTE_PREFIX,
+  MCP_PUBLIC_ROUTE_PREFIX,
+  MCP_ROUTE_PREFIXES,
+  joinMcpRoute,
+} from "./route-paths.js";
 
-// Re-export the shared MCP server builder + types so the stdio transport and
-// any (future) external importer of `@agent-native/core/mcp` keep resolving
-// against `./server.js` exactly as before this refactor.
 export {
   createMCPServerForRequest,
   verifyAuth,
   getAccessTokens,
   resolveOrgIdFromDomain,
   buildLinkArtifacts,
+  selectMcpDirectoryWidgetReadActions,
+  selectMcpDirectoryWidgetWriteActions,
 };
 export type { MCPConfig, MCPCallerIdentity, MCPRequestMeta };
 
-// ---------------------------------------------------------------------------
-// Runtime detection — Node fast-path vs. web-standard fallback
-// ---------------------------------------------------------------------------
-
-/**
- * Resolve the underlying Node `http` req/res pair if (and only if) we're
- * running on a real Node HTTP server (local dev, `node` Nitro preset). On the
- * web-standard runtime (Nitro 3 / Netlify web runtime, Cloudflare, Deno, Bun)
- * BOTH of these are undefined — that's the signal to take the web fallback
- * instead of returning 501.
- */
-function getNodeReqRes(event: H3Event): {
-  nodeReq: any | undefined;
-  nodeRes: any | undefined;
-} {
-  const e = event as any;
-  const nodeReq = e.node?.req ?? e.req?.runtime?.node?.req;
-  const nodeRes = e.node?.res ?? e.req?.runtime?.node?.res;
-  return { nodeReq, nodeRes };
-}
-
-function shouldUseNodeFastPath(event: H3Event): boolean {
-  if (process.env.AGENT_NATIVE_MCP_NODE_FAST_PATH !== "1") return false;
-  const { nodeReq, nodeRes } = getNodeReqRes(event);
-  return Boolean(nodeReq && nodeRes);
-}
-
-/**
- * Derive the request origin + the markdown deep-link target from the inbound
- * headers. Identical logic for both the Node and web paths so the absolute
- * deep-link URLs in tool results are computed the same way regardless of
- * runtime.
- */
 function deriveRequestMeta(event: H3Event): MCPRequestMeta {
   const forwardedProto = getRequestHeader(event, "x-forwarded-proto");
   const host =
@@ -95,6 +83,9 @@ function deriveRequestMeta(event: H3Event): MCPRequestMeta {
   const clientName = getRequestHeader(event, "user-agent")?.trim() || undefined;
   const clientHint =
     getRequestHeader(event, "x-agent-native-mcp-client")?.trim() || undefined;
+  const mcpRetryToken =
+    getRequestHeader(event, "x-agent-native-mcp-retry-token")?.trim() ||
+    undefined;
   const fullCatalogHeader = getRequestHeader(
     event,
     "x-agent-native-mcp-full-catalog",
@@ -103,14 +94,25 @@ function deriveRequestMeta(event: H3Event): MCPRequestMeta {
     fullCatalogHeader === "1" ||
     fullCatalogHeader === "true" ||
     fullCatalogHeader === "yes";
+  const inlineAppsHeader = getRequestHeader(
+    event,
+    "x-agent-native-mcp-inline-apps",
+  )?.toLowerCase();
+  const inlineAppsRequested =
+    inlineAppsHeader === "1" ||
+    inlineAppsHeader === "true" ||
+    inlineAppsHeader === "yes";
   const basePath = getConfiguredAppBasePath();
   return {
     origin,
     ...(basePath ? { basePath } : {}),
     target,
+    transport: "http",
     clientName,
     clientHint,
+    ...(mcpRetryToken ? { mcpRetryToken } : {}),
     ...(fullCatalog ? { fullCatalog } : {}),
+    ...(inlineAppsRequested ? { inlineMcpApps: true } : {}),
   };
 }
 
@@ -130,20 +132,11 @@ function isLoopbackOrigin(origin: string | undefined): boolean {
   }
 }
 
-/**
- * Reconstruct a Web Standard `Request` for the web-standard MCP transport.
- *
- * On the web runtime h3 v2 exposes the real web `Request` as `event.req`; we
- * prefer it (its `method` / `headers` are exactly what the client sent). But
- * the framework middleware rewrites `event.req.url` when it strips a mount
- * prefix, and the transport reads `req.method` + `req.headers` (never the
- * body — we pass that via `parsedBody`), so we always synthesize a clean
- * `Request` with the verified method + a fresh `Headers` copy. The URL is
- * cosmetic for the SDK (it only does `new URL(req.url)` for `requestInfo`),
- * so a best-effort absolute URL derived from the inbound host is sufficient
- * and never throws.
- */
-function buildWebRequest(event: H3Event, method: string): Request {
+function buildWebRequest(
+  event: H3Event,
+  method: string,
+  routePath = MCP_PUBLIC_ROUTE_PREFIX,
+): Request {
   const src = (event as any).req as Request | undefined;
 
   const headers = new Headers();
@@ -161,11 +154,6 @@ function buildWebRequest(event: H3Event, method: string): Request {
     }
   }
 
-  // The SDK requires Accept + Content-Type to advertise both JSON and SSE on
-  // a POST. Real MCP clients (Claude Code, `agent-native connect`) always
-  // send these; we never inject/alter them — if they're absent the SDK
-  // returns its spec-mandated 406/415, identical to the Node path.
-
   const host =
     headers.get("x-forwarded-host") || headers.get("host") || "localhost";
   const forwardedProto = headers.get("x-forwarded-proto");
@@ -173,24 +161,18 @@ function buildWebRequest(event: H3Event, method: string): Request {
     forwardedProto?.split(",")[0]?.trim() ||
     (/^(localhost|127\.0\.0\.1)(:|$)/.test(host) ? "http" : "https");
   const basePath = getConfiguredAppBasePath();
-  const url = `${proto}://${host}${basePath}/_agent-native/mcp`;
+  const url = `${proto}://${host}${basePath}${routePath}`;
 
-  // No body here on purpose: the JSON-RPC payload is forwarded via the
-  // transport's `parsedBody` option (the same mechanism the Node transport
-  // uses), so the request stream is never read twice.
   return new Request(url, { method, headers });
 }
 
-/**
- * Build an actionable JSON body for the 401 response. OAuth-capable clients
- * follow the `WWW-Authenticate` header automatically, but the JSON body is what
- * a human or a coding agent reads when a tool call comes back unauthorized — so
- * spell out the exact remediation: the `agent-native connect <url>` command and
- * the authorize/metadata URL. Keeping the legacy `error: "Unauthorized"` field
- * means existing clients that only check that field still work.
- */
-function buildUnauthorizedBody(event: H3Event): {
+function buildUnauthorizedBody(
+  event: H3Event,
+  routePath = MCP_PUBLIC_ROUTE_PREFIX,
+  refusal?: BearerCredentialRefusal,
+): {
   error: string;
+  reason?: BearerCredentialRefusal;
   message: string;
   authenticate: {
     command?: string;
@@ -201,8 +183,11 @@ function buildUnauthorizedBody(event: H3Event): {
   };
 } {
   const issuer = getMcpOAuthIssuer(event);
-  const mcpUrl = getMcpOAuthResource(event);
-  const resourceMetadataUrl = getMcpOAuthProtectedResourceMetadataUrl(event);
+  const mcpUrl = getMcpOAuthResource(event, routePath);
+  const resourceMetadataUrl = getMcpOAuthProtectedResourceMetadataUrl(
+    event,
+    routePath,
+  );
   const command = issuer
     ? `npx -y @agent-native/core@latest reconnect ${issuer}`
     : undefined;
@@ -210,9 +195,9 @@ function buildUnauthorizedBody(event: H3Event): {
     ? `npx @agent-native/core@latest connect ${issuer}`
     : undefined;
   const authorizeUrl = issuer
-    ? `${issuer}/_agent-native/mcp/oauth/authorize`
+    ? `${issuer}${MCP_PUBLIC_ROUTE_PREFIX}/oauth/authorize`
     : undefined;
-  const message = command
+  const instructions = command
     ? `Authentication required. Run \`${command}\` to re-authenticate this ` +
       `MCP connector without reinstalling it (or, in a Claude Code host, ` +
       `run /mcp and choose Authenticate), then retry. For first-time ` +
@@ -221,7 +206,10 @@ function buildUnauthorizedBody(event: H3Event): {
       "then retry.";
   return {
     error: "Unauthorized",
-    message,
+    ...(refusal ? { reason: refusal } : {}),
+    message: refusal
+      ? `${describeBearerCredentialRefusal(refusal)} ${instructions}`
+      : instructions,
     authenticate: {
       ...(command ? { command } : {}),
       ...(firstTimeCommand ? { firstTimeCommand } : {}),
@@ -232,6 +220,76 @@ function buildUnauthorizedBody(event: H3Event): {
   };
 }
 
+const loggedDirectoryProfileFailures = new Set<string>();
+const directoryLogMethods = new Set([
+  "initialize",
+  "notifications/initialized",
+  "server/discover",
+  "tools/list",
+  "tools/call",
+  "resources/list",
+  "resources/templates/list",
+  "resources/read",
+  "prompts/list",
+  "prompts/get",
+  "ping",
+]);
+
+function directoryLogMethod(body: unknown): string | undefined {
+  if (!body || typeof body !== "object") return undefined;
+  if (Array.isArray(body)) return "batch";
+  const method = (body as { method?: unknown }).method;
+  if (typeof method !== "string") return "other";
+  return directoryLogMethods.has(method) ? method : "other";
+}
+
+function responseStatusFromEvent(event: H3Event): number {
+  const status =
+    event.res?.status ??
+    (event as any).node?.res?.statusCode ??
+    (event as any)._status;
+  return typeof status === "number" && Number.isInteger(status) && status > 0
+    ? status
+    : 200;
+}
+
+function responseStatusFromError(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const status = error as { status?: unknown; statusCode?: unknown };
+  for (const candidate of [status.status, status.statusCode]) {
+    if (
+      typeof candidate === "number" &&
+      Number.isInteger(candidate) &&
+      candidate >= 100 &&
+      candidate <= 599
+    ) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function directoryProfileUnavailable(
+  event: H3Event,
+  validationError: McpDirectoryProfileValidationError,
+): { error: string; message: string } {
+  const failureKey = `${validationError.code}\0${validationError.message}`;
+  if (!loggedDirectoryProfileFailures.has(failureKey)) {
+    loggedDirectoryProfileFailures.add(failureKey);
+    console.error(
+      "[mcp] MCP directory profile validation failed:",
+      validationError,
+    );
+  }
+  setResponseStatus(event, 503);
+  setResponseHeader(event, "Cache-Control", "no-store");
+  return {
+    error: "MCP_DIRECTORY_PROFILE_INVALID",
+    message:
+      "The MCP directory is unavailable because its profile or widget origin is invalid.",
+  };
+}
+
 // ---------------------------------------------------------------------------
 // handleMcpRequest — runtime-agnostic MCP request handler
 // ---------------------------------------------------------------------------
@@ -239,234 +297,271 @@ function buildUnauthorizedBody(event: H3Event): {
 /**
  * Handle a single `{routePrefix}/mcp` request on either runtime.
  *
- * - **Default path:** build the SAME MCP `Server`
- *   from the SAME config + identity, drive it through the SDK's
- *   `WebStandardStreamableHTTPServerTransport` (which the Node transport is
- *   itself just a thin wrapper around), and return the resulting Web
- *   `Response` as a normal h3 return value. This is used for Nitro local dev
- *   too; the direct Node writer can otherwise race h3 and double-write.
- * - **Opt-in Node fast-path:** set `AGENT_NATIVE_MCP_NODE_FAST_PATH=1` to
- *   delegate directly to the SDK's `StreamableHTTPServerTransport`.
+ * Builds one request-scoped MCP `Server` from the verified caller identity and
+ * drives it through the SDK's v2 `createMcpHandler`. That entry serves native
+ * 2026-07-28 envelopes and stateless 2025-era traffic from the same factory,
+ * so protocol generations cannot drift apart.
  *
- * Auth, the `runWithRequestContext` identity wrap, the deep-link `_meta` /
- * markdown append, `requestMeta` origin/target derivation and the stateless
- * semantics are IDENTICAL on both paths because both build the same server
- * via `createMCPServerForRequest` and both transports funnel into the same
- * `WebStandardStreamableHTTPServerTransport.handleRequest(webRequest, {
- * parsedBody })` with the same options.
+ * The handler is Web Standard on every runtime. H3 owns the Node response when
+ * one exists, avoiding the double-write race from a transport writing directly
+ * to `node.res`.
  *
  * Returns:
  *   - `undefined` when the request targets a sub-route (so management/status
  *     routes mounted under `/_agent-native/mcp/*` handle it themselves) — the
  *     h3 mount falls through to the next handler.
- *   - a Web `Response` (web fallback) or a string/object (Node path /
- *     auth-error path) otherwise. The Node path also sets `_handled` so h3
- *     doesn't double-write.
+ *   - a Web `Response` or an auth-error object otherwise.
  */
-export async function handleMcpRequest(
+async function handleMcpRequestInternal(
   event: H3Event,
   config: MCPConfig,
+  routePath = MCP_PUBLIC_ROUTE_PREFIX,
+  onMcpMethod?: (method: string) => void,
 ): Promise<
   Response | string | { error: string } | Record<string, unknown> | undefined
 > {
   const pathname = event.url?.pathname || "/";
   const subpath = pathname.replace(/^\/+/, "").replace(/\/+$/, "");
   if (subpath) {
-    // Let management/status routes mounted under /_agent-native/mcp/* handle
-    // their own requests instead of treating them as MCP protocol traffic.
     return undefined;
   }
 
   const method = getMethod(event);
 
-  // Auth check — extracts the caller's identity from the JWT (`sub`), or, on
-  // the static-token / dev-open path, from the forwarded
-  // `X-Agent-Native-Owner-Email` hint the stdio proxy sends (the
-  // `agent-native mcp install` flow). Without this the install flow would run
-  // every tool unscoped (userEmail === undefined).
   const authHeader = getRequestHeader(event, "authorization");
   const ownerEmailHeader = getRequestHeader(
     event,
     "x-agent-native-owner-email",
   );
-  // Gate header-only dev-open on the REAL socket peer, never a parsed
-  // `Host` header (client-controlled — an attacker could send
-  // `Host: localhost`). A deployed app missing A2A_SECRET / ACCESS_TOKEN
-  // must fail closed rather than trust a spoofable owner-email header that
-  // `fullSurface` would otherwise escalate to the full mutating surface.
   const requestMeta = deriveRequestMeta(event);
-  const authResult = await verifyAuth(authHeader, ownerEmailHeader, {
-    allowDevOpen:
-      isLoopbackRequest(event) && isLoopbackOrigin(requestMeta.origin),
-    resourceUrl: getMcpOAuthAudiences(event),
-  });
+  const hasLocalOwnerHint = Boolean(ownerEmailHeader?.trim());
+  const directoryProfile =
+    routePath === MCP_DIRECTORY_ROUTE_PREFIX
+      ? config.directoryProfile
+      : undefined;
+  if (routePath === MCP_DIRECTORY_ROUTE_PREFIX && !directoryProfile) {
+    setResponseStatus(event, 404);
+    return { error: "Not found" };
+  }
+  const requestConfig = directoryProfile
+    ? {
+        ...config,
+        catalogMode: "directory" as const,
+        connectorCatalog: directoryProfile.connectorCatalog,
+        instructions: directoryProfile.instructions,
+        keyToolNames: directoryProfile.keyToolNames,
+        widgetDomain:
+          directoryProfile.widgetDomain ??
+          config.widgetDomain ??
+          requestMeta.origin,
+      }
+    : config;
+  let authResult: Awaited<ReturnType<typeof verifyAuth>>;
+  try {
+    authResult = await verifyAuth(authHeader, ownerEmailHeader, {
+      allowDevOpen:
+        isLoopbackRequest(event) &&
+        isLoopbackOrigin(requestMeta.origin) &&
+        (hasLocalOwnerHint || getAppConfig().mcp.allowDevOpen),
+      resourceUrl: getMcpOAuthAudiences(event, routePath),
+      requestOrigin: getOrigin(event),
+    });
+  } catch (error) {
+    if (!(error instanceof McpIdentityVerificationUnavailableError))
+      throw error;
+    setResponseStatus(event, 503);
+    setResponseHeader(event, "Retry-After", "5");
+    return {
+      error: "Service Unavailable",
+      message: CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+    };
+  }
+  if (!authResult.authed && authResult.unavailable) {
+    // The token is valid but its org membership could not be checked. No auth
+    // challenge: re-authenticating would not help, and the client must keep
+    // its tokens and retry.
+    setResponseStatus(event, 503);
+    setResponseHeader(event, "Retry-After", "5");
+    return {
+      error: "Service Unavailable",
+      message: CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+    };
+  }
   if (!authResult.authed) {
     setResponseStatus(event, 401);
-    setResponseHeader(event, "WWW-Authenticate", buildMcpOAuthChallenge(event));
-    return buildUnauthorizedBody(event);
-  }
-
-  // Stateless mode: only POST is meaningful. A stateless, per-request transport
-  // on serverless cannot keep the standalone GET SSE stream (server->client
-  // channel) alive across invocations — once the function returns and freezes,
-  // that stream dies and the client reports "session expired" / "not
-  // connected". The spec lets a server that offers no GET stream answer 405, so
-  // the client falls back to plain POST request/response. Reject GET here
-  // instead of letting the SDK open a doomed stream.
-  if (method === "DELETE") {
-    setResponseStatus(event, 204);
-    return "";
-  }
-
-  if (method !== "POST") {
-    setResponseStatus(event, 405);
-    return { error: "Method not allowed" };
-  }
-
-  // Read body for POST (GET has no body). Read it via the h3 helper exactly
-  // once; both transports accept it as a pre-parsed body so the request
-  // stream is never consumed twice.
-  const body = method === "POST" ? await readBody(event) : undefined;
-
-  // Optional diagnostics for host capability negotiation. Keep disabled by
-  // default because initialize payloads can include client-specific metadata.
-  if (process.env.MCP_DEBUG_INIT && body) {
-    const msgs = Array.isArray(body) ? body : [body];
-    const init = msgs.find(
-      (m): m is { params?: { capabilities?: unknown; clientInfo?: unknown } } =>
-        typeof m === "object" &&
-        m !== null &&
-        (m as { method?: unknown }).method === "initialize",
+    setResponseHeader(
+      event,
+      "WWW-Authenticate",
+      buildMcpOAuthChallenge(event, routePath, authResult.refusal),
     );
-    if (init) {
-      console.error(
-        "[MCP_DEBUG_INIT] clientInfo=",
-        JSON.stringify(init.params?.clientInfo),
-        "capabilities=",
-        JSON.stringify(init.params?.capabilities),
-      );
-    }
+    return buildUnauthorizedBody(event, routePath, authResult.refusal);
   }
 
-  // Per-request stateless transport + server. Both runtimes build the SAME
-  // server from the SAME config + verified identity + request meta, so
-  // tools/list, tools/call, and the deep-link `_meta` are identical. A
-  // connected real caller (connect-minted token / `mcp install` /
-  // ACCESS_TOKEN / production) gets the full action surface even in local
-  // dev; unauthenticated dev probes stay sparse. See `external-agents` skill.
-  const server = await createMCPServerForRequest(config, authResult.identity, {
+  const body = method === "POST" ? await readBody(event) : undefined;
+  onMcpMethod?.(directoryLogMethod(body) ?? method);
+
+  const initializeRequest = body
+    ? (Array.isArray(body) ? body : [body]).find(
+        (
+          m,
+        ): m is {
+          params?: {
+            capabilities?: unknown;
+            clientInfo?: { name?: unknown; version?: unknown };
+            protocolVersion?: unknown;
+          };
+        } =>
+          typeof m === "object" &&
+          m !== null &&
+          (m as { method?: unknown }).method === "initialize",
+      )
+    : undefined;
+
+  if (getAppConfig().observability.mcpDebugInitialize && initializeRequest) {
+    console.error(
+      "[MCP_DEBUG_INIT] clientInfo=",
+      JSON.stringify(initializeRequest.params?.clientInfo),
+      "capabilities=",
+      JSON.stringify(initializeRequest.params?.capabilities),
+    );
+  }
+
+  const serverRequestMeta: MCPRequestMeta = {
     ...requestMeta,
+    ...(requestConfig.createLocalAgentTaskClient
+      ? {
+          localAgentTaskClient: requestConfig.createLocalAgentTaskClient(event),
+        }
+      : {}),
     fullSurface: authResult.fullSurface === true,
-    // When the caller minted their token with --full-catalog (catalog_scope:
-    // "full" JWT claim), bypass the connector-catalog tier filter.
+    inlineMcpApps:
+      requestMeta.inlineMcpApps === true &&
+      authResult.identity?.firstPartyMcp === true
+        ? true
+        : undefined,
     ...(authResult.fullCatalog === true ? { fullCatalog: true } : {}),
-  });
-
-  if (shouldUseNodeFastPath(event)) {
-    const { nodeReq, nodeRes } = getNodeReqRes(event);
-    // ---- Opt-in Node fast-path ---------------------------------------------
-    const { StreamableHTTPServerTransport } =
-      await import("@modelcontextprotocol/sdk/server/streamableHttp.js");
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless
-      // Return JSON request/response instead of SSE. A stateless serverless
-      // instance can freeze right after returning a streaming Response, before
-      // the deferred SSE result event is flushed — the client then never gets
-      // the tools/call result and reports "session expired". JSON mode awaits
-      // the result inside the request lifecycle and returns it as one body.
-      enableJsonResponse: true,
-    });
-    await server.connect(transport);
+  };
+  if (directoryProfile) {
     try {
-      // The SDK transport writes directly to the Node response. Node-only by
-      // construction; we only reach here when real Node req/res exist.
-      await transport.handleRequest(nodeReq, nodeRes, body);
-    } catch (err: any) {
-      // The SDK transport writes directly to the Node response. If the socket
-      // is already closed/ended (client disconnected, or the host stream
-      // layer also flushed), Node throws ERR_STREAM_WRITE_AFTER_END *after*
-      // the MCP payload was already delivered correctly. Swallow that benign
-      // post-flush write so an external agent disconnecting mid-stream can
-      // never take down the server process; rethrow anything else.
-      if (err?.code !== "ERR_STREAM_WRITE_AFTER_END") throw err;
-      if (process.env.DEBUG)
-        console.log(
-          "[mcp] ignored post-flush ERR_STREAM_WRITE_AFTER_END (client disconnected)",
-        );
+      validateMcpDirectoryProfile(
+        requestConfig,
+        selectMcpActionSurface(requestConfig, serverRequestMeta),
+      );
+      validateMcpDirectoryWidgetDomain(requestConfig.widgetDomain);
+    } catch (error) {
+      if (!(error instanceof McpDirectoryProfileValidationError)) throw error;
+      return directoryProfileUnavailable(event, error);
     }
-    // Prevent H3 from double-writing the response
-    (event as any)._handled = true;
-    return undefined;
+  }
+  if (initializeRequest) {
+    const clientInfo = initializeRequest.params?.clientInfo;
+    const protocolVersion = initializeRequest.params?.protocolVersion;
+    trackMcpInitialize({
+      source: "http",
+      serverName: requestConfig.name,
+      serverVersion: requestConfig.version ?? "1.0.0",
+      ...(requestConfig.appId ? { appId: requestConfig.appId } : {}),
+      ...(typeof clientInfo?.name === "string"
+        ? { clientName: clientInfo.name }
+        : {}),
+      ...(typeof clientInfo?.version === "string"
+        ? { clientVersion: clientInfo.version }
+        : {}),
+      ...(requestMeta.clientName
+        ? { clientUserAgent: requestMeta.clientName }
+        : {}),
+      ...(typeof protocolVersion === "string" ? { protocolVersion } : {}),
+      ...(authResult.identity?.userEmail
+        ? { userId: authResult.identity.userEmail }
+        : {}),
+    });
   }
 
-  // ---- Web-standard response path (Nitro local dev, Netlify web runtime, CF,
-  // Deno, Bun) ---------------------------------------------------------------
-  //
-  // `StreamableHTTPServerTransport` is itself just a thin wrapper that
-  // converts the Node req/res to a web Request/Response and delegates to
-  // `WebStandardStreamableHTTPServerTransport.handleRequest(webRequest, {
-  // parsedBody })`. Using the web transport directly with the SAME options +
-  // the same pre-read `parsedBody` produces byte-identical protocol output
-  // (including the deep-link `_meta` built inside createMCPServerForRequest),
-  // and works on every web runtime because it returns a Web `Response`
-  // (JSON for request/response, or an SSE `ReadableStream` body which h3
-  // streams natively).
-  const { WebStandardStreamableHTTPServerTransport } =
-    await import("@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js");
-  const transport = new WebStandardStreamableHTTPServerTransport({
-    sessionIdGenerator: undefined, // stateless — same as the Node path
-    // JSON request/response (not SSE) — see the Node fast-path note above.
-    // This is the serverless-safe framing: the result is computed and returned
-    // within the request, never pushed onto a stream after the instance froze.
-    enableJsonResponse: true,
-  });
-  await server.connect(transport);
-  const webRequest = buildWebRequest(event, method);
-  // `parsedBody: undefined` would make the SDK try to read `req.json()`; our
-  // synthesized request has no body, so only pass the option for POST (where
-  // we actually have a parsed body). For GET the transport reads no body.
-  const response = await transport.handleRequest(
+  const { createMcpHandler } = await import("@modelcontextprotocol/server");
+  const handler = createMcpHandler(
+    () =>
+      createMCPServerForRequest(
+        requestConfig,
+        authResult.identity,
+        serverRequestMeta,
+      ),
+    {
+      legacy: "stateless",
+      responseMode: "auto",
+    },
+  );
+  const webRequest = buildWebRequest(event, method, routePath);
+  return handler.fetch(
     webRequest,
     method === "POST" ? { parsedBody: body } : undefined,
   );
-  return response;
 }
 
-// ---------------------------------------------------------------------------
-// mountMCP — register MCP Streamable HTTP endpoint on H3/Nitro
-// ---------------------------------------------------------------------------
+export async function handleMcpRequest(
+  event: H3Event,
+  config: MCPConfig,
+  routePath = MCP_PUBLIC_ROUTE_PREFIX,
+): Promise<
+  Response | string | { error: string } | Record<string, unknown> | undefined
+> {
+  const pathname = event.url?.pathname || "/";
+  const subpath = pathname.replace(/^\/+/, "").replace(/\/+$/, "");
+  const isDirectoryRequest =
+    routePath === MCP_DIRECTORY_ROUTE_PREFIX && !subpath;
+  const startedAt = performance.now();
+  let method = getMethod(event);
+  let status = 500;
 
-/**
- * Mount an MCP remote server on an H3/Nitro app.
- *
- * Endpoint: `{routePrefix}/mcp` (default `/_agent-native/mcp`)
- *
- * Uses stateless Streamable HTTP transport — no in-memory sessions, JSON
- * request/response (no SSE), and no standalone GET stream, so it survives
- * serverless instances that freeze between invocations (SSE framing there
- * drops the result and clients report "session expired"). Runtime-agnostic: a real Node
- * server uses the SDK's Node transport; the web-standard runtime (Nitro 3 /
- * Netlify web runtime, Cloudflare, Deno, Bun) uses the SDK's web-standard
- * transport. Both build the same server and produce identical JSON-RPC
- * output.
- *
- * Auth: Bearer token matching ACCESS_TOKEN/ACCESS_TOKENS or JWT via A2A_SECRET.
- * No auth required when neither is configured (dev mode).
- */
+  try {
+    const result = await handleMcpRequestInternal(
+      event,
+      config,
+      routePath,
+      (requestMethod) => {
+        method = requestMethod;
+      },
+    );
+    status =
+      result instanceof Response
+        ? result.status
+        : responseStatusFromEvent(event);
+    return result;
+  } catch (error) {
+    status = responseStatusFromError(error) ?? 500;
+    throw error;
+  } finally {
+    if (isDirectoryRequest) {
+      console.info("[mcp:directory] request", {
+        method,
+        status,
+        durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      });
+    }
+  }
+}
+
 export function mountMCP(
   nitroApp: any,
   config: MCPConfig,
   routePrefix = "/_agent-native",
 ): void {
-  getH3App(nitroApp).use(
-    `${routePrefix}/mcp`,
-    defineEventHandler(async (event) => {
-      return handleMcpRequest(event as H3Event, config);
-    }),
-  );
+  const routePaths =
+    routePrefix === "/_agent-native"
+      ? [...MCP_ROUTE_PREFIXES]
+      : [joinMcpRoute(routePrefix, "/mcp")];
+  if (config.directoryProfile) routePaths.unshift(MCP_DIRECTORY_ROUTE_PREFIX);
+
+  for (const routePath of routePaths) {
+    getH3App(nitroApp).use(
+      routePath,
+      defineEventHandler(async (event) => {
+        return handleMcpRequest(event as H3Event, config, routePath);
+      }),
+    );
+  }
 
   if (process.env.DEBUG)
     console.log(
-      `[mcp] Mounted MCP server at ${routePrefix}/mcp (${Object.keys(config.actions).length} tools${config.askAgent ? " + ask-agent" : ""})`,
+      `[mcp] Mounted MCP server at ${routePaths.join(" and ")} (${Object.keys(config.actions).length} tools${config.askAgent ? " + ask-agent" : ""})`,
     );
 }

@@ -1,12 +1,6 @@
-import {
-  useState,
-  useRef,
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-} from "react";
-import { createPortal } from "react-dom";
-import { useNavigate } from "react-router";
+import { useT } from "@agent-native/core/client/i18n";
+import { mailSettingsRoute } from "@shared/settings-navigation";
+import type { Alias } from "@shared/types";
 import {
   IconX,
   IconUsersGroup,
@@ -14,14 +8,18 @@ import {
   IconArrowsDiagonal,
   IconPlus,
 } from "@tabler/icons-react";
-import { cn } from "@/lib/utils";
-import { useContacts, type Contact } from "@/hooks/use-emails";
-import { useAliases, useCreateAlias } from "@/hooks/use-aliases";
 import {
-  isAliasToken,
-  aliasIdFromToken,
-  ALIAS_PREFIX,
-} from "@/lib/alias-utils";
+  useState,
+  useRef,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useId,
+} from "react";
+import { createPortal } from "react-dom";
+import { useNavigate } from "react-router";
+
 import {
   Dialog,
   DialogContent,
@@ -31,27 +29,32 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import type { Alias } from "@shared/types";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useAliases, useCreateAlias } from "@/hooks/use-aliases";
+import { useContacts, type Contact } from "@/hooks/use-emails";
+import {
+  isAliasToken,
+  aliasIdFromToken,
+  ALIAS_PREFIX,
+} from "@/lib/alias-utils";
+import { getActiveDescendantId } from "@/lib/combobox-aria";
+import { cn } from "@/lib/utils";
 
-/** Which header field a RecipientInput represents — used for cross-field drag. */
 export type RecipientField = "to" | "cc" | "bcc";
 
-/** DataTransfer MIME used when dragging a recipient chip between To/Cc/Bcc. */
 const RECIPIENT_DRAG_MIME = "application/x-mail-recipient";
 
 interface RecipientInputProps {
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
+  ariaLabel?: string;
   autoFocus?: boolean;
-  /** Field identity; enables dragging chips between To/Cc/Bcc when paired with onMoveRecipient. */
   field?: RecipientField;
-  /** Move a recipient token from one field to another (handled by the parent that owns all fields). */
   onMoveRecipient?: (
     value: string,
     from: RecipientField,
@@ -70,21 +73,12 @@ export function serializeRecipients(recipients: string[]): string {
   return recipients.join(", ");
 }
 
-// Permissive single-address check — good enough to decide whether a typed/pasted
-// token should auto-lock into a chip on blur. Send-time validation is authoritative.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function isValidEmail(value: string): boolean {
   return EMAIL_RE.test(value.trim());
 }
 
-/**
- * Splits a pasted blob of recipients (comma/semicolon/newline separated) into the
- * valid emails to add (deduped, case-insensitively, against `existing` and each
- * other) plus any non-email leftover to keep in the input. Returns `null` when the
- * paste should not be intercepted (single token, or nothing email-like) so the
- * caller can fall through to normal paste behavior.
- */
 export function extractPastedRecipients(
   text: string,
   existing: string[],
@@ -129,8 +123,6 @@ export function computeRecipientMove(
   };
 }
 
-// ─── AliasPopover ─────────────────────────────────────────────────────────────
-
 interface AliasPopoverProps {
   alias: Alias;
   anchorEl: HTMLElement;
@@ -144,6 +136,7 @@ function AliasPopover({
   onClose,
   onExpand,
 }: AliasPopoverProps) {
+  const t = useT();
   const navigate = useNavigate();
   const panelRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ top: 0, left: 0 });
@@ -156,7 +149,6 @@ function AliasPopover({
     });
   }, [anchorEl]);
 
-  // Close on outside click
   useEffect(() => {
     const handleClick = (e: MouseEvent) => {
       if (
@@ -172,7 +164,9 @@ function AliasPopover({
   }, [anchorEl, onClose]);
 
   const handleEdit = () => {
-    navigate(`/settings?alias=${alias.id}`);
+    void navigate(
+      `${mailSettingsRoute("aliases")}?alias=${encodeURIComponent(alias.id)}`,
+    );
     onClose();
   };
 
@@ -184,6 +178,7 @@ function AliasPopover({
   return createPortal(
     <div
       ref={panelRef}
+      data-an-block
       className="fixed z-[9999] w-72 rounded-xl border border-border bg-popover shadow-xl"
       style={{ top: pos.top, left: pos.left }}
     >
@@ -194,7 +189,9 @@ function AliasPopover({
           {alias.name}
         </span>
         <span className="rounded-full bg-indigo-500/15 px-2 py-0.5 text-[11px] font-medium text-indigo-300">
-          {alias.emails.length} recipients
+          {t("mail.recipients.recipientCount", {
+            count: alias.emails.length,
+          })}
         </span>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -206,7 +203,7 @@ function AliasPopover({
               <IconPencil className="size-3.5" />
             </button>
           </TooltipTrigger>
-          <TooltipContent>Edit alias</TooltipContent>
+          <TooltipContent>{t("mail.recipients.editAlias")}</TooltipContent>
         </Tooltip>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -218,7 +215,9 @@ function AliasPopover({
               <IconArrowsDiagonal className="size-3.5" />
             </button>
           </TooltipTrigger>
-          <TooltipContent>Expand to individual emails</TooltipContent>
+          <TooltipContent>
+            {t("mail.recipients.expandToIndividualEmails")}
+          </TooltipContent>
         </Tooltip>
       </div>
       {/* Email list */}
@@ -242,14 +241,13 @@ function AliasPopover({
   );
 }
 
-// ─── SaveAliasModal ───────────────────────────────────────────────────────────
-
 interface SaveAliasModalProps {
   emails: string[];
   onClose: () => void;
 }
 
 function SaveAliasModal({ emails, onClose }: SaveAliasModalProps) {
+  const t = useT();
   const [name, setName] = useState("");
   const createAlias = useCreateAlias();
 
@@ -263,9 +261,13 @@ function SaveAliasModal({ emails, onClose }: SaveAliasModalProps) {
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="max-w-sm">
         <DialogHeader>
-          <DialogTitle className="text-[14px]">Save as alias</DialogTitle>
+          <DialogTitle className="text-[14px]">
+            {t("mail.recipients.saveAsAlias")}
+          </DialogTitle>
           <DialogDescription className="text-[12px]">
-            Create a reusable group of {emails.length} recipients
+            {t("mail.recipients.createReusableGroup", {
+              count: emails.length,
+            })}
           </DialogDescription>
         </DialogHeader>
         <Input
@@ -274,10 +276,10 @@ function SaveAliasModal({ emails, onClose }: SaveAliasModalProps) {
           value={name}
           onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") handleSave();
+            if (e.key === "Enter") void handleSave();
             e.stopPropagation();
           }}
-          placeholder="Alias name"
+          placeholder={t("mail.recipients.aliasName")}
         />
         <DialogFooter>
           <button
@@ -285,7 +287,7 @@ function SaveAliasModal({ emails, onClose }: SaveAliasModalProps) {
             onClick={onClose}
             className="rounded-lg px-3 py-1.5 text-[13px] text-muted-foreground hover:bg-accent hover:text-foreground"
           >
-            Cancel
+            {t("mail.compose.cancel")}
           </button>
           <button
             type="button"
@@ -293,7 +295,9 @@ function SaveAliasModal({ emails, onClose }: SaveAliasModalProps) {
             disabled={!name.trim() || createAlias.isPending}
             className="rounded-lg bg-indigo-600 px-3 py-1.5 text-[13px] font-medium text-white hover:opacity-90 disabled:opacity-40"
           >
-            {createAlias.isPending ? "Saving…" : "Save"}
+            {createAlias.isPending
+              ? t("mail.recipients.saving")
+              : t("mail.integrations.save")}
           </button>
         </DialogFooter>
       </DialogContent>
@@ -301,16 +305,18 @@ function SaveAliasModal({ emails, onClose }: SaveAliasModalProps) {
   );
 }
 
-// ─── RecipientInput ───────────────────────────────────────────────────────────
-
 export function RecipientInput({
   value,
   onChange,
   placeholder,
+  ariaLabel,
   autoFocus,
   field,
   onMoveRecipient,
 }: RecipientInputProps) {
+  const t = useT();
+  const recipientInstanceId = useId().replace(/:/g, "");
+  const suggestionListId = `mail-recipient-suggestions-${recipientInstanceId}`;
   const [inputValue, setInputValue] = useState("");
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -329,43 +335,51 @@ export function RecipientInput({
   const { data: contacts = [] } = useContacts();
   const { data: aliases = [] } = useAliases();
 
-  const recipients = parseRecipients(value);
+  const recipients = useMemo(() => parseRecipients(value), [value]);
 
   const query = inputValue.toLowerCase().trim();
 
-  const filteredAliases = query
-    ? aliases.filter((a) => {
-        const alreadyAdded = recipients.includes(`${ALIAS_PREFIX}${a.id}`);
-        return !alreadyAdded && a.name.toLowerCase().includes(query);
-      })
-    : [];
-
-  // Contacts come pre-sorted by frequency from the server (SQL-tracked send counts)
-  const filteredContacts = query
-    ? contacts.filter((c) => {
-        const alreadyAdded = recipients.some(
-          (r) => r.toLowerCase() === c.email.toLowerCase(),
-        );
-        return (
-          !alreadyAdded &&
-          (c.name.toLowerCase().includes(query) ||
-            c.email.toLowerCase().includes(query))
-        );
-      })
-    : [];
-
-  // Combined for keyboard nav — aliases first (sliced to match dropdown rendering)
-  const aliasSlice = filteredAliases.slice(0, 4);
-  const contactSlice = filteredContacts.slice(
-    0,
-    8 - Math.min(filteredAliases.length, 4),
+  const filteredAliases = useMemo(
+    () =>
+      query
+        ? aliases.filter((a) => {
+            const alreadyAdded = recipients.includes(`${ALIAS_PREFIX}${a.id}`);
+            return !alreadyAdded && a.name.toLowerCase().includes(query);
+          })
+        : [],
+    [query, aliases, value],
   );
-  const allSuggestions: Array<
+
+  const filteredContacts = useMemo(
+    () =>
+      query
+        ? contacts.filter((c) => {
+            const alreadyAdded = recipients.some(
+              (r) => r.toLowerCase() === c.email.toLowerCase(),
+            );
+            return (
+              !alreadyAdded &&
+              (c.name.toLowerCase().includes(query) ||
+                c.email.toLowerCase().includes(query))
+            );
+          })
+        : [],
+    [query, contacts, value],
+  );
+
+  const allSuggestions = useMemo((): Array<
     { type: "alias"; item: Alias } | { type: "contact"; item: Contact }
-  > = [
-    ...aliasSlice.map((a) => ({ type: "alias" as const, item: a })),
-    ...contactSlice.map((c) => ({ type: "contact" as const, item: c })),
-  ];
+  > => {
+    const aliasSlice = filteredAliases.slice(0, 4);
+    const contactSlice = filteredContacts.slice(
+      0,
+      8 - Math.min(filteredAliases.length, 4),
+    );
+    return [
+      ...aliasSlice.map((a) => ({ type: "alias" as const, item: a })),
+      ...contactSlice.map((c) => ({ type: "contact" as const, item: c })),
+    ];
+  }, [filteredAliases, filteredContacts]);
 
   const hasSuggestions = allSuggestions.length > 0;
 
@@ -433,8 +447,6 @@ export function RecipientInput({
     [recipients, aliases, onChange],
   );
 
-  // Lock a pasted/typed-but-unconfirmed address into a chip when the field loses
-  // focus, so a bare paste (no Enter/Tab/comma) isn't silently dropped on send.
   const handleBlur = () => {
     const trimmed = inputValue.trim();
     if (trimmed && isValidEmail(trimmed)) {
@@ -442,25 +454,20 @@ export function RecipientInput({
     }
   };
 
-  // Pasting several addresses at once (comma/semicolon/newline separated) splits
-  // them into chips. A single token with no delimiter falls through to the normal
-  // paste so it lands in the input and locks in on blur.
   const handlePaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
     const result = extractPastedRecipients(
       e.clipboardData.getData("text"),
       recipients,
     );
-    if (!result) return; // single token / nothing email-like → normal paste
+    if (!result) return;
     e.preventDefault();
     if (result.added.length > 0) {
       onChange(serializeRecipients([...recipients, ...result.added]));
     }
-    // Preserve any non-email leftovers (e.g. a half-typed address) in the input.
     setInputValue(result.leftover);
     setShowSuggestions(false);
   };
 
-  // ── Cross-field drag (To ⇄ Cc ⇄ Bcc), Superhuman-style ──────────────────────
   const canDrag = !!field && !!onMoveRecipient;
 
   const handleChipDragStart = (
@@ -485,7 +492,6 @@ export function RecipientInput({
   };
 
   const handleContainerDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
-    // Ignore moves between the container's own children.
     if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
     setIsDropTarget(false);
   };
@@ -544,7 +550,6 @@ export function RecipientInput({
     }
   };
 
-  // Position dropdown relative to container, rendered via portal
   useLayoutEffect(() => {
     if (showSuggestions && hasSuggestions && containerRef.current) {
       const rect = containerRef.current.getBoundingClientRect();
@@ -556,7 +561,6 @@ export function RecipientInput({
     }
   }, [showSuggestions, hasSuggestions, inputValue]);
 
-  // Close suggestions on outside click
   useEffect(() => {
     const handleClick = (e: MouseEvent) => {
       if (
@@ -572,16 +576,27 @@ export function RecipientInput({
     return () => document.removeEventListener("mousedown", handleClick);
   }, []);
 
-  // Clamp selected index when filtered list changes (preserves position when possible)
-  useEffect(() => {
-    setSelectedIndex((prev) => Math.min(prev, allSuggestions.length - 1));
+  useLayoutEffect(() => {
+    if (allSuggestions.length === 0) return;
+    setSelectedIndex((prev) =>
+      Math.min(Math.max(prev, 0), allSuggestions.length - 1),
+    );
   }, [allSuggestions.length]);
+
+  useLayoutEffect(() => {
+    if (!showSuggestions || !hasSuggestions) return;
+    dropdownRef.current
+      ?.querySelector<HTMLElement>('[aria-selected="true"]')
+      ?.scrollIntoView({ block: "nearest" });
+  }, [allSuggestions, hasSuggestions, selectedIndex, showSuggestions]);
 
   const dropdown =
     showSuggestions && hasSuggestions
       ? createPortal(
           <div
             ref={dropdownRef}
+            id={suggestionListId}
+            role="listbox"
             className="fixed z-[9999] overflow-hidden rounded-lg border border-border bg-popover shadow-lg"
             style={{
               top: dropdownPos.top,
@@ -593,6 +608,10 @@ export function RecipientInput({
               {filteredAliases.slice(0, 4).map((alias, i) => (
                 <button
                   key={`alias-${alias.id}`}
+                  data-an-mask
+                  id={`${suggestionListId}-option-${i}`}
+                  role="option"
+                  aria-selected={i === selectedIndex}
                   type="button"
                   className={cn(
                     "flex w-full items-center gap-2.5 rounded-md px-3 py-1.5 text-left text-[13px] transition-colors",
@@ -611,7 +630,9 @@ export function RecipientInput({
                     {alias.name}
                   </span>
                   <span className="shrink-0 text-[11px] text-indigo-400/70">
-                    {alias.emails.length} people
+                    {t("mail.recipients.peopleCount", {
+                      count: alias.emails.length,
+                    })}
                   </span>
                 </button>
               ))}
@@ -622,6 +643,10 @@ export function RecipientInput({
                   return (
                     <button
                       key={contact.email}
+                      data-an-block
+                      id={`${suggestionListId}-option-${globalIndex}`}
+                      role="option"
+                      aria-selected={globalIndex === selectedIndex}
                       type="button"
                       className={cn(
                         "flex w-full items-center justify-between gap-4 rounded-md px-3 py-1.5 text-left text-[13px] transition-colors",
@@ -635,11 +660,17 @@ export function RecipientInput({
                         addRecipient(contact);
                       }}
                     >
-                      <span className="truncate font-medium text-foreground">
+                      <span
+                        data-an-mask
+                        className="truncate font-medium text-foreground"
+                      >
                         {contact.name}
                       </span>
                       {contact.name !== contact.email && (
-                        <span className="truncate text-[12px] text-muted-foreground/60 shrink-0">
+                        <span
+                          data-an-mask
+                          className="truncate text-[12px] text-muted-foreground/60 shrink-0"
+                        >
                           {contact.email}
                         </span>
                       )}
@@ -652,7 +683,6 @@ export function RecipientInput({
         )
       : null;
 
-  // Non-alias recipients for save-as-alias
   const nonAliasRecipients = recipients.filter((r) => !isAliasToken(r));
   const canSaveAlias = nonAliasRecipients.length >= 2;
 
@@ -677,6 +707,7 @@ export function RecipientInput({
             return (
               <span
                 key={`${r}-${i}`}
+                data-an-block
                 draggable={canDrag}
                 onDragStart={
                   canDrag ? (e) => handleChipDragStart(e, r) : undefined
@@ -708,6 +739,9 @@ export function RecipientInput({
                 </button>
                 <button
                   type="button"
+                  aria-label={t("mail.recipients.removeRecipient", {
+                    recipient: displayName,
+                  })}
                   onClick={() => removeRecipient(i)}
                   className="ml-0.5 rounded-sm p-0.5 text-indigo-400 hover:bg-indigo-500/20 transition-colors"
                 >
@@ -720,6 +754,7 @@ export function RecipientInput({
           return (
             <span
               key={`${r}-${i}`}
+              data-an-block
               draggable={canDrag}
               onDragStart={
                 canDrag ? (e) => handleChipDragStart(e, r) : undefined
@@ -732,6 +767,9 @@ export function RecipientInput({
               <span className="max-w-[180px] truncate">{r}</span>
               <button
                 type="button"
+                aria-label={t("mail.recipients.removeRecipient", {
+                  recipient: r,
+                })}
                 onClick={() => removeRecipient(i)}
                 className="ml-0.5 rounded-sm p-0.5 hover:bg-foreground/10 transition-colors"
               >
@@ -742,11 +780,28 @@ export function RecipientInput({
         })}
         <input
           ref={inputRef}
+          id={`${suggestionListId}-input`}
+          data-mail-recipient-input
+          data-recipient-field={field}
+          role="combobox"
+          aria-autocomplete="list"
+          aria-label={ariaLabel ?? placeholder}
+          aria-controls={
+            showSuggestions && hasSuggestions ? suggestionListId : undefined
+          }
+          aria-expanded={showSuggestions && hasSuggestions}
+          aria-activedescendant={getActiveDescendantId(
+            `${suggestionListId}-option-`,
+            showSuggestions && hasSuggestions,
+            selectedIndex,
+            allSuggestions.length,
+          )}
           type="text"
           value={inputValue}
           onChange={(e) => {
             setInputValue(e.target.value);
             setShowSuggestions(true);
+            setSelectedIndex(0);
           }}
           onFocus={() => {
             if (inputValue.trim()) setShowSuggestions(true);
@@ -765,7 +820,7 @@ export function RecipientInput({
             className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground/35 transition-colors hover:text-muted-foreground/60"
           >
             <IconPlus className="size-3" />
-            Save as alias
+            {t("mail.recipients.saveAsAlias")}
           </button>
         )}
       </div>

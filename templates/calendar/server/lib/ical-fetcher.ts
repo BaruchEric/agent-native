@@ -1,24 +1,13 @@
-import type { CalendarEvent } from "../../shared/api.js";
 import { ssrfSafeFetch } from "@agent-native/core/extensions/url-safety";
 import { isBlockedToolUrl } from "@agent-native/core/tools/url-safety";
 
-/** Convert a webcal:// URL to https:// */
+import type { CalendarEvent } from "../../shared/api.js";
+
 function normalizeUrl(url: string): string {
   return url.replace(/^webcal:\/\//i, "https://");
 }
 
-/**
- * Reject iCal URLs that point at private/internal addresses or non-https
- * schemes. The URL flows in from user input (the `add-external-calendar`
- * action) so without this guard a malicious URL like
- * `http://169.254.169.254/latest/meta-data/iam/security-credentials/` would
- * cause the production server to fetch AWS IAM creds and (for
- * fetchICalEvents) return them through the action response.
- */
 function assertSafeICalUrl(httpUrl: string): void {
-  // Force HTTPS — calendars consistently use https:// (or webcal:// rewritten
-  // to https://). Permitting plain http allows DNS-rebinding and clear-text
-  // pivots into internal services that happen to serve HTTP.
   let parsed: URL;
   try {
     parsed = new URL(httpUrl);
@@ -33,9 +22,7 @@ function assertSafeICalUrl(httpUrl: string): void {
   }
 }
 
-/** Unfold ICS lines (continuation lines start with a space or tab) */
 function unfoldLines(raw: string): string[] {
-  // Normalize CRLF and CR to LF
   const normalized = raw.replace(/\r\n?/g, "\n");
   const lines: string[] = [];
   for (const line of normalized.split("\n")) {
@@ -48,7 +35,6 @@ function unfoldLines(raw: string): string[] {
   return lines;
 }
 
-/** Unescape ICS text values (\n → newline, \, → comma, \; → semicolon, \\ → backslash) */
 function unescapeValue(value: string): string {
   return value
     .replace(/\\n/gi, "\n")
@@ -63,7 +49,6 @@ interface ICSProperty {
   value: string;
 }
 
-/** Parse a single ICS property line like "DTSTART;TZID=America/New_York:20250401T090000" */
 function parseLine(line: string): ICSProperty | null {
   const colonIdx = line.indexOf(":");
   if (colonIdx === -1) return null;
@@ -84,10 +69,6 @@ function parseLine(line: string): ICSProperty | null {
   return { name, params, value };
 }
 
-/**
- * Parse an ICS date/datetime string into an ISO 8601 string.
- * Returns { iso: string, allDay: boolean }
- */
 function parseICSDate(
   value: string,
   params: Record<string, string>,
@@ -95,13 +76,11 @@ function parseICSDate(
   const isDateOnly = params["VALUE"] === "DATE" || /^\d{8}$/.test(value.trim());
 
   if (isDateOnly) {
-    // YYYYMMDD → YYYY-MM-DD
     const v = value.trim();
     const iso = `${v.slice(0, 4)}-${v.slice(4, 6)}-${v.slice(6, 8)}`;
     return { iso, allDay: true };
   }
 
-  // YYYYMMDDTHHmmss[Z]
   const v = value.trim().replace("Z", "");
   const year = v.slice(0, 4);
   const month = v.slice(4, 6);
@@ -111,14 +90,12 @@ function parseICSDate(
   const sec = v.slice(13, 15) || "00";
 
   if (value.trim().endsWith("Z")) {
-    // UTC time
     return {
       iso: `${year}-${month}-${day}T${hour}:${min}:${sec}Z`,
       allDay: false,
     };
   }
 
-  // Floating time or TZID — treat as local ISO string
   return {
     iso: `${year}-${month}-${day}T${hour}:${min}:${sec}`,
     allDay: false,
@@ -136,7 +113,6 @@ interface RawEvent {
   status?: string;
 }
 
-/** Extract X-WR-CALNAME from the VCALENDAR block */
 function parseCalendarName(lines: string[]): string | null {
   for (const line of lines) {
     if (line.startsWith("BEGIN:VEVENT")) break;
@@ -148,7 +124,6 @@ function parseCalendarName(lines: string[]): string | null {
   return null;
 }
 
-/** Parse all VEVENTs from unfolded ICS lines */
 function parseEvents(lines: string[]): RawEvent[] {
   const events: RawEvent[] = [];
   let inEvent = false;
@@ -201,9 +176,8 @@ function parseEvents(lines: string[]): RawEvent[] {
         break;
       }
       case "DURATION": {
-        // Handle simple durations like P1D, PT1H (only set if no DTEND yet)
         if (!current.end && current.start) {
-          current.end = current.start; // fallback — duration parsing omitted
+          current.end = current.start;
         }
         break;
       }
@@ -220,7 +194,6 @@ export interface ICalFeedEvent {
   color: string;
 }
 
-/** Derive a display name from a URL (hostname + first path segment). */
 function nameFromUrl(url: string): string {
   try {
     const u = new URL(url.replace(/^webcal:/i, "https:"));
@@ -231,16 +204,11 @@ function nameFromUrl(url: string): string {
   }
 }
 
-/**
- * Fetch an ICS feed and return its display name (X-WR-CALNAME or hostname fallback).
- */
 export async function fetchICalName(url: string): Promise<string> {
   const httpUrl = normalizeUrl(url);
   try {
     assertSafeICalUrl(httpUrl);
   } catch {
-    // Don't echo the URL or the failure reason — the caller is user-facing
-    // and a verbose error helps an attacker map internal addresses.
     return nameFromUrl(url);
   }
   try {
@@ -261,10 +229,6 @@ export async function fetchICalName(url: string): Promise<string> {
   }
 }
 
-/**
- * Fetch an ICS feed URL and return parsed CalendarEvents within the given date range.
- * Returns an empty array on any error (gracefully degraded).
- */
 export async function fetchICalEvents(
   feedId: string,
   feedName: string,
@@ -272,14 +236,14 @@ export async function fetchICalEvents(
   color: string,
   from: string,
   to: string,
+  options: { throwOnError?: boolean } = {},
 ): Promise<CalendarEvent[]> {
   const httpUrl = normalizeUrl(url);
 
   try {
     assertSafeICalUrl(httpUrl);
   } catch {
-    // Silently degrade — never echo the URL or reason back. A loud error
-    // helps an attacker map internal infrastructure via probe responses.
+    if (options.throwOnError) throw new Error("ICS feed URL is not allowed");
     return [];
   }
 
@@ -293,9 +257,17 @@ export async function fetchICalEvents(
       },
       { maxRedirects: 3 },
     );
-    if (!response.ok) return [];
+    if (!response.ok) {
+      if (options.throwOnError) throw new Error("ICS feed request failed");
+      return [];
+    }
     icsText = await response.text();
-  } catch {
+  } catch (error) {
+    if (options.throwOnError) {
+      throw error instanceof Error
+        ? error
+        : new Error("ICS feed request failed");
+    }
     return [];
   }
 
@@ -316,12 +288,14 @@ export async function fetchICalEvents(
     .map((e) => ({
       id: `ical-${feedId}-${e.uid}`,
       title: e.summary || "(No title)",
+      titleIsGenerated: !e.summary,
       description: e.description || "",
       start: e.start,
       end: e.end,
       location: e.location || "",
       allDay: e.allDay,
       source: "ical" as const,
+      sourceId: feedId,
       color,
       createdAt: now,
       updatedAt: now,

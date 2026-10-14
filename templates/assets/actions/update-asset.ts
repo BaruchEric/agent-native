@@ -1,11 +1,12 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
+import { defineAction } from "@agent-native/core/action";
 import { eq } from "drizzle-orm";
-import { assertAccess } from "@agent-native/core/sharing";
+import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import { nowIso, parseJson, stringifyJson } from "../server/lib/json.js";
-import { getAssetOrThrow, serializeAsset } from "./_helpers.js";
+import { assertCanApprove } from "../server/lib/library-access.js";
 import { IMAGE_CATEGORIES } from "../shared/api.js";
+import { getAssetOrThrow, serializeAsset } from "./_helpers.js";
 
 export default defineAction({
   description:
@@ -26,6 +27,7 @@ export default defineAction({
         "product_reference",
         "diagram_reference",
         "video_reference",
+        "background_reference",
         "subject_reference",
         "edit_target",
         "generated",
@@ -39,7 +41,7 @@ export default defineAction({
   }),
   run: async ({ id, category, isStyleAnchor, ...args }) => {
     const asset = await getAssetOrThrow(id);
-    await assertAccess("asset-library", asset.libraryId, "editor");
+    await assertCanApprove(asset.libraryId, "Updating an asset");
     if (args.folderId !== undefined && args.folderId !== null) {
       const [folder] = await getDb()
         .select()

@@ -9,8 +9,6 @@ vi.mock("h3", async (importOriginal) => {
   const actual = await importOriginal<typeof import("h3")>();
   return {
     ...actual,
-    // The adapter reads the raw body via h3.readRawBody and caches it on
-    // event.context.__rawBody. Return the cached string (set per test).
     readRawBody: vi.fn(async (event: any) => event.context.__rawBody),
     getQuery: vi.fn(() => hoisted.query),
     getHeader: vi.fn(() => hoisted.header),
@@ -19,12 +17,13 @@ vi.mock("h3", async (importOriginal) => {
 
 import { whatsappAdapter } from "./whatsapp.js";
 
-/** Event whose raw body is the given JSON string (already stringified). */
 function eventWithRaw(raw: string | undefined, method = "POST"): any {
-  return { context: { __rawBody: raw }, node: { req: { method } } };
+  return {
+    context: { __rawBody: raw },
+    req: new Request("https://app.test/webhook", { method }),
+  };
 }
 
-/** A well-formed WhatsApp Cloud API text-message webhook payload. */
 function textWebhook(overrides: Record<string, any> = {}) {
   return {
     entry: [
@@ -74,16 +73,18 @@ afterEach(() => {
 
 describe("whatsappAdapter parseIncomingMessage", () => {
   it("normalizes a valid text message", async () => {
-    const msg = await whatsappAdapter().parseIncomingMessage(
+    const adapter = whatsappAdapter();
+    const msg = await adapter.parseIncomingMessage(
       eventWithRaw(JSON.stringify(textWebhook())),
     );
 
     expect(msg).toMatchObject({
       platform: "whatsapp",
-      externalThreadId: "15551234567",
+      externalThreadId: "phone:PNID:user:15551234567",
       text: "ship it",
       senderName: "Grace",
       senderId: "15551234567",
+      replyRef: "wamid.1",
       timestamp: 1700000000 * 1000,
     });
     expect(msg?.platformContext).toMatchObject({
@@ -93,6 +94,7 @@ describe("whatsappAdapter parseIncomingMessage", () => {
       from: "15551234567",
       timestamp: "1700000000",
     });
+    expect(adapter.getLegacyExternalThreadIds?.(msg!)).toEqual(["15551234567"]);
   });
 
   it("returns null for malformed JSON", async () => {
@@ -153,9 +155,44 @@ describe("whatsappAdapter parseIncomingMessage", () => {
   });
 });
 
+describe("whatsappAdapter getStatus", () => {
+  it("requires the app secret in addition to delivery credentials", async () => {
+    process.env.WHATSAPP_ACCESS_TOKEN = "example-access-token";
+    process.env.WHATSAPP_VERIFY_TOKEN = "example-verify-token";
+    process.env.WHATSAPP_PHONE_NUMBER_ID = "example-phone-id";
+
+    const status = await whatsappAdapter().getStatus();
+
+    expect(status.configured).toBe(false);
+    expect(status.details).toMatchObject({
+      hasAccessToken: true,
+      hasVerifyToken: true,
+      hasPhoneNumberId: true,
+      hasAppSecret: false,
+    });
+    expect(status.error).toContain("WHATSAPP_APP_SECRET");
+  });
+
+  it("reports configured when all four required secrets are present", async () => {
+    process.env.WHATSAPP_ACCESS_TOKEN = "example-access-token";
+    process.env.WHATSAPP_VERIFY_TOKEN = "example-verify-token";
+    process.env.WHATSAPP_PHONE_NUMBER_ID = "example-phone-id";
+    process.env.WHATSAPP_APP_SECRET = "example-app-secret";
+
+    const status = await whatsappAdapter().getStatus();
+
+    expect(status.configured).toBe(true);
+    expect(status.details).toMatchObject({ hasAppSecret: true });
+    expect(status.error).toBeUndefined();
+  });
+});
+
 describe("whatsappAdapter handleVerification (GET challenge handshake)", () => {
   function getEvent(): any {
-    return { context: {}, node: { req: { method: "GET" } } };
+    return {
+      context: {},
+      req: new Request("https://app.test/webhook", { method: "GET" }),
+    };
   }
 
   it("echoes the challenge when the verify token matches", async () => {
@@ -221,9 +258,10 @@ describe("whatsappAdapter handleVerification (GET challenge handshake)", () => {
     };
     const h3 = await import("h3");
     const readRawBody = h3.readRawBody as unknown as ReturnType<typeof vi.fn>;
-    // Event has no cached body yet; the source wrapper reads via h3 once and
-    // caches the bytes on event.context.__rawBody (M3 consume-once guard).
-    const event: any = { context: {}, node: { req: { method: "POST" } } };
+    const event: any = {
+      context: {},
+      req: new Request("https://app.test/webhook", { method: "POST" }),
+    };
     readRawBody.mockResolvedValueOnce('{"entry":[]}');
 
     const result = await whatsappAdapter().handleVerification(event);
@@ -231,8 +269,6 @@ describe("whatsappAdapter handleVerification (GET challenge handshake)", () => {
     expect(result).toEqual({ handled: false });
     expect(event.context.__rawBody).toBe('{"entry":[]}');
 
-    // A second read (e.g. from verifyWebhook/parseIncomingMessage) is served
-    // from the cache and never re-streams the request.
     readRawBody.mockClear();
     await whatsappAdapter().parseIncomingMessage(event);
     expect(readRawBody).not.toHaveBeenCalled();
@@ -288,7 +324,6 @@ describe("whatsappAdapter verifyWebhook (security)", () => {
   it("rejects a request whose signature does not match", async () => {
     process.env.WHATSAPP_APP_SECRET = "shh";
     const raw = JSON.stringify(textWebhook());
-    // signature computed over a DIFFERENT body — must fail
     const crypto = await import("node:crypto");
     hoisted.header =
       "sha256=" +
@@ -309,12 +344,9 @@ describe("whatsappAdapter verifyWebhook (security)", () => {
   });
 
   it("verifies over the exact raw bytes, not a JSON-equivalent re-serialization (M2)", async () => {
-    // Meta signs the exact bytes it sent. A signature minted over a byte
-    // variant (extra whitespace, same JSON value) must be rejected — the
-    // adapter must NOT re-stringify a parsed body before comparing.
     process.env.WHATSAPP_APP_SECRET = "shh";
     const sentBytes = '{"a":1,"b":2}';
-    const reserializedBytes = '{ "a": 1, "b": 2 }'; // same value, different bytes
+    const reserializedBytes = '{ "a": 1, "b": 2 }';
     const crypto = await import("node:crypto");
     hoisted.header =
       "sha256=" +
@@ -332,7 +364,6 @@ describe("whatsappAdapter verifyWebhook (security)", () => {
 describe("whatsappAdapter sendResponse", () => {
   it("does nothing when access token or phone number id is missing", async () => {
     process.env.WHATSAPP_ACCESS_TOKEN = "tok";
-    // no phone number id
     const fetchSpy = vi.fn();
     vi.stubGlobal("fetch", fetchSpy);
 
@@ -382,7 +413,7 @@ describe("whatsappAdapter sendResponse", () => {
     );
 
     expect(calls).toHaveLength(1);
-    expect(calls[0].url).toContain("/v21.0/PNID/messages");
+    expect(calls[0].url).toContain("/v25.0/PNID/messages");
     expect((calls[0].headers as any).Authorization).toBe("Bearer tok");
     expect(calls[0].body).toMatchObject({
       messaging_product: "whatsapp",
@@ -391,6 +422,36 @@ describe("whatsappAdapter sendResponse", () => {
       type: "text",
       text: { body: "hello there" },
     });
+  });
+
+  it("quotes the inbound wamid for a contextual reply", async () => {
+    process.env.WHATSAPP_ACCESS_TOKEN = "example-access-token";
+    process.env.WHATSAPP_PHONE_NUMBER_ID = "PNID";
+    let body: any;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: RequestInit) => {
+        body = JSON.parse(String(init?.body));
+        return Promise.resolve(
+          new Response(JSON.stringify({}), { status: 200 }),
+        );
+      }),
+    );
+
+    await whatsappAdapter().sendResponse(
+      { text: "contextual reply", platformContext: {} },
+      {
+        platform: "whatsapp",
+        externalThreadId: "phone:PNID:user:15551234567",
+        text: "question",
+        senderId: "15551234567",
+        replyRef: "wamid.example",
+        timestamp: 1,
+        platformContext: { phoneNumberId: "PNID" },
+      },
+    );
+
+    expect(body.context).toEqual({ message_id: "wamid.example" });
   });
 
   it("splits replies longer than the WhatsApp length limit", async () => {

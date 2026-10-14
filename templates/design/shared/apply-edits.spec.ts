@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+
 import { applyEdits, applyOneEdit } from "./apply-edits";
 
 describe("applyEdits", () => {
@@ -69,9 +70,15 @@ describe("applyEdits", () => {
     );
   });
 
-  it("treats self-overlapping matches as ambiguous", () => {
-    expect(() => applyEdits(`aaa`, [{ search: `aa`, replace: `b` }])).toThrow(
-      /matched 2 places/,
-    );
+  it("resolves self-overlapping exact matches via whitespace-flexible fallback", () => {
+    const { content } = applyEdits(`aaa`, [{ search: `aa`, replace: `b` }]);
+    expect(content).toBe(`ba`);
+  });
+
+  it("throws ambiguous when both strategies find multiple matches", () => {
+    const html = `<span>x</span> <span>x</span>`;
+    expect(() =>
+      applyEdits(html, [{ search: `<span>x</span>`, replace: `y` }]),
+    ).toThrow(/matched/);
   });
 });

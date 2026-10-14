@@ -6,7 +6,87 @@ export type RemoteCommandKind =
   | "approve"
   | "deny"
   | "stop"
-  | "status";
+  | "status"
+  | "computer-operation";
+
+export type RemoteExecutionWorkload =
+  | "code-agent"
+  | "scheduled-code"
+  | "external-agent";
+
+export type RemoteExecutionBackend =
+  | "desktop"
+  | "container"
+  | "kubernetes"
+  | "external";
+
+export type RemoteExecutionPersistence =
+  | "local-files"
+  | "persistent-volume"
+  | "ephemeral";
+
+export interface RemoteExecutionCapabilities {
+  backend?: RemoteExecutionBackend;
+  workloads?: RemoteExecutionWorkload[];
+  engines?: string[];
+  acceptsScheduledWork?: boolean;
+  acceptsPortalHandoffs?: boolean;
+  persistence?: RemoteExecutionPersistence;
+  adapters?: string[];
+}
+
+export type ComputerOperationClass =
+  | "browser.observe"
+  | "browser.control"
+  | "desktop.observe"
+  | "desktop.control";
+
+export type ComputerApprovalScope = "once" | "run" | "task";
+
+export interface ComputerCommandAction {
+  type: string;
+  target?: Record<string, unknown> | null;
+  input?: unknown;
+}
+
+export interface ComputerCommandEnvelope {
+  version: 1;
+  taskId: string;
+  runId: string;
+  sequence: number;
+  idempotencyKey: string;
+  operationClass: ComputerOperationClass;
+  action: ComputerCommandAction;
+  approval: {
+    id?: string | null;
+    scope: ComputerApprovalScope;
+    actionHash: string;
+  };
+  issuedAt: number;
+  leaseExpiresAt: number;
+}
+
+export interface RemoteComputerCapabilities {
+  browser?: {
+    observe: boolean;
+    control: boolean;
+    provider?: string | null;
+    version?: string | null;
+  };
+  desktop?: {
+    observe: boolean;
+    control: boolean;
+    accessibility?: boolean;
+    screenCapture?: boolean;
+    provider?: string | null;
+    version?: string | null;
+  };
+}
+
+export interface RemoteDeviceMetadata extends Record<string, unknown> {
+  computerCapabilities?: RemoteComputerCapabilities;
+  executionCapabilities?: RemoteExecutionCapabilities;
+}
 
 export type RemoteCommandStatus =
   | "pending"
@@ -25,7 +105,7 @@ export interface RemoteDevice {
   platform: string | null;
   appVersion: string | null;
   hostName: string | null;
-  metadata: Record<string, unknown> | null;
+  metadata: RemoteDeviceMetadata | null;
   deviceTokenHash: string;
   lastSeenAt: number | null;
   status: RemoteDeviceStatus;
@@ -42,7 +122,7 @@ export interface PublicRemoteDevice {
   platform: string | null;
   appVersion: string | null;
   hostName: string | null;
-  metadata: Record<string, unknown> | null;
+  metadata: RemoteDeviceMetadata | null;
   lastSeenAt: number | null;
   status: RemoteDeviceStatus;
   revokedAt: number | null;
@@ -61,6 +141,8 @@ export interface RemoteCommand {
   result: unknown;
   platform: string | null;
   externalThreadId: string | null;
+  idempotencyKey?: string | null;
+  computerOperation?: ComputerCommandEnvelope | null;
   attempts: number;
   nextCheckAt: number;
   claimedAt: number | null;
@@ -76,6 +158,15 @@ export interface RemoteRunEvent {
   seq: number;
   event: unknown;
   createdAt: number;
+}
+
+export interface RemoteLiveViewEvent {
+  type: "computer.live-view";
+  frameHandle: string;
+  capturedAt: number;
+  width?: number | null;
+  height?: number | null;
+  targetLabel?: string | null;
 }
 
 export type RemotePushRegistrationStatus = "active" | "inactive";

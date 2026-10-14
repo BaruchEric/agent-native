@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   IconDeviceFloppy,
   IconPencil,
   IconTrash,
   IconX,
 } from "@tabler/icons-react";
+import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useEffect, useMemo, useRef, useState } from "react";
+
 import {
   type FeatureConfig,
   type RegionGuideRect,
@@ -34,6 +36,9 @@ interface DrawState {
   pointerId: number;
   id: string;
   start: Point;
+  previousRects: RegionGuideRect[];
+  previousSelectedId: string | null;
+  dirtyBefore: boolean;
 }
 
 interface MoveState {
@@ -42,6 +47,7 @@ interface MoveState {
   id: string;
   start: Point;
   origin: RegionGuideRect;
+  dirtyBefore: boolean;
 }
 
 interface ResizeState {
@@ -51,6 +57,7 @@ interface ResizeState {
   corner: ResizeCorner;
   origin: RegionGuideRect;
   aspectRatio: number;
+  dirtyBefore: boolean;
 }
 
 type InteractionState = DrawState | MoveState | ResizeState;
@@ -283,7 +290,12 @@ export function RegionGuides() {
   );
 }
 
-export function RegionGuideEditor() {
+export function RegionGuideEditor({
+  mode = "preset",
+}: {
+  mode?: "preset" | "capture";
+}) {
+  const captureMode = mode === "capture";
   const config = useFeatureConfig();
   const guides = regionGuideConfig(config);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
@@ -304,13 +316,10 @@ export function RegionGuideEditor() {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         if (interactionRef.current) {
-          interactionRef.current = null;
-          setDraft(null);
+          cancelInteraction();
           return;
         }
-        getCurrentWindow()
-          .close()
-          .catch(() => {});
+        closeEditor();
       }
       if (event.key === "Backspace" || event.key === "Delete") {
         if (!selectedId) return;
@@ -320,7 +329,7 @@ export function RegionGuideEditor() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  });
+  }, [selectedId]);
 
   function updateRect(nextRect: RegionGuideRect | null) {
     if (!nextRect) return;
@@ -344,6 +353,27 @@ export function RegionGuideEditor() {
     setSelectedId(null);
     setDirty(true);
     setMessage(null);
+  }
+
+  async function useSelectedCaptureRegion() {
+    const selected =
+      (selectedId ? rects.find((rect) => rect.id === selectedId) : null) ??
+      rects[0] ??
+      null;
+    const rect = selected ? normalizeRect(selected) : null;
+    if (!rect) {
+      setMessage("Draw a region first.");
+      return;
+    }
+    await emit("clips:region-capture-selected", {
+      x: rect.x,
+      y: rect.y,
+      width: rect.width,
+      height: rect.height,
+    }).catch(() => {});
+    getCurrentWindow()
+      .close()
+      .catch(() => {});
   }
 
   async function savePreset() {
@@ -382,9 +412,46 @@ export function RegionGuideEditor() {
   }
 
   function closeEditor() {
+    if (captureMode) {
+      emit("clips:region-capture-cancelled").catch(() => {});
+    }
     getCurrentWindow()
       .close()
       .catch(() => {});
+  }
+
+  function releasePointerCapture(pointerId: number) {
+    try {
+      const surface = surfaceRef.current;
+      if (surface?.hasPointerCapture(pointerId)) {
+        surface.releasePointerCapture(pointerId);
+      }
+    } catch {
+      // coercion-ok: pointer capture release is best-effort during cancellation.
+      // ignore — pointer capture is best-effort here.
+    }
+  }
+
+  function cancelInteraction() {
+    const interaction = interactionRef.current;
+    if (!interaction) return;
+
+    interactionRef.current = null;
+    if (interaction.kind === "draw") {
+      setRects(interaction.previousRects);
+      setSelectedId(interaction.previousSelectedId);
+      setDirty(interaction.dirtyBefore);
+    } else {
+      setRects((current) =>
+        current.map((rect) =>
+          rect.id === interaction.id ? interaction.origin : rect,
+        ),
+      );
+      setDirty(interaction.dirtyBefore);
+    }
+    setDraft(null);
+    setMessage(null);
+    releasePointerCapture(interaction.pointerId);
   }
 
   function startDrawing(event: React.PointerEvent<HTMLDivElement>) {
@@ -403,9 +470,17 @@ export function RegionGuideEditor() {
       pointerId: event.pointerId,
       id,
       start: point,
+      previousRects: rects,
+      previousSelectedId: selectedId,
+      dirtyBefore: dirty,
     };
+    event.preventDefault();
     setSelectedId(null);
     setMessage(null);
+    if (captureMode) {
+      setRects([]);
+      setDirty(true);
+    }
     setDraft(null);
     surfaceRef.current?.setPointerCapture(event.pointerId);
   }
@@ -424,6 +499,7 @@ export function RegionGuideEditor() {
       id: rect.id,
       start: point,
       origin: rect,
+      dirtyBefore: dirty,
     };
     setSelectedId(rect.id);
     setMessage(null);
@@ -445,6 +521,7 @@ export function RegionGuideEditor() {
       corner,
       origin: rect,
       aspectRatio: visualAspectRatio(rect, surfaceSize(surfaceRef.current)),
+      dirtyBefore: dirty,
     };
     setSelectedId(rect.id);
     setMessage(null);
@@ -461,7 +538,14 @@ export function RegionGuideEditor() {
 
     if (interaction.kind === "draw") {
       setDraft(
-        squareRectFromPoints(interaction.id, interaction.start, point, size),
+        captureMode
+          ? rectFromPoints(interaction.id, interaction.start, point)
+          : squareRectFromPoints(
+              interaction.id,
+              interaction.start,
+              point,
+              size,
+            ),
       );
       return;
     }
@@ -490,29 +574,33 @@ export function RegionGuideEditor() {
     }
     if (interaction.kind === "draw") {
       const point = pointForEvent(event, surfaceRef.current);
-      const nextRect = squareRectFromPoints(
-        interaction.id,
-        interaction.start,
-        point,
-        surfaceSize(surfaceRef.current),
-      );
+      const nextRect = captureMode
+        ? rectFromPoints(interaction.id, interaction.start, point)
+        : squareRectFromPoints(
+            interaction.id,
+            interaction.start,
+            point,
+            surfaceSize(surfaceRef.current),
+          );
       if (nextRect) {
-        setRects((current) => [...current, nextRect]);
+        setRects((current) =>
+          captureMode ? [nextRect] : [...current, nextRect],
+        );
         setSelectedId(nextRect.id);
         setDirty(true);
       }
     }
     interactionRef.current = null;
     setDraft(null);
-    try {
-      const surface = surfaceRef.current;
-      if (surface?.hasPointerCapture(event.pointerId)) {
-        surface.releasePointerCapture(event.pointerId);
-      }
-    } catch {
-      // ignore — pointer capture is best-effort here.
-    }
+    releasePointerCapture(event.pointerId);
   }
+
+  const captureSelection = captureMode
+    ? (draft ??
+      (selectedId ? rects.find((rect) => rect.id === selectedId) : null) ??
+      rects[0] ??
+      null)
+    : null;
 
   return (
     <div
@@ -526,21 +614,25 @@ export function RegionGuideEditor() {
       <div className="region-guide-editor-bar" data-region-toolbar>
         <div className="region-guide-editor-title">
           <IconPencil size={16} stroke={1.8} />
-          <span>Region guide preset</span>
+          <span>
+            {captureMode ? "Recording region" : "Region guide preset"}
+          </span>
           <span className="region-guide-editor-count">
             {rects.length} {rects.length === 1 ? "box" : "boxes"}
           </span>
         </div>
         <div className="region-guide-editor-actions">
-          <button
-            type="button"
-            className="region-guide-editor-button"
-            onClick={deleteSelected}
-            disabled={!selectedId}
-          >
-            <IconTrash size={15} stroke={1.9} />
-            Delete
-          </button>
+          {!captureMode ? (
+            <button
+              type="button"
+              className="region-guide-editor-button"
+              onClick={deleteSelected}
+              disabled={!selectedId}
+            >
+              <IconTrash size={15} stroke={1.9} />
+              Delete
+            </button>
+          ) : null}
           <button
             type="button"
             className="region-guide-editor-button"
@@ -552,11 +644,13 @@ export function RegionGuideEditor() {
           <button
             type="button"
             className="region-guide-editor-button region-guide-editor-button-primary"
-            onClick={savePreset}
-            disabled={!dirty || saving || !config}
+            onClick={captureMode ? useSelectedCaptureRegion : savePreset}
+            disabled={
+              captureMode ? rects.length === 0 : !dirty || saving || !config
+            }
           >
             <IconDeviceFloppy size={15} stroke={1.9} />
-            {saving ? "Saving" : "Save"}
+            {captureMode ? "Use region" : saving ? "Saving" : "Save"}
           </button>
           <button
             type="button"
@@ -567,16 +661,29 @@ export function RegionGuideEditor() {
             <IconX size={17} stroke={1.9} />
           </button>
         </div>
-        {message ? (
-          <div className="region-guide-editor-message" aria-live="polite">
-            {message}
-          </div>
-        ) : null}
+        <div
+          className={`region-guide-editor-message ${
+            message ? "is-visible" : ""
+          }`}
+          aria-live="polite"
+        >
+          {message ?? ""}
+        </div>
       </div>
 
       <div className="region-guide-editor-hint" data-region-toolbar>
-        Square guides. Corners resize. Drag a box to move.
+        {captureMode
+          ? "Drag to select · Move to reposition · Corners to resize · Esc to cancel"
+          : "Square guides · Move a box · Drag a corner to resize"}
       </div>
+
+      {captureSelection ? (
+        <div
+          className="region-guide-selection-mask"
+          style={rectStyle(captureSelection)}
+          aria-hidden
+        />
+      ) : null}
 
       {rects.map((rect) => (
         <div

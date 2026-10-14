@@ -16,6 +16,11 @@
  *   Userinfo: https://www.googleapis.com/oauth2/v2/userinfo
  */
 
+import {
+  GOOGLE_PRIMARY_PROVIDER_CREDENTIAL_KEYS,
+  resolveGoogleProviderCredentialCandidatesWithReader,
+} from "@agent-native/core/server";
+
 export const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 export const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 export const GOOGLE_USERINFO_URL =
@@ -63,6 +68,7 @@ export interface CalendarEvent {
     email?: string;
     displayName?: string;
     responseStatus?: string;
+    self?: boolean;
   }>;
   conferenceData?: {
     entryPoints?: Array<{
@@ -82,7 +88,20 @@ export interface ExchangeCodeArgs {
   redirectUri: string;
 }
 
-/** Exchange an authorization code for tokens. Throws on non-2xx. */
+export interface GoogleOAuthClientCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+export async function resolveGoogleOAuthCredentialCandidates(): Promise<
+  GoogleOAuthClientCredentials[]
+> {
+  return resolveGoogleProviderCredentialCandidatesWithReader({
+    readCredential: (key) => process.env[key],
+    credentialKeyPairs: [GOOGLE_PRIMARY_PROVIDER_CREDENTIAL_KEYS],
+  });
+}
+
 export async function exchangeCode(
   args: ExchangeCodeArgs,
 ): Promise<GoogleTokenResponse> {
@@ -105,7 +124,6 @@ export async function exchangeCode(
   return (await res.json()) as GoogleTokenResponse;
 }
 
-/** Refresh an access token. Throws on non-2xx (caller decides whether to drop the row). */
 export async function refreshAccessToken(args: {
   refreshToken: string;
   clientId: string;
@@ -129,7 +147,43 @@ export async function refreshAccessToken(args: {
   return (await res.json()) as GoogleTokenResponse;
 }
 
-/** Best-effort revoke. Returns true if Google returned 2xx, false otherwise. */
+export function isPermanentRefreshFailure(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "";
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("invalid_grant") ||
+    lower.includes("unauthorized_client") ||
+    lower.includes("invalid_client")
+  );
+}
+
+export async function refreshAccessTokenWithFallback(args: {
+  refreshToken: string;
+  credentials: GoogleOAuthClientCredentials[];
+}): Promise<GoogleTokenResponse> {
+  let lastError: unknown;
+  for (const credentials of args.credentials) {
+    try {
+      return await refreshAccessToken({
+        refreshToken: args.refreshToken,
+        clientId: credentials.clientId,
+        clientSecret: credentials.clientSecret,
+      });
+    } catch (error) {
+      lastError = error;
+      if (!isPermanentRefreshFailure(error)) throw error;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Google token refresh failed.");
+}
+
 export async function revokeToken(token: string): Promise<boolean> {
   try {
     const res = await fetch(GOOGLE_REVOKE_URL, {
@@ -143,7 +197,6 @@ export async function revokeToken(token: string): Promise<boolean> {
   }
 }
 
-/** Fetch the user's basic profile so we can label the calendar account. */
 export async function getUserInfo(
   accessToken: string,
 ): Promise<GoogleUserInfo> {
@@ -159,9 +212,9 @@ export async function getUserInfo(
 
 export interface ListEventsArgs {
   accessToken: string;
-  calendarId?: string; // defaults to "primary"
-  timeMin?: string; // ISO
-  timeMax?: string; // ISO
+  calendarId?: string;
+  timeMin?: string;
+  timeMax?: string;
   maxResults?: number;
   singleEvents?: boolean;
   pageToken?: string;
@@ -178,7 +231,6 @@ export interface GetEventArgs {
   eventId: string;
 }
 
-/** Fetch a single event by id. Throws on non-2xx. */
 export async function getEvent(args: GetEventArgs): Promise<CalendarEvent> {
   const calId = encodeURIComponent(args.calendarId ?? "primary");
   const eventId = encodeURIComponent(args.eventId);
@@ -193,7 +245,6 @@ export async function getEvent(args: GetEventArgs): Promise<CalendarEvent> {
   return (await res.json()) as CalendarEvent;
 }
 
-/** Make a single events.list call (one page). Throws on non-2xx. */
 async function listEventsPage(
   args: ListEventsArgs,
 ): Promise<ListEventsResponse> {
@@ -223,19 +274,8 @@ async function listEventsPage(
   };
 }
 
-/**
- * Hard cap on pages to fetch per `listEvents` call — protects against runaway
- * pagination loops if Google ever returns a stuck `nextPageToken`. With the
- * default `maxResults=250`, the cap allows up to 1250 events per sync window.
- */
 const MAX_EVENT_PAGES = 5;
 
-/**
- * List events on a calendar, transparently following `nextPageToken` until the
- * page count cap is hit or the server stops returning a token. Throws on
- * non-2xx. Returns the merged list; `nextPageToken` is only included when the
- * cap was hit (so callers can decide whether to widen the time window).
- */
 export async function listEvents(
   args: ListEventsArgs,
 ): Promise<ListEventsResponse> {
@@ -257,11 +297,6 @@ export async function listEvents(
   };
 }
 
-/**
- * Pick the conferencing join URL from an event. Prefers Google Meet's
- * `hangoutLink`, then a `video` conferenceData entry point, then any
- * uri shaped like a known meeting platform.
- */
 export function pickJoinUrl(event: CalendarEvent): string | undefined {
   if (event.hangoutLink) return event.hangoutLink;
   const eps = event.conferenceData?.entryPoints ?? [];
@@ -275,7 +310,6 @@ export function pickJoinUrl(event: CalendarEvent): string | undefined {
       return ep.uri;
     }
   }
-  // Fall back to scanning the description / location for a meeting URL.
   const haystack = `${event.description ?? ""}\n${event.location ?? ""}`;
   const m = haystack.match(
     /https?:\/\/(?:[a-z0-9-]+\.)?(?:zoom\.us|meet\.google\.com|teams\.microsoft\.com|webex\.com)\/[^\s<>"]+/i,
@@ -283,7 +317,6 @@ export function pickJoinUrl(event: CalendarEvent): string | undefined {
   return m?.[0];
 }
 
-/** Detect the conferencing platform from an event's join URL. */
 export function detectPlatform(
   joinUrl: string | undefined,
 ): "zoom" | "meet" | "teams" | "webex" | "other" {

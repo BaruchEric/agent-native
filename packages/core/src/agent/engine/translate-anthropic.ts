@@ -1,35 +1,18 @@
-/**
- * Translation helpers between the AgentEngine normalized types and
- * @anthropic-ai/sdk's wire types.
- *
- * AnthropicEngine does very little translation because the framework's
- * EngineMessage / EngineTool shapes were modeled on Anthropic's types.
- * The main differences are: camelCase vs snake_case, and that
- * Anthropic uses `input_schema` while we use `inputSchema`.
- *
- * Builder's Gemini-backed gateway requires `tool_name` and `tool_input` on
- * every `tool_result` block. Use `engineMessagesToBuilderGatewayAnthropic` for
- * that path. The native Anthropic API keeps the strict `tool_result` shape
- * (`engineMessagesToAnthropic`).
- */
-
 import type Anthropic from "@anthropic-ai/sdk";
+
+import { flattenComposedRootSchema } from "./flatten-composed-root-schema.js";
+import {
+  createProviderToolNameMap,
+  toEngineToolName,
+  toProviderToolName,
+  type ProviderToolNameMap,
+} from "./tool-name.js";
 import type {
   EngineTool,
   EngineMessage,
   EngineContentPart,
   EngineEvent,
 } from "./types.js";
-
-// ---------------------------------------------------------------------------
-// EngineTool → Anthropic.Tool
-// ---------------------------------------------------------------------------
-
-const ANTHROPIC_UNSUPPORTED_TOP_LEVEL_SCHEMA_KEYS = [
-  "oneOf",
-  "anyOf",
-  "allOf",
-] as const;
 
 type JsonSchemaRecord = Record<string, unknown>;
 
@@ -75,37 +58,28 @@ function normalizeAnthropicInputSchema(
     return normalizeDbExecAnthropicInputSchema(schema);
   }
 
-  if (
-    !ANTHROPIC_UNSUPPORTED_TOP_LEVEL_SCHEMA_KEYS.some((key) => key in schema)
-  ) {
-    return schema as Anthropic.Tool["input_schema"];
-  }
-
-  const normalized: Record<string, unknown> = { ...schema };
-  for (const key of ANTHROPIC_UNSUPPORTED_TOP_LEVEL_SCHEMA_KEYS) {
-    delete normalized[key];
-  }
-  normalized.type = "object";
-  return normalized as Anthropic.Tool["input_schema"];
+  return flattenComposedRootSchema(schema) as Anthropic.Tool["input_schema"];
 }
 
-export function engineToolToAnthropic(tool: EngineTool): Anthropic.Tool {
+export function engineToolToAnthropic(
+  tool: EngineTool,
+  toolNameMap?: ProviderToolNameMap,
+): Anthropic.Tool {
+  const providerName = toProviderToolName(tool.name, toolNameMap);
   return {
-    name: tool.name,
+    name: providerName,
     description: tool.description,
     input_schema: normalizeAnthropicInputSchema(tool.name, tool.inputSchema),
   };
 }
 
-export function engineToolsToAnthropic(tools: EngineTool[]): Anthropic.Tool[] {
-  return tools.map(engineToolToAnthropic);
+export function engineToolsToAnthropic(
+  tools: EngineTool[],
+  toolNameMap = createProviderToolNameMap(tools),
+): Anthropic.Tool[] {
+  return tools.map((tool) => engineToolToAnthropic(tool, toolNameMap));
 }
 
-// ---------------------------------------------------------------------------
-// Tool result backfill (Gemini / Builder gateway)
-// ---------------------------------------------------------------------------
-
-/** JSON.stringify for tool_use inputs; never throws. */
 export function stringifyToolUseInputForGateway(input: unknown): string {
   try {
     if (input === undefined || input === null) return "{}";
@@ -115,15 +89,9 @@ export function stringifyToolUseInputForGateway(input: unknown): string {
   }
 }
 
-/** Same lead-in as structured-history replay when a tool_result cannot be paired. */
 export const UNMATCHED_TOOL_RESULT_REPLAY_PREFIX =
   "(Omitted unmatched tool results from replayed history.)";
 
-/**
- * Human/LLM-visible note when a tool_result cannot be matched to a tool_use
- * (replay from DB, or malformed engine history). Preserves tool_use_id and
- * a truncated payload instead of silently dropping the turn.
- */
 export function unmatchedToolResultReplayText(part: {
   toolCallId: string;
   content: unknown;
@@ -147,6 +115,24 @@ export function unmatchedToolResultReplayText(part: {
   return `${UNMATCHED_TOOL_RESULT_REPLAY_PREFIX} [tool_use_id=${part.toolCallId}${err}] ${body}`;
 }
 
+/**
+ * Identity of a synthetic interrupted tool result in engine messages, thread
+ * data, and the client (`client/sse-event-processor.ts` matches it verbatim).
+ * The model never sees it bare: replay rewrites it to an error whose outcome
+ * is unknown, or the model treats it as "did not run" and repeats a write that
+ * may have landed.
+ */
+export const INTERRUPTED_TOOL_RESULT_MARKER =
+  "Interrupted before this tool returned a result.";
+const INTERRUPTED_TOOL_RESULT_FOR_MODEL = `${INTERRUPTED_TOOL_RESULT_MARKER} Its outcome is UNKNOWN: the tool may have run. Verify the current state before repeating any write.`;
+
+export function isInterruptedToolResult(content: unknown): boolean {
+  return (
+    typeof content === "string" &&
+    content.startsWith(INTERRUPTED_TOOL_RESULT_MARKER)
+  );
+}
+
 function interruptedToolResultPart(part: {
   id: string;
   name: string;
@@ -157,26 +143,14 @@ function interruptedToolResultPart(part: {
     toolCallId: part.id,
     toolName: part.name,
     toolInput: stringifyToolUseInputForGateway(part.input),
-    content: "Interrupted before this tool returned a result.",
+    content: INTERRUPTED_TOOL_RESULT_FOR_MODEL,
+    isError: true,
   };
 }
 
-/**
- * Ensure every `tool-result` has a non-empty `toolName` and `toolInput` string,
- * using the matching assistant `tool-call` in the same conversation.
- * Assistant `tool-call` blocks without an immediately following result get a
- * synthetic interrupted result so replayed history stays provider-protocol safe.
- * Orphan tool-results (no resolvable tool name) become `text` notes so nothing
- * is silently dropped from replayed history.
- */
 export function backfillEngineMessagesToolResults(
   messages: EngineMessage[],
 ): EngineMessage[] {
-  // Walk messages in order. User tool-result blocks are valid only when they
-  // answer the immediately preceding assistant tool-call turn. This prevents
-  // older tool-results from being backfilled with later, unrelated tool-calls
-  // when ids are reused (e.g. `continuation_tc_1` reset across adapter
-  // recreations).
   const toolUseById = new Map<string, { name: string; input: unknown }>();
   const out: EngineMessage[] = [];
   let pendingToolUses: Array<{ id: string; name: string; input: unknown }> = [];
@@ -272,13 +246,21 @@ export function backfillEngineMessagesToolResults(
           : stringifyToolUseInputForGateway(
               pendingLookup?.input ?? lookup?.input,
             );
+      const interrupted = part.content === INTERRUPTED_TOOL_RESULT_MARKER;
       const filled: EngineContentPart = {
         type: "tool-result",
         toolCallId: part.toolCallId,
         toolName,
         toolInput,
-        content: part.content,
-        ...(part.isError ? { isError: true } : {}),
+        content: interrupted ? INTERRUPTED_TOOL_RESULT_FOR_MODEL : part.content,
+        ...(part.isError || interrupted ? { isError: true } : {}),
+        ...(part.approvalPause === undefined
+          ? {}
+          : { approvalPause: part.approvalPause }),
+        ...(part.approvalAskId ? { approvalAskId: part.approvalAskId } : {}),
+        ...(part.images && part.images.length > 0
+          ? { images: part.images }
+          : {}),
       };
       if (pendingLookup) {
         matchedPendingToolResults.set(part.toolCallId, filled);
@@ -315,45 +297,59 @@ export function backfillEngineMessagesToolResults(
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// EngineMessage → Anthropic.MessageParam
-// ---------------------------------------------------------------------------
+function replayableAnthropicPart(part: EngineContentPart): boolean {
+  if (part.type !== "thinking") return true;
+  if (part.redactedData || part.signature) return true;
+  console.warn(
+    "[anthropic-engine] dropping a thinking block with no signature; it cannot be replayed",
+  );
+  return false;
+}
 
 export function engineMessageToAnthropic(
   msg: EngineMessage,
-  opts?: { builderGateway?: boolean },
+  opts?: {
+    builderGateway?: boolean;
+    toolNameMap?: ProviderToolNameMap;
+  },
 ): Anthropic.MessageParam {
   const builderGateway = opts?.builderGateway === true;
+  const content = builderGateway
+    ? msg.content
+    : msg.content.filter(replayableAnthropicPart);
   return {
     role: msg.role,
-    content: msg.content.map((p) => enginePartToAnthropic(p, builderGateway)),
+    content: content.map((p) =>
+      enginePartToAnthropic(p, builderGateway, opts?.toolNameMap),
+    ),
   };
 }
 
-/** Messages for the Anthropic HTTP API (strict schema — no extra tool_result fields). */
 export function engineMessagesToAnthropic(
   messages: EngineMessage[],
+  toolNameMap = createProviderToolNameMap([], messages),
 ): Anthropic.MessageParam[] {
   const normalized = backfillEngineMessagesToolResults(messages);
-  return normalized.map((m) => engineMessageToAnthropic(m));
+  return normalized.flatMap((m) => {
+    const translated = engineMessageToAnthropic(m, { toolNameMap });
+    return translated.content.length > 0 ? [translated] : [];
+  });
 }
 
-/**
- * Messages for the Builder LLM gateway (Gemini-backed). Same Anthropic-shaped
- * envelope, but every `tool_result` includes `tool_name` and `tool_input`.
- */
 export function engineMessagesToBuilderGatewayAnthropic(
   messages: EngineMessage[],
+  toolNameMap = createProviderToolNameMap([], messages),
 ): Anthropic.MessageParam[] {
   const normalized = backfillEngineMessagesToolResults(messages);
   return normalized.map((m) =>
-    engineMessageToAnthropic(m, { builderGateway: true }),
+    engineMessageToAnthropic(m, { builderGateway: true, toolNameMap }),
   );
 }
 
 function enginePartToAnthropic(
   part: EngineContentPart,
   builderGateway: boolean,
+  toolNameMap?: ProviderToolNameMap,
 ): Anthropic.ContentBlockParam {
   switch (part.type) {
     case "text":
@@ -390,33 +386,35 @@ function enginePartToAnthropic(
       return {
         type: "tool_use",
         id: part.id,
-        name: part.name,
+        name: toProviderToolName(part.name, toolNameMap),
         input: part.input as Record<string, unknown>,
-      } as any; // tool_use is a ContentBlockParam in Anthropic SDK
+      } as any;
 
     case "tool-result": {
       if (builderGateway) {
-        const tool_name = part.toolName.trim();
+        const tool_name = toProviderToolName(part.toolName.trim(), toolNameMap);
         const tool_input = part.toolInput;
         return {
           type: "tool_result",
           tool_use_id: part.toolCallId,
           tool_name,
           tool_input,
-          content: part.content,
+          content: toolResultContentToAnthropic(part),
           ...(part.isError ? { is_error: true } : {}),
         } as any;
       }
       return {
         type: "tool_result",
         tool_use_id: part.toolCallId,
-        content: part.content,
+        content: toolResultContentToAnthropic(part),
         ...(part.isError ? { is_error: true } : {}),
       } as any;
     }
 
     case "thinking":
-      // Anthropic thinking blocks — pass through with signature for context window continuity
+      if (part.redactedData) {
+        return { type: "redacted_thinking", data: part.redactedData } as any;
+      }
       return {
         type: "thinking",
         thinking: part.text,
@@ -425,12 +423,37 @@ function enginePartToAnthropic(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Anthropic.ContentBlock → EngineContentPart (from final message)
-// ---------------------------------------------------------------------------
+function toolResultContentToAnthropic(
+  part: Extract<EngineContentPart, { type: "tool-result" }>,
+): string | Anthropic.ContentBlockParam[] {
+  if (part.isError || !part.images || part.images.length === 0) {
+    return part.content;
+  }
+  const imageBlocks: Anthropic.ImageBlockParam[] = [];
+  for (const image of part.images) {
+    if (image.url) {
+      imageBlocks.push({
+        type: "image",
+        source: { type: "url", url: image.url },
+      });
+    } else if (image.data && image.mediaType) {
+      imageBlocks.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: image.mediaType,
+          data: image.data,
+        },
+      });
+    }
+  }
+  if (imageBlocks.length === 0) return part.content;
+  return [{ type: "text", text: part.content }, ...imageBlocks];
+}
 
 export function anthropicContentToEngine(
   content: Anthropic.ContentBlock[],
+  toolNameMap?: ProviderToolNameMap,
 ): EngineContentPart[] {
   return content
     .map((block) => {
@@ -441,7 +464,7 @@ export function anthropicContentToEngine(
         return {
           type: "tool-call" as const,
           id: block.id,
-          name: block.name,
+          name: toEngineToolName(block.name, toolNameMap),
           input: block.input,
         };
       }
@@ -453,24 +476,21 @@ export function anthropicContentToEngine(
           signature: b.signature,
         };
       }
-      // Unknown block type — skip
+      if ((block as any).type === "redacted_thinking") {
+        return {
+          type: "thinking" as const,
+          text: "",
+          redactedData: (block as any).data ?? "",
+        };
+      }
+      console.warn(
+        `[anthropic-engine] dropping unrecognized content block type "${(block as any).type}" from the assistant turn; it will not be replayed`,
+      );
       return { type: "text" as const, text: "" };
     })
     .filter((p) => !(p.type === "text" && p.text === ""));
 }
 
-// ---------------------------------------------------------------------------
-// Anthropic stream chunk → EngineEvent
-// ---------------------------------------------------------------------------
-
-/**
- * Mutable state threaded across `anthropicChunkToEngineEvents` calls within a
- * single stream. Anthropic's `content_block_delta` chunks carry only the block
- * `index`, not the tool-call id/name — those arrive once on the matching
- * `content_block_start`. We remember `index → { id, name }` here so each
- * `input_json_delta` can be surfaced as a `tool-input-delta` carrying the same
- * id/name the consumer expects (mirroring the Builder gateway shape).
- */
 export interface AnthropicChunkStreamState {
   toolUseByIndex: Map<number, { id: string; name: string }>;
 }
@@ -479,20 +499,10 @@ export function createAnthropicChunkStreamState(): AnthropicChunkStreamState {
   return { toolUseByIndex: new Map() };
 }
 
-/**
- * Translate an Anthropic stream chunk into zero or more EngineEvents.
- * Called in a loop as chunks arrive from client.messages.stream().
- *
- * Pass a per-stream `state` (from `createAnthropicChunkStreamState`) to also
- * emit `tool-input-start` / `tool-input-delta` progress events while a tool
- * call's JSON input streams in. These are progress-only signals: the
- * authoritative `tool-call` blocks are still emitted from `finalMessage()` by
- * the engine, so omitting `state` simply drops the progress events without
- * changing tool dispatch.
- */
 export function anthropicChunkToEngineEvents(
   chunk: any,
   state?: AnthropicChunkStreamState,
+  toolNameMap?: ProviderToolNameMap,
 ): EngineEvent[] {
   const events: EngineEvent[] = [];
 
@@ -500,7 +510,10 @@ export function anthropicChunkToEngineEvents(
     const block = chunk.content_block;
     if (block?.type === "tool_use") {
       const id = typeof block.id === "string" ? block.id : undefined;
-      const name = typeof block.name === "string" ? block.name : undefined;
+      const name =
+        typeof block.name === "string"
+          ? toEngineToolName(block.name, toolNameMap)
+          : undefined;
       if (state && typeof chunk.index === "number" && id && name) {
         state.toolUseByIndex.set(chunk.index, { id, name });
       }
@@ -516,17 +529,12 @@ export function anthropicChunkToEngineEvents(
     } else if (chunk.delta?.type === "thinking_delta") {
       events.push({ type: "thinking-delta", text: chunk.delta.thinking ?? "" });
     } else if (chunk.delta?.type === "signature_delta") {
-      // Signature arrives after thinking — emit as a thinking-delta with empty text
-      // but carry the signature for the caller to store
       events.push({
         type: "thinking-delta",
         text: "",
         signature: chunk.delta.signature,
       });
     } else if (chunk.delta?.type === "input_json_delta") {
-      // Partial JSON for a streaming tool-call input. Surface as countable
-      // progress so long tool inputs (e.g. large extension HTML) don't look
-      // hung to the agent loop's tool-input activity heartbeat.
       const active =
         state && typeof chunk.index === "number"
           ? state.toolUseByIndex.get(chunk.index)
@@ -546,9 +554,97 @@ export function anthropicChunkToEngineEvents(
   return events;
 }
 
-// ---------------------------------------------------------------------------
-// Build tool_result blocks to append to messages after tool dispatch
-// ---------------------------------------------------------------------------
+export interface StreamedToolInputState {
+  byId: Map<string, { name: string; text: string; delivered: boolean }>;
+}
+
+export function createStreamedToolInputState(): StreamedToolInputState {
+  return { byId: new Map() };
+}
+
+export function observeStreamedToolInput(
+  state: StreamedToolInputState,
+  event: EngineEvent,
+): void {
+  if (event.type === "tool-input-start" || event.type === "tool-input-delta") {
+    const id = event.id;
+    if (!id) return;
+    const existing = state.byId.get(id);
+    const text = (event.type === "tool-input-delta" && event.text) || "";
+    if (existing) {
+      if (!existing.name && event.name) existing.name = event.name;
+      existing.text += text;
+      return;
+    }
+    state.byId.set(id, { name: event.name ?? "", text, delivered: false });
+    return;
+  }
+  if (event.type === "tool-call") {
+    if (isEmptyToolInput(event.input)) {
+      const streamedInput = parseStreamedToolInput(
+        state.byId.get(event.id)?.text ?? "",
+      );
+      if (streamedInput !== undefined) event.input = streamedInput;
+    }
+    markStreamedToolInputDelivered(state, event.id);
+    return;
+  }
+  if (event.type === "tool-call-error") {
+    markStreamedToolInputDelivered(state, event.id);
+  }
+}
+
+export function markStreamedToolInputDelivered(
+  state: StreamedToolInputState,
+  id: string,
+): void {
+  const existing = state.byId.get(id);
+  if (existing) existing.delivered = true;
+  else state.byId.set(id, { name: "", text: "", delivered: true });
+}
+
+const TRUNCATED_TOOL_INPUT_ERROR =
+  "The arguments never finished streaming, so this call was not executed and nothing changed. Call the tool again with complete arguments.";
+
+export function finalizeStreamedToolInputs(
+  state: StreamedToolInputState,
+  deliveredIds: Iterable<string> = [],
+): EngineEvent[] {
+  for (const id of deliveredIds) markStreamedToolInputDelivered(state, id);
+  const events: EngineEvent[] = [];
+  for (const [id, entry] of state.byId) {
+    if (entry.delivered) continue;
+    const input = parseStreamedToolInput(entry.text);
+    if (input !== undefined) {
+      events.push({ type: "tool-call", id, name: entry.name, input });
+    } else {
+      events.push({
+        type: "tool-call-error",
+        id,
+        name: entry.name || "unknown-tool",
+        input: entry.text,
+        error: TRUNCATED_TOOL_INPUT_ERROR,
+      });
+    }
+  }
+  return events;
+}
+
+function parseStreamedToolInput(
+  text: string,
+): Record<string, unknown> | undefined {
+  if (!text.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(text);
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isEmptyToolInput(input: unknown): boolean {
+  return input == null || (isRecord(input) && Object.keys(input).length === 0);
+}
 
 export function buildToolResultPart(
   toolCallId: string,

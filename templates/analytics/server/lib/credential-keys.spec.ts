@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+
 import {
   buildOptionalCredentialKeys,
   credentialProviderConfigs,
@@ -24,6 +25,8 @@ describe("credential key lookup", () => {
       "BIGQUERY_PROJECT_ID",
     ]);
     expect(keysFor("github")).toEqual(["GITHUB_TOKEN"]);
+    expect(keysFor("clay")).toEqual(["CLAY_PUBLIC_API_KEY"]);
+    expect(keysFor("builder")).toEqual(["BUILDER_PUBLIC_KEY"]);
     expect(keysFor("hubspot")).toEqual([
       "HUBSPOT_PRIVATE_APP_TOKEN",
       "HUBSPOT_ACCESS_TOKEN",
@@ -50,17 +53,23 @@ describe("credential key lookup", () => {
     expect(
       credentialProviderConfigs.find((cfg) => cfg.provider === "bigquery"),
     ).toMatchObject({
-      requiredKeys: [
+      requiredKeys: ["BIGQUERY_PROJECT_ID"],
+      optionalKeys: [
         "GOOGLE_APPLICATION_CREDENTIALS_JSON",
-        "BIGQUERY_PROJECT_ID",
+        "ANALYTICS_BIGQUERY_EVENTS_TABLE",
       ],
-      optionalKeys: ["ANALYTICS_BIGQUERY_EVENTS_TABLE"],
     });
     expect(
       credentialProviderConfigs.find((cfg) => cfg.provider === "gong"),
     ).toMatchObject({
       requiredKeys: ["GONG_ACCESS_KEY", "GONG_ACCESS_SECRET"],
       optionalKeys: ["GONG_API_BASE"],
+    });
+    expect(
+      credentialProviderConfigs.find((cfg) => cfg.provider === "hubspot"),
+    ).toMatchObject({
+      requiredKeys: ["HUBSPOT_PRIVATE_APP_TOKEN", "HUBSPOT_ACCESS_TOKEN"],
+      requiredMode: "any",
     });
   });
 });

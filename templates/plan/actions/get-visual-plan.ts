@@ -1,6 +1,10 @@
-import { defineAction, embedApp } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
-import { exportPlanContentToMdxFolder } from "../server/plan-mdx.js";
+
+import {
+  exportPlanContentToMdxFolder,
+  referencedBlockIdsForPlanComments,
+} from "../server/plan-mdx.js";
 import {
   buildPlanHtml,
   loadPlanBundle,
@@ -16,7 +20,7 @@ const queryBooleanSchema = z.preprocess((value) => {
 
 export default defineAction({
   description:
-    "Get an Agent-Native Plan bundle, including structured editable content with stable block IDs, source-control friendly MDX, exported HTML, sections, comments, and recent activity. Call this before targeted contentPatches, source patches, or resolving feedback on a specific plan.",
+    "Get an Agent-Native Plan bundle, including structured editable content with stable block IDs, source-control friendly MDX, exported HTML, sections, comments, and recent activity. Call this before targeted contentPatches, source patches, or resolving feedback on a specific plan. For full content replacement, replace-blocks, or replace-file, pass the returned plan.updatedAt exactly as expectedUpdatedAt and reread after the write.",
   schema: z.object({
     id: z.string().describe("Plan ID"),
     includeMdx: queryBooleanSchema
@@ -35,13 +39,13 @@ export default defineAction({
           .boolean()
           .optional()
           .describe(
-            "Include the exported MDX folder in the response. Defaults to true for agents; set false to skip the Prettier-formatted MDX export when you only need structured content or HTML.",
+            "Include the exported MDX folder in the response. Defaults to false for agent reads; set true for an explicit source-control workflow.",
           ),
         html: z
           .boolean()
           .optional()
           .describe(
-            "Include the exported HTML bundle in the response. Defaults to true for legacy plans; set false to skip when you only need structured content.",
+            "Include the exported HTML bundle in the response. Defaults to false for agent reads; set true when you explicitly need the rendered legacy artifact.",
           ),
       })
       .optional()
@@ -60,34 +64,16 @@ export default defineAction({
   },
   mcpApp: {
     compactCatalog: true,
-    resource: embedApp({
-      title: "Plan",
-      description:
-        "Open the Agent-Native Plan review surface for structured blocks, annotations, and comments.",
-      iframeTitle: "Agent-Native Plan",
-      openLabel: "Open Plan",
-      height: 860,
-    }),
   },
   run: async (args, ctx) => {
     const bundle = await loadPlanBundle(args.id);
-    // The interactive web viewer renders modern (structured-`content`) plans
-    // with the React `PlanContentRenderer` and never reads the server-built
-    // `html` or `mdx`: `html` only feeds the legacy iframe path (plans with no
-    // `content`), and `mdx` is the source-control export served on demand by
-    // `export-visual-plan`. Both were rebuilt on every read, and `usePlan`
-    // polls this action every 3s, so for the common case — a modern plan open
-    // in a browser — that was pure throwaway work holding the loading skeleton
-    // up, `mdx` worst of all (it Prettier-formats up to three MDX files). So
-    // skip what the frontend won't use. Agents / HTTP / CLI keep the full
-    // advertised contract, and legacy (content-less) plans still get `html`
-    // for their iframe.
     const isFrontend = ctx?.caller === "frontend";
     const isModern = Boolean(bundle.plan.content);
-    // Caller-controlled opt-out; defaults preserve existing behavior.
-    const wantMdx = args.includeMdx ?? args.include?.mdx ?? true;
-    const wantHtml = args.includeHtml ?? args.include?.html ?? true;
-    const includeStoredPlanExportFields = !isFrontend || wantHtml || wantMdx;
+    const isAgentCaller =
+      ctx?.caller === "tool" || ctx?.caller === "mcp" || ctx?.caller === "a2a";
+    const wantMdx = args.includeMdx ?? args.include?.mdx ?? !isAgentCaller;
+    const wantHtml = args.includeHtml ?? args.include?.html ?? !isAgentCaller;
+    const includeStoredPlanExportFields = wantHtml || wantMdx;
     return {
       ...bundle,
       planId: bundle.plan.id,
@@ -107,6 +93,9 @@ export default defineAction({
               brief: bundle.plan.brief,
               planId: bundle.plan.id,
               url: planPath(bundle.plan.id, bundle.plan.kind),
+              referencedBlockIds: referencedBlockIdsForPlanComments(
+                bundle.comments,
+              ),
             }),
     };
   },

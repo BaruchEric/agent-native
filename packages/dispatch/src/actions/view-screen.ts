@@ -1,47 +1,55 @@
-/**
- * See what the user is currently looking at on screen.
- *
- * Reads and returns the current navigation state from application state.
- *
- * Usage:
- *   pnpm action view-screen
- */
-
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { readAppState } from "@agent-native/core/application-state";
+import type { ActionEntry } from "@agent-native/core/server";
 import { z } from "zod";
+
+import { listWorkspaceApps } from "../server/lib/app-creation-store.js";
 import { listOverview } from "../server/lib/dispatch-store.js";
 import {
+  getAgentThreadDebug,
+  listAgentRunFailures,
+  listThreadDebugSources,
+  searchAgentThreads,
+} from "../server/lib/thread-debug-store.js";
+import { listDispatchUsageMetrics } from "../server/lib/usage-metrics-store.js";
+import {
   listVaultOverview,
-  listSecrets,
+  listSecretOptions,
   listGrants,
   listRequests,
   getVaultAccessSettings,
+  canManageVault,
 } from "../server/lib/vault-store.js";
-import { listWorkspaceApps } from "../server/lib/app-creation-store.js";
-import { listDispatchUsageMetrics } from "../server/lib/usage-metrics-store.js";
 import {
   listWorkspaceResourceOptions,
   listWorkspaceResourcesForApp,
 } from "../server/lib/workspace-resources-store.js";
-import {
-  getAgentThreadDebug,
-  listThreadDebugSources,
-  searchAgentThreads,
-} from "../server/lib/thread-debug-store.js";
+import { CHAT_FIRST_PANE_STATE_KEY } from "../shared/chat-first-pane.js";
+import getDreamSettings from "./get-dream-settings.js";
+import getDream from "./get-dream.js";
+import listConnectedAgents from "./list-connected-agents.js";
+import listDreamCandidates from "./list-dream-candidates.js";
+import listDreams from "./list-dreams.js";
+import listMcpAppAccess from "./list-mcp-app-access.js";
+
+const localDispatchActions: Record<string, ActionEntry> = {
+  "list-connected-agents": listConnectedAgents,
+  "list-mcp-app-access": listMcpAppAccess,
+  "list-dream-candidates": listDreamCandidates,
+  "list-dreams": listDreams,
+  "get-dream-settings": getDreamSettings,
+  "get-dream": getDream,
+};
 
 async function runLocalDispatchAction(
   name: string,
   args: Record<string, unknown>,
 ) {
-  const modulePath = `./${name}.js`;
-  const module = (await import(/* @vite-ignore */ modulePath)) as {
-    default?: {
-      run: (args: Record<string, unknown>) => unknown | Promise<unknown>;
-    };
-  };
-  if (!module.default) throw new Error(`Dispatch action not found: ${name}`);
-  return module.default.run(stripUndefined(args));
+  if (!Object.prototype.hasOwnProperty.call(localDispatchActions, name)) {
+    throw new Error(`Dispatch action not found: ${name}`);
+  }
+  const action = localDispatchActions[name];
+  return action.run(stripUndefined(args));
 }
 
 function stripUndefined(args: Record<string, unknown>) {
@@ -50,9 +58,80 @@ function stripUndefined(args: Record<string, unknown>) {
   );
 }
 
+function threadDebugLookbackHours(value: unknown): number {
+  if (value === "7d") return 168;
+  if (value === "30d") return 720;
+  return 24;
+}
+
+function threadDebugFailureStatus(
+  value: unknown,
+): "all" | "errored" | "aborted" | "truncated" {
+  return value === "errored" || value === "aborted" || value === "truncated"
+    ? value
+    : "all";
+}
+
+type EmbeddedApp =
+  | {
+      status: "open";
+      id: string;
+      path: string;
+      view?: string;
+      source: "route" | "chat-first-pane";
+    }
+  | { status: "unknown"; source: "route" | "chat-first-pane"; reason: string };
+
+async function resolveEmbeddedApp(
+  navigation: Record<string, any> | null,
+): Promise<EmbeddedApp | null> {
+  if (navigation?.view === "workspace-app") {
+    const id =
+      typeof navigation.workspaceAppId === "string"
+        ? navigation.workspaceAppId.trim()
+        : "";
+    if (!id) {
+      return {
+        status: "unknown",
+        source: "route",
+        reason: `The route ${navigation.path ?? "/apps/…"} embeds a workspace app, but its id could not be read from the URL.`,
+      };
+    }
+    return {
+      status: "open",
+      id,
+      path:
+        typeof navigation.workspaceAppPath === "string"
+          ? navigation.workspaceAppPath
+          : "/",
+      source: "route",
+    };
+  }
+
+  if (navigation?.view !== "chat") return null;
+  const pane = await readAppState(CHAT_FIRST_PANE_STATE_KEY);
+  if (pane === null) return null;
+  const appId = typeof pane.appId === "string" ? pane.appId.trim() : "";
+  if (!appId) {
+    return {
+      status: "unknown",
+      source: "chat-first-pane",
+      reason:
+        "A chat-first app pane is recorded, but its stored state does not name an app.",
+    };
+  }
+  return {
+    status: "open",
+    id: appId,
+    path: typeof pane.path === "string" && pane.path ? pane.path : "/",
+    ...(typeof pane.view === "string" && pane.view ? { view: pane.view } : {}),
+    source: "chat-first-pane",
+  };
+}
+
 export default defineAction({
   description:
-    "See what the user is currently looking at in the dispatch UI, including navigation state and a compact operational summary.",
+    "See what the user is currently looking at in the dispatch UI, including navigation state, any embedded workspace app, and a compact operational summary.",
   schema: z.object({}),
   http: false,
   run: async () => {
@@ -67,12 +146,32 @@ export default defineAction({
       approvalPolicy: overview.settings,
     };
     if (navigation) screen.navigation = navigation;
-    if (navigation?.view === "chat") {
+
+    const embeddedApp = await resolveEmbeddedApp(navigation);
+    if (embeddedApp) screen.embeddedApp = embeddedApp;
+
+    if (navigation?.view === "chat" || navigation?.view === "browser-chat") {
       screen.chatSurface = {
-        view: "full-page Dispatch chat",
+        view:
+          navigation.view === "browser-chat"
+            ? "embedded browser chat"
+            : "full-page Dispatch chat",
         purpose:
           "Create apps, manage workspace resources, route work to connected agents, and continue Dispatch conversations.",
       };
+      const agentPath =
+        typeof navigation.agentPath === "string"
+          ? navigation.agentPath.trim()
+          : "";
+      if (agentPath) {
+        const agents = await listWorkspaceResourceOptions({ kind: "agent" });
+        const agent = agents.find((resource) => resource.path === agentPath);
+        screen.chatSurface = {
+          ...(screen.chatSurface as Record<string, unknown>),
+          agentPath,
+          ...(agent ? { agent } : {}),
+        };
+      }
     }
     if (navigation?.view === "overview") {
       screen.recentAudit = overview.recentAudit.slice(0, 5);
@@ -81,7 +180,7 @@ export default defineAction({
     if (navigation?.view === "destinations") {
       screen.recentDestinations = overview.recentDestinations;
     }
-    if (navigation?.view === "agents") {
+    if (navigation?.view === "connected-agents") {
       const [connectedAgents, mcpAccess] = await Promise.all([
         runLocalDispatchAction("list-connected-agents", {}),
         runLocalDispatchAction("list-mcp-app-access", {}),
@@ -89,10 +188,27 @@ export default defineAction({
       screen.connectedAgents = connectedAgents;
       screen.mcpAppAccess = mcpAccess;
     }
+    if (navigation?.view === "agents") {
+      screen.simpleAgents = await listWorkspaceResourceOptions({
+        kind: "agent",
+      });
+    }
+    if (navigation?.view === "operations") {
+      const nav = navigation as { operationsView?: string };
+      screen.operatorConsole = {
+        view: nav.operationsView === "database" ? "database" : "monitoring",
+        monitoring:
+          "The shared observability dashboard provides traces, conversations, evaluations, experiments, and feedback.",
+        database:
+          "The shared database admin is available in Code mode for table browsing and SQL inspection.",
+        relatedTools: ["thread-debug", "audit", "destinations", "automations"],
+      };
+    }
     if (
       navigation?.view === "overview" ||
       navigation?.view === "metrics" ||
       navigation?.view === "apps" ||
+      navigation?.view === "workspace-app" ||
       navigation?.view === "new-app"
     ) {
       const workspaceApps = await listWorkspaceApps({
@@ -124,9 +240,31 @@ export default defineAction({
     }
     if (navigation?.view === "metrics") {
       try {
-        const metrics = await listDispatchUsageMetrics({ sinceDays: 30 });
+        const usageScope =
+          navigation.usageScope === "app"
+            ? "app"
+            : navigation.usageScope === "workspace"
+              ? "workspace"
+              : "me";
+        const usageUserEmail =
+          typeof navigation.usageUserEmail === "string"
+            ? navigation.usageUserEmail
+            : undefined;
+        const usageAppId =
+          typeof navigation.usageAppId === "string"
+            ? navigation.usageAppId
+            : undefined;
+        const metrics = await listDispatchUsageMetrics({
+          sinceDays: 30,
+          scope: usageScope,
+          userEmail: usageUserEmail,
+          appId: usageAppId,
+        });
         screen.usageMetrics = {
           billing: metrics.billing,
+          viewScope: metrics.viewScope,
+          selectedUserEmail: metrics.selectedUserEmail,
+          selectedAppId: metrics.selectedAppId,
           totals: metrics.totals,
           byApp: metrics.byApp.slice(0, 8),
           byUser: metrics.byUser.slice(0, 8),
@@ -140,9 +278,10 @@ export default defineAction({
       }
     }
     if (navigation?.view === "vault" || navigation?.view === "new-app") {
+      const isVaultAdmin = await canManageVault();
       const [secrets, grants, requests, access] = await Promise.all([
-        listSecrets(),
-        listGrants(),
+        listSecretOptions(),
+        isVaultAdmin ? listGrants() : Promise.resolve([]),
         listRequests({ status: "pending" }),
         getVaultAccessSettings(),
       ]);
@@ -175,7 +314,15 @@ export default defineAction({
       try {
         const nav = navigation as Record<string, any>;
         screen.threadDebugSources = await listThreadDebugSources();
-        if (nav.query) {
+        if (nav.threadDebugMode !== "threads") {
+          screen.agentRunFailures = await listAgentRunFailures({
+            sourceId: nav.sourceId ?? "all",
+            ownerEmail: nav.ownerEmail,
+            status: threadDebugFailureStatus(nav.failureStatus),
+            lookbackHours: threadDebugLookbackHours(nav.range),
+            limit: 10,
+          });
+        } else if (nav.query) {
           screen.threadDebugResults = await searchAgentThreads({
             sourceId: nav.sourceId,
             query: nav.query,
@@ -183,10 +330,14 @@ export default defineAction({
             limit: 10,
           });
         }
-        if (nav.threadId) {
+        if (nav.threadId || nav.runId) {
           const detail = await getAgentThreadDebug({
-            sourceId: nav.sourceId,
-            threadId: nav.threadId,
+            sourceId:
+              nav.runId && nav.inspectSourceId
+                ? nav.inspectSourceId
+                : nav.sourceId,
+            threadId: nav.runId ? undefined : nav.threadId,
+            runId: nav.runId,
             ownerEmail: nav.ownerEmail,
             maxRuns: 5,
             maxEvents: 80,
@@ -195,11 +346,17 @@ export default defineAction({
           screen.threadDebugSelection = {
             source: detail.source,
             thread: detail.thread,
+            ...(typeof nav.threadDebugItem === "string"
+              ? { selectedItem: nav.threadDebugItem }
+              : {}),
             messageCount: detail.messages.length,
             runCount: detail.runs.length,
             debug: detail.debug,
             debugRuns: (detail as any).debugRuns?.slice(-5) ?? [],
             messages: detail.messages.slice(-6),
+            runs: detail.runs
+              .slice(0, 5)
+              .map(({ events: _events, ...run }) => run),
           };
         }
       } catch (error) {

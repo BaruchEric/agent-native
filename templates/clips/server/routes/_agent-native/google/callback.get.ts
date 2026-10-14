@@ -1,19 +1,26 @@
 import {
+  createOAuthSession,
+  decodeOAuthState,
+  ensureGoogleAuthIdentity,
+  getAppUrl,
+  logOAuthStateDecodeFailure,
+  oauthCallbackResponse,
+  oauthErrorPage,
+  resolveGoogleSignInCredentials,
+  resolveOAuthOwner,
+  matchesDesktopOAuthBrowserBinding,
+  setDesktopExchange,
+  type OAuthStatePayload,
+} from "@agent-native/core/server";
+import { putSetting } from "@agent-native/core/settings";
+import { isGoogleProfileImageUrl } from "@agent-native/core/shared";
+import {
   defineEventHandler,
   getQuery,
   setResponseStatus,
   type H3Event,
 } from "h3";
-import {
-  createOAuthSession,
-  decodeOAuthState,
-  getAppUrl,
-  oauthCallbackResponse,
-  oauthErrorPage,
-  resolveOAuthOwner,
-  setDesktopExchange,
-  type OAuthStatePayload,
-} from "@agent-native/core/server";
+
 import {
   GOOGLE_TOKEN_URL,
   GOOGLE_USERINFO_URL,
@@ -23,12 +30,37 @@ import {
   isCalendarConnectState,
 } from "../../../lib/google-calendar-oauth.js";
 
+export async function persistGoogleProfileImage(
+  email: string,
+  picture: unknown,
+) {
+  if (!isGoogleProfileImageUrl(picture)) return;
+
+  await putSetting(`avatar:${email}`, { image: picture.trim() }).catch(
+    (error) => {
+      console.warn("[auth] failed to store Google profile image:", error);
+    },
+  );
+}
+
 async function handleGoogleSignInCallback(
   event: H3Event,
   state: OAuthStatePayload,
 ) {
   const desktop = state.desktop;
   const flowId = state.flowId;
+  if (
+    flowId &&
+    (!state.desktopVerifierHash ||
+      (state.desktopWebview &&
+        (!state.desktopBrowserBindingHash ||
+          !matchesDesktopOAuthBrowserBinding(
+            event,
+            state.desktopBrowserBindingHash,
+          ))))
+  ) {
+    return oauthErrorPage("Desktop OAuth browser binding is invalid.");
+  }
 
   try {
     const query = getQuery(event);
@@ -51,11 +83,10 @@ async function handleGoogleSignInCallback(
       return { error: "Missing authorization code" };
     }
 
-    const clientId = process.env.GOOGLE_CLIENT_ID;
-    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-    if (!clientId || !clientSecret) {
+    const credentials = resolveGoogleSignInCredentials();
+    if (!credentials) {
       return oauthErrorPage(
-        "Google OAuth is not configured (missing client id/secret).",
+        "Google sign-in is not configured (missing client id/secret).",
       );
     }
 
@@ -66,8 +97,8 @@ async function handleGoogleSignInCallback(
       },
       body: new URLSearchParams({
         code,
-        client_id: clientId,
-        client_secret: clientSecret,
+        client_id: credentials.clientId,
+        client_secret: credentials.clientSecret,
         redirect_uri: state.redirectUri,
         grant_type: "authorization_code",
       }),
@@ -90,6 +121,15 @@ async function handleGoogleSignInCallback(
         "Google account email is not verified. Please verify your email with Google and try again.",
       );
     }
+    const googleAccountId = typeof user.id === "string" ? user.id.trim() : "";
+    if (!googleAccountId) throw new Error("Could not get Google account id");
+    const isNewUser = await ensureGoogleAuthIdentity({
+      email,
+      accountId: googleAccountId,
+      name: typeof user.name === "string" ? user.name : undefined,
+      image: typeof user.picture === "string" ? user.picture : undefined,
+    });
+    await persistGoogleProfileImage(email, user.picture);
 
     const { hasProductionSession } = await resolveOAuthOwner(
       event,
@@ -98,15 +138,29 @@ async function handleGoogleSignInCallback(
     const { sessionToken } = await createOAuthSession(event, email, {
       hasProductionSession,
       desktop,
+      trackSignup: {
+        authProvider: "google",
+        name: typeof user.name === "string" ? user.name : undefined,
+        isNewUser,
+      },
     });
 
     if (flowId && sessionToken) {
-      setDesktopExchange(flowId, sessionToken, email);
+      if (!state.desktopVerifierHash) {
+        throw new Error("Missing desktop exchange challenge.");
+      }
+      await setDesktopExchange(
+        flowId,
+        sessionToken,
+        email,
+        state.desktopVerifierHash,
+      );
     }
 
     return oauthCallbackResponse(event, email, {
       sessionToken,
       desktop,
+      desktopWebview: state.desktopWebview,
       returnUrl: state.returnUrl,
       flowId,
       appName: "Clips",
@@ -119,10 +173,17 @@ async function handleGoogleSignInCallback(
 }
 
 export default defineEventHandler(async (event: H3Event) => {
-  const state = decodeOAuthState(
+  const decoded = decodeOAuthState(
     getQuery(event).state as string | undefined,
     getAppUrl(event, "/_agent-native/google/callback"),
   );
+  if (!decoded.ok) {
+    logOAuthStateDecodeFailure(event, decoded.reason, "google");
+    return oauthErrorPage(
+      "Connection failed: your sign-in link expired or is invalid. Please try again.",
+    );
+  }
+  const state = decoded;
 
   if (isCalendarConnectState(state)) {
     return handleGoogleCalendarCallback(event, state);

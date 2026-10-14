@@ -1,25 +1,50 @@
-import { eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
 import { resolveAccess } from "@agent-native/core/sharing";
+import { eq } from "drizzle-orm";
+
+import { getDb, schema } from "../server/db/index.js";
 import { absoluteUrl, parseJson } from "../server/lib/json.js";
+import {
+  assertCanDraftAuthoredBy,
+  type LibraryWriteAccess,
+} from "../server/lib/library-access.js";
 import type {
   AssetLineageSummary,
   GenerationSessionItemSummary,
   GenerationPresetSummary,
+  TemplateSummary,
   GenerationSessionSummary,
   ImageAssetMetadata,
   StyleBrief,
 } from "../shared/api.js";
 
-export async function requireLibrary(id: string) {
-  const access = await resolveAccess("asset-library", id);
-  if (!access) throw new Error("Asset library not found or not accessible.");
+type AccessCtx = {
+  userEmail?: string;
+  orgId?: string | null;
+};
+
+function accessContext(ctx?: AccessCtx) {
+  if (!ctx) return undefined;
+  return {
+    userEmail: ctx.userEmail,
+    orgId: ctx.orgId ?? undefined,
+  };
+}
+
+export async function requireLibrary(id: string, ctx?: AccessCtx) {
+  const access = await requireLibraryAccess(id, ctx);
   return access.resource;
+}
+
+export async function requireLibraryAccess(id: string, ctx?: AccessCtx) {
+  const access = await resolveAccess("asset-library", id, accessContext(ctx));
+  if (!access) throw new Error("Asset library not found or not accessible.");
+  return access;
 }
 
 export async function requireGenerationSessionInLibrary(
   sessionId: string,
   libraryId: string,
+  access?: LibraryWriteAccess,
 ) {
   const db = getDb();
   const [session] = await db
@@ -30,6 +55,13 @@ export async function requireGenerationSessionInLibrary(
   if (!session) throw new Error("Generation session not found.");
   if (session.libraryId !== libraryId) {
     throw new Error("Generation session does not belong to this library.");
+  }
+  if (!access?.canApprove) {
+    await assertCanDraftAuthoredBy(
+      libraryId,
+      session.createdBy,
+      "A generation session",
+    );
   }
   return session;
 }
@@ -78,6 +110,18 @@ export function assetUrls(asset: {
   };
 }
 
+export function imageArtifactLinks(input: {
+  id: string;
+  runId: string;
+  previewUrl: string;
+  downloadUrl: string;
+}) {
+  return [
+    `previewUrl: ${input.previewUrl} (ID: ${input.id}, Run: ${input.runId})`,
+    `downloadUrl: ${input.downloadUrl}`,
+  ];
+}
+
 export function serializeLibrary(row: any) {
   return {
     id: row.id,
@@ -89,6 +133,7 @@ export function serializeLibrary(row: any) {
     canonicalLogoAssetId: row.canonicalLogoAssetId,
     coverAssetId: row.coverAssetId,
     visibility: row.visibility,
+    accessRole: typeof row.accessRole === "string" ? row.accessRole : undefined,
     archivedAt: row.archivedAt ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -141,6 +186,7 @@ export function serializeGenerationRun(row: any) {
 }
 
 export function serializeGenerationPreset(row: any): GenerationPresetSummary {
+  const settings = parseJson<Record<string, unknown>>(row.settings, {});
   return {
     id: row.id,
     libraryId: row.libraryId,
@@ -155,10 +201,25 @@ export function serializeGenerationPreset(row: any): GenerationPresetSummary {
     model: row.model,
     textPolicy: row.textPolicy ?? "",
     referencePolicy: row.referencePolicy ?? "auto",
-    settings: parseJson<Record<string, unknown>>(row.settings, {}),
+    includeLogo: settings.includeLogo === true,
+    settings,
     sortOrder: Number(row.sortOrder ?? 0),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+  };
+}
+
+export function serializeTemplate(row: any): TemplateSummary {
+  const preset = serializeGenerationPreset(row);
+  const libraryId = row.libraryId ?? null;
+  return {
+    ...preset,
+    libraryId,
+    scope: libraryId ? "library" : "global",
+    visibility: row.visibility ?? "private",
+    ownerEmail: row.ownerEmail,
+    accessRole: typeof row.accessRole === "string" ? row.accessRole : undefined,
+    libraryTitle: row.libraryTitle ?? null,
   };
 }
 
@@ -346,6 +407,7 @@ export function serializeAsset(
       row.mediaType ?? (row.mimeType?.startsWith("video/") ? "video" : "image"),
     role: row.role,
     status: row.status,
+    category: metadata.category ?? null,
     title: row.title,
     description: row.description ?? metadata.description ?? null,
     altText: row.altText,
@@ -365,6 +427,107 @@ export function serializeAsset(
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     ...assetUrls(row),
+  };
+}
+
+export function serializeAssetSummary(row: {
+  id: string;
+  generationRunId?: string | null;
+  title?: string | null;
+  libraryId: string;
+  collectionId?: string | null;
+  status: string;
+  mediaType?: string | null;
+  aspectRatio?: string | null;
+  width?: number | null;
+  height?: number | null;
+  mimeType: string;
+  objectKey: string;
+  thumbnailObjectKey?: string | null;
+}) {
+  const urls = assetUrls(row);
+  return {
+    id: row.id,
+    runId: row.generationRunId ?? null,
+    artifactType: "image" as const,
+    title: row.title ?? null,
+    libraryId: row.libraryId,
+    collectionId: row.collectionId ?? null,
+    status: row.status,
+    mediaType:
+      row.mediaType ?? (row.mimeType.startsWith("video/") ? "video" : "image"),
+    aspectRatio: row.aspectRatio ?? null,
+    width: row.width ?? null,
+    height: row.height ?? null,
+    mimeType: row.mimeType,
+    url: urls.url,
+    previewUrl: urls.previewUrl,
+    downloadUrl: urls.downloadUrl,
+    embedUrl: urls.embedUrl,
+  };
+}
+
+export function serializeAssetListItem(
+  row: {
+    id: string;
+    libraryId: string;
+    collectionId?: string | null;
+    folderId?: string | null;
+    mediaType?: string | null;
+    role: string;
+    status: string;
+    title?: string | null;
+    description?: string | null;
+    altText?: string | null;
+    prompt?: string | null;
+    model?: string | null;
+    aspectRatio?: string | null;
+    mimeType: string;
+    width?: number | null;
+    height?: number | null;
+    durationSeconds?: number | null;
+    objectKey: string;
+    thumbnailObjectKey?: string | null;
+    metadata?: string | null;
+  },
+  lineage: AssetLineageSummary | null = null,
+) {
+  const metadata = parseJson<Record<string, unknown>>(row.metadata, {});
+  const urls = assetUrls(row);
+  return {
+    id: row.id,
+    libraryId: row.libraryId,
+    collectionId: row.collectionId ?? null,
+    folderId: row.folderId ?? null,
+    mediaType:
+      row.mediaType ?? (row.mimeType.startsWith("video/") ? "video" : "image"),
+    role: row.role,
+    status: row.status,
+    category: metadata.category ?? null,
+    title: row.title ?? null,
+    description: row.description ?? metadata.description ?? null,
+    altText: row.altText ?? null,
+    prompt: row.prompt ?? null,
+    model: row.model ?? null,
+    aspectRatio: row.aspectRatio ?? null,
+    mimeType: row.mimeType,
+    width: row.width ?? null,
+    height: row.height ?? null,
+    durationSeconds: row.durationSeconds ?? null,
+    metadata: {
+      category: metadata.category ?? null,
+      intent: metadata.intent ?? null,
+      description: metadata.description ?? null,
+      originalName: metadata.originalName ?? null,
+      provider: metadata.provider ?? null,
+    },
+    lineage,
+    url: urls.url,
+    previewUrl: urls.previewUrl,
+    thumbnailUrl: urls.thumbnailUrl,
+    downloadUrl: urls.downloadUrl,
+    embedPath: urls.embedPath,
+    embedUrl: urls.embedUrl,
   };
 }
 

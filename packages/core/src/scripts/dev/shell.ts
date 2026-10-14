@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import path from "node:path";
+
 import type { ActionTool } from "../../agent/types.js";
-import { parseArgs } from "../utils.js";
 import {
   getRequestOrgId,
   getRequestTimezone,
@@ -9,6 +9,7 @@ import {
   getRequestUserName,
   hasRequestContext,
 } from "../../server/request-context.js";
+import { parseArgs } from "../utils.js";
 
 const MAX_OUTPUT = 50_000;
 const TIMEOUT_MS = 30_000;
@@ -65,8 +66,6 @@ export async function run(args: Record<string, string>): Promise<string> {
       output = output.slice(0, MAX_OUTPUT) + "\n... (output truncated)";
     }
 
-    // Throw so the agent framework marks this as isError:true, preventing the
-    // agent from synthesizing a success narrative when the command failed.
     throw new Error(`Command failed (exit ${err?.status ?? "?"})\n${output}`);
   }
 }

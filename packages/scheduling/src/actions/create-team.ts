@@ -1,6 +1,7 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
+import { defineAction } from "@agent-native/core/action";
 import { nanoid } from "nanoid";
+import { z } from "zod";
+
 import { getSchedulingContext } from "../server/context.js";
 import { currentUserEmail, currentOrgId } from "./_helpers.js";
 
@@ -29,7 +30,6 @@ export default defineAction({
         ownerEmail,
         orgId: currentOrgId() ?? null,
       });
-    // Owner is automatically a member with owner role
     await getDb().insert(schema.teamMembers).values({
       id: nanoid(),
       teamId: id,

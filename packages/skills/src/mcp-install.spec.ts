@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { installSkills } from "./index.js";
@@ -57,11 +58,10 @@ describe("installSkills MCP registration", () => {
       isInteractive: () => false,
     });
 
-    // result surfaces the registered server
     expect(result.mcpServers).toHaveLength(1);
     expect(result.mcpServers[0].serverName).toBe("plan");
     expect(result.mcpServers[0].mcpUrl).toBe(
-      "https://plan.agent-native.com/_agent-native/mcp",
+      "https://plan.agent-native.com/mcp",
     );
 
     const config = JSON.parse(
@@ -69,12 +69,11 @@ describe("installSkills MCP registration", () => {
     );
     expect(config.mcpServers.plan).toEqual({
       type: "http",
-      url: "https://plan.agent-native.com/_agent-native/mcp",
+      url: "https://plan.agent-native.com/mcp",
     });
-    // alias registered too, pointing at the same URL, URL-only (no headers)
     expect(config.mcpServers["agent-native-plans"]).toEqual({
       type: "http",
-      url: "https://plan.agent-native.com/_agent-native/mcp",
+      url: "https://plan.agent-native.com/mcp",
     });
   });
 
@@ -94,7 +93,6 @@ describe("installSkills MCP registration", () => {
       isInteractive: () => false,
     });
 
-    // both skills installed, but only ONE plan MCP registration
     expect(result.skills.sort()).toEqual(["visual-plan", "visual-recap"]);
     expect(result.mcpServers.map((s) => s.serverName)).toEqual(["plan"]);
   });
@@ -117,7 +115,6 @@ describe("installSkills MCP registration", () => {
 
     expect(result.mcpServers).toHaveLength(0);
     expect(fs.existsSync(path.join(project, ".mcp.json"))).toBe(false);
-    // files still copied
     expect(
       fs.existsSync(
         path.join(project, ".claude", "skills", "visual-plan", "SKILL.md"),

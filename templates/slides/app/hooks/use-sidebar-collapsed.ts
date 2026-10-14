@@ -1,5 +1,6 @@
-import { useCallback } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback } from "react";
+
 import { TAB_ID } from "@/lib/tab-id";
 
 const KEY = "sidebarCollapsed";
@@ -74,9 +75,6 @@ export function useSidebarCollapsed() {
 
   const setCollapsed = useCallback(
     async (next: boolean | ((prev: boolean) => boolean)) => {
-      // Cancel any in-flight poll so its response can't overwrite the
-      // optimistic update we're about to commit (otherwise the UI snaps back
-      // when a stale 2s poll lands after the click).
       await qc.cancelQueries({ queryKey: QUERY_KEY });
       const prev =
         qc.getQueryData<SidebarCollapsedState>(QUERY_KEY)?.collapsed ??
@@ -94,7 +92,7 @@ export function useSidebarCollapsed() {
         },
         body: JSON.stringify({ collapsed: nextVal }),
       }).catch(() => {
-        qc.invalidateQueries({ queryKey: QUERY_KEY });
+        void qc.invalidateQueries({ queryKey: QUERY_KEY });
       });
     },
     [qc],

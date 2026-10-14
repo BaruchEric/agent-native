@@ -1,34 +1,52 @@
-/**
- * AnthropicEngine — wraps @anthropic-ai/sdk for use as an AgentEngine.
- *
- * This is the default, best-in-class engine. It supports all Anthropic-native
- * features: extended thinking, prompt caching, vision, computer use, and
- * parallel tool calls.
- *
- * All providerOptions.anthropic fields are forwarded directly to the SDK.
- */
-
-import type {
-  AgentEngine,
-  EngineCapabilities,
-  EngineStreamOptions,
-  EngineEvent,
-} from "./types.js";
+import {
+  clearProviderCredentialAuthFailure,
+  readDeployCredentialEnv,
+  recordProviderCredentialAuthFailure,
+} from "../../server/credential-provider.js";
+import {
+  allowsSamplingParams,
+  anthropicManualThinkingBudget,
+  normalizeReasoningEffortForModel,
+  supportsClaudeAdaptiveThinking,
+} from "../../shared/reasoning-effort.js";
+import { ANTHROPIC_MODEL_CONFIG } from "../model-config.js";
+import {
+  LLM_MISSING_CREDENTIALS_ERROR_CODE,
+  LLM_MISSING_CREDENTIALS_MESSAGE,
+} from "./credential-errors.js";
+import {
+  describeErrorWithCauses,
+  isBareProviderRejectionMessage,
+  PROVIDER_TRANSIENT_REJECTION_ERROR_CODE,
+} from "./error-detail.js";
+import { createFirstEventAbortController } from "./first-event-timeout.js";
+import { limitProviderTools } from "./limit-provider-tools.js";
+import { ANTHROPIC_API_ORIGIN } from "./openai-compatible-endpoint.js";
+import {
+  clampThinkingBudgetTokens,
+  resolveMaxOutputTokensForEngine,
+} from "./output-tokens.js";
+import {
+  splitSystemPromptForCache,
+  stablePrefixCacheControl,
+} from "./prompt-cache.js";
+import { createProviderToolNameMap } from "./tool-name.js";
 import {
   engineToolsToAnthropic,
   engineMessagesToAnthropic,
   anthropicContentToEngine,
   anthropicChunkToEngineEvents,
   createAnthropicChunkStreamState,
+  createStreamedToolInputState,
+  finalizeStreamedToolInputs,
+  observeStreamedToolInput,
 } from "./translate-anthropic.js";
-import { readDeployCredentialEnv } from "../../server/credential-provider.js";
-import { normalizeReasoningEffortForModel } from "../../shared/reasoning-effort.js";
-import {
-  LLM_MISSING_CREDENTIALS_ERROR_CODE,
-  LLM_MISSING_CREDENTIALS_MESSAGE,
-} from "./credential-errors.js";
-import { ANTHROPIC_MODEL_CONFIG } from "../model-config.js";
-import { resolveMaxOutputTokensForEngine } from "./output-tokens.js";
+import type {
+  AgentEngine,
+  EngineCapabilities,
+  EngineStreamOptions,
+  EngineEvent,
+} from "./types.js";
 
 export const ANTHROPIC_CAPABILITIES: EngineCapabilities = {
   thinking: true,
@@ -47,120 +65,207 @@ class AnthropicEngine implements AgentEngine {
   readonly label = "Claude (Anthropic SDK)";
   readonly defaultModel = ANTHROPIC_DEFAULT_MODEL;
   readonly supportedModels = ANTHROPIC_SUPPORTED_MODELS;
+  readonly acceptsCustomModels = true;
   readonly capabilities = ANTHROPIC_CAPABILITIES;
 
   private readonly apiKey: string;
+  private readonly baseURL: string | undefined;
 
-  constructor(apiKey: string) {
+  constructor(apiKey: string, baseURL: string | undefined) {
     this.apiKey = apiKey;
+    this.baseURL = baseURL;
   }
 
   async *stream(opts: EngineStreamOptions): AsyncIterable<EngineEvent> {
     const Anthropic = (await import("@anthropic-ai/sdk")).default;
-    const client = new Anthropic({ apiKey: this.apiKey });
+    // An undefined baseURL lets the SDK read ANTHROPIC_BASE_URL itself.
+    const client = new Anthropic({
+      apiKey: this.apiKey,
+      baseURL: this.baseURL,
+      maxRetries: 1,
+    });
 
-    const tools = engineToolsToAnthropic(opts.tools);
-    const messages = engineMessagesToAnthropic(opts.messages);
+    const toolNameMap = createProviderToolNameMap(opts.tools, opts.messages);
+    const tools = engineToolsToAnthropic(
+      limitProviderTools(opts.tools),
+      toolNameMap,
+    );
+    const messages = engineMessagesToAnthropic(opts.messages, toolNameMap);
     const anthropicOpts = opts.providerOptions?.anthropic;
 
-    // Build extra body params for Anthropic-native features
+    const resolvedMaxOutputTokens = resolveMaxOutputTokensForEngine(
+      this.name,
+      opts.maxOutputTokens,
+      opts.model,
+    );
+
     const extra: Record<string, unknown> = {};
     if (anthropicOpts?.thinking) {
       extra.thinking = {
         type: anthropicOpts.thinking.type,
-        budget_tokens: anthropicOpts.thinking.budgetTokens,
+        budget_tokens:
+          anthropicOpts.thinking.type === "enabled" &&
+          typeof anthropicOpts.thinking.budgetTokens === "number"
+            ? clampThinkingBudgetTokens(
+                anthropicOpts.thinking.budgetTokens,
+                resolvedMaxOutputTokens,
+              )
+            : anthropicOpts.thinking.budgetTokens,
       };
-    }
-    if (anthropicOpts?.topK !== undefined) {
-      extra.top_k = anthropicOpts.topK;
     }
     const reasoningEffort = normalizeReasoningEffortForModel(
       opts.model,
       opts.reasoningEffort,
     );
-    if (reasoningEffort) {
-      if (!extra.thinking) {
+    if (reasoningEffort && !extra.thinking) {
+      if (supportsClaudeAdaptiveThinking(opts.model)) {
         extra.thinking = { type: "adaptive" };
+        extra.output_config = { effort: reasoningEffort };
+      } else {
+        const budgetTokens = clampThinkingBudgetTokens(
+          anthropicManualThinkingBudget(reasoningEffort),
+          resolvedMaxOutputTokens,
+        );
+        if (budgetTokens !== undefined) {
+          extra.thinking = { type: "enabled", budget_tokens: budgetTokens };
+        }
       }
-      extra.output_config = { effort: reasoningEffort };
     }
 
-    // Apply prompt caching to the system prompt and tools by default.
-    // Cache is pure upside: identical prefixes on subsequent turns get ~90%
-    // off input cost and much faster time-to-first-token. If the prefix
-    // changes turn-to-turn, it's a no-op. Templates can opt out by setting
-    // providerOptions.anthropic.cacheControl = false.
+    const samplingAllowed = allowsSamplingParams({
+      model: opts.model,
+      thinkingEnabled: Boolean(extra.thinking),
+    });
+    if (samplingAllowed && anthropicOpts?.topK !== undefined) {
+      extra.top_k = anthropicOpts.topK;
+    }
+
     const cacheEnabled = anthropicOpts?.cacheControl !== false;
-    const systemBlocks: any[] = [{ type: "text", text: opts.systemPrompt }];
+    const { stable, volatile } = splitSystemPromptForCache(opts.systemPrompt);
+    const systemBlocks: any[] = [{ type: "text", text: stable }];
     if (cacheEnabled) {
-      systemBlocks[0].cache_control = { type: "ephemeral" };
+      systemBlocks[0].cache_control = stablePrefixCacheControl();
     }
+    if (volatile) systemBlocks.push({ type: "text", text: volatile });
 
-    // Apply cache_control to the last tool definition when caching is enabled.
-    // Anthropic caches the prefix up to and including the last cached block.
     let cachedTools = tools;
     if (cacheEnabled && tools.length > 0) {
       cachedTools = [...tools];
       const last = { ...cachedTools[cachedTools.length - 1] } as any;
-      last.cache_control = { type: "ephemeral" };
+      last.cache_control = stablePrefixCacheControl();
       cachedTools[cachedTools.length - 1] = last;
+    }
+
+    let cachedMessages = messages;
+    if (cacheEnabled && messages.length > 0) {
+      let lastUserIdx = -1;
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        if ((messages[i] as any).role === "user") {
+          lastUserIdx = i;
+          break;
+        }
+      }
+      if (lastUserIdx >= 0) {
+        cachedMessages = [...messages];
+        const lastMsg = { ...cachedMessages[lastUserIdx] } as any;
+        if (Array.isArray(lastMsg.content) && lastMsg.content.length > 0) {
+          const content = [...lastMsg.content];
+          const lastBlock = { ...content[content.length - 1] } as any;
+          lastBlock.cache_control = { type: "ephemeral" };
+          content[content.length - 1] = lastBlock;
+          lastMsg.content = content;
+          cachedMessages[lastUserIdx] = lastMsg;
+        }
+      }
     }
 
     const requestParams: any = {
       model: opts.model,
-      max_tokens: resolveMaxOutputTokensForEngine(
-        this.name,
-        opts.maxOutputTokens,
-      ),
+      max_tokens: resolvedMaxOutputTokens,
       system: systemBlocks,
       tools: cachedTools.length > 0 ? cachedTools : undefined,
-      messages,
-      ...(opts.temperature !== undefined
+      messages: cachedMessages,
+      ...(samplingAllowed && opts.temperature !== undefined
         ? { temperature: opts.temperature }
         : {}),
       ...extra,
     };
 
-    // Remove undefined tools to avoid Anthropic API validation errors
     if (!requestParams.tools) delete requestParams.tools;
 
+    const firstEventAbort = createFirstEventAbortController(opts.abortSignal);
     const apiStream = client.messages.stream(requestParams, {
-      signal: opts.abortSignal,
+      signal: firstEventAbort.signal,
     });
 
-    // Per-stream state lets the translator carry each tool-call's id/name from
-    // its `content_block_start` onto the streamed `input_json_delta` chunks, so
-    // long tool-input generation emits countable `tool-input-start` /
-    // `tool-input-delta` progress events (mirroring the Builder engine).
     const chunkState = createAnthropicChunkStreamState();
+    const toolInputs = createStreamedToolInputState();
 
     try {
       for await (const chunk of apiStream) {
-        const events = anthropicChunkToEngineEvents(chunk, chunkState);
+        firstEventAbort.markFirstEvent();
+        const events = anthropicChunkToEngineEvents(
+          chunk,
+          chunkState,
+          toolNameMap,
+        );
         for (const event of events) {
+          observeStreamedToolInput(toolInputs, event);
           yield event;
         }
       }
 
       const finalMessage = await apiStream.finalMessage();
-      const assistantContent = anthropicContentToEngine(finalMessage.content);
+      const assistantContent = anthropicContentToEngine(
+        finalMessage.content,
+        toolNameMap,
+      );
 
-      // Emit usage
+      for (const part of assistantContent) {
+        if (part.type === "tool-call") {
+          observeStreamedToolInput(toolInputs, part);
+        }
+      }
+
+      for (const recovered of finalizeStreamedToolInputs(
+        toolInputs,
+        assistantContent.flatMap((part) =>
+          part.type === "tool-call" ? [part.id] : [],
+        ),
+      )) {
+        if (recovered.type === "tool-call") {
+          assistantContent.push({
+            type: "tool-call",
+            id: recovered.id,
+            name: recovered.name,
+            input: recovered.input,
+          });
+        }
+        yield recovered;
+      }
+
       if (finalMessage.usage) {
+        const cacheReadTokens = finalMessage.usage.cache_read_input_tokens ?? 0;
+        const cacheWriteTokens =
+          finalMessage.usage.cache_creation_input_tokens ?? 0;
         yield {
           type: "usage",
-          inputTokens: finalMessage.usage.input_tokens ?? 0,
+          inputTokens:
+            (finalMessage.usage.input_tokens ?? 0) +
+            cacheReadTokens +
+            cacheWriteTokens,
           outputTokens: finalMessage.usage.output_tokens ?? 0,
-          cacheReadTokens:
-            (finalMessage.usage as any).cache_read_input_tokens ?? 0,
-          cacheWriteTokens:
-            (finalMessage.usage as any).cache_creation_input_tokens ?? 0,
+          cacheReadTokens,
+          cacheWriteTokens,
         };
       }
 
       yield { type: "assistant-content", parts: assistantContent };
+      await clearProviderCredentialAuthFailure({
+        key: "ANTHROPIC_API_KEY",
+        value: this.apiKey,
+      });
 
-      // Emit stop reason
       const stopReason = finalMessage.stop_reason ?? "end_turn";
       yield {
         type: "stop",
@@ -172,20 +277,60 @@ class AnthropicEngine implements AgentEngine {
               : "end_turn",
       };
     } catch (err: any) {
+      const timedOut = firstEventAbort.didTimeout();
+      const statusCode: number | undefined =
+        typeof err?.status === "number"
+          ? err.status
+          : typeof err?.statusCode === "number"
+            ? err.statusCode
+            : undefined;
+      const rawMessage: string = err?.message ?? String(err);
+      const errorMessage = timedOut
+        ? `${firstEventAbort.timeoutMessage()}; the connection appears wedged.`
+        : describeErrorWithCauses(err);
+      const isConnectionError =
+        !timedOut &&
+        statusCode === undefined &&
+        rawMessage.trim().toLowerCase() === "connection error.";
+      const isBareForbidden =
+        statusCode === 403 &&
+        (isBareProviderRejectionMessage(rawMessage) ||
+          isBareProviderRejectionMessage(errorMessage));
+      if (statusCode === 401) {
+        await recordProviderCredentialAuthFailure({
+          key: "ANTHROPIC_API_KEY",
+          value: this.apiKey,
+          status: statusCode,
+          code: "http_401",
+          message: errorMessage,
+        });
+      }
       yield {
         type: "stop",
         reason: "error",
-        error: err?.message ?? String(err),
+        error: errorMessage,
+        ...(statusCode !== undefined
+          ? isBareForbidden
+            ? {
+                errorCode: PROVIDER_TRANSIENT_REJECTION_ERROR_CODE,
+                statusCode,
+                providerRetryable: true,
+              }
+            : { errorCode: `http_${statusCode}`, statusCode }
+          : isConnectionError || timedOut
+            ? {
+                errorCode: "provider_network_error",
+                providerRetryable: true,
+              }
+            : {}),
       };
       throw err;
+    } finally {
+      firstEventAbort.cleanup();
     }
   }
 }
 
-/**
- * Create an AnthropicEngine instance.
- * Falls back to the deployment Anthropic key if no key is provided.
- */
 export function createAnthropicEngine(
   config: Record<string, unknown> = {},
 ): AgentEngine {
@@ -195,12 +340,12 @@ export function createAnthropicEngine(
     (allowEnvFallback ? readDeployCredentialEnv("ANTHROPIC_API_KEY") : "") ??
     "";
   if (!apiKey) {
-    // Return a "missing key" engine that immediately errors
     return {
       name: "anthropic",
       label: "Claude (Anthropic SDK)",
       defaultModel: ANTHROPIC_DEFAULT_MODEL,
       supportedModels: ANTHROPIC_SUPPORTED_MODELS,
+      acceptsCustomModels: true,
       capabilities: ANTHROPIC_CAPABILITIES,
       async *stream() {
         yield {
@@ -212,5 +357,13 @@ export function createAnthropicEngine(
       },
     };
   }
-  return new AnthropicEngine(apiKey);
+  // Only the deployment's own key may follow a deployment ANTHROPIC_BASE_URL;
+  // hosts inject gateway URLs there that reject every other key.
+  const deploymentKey = readDeployCredentialEnv("ANTHROPIC_API_KEY");
+  return new AnthropicEngine(
+    apiKey,
+    deploymentKey && apiKey === deploymentKey
+      ? undefined
+      : ANTHROPIC_API_ORIGIN,
+  );
 }

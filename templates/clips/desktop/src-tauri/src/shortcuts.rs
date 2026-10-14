@@ -1,5 +1,5 @@
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -26,12 +26,161 @@ fn numpad_enter_shortcut() -> Shortcut {
     Shortcut::new(None, Code::NumpadEnter)
 }
 
+fn countdown_return_shortcuts() -> Vec<Shortcut> {
+    #[cfg(target_os = "windows")]
+    {
+        vec![enter_shortcut()]
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec![enter_shortcut(), numpad_enter_shortcut()]
+    }
+}
+
+fn countdown_shortcuts() -> Vec<Shortcut> {
+    let mut shortcuts = vec![escape_shortcut()];
+    shortcuts.extend(countdown_return_shortcuts());
+    shortcuts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn countdown_return_shortcuts_match_platform_registration() {
+        let shortcuts = countdown_return_shortcuts();
+        assert!(shortcuts.contains(&enter_shortcut()));
+
+        #[cfg(target_os = "windows")]
+        assert!(!shortcuts.contains(&numpad_enter_shortcut()));
+
+        #[cfg(not(target_os = "windows"))]
+        assert!(shortcuts.contains(&numpad_enter_shortcut()));
+    }
+
+    #[test]
+    fn recording_shortcuts_match_platform_defaults() {
+        #[cfg(target_os = "macos")]
+        {
+            assert!(record_start_stop_shortcuts().contains(&Shortcut::new(
+                Some(Modifiers::SUPER | Modifiers::SHIFT),
+                Code::KeyL,
+            )));
+            assert!(record_cancel_shortcuts().contains(&Shortcut::new(
+                Some(Modifiers::ALT | Modifiers::SHIFT),
+                Code::KeyC,
+            )));
+            assert!(record_pause_shortcuts().contains(&Shortcut::new(
+                Some(Modifiers::ALT | Modifiers::SHIFT),
+                Code::KeyP,
+            )));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(record_start_stop_shortcuts().contains(&Shortcut::new(
+                Some(Modifiers::CONTROL | Modifiers::SHIFT),
+                Code::KeyL,
+            )));
+            assert!(record_cancel_shortcuts().contains(&Shortcut::new(
+                Some(Modifiers::ALT | Modifiers::SHIFT),
+                Code::KeyC,
+            )));
+            assert!(record_pause_shortcuts().contains(&Shortcut::new(
+                Some(Modifiers::ALT | Modifiers::SHIFT),
+                Code::KeyP,
+            )));
+            assert!(record_pause_shortcuts().contains(&Shortcut::new(
+                Some(Modifiers::ALT | Modifiers::SHIFT),
+                Code::KeyS,
+            )));
+        }
+    }
+}
+
 static CUSTOM_VOICE_SHORTCUT: OnceLock<Mutex<Option<Shortcut>>> = OnceLock::new();
 static CUSTOM_POPOVER_SHORTCUT: OnceLock<Mutex<Option<Shortcut>>> = OnceLock::new();
+static CUSTOM_RECORD_SHORTCUT: OnceLock<Mutex<Option<Shortcut>>> = OnceLock::new();
+static CUSTOM_RECORD_CANCEL_SHORTCUT: OnceLock<Mutex<Option<Shortcut>>> = OnceLock::new();
+static CUSTOM_RECORD_PAUSE_SHORTCUT: OnceLock<Mutex<Option<Shortcut>>> = OnceLock::new();
 static FN_TAP_ENABLED: AtomicBool = AtomicBool::new(false);
 static FN_TAP_INSTALL_STARTED: AtomicBool = AtomicBool::new(false);
 static POPOVER_DISMISS_SHORTCUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static POPOVER_VISIBILITY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static COUNTDOWN_SHORTCUTS_ACTIVE: AtomicBool = AtomicBool::new(false);
+static COUNTDOWN_SHORTCUTS_GENERATION: AtomicU64 = AtomicU64::new(0);
+static COUNTDOWN_SHORTCUTS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static DICTATION_ESCAPE_SHORTCUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static MONITOR_PICKER_ESCAPE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Escape has several owners (popover, countdown, dictation, monitor picker).
+/// Every register/unregister runs under this lock, and an owner stores its own
+/// flag before taking it, so a release can never unregister a shortcut another
+/// owner just claimed.
+static ESCAPE_SHORTCUT_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_escape() -> std::sync::MutexGuard<'static, ()> {
+    ESCAPE_SHORTCUT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn claim_escape(app: &AppHandle, label: &str) {
+    let _escape = lock_escape();
+    register_escape(app, label);
+}
+
+fn release_escape_if_unowned(app: &AppHandle) {
+    let _escape = lock_escape();
+    unregister_escape_if_unowned(app);
+}
+
+/// Follows `owner_flag` as it is under the lock, not as it was when the caller
+/// stored it: workers can run out of order.
+fn sync_escape_with_flag(app: &AppHandle, owner_flag: &AtomicBool, label: &str) {
+    let _escape = lock_escape();
+    if owner_flag.load(Ordering::SeqCst) {
+        register_escape(app, label);
+    } else {
+        unregister_escape_if_unowned(app);
+    }
+}
+
+fn register_escape(app: &AppHandle, label: &str) {
+    let shortcut = escape_shortcut();
+    let gs = app.global_shortcut();
+    if !gs.is_registered(shortcut) {
+        if let Err(err) = gs.register(shortcut) {
+            eprintln!("[clips-tray] failed to register {label} Escape: {err}");
+        }
+    }
+}
+
+fn unregister_escape_if_unowned(app: &AppHandle) {
+    if POPOVER_DISMISS_SHORTCUT_ACTIVE.load(Ordering::SeqCst)
+        || COUNTDOWN_SHORTCUTS_ACTIVE.load(Ordering::SeqCst)
+        || DICTATION_ESCAPE_SHORTCUT_ACTIVE.load(Ordering::SeqCst)
+        || MONITOR_PICKER_ESCAPE_ACTIVE.load(Ordering::SeqCst)
+    {
+        return;
+    }
+    let shortcut = escape_shortcut();
+    let gs = app.global_shortcut();
+    if gs.is_registered(shortcut) {
+        let _ = gs.unregister(shortcut);
+    }
+}
+
+#[derive(Default)]
+struct PendingVoiceStart {
+    pending: bool,
+    released: bool,
+}
+
+static PENDING_VOICE_START: Mutex<PendingVoiceStart> = Mutex::new(PendingVoiceStart {
+    pending: false,
+    released: false,
+});
 
 fn custom_voice_shortcut() -> &'static Mutex<Option<Shortcut>> {
     CUSTOM_VOICE_SHORTCUT.get_or_init(|| Mutex::new(None))
@@ -41,12 +190,36 @@ fn custom_popover_shortcut() -> &'static Mutex<Option<Shortcut>> {
     CUSTOM_POPOVER_SHORTCUT.get_or_init(|| Mutex::new(None))
 }
 
+fn custom_record_shortcut() -> &'static Mutex<Option<Shortcut>> {
+    CUSTOM_RECORD_SHORTCUT.get_or_init(|| Mutex::new(None))
+}
+
+fn custom_record_cancel_shortcut() -> &'static Mutex<Option<Shortcut>> {
+    CUSTOM_RECORD_CANCEL_SHORTCUT.get_or_init(|| Mutex::new(None))
+}
+
+fn custom_record_pause_shortcut() -> &'static Mutex<Option<Shortcut>> {
+    CUSTOM_RECORD_PAUSE_SHORTCUT.get_or_init(|| Mutex::new(None))
+}
+
 fn current_custom_voice_shortcut() -> Option<Shortcut> {
     custom_voice_shortcut().lock().ok().and_then(|g| *g)
 }
 
 fn current_custom_popover_shortcut() -> Option<Shortcut> {
     custom_popover_shortcut().lock().ok().and_then(|g| *g)
+}
+
+fn current_custom_record_shortcut() -> Option<Shortcut> {
+    custom_record_shortcut().lock().ok().and_then(|g| *g)
+}
+
+fn current_custom_record_cancel_shortcut() -> Option<Shortcut> {
+    custom_record_cancel_shortcut().lock().ok().and_then(|g| *g)
+}
+
+fn current_custom_record_pause_shortcut() -> Option<Shortcut> {
+    custom_record_pause_shortcut().lock().ok().and_then(|g| *g)
 }
 
 fn parse_optional_shortcut(value: Option<String>) -> Result<Option<Shortcut>, String> {
@@ -62,10 +235,6 @@ fn parse_optional_shortcut(value: Option<String>) -> Result<Option<Shortcut>, St
         .map_err(|err| err.to_string())
 }
 
-/// Swap a stored custom shortcut to `next`, returning the previous value on
-/// success so the caller can roll back later if a sibling registration fails.
-/// On failure the previous shortcut is re-registered locally and `state` is
-/// left untouched.
 fn swap_custom_shortcut<R: tauri::Runtime>(
     gs: &tauri_plugin_global_shortcut::GlobalShortcut<R>,
     state: &Mutex<Option<Shortcut>>,
@@ -87,12 +256,6 @@ fn swap_custom_shortcut<R: tauri::Runtime>(
     if let Some(next) = next {
         if let Err(err) = gs.register(next) {
             if let Some(old) = old {
-                // Only restore the prior state if re-registration actually
-                // succeeded — otherwise the OS rejected `old` and there is
-                // nothing registered for this slot. Tracking it as Some(old)
-                // would lie to future operations (is_registered/unregister
-                // would fail); leaving it None keeps state and reality in
-                // sync at the cost of forgetting the prior shortcut.
                 if gs.register(old).is_ok() {
                     *current = Some(old);
                 }
@@ -104,28 +267,147 @@ fn swap_custom_shortcut<R: tauri::Runtime>(
     Ok(old)
 }
 
+fn swap_custom_recording_shortcut<R: tauri::Runtime>(
+    gs: &tauri_plugin_global_shortcut::GlobalShortcut<R>,
+    state: &Mutex<Option<Shortcut>>,
+    next: Option<Shortcut>,
+    defaults: &[Shortcut],
+    label: &str,
+) -> Result<Option<Shortcut>, String> {
+    let current = state
+        .lock()
+        .map_err(|_| format!("failed to lock {label} shortcut state"))?
+        .to_owned();
+    if current == next {
+        return Ok(current);
+    }
+
+    let replacing_default = current.is_none() && next.is_some();
+    let restoring_default = current.is_some() && next.is_none();
+    if replacing_default {
+        for shortcut in defaults {
+            if gs.is_registered(*shortcut) {
+                let _ = gs.unregister(*shortcut);
+            }
+        }
+    }
+    if restoring_default {
+        let mut newly_registered = Vec::new();
+        for shortcut in defaults {
+            if gs.is_registered(*shortcut) {
+                continue;
+            }
+            if let Err(error) = gs.register(*shortcut) {
+                for registered in newly_registered {
+                    let _ = gs.unregister(registered);
+                }
+                return Err(format!(
+                    "failed to restore default {label} shortcut: {error}"
+                ));
+            }
+            newly_registered.push(*shortcut);
+        }
+    }
+
+    match swap_custom_shortcut(gs, state, next, label) {
+        Ok(previous) => Ok(previous),
+        Err(error) => {
+            if replacing_default {
+                for shortcut in defaults {
+                    if !gs.is_registered(*shortcut) {
+                        let _ = gs.register(*shortcut);
+                    }
+                }
+            } else if restoring_default {
+                for shortcut in defaults {
+                    if gs.is_registered(*shortcut) {
+                        let _ = gs.unregister(*shortcut);
+                    }
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn set_custom_shortcuts(
     app: AppHandle,
     voice: Option<String>,
     popover: Option<String>,
+    record: Option<String>,
+    record_cancel: Option<String>,
+    record_pause: Option<String>,
 ) -> Result<(), String> {
     let voice = parse_optional_shortcut(voice)?;
     let popover = parse_optional_shortcut(popover)?;
-    if voice.is_some() && voice == popover {
-        return Err("Voice dictation and Open Clips need different shortcuts.".to_string());
+    let record = parse_optional_shortcut(record)?;
+    let record_cancel = parse_optional_shortcut(record_cancel)?;
+    let record_pause = parse_optional_shortcut(record_pause)?;
+    let slots = [
+        ("Voice dictation", voice),
+        ("Open Clips", popover),
+        ("Start/stop recording", record),
+        ("Cancel recording", record_cancel),
+        ("Pause/resume recording", record_pause),
+    ];
+    for (index, (label, shortcut)) in slots.iter().enumerate() {
+        if shortcut.is_none() {
+            continue;
+        }
+        if slots[..index]
+            .iter()
+            .any(|(_, other)| other.is_some() && other == shortcut)
+        {
+            return Err(format!("{label} needs a different shortcut."));
+        }
     }
     let gs = app.global_shortcut();
+    let record_defaults = record_start_stop_shortcuts();
+    let record_cancel_defaults = record_cancel_shortcuts();
+    let record_pause_defaults = record_pause_shortcuts();
 
-    let prev_voice = swap_custom_shortcut(gs, custom_voice_shortcut(), voice, "voice")?;
-    if let Err(err) = swap_custom_shortcut(gs, custom_popover_shortcut(), popover, "Clips") {
-        // Popover registration failed after voice already mutated — roll the
-        // voice slot back to its previous value so callers see all-or-nothing
-        // behaviour. If the rollback itself fails we surface only the
-        // original popover error to the user; the local state always
-        // reflects whatever actually got registered.
-        let _ = swap_custom_shortcut(gs, custom_voice_shortcut(), prev_voice, "voice");
-        return Err(err);
+    let updates = [
+        (custom_voice_shortcut(), voice, "voice", None),
+        (custom_popover_shortcut(), popover, "Clips", None),
+        (
+            custom_record_shortcut(),
+            record,
+            "recording",
+            Some(record_defaults.as_slice()),
+        ),
+        (
+            custom_record_cancel_shortcut(),
+            record_cancel,
+            "recording cancel",
+            Some(record_cancel_defaults.as_slice()),
+        ),
+        (
+            custom_record_pause_shortcut(),
+            record_pause,
+            "recording pause",
+            Some(record_pause_defaults.as_slice()),
+        ),
+    ];
+    let mut previous = Vec::with_capacity(updates.len());
+    for (state, next, label, defaults) in updates {
+        let result = match defaults {
+            Some(defaults) => swap_custom_recording_shortcut(gs, state, next, defaults, label),
+            None => swap_custom_shortcut(gs, state, next, label),
+        };
+        match result {
+            Ok(old) => previous.push((state, old, label, defaults)),
+            Err(err) => {
+                for (state, old, label, defaults) in previous.into_iter().rev() {
+                    if let Some(defaults) = defaults {
+                        let _ = swap_custom_recording_shortcut(gs, state, old, defaults, label);
+                    } else {
+                        let _ = swap_custom_shortcut(gs, state, old, label);
+                    }
+                }
+                return Err(err);
+            }
+        }
     }
 
     Ok(())
@@ -135,7 +417,7 @@ pub async fn set_custom_shortcuts(
 pub async fn set_fn_shortcut_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
     FN_TAP_ENABLED.store(enabled, Ordering::SeqCst);
     if !enabled {
-        set_dictation_active(&app, false);
+        set_dictation_active_and_sync_escape(&app, false);
         return Ok(());
     }
 
@@ -150,20 +432,74 @@ pub async fn set_fn_shortcut_enabled(app: AppHandle, enabled: bool) -> Result<()
     Ok(())
 }
 
+fn paste_last_dictation_shortcut() -> Shortcut {
+    #[cfg(target_os = "macos")]
+    {
+        Shortcut::new(Some(Modifiers::SUPER | Modifiers::CONTROL), Code::KeyV)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyV)
+    }
+}
+
+fn record_start_stop_shortcuts() -> Vec<Shortcut> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![Shortcut::new(
+            Some(Modifiers::SUPER | Modifiers::SHIFT),
+            Code::KeyL,
+        )]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec![Shortcut::new(
+            Some(Modifiers::CONTROL | Modifiers::SHIFT),
+            Code::KeyL,
+        )]
+    }
+}
+
+fn record_cancel_shortcuts() -> Vec<Shortcut> {
+    vec![Shortcut::new(
+        Some(Modifiers::ALT | Modifiers::SHIFT),
+        Code::KeyC,
+    )]
+}
+
+fn record_pause_shortcuts() -> Vec<Shortcut> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![Shortcut::new(
+            Some(Modifiers::ALT | Modifiers::SHIFT),
+            Code::KeyP,
+        )]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec![
+            Shortcut::new(Some(Modifiers::ALT | Modifiers::SHIFT), Code::KeyP),
+            Shortcut::new(Some(Modifiers::ALT | Modifiers::SHIFT), Code::KeyS),
+        ]
+    }
+}
+
+fn matches_any(shortcut: &Shortcut, candidates: &[Shortcut]) -> bool {
+    candidates.iter().any(|candidate| candidate == shortcut)
+}
+
 pub fn register_shortcuts(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    // Register the global shortcut. On macOS we use Cmd+Shift+L;
-    // on Windows/Linux we use Ctrl+Shift+L. Registering both is safe
-    // because on macOS Ctrl isn't the primary modifier and vice versa.
-    let shortcut_cmd = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyL);
-    let shortcut_ctrl = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyL);
     let voice_cmd_space = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Space);
     let voice_ctrl_space = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
     let gs = app.handle().global_shortcut();
-    if let Err(err) = gs.register(shortcut_cmd) {
-        eprintln!("[clips-tray] failed to register Cmd+Shift+L: {err}");
-    }
-    if let Err(err) = gs.register(shortcut_ctrl) {
-        eprintln!("[clips-tray] failed to register Ctrl+Shift+L: {err}");
+    for shortcut in record_start_stop_shortcuts()
+        .into_iter()
+        .chain(record_cancel_shortcuts())
+        .chain(record_pause_shortcuts())
+    {
+        if let Err(err) = gs.register(shortcut) {
+            eprintln!("[clips-tray] failed to register recording shortcut {shortcut:?}: {err}");
+        }
     }
     if let Err(err) = gs.register(voice_cmd_space) {
         eprintln!("[clips-tray] failed to register Cmd+Shift+Space voice shortcut: {err}");
@@ -171,99 +507,233 @@ pub fn register_shortcuts(app: &tauri::App) -> Result<(), Box<dyn std::error::Er
     if let Err(err) = gs.register(voice_ctrl_space) {
         eprintln!("[clips-tray] failed to register Ctrl+Shift+Space voice shortcut: {err}");
     }
+    if let Err(err) = gs.register(paste_last_dictation_shortcut()) {
+        eprintln!("[clips-tray] failed to register paste-last-dictation shortcut: {err}");
+    }
 
     Ok(())
 }
 
-/// Globally intercept Escape while the popover is visible so it dismisses even
-/// when another app is focused — Loom-style. We register/unregister on every
-/// `clips:popover-visible` toggle so Escape stays a normal key everywhere
-/// else. The "parked offscreen" voice-dictation state emits visible=false, so
-/// Escape is correctly inactive then too.
 pub fn install_popover_dismiss_handler(app: &tauri::App) {
+    #[cfg(target_os = "macos")]
+    install_window_picker_escape_monitor(app);
+
     let handle = app.handle().clone();
     app.listen("clips:popover-visible", move |event| {
         let payload = event.payload().to_string();
+        let generation = POPOVER_VISIBILITY_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         let handle = handle.clone();
-        // Defer register/unregister to a worker thread. Calling
-        // global_shortcut::{register,unregister,is_registered} from inside
-        // a listener fired by an Escape press freezes the app on macOS:
-        // the listener runs while the Carbon hotkey callback is still on
-        // the stack, and Carbon's hotkey table is not reentrant from
-        // within its own callback.
         std::thread::spawn(move || {
+            if POPOVER_VISIBILITY_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
             let visible: bool = serde_json::from_str(&payload).unwrap_or(false);
+            let picker_active = crate::native_screen::window_picker_active();
+            let recording_flow_active = is_recording_active(&handle);
             POPOVER_DISMISS_SHORTCUT_ACTIVE.store(visible, Ordering::SeqCst);
-            let shortcut = escape_shortcut();
-            let gs = handle.global_shortcut();
-            if visible {
-                if !gs.is_registered(shortcut) {
-                    if let Err(err) = gs.register(shortcut) {
-                        eprintln!("[clips-tray] failed to register Escape: {err}");
-                    }
-                }
-            } else if !COUNTDOWN_SHORTCUTS_ACTIVE.load(Ordering::SeqCst)
-                && gs.is_registered(shortcut)
-            {
-                let _ = gs.unregister(shortcut);
+            if visible || picker_active || recording_flow_active {
+                claim_escape(&handle, "popover");
+            } else {
+                release_escape_if_unowned(&handle);
             }
         });
     });
 }
 
-pub fn install_countdown_shortcut_handler(app: &tauri::App) {
-    let handle = app.handle().clone();
-    app.listen("clips:countdown-shortcuts-active", move |event| {
-        let payload = event.payload().to_string();
-        let handle = handle.clone();
-        let active: bool = serde_json::from_str(&payload).unwrap_or(false);
-        set_countdown_shortcuts_active(handle, active);
+#[cfg(target_os = "macos")]
+fn install_window_picker_escape_monitor(app: &tauri::App) {
+    use std::ptr::NonNull;
+
+    use block2::RcBlock;
+    use objc2_app_kit::{NSEvent, NSEventMask};
+
+    let app_for_global = app.handle().clone();
+    let global_handler = RcBlock::new(move |event: NonNull<NSEvent>| {
+        if crate::native_screen::window_picker_active() && unsafe { event.as_ref().keyCode() } == 53
+        {
+            let app = app_for_global.clone();
+            thread::spawn(move || crate::native_screen::cancel_window_picker(&app));
+        }
+    });
+    if NSEvent::addGlobalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &global_handler)
+        .is_none()
+    {
+        eprintln!("[clips-tray] failed to install global Window picker Escape monitor");
+    }
+
+    let app_for_local = app.handle().clone();
+    let local_handler = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+        if crate::native_screen::window_picker_active() && unsafe { event.as_ref().keyCode() } == 53
+        {
+            let app = app_for_local.clone();
+            thread::spawn(move || crate::native_screen::cancel_window_picker(&app));
+        }
+        event.as_ptr()
+    });
+    let local_monitor = unsafe {
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &local_handler)
+    };
+    if local_monitor.is_none() {
+        eprintln!("[clips-tray] failed to install local Window picker Escape monitor");
+    }
+}
+
+pub(crate) async fn arm_window_picker_escape(app: &AppHandle) -> Result<(), String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _escape = lock_escape();
+        let shortcut = escape_shortcut();
+        let gs = app.global_shortcut();
+        if gs.is_registered(shortcut) {
+            return Ok(());
+        }
+        gs.register(shortcut)
+            .map_err(|error| format!("failed to register Window picker Escape: {error}"))
+    })
+    .await
+    .map_err(|error| format!("Window picker Escape registration worker stopped: {error}"))?
+}
+
+/// The monitor picker's webviews only see Esc while one of them is focused, so
+/// Esc is claimed globally for as long as the picker is open.
+pub(crate) fn set_monitor_picker_escape(app: &AppHandle, active: bool) {
+    MONITOR_PICKER_ESCAPE_ACTIVE.store(active, Ordering::SeqCst);
+    let app = app.clone();
+    thread::spawn(move || {
+        sync_escape_with_flag(&app, &MONITOR_PICKER_ESCAPE_ACTIVE, "monitor picker");
     });
 }
 
-fn set_countdown_shortcuts_active(app: AppHandle, active: bool) {
-    COUNTDOWN_SHORTCUTS_ACTIVE.store(active, Ordering::SeqCst);
+pub fn set_dictation_active_and_sync_escape(app: &AppHandle, active: bool) {
+    set_dictation_active(app, active);
+    sync_dictation_escape_shortcut(app.clone(), active);
+}
+
+#[tauri::command]
+pub fn set_dictation_escape_active(app: AppHandle, active: bool) -> Result<(), String> {
+    set_dictation_active_and_sync_escape(&app, active);
+    Ok(())
+}
+
+fn sync_dictation_escape_shortcut(app: AppHandle, active: bool) {
+    DICTATION_ESCAPE_SHORTCUT_ACTIVE.store(active, Ordering::SeqCst);
     thread::spawn(move || {
+        sync_escape_with_flag(&app, &DICTATION_ESCAPE_SHORTCUT_ACTIVE, "dictation-cancel");
+    });
+}
+
+pub(crate) async fn prepare_countdown_shortcuts(app: AppHandle) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = COUNTDOWN_SHORTCUTS_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = COUNTDOWN_SHORTCUTS_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        COUNTDOWN_SHORTCUTS_ACTIVE.store(true, Ordering::SeqCst);
+        let _escape = lock_escape();
         let gs = app.global_shortcut();
-        let escape = escape_shortcut();
-        let enter = enter_shortcut();
-        let numpad_enter = numpad_enter_shortcut();
-        if active {
-            for shortcut in [escape, enter, numpad_enter] {
-                if !gs.is_registered(shortcut) {
-                    if let Err(err) = gs.register(shortcut) {
-                        eprintln!("[clips-tray] failed to register countdown shortcut: {err}");
+        let mut newly_registered = Vec::new();
+        for shortcut in countdown_shortcuts() {
+            if !gs.is_registered(shortcut) {
+                if let Err(error) = gs.register(shortcut) {
+                    for registered in newly_registered {
+                        let _ = gs.unregister(registered);
                     }
+                    COUNTDOWN_SHORTCUTS_ACTIVE.store(false, Ordering::SeqCst);
+                    return Err(format!("failed to register countdown shortcut: {error}"));
                 }
+                newly_registered.push(shortcut);
             }
+        }
+        Ok::<u64, String>(generation)
+    })
+    .await
+    .map_err(|error| format!("countdown shortcut worker stopped unexpectedly: {error}"))?
+}
+
+pub(crate) async fn finish_countdown_shortcuts(
+    app: AppHandle,
+    generation: u64,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = COUNTDOWN_SHORTCUTS_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if COUNTDOWN_SHORTCUTS_GENERATION.load(Ordering::SeqCst) != generation {
             return;
         }
-
-        for shortcut in [enter, numpad_enter] {
+        COUNTDOWN_SHORTCUTS_ACTIVE.store(false, Ordering::SeqCst);
+        let gs = app.global_shortcut();
+        for shortcut in countdown_return_shortcuts() {
             if gs.is_registered(shortcut) {
                 let _ = gs.unregister(shortcut);
             }
         }
-        if !POPOVER_DISMISS_SHORTCUT_ACTIVE.load(Ordering::SeqCst) && gs.is_registered(escape) {
-            let _ = gs.unregister(escape);
-        }
-    });
+        release_escape_if_unowned(&app);
+    })
+    .await
+    .map_err(|error| format!("countdown shortcut cleanup worker stopped unexpectedly: {error}"))
 }
 
+/// Observe key-down events only while Clips itself is the active application.
+/// AppKit local monitors need no Input Monitoring permission and never receive
+/// keystrokes destined for another app. The active-generation gate keeps this
+/// listener inert outside the three-second countdown.
+#[cfg(target_os = "macos")]
+pub fn install_countdown_local_key_monitor(app: &tauri::App) {
+    use std::ptr::NonNull;
+
+    use block2::RcBlock;
+    use objc2_app_kit::{NSEvent, NSEventMask};
+
+    let app = app.handle().clone();
+    let handler = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+        if COUNTDOWN_SHORTCUTS_ACTIVE.load(Ordering::SeqCst) {
+            let key_code = unsafe { event.as_ref().keyCode() };
+            let countdown_event = match key_code {
+                36 | 76 => Some("clips:countdown-done"),
+                53 => Some("clips:countdown-cancel"),
+                _ => None,
+            };
+            if let Some(countdown_event) = countdown_event {
+                let app = app.clone();
+                thread::spawn(move || finish_countdown_from_shortcut(&app, countdown_event));
+            }
+        }
+        event.as_ptr()
+    });
+    let monitor = unsafe {
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &handler)
+    };
+    if monitor.is_none() {
+        eprintln!("[clips-tray] failed to install app-local countdown key monitor");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn install_countdown_local_key_monitor(_app: &tauri::App) {}
+
 fn finish_countdown_from_shortcut(app: &AppHandle, event: &'static str) {
-    let _ = app.emit(event, ());
+    dlog!("[clips-tray] countdown shortcut accepted: {event}");
+    let cause = if event == "clips:countdown-cancel" {
+        "escape"
+    } else {
+        "return"
+    };
+    let _ = app.emit(event, serde_json::json!({ "cause": cause }));
     if let Some(window) = app.get_webview_window("countdown") {
         let _ = window.close();
     }
-    set_countdown_shortcuts_active(app.clone(), false);
+    let app = app.clone();
+    let generation = COUNTDOWN_SHORTCUTS_GENERATION.load(Ordering::SeqCst);
+    tauri::async_runtime::spawn(async move {
+        let _ = finish_countdown_shortcuts(app, generation).await;
+    });
 }
 
-/// Build the global shortcut plugin with its handler. Called from `run()` to
-/// register the plugin before `.build()`.
 pub fn build_shortcut_plugin() -> tauri_plugin_global_shortcut::Builder<tauri::Wry> {
     tauri_plugin_global_shortcut::Builder::new().with_handler(|app, shortcut, event| {
-        let is_cmd = shortcut.matches(Modifiers::SUPER | Modifiers::SHIFT, Code::KeyL);
-        let is_ctrl = shortcut.matches(Modifiers::CONTROL | Modifiers::SHIFT, Code::KeyL);
         let is_voice_cmd_space = shortcut.matches(Modifiers::SUPER | Modifiers::SHIFT, Code::Space);
         let is_voice_ctrl_space =
             shortcut.matches(Modifiers::CONTROL | Modifiers::SHIFT, Code::Space);
@@ -273,9 +743,22 @@ pub fn build_shortcut_plugin() -> tauri_plugin_global_shortcut::Builder<tauri::W
         let is_custom_popover = current_custom_popover_shortcut()
             .map(|custom| custom == *shortcut)
             .unwrap_or(false);
+        let is_custom_record = current_custom_record_shortcut()
+            .map(|custom| custom == *shortcut)
+            .unwrap_or(false);
+        let is_custom_record_cancel = current_custom_record_cancel_shortcut()
+            .map(|custom| custom == *shortcut)
+            .unwrap_or(false);
+        let is_custom_record_pause = current_custom_record_pause_shortcut()
+            .map(|custom| custom == *shortcut)
+            .unwrap_or(false);
+        let is_record_start_stop = matches_any(shortcut, &record_start_stop_shortcuts());
+        let is_record_cancel = matches_any(shortcut, &record_cancel_shortcuts());
+        let is_record_pause = matches_any(shortcut, &record_pause_shortcuts());
         let is_escape = shortcut.matches(Modifiers::empty(), Code::Escape);
         let is_enter = shortcut.matches(Modifiers::empty(), Code::Enter);
         let is_numpad_enter = shortcut.matches(Modifiers::empty(), Code::NumpadEnter);
+        let is_paste_last_dictation = *shortcut == paste_last_dictation_shortcut();
         if (is_escape || is_enter || is_numpad_enter)
             && COUNTDOWN_SHORTCUTS_ACTIVE.load(Ordering::SeqCst)
         {
@@ -291,21 +774,44 @@ pub fn build_shortcut_plugin() -> tauri_plugin_global_shortcut::Builder<tauri::W
                 finish_countdown_from_shortcut(app, event);
                 return;
             }
-            set_countdown_shortcuts_active(app.clone(), false);
+            let app = app.clone();
+            let generation = COUNTDOWN_SHORTCUTS_GENERATION.load(Ordering::SeqCst);
+            tauri::async_runtime::spawn(async move {
+                let _ = finish_countdown_shortcuts(app, generation).await;
+            });
         }
         if is_escape {
             if event.state() != tauri_plugin_global_shortcut::ShortcutState::Pressed {
                 return;
             }
-            // Don't dismiss mid-recording — same guard as the React-side Esc
-            // handler. The user would lose the recorder handle.
-            if is_recording_active(app) {
+            if crate::native_screen::window_picker_active() {
+                crate::native_screen::cancel_window_picker(app);
                 return;
             }
-            if let Some(window) = app.get_webview_window("popover") {
-                let _ = window.hide();
+            if MONITOR_PICKER_ESCAPE_ACTIVE.load(Ordering::SeqCst) {
+                let _ = app.emit("clips:monitor-picker-cancelled", ());
+                return;
             }
-            let _ = app.emit("clips:popover-visible", false);
+            if is_dictation_active(app) {
+                let _ = app.emit("voice:cancel", ());
+                return;
+            }
+            if is_recording_active(app) && crate::clips::popover_is_parked(app) {
+                return;
+            }
+            crate::clips::hide_popover(app);
+            return;
+        }
+        if is_paste_last_dictation {
+            if event.state() != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                return;
+            }
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(err) = crate::clips::paste_last_dictation(app).await {
+                    eprintln!("[clips-tray] paste_last_dictation failed: {err}");
+                }
+            });
             return;
         }
         if is_voice_cmd_space || is_voice_ctrl_space || is_custom_voice {
@@ -328,6 +834,7 @@ pub fn build_shortcut_plugin() -> tauri_plugin_global_shortcut::Builder<tauri::W
                     }
                     if !already_active {
                         eprintln!("[clips-tray] {source} down — starting voice dictation");
+                        sync_dictation_escape_shortcut(app.clone(), true);
                         emit_voice_shortcut(app, "voice:shortcut-start", source, true);
                     }
                 }
@@ -338,6 +845,10 @@ pub fn build_shortcut_plugin() -> tauri_plugin_global_shortcut::Builder<tauri::W
                         }
                     }
                     eprintln!("[clips-tray] {source} up — stopping voice dictation");
+                    sync_dictation_escape_shortcut(app.clone(), false);
+                    if mark_released_if_start_pending() {
+                        return;
+                    }
                     emit_voice_shortcut(app, "voice:shortcut-stop", source, false);
                 }
             }
@@ -347,18 +858,40 @@ pub fn build_shortcut_plugin() -> tauri_plugin_global_shortcut::Builder<tauri::W
         if event.state() != tauri_plugin_global_shortcut::ShortcutState::Pressed {
             return;
         }
-        if is_cmd || is_ctrl || is_custom_popover {
-            // Loom-style: if a recording is already active, the
-            // global shortcut stops it rather than re-opening the
-            // popover. Keeps parity with the tray-icon click
-            // behaviour in `on_tray_icon_event`.
-            if is_recording_active(app) {
-                let _ = app.emit("clips:recorder-stop", ());
-            } else {
-                toggle_popover(app);
-            }
+        if is_record_cancel || is_custom_record_cancel {
+            let _ = app.emit("clips:recorder-cancel", ());
+            return;
+        }
+        if is_record_pause || is_custom_record_pause {
+            let _ = app.emit("clips:recorder-toggle-pause", ());
+            return;
+        }
+        if is_record_start_stop || is_custom_record {
+            wake_popover_for_recording_shortcut(app);
+            let app = app.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(80));
+                let _ = app.emit("clips:record-shortcut", ());
+            });
+            return;
+        }
+        if is_custom_popover {
+            toggle_popover(app);
         }
     })
+}
+
+fn wake_popover_for_recording_shortcut(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("popover") else {
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        return;
+    }
+    let _ = window.set_position(PhysicalPosition::new(2_i32, 2_i32));
+    let _ = window.set_size(tauri::Size::Physical(PhysicalSize::new(2_u32, 2_u32)));
+    show_without_activation(&window);
+    let _ = app.emit("clips:popover-visible", false);
 }
 
 fn emit_voice_shortcut(
@@ -370,11 +903,34 @@ fn emit_voice_shortcut(
     if wake {
         remember_voice_target(app);
         wake_popover_for_voice(app);
+        if let Ok(mut pending) = PENDING_VOICE_START.lock() {
+            *pending = PendingVoiceStart {
+                pending: true,
+                released: false,
+            };
+        }
         let app = app.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(80));
-            if should_emit_delayed_voice_start(&app, source) {
+            // A tap shorter than the wake delay is still a deliberate press
+            // (toggle mode depends on it), so deliver it as start + stop in
+            // order rather than dropping it.
+            let released_early = PENDING_VOICE_START
+                .lock()
+                .map(|mut pending| {
+                    let released = pending.released;
+                    *pending = PendingVoiceStart::default();
+                    released
+                })
+                .unwrap_or(false);
+            if released_early || is_dictation_active(&app) {
                 let _ = app.emit(event, serde_json::json!({ "source": source }));
+                if released_early {
+                    let _ = app.emit(
+                        "voice:shortcut-stop",
+                        serde_json::json!({ "source": source }),
+                    );
+                }
             } else {
                 hide_voice_wake_popover(&app);
             }
@@ -382,6 +938,17 @@ fn emit_voice_shortcut(
         return;
     }
     let _ = app.emit(event, serde_json::json!({ "source": source }));
+}
+
+fn mark_released_if_start_pending() -> bool {
+    let Ok(mut pending) = PENDING_VOICE_START.lock() else {
+        return false;
+    };
+    if pending.pending {
+        pending.released = true;
+        return true;
+    }
+    false
 }
 
 fn should_emit_delayed_voice_start(app: &tauri::AppHandle, source: &'static str) -> bool {
@@ -405,43 +972,10 @@ fn wake_popover_for_voice(app: &tauri::AppHandle) {
     }
     let _ = window.set_position(PhysicalPosition::new(2_i32, 2_i32));
     let _ = window.set_size(tauri::Size::Physical(PhysicalSize::new(2_u32, 2_u32)));
-    // Use orderFrontRegardless instead of Tauri's show() (which calls
-    // makeKeyAndOrderFront and steals focus from the user's foreground
-    // app). The popover is parked at 2x2 px just to keep its JS alive so
-    // it can receive the voice:shortcut-* events — the user should never
-    // notice it appearing.
     show_without_activation(&window);
     let _ = app.emit("clips:popover-visible", false);
 }
 
-/// Listen for Fn (globe) key down/up via a CoreGraphics event tap.
-///
-/// We use the lower-level `CGEventTap::new` + manual runloop registration
-/// (rather than the `with_enabled` convenience) so we can:
-///
-/// - Subscribe to `TapDisabledByTimeout` and `TapDisabledByUserInput`,
-///   which macOS posts when it auto-disables the tap after a slow
-///   callback or system event (sleep/wake, screen lock, Mission Control).
-///   Without this subscription the tap silently dies after the first
-///   dictation and Fn appears to "do nothing" on subsequent presses —
-///   which is the exact symptom we were hitting.
-/// - Hold a reference to the `CGEventTap` on the runloop thread and call
-///   `tap.enable()` between runloop ticks, so a disabled tap is revived
-///   automatically without the user having to relaunch the app.
-///
-/// Tap is `ListenOnly` so we don't swallow the user's real Fn behavior
-/// (the system globe/input-source HUD still appears unless the user sets
-/// System Settings → Keyboard → Press 🌐 key to: Do Nothing).
-///
-/// Edge-triggered on the SecondaryFn flag bit: `voice:shortcut-start` on
-/// `false → true`, `voice:shortcut-stop` on `true → false`. Other modifier
-/// flag changes (Cmd, Shift, Ctrl, Option) are ignored.
-///
-/// `DictationActive` is mirrored on every edge so the long-tail
-/// `show_flow_bar` safety timeout applies to Fn-triggered dictation too.
-///
-/// Pattern adapted from linespeed and handy-keys (proven open-source
-/// Tauri voice-dictation apps that ship to thousands of macOS users).
 #[cfg(target_os = "macos")]
 fn ensure_fn_event_tap(app: tauri::AppHandle) {
     if FN_TAP_INSTALL_STARTED.swap(true, Ordering::SeqCst) {
@@ -451,13 +985,41 @@ fn ensure_fn_event_tap(app: tauri::AppHandle) {
 }
 
 #[cfg(target_os = "macos")]
+fn fn_event_tap_is_enabled(tap: &core_graphics::event::CGEventTap<'static>) -> bool {
+    use core_foundation::base::TCFType;
+
+    extern "C" {
+        fn CGEventTapIsEnabled(tap: core_foundation::mach_port::CFMachPortRef) -> bool;
+    }
+
+    unsafe { CGEventTapIsEnabled(tap.mach_port().as_concrete_TypeRef()) }
+}
+
+#[cfg(target_os = "macos")]
+fn schedule_fn_event_tap_restart(app: tauri::AppHandle, reason: &'static str, delay: Duration) {
+    eprintln!("[clips-tray][fn-tap] restarting Fn event tap: {reason}");
+    FN_TAP_INSTALL_STARTED.store(false, Ordering::SeqCst);
+    if !FN_TAP_ENABLED.load(Ordering::SeqCst) {
+        return;
+    }
+    thread::spawn(move || {
+        thread::sleep(delay);
+        if FN_TAP_ENABLED.load(Ordering::SeqCst) {
+            ensure_fn_event_tap(app);
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
 fn install_fn_event_tap(app: tauri::AppHandle) {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
-    use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+    use core_foundation::runloop::{
+        kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop, CFRunLoopRunResult,
+    };
     use core_graphics::event::{
         CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
         CGEventType, CallbackResult,
@@ -466,12 +1028,14 @@ fn install_fn_event_tap(app: tauri::AppHandle) {
     let prev_down = Arc::new(AtomicBool::new(false));
     let needs_reenable = Arc::new(AtomicBool::new(false));
     let event_count = Arc::new(AtomicU64::new(0));
+    let fn_down_at = Arc::new(AtomicU64::new(0));
+    let tap_epoch = std::time::Instant::now();
 
     let app_for_cancel = app.clone();
     let prev_for_cancel = prev_down.clone();
     app.listen("voice:cancel", move |_event| {
         prev_for_cancel.store(false, Ordering::SeqCst);
-        set_dictation_active(&app_for_cancel, false);
+        set_dictation_active_and_sync_escape(&app_for_cancel, false);
     });
 
     dlog!("[clips-tray][fn-tap] install_fn_event_tap called — spawning listener thread");
@@ -483,20 +1047,13 @@ fn install_fn_event_tap(app: tauri::AppHandle) {
             let prev_for_cb = prev_down.clone();
             let needs_reenable_for_cb = needs_reenable.clone();
             let event_count_for_cb = event_count.clone();
+            let fn_down_at_for_cb = fn_down_at.clone();
 
             dlog!("[clips-tray][fn-tap] thread started; about to call CGEventTap::new");
             let tap_result = CGEventTap::new(
                 CGEventTapLocation::HID,
                 CGEventTapPlacement::HeadInsertEventTap,
                 CGEventTapOptions::ListenOnly,
-                // ONLY include FlagsChanged in the mask. The
-                // TapDisabledByTimeout / TapDisabledByUserInput types
-                // are NOT mask-subscribable — their numeric values
-                // (0xFFFFFFFE / 0xFFFFFFFF) overflow the `1 << n` shift
-                // the rust crate uses to build the mask, panicking the
-                // tap thread on creation. Those events are still
-                // delivered to the callback automatically when the OS
-                // disables the tap; we just match on `etype` below.
                 vec![CGEventType::FlagsChanged],
                 move |_proxy, etype, event| {
                     let n = event_count_for_cb.fetch_add(1, Ordering::SeqCst) + 1;
@@ -512,13 +1069,8 @@ fn install_fn_event_tap(app: tauri::AppHandle) {
                             eprintln!(
                                 "[clips-tray] Fn tap disabled by timeout — flagging for re-enable"
                             );
-                            // Reset edge state so the next genuine Fn-down
-                            // is detected as a fresh transition (we may have
-                            // missed an up-edge while the tap was disabled).
                             prev_for_cb.store(false, Ordering::SeqCst);
                             needs_reenable_for_cb.store(true, Ordering::SeqCst);
-                            // Wake the runloop thread out of run_in_mode so
-                            // it can call tap.enable() before the next event.
                             CFRunLoop::get_current().stop();
                             return CallbackResult::Keep;
                         }
@@ -547,32 +1099,39 @@ fn install_fn_event_tap(app: tauri::AppHandle) {
                     if fn_down == was_down {
                         return CallbackResult::Keep;
                     }
-                    set_dictation_active(&app_for_cb, fn_down);
+                    set_dictation_active_and_sync_escape(&app_for_cb, fn_down);
                     if fn_down {
                         dlog!("[clips-tray] Fn down — starting voice dictation");
-                        // Wake the popover (parked at 2x2, no focus) so its
-                        // JS runtime is live to receive the event. Without
-                        // this, if the popover was hidden, macOS may have
-                        // suspended its webview and the listener wouldn't
-                        // fire — manifesting as "Fn key sometimes does
-                        // nothing" depending on whether the popover happened
-                        // to be open.
+                        remember_voice_target(&app_for_cb);
+                        fn_down_at_for_cb.store(
+                            tap_epoch.elapsed().as_millis() as u64,
+                            Ordering::SeqCst,
+                        );
                         wake_popover_for_voice(&app_for_cb);
-                        // Small delay to give the popover JS a chance to
-                        // resume before we emit. wake_popover_for_voice
-                        // hops to the main thread internally so the actual
-                        // show happens slightly later than this line.
                         let app_for_emit = app_for_cb.clone();
                         let prev_for_emit = prev_for_cb.clone();
+                        let fn_down_at_for_emit = fn_down_at_for_cb.clone();
                         thread::spawn(move || {
                             thread::sleep(Duration::from_millis(80));
-                            if prev_for_emit.load(Ordering::SeqCst)
-                                && should_emit_delayed_voice_start(&app_for_emit, "fn")
-                            {
+                            let still_down = prev_for_emit.load(Ordering::SeqCst);
+                            let fast_tap = !still_down
+                                && fn_down_at_for_emit.load(Ordering::SeqCst) != 0;
+                            let should_emit = if fast_tap {
+                                FN_TAP_ENABLED.load(Ordering::SeqCst)
+                            } else {
+                                should_emit_delayed_voice_start(&app_for_emit, "fn")
+                            };
+                            if (still_down || fast_tap) && should_emit {
                                 let _ = app_for_emit.emit(
                                     "voice:shortcut-start",
                                     serde_json::json!({ "source": "fn" }),
                                 );
+                                if fast_tap {
+                                    let _ = app_for_emit.emit(
+                                        "voice:shortcut-stop",
+                                        serde_json::json!({ "source": "fn" }),
+                                    );
+                                }
                             } else {
                                 hide_voice_wake_popover(&app_for_emit);
                             }
@@ -580,6 +1139,13 @@ fn install_fn_event_tap(app: tauri::AppHandle) {
                         install_fn_release_watchdog(app_for_cb.clone(), prev_for_cb.clone());
                     } else {
                         dlog!("[clips-tray] Fn up — stopping voice dictation");
+                        let elapsed_since_down =
+                            tap_epoch.elapsed().as_millis() as u64
+                                - fn_down_at_for_cb.load(Ordering::SeqCst);
+                        fn_down_at_for_cb.store(0, Ordering::SeqCst);
+                        if elapsed_since_down < 80 {
+                            return CallbackResult::Keep;
+                        }
                         let _ = app_for_cb.emit(
                             "voice:shortcut-stop",
                             serde_json::json!({ "source": "fn" }),
@@ -595,13 +1161,17 @@ fn install_fn_event_tap(app: tauri::AppHandle) {
                     t
                 }
                 Err(()) => {
-                    FN_TAP_INSTALL_STARTED.store(false, Ordering::SeqCst);
                     eprintln!(
                         "[clips-tray][fn-tap] CGEventTapCreate returned NULL. Most likely cause: \
                          Input Monitoring is not granted to Clips. Open System Settings → \
                          Privacy & Security → Input Monitoring and enable Clips (or the \
                          terminal running `tauri dev`). Note: Accessibility is a separate \
                          permission and is not sufficient for ListenOnly taps."
+                    );
+                    schedule_fn_event_tap_restart(
+                        app,
+                        "CGEventTapCreate returned NULL",
+                        Duration::from_secs(5),
                     );
                     return;
                 }
@@ -612,8 +1182,12 @@ fn install_fn_event_tap(app: tauri::AppHandle) {
                     s
                 }
                 Err(()) => {
-                    FN_TAP_INSTALL_STARTED.store(false, Ordering::SeqCst);
                     eprintln!("[clips-tray][fn-tap] CFMachPortCreateRunLoopSource failed");
+                    schedule_fn_event_tap_restart(
+                        app,
+                        "CFMachPortCreateRunLoopSource failed",
+                        Duration::from_secs(2),
+                    );
                     return;
                 }
             };
@@ -624,29 +1198,59 @@ fn install_fn_event_tap(app: tauri::AppHandle) {
                 "[clips-tray][fn-tap] tap enabled; entering runloop — press Fn now to test"
             );
 
-            // Run the runloop in repeated short bursts so we can re-enable
-            // the tap if the OS disables it. We use run_current (blocks
-            // until something stops the loop) and re-enter on exit. The
-            // disable callbacks above call CFRunLoop::stop, which makes
-            // run_current return; we then call tap.enable() and re-enter.
-            // This is the handy-keys / linespeed pattern.
+            let mut consecutive_reenable_failures = 0_u8;
             loop {
-                if needs_reenable.swap(false, Ordering::SeqCst) {
-                    dlog!("[clips-tray] re-enabling Fn event tap");
-                    tap.enable();
+                if !FN_TAP_ENABLED.load(Ordering::SeqCst) {
+                    FN_TAP_INSTALL_STARTED.store(false, Ordering::SeqCst);
+                    return;
                 }
-                CFRunLoop::run_current();
-                // run_current returned — either we asked it to (a disable
-                // event flagged needs_reenable above), or something else
-                // removed our source. In the latter case avoid a tight
-                // spin, then re-call enable() defensively (it's idempotent
-                // — calling on an already-enabled tap is a no-op).
-                if !needs_reenable.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(50));
-                    dlog!(
-                        "[clips-tray] Fn runloop exited unexpectedly — re-enabling tap"
-                    );
-                    needs_reenable.store(true, Ordering::SeqCst);
+
+                let reenable_reason = if needs_reenable.swap(false, Ordering::SeqCst) {
+                    Some("disabled callback")
+                } else if !fn_event_tap_is_enabled(&tap) {
+                    Some("health check")
+                } else {
+                    None
+                };
+
+                if let Some(reason) = reenable_reason {
+                    eprintln!("[clips-tray][fn-tap] re-enabling Fn event tap ({reason})");
+                    tap.enable();
+                    thread::sleep(Duration::from_millis(20));
+                    if fn_event_tap_is_enabled(&tap) {
+                        consecutive_reenable_failures = 0;
+                    } else {
+                        consecutive_reenable_failures =
+                            consecutive_reenable_failures.saturating_add(1);
+                        if consecutive_reenable_failures >= 2 {
+                            schedule_fn_event_tap_restart(
+                                app.clone(),
+                                "tapEnable did not stick",
+                                Duration::from_millis(750),
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                match unsafe {
+                    CFRunLoop::run_in_mode(
+                        kCFRunLoopDefaultMode,
+                        Duration::from_millis(500),
+                        true,
+                    )
+                } {
+                    CFRunLoopRunResult::Finished => {
+                        schedule_fn_event_tap_restart(
+                            app.clone(),
+                            "runloop finished",
+                            Duration::from_millis(750),
+                        );
+                        return;
+                    }
+                    CFRunLoopRunResult::Stopped
+                    | CFRunLoopRunResult::TimedOut
+                    | CFRunLoopRunResult::HandledSource => {}
                 }
             }
         })
@@ -666,16 +1270,12 @@ fn install_fn_release_watchdog(
     use std::time::Duration;
 
     thread::spawn(move || {
-        // The CGEventTap occasionally misses the Fn up-edge after sleep,
-        // Mission Control, or tap re-enable churn. Poll the current HID
-        // modifier flags while we believe Fn is down; if the physical state
-        // says it is up, synthesize the missing stop event.
         thread::sleep(Duration::from_millis(120));
         while prev_down.load(Ordering::SeqCst) {
             if !current_fn_flag_down() {
                 if prev_down.swap(false, Ordering::SeqCst) {
                     dlog!("[clips-tray] Fn up missed — synthesizing voice stop");
-                    set_dictation_active(&app, false);
+                    set_dictation_active_and_sync_escape(&app, false);
                     let _ = app.emit(
                         "voice:shortcut-stop",
                         serde_json::json!({ "source": "fn", "synthetic": true }),

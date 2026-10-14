@@ -1,5 +1,6 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
+
 import { runQuery } from "../server/lib/bigquery";
 
 export default defineAction({
@@ -7,6 +8,7 @@ export default defineAction({
     "Query inbound sales/demo form submissions from a configured warehouse form-submissions table.",
   schema: z.object({}),
   http: false,
+  grounding: true,
   run: async () => {
     const sql = `
 SELECT

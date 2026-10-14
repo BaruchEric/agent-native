@@ -1,11 +1,13 @@
-import type { CalendarEvent } from "@shared/api";
+import type { CalendarEvent, OverlayPerson } from "@shared/api";
 export {
   GOOGLE_EVENT_COLOR_OPTIONS,
   getGoogleEventColorHex,
 } from "@shared/google-event-colors";
-import type { CalendarColorMode } from "./calendar-view-preferences";
-
-// ─── Palette (dark-mode editor inspired) ─────────────────────────────────────
+import type {
+  CalendarColorMode,
+  CalendarColorSourceKey,
+} from "./calendar-view-preferences";
+import { isPersonCalendarId } from "./person-calendar";
 
 export const EVENT_CATEGORY_COLORS = {
   focus: "#7C9C6B", // sage — self-holds, focus time
@@ -20,11 +22,40 @@ export const EVENT_CATEGORY_COLORS = {
 export type EventCategory = keyof typeof EVENT_CATEGORY_COLORS;
 
 export interface CalendarColorPreferences {
+  /** @deprecated legacy global fallback, used only when no per-account entry exists */
   colorMode?: CalendarColorMode;
+  /** @deprecated legacy global fallback, used only when no per-account entry exists */
   singleColor?: string;
+  accountColorModes?: Record<CalendarColorSourceKey, CalendarColorMode>;
+  accountColors?: Record<CalendarColorSourceKey, string>;
+  googleCalendarColors?: Record<string, string>;
 }
 
-// ─── Free email providers (skip internal/external when user is on one) ───────
+export function applyOverlayOwnerMarkers(
+  events: CalendarEvent[],
+  people: OverlayPerson[],
+): CalendarEvent[] {
+  const ownersByEmail = new Map(
+    people.map((person) => [person.email.trim().toLowerCase(), person]),
+  );
+
+  return events.map((event) => {
+    const ownerEmail =
+      event.overlayEmail ??
+      (event.source === "google" &&
+      event.calendarPrimary === false &&
+      event.calendarId &&
+      isPersonCalendarId(event.calendarId)
+        ? event.calendarId
+        : undefined);
+    const owner = ownerEmail
+      ? ownersByEmail.get(ownerEmail.trim().toLowerCase())
+      : undefined;
+    return owner
+      ? { ...event, ownerColor: owner.color, ownerName: owner.name }
+      : event;
+  });
+}
 
 const FREE_DOMAINS = new Set([
   "gmail.com",
@@ -44,35 +75,25 @@ function getDomain(email: string): string {
   return email.split("@")[1]?.toLowerCase() ?? "";
 }
 
-// ─── Classification ──────────────────────────────────────────────────────────
-
 export function classifyEvent(event: CalendarEvent): EventCategory {
-  // All-day events (OOO, travel, birthdays)
   if (event.allDay) return "allDay";
 
   const attendees = event.attendees;
 
-  // No attendees data → focus time
   if (!attendees || attendees.length === 0) return "focus";
 
-  // Filter out self to count "others"
   const others = attendees.filter((a) => !a.self);
 
-  // Only self → focus time / self-hold
   if (others.length === 0) return "focus";
 
-  // Determine user domain from accountEmail or self attendee
   const selfAttendee = attendees.find((a) => a.self);
   const userEmail = event.accountEmail || selfAttendee?.email || "";
   const userDomain = getDomain(userEmail);
 
-  // If user is on a free provider, we can't distinguish internal/external
-  // Fall back to count-based coloring
   if (!userDomain || FREE_DOMAINS.has(userDomain)) {
     return others.length === 1 ? "internal1on1" : "internalGroup";
   }
 
-  // Check if all others are internal (same domain)
   const allInternal = others.every((a) => getDomain(a.email) === userDomain);
   const anyInternal = others.some((a) => getDomain(a.email) === userDomain);
 
@@ -80,47 +101,26 @@ export function classifyEvent(event: CalendarEvent): EventCategory {
     return allInternal ? "internal1on1" : "external1on1";
   }
 
-  // Group meetings (3+ total = 2+ others)
   if (allInternal) return "internalGroup";
-  if (!anyInternal) return "externalGroup"; // all external
-  return "externalGroup"; // mixed = treat as external group
+  if (!anyInternal) return "externalGroup";
+  return "externalGroup";
 }
 
-// ─── "All others declined" detection ─────────────────────────────────────────
-
-/**
- * Returns true when every non-self attendee has declined the event,
- * meaning nobody else is coming. Only triggers when there are 2+ attendees
- * (i.e. at least one non-self attendee exists) and the user hasn't declined.
- */
 export function allOtherDeclined(event: CalendarEvent): boolean {
   const attendees = event.attendees;
   if (!attendees || attendees.length < 2) return false;
-  // Don't warn if the user themselves declined
   if (event.responseStatus === "declined") return false;
   const others = attendees.filter((a) => !a.self);
   if (others.length === 0) return false;
   return others.every((a) => a.responseStatus === "declined");
 }
 
-// ─── Main color function ─────────────────────────────────────────────────────
-
-/**
- * Returns a hex color for a calendar event based on its meeting type.
- * Respects user-set colors and overlay colors first.
- * For local (non-Google) events without a color, returns CSS var.
- */
 export function getEventAutoColor(event: CalendarEvent): string {
-  // User/Google-set color takes priority
   if (event.color) return event.color;
+  if (event.calendarColor) return event.calendarColor;
 
-  // Overlay events keep their overlay-assigned color
-  if (event.overlayEmail) return EVENT_CATEGORY_COLORS.fallback;
-
-  // Local events without a color use the theme primary
   if (event.source !== "google") return "hsl(var(--primary))";
 
-  // Auto-classify Google events
   const category = classifyEvent(event);
   return EVENT_CATEGORY_COLORS[category];
 }
@@ -129,13 +129,35 @@ export function getEventDisplayColor(
   event: CalendarEvent,
   preferences?: CalendarColorPreferences,
 ): string {
-  if (
-    preferences?.colorMode === "single" &&
-    preferences.singleColor &&
-    event.source === "google" &&
-    !event.overlayEmail
-  ) {
-    return preferences.singleColor;
+  if (event.ownerColor) return event.ownerColor;
+
+  if (event.source === "google" && !event.overlayEmail && preferences) {
+    const sourceColor = event.canonicalKey
+      ? preferences.googleCalendarColors?.[event.canonicalKey]
+      : undefined;
+    if (sourceColor) return sourceColor;
+
+    const accountKey = event.accountEmail;
+    const accountMode = accountKey
+      ? preferences.accountColorModes?.[accountKey]
+      : undefined;
+    const accountColor = accountKey
+      ? preferences.accountColors?.[accountKey]
+      : undefined;
+
+    const colorMode = accountMode ?? preferences.colorMode;
+    if (colorMode === "multi") {
+      return EVENT_CATEGORY_COLORS[classifyEvent(event)];
+    }
+
+    if (accountMode === "single" && accountColor) return accountColor;
+    if (
+      !accountMode &&
+      preferences.colorMode === "single" &&
+      preferences.singleColor
+    ) {
+      return accountColor ?? preferences.singleColor;
+    }
   }
   return getEventAutoColor(event);
 }

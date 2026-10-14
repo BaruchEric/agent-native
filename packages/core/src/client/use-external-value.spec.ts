@@ -2,6 +2,7 @@
 import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
 import { useReconciledState } from "./use-external-value.js";
 
 let container: HTMLDivElement;
@@ -24,7 +25,6 @@ interface HarnessProps {
   active: boolean;
 }
 
-// Exposes the hook's return values to the test via a ref-like capture object.
 function makeHarness() {
   const captured: {
     local: string;
@@ -85,17 +85,14 @@ describe("useReconciledState", () => {
       );
     });
 
-    // User types — local diverges from external.
     act(() => captured.setLocal("user typing"));
     expect(captured.local).toBe("user typing");
 
-    // Agent writes a new external value while the user is still active.
     act(() => {
       root.render(
         React.createElement(Harness, { external: "agent edit", active: true }),
       );
     });
-    // Local typing is preserved, not clobbered.
     expect(captured.local).toBe("user typing");
     expect(captured.external).toBe("agent edit");
   });
@@ -109,7 +106,6 @@ describe("useReconciledState", () => {
     });
     act(() => captured.setLocal("user typing"));
 
-    // External changes while active — held back.
     act(() => {
       root.render(
         React.createElement(Harness, { external: "agent edit", active: true }),
@@ -117,7 +113,6 @@ describe("useReconciledState", () => {
     });
     expect(captured.local).toBe("user typing");
 
-    // External changes again, now the user is no longer active — adopt it.
     act(() => {
       root.render(
         React.createElement(Harness, {
@@ -179,7 +174,6 @@ describe("useReconciledState", () => {
       root.render(React.createElement(Harness2, { external: "Hello" }));
     });
     act(() => captured.setLocal("edited"));
-    // Case-only change is "equal" under the custom comparator -> not adopted.
     act(() => {
       root.render(React.createElement(Harness2, { external: "HELLO" }));
     });

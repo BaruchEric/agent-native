@@ -4,6 +4,7 @@
 // Writes to data/pins/{uuid}.json — one file per annotation.
 // Atomic writes (temp + rename). Path traversal validation on all IDs.
 
+import { randomUUID } from "crypto";
 import {
   readdir,
   readFile,
@@ -13,8 +14,7 @@ import {
   mkdir,
 } from "fs/promises";
 import { join, resolve } from "path";
-import { tmpdir } from "os";
-import { randomUUID } from "crypto";
+
 import type { Pin, PinStatus, PinStorage } from "../types/index.js";
 import { PinSchema } from "./schemas.js";
 
@@ -36,7 +36,6 @@ export class FileStore implements PinStorage {
   private pinPath(id: string): string {
     this.validateId(id);
     const resolved = join(this.dir, `${id}.json`);
-    // Ensure resolved path is within the data directory
     if (!resolved.startsWith(this.dir)) {
       throw new Error("Path traversal detected");
     }
@@ -60,9 +59,14 @@ export class FileStore implements PinStorage {
 
   private async atomicWrite(filePath: string, data: string): Promise<void> {
     await this.ensureDir();
-    const tempPath = join(tmpdir(), `pinpoint-${randomUUID()}.tmp`);
-    await writeFile(tempPath, data, "utf-8");
-    await rename(tempPath, filePath);
+    const tempPath = join(this.dir, `.${randomUUID()}.tmp`);
+    try {
+      await writeFile(tempPath, data, "utf-8");
+      await rename(tempPath, filePath);
+    } catch (err) {
+      await unlink(tempPath).catch(() => {});
+      throw err;
+    }
   }
 
   async load(pageUrl: string): Promise<Pin[]> {

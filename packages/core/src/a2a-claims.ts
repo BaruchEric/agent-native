@@ -1,0 +1,62 @@
+import * as jose from "jose";
+
+import { verifyA2AToken } from "./a2a/server.js";
+
+export interface VerifiedA2AClaims {
+  email: string;
+  orgId: string;
+  orgDomain: string;
+  jti: string;
+  issuer?: string;
+  scope: string[];
+}
+
+export async function verifyA2ATokenWithClaims(
+  token: string,
+  event?: any,
+): Promise<VerifiedA2AClaims | null> {
+  const identity = await verifyA2AToken(token, event);
+  if (!identity.email) return null;
+  try {
+    const raw = jose.decodeJwt(token);
+    const audiences = Array.isArray(raw.aud)
+      ? raw.aud.filter((value): value is string => typeof value === "string")
+      : typeof raw.aud === "string"
+        ? [raw.aud]
+        : [];
+    if (audiences.length === 0 || audiences.some((value) => !value.trim()))
+      return null;
+    const claimedOrgId =
+      typeof raw.org_id === "string" ? raw.org_id.trim() : "";
+    // Global-secret verification can resolve an ID-only claim locally; require
+    // the signed domain too so the ID alone cannot choose the authorization scope.
+    const claimedOrgDomain =
+      typeof raw.org_domain === "string"
+        ? raw.org_domain.trim().toLowerCase()
+        : "";
+    const orgId = identity.orgId?.trim() ?? "";
+    const jti = typeof raw.jti === "string" ? raw.jti.trim() : "";
+    const scopes =
+      typeof raw.scope === "string"
+        ? raw.scope.split(/\s+/).filter(Boolean)
+        : [];
+    const issuer = typeof raw.iss === "string" ? raw.iss.trim() : "";
+    const orgDomain = identity.orgDomain?.trim().toLowerCase() ?? "";
+    return claimedOrgId &&
+      claimedOrgId === orgId &&
+      claimedOrgDomain &&
+      claimedOrgDomain === orgDomain &&
+      jti
+      ? {
+          email: identity.email,
+          orgId,
+          orgDomain,
+          jti,
+          ...(issuer ? { issuer } : {}),
+          scope: scopes,
+        }
+      : null;
+  } catch {
+    return null;
+  }
+}

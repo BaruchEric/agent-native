@@ -1,61 +1,101 @@
 import {
+  navigateWithAgentChatViewTransition,
+  sendToAgentChat,
+  useChatThreads,
+  type ChatThreadSummary,
+} from "@agent-native/core/client/agent-chat";
+import { useCodeMode } from "@agent-native/core/client/agent-chat";
+import { appPath } from "@agent-native/core/client/api-path";
+import { useSession } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { buildSignInReturnHref } from "@agent-native/core/client/sign-in-return";
+import { useSendToAgentChat } from "@agent-native/toolkit/app/chat/composer";
+import { DevDatabaseLink } from "@agent-native/toolkit/app/db-admin";
+import { FeedbackButton } from "@agent-native/toolkit/app/feedback";
+import { OrgSwitcher } from "@agent-native/toolkit/app/org";
+import { openCommandMenu } from "@agent-native/toolkit/app/shared";
+import {
+  AppSidebar,
+  AppSidebarNavItem,
+  AgentNativeIcon,
+} from "@agent-native/toolkit/app/shared";
+import { LazyChunkErrorBoundary } from "@agent-native/toolkit/app/shared";
+import { LazyChunkRetryFallback } from "@agent-native/toolkit/app/shared";
+import {
+  ChatHistoryRail,
+  type ChatHistoryItem,
+} from "@agent-native/toolkit/chat-history";
+import { planPathForKind } from "@shared/plan-routes";
+import {
+  IconClipboardCheck,
+  IconEdit,
+  IconMessageCircle,
+  IconPlus,
+  IconRefresh,
+  IconNews,
+} from "@tabler/icons-react";
+import {
+  lazy,
+  Suspense,
   useEffect,
   useMemo,
-  useRef,
   useState,
-  type FormEvent,
   type MouseEvent,
 } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
-import {
-  IconArchive,
-  IconClipboardCheck,
-  IconDots,
-  IconEdit,
-  IconLayoutSidebarLeftCollapse,
-  IconLayoutSidebarLeftExpand,
-  IconMessageCircle,
-  IconPin,
-  IconPlus,
-} from "@tabler/icons-react";
 import { toast } from "sonner";
-import { cn } from "@/lib/utils";
-import { ExtensionsSidebarSection } from "@agent-native/core/client/extensions";
-import {
-  agentNativePath,
-  DevDatabaseLink,
-  FeedbackButton,
-  appPath,
-  markAgentChatHomeHandoff,
-  navigateWithAgentChatViewTransition,
-  useChatThreads,
-  useSession,
-  type ChatThreadSummary,
-} from "@agent-native/core/client";
-import { OrgSwitcher } from "@agent-native/core/client/org";
-import { APP_TITLE } from "@/lib/app-config";
-import { usePlans } from "@/hooks/use-plans";
+
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { Input } from "@/components/ui/input";
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useEditionsLab } from "@/hooks/use-editions-lab";
+import { usePlans } from "@/hooks/use-plans";
+import { APP_TITLE } from "@/lib/app-config";
+import { isPlanChatPath, planChatThreadPath } from "@/lib/chat-route";
+import { planReturnPathFromLocation } from "@/lib/plan-return-path";
+import { cn } from "@/lib/utils";
+
+const loadPlanBrandingComposer = () =>
+  import("@agent-native/toolkit/app/chat/composer/index").then(
+    ({ PromptComposer }) => ({
+      default: PromptComposer,
+    }),
+  );
+const LazyPlanBrandingComposer = lazy(loadPlanBrandingComposer);
+
+function preloadPlanBrandingComposer() {
+  void loadPlanBrandingComposer().catch(() => {});
+}
 
 const PLAN_CHAT_STORAGE_KEY = "plans";
 
+const PLAN_BRANDING_CODE_CONTEXT = [
+  "The user is using the Plan app branding customization popover.",
+  "Make source-code changes for Plan branding in templates/plan.",
+  "Inspect the current brand surfaces first: app/lib/app-config.ts, app/components/layout/Sidebar.tsx, app/root.tsx metadata/icons, public brand assets, and app/global.css theme tokens.",
+  "Keep runtime plan data, stored plans, recaps, comments, and generated plan content unchanged unless the user explicitly asks for those data changes.",
+  "Use existing Plan styling, shadcn primitives, Tabler icons, and repo patterns. Keep changes tightly scoped.",
+].join("\n");
+
+function buildBrandingCustomizationMessage(request: string) {
+  return ["Customize the Plan app branding.", "", "Request:", request].join(
+    "\n",
+  );
+}
+
 const navItems = [
-  { icon: IconMessageCircle, label: "Ask", href: "/" },
-  { icon: IconClipboardCheck, label: "Plan", href: "/plans" },
+  { icon: IconMessageCircle, labelKey: "navigation.ask", href: "/chat" },
+  { icon: IconClipboardCheck, labelKey: "navigation.plan", href: "/plans" },
 ];
 
 interface SidebarProps {
@@ -125,8 +165,15 @@ function persistedActiveThreadId() {
   }
 }
 
-function PlanChatsSection({ collapsed }: { collapsed: boolean }) {
+function PlanChatsSection({
+  collapsed,
+  open,
+}: {
+  collapsed: boolean;
+  open: boolean;
+}) {
   const navigate = useNavigate();
+  const t = useT();
   const {
     threads,
     activeThreadId,
@@ -140,18 +187,28 @@ function PlanChatsSection({ collapsed }: { collapsed: boolean }) {
     autoCreate: false,
     restoreActiveThread: false,
   });
-  const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
-  const [renameDraft, setRenameDraft] = useState("");
-  const renameInputRef = useRef<HTMLInputElement | null>(null);
-  const committingRenameRef = useRef(false);
 
   const visibleThreads = useMemo(
     () =>
       threads
         .filter((thread) => thread.messageCount > 0 && !thread.archivedAt)
         .sort(compareThreads)
-        .slice(0, 8),
+        .slice(0, 15),
     [threads],
+  );
+  const chatItems = useMemo<ChatHistoryItem[]>(
+    () =>
+      visibleThreads.map((thread) => ({
+        id: thread.id,
+        title: threadTitle(thread),
+        titleText: threadTitle(thread),
+        timestamp:
+          thread.id === activeThreadId
+            ? undefined
+            : formatThreadAge(threadUpdatedAt(thread)),
+        pinned: Boolean(thread.pinnedAt),
+      })),
+    [activeThreadId, visibleThreads],
   );
 
   useEffect(() => {
@@ -173,19 +230,11 @@ function PlanChatsSection({ collapsed }: { collapsed: boolean }) {
     };
   }, [refreshThreads]);
 
-  useEffect(() => {
-    if (!renamingThreadId) return;
-    requestAnimationFrame(() => {
-      renameInputRef.current?.focus();
-      renameInputRef.current?.select();
-    });
-  }, [renamingThreadId]);
-
   if (collapsed) return null;
 
   function openThread(threadId: string, options?: { isNew?: boolean }) {
     switchThread(threadId);
-    navigateWithAgentChatViewTransition(navigate, "/");
+    navigateWithAgentChatViewTransition(navigate, planChatThreadPath(threadId));
     window.requestAnimationFrame(() => {
       window.dispatchEvent(
         new CustomEvent("agent-chat:open-thread", {
@@ -205,7 +254,7 @@ function PlanChatsSection({ collapsed }: { collapsed: boolean }) {
       threadId === activeThreadId || threadId === persistedActiveThreadId();
     const archived = await archiveThread(threadId);
     if (!archived) {
-      toast.error("Could not archive chat.");
+      toast.error(t("raw.sidebar.archiveChatFailed"));
       return;
     }
     if (wasActive) {
@@ -213,173 +262,68 @@ function PlanChatsSection({ collapsed }: { collapsed: boolean }) {
     }
   }
 
-  function startRenameThread(thread: ChatThreadSummary) {
-    committingRenameRef.current = false;
-    setRenameDraft(threadTitle(thread));
-    setRenamingThreadId(thread.id);
-  }
-
-  function cancelRenameThread() {
-    committingRenameRef.current = true;
-    setRenamingThreadId(null);
-    setRenameDraft("");
-  }
-
-  async function commitRenameThread() {
-    if (committingRenameRef.current) return;
-    const threadId = renamingThreadId;
-    const title = renameDraft.trim();
-    if (!threadId) return;
-    committingRenameRef.current = true;
-    setRenamingThreadId(null);
-    setRenameDraft("");
-    if (title) {
-      const renamed = await renameThread(threadId, title);
-      if (!renamed) toast.error("Could not rename chat.");
-    }
-    committingRenameRef.current = false;
-  }
-
-  function handleRenameSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    void commitRenameThread();
+  function handleRenameThread(threadId: string, title: string) {
+    void renameThread(threadId, title).then((renamed) => {
+      if (!renamed) toast.error(t("raw.sidebar.renameChatFailed"));
+    });
   }
 
   return (
-    <div className="mt-2 border-l border-sidebar-border/70 pl-3">
-      <div className="mb-1 flex h-7 items-center gap-2 pr-1">
-        <div className="min-w-0 flex-1 text-xs font-medium text-sidebar-foreground/70">
-          Chats
-        </div>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              onClick={handleNewChat}
-              className="flex size-6 shrink-0 items-center justify-center rounded-md text-sidebar-foreground/65 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-              aria-label="New Plan chat"
-            >
-              <IconPlus className="size-3.5" />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent>New chat</TooltipContent>
-        </Tooltip>
-      </div>
-
-      <div className="grid gap-0.5">
-        {visibleThreads.map((thread) => {
-          const isActive = thread.id === activeThreadId;
-          const isRenaming = thread.id === renamingThreadId;
-          return (
-            <div
-              key={thread.id}
-              className={cn(
-                "group flex h-8 min-w-0 items-center rounded-md text-sm transition-colors",
-                isActive
-                  ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                  : "text-sidebar-foreground/80 hover:bg-sidebar-accent/65 hover:text-sidebar-accent-foreground",
-              )}
-            >
-              {isRenaming ? (
-                <form
-                  onSubmit={handleRenameSubmit}
-                  className="flex h-full min-w-0 flex-1 items-center px-1.5"
-                >
-                  <Input
-                    ref={renameInputRef}
-                    value={renameDraft}
-                    onChange={(event) => setRenameDraft(event.target.value)}
-                    onBlur={() => void commitRenameThread()}
-                    onKeyDown={(event) => {
-                      if (event.key === "Escape") {
-                        event.preventDefault();
-                        cancelRenameThread();
-                      }
-                    }}
-                    maxLength={160}
-                    aria-label={`Rename ${threadTitle(thread)}`}
-                    className="h-6 min-w-0 rounded-sm border-sidebar-border bg-background px-1.5 text-xs"
-                  />
-                </form>
-              ) : (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => openThread(thread.id)}
-                    className="flex h-full min-w-0 flex-1 items-center px-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    <span className="min-w-0 flex-1 truncate">
-                      {threadTitle(thread)}
-                    </span>
-                  </button>
-                  <div className="relative flex size-7 shrink-0 items-center justify-end pr-1">
-                    <span className="text-[11px] text-sidebar-foreground/50 transition-opacity group-hover:opacity-0 group-focus-within:opacity-0">
-                      {isActive ? "" : formatThreadAge(threadUpdatedAt(thread))}
-                    </span>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <button
-                          type="button"
-                          aria-label={`Chat options for ${threadTitle(thread)}`}
-                          className="absolute right-1 flex size-6 items-center justify-center rounded-md text-sidebar-foreground/65 opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100"
-                        >
-                          <IconDots className="size-4" />
-                        </button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent
-                        align="end"
-                        side="right"
-                        sideOffset={6}
-                      >
-                        <DropdownMenuItem
-                          onSelect={() => startRenameThread(thread)}
-                        >
-                          <IconEdit className="size-4" />
-                          Rename chat
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onSelect={() =>
-                            void pinThread(thread.id, !thread.pinnedAt)
-                          }
-                        >
-                          <IconPin className="size-4" />
-                          {thread.pinnedAt ? "Unpin chat" : "Pin chat"}
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          className="text-destructive focus:text-destructive"
-                          onSelect={() => void handleArchiveThread(thread.id)}
-                        >
-                          <IconArchive className="size-4" />
-                          Archive chat
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                </>
-              )}
-            </div>
-          );
-        })}
+    <div
+      className="an-chat-history-rail__collapse"
+      data-state={open ? "open" : "closed"}
+      aria-hidden={!open}
+    >
+      <div className="ms-4">
+        <ChatHistoryRail
+          items={chatItems}
+          activeId={activeThreadId}
+          onSelect={(threadId) => openThread(threadId)}
+          onNewChat={() => void handleNewChat()}
+          railLabels={{
+            newChat: t("sidebar.newChat"),
+            showMore: t("sidebar.chats"),
+            showLess: t("sidebar.chats"),
+          }}
+          renameMaxLength={160}
+          onTogglePin={(threadId) => {
+            const thread = visibleThreads.find((item) => item.id === threadId);
+            if (thread) void pinThread(threadId, !thread.pinnedAt);
+          }}
+          onRename={handleRenameThread}
+          onDelete={(threadId) => void handleArchiveThread(threadId)}
+          labels={{
+            options: (item) => `${t("sidebar.chats")}: ${item.titleText ?? ""}`,
+            renameInput: (item) =>
+              `${t("sidebar.renameChat")}: ${item.titleText ?? ""}`,
+            rename: t("sidebar.renameChat"),
+            pin: t("sidebar.pinChat"),
+            unpin: t("sidebar.unpinChat"),
+            delete: t("sidebar.archiveChat"),
+          }}
+          className="min-w-0"
+        />
       </div>
     </div>
   );
 }
 
 function signInForPlanCreate() {
-  window.location.href = `${agentNativePath(
-    "/_agent-native/sign-in",
-  )}?return=${encodeURIComponent("/plans?create=1")}`;
+  window.location.href = buildSignInReturnHref({
+    returnTo: appPath("/plans?create=1"),
+  });
 }
 
 function signInWithReturnPath(returnPath: string) {
-  window.location.href = `${agentNativePath(
-    "/_agent-native/sign-in",
-  )}?return=${encodeURIComponent(returnPath || "/")}`;
+  window.location.href = buildSignInReturnHref({
+    returnTo: appPath(returnPath),
+  });
 }
 
 function PlansSidebarSection({ collapsed }: { collapsed: boolean }) {
   const location = useLocation();
   const navigate = useNavigate();
+  const t = useT();
   const { session, isLoading: sessionLoading } = useSession();
   const plansQuery = usePlans({
     enabled: Boolean(session),
@@ -404,21 +348,19 @@ function PlansSidebarSection({ collapsed }: { collapsed: boolean }) {
       signInForPlanCreate();
       return;
     }
-    markAgentChatHomeHandoff("plans");
     navigateWithAgentChatViewTransition(navigate, "/plans?create=1");
   };
 
   const openPlanPath = (event: MouseEvent<HTMLAnchorElement>, path: string) => {
     event.preventDefault();
-    markAgentChatHomeHandoff("plans");
     navigateWithAgentChatViewTransition(navigate, path);
   };
 
   return (
-    <div className="mt-2 border-l border-sidebar-border/70 pl-3">
-      <div className="mb-1 flex h-7 items-center gap-2 pr-1">
+    <div className="mt-2 border-s border-sidebar-border/70 ps-3">
+      <div className="mb-1 flex h-7 items-center gap-2 pe-1">
         <div className="min-w-0 flex-1 text-xs font-medium text-sidebar-foreground/70">
-          Plan
+          {t("sidebar.planSection")}
         </div>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -427,13 +369,15 @@ function PlansSidebarSection({ collapsed }: { collapsed: boolean }) {
               onClick={requestCreatePlan}
               disabled={sessionLoading}
               className="flex size-6 shrink-0 items-center justify-center rounded-md text-sidebar-foreground/65 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50"
-              aria-label={session ? "New plan" : "Sign in to create a plan"}
+              aria-label={
+                session ? t("sidebar.newPlan") : t("sidebar.signInCreatePlan")
+              }
             >
               <IconPlus className="size-3.5" />
             </button>
           </TooltipTrigger>
           <TooltipContent>
-            {session ? "New plan" : "Sign in to create"}
+            {session ? t("sidebar.newPlan") : t("sidebar.signInToCreate")}
           </TooltipContent>
         </Tooltip>
       </div>
@@ -448,9 +392,9 @@ function PlansSidebarSection({ collapsed }: { collapsed: boolean }) {
         <button
           type="button"
           onClick={signInForPlanCreate}
-          className="rounded-md px-2 py-1.5 text-left text-xs leading-5 text-sidebar-foreground/65 transition-colors hover:bg-sidebar-accent/65 hover:text-sidebar-accent-foreground"
+          className="rounded-md px-2 py-1.5 text-start text-xs leading-5 text-sidebar-foreground/65 transition-colors hover:bg-sidebar-accent/65 hover:text-sidebar-accent-foreground"
         >
-          Sign in to create and keep plans.
+          {t("sidebar.signInKeepPlans")}
         </button>
       ) : plansQuery.isLoading ? (
         <div className="grid gap-1">
@@ -458,18 +402,31 @@ function PlansSidebarSection({ collapsed }: { collapsed: boolean }) {
             <Skeleton key={item} className="h-8 rounded-md bg-sidebar-accent" />
           ))}
         </div>
+      ) : plansQuery.isError ? (
+        <div className="grid gap-2 rounded-md border border-sidebar-border/70 p-2">
+          <p className="text-xs leading-5 text-sidebar-foreground/65">
+            {t("plansPage.loadError.didNotLoadTitle")}
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7 justify-center text-xs"
+            onClick={() => void plansQuery.refetch()}
+          >
+            <IconRefresh className="size-3.5" />
+            {t("plansPage.loadError.retry")}
+          </Button>
+        </div>
       ) : plans.length === 0 ? (
         <p className="px-2 py-1.5 text-xs leading-5 text-sidebar-foreground/55">
-          No plans yet.
+          {t("sidebar.noPlans")}
         </p>
       ) : (
         <div className="grid gap-0.5">
           {plans.map((plan) => {
             const isActive = plan.id === selectedPlanId;
-            const href =
-              plan.kind === "recap"
-                ? `/recaps/${plan.id}`
-                : `/plans/${plan.id}`;
+            const href = planPathForKind(plan.id, plan.kind);
             return (
               <Link
                 key={plan.id}
@@ -488,7 +445,7 @@ function PlansSidebarSection({ collapsed }: { collapsed: boolean }) {
                     variant="outline"
                     className="h-4 shrink-0 rounded px-1 text-[9px]"
                   >
-                    Recap
+                    {t("sidebar.recapBadge")}
                   </Badge>
                 )}
                 {plan.openCommentCount > 0 ? (
@@ -510,14 +467,108 @@ function PlansSidebarSection({ collapsed }: { collapsed: boolean }) {
             <Link
               to="/plans"
               onClick={(event) => openPlanPath(event, "/plans")}
-              className="rounded-md px-2 py-1.5 text-left text-xs leading-5 text-sidebar-foreground/55 transition-colors hover:bg-sidebar-accent/65 hover:text-sidebar-accent-foreground"
+              className="rounded-md px-2 py-1.5 text-start text-xs leading-5 text-sidebar-foreground/55 transition-colors hover:bg-sidebar-accent/65 hover:text-sidebar-accent-foreground"
             >
-              View all plans…
+              {t("sidebar.viewAllPlans")}
             </Link>
           )}
         </div>
       )}
     </div>
+  );
+}
+
+function BrandingCustomizePopover() {
+  const [open, setOpen] = useState(false);
+  const { isCodeMode } = useCodeMode();
+  const { send, isGenerating, codeRequiredDialog } = useSendToAgentChat();
+  const t = useT();
+
+  function handleSubmit(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed || isGenerating) return;
+    const message = buildBrandingCustomizationMessage(trimmed);
+    const payload = {
+      message,
+      context: PLAN_BRANDING_CODE_CONTEXT,
+      submit: true,
+      type: "code" as const,
+      newTab: true,
+    };
+    const tabId = isCodeMode ? sendToAgentChat(payload) : send(payload);
+    setOpen(false);
+    if (tabId) {
+      toast.success(
+        isCodeMode ? t("sidebar.brandingSentLocal") : t("sidebar.brandingSent"),
+      );
+    }
+  }
+
+  return (
+    <>
+      {codeRequiredDialog}
+      <Popover
+        open={open}
+        onOpenChange={(nextOpen) => {
+          if (nextOpen) preloadPlanBrandingComposer();
+          setOpen(nextOpen);
+        }}
+      >
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            aria-label={t("sidebar.customizePlanBranding")}
+            title={t("sidebar.customizeBranding")}
+            onPointerEnter={preloadPlanBrandingComposer}
+            onFocus={preloadPlanBrandingComposer}
+            className="flex size-7 shrink-0 items-center justify-center rounded-md text-sidebar-foreground/55 opacity-0 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover/brand:opacity-100 group-focus-within/brand:opacity-100 data-[state=open]:opacity-100"
+          >
+            <IconEdit className="size-3.5" />
+          </button>
+        </PopoverTrigger>
+        <PopoverContent
+          side="right"
+          align="start"
+          sideOffset={8}
+          className="relative w-[calc(100vw-2rem)] max-w-[420px] rounded-xl border-border bg-card p-3 shadow-xl sm:w-[420px]"
+        >
+          <div className="mb-2 px-1">
+            <h3 className="text-sm font-semibold text-foreground">
+              {t("sidebar.customizeBranding")}
+            </h3>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t("sidebar.customizeBrandingDescription")}
+            </p>
+          </div>
+          <LazyChunkErrorBoundary fallback={<LazyChunkRetryFallback />}>
+            <Suspense
+              fallback={
+                <div
+                  aria-busy="true"
+                  className="flex min-h-36 flex-col justify-between gap-3"
+                >
+                  <Skeleton className="h-24 w-full" />
+                  <div className="flex justify-end gap-2">
+                    <Skeleton className="h-8 w-16" />
+                    <Skeleton className="h-8 w-20" />
+                  </div>
+                </div>
+              }
+            >
+              <LazyPlanBrandingComposer
+                autoFocus
+                disabled={isGenerating}
+                attachmentsEnabled={false}
+                showModelSelector={false}
+                placeholder={t("sidebar.customizeBrandingPlaceholder")}
+                draftScope="plans:customize-branding"
+                onSubmit={handleSubmit}
+              />
+            </Suspense>
+          </LazyChunkErrorBoundary>
+        </PopoverContent>
+      </Popover>
+    </>
   );
 }
 
@@ -527,167 +578,105 @@ export function Sidebar({
   onCollapsedChange,
 }: SidebarProps) {
   const location = useLocation();
+  const pathname = location.pathname.replace(/\/+$/, "") || "/";
   const { session, isLoading: sessionLoading } = useSession();
-  const returnPath = `${location.pathname}${location.search}${location.hash}`;
-  const ToggleIcon = collapsed
-    ? IconLayoutSidebarLeftExpand
-    : IconLayoutSidebarLeftCollapse;
-  const collapseButton = collapsible ? (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          type="button"
-          size="icon"
-          variant="ghost"
-          className="size-8 shrink-0 text-muted-foreground"
-          onClick={() => onCollapsedChange?.(!collapsed)}
-          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-        >
-          <ToggleIcon className="size-4" />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent side="right">
-        {collapsed ? "Expand sidebar" : "Collapse sidebar"}
-      </TooltipContent>
-    </Tooltip>
+  const t = useT();
+  const editionsEnabled = useEditionsLab();
+  const returnPath = planReturnPathFromLocation(location);
+
+  const feedbackButton = (
+    <FeedbackButton variant={collapsed ? "icon" : "sidebar"} side="right" />
+  );
+
+  const orgSwitcher = session ? (
+    <OrgSwitcher compact={collapsed} />
+  ) : !sessionLoading ? (
+    <Button
+      type="button"
+      size="sm"
+      variant="outline"
+      className={collapsed ? "!size-9 !p-0 text-xs" : "h-8 w-full px-3 text-xs"}
+      onClick={() => signInWithReturnPath(returnPath)}
+    >
+      {collapsed ? "In" : t("sidebar.signIn")}
+    </Button>
   ) : null;
 
   return (
-    <aside
-      data-collapsed={collapsed ? "true" : "false"}
-      className={cn(
-        "flex h-full min-w-0 shrink-0 flex-col overflow-hidden border-r border-border bg-sidebar text-sidebar-foreground transition-[width] duration-150",
-        collapsed ? "w-14" : "w-60",
-      )}
-    >
-      <div
-        className={cn(
-          "flex h-12 shrink-0 items-center border-b border-border",
-          collapsed ? "justify-center px-0" : "gap-2 px-3",
-        )}
-      >
-        <div
-          className={cn(
-            "flex min-w-0 items-center gap-2",
-            collapsed ? "justify-center" : "flex-1",
-          )}
-        >
-          <img
-            src={appPath("/agent-native-icon-light.svg")}
-            alt=""
-            aria-hidden="true"
-            className="block h-4 w-auto max-w-7 shrink-0 dark:hidden"
-          />
-          <img
-            src={appPath("/agent-native-icon-dark.svg")}
-            alt=""
-            aria-hidden="true"
-            className="hidden h-4 w-auto max-w-7 shrink-0 dark:block"
-          />
-          {!collapsed && (
-            <span className="truncate text-sm font-semibold tracking-tight">
-              {APP_TITLE}
-            </span>
-          )}
+    <AppSidebar
+      collapsed={collapsed}
+      collapsible={collapsible}
+      onCollapsedChange={onCollapsedChange}
+      brandName={APP_TITLE}
+      appId="plan"
+      brandHref="/plans"
+      brandLink={
+        <div className="group/brand flex min-w-0 items-center gap-1">
+          <Link
+            to="/plans"
+            className={cn(
+              "flex min-w-0 items-center gap-2 rounded text-start outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              collapsed && "size-8 justify-center",
+            )}
+          >
+            <AgentNativeIcon
+              aria-hidden="true"
+              className="h-3.5 w-6 shrink-0 text-primary"
+            />
+            {!collapsed && (
+              <span className="truncate text-sm font-semibold text-primary">
+                {APP_TITLE}
+              </span>
+            )}
+          </Link>
+          {!collapsed ? <BrandingCustomizePopover /> : null}
         </div>
+      }
+      feedback={feedbackButton}
+      orgSwitcher={orgSwitcher}
+      footerExtras={<DevDatabaseLink />}
+    >
+      <div>
+        <AppSidebarNavItem
+          to="/chat"
+          label={t("navigation.ask")}
+          icon={IconMessageCircle}
+          active={isPlanChatPath(pathname)}
+        />
+        <PlanChatsSection
+          collapsed={collapsed}
+          open={isPlanChatPath(pathname)}
+        />
       </div>
 
-      <nav className="flex-1 space-y-1 overflow-y-auto px-2 py-2">
-        {navItems.map((item) => {
-          const Icon = item.icon;
-          const isActive =
-            item.href === "/"
-              ? location.pathname === "/"
-              : item.href === "/plans"
-                ? location.pathname.startsWith("/plans") ||
-                  location.pathname.startsWith("/recaps") ||
-                  location.pathname.startsWith("/local-plans")
-                : location.pathname.startsWith(item.href);
-          const link = (
-            <Link
-              to={item.href}
-              onClick={() => {
-                if (item.href !== "/") markAgentChatHomeHandoff("plans");
-              }}
-              className={cn(
-                "flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors",
-                isActive
-                  ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                  : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground",
-                collapsed && "justify-center gap-0 px-0",
-              )}
-            >
-              <Icon className="h-4 w-4 shrink-0" />
-              {collapsed ? (
-                <span className="sr-only">{item.label}</span>
-              ) : (
-                item.label
-              )}
-            </Link>
-          );
-          return (
-            <div key={item.href}>
-              {link}
-              {item.href === "/" && isActive ? (
-                <PlanChatsSection collapsed={collapsed} />
-              ) : null}
-              {item.href === "/plans" && isActive ? (
-                <PlansSidebarSection collapsed={collapsed} />
-              ) : null}
-            </div>
-          );
-        })}
-      </nav>
+      <div>
+        <AppSidebarNavItem
+          to="/plans"
+          label={t("navigation.plan")}
+          icon={IconClipboardCheck}
+          active={
+            pathname.startsWith("/plans") ||
+            pathname.startsWith("/recaps") ||
+            pathname.startsWith("/local-plans")
+          }
+        />
+        {pathname.startsWith("/plans") ||
+        pathname.startsWith("/recaps") ||
+        pathname.startsWith("/local-plans") ? (
+          <PlansSidebarSection collapsed={collapsed} />
+        ) : null}
+      </div>
 
-      {!collapsed && session && (
-        <>
-          <div className="border-t border-border px-2 py-2">
-            <ExtensionsSidebarSection />
-          </div>
-
-          <div className="space-y-2 border-t border-border px-3 py-2">
-            <DevDatabaseLink />
-            <FeedbackButton />
-            <OrgSwitcher />
-          </div>
-        </>
-      )}
-
-      {!collapsed && !sessionLoading && !session && (
-        <div className="space-y-2 border-t border-border px-3 py-2">
-          <DevDatabaseLink />
-          <FeedbackButton />
-          <div className="flex items-center justify-between gap-2">
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              className="h-8 px-3 text-xs"
-              onClick={() => signInWithReturnPath(returnPath)}
-            >
-              Sign in
-            </Button>
-            {collapseButton}
-          </div>
-        </div>
-      )}
-
-      {collapsed && collapsible ? (
-        <div
-          className={cn(
-            "border-t border-border px-2 py-2",
-            collapsed ? "flex justify-center" : "flex justify-end",
-          )}
-        >
-          {collapseButton}
+      {editionsEnabled ? (
+        <div>
+          <AppSidebarNavItem
+            to="/editions"
+            label={t("edition.nav.label")}
+            icon={IconNews}
+            active={pathname.startsWith("/editions")}
+          />
         </div>
       ) : null}
-
-      {!collapsed && (session || sessionLoading) && collapsible ? (
-        <div className="flex justify-end border-t border-border px-2 py-2">
-          {collapseButton}
-        </div>
-      ) : null}
-    </aside>
+    </AppSidebar>
   );
 }

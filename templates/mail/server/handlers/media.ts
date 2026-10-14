@@ -1,21 +1,36 @@
+import fs from "node:fs";
+import path from "node:path";
+
+import { resolveOrgIdForEmail } from "@agent-native/core/org";
+import { streamFile, getSession } from "@agent-native/core/server";
 import {
   defineEventHandler,
+  getHeader,
   getQuery,
   readRawBody,
   getRouterParam,
+  sendRedirect,
   setResponseStatus,
   setResponseHeader,
   type H3Event,
 } from "h3";
-import { streamFile, getSession } from "@agent-native/core/server";
-import fs from "node:fs";
-import path from "node:path";
 import { nanoid } from "nanoid";
-import { getStoredUpload, putStoredUpload } from "../lib/upload-store.js";
 
-const UPLOADS_DIR = path.resolve("data/uploads");
+import {
+  claimAttachmentUploadTicket,
+  verifyAttachmentUploadTicket,
+} from "../lib/attachment-upload-ticket.js";
+import {
+  MAX_UPLOAD_BYTES,
+  MediaStorageSetupError,
+  mimeTypeForUpload,
+  storeMediaUpload,
+  uploadsDirectory,
+} from "../lib/media-upload.js";
+import { getStoredUpload } from "../lib/upload-store.js";
 
-// Ensure uploads directory exists (guarded for edge runtimes without filesystem)
+const UPLOADS_DIR = uploadsDirectory();
+
 try {
   if (!fs.existsSync(UPLOADS_DIR)) {
     fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -23,26 +38,6 @@ try {
 } catch {
   // Edge runtime (e.g. Cloudflare Workers) — no local filesystem
 }
-
-const MIME_MAP: Record<string, string> = {
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".gif": "image/gif",
-  ".webp": "image/webp",
-  ".svg": "image/svg+xml",
-  ".pdf": "application/pdf",
-  ".txt": "text/plain",
-  ".csv": "text/csv",
-  ".doc": "application/msword",
-  ".docx":
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  ".xls": "application/vnd.ms-excel",
-  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  ".zip": "application/zip",
-};
-
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
 
 export const uploadMedia = defineEventHandler(async (event: H3Event) => {
   const session = await getSession(event).catch(() => null);
@@ -65,40 +60,91 @@ export const uploadMedia = defineEventHandler(async (event: H3Event) => {
 
     const originalName = (getQuery(event).filename as string) || "upload";
     const ext = path.extname(originalName).toLowerCase() || ".bin";
-    const id = nanoid(12) + ext;
-    const filePath = path.join(UPLOADS_DIR, id);
-
-    const mimeType = MIME_MAP[ext] || "application/octet-stream";
-    const payload = {
-      url: `/api/media/${id}`,
-      filename: id,
+    return await storeMediaUpload({
+      ownerEmail: session.email,
+      orgId: session.orgId,
+      data: body instanceof Uint8Array ? body : new Uint8Array(body),
+      filename: nanoid(12) + ext,
       originalName,
-      mimeType,
-      size: body.byteLength,
-    };
-
-    try {
-      fs.writeFileSync(filePath, body);
-    } catch {
-      await putStoredUpload(session.email, {
-        ...payload,
-        dataBase64: Buffer.from(body).toString("base64"),
-        createdAt: Date.now(),
-      });
-    }
-
-    return payload;
+    });
   } catch (err) {
+    if (err instanceof MediaStorageSetupError) {
+      setResponseStatus(event, 503);
+      return {
+        error: err.message,
+        storageSetupRequired: true,
+      };
+    }
     console.error("[media] Upload failed:", err);
     setResponseStatus(event, 500);
     return { error: "Upload failed" };
   }
 });
 
+export const uploadAttachmentWithTicket = defineEventHandler(
+  async (event: H3Event) => {
+    const uploadId = getRouterParam(event, "uploadId") as string;
+    const authorization = getHeader(event, "authorization") || "";
+    const token = authorization.startsWith("Bearer ")
+      ? authorization.slice("Bearer ".length).trim()
+      : "";
+    const verified = await verifyAttachmentUploadTicket(uploadId, token);
+    if (!verified) {
+      setResponseStatus(event, 401);
+      return { error: "Invalid or expired attachment upload URL" };
+    }
+    const body = await readRawBody(event, false);
+    if (!body || !body.byteLength) {
+      setResponseStatus(event, 400);
+      return { error: "No file data" };
+    }
+    if (body.byteLength > MAX_UPLOAD_BYTES) {
+      setResponseStatus(event, 413);
+      return { error: "File too large (max 10 MB)" };
+    }
+
+    const orgId =
+      verified.ticket.orgId ??
+      (await resolveOrgIdForEmail(verified.ownerEmail)) ??
+      undefined;
+
+    const claimed = await claimAttachmentUploadTicket(uploadId, token);
+    if (!claimed) {
+      setResponseStatus(event, 401);
+      return { error: "Invalid or expired attachment upload URL" };
+    }
+
+    try {
+      const uploaded = await storeMediaUpload({
+        ownerEmail: claimed.ownerEmail,
+        orgId,
+        data: body instanceof Uint8Array ? body : new Uint8Array(body),
+        filename: claimed.ticket.filename,
+        originalName: claimed.ticket.originalName,
+      });
+      return {
+        ...uploaded,
+        attachment: {
+          filename: uploaded.filename,
+          originalName: uploaded.originalName,
+          mimeType: uploaded.mimeType,
+        },
+      };
+    } catch (err) {
+      if (err instanceof MediaStorageSetupError) {
+        setResponseStatus(event, 503);
+        return { error: err.message, storageSetupRequired: true };
+      }
+      console.error("[media] Ticketed attachment upload failed:", err);
+      setResponseStatus(event, 500);
+      return { error: "Upload failed" };
+    }
+  },
+);
+
 export const serveMedia = defineEventHandler(async (event: H3Event) => {
   const filename = getRouterParam(event, "filename") as string;
 
-  // Prevent directory traversal
   if (filename.includes("..") || filename.includes("/")) {
     setResponseStatus(event, 400);
     return { error: "Invalid filename" };
@@ -115,6 +161,13 @@ export const serveMedia = defineEventHandler(async (event: H3Event) => {
     if (!stored) {
       setResponseStatus(event, 404);
       return { error: "File not found" };
+    }
+    if (stored.url) {
+      return sendRedirect(event, stored.url, 302);
+    }
+    if (!stored.dataBase64) {
+      setResponseStatus(event, 404);
+      return { error: "File data not found" };
     }
 
     setResponseHeader(event, "Content-Type", stored.mimeType);
@@ -134,7 +187,7 @@ export const serveMedia = defineEventHandler(async (event: H3Event) => {
     return Buffer.from(stored.dataBase64, "base64");
   }
 
-  const mimeType = MIME_MAP[ext] || "application/octet-stream";
+  const mimeType = mimeTypeForUpload(filename);
 
   setResponseHeader(event, "Content-Type", mimeType);
   setResponseHeader(
@@ -142,13 +195,7 @@ export const serveMedia = defineEventHandler(async (event: H3Event) => {
     "Cache-Control",
     "public, max-age=31536000, immutable",
   );
-  // Always send X-Content-Type-Options: nosniff so browsers don't MIME-sniff
-  // a polyglot upload (e.g. an SVG/HTML file uploaded with a `.png` extension)
-  // into HTML and execute any embedded `<script>`. The Content-Disposition
-  // attachment fallback below covers the documented SVG/HTML extensions; this
-  // header closes the polyglot bypass for every other type too.
   setResponseHeader(event, "X-Content-Type-Options", "nosniff");
-  // Force download for SVG and other types that could execute scripts inline.
   if (ext === ".svg" || ext === ".html" || ext === ".htm") {
     setResponseHeader(
       event,

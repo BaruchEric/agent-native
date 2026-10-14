@@ -1,24 +1,29 @@
-/**
- * Shared types for the agent observability system.
- *
- * Covers traces, feedback, evals, experiments, and satisfaction scoring.
- * Each domain module imports from here so the data model is consistent
- * across the entire observability stack.
- */
-
-// ─── Traces ───────────────────────────────────────────────────────────
+import type { AgentMcpAppPayload } from "../mcp-client/app-result.js";
 
 export type SpanType = "llm_call" | "tool_call" | "agent_run";
-export type SpanStatus = "success" | "error";
+/**
+ * `paused` is a run that stopped on purpose to wait for the user (a question or
+ * an approval). It is not a failure: error counts and rates must not include it.
+ */
+export type SpanStatus = "success" | "error" | "paused";
+
+/**
+ * What `errorMessage` of a failed tool span holds, so callers can tell the cases
+ * apart instead of reading them all as `null`:
+ * - `full` — the sanitized error text (captureToolResults was on)
+ * - `signature` — one redacted line; the rest was withheld by config
+ * - `withheld` — text exists but was written before the redaction contract, so
+ *   it is not returned
+ * - `unrecorded` — nothing was stored
+ */
+export type SpanErrorDetail = "full" | "signature" | "withheld" | "unrecorded";
 
 export interface TraceSpan {
   id: string;
   runId: string;
   threadId: string | null;
-  /** Owner of the run that produced this span. Null for legacy rows
-   *  written before per-user isolation; null also means "no auth context"
-   *  (background tasks, etc.) and is filtered out of per-user reads. */
   userId: string | null;
+  orgId?: string | null;
   parentSpanId: string | null;
   spanType: SpanType;
   name: string;
@@ -30,15 +35,19 @@ export interface TraceSpan {
   durationMs: number;
   status: SpanStatus;
   errorMessage: string | null;
+  /** Set when reading a failed tool span; see {@link SpanErrorDetail}. */
+  errorDetail?: SpanErrorDetail;
   metadata: Record<string, unknown> | null;
   createdAt: number;
+  /** Request/span end time in epoch milliseconds. Older rows derive this from duration. */
+  endedAt?: number;
 }
 
 export interface TraceSummary {
   runId: string;
   threadId: string | null;
-  /** See `TraceSpan.userId`. */
   userId: string | null;
+  orgId?: string | null;
   totalSpans: number;
   llmCalls: number;
   toolCalls: number;
@@ -50,9 +59,10 @@ export interface TraceSummary {
   totalOutputTokens: number;
   model: string;
   createdAt: number;
+  runCount?: number;
+  reviewGroupLabel?: string;
+  reviewGroupRunIds?: string[];
 }
-
-// ─── Feedback ────────────���────────────────────────────────────────────
 
 export type FeedbackType = "thumbs_up" | "thumbs_down" | "category" | "text";
 
@@ -63,15 +73,128 @@ export interface FeedbackEntry {
   messageSeq: number | null;
   feedbackType: FeedbackType;
   value: string;
+  idempotencyKey?: string | null;
   userId: string | null;
+  orgId?: string | null;
+  source?: "chat" | "human_review";
   createdAt: number;
+}
+
+export type InstructionUpdateStatus = "draft" | "approved" | "applied";
+
+export interface InstructionUpdate {
+  id: string;
+  runId: string;
+  threadId: string | null;
+  target: "agent" | "developer" | "skill";
+  instruction: string;
+  feedback: string;
+  status: InstructionUpdateStatus;
+  userId: string;
+  orgId?: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface OutputReviewListRow {
+  runId: string;
+  orgId: string;
+  readOnly: boolean;
+  threadId: string | null;
+  ask: string;
+  answer: string;
+  hasInlineApp: boolean;
+  inlineAppTitle?: string;
+  threadTitle: string;
+  summary: HumanReviewSummaryPayload | null;
+  summaryUpdatedAt?: number;
+  artifacts: HumanReviewArtifactRef[];
+  runs: OutputReviewRun[];
+  runCount: number;
+  authorEmail?: string;
+  authorName?: string;
+  authorAvatar?: string;
+  model: string;
+  createdAt: number;
+  feedback: FeedbackEntry[];
+  instructionUpdate: InstructionUpdate | null;
+}
+
+export interface OutputReviewRun {
+  runId: string;
+  threadId?: string | null;
+  model: string;
+  createdAt: number;
+  summaryUpdatedAt?: number;
+}
+
+export interface HumanReviewArtifactRef {
+  appId: "design" | "slides" | "analytics";
+  artifactId: string;
+  title: string;
+  path?: string;
+}
+
+export interface HumanReviewSummaryPayload {
+  ask: string;
+  outcome: string;
+  artifacts: HumanReviewArtifactRef[];
+}
+
+export interface HumanReviewSummary extends HumanReviewSummaryPayload {
+  runId: string;
+  orgId: string;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface OutputReviewThreadMessage {
+  role: "user" | "assistant";
+  text: string;
+  toolCalls?: string[];
+}
+
+export interface OutputReviewDetail {
+  runId: string;
+  orgId: string;
+  app: AgentMcpAppPayload | null;
+  messages: OutputReviewThreadMessage[];
+  artifacts: HumanReviewArtifactRef[];
+  summary: HumanReviewSummaryPayload | null;
+  ask: string;
+  answer: string;
+}
+
+export type ObservabilityReviewScope =
+  | { kind: "organization"; orgId: string }
+  | { kind: "all"; activeOrgId: string };
+
+export interface ObservabilityReviewThreadScope {
+  orgId: string;
+  threadId: string;
+}
+
+export interface ObservabilityReviewRunScope {
+  orgId: string;
+  runId: string;
+}
+
+export function observabilityReviewThreadKey(
+  orgId: string,
+  threadId: string,
+): string {
+  return JSON.stringify([orgId, threadId]);
+}
+
+/** @deprecated Use OutputReviewListRow for list data. */
+export interface OutputReviewRow extends OutputReviewListRow {
+  inlineApp?: AgentMcpAppPayload;
 }
 
 export interface SatisfactionScore {
   id: string;
   threadId: string;
-  /** Owner of the thread the score was computed for. Same null semantics
-   *  as `TraceSpan.userId`. */
   userId: string | null;
   frustrationScore: number;
   rephrasingScore: number;
@@ -81,16 +204,12 @@ export interface SatisfactionScore {
   computedAt: number;
 }
 
-// ─── Evals ─────────��──────────────────────────────────────────────────
-
 export type EvalType = "automated" | "llm_judge" | "human";
 
 export interface EvalResult {
   id: string;
   runId: string;
   threadId: string | null;
-  /** Owner of the run being evaluated. Same null semantics as
-   *  `TraceSpan.userId`. */
   userId: string | null;
   evalType: EvalType;
   criteria: string;
@@ -107,6 +226,16 @@ export interface EvalDataset {
   entries: EvalTestCase[];
   createdAt: number;
   updatedAt: number;
+  /**
+   * Owner of the dataset. Null on legacy rows from before per-user
+   * isolation; scoped reads pass `userId` the same way traces do.
+   */
+  userId?: string | null;
+  /**
+   * Per-owner identity of a trace promotion. Null on datasets that were
+   * not promoted from a run. A unique index makes repeat promotion upsert.
+   */
+  idempotencyKey?: string | null;
 }
 
 export interface EvalTestCase {
@@ -122,8 +251,6 @@ export interface EvalCriteria {
   rubric?: string;
   scoreRange?: { min: number; max: number };
 }
-
-// ─── Experiments ───────��──────────────────────────────────────────────
 
 export type ExperimentStatus = "draft" | "running" | "paused" | "completed";
 
@@ -171,28 +298,14 @@ export interface ExperimentMetricResult {
   computedAt: number;
 }
 
-// ─── Observability config ─────────────────────────────────────────────
-
 export interface ObservabilityConfig {
   enabled: boolean;
   capturePrompts: boolean;
   captureToolArgs: boolean;
   captureToolResults: boolean;
+  captureLlmSpans: boolean;
   evalSampleRate: number;
-  exporters: ObservabilityExporterConfig[];
+  inferredSentimentEnabled: boolean;
+  inferredSentimentSampleRate: number;
+  inferredSentimentModel: string;
 }
-
-export interface ObservabilityExporterConfig {
-  type: "otlp" | "console" | "custom";
-  endpoint?: string;
-  headers?: Record<string, string>;
-}
-
-export const DEFAULT_OBSERVABILITY_CONFIG: ObservabilityConfig = {
-  enabled: true,
-  capturePrompts: false,
-  captureToolArgs: false,
-  captureToolResults: false,
-  evalSampleRate: 0,
-  exporters: [],
-};

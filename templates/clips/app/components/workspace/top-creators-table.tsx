@@ -1,4 +1,7 @@
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { useT } from "@agent-native/core/client/i18n";
+
+import { ClipsAvatar } from "@/components/clips-avatar";
+import { Empty, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import {
   Table,
   TableBody,
@@ -10,6 +13,7 @@ import {
 
 export interface TopCreatorRow {
   email: string;
+  name?: string | null;
   recordings: number;
   views: number;
   engagement: number;
@@ -25,11 +29,16 @@ function initials(email: string): string {
 }
 
 export function TopCreatorsTable({ rows }: TopCreatorsTableProps) {
+  const t = useT();
   if (!rows.length) {
     return (
-      <div className="py-6 text-center text-sm text-muted-foreground">
-        No creators yet.
-      </div>
+      <Empty className="gap-2 rounded-none py-6 md:p-6">
+        <EmptyHeader>
+          <EmptyTitle className="text-sm font-medium text-muted-foreground">
+            {t("clipsFinalRaw.noCreatorsYet")}
+          </EmptyTitle>
+        </EmptyHeader>
+      </Empty>
     );
   }
 
@@ -38,36 +47,54 @@ export function TopCreatorsTable({ rows }: TopCreatorsTableProps) {
       <Table>
         <TableHeader>
           <TableRow>
-            <TableHead>Creator</TableHead>
-            <TableHead className="text-right w-24">Recordings</TableHead>
-            <TableHead className="text-right w-20">Views</TableHead>
-            <TableHead className="text-right w-28">Engagement</TableHead>
+            <TableHead>{t("clipsFinalRaw.creator")}</TableHead>
+            <TableHead className="text-end w-24">
+              {t("insightsHub.recordings")}
+            </TableHead>
+            <TableHead className="text-end w-20">
+              {t("insightsHub.views")}
+            </TableHead>
+            <TableHead className="text-end w-28">
+              {t("clipsFinalRaw.engagement")}
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          {rows.map((row) => (
-            <TableRow key={row.email}>
-              <TableCell>
-                <div className="flex items-center gap-2 min-w-0">
-                  <Avatar className="h-7 w-7 flex-shrink-0">
-                    <AvatarFallback className="text-xs bg-primary text-primary-foreground">
-                      {initials(row.email)}
-                    </AvatarFallback>
-                  </Avatar>
-                  <span className="truncate">{row.email}</span>
-                </div>
-              </TableCell>
-              <TableCell className="text-right tabular-nums">
-                {row.recordings.toLocaleString()}
-              </TableCell>
-              <TableCell className="text-right tabular-nums">
-                {row.views.toLocaleString()}
-              </TableCell>
-              <TableCell className="text-right tabular-nums">
-                {row.engagement.toLocaleString()}
-              </TableCell>
-            </TableRow>
-          ))}
+          {rows.map((row) => {
+            const displayName = row.name?.trim() || row.email;
+            return (
+              <TableRow key={row.email}>
+                <TableCell>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <ClipsAvatar
+                      email={row.email}
+                      alt={displayName}
+                      fallback={initials(displayName)}
+                      className="h-7 w-7 flex-shrink-0"
+                      fallbackClassName="text-xs bg-primary text-primary-foreground"
+                    />
+                    <div className="min-w-0">
+                      <div className="truncate">{displayName}</div>
+                      {displayName !== row.email ? (
+                        <div className="truncate text-xs text-muted-foreground">
+                          {row.email}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                </TableCell>
+                <TableCell className="text-end tabular-nums">
+                  {row.recordings.toLocaleString()}
+                </TableCell>
+                <TableCell className="text-end tabular-nums">
+                  {row.views.toLocaleString()}
+                </TableCell>
+                <TableCell className="text-end tabular-nums">
+                  {row.engagement.toLocaleString()}
+                </TableCell>
+              </TableRow>
+            );
+          })}
         </TableBody>
       </Table>
     </div>

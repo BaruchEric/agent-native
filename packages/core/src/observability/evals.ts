@@ -1,17 +1,17 @@
+import {
+  resolveEngine,
+  getStoredModelForEngine,
+  normalizeModelForEngine,
+} from "../agent/engine/index.js";
+import type { AgentEngine } from "../agent/engine/types.js";
+import { getRunById, getRunEventsSince } from "../agent/run-store.js";
+import { getTraceSummary, insertEvalResult, getEvalDataset } from "./store.js";
 import type {
   EvalResult,
   EvalCriteria,
   TraceSummary,
   EvalTestCase,
 } from "./types.js";
-import { getTraceSummary, insertEvalResult, getEvalDataset } from "./store.js";
-import { getRunById, getRunEventsSince } from "../agent/run-store.js";
-import type { AgentEngine } from "../agent/engine/types.js";
-import {
-  resolveEngine,
-  getStoredModelForEngine,
-  normalizeModelForEngine,
-} from "../agent/engine/index.js";
 
 const LATENCY_BASELINE_PER_TOOL_MS = 10_000;
 const COST_BASELINE_PER_TOOL_CX100 = 50;
@@ -43,8 +43,6 @@ function makeEvalResult(opts: MakeEvalResultOpts): EvalResult {
   };
 }
 
-/** Lift the (runId, threadId, userId) triple off a TraceSummary —
- *  every automated scorer pulls these together. */
 function fromSummary(summary: TraceSummary): {
   runId: string;
   threadId: string | null;
@@ -56,8 +54,6 @@ function fromSummary(summary: TraceSummary): {
     userId: summary.userId,
   };
 }
-
-// ─── Layer 1: Automated deterministic scorers ────────────────────────
 
 function scoreToolSuccessRate(summary: TraceSummary): EvalResult {
   const total = summary.toolCalls;
@@ -76,8 +72,6 @@ function scoreToolSuccessRate(summary: TraceSummary): EvalResult {
 }
 
 function scoreStepEfficiency(summary: TraceSummary): EvalResult {
-  // No tool calls = simple Q&A, maximally efficient.
-  // With tools: penalize excessive LLM iterations relative to tool calls.
   const score =
     summary.toolCalls === 0
       ? 1.0
@@ -128,14 +122,8 @@ function scoreErrorRecovery(
   runStatus: string,
 ): EvalResult {
   const hadErrors = summary.failedTools > 0;
-  let score: number;
-  if (!hadErrors) {
-    score = 1.0;
-  } else if (runStatus === "completed") {
-    score = 1.0;
-  } else {
-    score = 0;
-  }
+  const recovered = runStatus === "completed";
+  const score = !hadErrors || recovered ? 1.0 : 0;
   return makeEvalResult({
     ...fromSummary(summary),
     evalType: "automated",
@@ -168,8 +156,6 @@ export async function runAutomatedEvals(runId: string): Promise<EvalResult[]> {
 
   return results;
 }
-
-// ─── Layer 2: LLM-as-Judge ───────────────────────────────────────────
 
 function buildConversationTranscript(
   events: Array<{ seq: number; eventData: string }>,
@@ -265,6 +251,7 @@ export async function runLlmJudgeEval(
         tools: [],
         abortSignal: controller.signal,
         maxOutputTokens: 512,
+        reasoningEffort: "none",
         temperature: 0,
       });
 
@@ -307,8 +294,6 @@ export async function runLlmJudgeEval(
     return null;
   }
 }
-
-// ─── Layer 3: Dataset evaluation ─────────────────────────────────────
 
 export async function runDatasetEval(
   datasetId: string,
@@ -412,6 +397,7 @@ async function evaluateTestCase(
         tools: [],
         abortSignal: controller.signal,
         maxOutputTokens: 512,
+        reasoningEffort: "none",
         temperature: 0,
       });
 
@@ -437,13 +423,8 @@ async function evaluateTestCase(
     const normalizedScore =
       max > min ? (parsed.score - min) / (max - min) : parsed.score;
 
-    // Dataset evals use a synthetic runId since there's no real run
     const syntheticRunId = `dataset:${datasetId}:${crypto.randomUUID()}`;
 
-    // Dataset evals are administrative — there's no per-user runId, so
-    // we leave userId null. Per-user reads filter null rows out, which
-    // is the right default; admins can fetch dataset evals via the
-    // unfiltered call path.
     const result = makeEvalResult({
       runId: syntheticRunId,
       threadId: null,
@@ -469,8 +450,6 @@ async function evaluateTestCase(
     return null;
   }
 }
-
-// ─── Orchestrator ────────────────────────────────────────────────────
 
 export async function evaluateRun(
   runId: string,

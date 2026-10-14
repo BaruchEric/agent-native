@@ -1,18 +1,14 @@
 #!/usr/bin/env node
-/**
- * Lazy root template gateway for framework development.
- *
- * This is the repo-root counterpart to `agent-native dev` in generated
- * workspaces: expose one local origin, mount templates at /<template>, and
- * start each template server only when something requests it.
- */
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 import type { Duplex } from "node:stream";
+import { pathToFileURL } from "node:url";
+
 import {
+  attachGatewaySocketErrorSink,
   escapeHtml,
   normalizeOrigin,
   rewriteRedirectLocation,
@@ -37,6 +33,11 @@ interface TemplateApp {
   outputTail?: string;
   ready?: boolean;
   readinessProbe?: Promise<void>;
+  lastActivityAt?: number;
+  lastNon5xxAt?: number;
+  persistent5xxSince?: number;
+  openSockets?: number;
+  evicting?: boolean;
 }
 
 const argv = process.argv.slice(2);
@@ -49,9 +50,13 @@ const DEFAULT_GATEWAY_PORT = 8080;
 const FRAME_PORT = 3334;
 const PROXY_READY_RETRY_DELAY_MS = 250;
 const APP_RESTART_MAX_DELAY_MS = 10_000;
-const DEFAULT_PROXY_RESPONSE_TIMEOUT_MS = 5_000;
+const DEFAULT_PROXY_RESPONSE_TIMEOUT_MS = 15_000;
+const DEFAULT_PROXY_BROWSER_ASSET_RESPONSE_TIMEOUT_MS = 15_000;
 const DEFAULT_PROXY_NON_HTML_RESPONSE_TIMEOUT_MS = 120_000;
 const APP_OUTPUT_TAIL_BYTES = 8_000;
+const EVICT_SWEEP_MS = 30_000;
+const STUCK_APP_RESTART_MS = 300_000;
+const PERSISTENT_5XX_RESTART_MS = 75_000;
 const APP_IFRAME_ALLOW = "camera; microphone; display-capture; fullscreen";
 const POLLING_WATCH_INTERVAL_MS = "1000";
 const DESKTOP_LAZY_DEFAULT_TEMPLATE_IDS = ["assets"];
@@ -135,9 +140,12 @@ Options:
   --desktop                 Also start the clips-desktop tray (Tauri)
   --electron                Also start the Electron desktop shell and frame
   --eager                   Start every exposed template immediately
-  --no-prewarm              Skip background prewarm of non-default templates
-                            (defaults to on in lazy mode)
+  --prewarm                 Background-warm all selected templates for snappy
+                            switching (default: off / truly lazy)
+  --no-prewarm              No-op alias (prewarm is already off by default)
   --prewarm-concurrency=N   Max parallel Vite spawns during prewarm (default 2)
+  --watch-core-dist         Rebuild core dist in the background (normally
+                            unnecessary because monorepo Vite aliases core src)
   --open                    Open the gateway URL in the browser on ready
   --no-open                 (legacy / no-op — auto-open is off by default)
   --no-kill                 Do not kill stale processes on gateway/template ports
@@ -244,10 +252,16 @@ const eager = hasFlag("--eager");
 const dryRun = hasFlag("--dry-run");
 const prewarmEnabled = (() => {
   if (eager) return false;
-  if (hasFlag("--no-prewarm")) return false;
-  const env = process.env.WORKSPACE_NO_PREWARM;
-  if (env === "1" || env === "true") return false;
-  return true;
+  if (hasFlag("--prewarm")) return true;
+  return readBooleanEnv(process.env.WORKSPACE_PREWARM) === true;
+})();
+const DEFAULT_TEMPLATE_IDLE_MS = 1_800_000;
+const templateIdleMs = (() => {
+  const raw = process.env.WORKSPACE_TEMPLATE_IDLE_MS;
+  if (raw === undefined) return DEFAULT_TEMPLATE_IDLE_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_TEMPLATE_IDLE_MS;
+  return Math.floor(parsed);
 })();
 const prewarmConcurrency = (() => {
   const raw =
@@ -279,16 +293,29 @@ const shouldOpen =
   process.env.WORKSPACE_NO_OPEN !== "1" &&
   !isHeadlessEnv;
 const shouldKill = !hasFlag("--no-kill");
+const shouldWatchCoreDist =
+  hasFlag("--watch-core-dist") ||
+  readBooleanEnv(process.env.WORKSPACE_WATCH_CORE_DIST) === true;
 const gatewayHost = process.env.WORKSPACE_HOST || DEFAULT_GATEWAY_HOST;
 const requestedGatewayPort = Number(
   process.env.WORKSPACE_PORT || process.env.PORT || DEFAULT_GATEWAY_PORT,
 );
 const proxyReadyTimeoutMs = Number(
-  process.env.WORKSPACE_PROXY_READY_TIMEOUT_MS ?? 30_000,
+  process.env.WORKSPACE_PROXY_READY_TIMEOUT_MS ?? 90_000,
+);
+const stuckAppRestartMs = Number(
+  process.env.WORKSPACE_STUCK_APP_RESTART_MS ?? STUCK_APP_RESTART_MS,
+);
+const persistent5xxRestartMs = Number(
+  process.env.WORKSPACE_PERSISTENT_5XX_RESTART_MS ?? PERSISTENT_5XX_RESTART_MS,
 );
 const proxyResponseTimeoutMs = Number(
   process.env.WORKSPACE_PROXY_RESPONSE_TIMEOUT_MS ??
     DEFAULT_PROXY_RESPONSE_TIMEOUT_MS,
+);
+const proxyBrowserAssetResponseTimeoutMs = Number(
+  process.env.WORKSPACE_PROXY_BROWSER_ASSET_RESPONSE_TIMEOUT_MS ??
+    DEFAULT_PROXY_BROWSER_ASSET_RESPONSE_TIMEOUT_MS,
 );
 const proxyNonHtmlResponseTimeoutMs = Number(
   process.env.WORKSPACE_PROXY_NON_HTML_RESPONSE_TIMEOUT_MS ??
@@ -304,7 +331,6 @@ const defaultApp =
       ? "dispatch"
       : apps[0].id;
 const backgroundProcesses: ChildProcess[] = [];
-const proxySocketsWithErrorSink = new WeakSet<net.Socket>();
 let shuttingDown = false;
 let gatewayServer: http.Server | undefined;
 
@@ -321,6 +347,7 @@ type PollingFileWatcherMode = "enable" | "disable-explicit" | "disable-default";
 function pollingFileWatcherMode(
   env: NodeJS.ProcessEnv,
   root: string,
+  options: { multiTemplateWatchLoad?: boolean } = {},
 ): PollingFileWatcherMode {
   const explicit =
     readBooleanEnv(env.AGENT_NATIVE_DEV_USE_POLLING) ??
@@ -340,12 +367,15 @@ function pollingFileWatcherMode(
     env.GITPOD_WORKSPACE_ID ||
     env.REMOTE_CONTAINERS ||
     env.DEVCONTAINER ||
-    root.startsWith("/root/app/"),
+    root.startsWith("/root/app/") ||
+    options.multiTemplateWatchLoad,
   );
   return autoEnable ? "enable" : "disable-default";
 }
 
-const pollingMode = pollingFileWatcherMode(process.env, ROOT);
+const pollingMode = pollingFileWatcherMode(process.env, ROOT, {
+  multiTemplateWatchLoad: apps.length > 1 && (eager || prewarmEnabled),
+});
 const usePollingFileWatcher = pollingMode === "enable";
 
 function devWatcherEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -359,10 +389,6 @@ function devWatcherEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     };
   }
   if (pollingMode === "disable-explicit") {
-    // The user explicitly turned polling off. Strip the watcher vars from
-    // the child env so an inherited parent-shell CHOKIDAR_USEPOLLING=1 (or
-    // stale TSC_WATCH* override) can't silently re-enable polling against
-    // the user's explicit wish.
     const {
       CHOKIDAR_USEPOLLING: _polling,
       CHOKIDAR_INTERVAL: _interval,
@@ -372,9 +398,6 @@ function devWatcherEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     } = env;
     return rest;
   }
-  // disable-default: no explicit signal either way. Pass the env through
-  // unchanged so legitimate user overrides like
-  // TSC_WATCHFILE=UseFsEventsWithFallbackDynamicPolling survive.
   return env;
 }
 
@@ -416,10 +439,6 @@ function stripAnsi(value: string): string {
   return value.replace(ANSI_REGEX, "");
 }
 
-// Stable per-name prefix coloring so [tray]/[core]/[dispatch] are easy to scan
-// the same way concurrently colors prefixes in eager mode. Codes are SGR foreground
-// values; the palette skips black/white/red to avoid low contrast and "looks
-// like an error" false signals.
 const PREFIX_PALETTE = [33, 34, 35, 36, 32, 95, 94, 96, 92, 93];
 const prefixColors = new Map<string, number>();
 
@@ -438,22 +457,10 @@ function isChildDevServerUrlLine(line: string): boolean {
   );
 }
 
-// Header of Nitro 3 (beta)'s transient cold-start 503. On the first SSR request,
-// Nitro's dev runner waits ~3.1s for the SSR entry import; if Vite is still
-// optimizing deps it throws `NitroViteError: Vite environment "nitro" is
-// unavailable`, which surfaces via the worker's unhandledRejection trap. It is
-// self-healing \u2014 the next request succeeds \u2014 and in practice is provoked only by
-// our own readiness probes during warm-up. A genuine SSR import failure uses a
-// different message (the actual import error) and the runner's entryError path,
-// so matching this exact signature does not hide real bugs.
 function isNitroUnavailableHeader(line: string): boolean {
   return /environment "[^"]*" is unavailable/.test(stripAnsi(line));
 }
 
-// One line of the transient-503 block (header, its stack frames, or the
-// `{ status: 503 }` wrapper). Only ever applied to a chunk already known to
-// contain the header (see pipeOutput), so the loose `}`/`at node:internal`
-// matchers can't strip unrelated output.
 function isNitroWarmupNoiseLine(line: string): boolean {
   const s = stripAnsi(line).trimEnd();
   return (
@@ -477,9 +484,6 @@ function pipeOutput(
     .filter(Boolean)
     .filter((line) => !isChildDevServerUrlLine(line));
   if (lines.length === 0) return "";
-  // Return the full text for outputTail (failure diagnostics) regardless, but
-  // keep the transient cold-start 503 block off the console while the app is
-  // still warming up — only touching chunks that actually contain its header.
   const output = lines.join("\n") + "\n";
   const displayLines =
     suppressNitroNoise && lines.some(isNitroUnavailableHeader)
@@ -513,6 +517,42 @@ function wantsHtml(req: http.IncomingMessage): boolean {
   const accept = firstHeaderValue(req.headers.accept);
   if (!accept) return false;
   return accept.includes("text/html");
+}
+
+const BROWSER_ASSET_DESTINATIONS = new Set([
+  "audioworklet",
+  "font",
+  "image",
+  "manifest",
+  "paintworklet",
+  "script",
+  "serviceworker",
+  "sharedworker",
+  "style",
+  "track",
+  "video",
+  "worker",
+]);
+
+export function isBrowserAssetDestination(
+  destination: string | string[] | undefined,
+): boolean {
+  const value = Array.isArray(destination) ? destination[0] : destination;
+  return value ? BROWSER_ASSET_DESTINATIONS.has(value.toLowerCase()) : false;
+}
+
+function isBrowserAssetRequest(req: http.IncomingMessage): boolean {
+  if (req.method !== "GET" && req.method !== "HEAD") return false;
+  return isBrowserAssetDestination(req.headers["sec-fetch-dest"]);
+}
+
+export function selectProxyResponseTimeout(
+  request: { html: boolean; browserAsset: boolean },
+  timeouts: { html: number; browserAsset: number; other: number },
+): number {
+  if (request.html) return timeouts.html;
+  if (request.browserAsset) return timeouts.browserAsset;
+  return timeouts.other;
 }
 
 function renderStartingApp(app: TemplateApp): string {
@@ -694,7 +734,7 @@ function probePort(port: number, timeoutMs = 1_000): Promise<boolean> {
   });
 }
 
-function probeHttpReady(
+export function probeHttpReady(
   app: Pick<TemplateApp, "id" | "port">,
   timeoutMs = 1_000,
 ): Promise<boolean> {
@@ -720,11 +760,6 @@ function probeHttpReady(
       },
       (res) => {
         res.resume();
-        // A 5xx here is Nitro's transient cold-start 503 ("Vite environment
-        // ... is unavailable") — the SSR entry is still importing, so the app
-        // is not ready. Only a non-5xx response means it can actually serve;
-        // otherwise we'd flip app.ready and proxy real traffic into a cold
-        // dev server (and the prewarm would "warm" nothing).
         finish((res.statusCode ?? 500) < 500);
       },
     );
@@ -750,11 +785,7 @@ async function waitForHttpReady(
 ): Promise<boolean> {
   let retryDelay = PROXY_READY_RETRY_DELAY_MS;
   while (Date.now() < deadline) {
-    // Nitro's dev SSR runner waits ~3.1s for the entry import before returning
-    // 503, so give each probe long enough to receive that real response rather
-    // than abandoning it at 1s — an abandoned request still completes (and
-    // logs) server-side. Backing off between polls keeps the warm-up quiet.
-    const timeoutMs = Math.min(4_000, Math.max(1, deadline - Date.now()));
+    const timeoutMs = readinessProbeTimeoutMs(deadline, Date.now());
     if (await probeHttpReady(app, timeoutMs)) return true;
     await new Promise((resolve) => setTimeout(resolve, retryDelay));
     retryDelay = Math.min(retryDelay * 2, 2_000);
@@ -762,30 +793,95 @@ async function waitForHttpReady(
   return false;
 }
 
+export function readinessProbeTimeoutMs(deadline: number, now: number): number {
+  return Math.max(1, deadline - now);
+}
+
+export function markAppReady(app: TemplateApp): void {
+  app.ready = true;
+  app.lastNon5xxAt = Date.now();
+  app.persistent5xxSince = undefined;
+  app.restartAttempts = 0;
+}
+
+export function shouldRestartStuckApp(input: {
+  portOpen: boolean;
+  lastNon5xxAt: number;
+  now: number;
+  stuckMs: number;
+}): boolean {
+  if (!input.portOpen) return true;
+  return input.now - input.lastNon5xxAt > input.stuckMs;
+}
+
+export function shouldRestartPersistent5xx(input: {
+  first5xxAt: number;
+  now: number;
+  restartMs: number;
+}): boolean {
+  return input.now - input.first5xxAt > input.restartMs;
+}
+
 function ensureReadinessProbe(app: TemplateApp): void {
   if (app.ready || app.readinessProbe) return;
-  app.readinessProbe = waitForHttpReady(app, Date.now() + proxyReadyTimeoutMs)
-    .then((ready) => {
-      if (ready) {
+  app.readinessProbe = waitForPort(app.port, Date.now() + proxyReadyTimeoutMs)
+    .then((listening) => {
+      if (listening) {
         app.ready = true;
         return;
       }
-      failAppStartupTimeout(app);
+      void failAppStartupTimeout(app);
     })
     .finally(() => {
       app.readinessProbe = undefined;
     });
 }
 
-/**
- * Background-spawn templates other than the default so the first navigation
- * into each one doesn't pay the cold Vite + esbuild prebundle cost. The lazy
- * proxy still handles correctness; this just makes second/third/Nth visits
- * feel instant. Concurrency-limited to keep CPU pressure sane on laptops.
- */
+export function shouldEvict(input: {
+  lastActivityAt: number;
+  openSockets: number;
+  now: number;
+  idleTimeoutMs: number;
+  ready?: boolean;
+}): boolean {
+  if (input.idleTimeoutMs <= 0) return false;
+  if (input.openSockets > 0) return false;
+  if (input.ready === false) return false;
+  return input.now - input.lastActivityAt > input.idleTimeoutMs;
+}
+
+function evictApp(app: TemplateApp): void {
+  process.stderr.write(
+    `${colorPrefix(app.id)} evicting idle app (no activity for ${Math.round(
+      templateIdleMs / 1_000,
+    )}s)\n`,
+  );
+  app.evicting = true;
+  killChildProcessTree(app.process, "SIGTERM");
+}
+
+function sweepIdleApps(): void {
+  if (templateIdleMs <= 0) return;
+  const now = Date.now();
+  for (const app of apps) {
+    if (!app.process || app.process.killed) continue;
+    if (app.restartTimer || app.readinessProbe) continue;
+    if (
+      shouldEvict({
+        lastActivityAt: app.lastActivityAt ?? now,
+        openSockets: app.openSockets ?? 0,
+        now,
+        idleTimeoutMs: templateIdleMs,
+        ready: app.ready ?? false,
+      })
+    ) {
+      evictApp(app);
+    }
+  }
+}
+
 async function prewarmRemainingApps(): Promise<void> {
   const queue = apps
-    .filter((app) => app.id !== defaultApp)
     .filter((app) => !(app.process && !app.process.killed))
     .map((app) => app.id);
 
@@ -847,60 +943,120 @@ function proxyHeaders(
   };
 }
 
+function appDatabaseEnv(app: TemplateApp): NodeJS.ProcessEnv {
+  const appEnvName = app.id.toUpperCase().replace(/-/g, "_");
+  const databaseUrlKey = `${appEnvName}_DATABASE_URL`;
+  if (process.env[databaseUrlKey]) return {};
+
+  return {
+    [databaseUrlKey]: `pglite:${path.join(app.dir, "data", "pglite")}`,
+  };
+}
+
+export function appLocalEnv(
+  app: Pick<TemplateApp, "id" | "dir">,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  const appPrefix = `${app.id.toUpperCase().replace(/-/g, "_")}_`;
+  for (const fileName of [".env", ".env.local"]) {
+    const envPath = path.join(app.dir, fileName);
+    if (!fs.existsSync(envPath)) continue;
+    for (const [key, value] of Object.entries(
+      parseEnv(fs.readFileSync(envPath, "utf8")),
+    )) {
+      if (key.startsWith(appPrefix)) env[key] = value;
+    }
+  }
+  return env;
+}
+
+function appGoogleOAuthEnv(app: TemplateApp): NodeJS.ProcessEnv {
+  const appEnvName = app.id.toUpperCase().replace(/-/g, "_");
+  const clientIdKey = `${appEnvName}_GOOGLE_CLIENT_ID`;
+  const clientSecretKey = `${appEnvName}_GOOGLE_CLIENT_SECRET`;
+  const clientId = process.env[clientIdKey];
+  const clientSecret = process.env[clientSecretKey];
+
+  if (!clientId && !clientSecret) return {};
+  if (!clientId || !clientSecret) {
+    const missingKey = clientId ? clientSecretKey : clientIdKey;
+    console.warn(
+      `[dev-lazy] ${app.id}: ignoring incomplete app-scoped Google OAuth credentials; ${missingKey} is missing.`,
+    );
+    return {};
+  }
+
+  return {
+    GOOGLE_CLIENT_ID: clientId,
+    GOOGLE_CLIENT_SECRET: clientSecret,
+  };
+}
+
 function startApp(app: TemplateApp): void {
   if (app.process && !app.process.killed) return;
   if (app.restartTimer) return;
   app.lastFailure = undefined;
   app.outputTail = undefined;
+  app.evicting = false;
+  app.lastActivityAt = Date.now();
+  app.lastNon5xxAt = Date.now();
+  app.persistent5xxSince = undefined;
+  app.openSockets ??= 0;
 
   const basePath = `/${app.id}`;
-  const child = spawn(
-    "pnpm",
-    [
-      "--dir",
-      app.dir,
-      "exec",
-      "vite",
-      "--host",
-      "127.0.0.1",
-      "--port",
-      String(app.port),
-      "--strictPort",
-    ],
-    {
-      cwd: ROOT,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32",
-      env: devWatcherEnv({
-        ...process.env,
-        // Children write to a pipe (not a TTY), so vite/pnpm/chalk/picocolors
-        // skip colors by default. FORCE_COLOR=1 re-enables them — the parent's
-        // stdout is a TTY, so ANSI codes pass straight through to the user.
-        FORCE_COLOR: "1",
-        APP_NAME: app.id,
-        AGENT_NATIVE_WORKSPACE: "1",
-        AGENT_NATIVE_WORKSPACE_APPS_JSON: workspaceAppsJson(),
-        APP_BASE_PATH: basePath,
-        VITE_AGENT_NATIVE_WORKSPACE: "1",
-        VITE_AGENT_NATIVE_WORKSPACE_APPS_JSON: workspaceAppsJson(),
-        VITE_APP_BASE_PATH: basePath,
-        VITE_WORKSPACE_OAUTH_ORIGIN: workspaceOAuthOrigin(
-          process.env,
-          gatewayUrl,
-        ),
-        VITE_WORKSPACE_GATEWAY_URL: gatewayUrl,
-        PORT: String(app.port),
-        WORKSPACE_GATEWAY_URL: gatewayUrl,
-      }),
-    },
-  );
+  let child: ChildProcess;
+  try {
+    child = spawn(
+      "pnpm",
+      [
+        "--dir",
+        app.dir,
+        "exec",
+        "vite",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        String(app.port),
+        "--strictPort",
+      ],
+      {
+        cwd: ROOT,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: process.platform !== "win32",
+        env: devWatcherEnv({
+          ...process.env,
+          ...appDatabaseEnv(app),
+          ...appLocalEnv(app),
+          ...appGoogleOAuthEnv(app),
+          FORCE_COLOR: "1",
+          APP_NAME: app.id,
+          AGENT_NATIVE_WORKSPACE: "1",
+          AGENT_NATIVE_WORKSPACE_APPS_JSON: workspaceAppsJson(),
+          APP_BASE_PATH: basePath,
+          VITE_AGENT_NATIVE_WORKSPACE: "1",
+          VITE_AGENT_NATIVE_WORKSPACE_APPS_JSON: workspaceAppsJson(),
+          VITE_APP_BASE_PATH: basePath,
+          VITE_WORKSPACE_OAUTH_ORIGIN: workspaceOAuthOrigin(
+            process.env,
+            gatewayUrl,
+          ),
+          VITE_WORKSPACE_GATEWAY_URL: gatewayUrl,
+          PORT: String(app.port),
+          WORKSPACE_GATEWAY_URL: gatewayUrl,
+        }),
+      },
+    );
+  } catch (error) {
+    scheduleAppRestart(app, {
+      code: null,
+      output: app.outputTail ?? "",
+      logMessage: `failed to spawn dev server: ${(error as Error).message}`,
+    });
+    return;
+  }
 
   app.process = child;
   const prefix = colorPrefix(app.id);
-  const stableTimer = setTimeout(() => {
-    app.restartAttempts = 0;
-  }, 5_000);
-  stableTimer.unref();
 
   child.stdout?.on("data", (chunk) => {
     appendAppOutputTail(
@@ -919,12 +1075,25 @@ function startApp(app: TemplateApp): void {
       ),
     );
   });
-  child.on("exit", (code) => {
-    clearTimeout(stableTimer);
+  child.on("error", (error) => {
     app.process = undefined;
     app.ready = false;
     app.readinessProbe = undefined;
-    if (code === 0 || shuttingDown) return;
+    app.evicting = false;
+    if (shuttingDown) return;
+    scheduleAppRestart(app, {
+      code: null,
+      output: app.outputTail ?? "",
+      logMessage: `dev server process error: ${error.message}`,
+    });
+  });
+  child.on("exit", (code) => {
+    const wasEvicting = app.evicting;
+    app.process = undefined;
+    app.ready = false;
+    app.readinessProbe = undefined;
+    app.evicting = false;
+    if (code === 0 || shuttingDown || wasEvicting) return;
     scheduleAppRestart(app, {
       code,
       output: app.outputTail ?? "",
@@ -933,7 +1102,7 @@ function startApp(app: TemplateApp): void {
   });
 }
 
-function scheduleAppRestart(
+export function scheduleAppRestart(
   app: TemplateApp,
   input: { code: number | null; output: string; logMessage: string },
 ): void {
@@ -954,15 +1123,41 @@ function scheduleAppRestart(
     app.restartTimer = undefined;
     startApp(app);
   }, delay);
-  app.restartTimer.unref();
 }
 
-function failAppStartupTimeout(app: TemplateApp): void {
+async function failAppStartupTimeout(app: TemplateApp): Promise<void> {
   if (app.ready || app.restartTimer) return;
   const timeout = formatProxyReadyTimeout(proxyReadyTimeoutMs);
+  const portOpen = await probePort(app.port);
+  const stillAlive = Boolean(app.process && !app.process.killed);
+  if (app.ready || app.restartTimer) return;
+
+  if (
+    portOpen &&
+    stillAlive &&
+    !shouldRestartStuckApp({
+      portOpen,
+      lastNon5xxAt: app.lastNon5xxAt ?? Date.now(),
+      now: Date.now(),
+      stuckMs: stuckAppRestartMs,
+    })
+  ) {
+    process.stderr.write(
+      `${colorPrefix(app.id)} still compiling/optimizing after ${timeout} ` +
+        `but 127.0.0.1:${app.port} is accepting connections; waiting instead ` +
+        `of restarting\n`,
+    );
+    ensureReadinessProbe(app);
+    return;
+  }
+
   const message =
-    `Timed out waiting ${timeout} for /${app.id} to return ` +
-    `an HTTP response on 127.0.0.1:${app.port}.`;
+    portOpen && stillAlive
+      ? `/${app.id} has not returned a healthy response for ` +
+        `${formatProxyReadyTimeout(stuckAppRestartMs)} despite an open port ` +
+        `on 127.0.0.1:${app.port}; treating it as stuck.`
+      : `Timed out waiting ${timeout} for /${app.id} to return ` +
+        `an HTTP response on 127.0.0.1:${app.port}.`;
   const output = [message, app.outputTail?.trim()]
     .filter(Boolean)
     .join("\n\nLast child output:\n");
@@ -973,7 +1168,41 @@ function failAppStartupTimeout(app: TemplateApp): void {
     output,
     logMessage: message,
   });
-  app.process?.kill("SIGTERM");
+  killChildProcessTree(app.process, "SIGTERM");
+}
+
+async function maybeRecoverPersistent5xx(
+  app: TemplateApp,
+  statusCode: number,
+): Promise<void> {
+  if (app.restartTimer) return;
+  const now = Date.now();
+  const first5xxAt = (app.persistent5xxSince ??= now);
+  if (
+    !shouldRestartPersistent5xx({
+      first5xxAt,
+      now,
+      restartMs: persistent5xxRestartMs,
+    })
+  ) {
+    return;
+  }
+  const stillAlive = Boolean(app.process && !app.process.killed);
+  if (!stillAlive) return;
+  if (!(await probePort(app.port))) return;
+  if (app.restartTimer || app.persistent5xxSince !== first5xxAt) return;
+  process.stderr.write(
+    `${colorPrefix(app.id)} stuck serving ${statusCode} continuously for ` +
+      `${formatProxyReadyTimeout(persistent5xxRestartMs)}; restarting ` +
+      `(likely a stranded dev-server runner)\n`,
+  );
+  app.ready = false;
+  killChildProcessTree(app.process, "SIGTERM");
+  scheduleAppRestart(app, {
+    code: null,
+    output: app.outputTail ?? "",
+    logMessage: `stuck serving ${statusCode} responses with no healthy reply`,
+  });
 }
 
 function proxyHttp(
@@ -981,6 +1210,7 @@ function proxyHttp(
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ): void {
+  app.lastActivityAt = Date.now();
   const cold = !app.process || app.process.killed;
   startApp(app);
 
@@ -1008,9 +1238,45 @@ function proxyHttp(
     const headers = proxyHeaders(req, `127.0.0.1:${app.port}`);
     let settled = false;
     let responseTimer: NodeJS.Timeout;
-    const responseTimeoutMs = wantsHtml(req)
-      ? proxyResponseTimeoutMs
-      : proxyNonHtmlResponseTimeoutMs;
+    let bodyTimer: NodeJS.Timeout | undefined;
+    let upstreamResponse: http.IncomingMessage | undefined;
+    let streamSocketReleased = true;
+    const releaseStreamSocket = () => {
+      if (streamSocketReleased) return;
+      streamSocketReleased = true;
+      app.openSockets = Math.max(0, (app.openSockets ?? 1) - 1);
+    };
+    const browserAsset = isBrowserAssetRequest(req);
+    const responseTimeoutMs = selectProxyResponseTimeout(
+      { html: wantsHtml(req), browserAsset },
+      {
+        html: proxyResponseTimeoutMs,
+        browserAsset: proxyBrowserAssetResponseTimeoutMs,
+        other: proxyNonHtmlResponseTimeoutMs,
+      },
+    );
+    const clearBodyTimer = () => {
+      if (bodyTimer) clearTimeout(bodyTimer);
+      bodyTimer = undefined;
+    };
+    const abortUpstream = () => {
+      clearTimeout(responseTimer);
+      clearBodyTimer();
+      upstreamResponse?.destroy();
+      proxyReq.destroy();
+    };
+    const armBodyTimer = () => {
+      if (!wantsHtml(req) && !browserAsset) return;
+      clearBodyTimer();
+      bodyTimer = setTimeout(() => {
+        process.stderr.write(
+          `${colorPrefix(app.id)} response body stalled for ${formatProxyReadyTimeout(responseTimeoutMs)}: ${req.method ?? "GET"} ${req.url ?? "/"}\n`,
+        );
+        upstreamResponse?.destroy();
+        if (!res.destroyed) res.destroy();
+      }, responseTimeoutMs);
+      bodyTimer.unref();
+    };
     const proxyReq = http.request(
       {
         hostname: "127.0.0.1",
@@ -1020,14 +1286,19 @@ function proxyHttp(
         headers,
       },
       (proxyRes) => {
+        upstreamResponse = proxyRes;
         if (settled) {
           proxyRes.resume();
           return;
         }
         settled = true;
         clearTimeout(responseTimer);
-        app.ready = true;
         const statusCode = proxyRes.statusCode ?? 502;
+        if (statusCode < 500) {
+          markAppReady(app);
+        } else {
+          void maybeRecoverPersistent5xx(app, statusCode);
+        }
         const responseHeaders = { ...proxyRes.headers };
         if (statusCode >= 300 && statusCode < 400) {
           const rewritten = rewriteRedirectLocation(
@@ -1036,21 +1307,32 @@ function proxyHttp(
           );
           if (rewritten) responseHeaders.location = rewritten;
         }
+        armBodyTimer();
+        proxyRes.on("data", armBodyTimer);
+        proxyRes.on("data", () => {
+          app.lastActivityAt = Date.now();
+        });
+        proxyRes.once("end", clearBodyTimer);
+        proxyRes.once("close", clearBodyTimer);
         res.writeHead(statusCode, responseHeaders);
+        streamSocketReleased = false;
+        app.openSockets = (app.openSockets ?? 0) + 1;
+        res.once("finish", releaseStreamSocket);
+        res.once("close", releaseStreamSocket);
+        res.once("error", releaseStreamSocket);
         proxyRes.once("error", () => {
+          clearBodyTimer();
           if (!res.destroyed) res.destroy();
         });
         proxyRes.pipe(res);
       },
     );
     proxyReq.once("socket", (socket) => {
-      if (proxySocketsWithErrorSink.has(socket)) return;
-      proxySocketsWithErrorSink.add(socket);
-      socket.on("error", () => {});
+      attachGatewaySocketErrorSink(socket);
     });
-    res.once("error", () => {
-      proxyReq.destroy();
-    });
+    req.once("aborted", abortUpstream);
+    res.once("close", abortUpstream);
+    res.once("error", abortUpstream);
     responseTimer = setTimeout(() => {
       if (settled) return;
       settled = true;
@@ -1094,7 +1376,7 @@ function proxyHttp(
 
   void waitForHttpReady(app, Date.now() + proxyReadyTimeoutMs).then((ready) => {
     if (!ready) {
-      failAppStartupTimeout(app);
+      void failAppStartupTimeout(app);
       if (!res.headersSent) {
         res.writeHead(502, { "content-type": "text/plain" });
         res.end(
@@ -1105,7 +1387,7 @@ function proxyHttp(
       }
       return;
     }
-    app.ready = true;
+    markAppReady(app);
     dispatch();
   });
 }
@@ -1116,15 +1398,35 @@ function proxyUpgrade(
   socket: Duplex,
   head: Buffer,
 ): void {
+  app.lastActivityAt = Date.now();
+  app.openSockets = (app.openSockets ?? 0) + 1;
+  let released = false;
+  const releaseSocket = () => {
+    if (released) return;
+    released = true;
+    app.openSockets = Math.max(0, (app.openSockets ?? 1) - 1);
+    app.lastActivityAt = Date.now();
+  };
+  socket.once("close", releaseSocket);
+  socket.once("error", releaseSocket);
+
   startApp(app);
+  let target: net.Socket | undefined;
+  attachGatewaySocketErrorSink(socket, () => {
+    target?.destroy();
+  });
+  socket.once("close", () => {
+    target?.destroy();
+  });
   void waitForPort(app.port, Date.now() + proxyReadyTimeoutMs).then((ready) => {
     if (!ready) {
-      failAppStartupTimeout(app);
+      void failAppStartupTimeout(app);
       socket.destroy();
       return;
     }
-    app.ready = true;
-    const target = net.connect(app.port, "127.0.0.1", () => {
+    if (socket.destroyed) return;
+    markAppReady(app);
+    const upstream = net.connect(app.port, "127.0.0.1", () => {
       const headers = Object.entries(proxyHeaders(req, `127.0.0.1:${app.port}`))
         .flatMap(([key, value]) =>
           Array.isArray(value)
@@ -1132,14 +1434,20 @@ function proxyUpgrade(
             : [`${key}: ${value ?? ""}`],
         )
         .join("\r\n");
-      target.write(
+      upstream.write(
         `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n${headers}\r\n\r\n`,
       );
-      if (head.length) target.write(head);
-      socket.pipe(target).pipe(socket);
+      if (head.length) upstream.write(head);
+      socket.pipe(upstream).pipe(socket);
     });
+    target = upstream;
 
-    target.on("error", () => socket.destroy());
+    attachGatewaySocketErrorSink(upstream, () => {
+      if (!socket.destroyed) socket.destroy();
+    });
+    upstream.once("close", () => {
+      if (!socket.destroyed) socket.destroy();
+    });
   });
 }
 
@@ -1158,8 +1466,48 @@ function workspaceAppsPayload(): string {
   );
 }
 
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+export function canonicalLoopbackRedirect(
+  requestHost: string | undefined,
+  requestTarget: string | undefined,
+  canonicalGatewayUrl: string,
+  requestOrigin?: string | undefined,
+): string | undefined {
+  if (requestOrigin) return undefined;
+  if (!requestHost || !requestTarget?.startsWith("/")) return undefined;
+
+  try {
+    const canonical = new URL(canonicalGatewayUrl);
+    const requested = new URL(`${canonical.protocol}//${requestHost}`);
+    if (
+      !LOOPBACK_HOSTNAMES.has(canonical.hostname) ||
+      !LOOPBACK_HOSTNAMES.has(requested.hostname) ||
+      canonical.port !== requested.port ||
+      canonical.hostname === requested.hostname
+    ) {
+      return undefined;
+    }
+    return `${canonical.origin}${requestTarget}`;
+  } catch {
+    return undefined;
+  }
+}
+
 function createGateway(): http.Server {
   const server = http.createServer((req, res) => {
+    const canonicalRedirect = canonicalLoopbackRedirect(
+      firstHeaderValue(req.headers.host),
+      req.url,
+      gatewayUrl,
+      firstHeaderValue(req.headers.origin),
+    );
+    if (canonicalRedirect) {
+      res.writeHead(307, { location: canonicalRedirect });
+      res.end();
+      return;
+    }
+
     const parsedUrl = new URL(req.url || "/", "http://templates.local");
     const pathname = parsedUrl.pathname;
 
@@ -1356,122 +1704,141 @@ function shutdown(code = 0): void {
   }, 1_000).unref();
 }
 
-if (dryRun) {
-  console.log(`[dev-lazy] Gateway: ${gatewayUrl}`);
-  console.log(
-    `[dev-lazy] Mode: ${
-      eager ? "eager" : prewarmEnabled ? "lazy+prewarm" : "lazy"
-    }`,
-  );
-  if (usePollingFileWatcher) {
-    console.log(
-      `[dev-lazy] Watch mode: polling (${POLLING_WATCH_INTERVAL_MS}ms)`,
-    );
-  }
-  for (const app of apps) {
-    console.log(`[dev-lazy] ${app.id}: /${app.id} -> 127.0.0.1:${app.port}`);
-  }
-  if (includeDesktop) {
-    console.log("[dev-lazy] tray: clips-desktop dev (Tauri)");
-  }
-  if (includeElectron) {
-    console.log(`[dev-lazy] frame: http://localhost:${FRAME_PORT}`);
-    console.log("[dev-lazy] electron: @agent-native/desktop-app dev");
-  }
-  process.exit(0);
-}
-
-if (includeElectron) {
-  ensureElectronBinary();
-}
-
-if (shouldKill) {
-  const ports = [
-    requestedGatewayPort,
-    ...(includeElectron ? [FRAME_PORT] : []),
-    ...apps.map((app) => app.port),
-  ];
-  for (const port of ports) killPort(port);
-}
-
-console.log("[dev-lazy] Prebuilding @agent-native/core...");
-execSync("pnpm --filter @agent-native/core build", { stdio: "inherit" });
-
-if (usePollingFileWatcher) {
-  console.log(
-    `[dev-lazy] Using polling file watchers (${POLLING_WATCH_INTERVAL_MS}ms) to avoid remote-container inotify limits.`,
-  );
-}
-
-startBackgroundProcess("core", "pnpm", [
-  "--filter",
-  "@agent-native/core",
-  "exec",
-  "tsc",
-  "--watch",
-  "--preserveWatchOutput",
-]);
-
-const server = createGateway();
-gatewayServer = server;
-
-function listen(port: number, attempts = 20): void {
-  server.once("error", (err: NodeJS.ErrnoException) => {
-    if (err.code === "EADDRINUSE" && attempts > 0) {
-      listen(port + 1, attempts - 1);
-      return;
-    }
-    console.error(`[dev-lazy] Could not start gateway: ${err.message}`);
-    shutdown(1);
-  });
-  server.listen(port, gatewayHost, () => {
-    const address = server.address();
-    const actualPort =
-      typeof address === "object" && address ? address.port : port;
-    gatewayUrl = `http://${gatewayHost}:${actualPort}`;
-    console.log(`[dev-lazy] Default: ${gatewayUrl}/${defaultApp}`);
+async function main(): Promise<void> {
+  if (dryRun) {
     console.log(`[dev-lazy] Gateway: ${gatewayUrl}`);
     console.log(
       `[dev-lazy] Mode: ${
         eager ? "eager" : prewarmEnabled ? "lazy+prewarm" : "lazy"
       }`,
     );
+    if (usePollingFileWatcher) {
+      console.log(
+        `[dev-lazy] Watch mode: polling (${POLLING_WATCH_INTERVAL_MS}ms)`,
+      );
+    }
     for (const app of apps) {
       console.log(`[dev-lazy] ${app.id}: /${app.id} -> 127.0.0.1:${app.port}`);
     }
-
-    if (eager) {
-      for (const app of apps) startApp(app);
-    } else if (!includeElectron) {
-      const app = selectedById.get(defaultApp);
-      if (app) startApp(app);
-      if (prewarmEnabled) {
-        void prewarmRemainingApps().catch((err) => {
-          console.error(
-            `[dev-lazy] Prewarm error: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }
-    }
-
     if (includeDesktop) {
-      // Boot the Tauri clips tray after its backend is reachable. The tray's
-      // Google sign-in opens the Clips backend URL directly in the browser.
-      const startClipsTray = () => {
-        if (shuttingDown) return;
-        startBackgroundProcess("tray", "pnpm", [
-          "--filter",
-          "clips-desktop",
-          "dev",
-        ]);
-      };
-      const clipsApp = selectedById.get("clips");
-      if (clipsApp) {
-        startApp(clipsApp);
-        void waitForPort(clipsApp.port, Date.now() + proxyReadyTimeoutMs).then(
-          (ready) => {
+      console.log("[dev-lazy] tray: clips-desktop dev (Tauri)");
+    }
+    if (includeElectron) {
+      console.log(`[dev-lazy] frame: http://localhost:${FRAME_PORT}`);
+      console.log("[dev-lazy] electron: @agent-native/desktop-app dev");
+    }
+    return;
+  }
+
+  if (includeElectron) {
+    ensureElectronBinary();
+  }
+
+  if (shouldKill) {
+    const ports = [
+      requestedGatewayPort,
+      ...(includeElectron ? [FRAME_PORT] : []),
+      ...apps.map((app) => app.port),
+    ];
+    for (const port of ports) killPort(port);
+  }
+
+  console.log("[dev-lazy] Prebuilding workspace packages...");
+  execSync("node scripts/prebuild-workspace-packages.ts dev", {
+    stdio: "inherit",
+  });
+
+  if (usePollingFileWatcher) {
+    console.log(
+      `[dev-lazy] Using polling file watchers (${POLLING_WATCH_INTERVAL_MS}ms) to avoid file watcher descriptor limits.`,
+    );
+  }
+
+  if (shouldWatchCoreDist) {
+    startBackgroundProcess("core", "pnpm", [
+      "--filter",
+      "@agent-native/core",
+      "exec",
+      "tsc",
+      "--watch",
+      "--preserveWatchOutput",
+      "--noCheck",
+      "--declaration",
+      "false",
+      "--declarationMap",
+      "false",
+      "--sourceMap",
+      "false",
+      "--inlineSources",
+      "false",
+    ]);
+  }
+
+  const server = createGateway();
+  gatewayServer = server;
+
+  if (templateIdleMs > 0) {
+    const evictSweep = setInterval(sweepIdleApps, EVICT_SWEEP_MS);
+    evictSweep.unref();
+  }
+
+  function listen(port: number, attempts = 20): void {
+    server.once("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EADDRINUSE" && attempts > 0) {
+        listen(port + 1, attempts - 1);
+        return;
+      }
+      console.error(`[dev-lazy] Could not start gateway: ${err.message}`);
+      shutdown(1);
+    });
+    server.listen(port, gatewayHost, () => {
+      const address = server.address();
+      const actualPort =
+        typeof address === "object" && address ? address.port : port;
+      gatewayUrl = `http://${gatewayHost}:${actualPort}`;
+      console.log(`[dev-lazy] Default: ${gatewayUrl}/${defaultApp}`);
+      console.log(`[dev-lazy] Gateway: ${gatewayUrl}`);
+      console.log(
+        `[dev-lazy] Mode: ${
+          eager ? "eager" : prewarmEnabled ? "lazy+prewarm" : "lazy"
+        }`,
+      );
+      for (const app of apps) {
+        console.log(
+          `[dev-lazy] ${app.id}: /${app.id} -> 127.0.0.1:${app.port}`,
+        );
+      }
+
+      if (eager) {
+        for (const app of apps) startApp(app);
+      } else if (!includeElectron) {
+        if (prewarmEnabled) {
+          void prewarmRemainingApps().catch((err) => {
+            console.error(
+              `[dev-lazy] Prewarm error: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          });
+        }
+      }
+
+      if (includeDesktop) {
+        const startClipsTray = () => {
+          if (shuttingDown) return;
+          startBackgroundProcess("tray", "pnpm", [
+            "--filter",
+            "clips-desktop",
+            "dev",
+          ]);
+        };
+        const clipsApp = selectedById.get("clips");
+        if (clipsApp) {
+          startApp(clipsApp);
+          void waitForPort(
+            clipsApp.port,
+            Date.now() + proxyReadyTimeoutMs,
+          ).then((ready) => {
             if (ready) {
               clipsApp.ready = true;
             } else {
@@ -1480,38 +1847,49 @@ function listen(port: number, attempts = 20): void {
               );
             }
             startClipsTray();
-          },
-        );
-      } else {
-        console.warn(
-          "[dev-lazy] --desktop starts the Clips tray, but the clips template is not selected.",
-        );
-        startClipsTray();
+          });
+        } else {
+          console.warn(
+            "[dev-lazy] --desktop starts the Clips tray, but the clips template is not selected.",
+          );
+          startClipsTray();
+        }
       }
-    }
 
-    if (includeElectron) {
-      const env = electronLazyEnv();
-      startBackgroundProcess(
-        "frame",
-        "pnpm",
-        ["--filter", "@agent-native/frame", "dev"],
-        env,
-      );
-      startBackgroundProcess(
-        "electron",
-        "pnpm",
-        ["--filter", "@agent-native/desktop-app", "dev"],
-        env,
-      );
-    }
+      if (includeElectron) {
+        const env = electronLazyEnv();
+        startBackgroundProcess(
+          "frame",
+          "pnpm",
+          ["--filter", "@agent-native/frame", "dev"],
+          env,
+        );
+        startBackgroundProcess(
+          "electron",
+          "pnpm",
+          ["--filter", "@agent-native/desktop-app", "dev"],
+          env,
+        );
+      }
 
-    openBrowser(`${gatewayUrl}/${defaultApp}`);
+      openBrowser(`${gatewayUrl}/${defaultApp}`);
+    });
+  }
+
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.once(sig, () => shutdown(sig === "SIGINT" ? 0 : 1));
+  }
+
+  listen(requestedGatewayPort);
+}
+
+const isDirectRun =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (isDirectRun) {
+  void main().catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
   });
 }
-
-for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-  process.once(sig, () => shutdown(sig === "SIGINT" ? 0 : 1));
-}
-
-listen(requestedGatewayPort);

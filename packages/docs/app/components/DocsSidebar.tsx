@@ -1,84 +1,35 @@
+import { useLocale, useT } from "@agent-native/core/client/i18n";
 import { IconChevronRight } from "@tabler/icons-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation } from "react-router";
-import { NAV_SECTIONS, type NavItem } from "./docsNavItems";
 
-const ALWAYS_OPEN_SECTION_INDEX = 0;
-
-function normalizePath(pathname: string) {
-  return pathname.length > 1 ? pathname.replace(/\/+$/, "") : pathname;
-}
-
-function isItemActive(itemPath: string, pathname: string) {
-  return normalizePath(pathname) === itemPath;
-}
-
-function sectionContainsActive(
-  section: (typeof NAV_SECTIONS)[number],
-  pathname: string,
-) {
-  return section.items.some(
-    (item) =>
-      (item.to ? isItemActive(item.to, pathname) : false) ||
-      item.children?.some((child) =>
-        child.to ? isItemActive(child.to, pathname) : false,
-      ),
-  );
-}
-
-// A nav item with children and no `to` is a chevron-only group header.
-function isGroupItem(item: NavItem) {
-  return !item.to && Boolean(item.children?.length);
-}
-
-function groupClipId(label: string) {
-  return `docs-sidebar-group-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
-}
-
-// The label of the group whose child matches the active route, if any — used
-// to auto-open that group (mirrors getActiveSectionTitle for sections).
-function getActiveGroupLabel(pathname: string) {
-  for (const section of NAV_SECTIONS) {
-    for (const item of section.items) {
-      if (
-        isGroupItem(item) &&
-        item.children?.some((child) =>
-          child.to ? isItemActive(child.to, pathname) : false,
-        )
-      ) {
-        return item.label;
-      }
-    }
-  }
-  return null;
-}
-
-function getActiveSectionTitle(pathname: string) {
-  const activeSectionIndex = NAV_SECTIONS.findIndex((section) =>
-    sectionContainsActive(section, pathname),
-  );
-
-  if (activeSectionIndex <= ALWAYS_OPEN_SECTION_INDEX) {
-    return null;
-  }
-
-  return NAV_SECTIONS[activeSectionIndex]?.title ?? null;
-}
+import { getDocsNavSections } from "./docsNavItems";
+import {
+  ALWAYS_OPEN_SECTION_INDEX,
+  docsNavGroupClipId,
+  getActiveDocsNavGroupId,
+  getActiveDocsNavSectionId,
+  isDocsNavGroupItem,
+  isDocsNavItemActive,
+} from "./docsNavState";
 
 export default function DocsSidebar() {
   const location = useLocation();
+  const { locale } = useLocale();
+  const t = useT();
+  const navSections = useMemo(() => getDocsNavSections(locale, t), [locale, t]);
   const navRef = useRef<HTMLElement>(null);
-  const [openSectionTitle, setOpenSectionTitle] = useState<string | null>(() =>
-    getActiveSectionTitle(location.pathname),
+  const [openSectionId, setOpenSectionId] = useState<string | null>(() =>
+    getActiveDocsNavSectionId(navSections, location.pathname),
   );
-  const [openGroupLabel, setOpenGroupLabel] = useState<string | null>(() =>
-    getActiveGroupLabel(location.pathname),
+  const [openGroupId, setOpenGroupId] = useState<string | null>(() =>
+    getActiveDocsNavGroupId(navSections, location.pathname),
   );
 
   useEffect(() => {
-    setOpenSectionTitle(getActiveSectionTitle(location.pathname));
-    setOpenGroupLabel(getActiveGroupLabel(location.pathname));
-  }, [location.pathname]);
+    setOpenSectionId(getActiveDocsNavSectionId(navSections, location.pathname));
+    setOpenGroupId(getActiveDocsNavGroupId(navSections, location.pathname));
+  }, [location.pathname, navSections]);
 
   useEffect(() => {
     const nav = navRef.current;
@@ -113,21 +64,21 @@ export default function DocsSidebar() {
     });
 
     return () => window.cancelAnimationFrame(frame);
-  }, [location.pathname, openSectionTitle]);
+  }, [location.pathname, openSectionId]);
 
   return (
     <aside className="hidden w-[228px] shrink-0 lg:block">
       <nav
         ref={navRef}
-        className="docs-sidebar-nav sticky top-[65px] max-h-[calc(100vh-65px)] overflow-y-auto pb-8 pt-8 pr-4"
+        className="docs-sidebar-nav sticky top-[65px] max-h-[calc(100vh-65px)] overflow-y-auto pb-8 pt-8 pe-4"
       >
-        {NAV_SECTIONS.map((section, index) => {
+        {navSections.map((section, index) => {
           const isAlwaysOpen = index === ALWAYS_OPEN_SECTION_INDEX;
-          const isOpen = isAlwaysOpen || openSectionTitle === section.title;
+          const isOpen = isAlwaysOpen || openSectionId === section.id;
           const sectionId = `docs-sidebar-section-${index}`;
 
           return (
-            <section key={section.title} className="docs-sidebar-section">
+            <section key={section.id} className="docs-sidebar-section">
               {isAlwaysOpen ? (
                 <p className="docs-sidebar-section-label">{section.title}</p>
               ) : (
@@ -137,8 +88,8 @@ export default function DocsSidebar() {
                   aria-expanded={isOpen}
                   aria-controls={sectionId}
                   onClick={() =>
-                    setOpenSectionTitle((current) =>
-                      current === section.title ? null : section.title,
+                    setOpenSectionId((current) =>
+                      current === section.id ? null : section.id,
                     )
                   }
                 >
@@ -146,7 +97,7 @@ export default function DocsSidebar() {
                   <IconChevronRight
                     size={16}
                     stroke={1.75}
-                    className={`docs-sidebar-chevron${isOpen ? " is-open" : ""}`}
+                    className={`docs-sidebar-chevron rtl:-scale-x-100${isOpen ? " is-open" : ""}`}
                     aria-hidden="true"
                   />
                 </button>
@@ -161,21 +112,17 @@ export default function DocsSidebar() {
               >
                 <ul className="docs-sidebar-section-items">
                   {section.items.map((item) => {
-                    const isGroup = isGroupItem(item);
+                    const isGroup = isDocsNavGroupItem(item);
                     const active = item.to
-                      ? isItemActive(item.to, location.pathname)
+                      ? isDocsNavItemActive(item.to, location.pathname)
                       : false;
-                    // Groups expand/collapse; non-group children (if any ever
-                    // exist) always render open.
-                    const groupOpen = isGroup
-                      ? openGroupLabel === item.label
-                      : true;
+                    const groupOpen = isGroup ? openGroupId === item.id : true;
                     const clipId = isGroup
-                      ? groupClipId(item.label)
+                      ? docsNavGroupClipId(item)
                       : undefined;
                     const childrenTabbable = isOpen && groupOpen;
                     return (
-                      <li key={item.label}>
+                      <li key={item.id}>
                         {isGroup ? (
                           <button
                             type="button"
@@ -184,25 +131,35 @@ export default function DocsSidebar() {
                             aria-controls={clipId}
                             tabIndex={isOpen ? undefined : -1}
                             onClick={() =>
-                              setOpenGroupLabel((current) =>
-                                current === item.label ? null : item.label,
+                              setOpenGroupId((current) =>
+                                current === item.id ? null : item.id,
                               )
+                            }
+                            style={
+                              item.draft
+                                ? { color: "var(--approaches-warn)" }
+                                : undefined
                             }
                           >
                             <span>{item.label}</span>
                             <IconChevronRight
                               size={16}
                               stroke={1.75}
-                              className={`docs-sidebar-chevron${groupOpen ? " is-open" : ""}`}
+                              className={`docs-sidebar-chevron rtl:-scale-x-100${groupOpen ? " is-open" : ""}`}
                               aria-hidden="true"
                             />
                           </button>
                         ) : (
                           <Link
-                            data-an-prefetch={isOpen ? "render" : undefined}
+                            data-an-prefetch={isOpen ? "viewport" : undefined}
                             to={item.to!}
                             className={`sidebar-link${active ? " is-active" : ""}`}
                             tabIndex={isOpen ? undefined : -1}
+                            style={
+                              item.draft
+                                ? { color: "var(--approaches-warn)" }
+                                : undefined
+                            }
                           >
                             {item.label}
                           </Link>
@@ -218,18 +175,28 @@ export default function DocsSidebar() {
                             <ul className="docs-sidebar-subitems">
                               {item.children.map((child) => {
                                 const childActive = child.to
-                                  ? isItemActive(child.to, location.pathname)
+                                  ? isDocsNavItemActive(
+                                      child.to,
+                                      location.pathname,
+                                    )
                                   : false;
                                 return (
-                                  <li key={child.to ?? child.label}>
+                                  <li key={child.id}>
                                     <Link
                                       data-an-prefetch={
-                                        childrenTabbable ? "render" : undefined
+                                        childrenTabbable
+                                          ? "viewport"
+                                          : undefined
                                       }
                                       to={child.to!}
                                       className={`sidebar-link sidebar-sublink${childActive ? " is-active" : ""}`}
                                       tabIndex={
                                         childrenTabbable ? undefined : -1
+                                      }
+                                      style={
+                                        child.draft
+                                          ? { color: "var(--approaches-warn)" }
+                                          : undefined
                                       }
                                     >
                                       {child.label}

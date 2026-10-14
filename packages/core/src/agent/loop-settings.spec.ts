@@ -1,7 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// In-memory settings store keyed by the helper + scope id, so we can assert
-// org/user isolation without a real DB.
 const orgStore = new Map<string, Record<string, unknown>>();
 const userStore = new Map<string, Record<string, unknown>>();
 
@@ -37,7 +35,6 @@ vi.mock("../settings/index.js", () => ({
   ),
 }));
 
-// Role lookup for canUpdate; tests set the row to return.
 let roleRows: Array<{ role: string }> = [];
 let roleQueryThrows = false;
 const execute = vi.fn(async (_q: { sql: string; args: unknown[] }) => {
@@ -47,7 +44,6 @@ const execute = vi.fn(async (_q: { sql: string; args: unknown[] }) => {
 
 vi.mock("../db/client.js", () => ({
   getDbExec: () => ({ execute }),
-  isPostgres: () => false,
 }));
 
 const {
@@ -62,6 +58,12 @@ const {
   writeAgentLoopSettings,
   resetAgentLoopSettings,
   canUpdateAgentLoopSettings,
+  DEFAULT_AGENT_MAX_RUN_INPUT_TOKENS,
+  MIN_AGENT_MAX_RUN_INPUT_TOKENS,
+  MAX_AGENT_MAX_RUN_INPUT_TOKENS,
+  normalizeMaxRunInputTokens,
+  validateMaxRunInputTokensInput,
+  getDefaultMaxRunInputTokens,
 } = await import("./loop-settings.js");
 
 beforeEach(() => {
@@ -197,7 +199,6 @@ describe("readAgentLoopSettings scope resolution", () => {
     vi.stubEnv("AGENT_MAX_ITERATIONS", "12");
     orgStore.set(orgK("org1", AGENT_LOOP_SETTINGS_KEY), { unrelated: true });
     const s = await readAgentLoopSettings({ orgId: "org1" });
-    // No stored maxIterations -> defaultMaxIterations and env source.
     expect(s.maxIterations).toBe(12);
     expect(s.defaultMaxIterations).toBe(12);
     expect(s.source).toBe("env");
@@ -205,13 +206,11 @@ describe("readAgentLoopSettings scope resolution", () => {
   });
 
   it("keeps source=scope (not env) when a row stores maxIterations even with the env set", async () => {
-    // The stored value wins; source must reflect where it came from, not env.
     vi.stubEnv("AGENT_MAX_ITERATIONS", "12");
     orgStore.set(orgK("org1", AGENT_LOOP_SETTINGS_KEY), { maxIterations: 42 });
     const s = await readAgentLoopSettings({ orgId: "org1" });
     expect(s.maxIterations).toBe(42);
     expect(s.source).toBe("org");
-    // The env still informs the surfaced default even though it is not used.
     expect(s.defaultMaxIterations).toBe(12);
   });
 });
@@ -311,5 +310,47 @@ describe("canUpdateAgentLoopSettings", () => {
   it("denies (fails closed) when the role query throws", async () => {
     roleQueryThrows = true;
     expect(await canUpdateAgentLoopSettings("a@b.com", "org1")).toBe(false);
+  });
+});
+
+describe("maxRunInputTokens — the per-turn spend ceiling", () => {
+  it("clamps out-of-range values and passes valid ones through", () => {
+    expect(normalizeMaxRunInputTokens(1)).toBe(MIN_AGENT_MAX_RUN_INPUT_TOKENS);
+    expect(normalizeMaxRunInputTokens(1e12)).toBe(
+      MAX_AGENT_MAX_RUN_INPUT_TOKENS,
+    );
+    expect(normalizeMaxRunInputTokens(500_000)).toBe(500_000);
+    expect(normalizeMaxRunInputTokens(undefined)).toBe(
+      DEFAULT_AGENT_MAX_RUN_INPUT_TOKENS,
+    );
+  });
+
+  it("rejects non-integer and out-of-range input", () => {
+    expect(validateMaxRunInputTokensInput("nope").ok).toBe(false);
+    expect(validateMaxRunInputTokensInput(1).ok).toBe(false);
+    expect(validateMaxRunInputTokensInput(500_000)).toEqual({
+      ok: true,
+      value: 500_000,
+    });
+  });
+
+  it("reads an env override", () => {
+    vi.stubEnv("AGENT_MAX_RUN_INPUT_TOKENS", "750000");
+    expect(getDefaultMaxRunInputTokens()).toBe(750_000);
+  });
+
+  it("round-trips through org settings alongside maxIterations", async () => {
+    const ctx = { orgId: "org1", userEmail: "a@b.com" };
+    await writeAgentLoopSettings(ctx, 50, 500_000);
+    const settings = await readAgentLoopSettings(ctx);
+    expect(settings.maxIterations).toBe(50);
+    expect(settings.maxRunInputTokens).toBe(500_000);
+  });
+
+  it("falls back to the default when only maxIterations was stored", async () => {
+    const ctx = { orgId: "org1", userEmail: "a@b.com" };
+    await writeAgentLoopSettings(ctx, 50);
+    const settings = await readAgentLoopSettings(ctx);
+    expect(settings.maxRunInputTokens).toBe(DEFAULT_AGENT_MAX_RUN_INPUT_TOKENS);
   });
 });

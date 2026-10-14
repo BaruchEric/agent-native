@@ -1,5 +1,6 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
+
 import { listBookings } from "../server/bookings-repo.js";
 import { currentUserEmail } from "./_helpers.js";
 

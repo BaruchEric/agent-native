@@ -1,10 +1,23 @@
+import { sendToAgentChat } from "@agent-native/core/client/agent-chat";
+import { appBasePath } from "@agent-native/core/client/api-path";
+import { useT } from "@agent-native/core/client/i18n";
+import { IconLoader2, IconX } from "@tabler/icons-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IconLoader2, IconX } from "@tabler/icons-react";
-import { appBasePath, sendToAgentChat } from "@agent-native/core/client";
-import { toast } from "@/hooks/use-toast";
+import { toast } from "sonner";
+
+import { UploadStorageGate } from "@/components/editor/UploadStorageGate";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { useSlideFileStorageStatus } from "@/hooks/use-slide-file-storage-status";
+import {
+  canInlineImageFile,
+  buildImageDropAgentPayload,
+  isMissingUploadProviderError,
+  readFileAsDataUrl,
+  type HostedImageUploadResult,
+} from "@/lib/image-drop-to-agent";
+import { parseUploadResponse } from "@/lib/upload-response";
 
 const POPOVER_WIDTH = 360;
 const POPOVER_MARGIN = 12;
@@ -12,27 +25,11 @@ const POPOVER_MARGIN = 12;
 interface ImageDropPromptPopoverProps {
   open: boolean;
   file: File | null;
-  /** Drop position in viewport coordinates. */
   position: { x: number; y: number } | null;
-  /** Optional deck/slide context to include in the agent prompt. */
   contextHint?: string;
   onClose: () => void;
 }
 
-/**
- * Popover shown after a user drops an image somewhere on the slides editor
- * that doesn't have a clear target (i.e. not on an image placeholder or
- * existing `<img>`). The popover previews the image, lets the user describe
- * what to do with it, and hands the task off to the agent chat with the image
- * uploaded to Builder.io as a reference URL.
- *
- * Why this exists: dropping image files onto an unclear target previously did
- * one of two unhelpful things — opened the file in a new browser tab (when the
- * drop landed outside the slide canvas) or silently inserted the image into
- * the first placeholder (when the user wanted something else). This popover
- * makes the intent explicit and routes the work through the agent so the user
- * can phrase the ask in plain language.
- */
 export default function ImageDropPromptPopover({
   open,
   file,
@@ -40,8 +37,13 @@ export default function ImageDropPromptPopover({
   contextHint,
   onClose,
 }: ImageDropPromptPopoverProps) {
+  const t = useT();
+  const storageQuery = useSlideFileStorageStatus(open);
+  const fileStorageConfigured =
+    storageQuery.data?.configured === true && !storageQuery.isError;
   const [prompt, setPrompt] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [storagePromptOpen, setStoragePromptOpen] = useState(false);
   const panelRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -83,7 +85,6 @@ export default function ImageDropPromptPopover({
     };
   }, [open, onClose]);
 
-  // Position relative to drop point, clamped within the viewport.
   const computedPosition = useMemo(() => {
     if (!position) {
       return { top: "50%", left: "50%", transform: "translate(-50%, -50%)" };
@@ -91,13 +92,12 @@ export default function ImageDropPromptPopover({
     const vw = typeof window !== "undefined" ? window.innerWidth : 1024;
     const vh = typeof window !== "undefined" ? window.innerHeight : 768;
     const width = POPOVER_WIDTH;
-    const height = 320;
+    const height = 460;
     let left = position.x - width / 2;
     let top = position.y + POPOVER_MARGIN;
     if (left < POPOVER_MARGIN) left = POPOVER_MARGIN;
     if (left + width > vw - POPOVER_MARGIN) left = vw - width - POPOVER_MARGIN;
     if (top + height > vh - POPOVER_MARGIN) {
-      // Flip above the drop point if there isn't room below.
       top = Math.max(POPOVER_MARGIN, position.y - height - POPOVER_MARGIN);
     }
     return { top: `${top}px`, left: `${left}px`, transform: "none" };
@@ -107,61 +107,75 @@ export default function ImageDropPromptPopover({
 
   const handleSubmit = async () => {
     if (!file) return;
+    if (!fileStorageConfigured) {
+      setStoragePromptOpen(true);
+      return;
+    }
     setUploading(true);
     try {
       const form = new FormData();
       form.append("file", file);
-      // Use the slides assets endpoint (which routes through the framework's
-      // uploadFile() provider chain first, then falls back to local disk in
-      // dev). Goes via Builder.io when configured; works without it in dev.
       const res = await fetch(`${appBasePath()}/api/assets/upload`, {
         method: "POST",
         body: form,
       });
-      const data = (await res.json().catch(() => null)) as {
+      const data = await parseUploadResponse<{
         url?: string;
         error?: string;
-      } | null;
-      if (!res.ok || !data?.url) {
-        throw new Error(
-          data?.error ||
-            "Image upload failed. Connect or reconnect Builder.io in Settings → File uploads, or register a custom provider via registerFileUploadProvider().",
-        );
+      }>(res, t("raw.imageUploadGenericError"));
+      const upload: HostedImageUploadResult = {
+        ok: res.ok && !!data.url,
+        status: res.status,
+        url: data.url,
+        error: data.error,
+      };
+
+      const dataUrl = canInlineImageFile(file)
+        ? await readFileAsDataUrl(file)
+        : undefined;
+
+      if (
+        !upload.ok &&
+        isMissingUploadProviderError(upload.status, upload.error)
+      ) {
+        await storageQuery.refetch();
+        setStoragePromptOpen(true);
+        return;
       }
 
-      const userIntent = prompt.trim();
-      const intentLine =
-        userIntent.length > 0
-          ? userIntent
-          : "Use this image on the current slide.";
-      const lines = [intentLine];
-      if (contextHint && contextHint.trim().length > 0) {
-        lines.push(contextHint.trim());
-      }
-      lines.push(
-        `Image URL (already uploaded): ${data.url}`,
-        `Filename: ${file.name}`,
-      );
-
-      sendToAgentChat({
-        message: lines.join("\n\n"),
-        submit: true,
-        referenceImagePaths: [data.url],
+      const payload = buildImageDropAgentPayload({
+        intent: prompt,
+        contextHint,
+        filename: file.name,
+        upload,
+        dataUrl,
       });
 
+      if (payload.kind === "hosted") {
+        sendToAgentChat({
+          message: payload.message,
+          context: payload.context,
+          submit: true,
+          referenceImagePaths: payload.referenceImagePaths,
+          images: payload.images,
+        });
+      } else {
+        sendToAgentChat({
+          message: payload.message,
+          context: payload.context,
+          submit: true,
+          images: payload.images,
+        });
+      }
+
       onClose();
-      toast({
-        title: "Sent to agent",
+      toast.success(t("raw.sentToAgent"), {
         description: file.name,
       });
     } catch (err) {
-      toast({
-        title: "Image upload failed",
+      toast.error(t("raw.imageUploadFailed"), {
         description:
-          err instanceof Error
-            ? err.message
-            : "Something went wrong uploading this image.",
-        variant: "destructive",
+          err instanceof Error ? err.message : t("raw.imageUploadGenericError"),
       });
     } finally {
       setUploading(false);
@@ -172,13 +186,13 @@ export default function ImageDropPromptPopover({
     <div
       ref={panelRef}
       role="dialog"
-      aria-label="What should we do with this image?"
+      aria-label={t("raw.imagePromptTitle")}
       className="fixed z-[210] rounded-xl border border-border bg-popover shadow-2xl shadow-black/60"
       style={{ width: POPOVER_WIDTH, ...computedPosition }}
     >
       <div className="flex items-start justify-between gap-2 px-3.5 pt-3 pb-2">
         <span className="text-sm font-medium text-foreground/90">
-          What should we do with this image?
+          {t("raw.imagePromptTitle")}
         </span>
         <button
           type="button"
@@ -219,7 +233,7 @@ export default function ImageDropPromptPopover({
               if (!uploading) void handleSubmit();
             }
           }}
-          placeholder="e.g. Use as the title-slide hero. Or: replace the headshot on slide 3."
+          placeholder={t("raw.imagePromptPlaceholder")}
           rows={3}
           disabled={uploading}
           className="resize-none text-sm"
@@ -243,14 +257,21 @@ export default function ImageDropPromptPopover({
             {uploading ? (
               <span className="inline-flex items-center gap-1.5">
                 <IconLoader2 className="h-3.5 w-3.5 animate-spin" />
-                Uploading…
+                {t("raw.uploading")}
               </span>
             ) : (
-              "Send to agent"
+              t("raw.sendToAgent")
             )}
           </Button>
         </div>
       </div>
+      <UploadStorageGate
+        configured={fileStorageConfigured}
+        unavailable={!storageQuery.isSuccess}
+        open={storagePromptOpen}
+        onOpenChange={setStoragePromptOpen}
+        onRetry={() => void storageQuery.refetch()}
+      />
     </div>,
     document.body,
   );

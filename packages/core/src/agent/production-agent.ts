@@ -1,136 +1,577 @@
+import { createHash, randomUUID } from "node:crypto";
+
+import {
+  MAX_AGENT_REQUEST_ATTACHMENT_DATA_CHARS,
+  MAX_AGENT_REQUEST_ATTACHMENTS,
+  type AgentSuggestion,
+} from "@agent-native/agentkit/protocol";
+import Ajv, { type ErrorObject, type ValidateFunction } from "ajv";
+import Ajv2020 from "ajv/dist/2020.js";
 import {
   defineEventHandler,
+  getHeader,
   setResponseHeader,
   setResponseStatus,
   getMethod,
 } from "h3";
-import Ajv, { type ValidateFunction } from "ajv";
-import {
-  isDeployCredentialFallbackAllowed,
-  readDeployCredentialEnv,
-} from "../server/credential-provider.js";
 import type { EventHandler as H3EventHandler } from "h3";
-import type {
-  ActionTool,
-  AgentNativeJsonSchema,
-  AgentChatAttachment,
-  AgentChatRequest,
-  AgentChatEvent,
-  AgentChatReference,
-  AgentChatStructuredMessage,
-} from "./types.js";
-import type {
-  AgentEngine,
-  EngineTool,
-  EngineMessage,
-  EngineContentPart,
-  EngineEvent,
-  EngineToolResultPart,
-} from "./engine/types.js";
-import { EngineError } from "./engine/types.js";
-import { resolveMaxOutputTokensForEngine } from "./engine/output-tokens.js";
+
+import "../authorization/check-action.js";
+import { parseA2AAgentActivityPart } from "../a2a/activity.js";
+import type { A2AConnectionRequestMetadata, Task } from "../a2a/types.js";
 import {
-  backfillEngineMessagesToolResults,
-  stringifyToolUseInputForGateway,
-  unmatchedToolResultReplayText,
-} from "./engine/translate-anthropic.js";
+  actionCallEmitsChange,
+  actionCallIsReadOnly,
+  actionChangeResource,
+} from "../action-call-classification.js";
 import {
-  resolveEngine,
-  registerBuiltinEngines,
-  getStoredModelForEngine,
-  normalizeModelForEngine,
-} from "./engine/index.js";
+  ACTION_CHAT_UI_RECORD_CHANGE_RENDERER,
+  normalizeActionChangeResult,
+} from "../action-ui.js";
 import {
-  LLM_MISSING_CREDENTIALS_ERROR_CODE,
-  LLM_MISSING_CREDENTIALS_MESSAGE,
-  userFacingLlmCredentialError,
-} from "./engine/credential-errors.js";
-import { PROVIDER_TO_ENV } from "./engine/provider-env-vars.js";
+  AgentConnectionRequiredError,
+  describeToolParameterSignature,
+  isActionContractError,
+  runActionWithExecutionOutcome,
+  isActionHiddenFromEveryAgentSurface,
+  isAgentActionStopError,
+  isAgentConnectionRequiredError,
+  type ActionAutomationContext,
+  type ActionCaller,
+  type WriteReceipt,
+  stripUnsupportedSchemaKeywords,
+} from "../action.js";
+import { getAppConfig } from "../app-config/index.js";
+import {
+  MAX_BACKGROUND_RUN_CONTINUATIONS,
+  MAX_CONSECUTIVE_NO_PROGRESS_CONTINUATIONS,
+  MAX_TURN_WALL_CLOCK_MS,
+} from "../app-config/run-lifecycle-invariants.js";
 import { readAppState } from "../application-state/script-helpers.js";
-import { isDemoModeEnabled } from "../demo/config.js";
-import { redactDemoData, redactDemoString } from "../demo/redact.js";
 import {
-  redactSensitiveFields,
-  sanitizeToolErrorText,
-  sanitizeToolErrorValue,
-} from "./tool-error-redaction.js";
-import {
-  startRun,
-  subscribeToRun,
-  getActiveRunForThread,
-  getActiveRunForThreadAsync,
-  getRun,
-  abortRun,
-  tryClaimRunSlot,
-} from "./run-manager.js";
-import type { ActiveRun } from "./run-manager.js";
-import { readBody } from "../server/h3-helpers.js";
+  detectArtifactReceipts,
+  type ArtifactReceipt,
+} from "../artifacts/detect.js";
 import { isReadOnlyShellCommand } from "../coding-tools/index.js";
+import type { AgentNativeHarnessSetting } from "../config.js";
 import {
-  getRequestRunContext,
-  ensureRequestRunContext,
-  getRequestOrgId,
-  getRequestUserEmail,
-} from "../server/request-context.js";
-import { isMcpToolAllowedForRequest } from "../mcp-client/visibility.js";
-import { isMcpActionResult } from "../mcp-client/app-result.js";
-import {
-  createToolSearchEntry,
-  TOOL_SEARCH_ACTION_NAME,
-} from "./tool-search.js";
-import {
-  getDefaultMaxIterations,
-  normalizeMaxIterations,
-  readAgentLoopSettings,
-} from "./loop-settings.js";
-import {
-  isReasoningEffort,
-  normalizeReasoningEffortForModel,
-  type ReasoningEffort,
-} from "../shared/reasoning-effort.js";
-import { isAgentActionStopError } from "../action.js";
-import {
-  writeLedgerEntry,
-  readLedgerEntry,
-  clearLedgerForThread,
-  getCurrentTurnEventsForThread,
-} from "./run-store.js";
-import {
-  classifyToolCallJournal,
-  findCompletedJournalEntry,
-  type ToolCallJournal,
-} from "./tool-call-journal.js";
-import { preUploadAttachments } from "../file-upload/pre-upload-attachments.js";
+  CredentialEndpointMismatchError,
+  type CredentialProvenance,
+} from "../credentials/index.js";
+import { getDbExec, isTransientDatabaseError } from "../db/client.js";
+import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
 import { extensionIdFromPathname } from "../extensions/path.js";
-import { applyContextDirectives } from "./context-xray/apply-directives.js";
 import {
-  ProcessorChain,
-  TripWire,
-  toolCallsFromContent,
-  type Processor,
-} from "./processors.js";
+  describeAttachmentBytesVerdict,
+  normalizeImageMediaType,
+  reconcileImageBytes,
+  reconcilePdfBytes,
+} from "../file-upload/attachment-bytes.js";
+import {
+  formatBase64CharBudget,
+  MAX_INLINE_FILE_BASE64_CHARS,
+  MAX_INLINE_IMAGE_BASE64_CHARS,
+} from "../file-upload/inline-attachment-limits.js";
+import {
+  claimOwnedAttachmentHydrationCandidate,
+  createOwnedAttachmentHydrationBudget,
+  describeOwnedImageReadFailure,
+  hydrateOwnedImageUrl,
+  type OwnedAttachmentHydrationBudget,
+  type OwnedImageReadFailureCode,
+} from "../file-upload/owned-attachment.js";
+import { preUploadAttachments } from "../file-upload/pre-upload-attachments.js";
+import { canonicalImageReferenceUrl } from "../file-upload/thread-image-history.js";
+import { isMcpActionResult } from "../mcp-client/app-result.js";
+import { extractMcpToolResultImages } from "../mcp-client/index.js";
+import { isMcpToolAllowedForRequest } from "../mcp-client/visibility.js";
+import { isObjectOnly } from "../mcp/tool-input-schema.js";
+import {
+  describeSettingsViewForAgent,
+  SETTINGS_VIEW_STATE_KEY,
+} from "../navigation/settings-redirects.js";
+import { shouldInferSentimentForTurn } from "../observability/sentiment.js";
+import { parseServiceIdentityEmail } from "../org/service-identity.js";
+import { ServicePrincipalRefusedError } from "../org/service-principal-guard.js";
 import {
   completeRun as completeProgressRun,
   startRun as startProgressRun,
   updateRunProgress,
 } from "../progress/registry.js";
-import { loadContextDirectives } from "./context-xray/directives-store.js";
 import {
-  buildManifest,
-  writeContextManifest,
+  readOptionalKeyCache,
+  writeOptionalKeyCache,
+} from "../secrets/optional-key-cache.js";
+import {
+  AGENT_CHAT_AI_SETUP_REQUIRED_CODE,
+  isAgentChatAiSetupRequiredError,
+} from "../server/agent-chat-ai-setup.js";
+import {
+  COMPACT_PROMPT_RESOURCES_TOTAL_MAX_CHARS,
+  preloadJevContextWithStatus,
+  type JevPromptContextCandidate,
+} from "../server/agent-chat/prompt-resources.js";
+import {
+  isRuntimeVisibleScope,
+  parseSkillFrontmatter,
+} from "../server/agent-chat/skill-frontmatter.js";
+import { captureError } from "../server/capture-error.js";
+import {
+  canUseDeployCredentialFallbackForRequest,
+  getProviderCredentialAuthFailure,
+  isBuilderGatewayDeployConfigured,
+  readDeployCredentialEnv,
+  resolveBuilderGatewayAuth,
+  type BuilderGatewayAuth,
+} from "../server/credential-provider.js";
+import { orderCredentialScopes } from "../server/credential-read-order.js";
+import { readBody } from "../server/h3-helpers.js";
+import { resolveHostedHarnessPolicy } from "../server/hosted-harness-policy.js";
+import {
+  isPersonalProviderKeyUseRestricted,
+  isPersonalProviderPolicyKey,
+  PERSONAL_PROVIDER_KEYS_RESTRICTED_ERROR_CODE,
+  PERSONAL_PROVIDER_KEYS_RESTRICTED_MESSAGE,
+} from "../server/personal-provider-key-policy.js";
+import {
+  assertRequestActionSurfaceIsolation,
+  getRequestRunContext,
+  ensureRequestRunContext,
+  getRequestContext,
+  getRequestAuthCapability,
+  getRequestOrgId,
+  getRequestUserEmail,
+  runWithRequestContext,
+} from "../server/request-context.js";
+import { secretKeyNames } from "../server/secret-key-aliases.js";
+import { fireInternalDispatch } from "../server/self-dispatch.js";
+import {
+  retryContextFromRequest,
+  type RefusedTurnRetryContext,
+} from "../shared/agent-chat-run-not-started.js";
+import { ANALYTICS_CLIENT_PLATFORM_BODY_FIELD } from "../shared/analytics-platform.js";
+import {
+  isContextDegraded,
+  preloadedContextUnavailableNote,
+  readReportedContextStatus,
+  screenContextUnavailableNote,
+  SELECTION_CONTEXT_UNAVAILABLE_NOTE,
+  worstContextStatus,
+  type ContextStatus,
+} from "../shared/context-status.js";
+import { parseBase64DataUrl } from "../shared/data-url.js";
+import { stripDiagnosticSnippets } from "../shared/diagnostic-snippet.js";
+import {
+  DurableAttachmentReferenceRequiredError,
+  stripInlineBytes,
+} from "../shared/inline-bytes.js";
+import {
+  isReasoningEffort,
+  normalizeReasoningEffortForRequest,
+  stepDownReasoningEffort,
+  type ReasoningEffort,
+} from "../shared/reasoning-effort.js";
+import {
+  SYNTHETIC_TRAFFIC_BETA_E2E,
+  SYNTHETIC_TRAFFIC_HEADER,
+} from "../shared/test-traffic.js";
+import type { TrackingMeta } from "../tracking/registry.js";
+import { actionPreparationContinuationNote } from "./action-continuation-guidance.js";
+import {
+  drainAgentWarnings,
+  formatAgentWarningsForToolResult,
+} from "./action-warnings.js";
+import {
+  CONTINUE_UNAVAILABLE_CODE,
+  type ContinueTrigger,
+} from "./auto-continue.js";
+import { clipHead } from "./clip-text.js";
+import {
+  connectionRequiredMessage,
+  priorConnectionContextNote,
+  resolvePriorConnectionNote,
+  type PriorConnectionNote,
+} from "./connection-required-note.js";
+import {
+  buildSystemManifestSections,
+  readContextXraySystemSections,
 } from "./context-xray/manifest.js";
-import { computeProtectedSegmentIds } from "./context-xray/segments.js";
+import {
+  AGENT_CHAT_BROWSER_SESSION_ID_FIELD,
+  AGENT_CHAT_BACKGROUND_RUN_FIELD,
+  AGENT_CHAT_PROCESS_RUN_PATH,
+  AGENT_CHAT_RECOVERY_OF_RUN_FIELD,
+  backgroundRuntimeDiagnosticDetail,
+  dispatchPathTargetsNetlifyBackgroundFunction,
+  isAgentChatDurableBackgroundEnabled,
+  isAgentChatForegroundSelfChainEnabled,
+  isInBackgroundFunctionRuntime,
+  resolveAgentChatProcessRunDispatchPath,
+  shouldUseBackgroundFunctionTimeoutForWorker,
+} from "./durable-background.js";
+import { applyContextXrayTransformForIteration } from "./engine/context-directives-transform.js";
+import { attemptContinuationDispatch } from "./engine/continuation-dispatch-retry.js";
+import {
+  formatLlmCredentialErrorMessage,
+  LLM_MISSING_CREDENTIALS_ERROR_CODE,
+  LLM_MISSING_CREDENTIALS_MESSAGE,
+  userFacingLlmCredentialError,
+} from "./engine/credential-errors.js";
+import {
+  BUILDER_GATEWAY_INTERNAL_ERROR_CODE,
+  isContextOverflowCode,
+  isContextOverflowMessage,
+  isInvalidAttachmentProviderMessage,
+  isProviderConnectionErrorMessage,
+  PROVIDER_RATE_LIMITED_ERROR_CODE,
+  PROVIDER_TRANSIENT_REJECTION_ERROR_CODE,
+} from "./engine/error-detail.js";
+import {
+  resolveEngine,
+  explicitEngineName,
+  registerBuiltinEngines,
+  getStoredModelForEngine,
+  normalizeModelForEngine,
+  isResolvedEngineUsableForRequest,
+  type ResolveEngineConfig,
+} from "./engine/index.js";
+import {
+  limitProviderTools,
+  MAX_PROVIDER_TOOLS,
+} from "./engine/limit-provider-tools.js";
+import {
+  resolveEmptyResponseRetryMaxOutputTokens,
+  resolveMainChatMaxOutputTokens,
+  resolveMaxOutputTokensForEngine,
+} from "./engine/output-tokens.js";
+import { PROVIDER_TO_ENV } from "./engine/provider-env-vars.js";
+import {
+  JOURNALED_TOOL_REPLAY_PREFIX,
+  RECOVERED_TOOL_REPLAY_PREFIX,
+  loadedSkillPagesContext,
+  loadPriorTurnToolCallJournal,
+  seedRepeatedToolErrorCountsFromJournal,
+  seedRepeatedToolCallCountsFromJournal,
+} from "./engine/tool-call-journal-seed.js";
+import {
+  backfillEngineMessagesToolResults,
+  INTERRUPTED_TOOL_RESULT_MARKER,
+  isInterruptedToolResult,
+  stringifyToolUseInputForGateway,
+  unmatchedToolResultReplayText,
+} from "./engine/translate-anthropic.js";
+import type {
+  AgentEngine,
+  EngineTool,
+  EngineMessage,
+  EngineContentPart,
+  EngineImagePart,
+  EngineEvent,
+  EngineToolResultPart,
+} from "./engine/types.js";
+import { EngineError } from "./engine/types.js";
+import {
+  FOLLOW_UP_SUGGESTIONS_COMPLETION_SYSTEM_PROMPT,
+  FOLLOW_UP_SUGGESTIONS_INSTRUCTION,
+  FOLLOW_UP_SUGGESTIONS_MAX_OUTPUT_TOKENS,
+  FOLLOW_UP_SUGGESTIONS_TOOL_NAME,
+  buildFollowUpCompletionMessages,
+  followUpSuggestionsTool,
+  identifyFollowUpSuggestions,
+  parseFollowUpSuggestions,
+  type FollowUpSuggestionsFailure,
+} from "./follow-up-suggestions.js";
+import {
+  filterHostedHarnessToolNames,
+  normalizeHostedHarnessRuntime,
+} from "./harness/hosted.js";
+import {
+  buildRecentUserRequestContext,
+  buildJevRequestContext,
+  preloadJevTools,
+} from "./jev-tool-prefetch.js";
+import {
+  type AgentLoopSettings,
+  getDefaultMaxIterations,
+  getDefaultMaxRunInputTokens,
+  MAX_AGENT_MAX_ITERATIONS,
+  MIN_AGENT_MAX_ITERATIONS,
+  normalizeMaxIterations,
+  normalizeMaxRunInputTokens,
+  readAgentLoopSettings,
+} from "./loop-settings.js";
+import {
+  getContextWindowForModel,
+  resolveFallbackModel,
+} from "./model-config.js";
 import {
   maybeCompactThread,
   buildObservationalContext,
   hasObservationalMemory,
   serializeObservationalMemoryBlock,
 } from "./observational-memory/index.js";
+import {
+  ProcessorChain,
+  TripWire,
+  toolCallsFromContent,
+  type Processor,
+} from "./processors.js";
+import { applyUncheckedDefaultModelReplacement } from "./provider-model-selection.js";
+import {
+  startRun,
+  subscribeToRun,
+  replayCompletedTurn,
+  getActiveRunForThread,
+  getActiveRunForThreadAsync,
+  getRun,
+  abortRun,
+  abortRunDurably,
+  abortTurnByRefDurably,
+  abortTurnDurably,
+  getSlotHoldingRunId,
+  tryClaimRunSlot,
+  isHostedRuntime,
+  resolveRunSoftTimeoutMs,
+  resolveRunToolTimeoutCeilingMs,
+  endsAfterToolResultWithoutAssistantFinal,
+  endsDuringActionPreparation,
+} from "./run-manager.js";
+import type { ActiveRun } from "./run-manager.js";
+import {
+  writeLedgerEntry,
+  readLedgerEntry,
+  clearLedgerForThread,
+  type AgentTurnInitiator,
+  AgentTurnInitiatorMismatchError,
+  AgentTurnInitiatorUnavailableError,
+  insertRun,
+  insertRunEvent,
+  isTurnAborted,
+  markRunAborted,
+  updateRunHeartbeat,
+  updateRunStatusIfRunning,
+  setRunError,
+  setRunTerminalReason,
+  claimBackgroundRun,
+  readBackgroundRunClaim,
+  recordRunDiagnostic,
+  countRunsForTurn,
+  RUN_DIAG_STAGE,
+  UNCLAIMED_BACKGROUND_RUN_GRACE_MS,
+  turnRunLedgerExhausted,
+} from "./run-store.js";
+import { buildCurrentTimeUserContext } from "./runtime-context.js";
+import {
+  claimSetupResume,
+  setupResumeRefusedRunId,
+} from "./setup-resume-claim.js";
+import { getStrictToolInputValidator } from "./strict-tool-input.js";
+import {
+  consumeAgentToolApproval,
+  createAgentToolApproval,
+  isAgentToolAlwaysAllowed,
+  resolveAgentToolApprovalTurnId,
+} from "./tool-approval-store.js";
+import type { AgentToolApprovalBinding } from "./tool-approval-store.js";
+import {
+  findCompletedJournalEntry,
+  isUnavailableToolCallInput,
+} from "./tool-call-journal.js";
+import {
+  redactSensitiveFields,
+  sanitizeToolErrorText,
+  sanitizeToolErrorValue,
+} from "./tool-error-redaction.js";
+import {
+  describeToolResultImages,
+  extractAgentImagesFromActionResult,
+} from "./tool-result-images.js";
+import {
+  createToolSearchEntry,
+  extractToolSearchResultNames,
+  filterActionsForAgentDiscovery,
+  readLoadedToolNames,
+  searchToolRegistry,
+  TOOL_SEARCH_ACTION_NAME,
+  withLoadedToolNames,
+} from "./tool-search.js";
+import { buildTurnResumeContext } from "./turn-resume-context.js";
+import {
+  normalizeAgentActionScope,
+  type AgentActionScope,
+  ActionTool,
+  AgentNativeJsonSchema,
+  AgentChatAttachment,
+  AgentChatRequest,
+  AgentChatEvent,
+  AgentFileMutationProof,
+  AgentChatReference,
+  AgentChatStructuredContentPart,
+  AgentChatStructuredMessage,
+  RunEvent,
+} from "./types.js";
+import {
+  mergeFinalResponseGuards,
+  readWriteReceipt,
+  writeReceiptGuard,
+  type ToolWriteReceipt,
+} from "./write-receipts.js";
 
-// Register built-in engines on first import
 registerBuiltinEngines();
 
 export { PROVIDER_TO_ENV };
+
+/**
+ * Grace window + poll interval for the foreground circuit-breaker that confirms
+ * a background worker actually CLAIMED a 202-dispatched run before recovering
+ * inline. The grace must cover the worker's cold-start + per-request init before
+ * it reaches `claimBackgroundRun`: light apps win the claim in ~1-2s, but heavy
+ * apps (e.g. analytics) were observed in prod taking >8s, so an 8s grace made
+ * their worker lose the race every time and always fall back to inline (adding
+ * ~8s latency with no background budget). 15s covers the slow apps while staying
+ * well within the foreground's ~40s soft-timeout.
+ */
+export const BACKGROUND_CLAIM_GRACE_MS = 15_000;
+/**
+ * Safety margin subtracted from the unclaimed-reaper grace when deciding how
+ * long the foreground may keep waiting for a slow-but-live worker to claim. The
+ * foreground recovers the run inline this many ms BEFORE `reapUnclaimedBackgroundRun`
+ * would error an unclaimed row, so the foreground always wins the race to claim
+ * and the two never collide — see `resolveBackgroundDispatchOutcome`.
+ */
+export const BACKGROUND_REAPER_SAFETY_MARGIN_MS = 2_000;
+export const BACKGROUND_CLAIM_POLL_MS = 400;
+export const BACKGROUND_PRECLAIM_HEARTBEAT_MS = 1_500;
+export const BACKGROUND_PRECLAIM_HEARTBEAT_MAX_MS = 15_000;
+
+export type BackgroundDispatchOutcome =
+  | { action: "stream" }
+  | { action: "subscribe" }
+  | {
+      action: "inline";
+      reason: "dispatch-failed" | "worker-never-claimed" | "no-row";
+    };
+
+function parseRunDiagnostic(raw: string | null | undefined): {
+  stage: string | null;
+  at: number | null;
+} {
+  if (!raw) return { stage: null, at: null };
+  try {
+    const parsed = JSON.parse(raw) as { stage?: unknown; at?: unknown };
+    return {
+      stage: typeof parsed.stage === "string" ? parsed.stage : null,
+      at:
+        typeof parsed.at === "number" && Number.isFinite(parsed.at)
+          ? parsed.at
+          : null,
+    };
+  } catch {
+    // Not JSON — treat the raw value as the stage name.
+  }
+  return { stage: raw, at: null };
+}
+
+export async function resolveBackgroundDispatchOutcome(opts: {
+  dispatched: boolean;
+  backgroundRowInserted: boolean;
+  runId: string;
+  graceMs: number;
+  reaperGraceMs?: number;
+  reaperSafetyMarginMs?: number;
+  streamWhenWorkerAlive?: boolean;
+  pollIntervalMs: number;
+  readClaim: (runId: string) => Promise<{
+    dispatchMode: string | null;
+    status: string | null;
+    diagStage?: string | null;
+    lastLivenessAt?: number | null;
+  } | null>;
+  claim: (runId: string) => Promise<boolean>;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}): Promise<BackgroundDispatchOutcome> {
+  const now = opts.now ?? (() => Date.now());
+  const sleep =
+    opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+
+  const ALIVE_IN_SETUP: ReadonlySet<string> = new Set([
+    RUN_DIAG_STAGE.authPassed,
+    RUN_DIAG_STAGE.workerEntered,
+  ]);
+  const DIED_BEFORE_CLAIM: ReadonlySet<string> = new Set([
+    RUN_DIAG_STAGE.authFailed,
+    RUN_DIAG_STAGE.routeThrew,
+    RUN_DIAG_STAGE.workerThrew,
+  ]);
+
+  if (opts.dispatched) {
+    const startedAt = now();
+    const baseDeadline = startedAt + opts.graceMs;
+    const reaperGraceMs = opts.reaperGraceMs;
+    const reaperMargin =
+      opts.reaperSafetyMarginMs ?? BACKGROUND_REAPER_SAFETY_MARGIN_MS;
+    let preclaimDeadlineAt: number | null = null;
+    for (;;) {
+      const claim = await opts.readClaim(opts.runId).catch(() => null);
+      if (
+        claim &&
+        ((claim.dispatchMode && claim.dispatchMode !== "background") ||
+          (claim.status && claim.status !== "running"))
+      ) {
+        return { action: "stream" };
+      }
+      const diagnostic = parseRunDiagnostic(claim?.diagStage);
+      const stage = diagnostic.stage;
+      if (
+        preclaimDeadlineAt == null &&
+        diagnostic.at != null &&
+        ALIVE_IN_SETUP.has(stage ?? "")
+      ) {
+        const diagnosticDeadline =
+          diagnostic.at + BACKGROUND_PRECLAIM_HEARTBEAT_MAX_MS;
+        preclaimDeadlineAt = diagnosticDeadline;
+      }
+      if (stage && DIED_BEFORE_CLAIM.has(stage)) break;
+      const elapsedNow = now();
+      if (preclaimDeadlineAt != null && elapsedNow >= preclaimDeadlineAt) {
+        break;
+      }
+      const reaperWillFireSoon =
+        reaperGraceMs != null &&
+        claim?.lastLivenessAt != null &&
+        elapsedNow - claim.lastLivenessAt >= reaperGraceMs - reaperMargin;
+      if (reaperWillFireSoon) break;
+      const aliveInSetup =
+        reaperGraceMs != null &&
+        claim?.status === "running" &&
+        !!stage &&
+        ALIVE_IN_SETUP.has(stage);
+      if (aliveInSetup && opts.streamWhenWorkerAlive) {
+        return { action: "stream" };
+      }
+      if (elapsedNow >= baseDeadline && !aliveInSetup) break;
+      await sleep(opts.pollIntervalMs);
+    }
+  }
+
+  if (!opts.backgroundRowInserted) {
+    return { action: "inline", reason: "no-row" };
+  }
+  let claimedInline = false;
+  try {
+    claimedInline = await opts.claim(opts.runId);
+  } catch {
+    claimedInline = false;
+  }
+  if (claimedInline) {
+    return {
+      action: "inline",
+      reason: opts.dispatched ? "worker-never-claimed" : "dispatch-failed",
+    };
+  }
+  return { action: "subscribe" };
+}
 
 const SAFE_BROWSER_TAB_ID_RE = /^[A-Za-z0-9_-]{1,96}$/;
 
@@ -140,7 +581,13 @@ function normalizeBrowserTabId(value: unknown): string | undefined {
   return SAFE_BROWSER_TAB_ID_RE.test(trimmed) ? trimmed : undefined;
 }
 
-function normalizeChatScope(
+function normalizeUsageLabel(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+  return trimmed ? trimmed.slice(0, 120) : undefined;
+}
+
+export function normalizeChatScope(
   value: unknown,
 ): { type: string; id: string; label?: string } | null | undefined {
   if (value == null) return null;
@@ -162,138 +609,499 @@ function appStateKeyForBrowserTab(key: string, browserTabId?: string): string {
   return browserTabId ? `${key}:${browserTabId}` : key;
 }
 
+/** `readAppState` throws when the request has no identity: that is no user to read for, not a failed read. */
+function hasAppStateIdentity(): boolean {
+  return Boolean(getRequestUserEmail() || getRequestAuthCapability());
+}
+
 async function readAppStateForBrowserTab<T>(
   key: string,
   browserTabId?: string,
 ): Promise<T | null> {
+  if (!browserTabId) return (await readAppState(key)) as T | null;
   const tabKey = appStateKeyForBrowserTab(key, browserTabId);
-  if (tabKey !== key) {
-    const scoped = (await readAppState(tabKey).catch(() => null)) as T | null;
-    if (scoped) return scoped;
-  }
-  return (await readAppState(key)) as T | null;
+  return (await readAppState(tabKey)) as T | null;
 }
 
-/**
- * Look up a user's persisted API key for the given provider. Returns
- * `undefined` for unauthenticated callers.
- *
- * Read order:
- *   1. `app_secrets` — encrypted user override, then active org/workspace.
- *   2. Legacy `user-api-key:<provider>:<email>` settings row — pre-migration
- *      data that hasn't been backfilled yet. Surfaced for compat only;
- *      writes always go to app_secrets now.
- */
-export async function getOwnerApiKey(
+async function getOwnerApiKeyDetailed(
   provider: string,
   ownerEmail: string | null | undefined,
-): Promise<string | undefined> {
+  options?: { onLookupFailure?: () => void },
+): Promise<
+  { apiKey: string; credentialProvenance: CredentialProvenance } | undefined
+> {
   if (!ownerEmail) return undefined;
+  let lookupFailed = false;
+  const reportLookupFailure = (): void => {
+    if (!lookupFailed) return;
+    options?.onLookupFailure?.();
+    lookupFailed = false;
+  };
   const secretKey =
     PROVIDER_TO_ENV[provider] ?? `${provider.toUpperCase()}_API_KEY`;
+  const syntheticTraffic = getRequestContext()?.isSyntheticTraffic === true;
+  const orgId = getRequestOrgId();
+  // Restricted members keep their stored keys, but none of the personal rows
+  // below (user, solo workspace, legacy settings) may answer. Unknown is a
+  // failed lookup, never "not restricted". Keys outside the policy (Jev) are
+  // never gated, so their lookup must not depend on the policy read either.
+  let personalRestricted = false;
+  try {
+    personalRestricted =
+      isPersonalProviderPolicyKey(secretKey) &&
+      (await isPersonalProviderKeyUseRestricted(
+        orgId ? { email: ownerEmail, orgId } : { email: ownerEmail },
+      ));
+  } catch {
+    lookupFailed = true;
+    reportLookupFailure();
+    return undefined;
+  }
   try {
     const { readAppSecret } = await import("../secrets/storage.js");
     const refs: Array<{
       scope: "user" | "org" | "workspace";
       scopeId: string;
-    }> = [{ scope: "user", scopeId: ownerEmail }];
-    const orgId = getRequestOrgId();
-    if (orgId) {
+    }> = personalRestricted ? [] : [{ scope: "user", scopeId: ownerEmail }];
+    if (orgId && !syntheticTraffic) {
       refs.push(
         { scope: "org", scopeId: orgId },
         { scope: "workspace", scopeId: orgId },
       );
-    } else {
+    } else if (!syntheticTraffic && !personalRestricted) {
       refs.push({ scope: "workspace", scopeId: `solo:${ownerEmail}` });
     }
-    for (const ref of refs) {
-      const fromSecrets = await readAppSecret({
-        key: secretKey,
-        scope: ref.scope,
-        scopeId: ref.scopeId,
-      });
-      if (fromSecrets?.value) return fromSecrets.value;
+    for (const ref of await orderCredentialScopes(refs, orgId, ownerEmail)) {
+      for (const storedKey of secretKeyNames(secretKey)) {
+        const fromSecrets = await readAppSecret({
+          key: storedKey,
+          scope: ref.scope,
+          scopeId: ref.scopeId,
+        });
+        if (
+          fromSecrets?.value &&
+          !(await getProviderCredentialAuthFailure({
+            key: secretKey,
+            value: fromSecrets.value,
+          }))
+        ) {
+          return {
+            apiKey: fromSecrets.value,
+            credentialProvenance: ref,
+          };
+        }
+      }
     }
   } catch {
-    // app_secrets table not ready — fall through to legacy lookup.
+    lookupFailed = true;
+    if (syntheticTraffic) {
+      reportLookupFailure();
+      return undefined;
+    }
+  }
+  if (syntheticTraffic || personalRestricted) {
+    reportLookupFailure();
+    return undefined;
   }
   try {
     const { getSetting } = await import("../settings/store.js");
     const stored = await getSetting(`user-api-key:${provider}:${ownerEmail}`);
     const key =
       stored && typeof stored.key === "string" ? stored.key.trim() : "";
-    if (key) return key;
+    if (
+      key &&
+      !(await getProviderCredentialAuthFailure({ key: secretKey, value: key }))
+    ) {
+      return {
+        apiKey: key,
+        credentialProvenance: { scope: "user", scopeId: ownerEmail },
+      };
+    }
     if (provider === "anthropic") {
       const legacy = await getSetting(`user-anthropic-api-key:${ownerEmail}`);
       const legacyKey =
         legacy && typeof legacy.key === "string" ? legacy.key.trim() : "";
-      return legacyKey || undefined;
+      if (
+        legacyKey &&
+        !(await getProviderCredentialAuthFailure({
+          key: secretKey,
+          value: legacyKey,
+        }))
+      ) {
+        return {
+          apiKey: legacyKey,
+          credentialProvenance: { scope: "user", scopeId: ownerEmail },
+        };
+      }
+      reportLookupFailure();
+      return undefined;
     }
+    reportLookupFailure();
     return undefined;
   } catch {
+    lookupFailed = true;
+    reportLookupFailure();
     return undefined;
   }
 }
 
-/**
- * Derive the provider name from the active engine setting.
- * "ai-sdk:openai" → "openai", "anthropic" → "anthropic"
- */
+export async function getOwnerApiKey(
+  provider: string,
+  ownerEmail: string | null | undefined,
+  options?: { onLookupFailure?: () => void },
+): Promise<string | undefined> {
+  return (await getOwnerApiKeyDetailed(provider, ownerEmail, options))?.apiKey;
+}
+
+export async function getOwnerJevApiKey(
+  ownerEmail: string | null | undefined,
+): Promise<string | undefined> {
+  return (await getOwnerJevApiKeyCredential(ownerEmail)).credential?.apiKey;
+}
+
+async function getOwnerJevApiKeyCredential(
+  ownerEmail: string | null | undefined,
+): Promise<{
+  credential: { apiKey: string; source: "user" | "deployment" } | null;
+  lookupFailed: boolean;
+}> {
+  if (!ownerEmail) return { credential: null, lookupFailed: false };
+  const cacheKey = [
+    "jev-source-v1",
+    ownerEmail,
+    getRequestOrgId() ?? `solo:${ownerEmail}`,
+    getRequestContext()?.isSyntheticTraffic === true ? "synthetic" : "normal",
+  ].join("\u0000");
+  const cached = readOptionalKeyCache(cacheKey);
+  if (cached.hit) {
+    if (!cached.value) return { credential: null, lookupFailed: false };
+    const separator = cached.value.indexOf(":");
+    const source = cached.value.slice(0, separator);
+    const apiKey = cached.value.slice(separator + 1);
+    return {
+      credential:
+        (source === "user" || source === "deployment") && apiKey
+          ? { apiKey, source }
+          : null,
+      lookupFailed: false,
+    };
+  }
+  let lookupFailed = false;
+  const value = await getOwnerApiKey("jev", ownerEmail, {
+    onLookupFailure: () => {
+      lookupFailed = true;
+    },
+  });
+  if (value) {
+    if (!lookupFailed) writeOptionalKeyCache(cacheKey, `user:${value}`);
+    return {
+      credential: { apiKey: value, source: "user" },
+      lookupFailed,
+    };
+  }
+  if (lookupFailed) return { credential: null, lookupFailed: true };
+
+  const deployKey = canUseDeployCredentialFallbackForRequest("JEV_API_KEY")
+    ? readDeployCredentialEnv("JEV_API_KEY")?.trim()
+    : undefined;
+  if (
+    deployKey &&
+    !(await getProviderCredentialAuthFailure({
+      key: "JEV_API_KEY",
+      value: deployKey,
+    }))
+  ) {
+    if (!lookupFailed) {
+      writeOptionalKeyCache(cacheKey, `deployment:${deployKey}`);
+    }
+    return {
+      credential: { apiKey: deployKey, source: "deployment" },
+      lookupFailed: false,
+    };
+  }
+
+  if (!lookupFailed) writeOptionalKeyCache(cacheKey, undefined);
+  return { credential: null, lookupFailed: false };
+}
+
+export interface JevContextCredentials {
+  apiKey: string | undefined;
+  personalApiKey: string | undefined;
+  builderAuth: BuilderGatewayAuth | null;
+  apiKeyLookupFailed?: boolean;
+  builderAuthLookupFailed?: boolean;
+}
+
+export async function getJevContextCredentials(
+  ownerEmail: string | null | undefined,
+): Promise<JevContextCredentials> {
+  const requestContext = getRequestContext();
+  const [lookup, builderAuthLookup] = await Promise.all([
+    getOwnerJevApiKeyCredential(ownerEmail),
+    resolveBuilderGatewayAuth({
+      userEmail: ownerEmail,
+      orgId: requestContext?.orgScope === "personal" ? null : getRequestOrgId(),
+    }).then(
+      (builderAuth) => ({ builderAuth, lookupFailed: false }),
+      () => ({ builderAuth: null, lookupFailed: true }),
+    ),
+  ]);
+  const credential = lookup.credential;
+  return {
+    apiKey: credential?.apiKey,
+    personalApiKey:
+      credential?.source === "user" ? credential.apiKey : undefined,
+    builderAuth: builderAuthLookup.builderAuth,
+    ...(lookup.lookupFailed ? { apiKeyLookupFailed: true } : {}),
+    ...(builderAuthLookup.lookupFailed
+      ? { builderAuthLookupFailed: true }
+      : {}),
+  };
+}
+
 export function engineToProvider(engineName: string): string {
   return engineName.startsWith("ai-sdk:") ? engineName.slice(7) : engineName;
 }
 
-/**
- * Returns true when this process should block generic deploy-level provider
- * credentials for signed-in chat requests.
- *
- * Self-hosted single-tenant deployments keep the env-var fallback so the
- * original BYO-server UX continues to work without a per-user key.
- */
-function shouldBlockDeployCredentialFallback(): boolean {
-  return !isDeployCredentialFallbackAllowed();
+export interface ResolvedOwnerApiKey {
+  apiKey: string | undefined;
+  apiKeyEnvVar: string | undefined;
+  credentialProvenance?: CredentialProvenance;
 }
 
-/**
- * Resolve the active engine's provider and look up the user's API key for it.
- *
- * In shared hosted deploys we deliberately refuse the deploy-level fallback
- * for authenticated users. Without that gate any
- * signed-in user who hasn't configured their own provider key would silently
- * inherit the deployment's key (uncapped billing on the owner's account,
- * prompt logging tied to the deployment owner) — exactly the prior-incident
- * pattern we hit on 2026-04-29.
- *
- * Single-tenant (local-dev, self-hosted SQLite) keeps the env fallback.
- *
- * Callers in `agent-chat-plugin.ts`, `triggers/dispatcher.ts`,
- * `jobs/scheduler.ts`, and `integrations/plugin.ts` historically layer
- * another deployment-key fallback after this must keep the same gate.
- */
+export class OwnerAgentEngineSettingUnavailableError extends Error {
+  readonly errorCode = "agent_engine_settings_unavailable";
+
+  constructor(cause: unknown) {
+    super("Unable to read the active agent engine setting.", { cause });
+    this.name = "OwnerAgentEngineSettingUnavailableError";
+  }
+}
+
+const NO_OWNER_API_KEY: ResolvedOwnerApiKey = {
+  apiKey: undefined,
+  apiKeyEnvVar: undefined,
+};
+
+export async function getOwnerApiKeyForEngine(
+  engineName: string,
+  ownerEmail: string | null | undefined,
+): Promise<ResolvedOwnerApiKey> {
+  try {
+    const provider = engineToProvider(engineName);
+    const envVar = PROVIDER_TO_ENV[provider];
+    const ownerKey = await getOwnerApiKeyDetailed(provider, ownerEmail);
+    if (ownerKey) {
+      return {
+        apiKey: ownerKey.apiKey,
+        apiKeyEnvVar: envVar,
+        credentialProvenance: ownerKey.credentialProvenance,
+      };
+    }
+    if (!envVar || !canUseDeployCredentialFallbackForRequest(envVar)) {
+      return NO_OWNER_API_KEY;
+    }
+    const envKey = readDeployCredentialEnv(envVar);
+    if (
+      envKey &&
+      !(await getProviderCredentialAuthFailure({ key: envVar, value: envKey }))
+    ) {
+      return {
+        apiKey: envKey,
+        apiKeyEnvVar: envVar,
+        credentialProvenance: { scope: "deployment" },
+      };
+    }
+    return NO_OWNER_API_KEY;
+  } catch {
+    return NO_OWNER_API_KEY;
+  }
+}
+
 export async function getOwnerActiveApiKey(
   ownerEmail: string | null | undefined,
 ): Promise<string | undefined> {
   try {
-    const { getSetting } = await import("../settings/store.js");
-    const engineSetting = await getSetting("agent-engine");
+    const { readDefaultAgentEngineSetting } =
+      await import("./default-agent-engine.js");
+    const engineSetting = await readDefaultAgentEngineSetting({
+      userEmail: ownerEmail ?? getRequestUserEmail(),
+      orgId: getRequestOrgId(),
+    });
     const activeEngine =
       (engineSetting?.engine as string | undefined) ?? "anthropic";
-    const provider = engineToProvider(activeEngine);
-    const userKey = await getOwnerApiKey(provider, ownerEmail);
-    if (userKey) return userKey;
-    if (shouldBlockDeployCredentialFallback()) {
-      // Shared hosted default: refuse the env fallback. A null user
-      // (unauthenticated / background context with no owner) gets undefined
-      // here too — there's no user to bill, and the call site must surface a
-      // "configure a key" error to the requester rather than silently using
-      // the deploy key.
-      return undefined;
-    }
-    const envVar = PROVIDER_TO_ENV[provider];
-    return envVar ? readDeployCredentialEnv(envVar) : undefined;
+    return (await getOwnerApiKeyForEngine(activeEngine, ownerEmail)).apiKey;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Resolve the credential to hand `resolveEngine` alongside `engineOption`.
+ *
+ * The provenance is the point. An explicitly named engine skips the registry's
+ * value-comparison path, so an untagged key resolved from the saved
+ * `agent-engine` setting would ride along to whatever provider the caller
+ * named — shipping, say, a live Anthropic secret to OpenAI's endpoint and
+ * making the resulting 401 blame a key the user never saved. Resolving the key
+ * for the named engine keeps the two in step; only the no-explicit-engine case
+ * may stay untagged, because the registry's automatic branches re-derive the
+ * credential themselves.
+ */
+export async function resolveOwnerEngineApiKey(input: {
+  engineOption?: ResolveEngineConfig["engineOption"];
+  ownerEmail: string | null | undefined;
+  /**
+   * Host-provided credential, which is Anthropic by contract
+   * (`AgentChatPluginOptions.apiKey` / `WebhookHandlerOptions.apiKey`). Used
+   * only when no owner key was found.
+   */
+  anthropicFallback?: string;
+}): Promise<ResolvedOwnerApiKey> {
+  if (
+    input.engineOption &&
+    typeof input.engineOption === "object" &&
+    "stream" in input.engineOption
+  ) {
+    return NO_OWNER_API_KEY;
+  }
+
+  const engineName = explicitEngineName(input.engineOption);
+  let activeEngineSetting:
+    | { status: "available"; engine: string }
+    | { status: "unavailable"; error: unknown }
+    | undefined;
+  if (engineName) {
+    const resolved = await getOwnerApiKeyForEngine(
+      engineName,
+      input.ownerEmail,
+    );
+    if (resolved.apiKey) return resolved;
+  } else {
+    try {
+      const { getSetting } = await import("../settings/store.js");
+      const engineSetting = await getSetting("agent-engine");
+      activeEngineSetting = {
+        status: "available",
+        engine: (engineSetting?.engine as string | undefined) ?? "anthropic",
+      };
+    } catch (error) {
+      activeEngineSetting = { status: "unavailable", error };
+    }
+    if (activeEngineSetting.status === "available") {
+      const activeKey = await getOwnerApiKeyForEngine(
+        activeEngineSetting.engine,
+        input.ownerEmail,
+      );
+      if (activeKey.apiKey) return { ...activeKey, apiKeyEnvVar: undefined };
+    }
+  }
+  const fallback = input.anthropicFallback?.trim();
+  const canUseFallback =
+    fallback && canUseDeployCredentialFallbackForRequest("ANTHROPIC_API_KEY");
+  if (activeEngineSetting?.status === "unavailable" && !canUseFallback) {
+    throw new OwnerAgentEngineSettingUnavailableError(
+      activeEngineSetting.error,
+    );
+  }
+  return fallback && canUseFallback
+    ? {
+        apiKey: fallback,
+        apiKeyEnvVar: "ANTHROPIC_API_KEY",
+        credentialProvenance: { scope: "deployment" },
+      }
+    : NO_OWNER_API_KEY;
+}
+
+/**
+ * The engine a chat request runs on. Anything that tells the user what their
+ * chat will run on (the sidebar credit notice) asks this too, so it cannot
+ * disagree with the chat.
+ */
+export async function resolveChatEngine(input: {
+  engineOption?: ResolveEngineConfig["engineOption"];
+  ownerKey: ResolvedOwnerApiKey;
+  model?: string;
+  appId?: string;
+  credentialIdentity: ResolveEngineConfig["credentialIdentity"];
+}): Promise<AgentEngine> {
+  const key = {
+    apiKey: input.ownerKey.apiKey,
+    apiKeyEnvVar: input.ownerKey.apiKeyEnvVar,
+    apiKeyProvenance: input.ownerKey.credentialProvenance,
+    appId: input.appId,
+    credentialIdentity: input.credentialIdentity,
+  };
+  try {
+    return await resolveEngine({
+      ...key,
+      engineOption: input.engineOption,
+      model: input.model,
+    });
+  } catch (error) {
+    if (
+      input.engineOption !== undefined ||
+      error instanceof CredentialEndpointMismatchError
+    ) {
+      throw error;
+    }
+    return resolveEngine(key);
+  }
+}
+
+/**
+ * A message sent while another run holds the thread. It is not saved yet; the
+ * client delivers it once that run ends instead of showing the user an error.
+ */
+function runSlotBusy(
+  event: Parameters<typeof setResponseStatus>[0],
+  activeRunId: string | null,
+) {
+  setResponseStatus(event, 409);
+  return {
+    error: "Run already in progress for this thread",
+    code: "run_slot_busy",
+    retryable: true,
+    activeRunId,
+  };
+}
+
+/**
+ * The error a chat turn answers with when no model credential is usable. A
+ * member whose org restricts personal API keys can't fix that by adding a key,
+ * so they get the restriction instead of the connect-a-provider prompt.
+ */
+export async function missingCredentialsChatError(input: {
+  ownerEmail: string | null | undefined;
+  visitorFacing: boolean;
+}): Promise<{
+  type: "error";
+  error: string;
+  errorCode: string;
+  recoverable?: false;
+}> {
+  let restricted = false;
+  if (!input.visitorFacing && input.ownerEmail) {
+    const lookup = isPersonalProviderKeyUseRestricted({
+      email: input.ownerEmail,
+    });
+    // coercion-ok: the turn has already failed; an unreadable policy keeps the generic copy.
+    restricted = await lookup.catch(() => false);
+  }
+  return restricted
+    ? {
+        type: "error",
+        error: PERSONAL_PROVIDER_KEYS_RESTRICTED_MESSAGE,
+        errorCode: PERSONAL_PROVIDER_KEYS_RESTRICTED_ERROR_CODE,
+        recoverable: false,
+      }
+    : {
+        type: "error",
+        error: formatLlmCredentialErrorMessage({
+          visitorFacing: input.visitorFacing,
+        }),
+        errorCode: LLM_MISSING_CREDENTIALS_ERROR_CODE,
+      };
 }
 
 /** @deprecated Use getOwnerApiKey("anthropic", ownerEmail) instead */
@@ -303,83 +1111,141 @@ export async function getOwnerAnthropicApiKey(
   return getOwnerApiKey("anthropic", ownerEmail);
 }
 
-/**
- * Context passed as the optional second argument to an action's `run`.
- * Defined in `../action.js` (cycle-free home) and re-exported here so existing
- * importers (e.g. `scripts/call-agent.ts`) keep their import path.
- */
 export type { ActionRunContext, ActionCaller } from "../action.js";
 
 export interface ActionEntry {
   tool: ActionTool;
-  run: (
-    args: any,
-    context?: import("../action.js").ActionRunContext,
-  ) => Promise<any> | any;
-  /** Standard Schema input validator when declared through defineAction. */
+  run: (args: any, context?: import("../action.js").ActionRunContext) => any;
+  access?: import("../authorization/check-action.js").ActionAccessConfig;
+  fileMutationProof?: (args: unknown) => AgentFileMutationProof | undefined;
   schema?: unknown;
-  /** HTTP exposure config. `false` = agent-only. Omitted = auto-inferred from name. */
   http?: import("../action.js").ActionHttpConfig | false;
-  /** Whether HTTP/frontend action calls must have an authenticated owner.
-   *  Defaults to true; false lets safe metadata/read actions run with
-   *  `ctx.userEmail` undefined when auth resolution returns 401/403. */
   requiresAuth?: boolean;
-  /** Whether the action is exposed to the agent as a callable tool. Only an
-   *  explicit `false` hides it from every agent tool surface (in-app assistant,
-   *  MCP, A2A, job/trigger runners) while leaving it frontend/HTTP-callable.
-   *  Set by `defineAction`'s `agentTool` option. */
+  maxBodyBytes?: number;
+  uiOnly?: boolean;
   agentTool?: boolean;
-  /** Explicit opt-in metadata for public agent protocols. Public routes never
-   *  imply public tool exposure; MCP/A2A/OpenAPI surfaces must filter for this. */
+  mcpTool?: boolean;
+  /** True when this entry's raw tool schema was authored by an external MCP
+   *  server (imported via the MCP client), not a local action. Distinct
+   *  from `mcpTool`, which controls whether a *local* action is exposed to
+   *  external agents — reusing that flag here would both misclassify local
+   *  actions that opt into external exposure and (via `declaredMcpToolNames`)
+   *  auto-add imported server tools to this app's own outbound MCP/A2A
+   *  catalog. Only used to pick the MCP protocol's default 2020-12 JSON
+   *  Schema dialect when the schema omits `$schema`. */
+  fromMcpServer?: boolean;
+  mcpAnnotations?: import("../action.js").ActionMcpToolAnnotations;
+  deferLoading?: boolean;
   publicAgent?: import("../action.js").PublicAgentActionConfig;
-  /** If true, completion does NOT trigger a screen-refresh change event.
-   *  Set automatically by `defineAction` when `http.method === "GET"`. */
   readOnly?: boolean;
-  /** If true, this action can run concurrently with other same-turn
-   *  read-only/parallel-safe tool calls. Only use for actions that handle
-   *  their own write ordering and idempotency. */
+  /** Bookkeeping writes still need replay protection, but cannot confirm automation work. */
+  confirmsAutomationWork?: boolean;
+  grounding?: boolean;
+  allowInPlanMode?: boolean;
+  planMode?: import("../action.js").ActionPlanModeConfig<any>;
+  changeEvents?: boolean;
+  persistInBrowser?: boolean;
+  changeResource?: (
+    input: any,
+    result: any,
+  ) => import("../action.js").ActionChangeResource | null | undefined;
   parallelSafe?: boolean;
-  /** Whether this action may be invoked from the tools-iframe bridge.
-   *  **Default-allow opt-out**: only an explicit `false` returns 403.
-   *  - `true` / `undefined` — allow.
-   *  - `false` — explicit deny; the tools bridge returns 403.
-   *  See `defineAction` (`packages/core/src/action.ts`) and audit H5 in
-   *  `security-audit/05-tools-sandbox.md`. */
+  dedupe?: boolean;
   toolCallable?: boolean;
-  /** Optional deep-link builder. When set, MCP/A2A surfaces append an
-   *  "Open in <app> →" link built from the call's args + result. Pure, sync,
-   *  best-effort. See `defineAction` and the `external-agents` skill. */
+  agentDiscoveryAvailable?: (
+    context?: import("../action.js").ActionRunContext,
+  ) => boolean | Promise<boolean>;
+  capabilityScopes?: readonly string[];
+  cliWrapper?: boolean;
   link?: import("../action.js").ActionLinkBuilder;
-  /** Optional MCP Apps UI resource for hosts that support inline interactive
-   *  app iframes. CLI/non-UI hosts still receive the normal tool result and
-   *  any deep link from `link`. */
   mcpApp?: import("../action.js").ActionMcpAppConfig;
-  /** Optional native Agent-Native chat renderer for this action's result. */
   chatUI?: import("../action-ui.js").ActionChatUIConfig;
-  /**
-   * Per-tool timeout override in milliseconds. When set, the agent loop uses
-   * this value instead of the global TOOL_TIMEOUT_MS (60 s) for this action.
-   * Useful for long-running tools such as sandboxed code execution.
-   */
   timeoutMs?: number;
-  /**
-   * Per-tool max-result-chars override. When set, the agent loop truncates
-   * the result to this many characters instead of the global 50 000 cap.
-   */
   maxResultChars?: number;
-  /**
-   * Opt-in human-in-the-loop approval gate (default off). When truthy (or a
-   * predicate that resolves truthy for the call's args), the loop emits
-   * `approval_required` and stops the turn instead of executing this action,
-   * until a human approves the specific call. Set by `defineAction`'s
-   * `needsApproval` option. See `packages/core/docs/content/actions.md`.
-   */
   needsApproval?:
     | boolean
     | ((
         args: any,
         ctx?: import("../action.js").ActionRunContext,
       ) => boolean | Promise<boolean>);
+  allowPersistentApproval?: boolean;
+  endsTurn?: boolean;
+  frameworkGroup?: import("../framework-tools.js").FrameworkToolGroup;
+}
+
+interface ResolvedActionChatUI {
+  chatUI: Omit<
+    import("../action-ui.js").ActionChatUIConfig,
+    "when" | "projectResult"
+  >;
+  result: unknown;
+}
+
+function actionChatUIForResult(
+  actionName: string,
+  actionEntry: ActionEntry,
+  args: Record<string, unknown>,
+  result: unknown,
+  isError: boolean,
+  storedWidgetResult = false,
+): ResolvedActionChatUI | undefined {
+  const chatUI =
+    actionEntry.chatUI ??
+    (normalizeActionChangeResult(result)
+      ? {
+          renderer: ACTION_CHAT_UI_RECORD_CHANGE_RENDERER,
+          when: (_args: Record<string, unknown>, value: unknown) =>
+            normalizeActionChangeResult(value) !== null,
+          projectResult: (_args: Record<string, unknown>, value: unknown) =>
+            normalizeActionChangeResult(value),
+        }
+      : undefined);
+  if (!chatUI || isError) return undefined;
+  if (!storedWidgetResult && chatUI.when) {
+    try {
+      if (!chatUI.when(args, result)) return undefined;
+    } catch (error) {
+      console.warn(
+        `Could not evaluate chatUI.when for ${actionName}; preserving action result.`,
+        error,
+      );
+      return undefined;
+    }
+  }
+  let widgetResult = result;
+  if (!storedWidgetResult && chatUI.projectResult) {
+    try {
+      widgetResult = chatUI.projectResult(args, result);
+    } catch (error) {
+      console.warn(
+        `Could not project chatUI result for ${actionName}; omitting the widget.`,
+        error,
+      );
+      return undefined;
+    }
+  }
+  return {
+    chatUI: {
+      renderer: chatUI.renderer,
+      ...(chatUI.title ? { title: chatUI.title } : {}),
+      ...(chatUI.description ? { description: chatUI.description } : {}),
+    },
+    result: widgetResult,
+  };
+}
+
+function parseRecoveredActionResult(
+  result: string,
+  resultIsString: boolean | undefined,
+): { value: unknown } | undefined {
+  if (resultIsString === undefined) return undefined;
+  if (resultIsString) return { value: result };
+  try {
+    return { value: JSON.parse(result) as unknown };
+  } catch (error) {
+    if (error instanceof SyntaxError) return undefined;
+    throw error;
+  }
 }
 
 /** @deprecated Use `ActionEntry` instead */
@@ -387,12 +1253,215 @@ export type ScriptEntry = ActionEntry;
 
 export type AgentExecutionMode = "act" | "plan";
 
+export interface AgentActionSurface {
+  allowedActionNames: readonly string[];
+  actionScope?: AgentActionScope;
+}
+
+export interface DefaultAgentActionSurface {
+  mode: "default";
+}
+
+export type AgentActionSurfaceResolution =
+  | AgentActionSurface
+  | DefaultAgentActionSurface;
+
+type NormalizedAgentActionSurface =
+  | DefaultAgentActionSurface
+  | {
+      mode: "allowlist";
+      allowedActionNames: string[];
+      actionScope?: AgentActionScope;
+    };
+
+export interface AgentActionSurfaceDetails {
+  event: any;
+  ownerEmail: string | null;
+  orgId: string | null;
+  threadId?: string;
+  mode: AgentExecutionMode;
+  internalContinuation: boolean;
+  requestedTurnId?: string;
+  queuedMessageId?: string;
+  actionScope?: Readonly<AgentActionScope>;
+  availableActionNames: readonly string[];
+}
+
+function hasOwn(
+  value: unknown,
+  propertyName: string,
+): value is Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    Object.prototype.hasOwnProperty.call(value, propertyName)
+  );
+}
+
+export function readPersistedAllowedActionNames(
+  value: unknown,
+): string[] | undefined {
+  if (!hasOwn(value, "allowedActionNames")) return undefined;
+  const names = value.allowedActionNames;
+  if (
+    !Array.isArray(names) ||
+    !names.every((name) => typeof name === "string")
+  ) {
+    return [];
+  }
+  return [...new Set(names)];
+}
+
+export function normalizeAgentActionSurfaceResolution(
+  value: unknown,
+): NormalizedAgentActionSurface {
+  if (hasOwn(value, "mode")) {
+    if (value.mode === "default" && !hasOwn(value, "allowedActionNames")) {
+      return { mode: "default" };
+    }
+    throw new Error("resolveActionSurface returned an invalid default surface");
+  }
+  if (!hasOwn(value, "allowedActionNames")) {
+    throw new Error("resolveActionSurface returned an invalid action surface");
+  }
+  const allowedActionNames = value.allowedActionNames;
+  if (
+    !Array.isArray(allowedActionNames) ||
+    !allowedActionNames.every((name) => typeof name === "string")
+  ) {
+    throw new Error("resolveActionSurface returned an invalid action surface");
+  }
+  return {
+    mode: "allowlist",
+    allowedActionNames: [...new Set(allowedActionNames)],
+    ...(hasOwn(value, "actionScope")
+      ? { actionScope: normalizeAgentActionScope(value.actionScope) }
+      : {}),
+  };
+}
+
+export type PersistedActionSurface =
+  | {
+      orgId: string | null;
+      allowedActionNames: string[];
+      actionScope?: AgentActionScope;
+    }
+  | {
+      orgId: string | null;
+      mode: "default";
+    };
+
+export function readPersistedActionSurface(
+  value: unknown,
+  propertyName: string,
+): PersistedActionSurface | undefined {
+  if (!hasOwn(value, propertyName)) return undefined;
+  const surface = value[propertyName];
+  if (!hasOwn(surface, "orgId")) {
+    return { orgId: null, allowedActionNames: [] };
+  }
+  const orgId = surface.orgId;
+  if (
+    orgId !== null &&
+    (typeof orgId !== "string" || orgId.trim().length === 0)
+  ) {
+    return { orgId: null, allowedActionNames: [] };
+  }
+  if (hasOwn(surface, "mode")) {
+    if (surface.mode === "default" && !hasOwn(surface, "allowedActionNames")) {
+      return { orgId, mode: "default" };
+    }
+    return { orgId: null, allowedActionNames: [] };
+  }
+  const allowedActionNames = readPersistedAllowedActionNames(surface) ?? [];
+  if (!hasOwn(surface, "actionScope")) return { orgId, allowedActionNames };
+  try {
+    return {
+      orgId,
+      allowedActionNames,
+      actionScope: normalizeAgentActionScope(
+        (surface as Record<string, unknown>).actionScope,
+      ),
+    };
+  } catch {
+    return { orgId: null, allowedActionNames: [] };
+  }
+}
+
+function readPersistedAdditionalActionNames(
+  body: AgentChatRequest,
+): string[] | undefined {
+  const names = body.__resolvedAdditionalActionNames;
+  if (names === undefined) return undefined;
+  if (!Array.isArray(names) || names.some((name) => typeof name !== "string")) {
+    throw new Error("Persisted additional action names are malformed");
+  }
+  return names;
+}
+
+/**
+ * A durable continuation re-resolves the caller's additional actions, which
+ * may have changed since the turn started. Keep the turn's names: drop entries
+ * that appeared since, and keep a vanished name as an entry that fails loudly
+ * when called, so a persisted action allowlist that names it still resolves.
+ * A name that has since become a registered action is left to that action.
+ */
+export function pinAdditionalActionsToTurn(
+  resolved: Record<string, ActionEntry>,
+  turnNames: readonly string[],
+  registered: Record<string, ActionEntry>,
+): Record<string, ActionEntry> {
+  const pinned: Record<string, ActionEntry> = {};
+  for (const name of turnNames) {
+    if (Object.hasOwn(registered, name)) continue;
+    pinned[name] = Object.hasOwn(resolved, name)
+      ? resolved[name]
+      : {
+          tool: {
+            description: `${name} is no longer available to this caller.`,
+            parameters: { type: "object", properties: {} },
+          },
+          readOnly: true,
+          run: () => {
+            throw new Error(
+              `${name} is no longer available to this caller; it was removed after this turn started.`,
+            );
+          },
+        };
+  }
+  return pinned;
+}
+
+export function filterActionsByAllowedNames(
+  actions: Record<string, ActionEntry>,
+  allowedActionNames: readonly string[],
+): Record<string, ActionEntry> {
+  const allowedNames = [...new Set(allowedActionNames)];
+  const unknownNames = allowedNames.filter(
+    (name) => !Object.prototype.hasOwnProperty.call(actions, name),
+  );
+  if (unknownNames.length > 0) {
+    throw new Error(
+      `resolveActionSurface returned unknown action name(s): ${unknownNames.join(", ")}`,
+    );
+  }
+  const filtered = Object.fromEntries(
+    allowedNames.map((name) => [name, actions[name]!]),
+  );
+
+  if (filtered[TOOL_SEARCH_ACTION_NAME]) {
+    filtered[TOOL_SEARCH_ACTION_NAME] = createToolSearchEntry(() => filtered);
+  }
+
+  return filtered;
+}
+
 export const PLAN_MODE_SYSTEM_PROMPT = `## Plan Mode Active
 
 You are in Plan mode. This turn is for research, clarification, and a proposed approach only.
 
 Hard rules:
-- Use only read-only tools. Do not edit files, write resources, run mutating bash commands, mutate SQL rows, navigate the UI, send notifications, create jobs, create tools, call external agents, or change external systems.
+- Use only read-only tools. Do not edit files, write resources, run mutating bash commands, mutate SQL rows, navigate the UI, send notifications, create jobs, create tools, send messages or tasks to external agents, or change external systems.
 - If a needed detail is unclear, ask a concise clarifying question before proposing a plan.
 - When ready, present a concrete plan with the files/tools you expect to touch, the intended changes, validation steps, and notable risks.
 - Do not treat approval as implicit while Plan mode is still active. Tell the user to switch to Act mode with the mode selector or /act before implementation.`;
@@ -401,20 +1470,9 @@ const PLAN_MODE_BLOCKED_READONLY_TOOLS = new Set([
   "refresh-screen",
   "set-search-params",
   "set-url-path",
+  "open-settings-page",
 ]);
 
-const PLAN_MODE_ALLOWED_ACTIONS: Record<string, readonly string[]> = {
-  resources: ["list", "read"],
-  "chat-history": ["search"],
-  "agent-teams": ["status", "read-result", "list"],
-  "manage-jobs": ["list"],
-  "manage-automations": ["list-events", "list"],
-  "manage-notifications": ["list"],
-  "manage-progress": ["list"],
-  "manage-agent-engine": ["list"],
-};
-
-const PLAN_MODE_WEB_REQUEST_METHODS = new Set(["GET", "HEAD"]);
 const SOURCE_SWEEP_AGENT_TEAM_ALLOWED_ACTIONS = [
   "status",
   "read-result",
@@ -430,49 +1488,85 @@ function getToolAction(name: string, args: unknown): string {
   return String(raw ?? "").toLowerCase();
 }
 
-function getWebRequestMethod(args: unknown): string {
-  const raw =
-    args && typeof args === "object" && "method" in args
-      ? (args as Record<string, unknown>).method
-      : undefined;
-  return String(raw ?? "GET").toUpperCase();
-}
-
-function restrictActionEnum(
+function projectPlanModeParameters(
   parameters: ActionTool["parameters"] | undefined,
-  allowedActions: readonly string[],
+  planMode: import("../action.js").ActionPlanModeConfig<any> | undefined,
 ): ActionTool["parameters"] | undefined {
-  if (!parameters) return parameters;
-  const actionParam = parameters.properties.action;
-  if (!actionParam) return parameters;
+  if (!parameters || !planMode) return parameters;
+  const allowedProperties = planMode.allowedProperties
+    ? new Set(planMode.allowedProperties)
+    : undefined;
+  const omittedProperties = new Set(planMode.omittedProperties ?? []);
+  const properties = Object.fromEntries(
+    Object.entries(parameters.properties).filter(
+      ([key]) =>
+        (!allowedProperties || allowedProperties.has(key)) &&
+        !omittedProperties.has(key),
+    ),
+  ) as typeof parameters.properties;
+  let changed = false;
+  for (const [key, values] of Object.entries(planMode.allowedValues ?? {})) {
+    const parameter = properties[key];
+    if (!parameter) continue;
+    properties[key] = { ...parameter, enum: [...values] };
+    changed = true;
+  }
+  if (
+    !changed &&
+    !allowedProperties &&
+    omittedProperties.size === 0 &&
+    (planMode.requiredProperties?.length ?? 0) === 0
+  ) {
+    return parameters;
+  }
+  const required = Array.from(
+    new Set([
+      ...(parameters.required?.filter((key) => key in properties) ?? []),
+      ...(planMode.requiredProperties?.filter((key) => key in properties) ??
+        []),
+    ]),
+  );
   return {
     ...parameters,
-    properties: {
-      ...parameters.properties,
-      action: {
-        ...actionParam,
-        enum: [...allowedActions],
-      },
-    },
+    properties,
+    ...(required.length > 0 ? { required } : {}),
   };
 }
 
-function restrictWebRequestMethods(
-  parameters: ActionTool["parameters"] | undefined,
-): ActionTool["parameters"] | undefined {
-  if (!parameters) return parameters;
-  const methodParam = parameters.properties.method;
-  if (!methodParam) return parameters;
-  return {
-    ...parameters,
-    properties: {
-      ...parameters.properties,
-      method: {
-        ...methodParam,
-        enum: [...PLAN_MODE_WEB_REQUEST_METHODS],
-      },
+function matchesPlanModeInputPolicy(
+  input: unknown,
+  planMode: import("../action.js").ActionPlanModeConfig<any>,
+): boolean {
+  const hasPropertyPolicy =
+    planMode.allowedProperties !== undefined ||
+    (planMode.omittedProperties?.length ?? 0) > 0 ||
+    planMode.allowedValues !== undefined;
+  if (!hasPropertyPolicy) return true;
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return false;
+  }
+  const values = input as Record<string, unknown>;
+  const allowedProperties = planMode.allowedProperties
+    ? new Set(planMode.allowedProperties)
+    : undefined;
+  const omittedProperties = new Set(planMode.omittedProperties ?? []);
+  if (
+    Object.keys(values).some(
+      (key) =>
+        (allowedProperties && !allowedProperties.has(key)) ||
+        omittedProperties.has(key),
+    )
+  ) {
+    return false;
+  }
+  return Object.entries(planMode.allowedValues ?? {}).every(
+    ([key, allowed]) => {
+      const value = values[key];
+      return (
+        value == null || (typeof value === "string" && allowed.includes(value))
+      );
     },
-  };
+  );
 }
 
 function planModeBlockedMessage(toolName: string, reason?: string): string {
@@ -488,19 +1582,26 @@ export function isPlanModeToolCallAllowed(
   input: unknown,
   entry: ActionEntry,
 ): boolean {
+  if (entry.allowInPlanMode === false) return false;
   if (PLAN_MODE_BLOCKED_READONLY_TOOLS.has(name)) return false;
-
-  if (name === "web-request") {
-    return PLAN_MODE_WEB_REQUEST_METHODS.has(getWebRequestMethod(input));
-  }
 
   if (name === "bash") {
     return isPlanModeReadOnlyBashCall(input);
   }
 
-  const allowedActions = PLAN_MODE_ALLOWED_ACTIONS[name];
-  if (allowedActions) {
-    return allowedActions.includes(getToolAction(name, input));
+  if (entry.planMode) {
+    if (!matchesPlanModeInputPolicy(input, entry.planMode)) {
+      return false;
+    }
+    try {
+      const effect =
+        typeof entry.planMode.effect === "function"
+          ? entry.planMode.effect(input)
+          : entry.planMode.effect;
+      return effect === "read";
+    } catch {
+      return false;
+    }
   }
 
   return entry.readOnly === true;
@@ -516,45 +1617,35 @@ function isPlanModeReadOnlyBashCall(input: unknown): boolean {
 function createPlanModeGuardedAction(
   name: string,
   entry: ActionEntry,
-  allowedActions: readonly string[],
 ): ActionEntry {
+  const allowedValues = entry.planMode?.allowedValues;
+  const allowedDescription = allowedValues
+    ? Object.entries(allowedValues)
+        .map(
+          ([key, values]) =>
+            `\`${key}\`: ${values.map((value) => `"${value}"`).join(", ")}`,
+        )
+        .join("; ")
+    : "";
+  const guidance =
+    entry.planMode?.description ??
+    (allowedDescription
+      ? `only these argument values are available: ${allowedDescription}.`
+      : "only calls classified as read-only are available.");
   return {
     ...entry,
     readOnly: true,
     tool: {
       ...entry.tool,
-      description:
-        `${entry.tool.description}\n\nPlan mode: only these read-only actions are available: ` +
-        allowedActions.map((action) => `"${action}"`).join(", ") +
-        ".",
-      parameters: restrictActionEnum(entry.tool.parameters, allowedActions),
+      description: `${entry.tool.description}\n\nPlan mode: ${guidance}`,
+      parameters: projectPlanModeParameters(
+        entry.tool.parameters,
+        entry.planMode,
+      ),
     },
     run: async (args, context) => {
-      const action = getToolAction(name, args);
-      if (!allowedActions.includes(action)) {
-        return planModeBlockedMessage(
-          name,
-          `action="${action || "(missing)"}"`,
-        );
-      }
-      return entry.run(args, context);
-    },
-  };
-}
-
-function createPlanModeWebRequestAction(entry: ActionEntry): ActionEntry {
-  return {
-    ...entry,
-    readOnly: true,
-    tool: {
-      ...entry.tool,
-      description: `${entry.tool.description}\n\nPlan mode: only GET and HEAD requests are allowed.`,
-      parameters: restrictWebRequestMethods(entry.tool.parameters),
-    },
-    run: async (args, context) => {
-      const method = getWebRequestMethod(args);
-      if (!PLAN_MODE_WEB_REQUEST_METHODS.has(method)) {
-        return planModeBlockedMessage("web-request", `method="${method}"`);
+      if (!isPlanModeToolCallAllowed(name, args, entry)) {
+        return planModeBlockedMessage(name, "call is not read-only");
       }
       return entry.run(args, context);
     },
@@ -578,6 +1669,23 @@ function createPlanModeBashAction(entry: ActionEntry): ActionEntry {
   };
 }
 
+function createPlanModeBlockedAction(
+  name: string,
+  entry: ActionEntry,
+  reason?: string,
+): ActionEntry {
+  return {
+    ...entry,
+    allowInPlanMode: false,
+    readOnly: true,
+    tool: {
+      ...entry.tool,
+      description: `${entry.tool.description}\n\nPlan mode blocked: ${reason ?? "not available while planning"}.`,
+    },
+    run: async () => planModeBlockedMessage(name, reason),
+  };
+}
+
 export function createPlanModeActionRegistry(
   actions: Record<string, ActionEntry>,
 ): Record<string, ActionEntry> {
@@ -585,16 +1693,20 @@ export function createPlanModeActionRegistry(
 
   for (const [name, entry] of Object.entries(actions)) {
     if (name === TOOL_SEARCH_ACTION_NAME) continue;
-    if (PLAN_MODE_BLOCKED_READONLY_TOOLS.has(name)) continue;
-
-    const allowedActions = PLAN_MODE_ALLOWED_ACTIONS[name];
-    if (allowedActions) {
-      filtered[name] = createPlanModeGuardedAction(name, entry, allowedActions);
+    if (entry.allowInPlanMode === false) {
+      filtered[name] = createPlanModeBlockedAction(
+        name,
+        entry,
+        "not available while planning",
+      );
       continue;
     }
-
-    if (name === "web-request") {
-      filtered[name] = createPlanModeWebRequestAction(entry);
+    if (PLAN_MODE_BLOCKED_READONLY_TOOLS.has(name)) {
+      filtered[name] = createPlanModeBlockedAction(
+        name,
+        entry,
+        "not available while planning",
+      );
       continue;
     }
 
@@ -603,8 +1715,26 @@ export function createPlanModeActionRegistry(
       continue;
     }
 
-    if (entry.readOnly === true) {
+    if (entry.planMode) {
+      if (typeof entry.planMode.effect === "function") {
+        filtered[name] = createPlanModeGuardedAction(name, entry);
+      } else if (entry.planMode.effect === "read") {
+        filtered[name] = createPlanModeGuardedAction(name, entry);
+      } else {
+        filtered[name] = createPlanModeBlockedAction(
+          name,
+          entry,
+          "write or unknown effect",
+        );
+      }
+    } else if (entry.readOnly === true) {
       filtered[name] = entry;
+    } else {
+      filtered[name] = createPlanModeBlockedAction(
+        name,
+        entry,
+        "write or side-effecting tool",
+      );
     }
   }
 
@@ -615,109 +1745,147 @@ export function createPlanModeActionRegistry(
   return filtered;
 }
 
+type AgentRunTrackingSource = Pick<
+  TrackingMeta,
+  "userId" | "authUserId" | "anonymousId" | "sessionId"
+> & { isSyntheticTraffic?: boolean };
+
+export interface PreparedAgentRequest {
+  message?: string;
+  displayMessage?: string;
+  attachments?: AgentChatAttachment[];
+  /** Server-prepared context that must not be persisted as current-turn uploads. */
+  contextAttachments?: AgentChatAttachment[];
+  contextNote?: string;
+  /** Resolve model-specific context only after the effective model is known. */
+  prepareAfterModel?: (details: {
+    model: string;
+    vision: boolean;
+    /** Shared across every image/file hydration performed during this request. */
+    hydrationBudget: OwnedAttachmentHydrationBudget;
+    /**
+     * Durable URLs of earlier-turn images this request already sends as
+     * structured-history image parts. Prepared context must skip them so each
+     * image reaches the model once.
+     */
+    historyImageUrls: readonly string[];
+  }) =>
+    | void
+    | Pick<PreparedAgentRequest, "contextAttachments" | "contextNote">
+    | Promise<void | Pick<
+        PreparedAgentRequest,
+        "contextAttachments" | "contextNote"
+      >>;
+  jevPromptCandidates?: JevPromptContextCandidate[];
+  jevFallbackCandidateIds?: string[];
+  /**
+   * Whether the app's own reference retrieval reached the model. Omit it to
+   * report nothing; `timed_out` and `failed` tell the model it is working
+   * without references it would normally have.
+   */
+  status?: ContextStatus;
+}
+
 export interface ProductionAgentOptions {
-  /** Action entries for the agent. Use `actions` (preferred) or `scripts` (deprecated alias). */
+  /** Gate a newly admitted user turn after trusted continuation checks. */
+  assertAiSetupReady: () => Promise<void>;
   actions?: Record<string, ActionEntry>;
   /** @deprecated Use `actions` instead */
   scripts?: Record<string, ActionEntry>;
-  /** Static system prompt string, or async function called per-request with the H3 event */
+  resolveAdditionalActions?: (details: {
+    event: any;
+    ownerEmail: string | null;
+    orgId: string | null;
+  }) => Record<string, ActionEntry> | Promise<Record<string, ActionEntry>>;
   systemPrompt: string | ((event: any) => string | Promise<string>);
-  /** Falls back to ANTHROPIC_API_KEY env var. Ignored when `engine` is provided. */
   apiKey?: string;
-  /** Agent engine to use. Defaults to the "anthropic" engine. */
   engine?:
     | AgentEngine
     | string
     | { name: string; config: Record<string, unknown> };
-  /** Model to use. Defaults to the resolved engine's default model. */
   model?: string;
-  /** App/template id used for org-scoped per-app model defaults. */
   appId?: string;
-  /** Default reasoning effort for requests that do not supply an override. */
+  hostedHarnessConfig?: AgentNativeHarnessSetting;
   reasoningEffort?: ReasoningEffort;
-  /** Provider-specific options passed through to the engine */
   providerOptions?: EngineMessage extends never ? never : any;
-  /** Called when a run completes (for server-side thread persistence) */
-  onRunComplete?: (run: ActiveRun, threadId: string | undefined) => void;
-  /** Called after request validation but before a run is started. */
+  onRunComplete?: (
+    run: ActiveRun,
+    threadId: string | undefined,
+    trackingSource?: AgentRunTrackingSource,
+  ) => void;
   onRunPrepared?: (details: {
     runId: string;
+    turnId: string;
     threadId: string | undefined;
     message: string;
+    agentKitMessageId?: string;
     attachments?: AgentChatAttachment[];
+    queuedMessageId?: string;
+    queuedMessageClaimId?: string;
   }) => void | Promise<void>;
   /**
-   * Optional per-template request normalizer. Runs after owner resolution and
-   * before system/context assembly so templates can materialize uploaded chat
-   * attachments or append app-specific, non-visible instructions.
+   * The turn was refused before a run started (no usable model credential).
+   * `runId` is the turn id the client already uses as its run id.
    */
+  onRunNotStarted?: (details: {
+    runId: string;
+    turnId: string;
+    threadId: string;
+    message: string;
+    attachments?: AgentChatAttachment[];
+    queuedMessageId?: string;
+    agentKitMessageId?: string;
+    retryContext: RefusedTurnRetryContext;
+    failure: { code: string; message: string };
+  }) => Promise<void>;
   prepareRequest?: (details: {
     event: any;
     ownerEmail: string | null;
     message: string;
     displayMessage?: string;
     attachments: AgentChatAttachment[];
+    structuredHistory?: AgentChatStructuredMessage[];
     references: AgentChatReference[];
     threadId?: string;
+    requestContext: string;
+    contextPrefetchDeadlineAt: number;
     internalContinuation?: boolean;
+    dispatchToBackground: boolean;
+    isBackgroundWorker?: boolean;
     mode: AgentExecutionMode;
-  }) =>
-    | void
-    | {
-        message?: string;
-        displayMessage?: string;
-        attachments?: AgentChatAttachment[];
-      }
-    | Promise<void | {
-        message?: string;
-        displayMessage?: string;
-        attachments?: AgentChatAttachment[];
-      }>;
-  /** Optional per-app agent run chunk budget in milliseconds. Defaults to
-   *  AGENT_RUN_SOFT_TIMEOUT_MS when set, otherwise no framework-imposed
-   *  timeout. When reached, the client receives an internal auto-continuation
-   *  signal instead of a user-facing warning. */
+  }) => void | PreparedAgentRequest | Promise<void | PreparedAgentRequest>;
+  resolveActionSurface?: (
+    details: AgentActionSurfaceDetails,
+  ) => AgentActionSurfaceResolution | Promise<AgentActionSurfaceResolution>;
   runSoftTimeoutMs?: number;
-  /** Called when a run starts, with the send function for emitting events and the threadId */
+  runNoProgressTimeoutMs?: number;
+  durableBackgroundRuns?: boolean;
   onRunStart?: (
     send: (event: AgentChatEvent) => void,
     threadId: string,
+    runId: string,
   ) => void | Promise<void>;
-  /**
-   * Called after the engine + model are resolved for this request. Used by
-   * the plugin layer to thread the parent's choices into sub-agents so
-   * delegated tasks don't default back to Anthropic + Claude.
-   */
   onEngineResolved?: (engine: AgentEngine, model: string) => void;
-  /** Resolve the owner email from the H3 event (for usage tracking) */
   resolveOwnerEmail?: (event: any) => string | Promise<string>;
-  /**
-   * Optional final-answer guard. If it returns a message after a text-only
-   * assistant turn, the loop clears that draft once and asks the model to
-   * continue with the returned corrective instruction before allowing a final.
-   */
   finalResponseGuard?: AgentLoopFinalResponseGuard;
-  /**
-   * Skip auto-injecting the workspace files/skills/agents inventory on the
-   * first message of a conversation. Useful for minimal/voice apps where
-   * the ~2KB inventory of unrelated resources is noise, not signal.
-   * Default: false (inventory is injected).
-   */
   skipFilesContext?: boolean;
+  jevContextCompact?: boolean;
   /**
    * Optional starter tool catalog. When set, the first model request includes
    * only these tool schemas plus `tool-search`; the full action registry remains
    * searchable, and matching tool schemas from `tool-search` results are added
    * to the next model request. This keeps first-token latency low without
-   * forcing rarely used capabilities into every prompt.
+   * forcing rarely used capabilities into every prompt. The framework also
+   * promotes common provider/corpus/code-execution tools when the current
+   * app/mode registry exposes them, so prompts that teach broad integrations do
+   * not describe tools that require an extra discovery turn before use.
    */
   initialToolNames?: string[];
-  /**
-   * App-level default tool limits. Each action's own `timeoutMs` /
-   * `maxResultChars` takes precedence; this sets the fallback for actions
-   * that don't declare their own limits.
-   */
-  toolLimits?: { timeoutMs?: number; maxResultChars?: number };
+  toolLimits?: {
+    timeoutMs?: number;
+    maxResultChars?: number;
+    hardMaxResultChars?: number;
+  };
 }
 
 export async function resolveAgentOwnerEmail(
@@ -735,19 +1903,60 @@ export async function resolveAgentOwnerEmail(
   return ownerEmail ?? getRequestUserEmail() ?? null;
 }
 
+function snapshotAgentRunTrackingSource(): AgentRunTrackingSource | undefined {
+  const requestContext = getRequestContext();
+  if (!requestContext) return undefined;
+  const source = requestContext.agentRunAnonymous
+    ? {
+        ...(requestContext.userEmail
+          ? { anonymousId: requestContext.userEmail }
+          : {}),
+        ...(requestContext.browserSessionId
+          ? { sessionId: requestContext.browserSessionId }
+          : {}),
+      }
+    : {
+        ...(requestContext.userEmail
+          ? { userId: requestContext.userEmail }
+          : {}),
+        ...(requestContext.authUserId
+          ? { authUserId: requestContext.authUserId }
+          : {}),
+        ...(requestContext.browserSessionId
+          ? { sessionId: requestContext.browserSessionId }
+          : {}),
+      };
+  const isSyntheticTraffic = requestContext.isSyntheticTraffic === true;
+  return Object.keys(source).length > 0 || isSyntheticTraffic
+    ? { ...source, ...(isSyntheticTraffic ? { isSyntheticTraffic: true } : {}) }
+    : undefined;
+}
+
 const MAX_RETRIES = 3;
-/**
- * Retry budget override for `builder_gateway_error` — the no-detail Builder
- * gateway fallback. Production data shows this code is almost never
- * transient: it's the gateway emitting `{type:"stop",reason:"error"}` with
- * no explanation, which usually means the upstream provider rejected the
- * call (model quota, account misconfiguration). Retrying the same request
- * synchronously rarely recovers, and each retry emits a `clear` event that
- * wipes the user's visible content and re-streams from scratch — three
- * cycles of "regenerate, clear, regenerate" inside a single run for a
- * failure mode where retrying doesn't help. Keep the budget at 1 so we
- * cover genuinely transient cases without the visible flicker storm.
- */
+const COMPLETION_DATABASE_RETRY_DELAYS_MS = [250, 750, 1_500] as const;
+
+export async function runCompletionCallbackWithDatabaseRetry(
+  callback: () => void | Promise<void>,
+  options?: { sleep?: (ms: number) => Promise<void> },
+): Promise<void> {
+  const sleep =
+    options?.sleep ??
+    ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await callback();
+      return;
+    } catch (error) {
+      const retryDelay = COMPLETION_DATABASE_RETRY_DELAYS_MS[attempt];
+      if (!isTransientDatabaseError(error) || retryDelay === undefined) {
+        throw error;
+      }
+      await sleep(retryDelay);
+    }
+  }
+}
+
 const BUILDER_GATEWAY_ERROR_MAX_RETRIES = 1;
 const RETRY_BASE_DELAY_MS = 2000;
 
@@ -755,31 +1964,115 @@ function maxRetriesForError(err: unknown): number {
   if (err instanceof EngineError) {
     const code = (err.errorCode ?? "").toLowerCase();
     if (code === "builder_gateway_error") {
+      if (isTransientProviderRateLimitError(err)) return MAX_RETRIES;
       return BUILDER_GATEWAY_ERROR_MAX_RETRIES;
     }
   }
   return MAX_RETRIES;
 }
 const TOOL_INPUT_ACTIVITY_INTERVAL_MS = 1500;
+const VISIBLE_RETRY_THRESHOLD_MS = 10_000;
+/**
+ * FIX 2 (durable-background incident): tighter no-progress deadline for ONLY
+ * the FIRST engine-stream event of a model call, and ONLY on the clamped
+ * HOSTED foreground runtime — `isHostedRuntime()` (run-manager.ts, the same
+ * predicate that selects the 40s soft budget) AND NOT proven to be running
+ * inside a Netlify background function (`isInBackgroundFunctionRuntime`). A
+ * hung first model event previously rode the full
+ * `MODEL_STREAM_NO_PROGRESS_TIMEOUT_MS` (90s) before the in-loop watchdog
+ * could emit `auto_continue` — but the hosted foreground function is killed
+ * around 40s, so that watchdog could never actually fire: the run died as a
+ * silent platform kill instead of a recoverable checkpoint (observed: ~40s of
+ * "Contacting model" with zero tokens, then a hard timeout with no
+ * auto_continue ever emitted). Once a real model event has been observed for
+ * this model call, subsequent gaps revert to the normal 90s watchdog — this
+ * only guards the "nothing has happened yet" window. A `gateway-heartbeat`
+ * does NOT count as that first event (it proves the transport is up, not that
+ * the model started); it is excluded from stream progress for the same reason.
+ *
+ * ORDERING INVARIANT (each bound must stay strictly smaller than the next —
+ * do not change one without re-checking the others). This cap exists ONLY
+ * where the 40s ceiling exists: off hosted runtimes (local dev, self-hosted
+ * long-lived Node) `resolveRunSoftTimeoutMs` resolves to 0 (no soft-timeout
+ * regime, no platform wall), a genuinely slow first token — large local
+ * contexts, slow local providers — is legitimate, and the full 90s window
+ * applies unchanged:
+ *   FOREGROUND_FIRST_MODEL_EVENT_TIMEOUT_MS (25s, here)
+ * < HOSTED_SOFT_TIMEOUT_CEILING_MS           (40s, run-manager.ts)
+ * < MODEL_STREAM_NO_PROGRESS_TIMEOUT_MS      (90s, above)
+ * < RUN_NO_PROGRESS_HARD_TIMEOUT_MS          (150s, run-manager.ts)
+ *
+ * Ordering alone is NOT sufficient between the last two, because they do not
+ * measure the same events: the bounds above watch engine-stream frames, while
+ * the run-manager backstop watches events this loop FORWARDS. Extended
+ * thinking produces the first without the second, so the 150s bound sat inside
+ * the working distribution and killed live runs. What keeps them consistent is
+ * the `model_stream` start/end bracket around the engine call, which suspends
+ * the outer backstop while these inner bounds are the ones on duty.
+ *
+ * Background-function runs (proven 15-min budget, no ~40s wall) are likewise
+ * unaffected — they keep the full 90s window for every event, first or not.
+ */
+const FOREGROUND_FIRST_MODEL_EVENT_TIMEOUT_MS = 25_000;
+const EMPTY_FINAL_RESPONSE_RETRY_LIMIT = 2;
+const TRUNCATED_TOOL_CALL_RETRY_LIMIT = 2;
+const MAIN_CHAT_INTERNAL_CONTINUATION_LIMIT = 6;
+const RUN_BUDGET_EXHAUSTED_ERROR_CODE = "run_budget_exhausted";
+const RUN_BUDGET_EXHAUSTED_MESSAGE =
+  "I ran out of time before finishing this step. " +
+  "I stopped rather than keep retrying silently. " +
+  "Check any completed tool cards above before retrying, ideally as one smaller follow-up.";
+const MAX_INLINE_ATTACHMENT_BASE64_CHARS = MAX_INLINE_FILE_BASE64_CHARS;
 const MAX_TEXT_ATTACHMENT_CHARS = 60_000;
+const MAX_TEXT_ATTACHMENTS_TOTAL_CHARS = 80_000;
 const MAX_SELECTION_CONTEXT_CHARS = 8_000;
 const MAX_RESOURCE_INVENTORY_ITEMS = 40;
 const MAX_RESOURCE_INVENTORY_DESCRIPTION_CHARS = 160;
 const MAX_INLINE_SKILL_REFERENCE_CHARS = 40_000;
-const SOURCE_SWEEP_TOOL_CALL_THRESHOLD = 12;
 
-/**
- * Hard cap on the `<current-screen>` block injected into EVERY user message.
- *
- * The screen snapshot comes from the template's `view-screen` action, which can
- * be unbounded — e.g. a recording/meeting page returns the full transcript +
- * every segment. Injected on every turn with no cap, that single block can blow
- * past the model's context window and hard-error the chat with
- * `context_length_exceeded` (observed: a brand-new "hi" message failing because
- * an open recording's transcript shipped in `<current-screen>`). Keep this to a
- * compact page summary; the agent can call `view-screen` (or a data action like
- * `get-recording-player-data`) for full detail on demand.
- */
+const MAX_LOADED_SKILL_SLUGS = 16;
+const LOADED_SKILL_SLUG_PATTERN = /^skill-[a-z0-9]+(?:-+[a-z0-9]+)*$/;
+
+export function normalizeLoadedSkillSlugs(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const slugs = value.filter(
+    (slug): slug is string =>
+      typeof slug === "string" &&
+      slug.length <= 200 &&
+      LOADED_SKILL_SLUG_PATTERN.test(slug),
+  );
+  return [...new Set(slugs.reverse())]
+    .slice(0, MAX_LOADED_SKILL_SLUGS)
+    .reverse();
+}
+
+function skillPageIntactInHistory(
+  messages: readonly EngineMessage[],
+  slug: string,
+  page: string,
+): boolean {
+  const ending = page.trimEnd().slice(-200);
+  return messages.some((message) =>
+    message.content.some(
+      (part) =>
+        part.type === "tool-result" &&
+        part.toolName === "docs-search" &&
+        !part.isError &&
+        part.toolInput.includes(JSON.stringify(slug)) &&
+        part.content.includes(ending),
+    ),
+  );
+}
+export function resolveSourceSweepToolCallThreshold(): number {
+  return getAppConfig().agent.sourceSweepToolCallThreshold;
+}
+const EXPANDED_TOOL_SCHEMA_WARN_BYTES = 32_000;
+const MAX_TOOL_SEARCH_OVERFLOW_NAMES_SHOWN = 5;
+const PROVIDER_CORE_TOOL_NAMES = [
+  TOOL_SEARCH_ACTION_NAME,
+  FOLLOW_UP_SUGGESTIONS_TOOL_NAME,
+];
+
 const MAX_SCREEN_CONTEXT_CHARS = 10_000;
 
 function capScreenContext(text: string): string {
@@ -813,6 +2106,271 @@ function generateRunId(): string {
   return `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+export { DurableAttachmentReferenceRequiredError };
+
+function isDataUrlReference(value: unknown): boolean {
+  return typeof value === "string" && /^\s*data:/i.test(value);
+}
+
+function hasDurableAttachmentUrl(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const normalized = value.trim();
+  if (
+    !normalized ||
+    isDataUrlReference(normalized) ||
+    isRawBase64Payload(normalized) ||
+    !URL.canParse(normalized)
+  ) {
+    return false;
+  }
+  const url = new URL(normalized);
+  return (
+    url.protocol === "https:" &&
+    !url.username &&
+    !url.password &&
+    !url.search &&
+    !url.hash
+  );
+}
+
+const OMIT_DURABLE_DISPATCH_VALUE = Symbol("omit-durable-dispatch-value");
+const DURABLE_ATTACHMENT_PAYLOAD_FIELDS =
+  /^(?:base64|bytes|body|data|dataurl|image|payload)$/i;
+const DURABLE_ATTACHMENT_REFERENCE_FIELDS =
+  /^(?:preview|referenceUrl|src|thumbnail|url)$/i;
+const DURABLE_INLINE_BASE64_MIN_CHARS = 64;
+const DURABLE_INLINE_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+function isInlineByteArray(value: unknown): boolean {
+  return (
+    (Array.isArray(value) &&
+      value.length > 0 &&
+      value.every(
+        (entry) =>
+          typeof entry === "number" &&
+          Number.isInteger(entry) &&
+          entry >= 0 &&
+          entry <= 255,
+      )) ||
+    ((value instanceof Uint8Array || value instanceof Uint8ClampedArray) &&
+      value.length > 0) ||
+    (value instanceof ArrayBuffer && value.byteLength > 0)
+  );
+}
+
+function isRawBase64Payload(value: string): boolean {
+  const normalized = value.trim();
+  return (
+    normalized.length > 0 &&
+    normalized.length % 4 === 0 &&
+    DURABLE_INLINE_BASE64_RE.test(normalized)
+  );
+}
+
+function isInlineBase64Payload(value: string): boolean {
+  const normalized = value.trim();
+  return (
+    normalized.length >= DURABLE_INLINE_BASE64_MIN_CHARS &&
+    isRawBase64Payload(normalized)
+  );
+}
+
+function isInlineAttachmentPayload(value: unknown): boolean {
+  return (
+    (typeof value === "string" &&
+      (parseBase64DataUrl(value) !== null || isRawBase64Payload(value))) ||
+    isInlineByteArray(value)
+  );
+}
+
+function isAttachmentCollectionField(fieldName: string): boolean {
+  const normalized = fieldName.toLowerCase().replace(/[-_]/g, "");
+  return (
+    normalized.endsWith("attachment") ||
+    normalized.endsWith("attachments") ||
+    normalized === "files" ||
+    normalized === "images"
+  );
+}
+
+function containsDurableAttachmentPayload(
+  value: unknown,
+  attachmentContext = false,
+  fieldName?: string,
+  seen = new WeakMap<object, Set<string>>(),
+): boolean {
+  if (typeof value === "string") {
+    if (!attachmentContext) return false;
+    if (DURABLE_ATTACHMENT_PAYLOAD_FIELDS.test(fieldName ?? "")) {
+      return isInlineAttachmentPayload(value);
+    }
+    return (
+      DURABLE_ATTACHMENT_REFERENCE_FIELDS.test(fieldName ?? "") &&
+      (isDataUrlReference(value) || isRawBase64Payload(value))
+    );
+  }
+  if (!value || typeof value !== "object") return false;
+  const visitKey = `${attachmentContext}:${fieldName ?? ""}`;
+  let visitedContexts = seen.get(value);
+  if (visitedContexts?.has(visitKey)) return false;
+  if (!visitedContexts) {
+    visitedContexts = new Set();
+    seen.set(value, visitedContexts);
+  }
+  visitedContexts.add(visitKey);
+  if (
+    attachmentContext &&
+    DURABLE_ATTACHMENT_PAYLOAD_FIELDS.test(fieldName ?? "") &&
+    isInlineByteArray(value)
+  ) {
+    return true;
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) =>
+      containsDurableAttachmentPayload(
+        item,
+        attachmentContext,
+        fieldName,
+        seen,
+      ),
+    );
+  }
+
+  const item = value as Record<string, unknown>;
+  const isAttachment =
+    attachmentContext ||
+    item.type === "image" ||
+    item.type === "file" ||
+    item.type === "document" ||
+    [item.contentType, item.mediaType, item.mimeType].some(
+      (mimeType) => typeof mimeType === "string" && /^image\//i.test(mimeType),
+    );
+  return Object.entries(item).some(([key, child]) =>
+    containsDurableAttachmentPayload(
+      child,
+      isAttachment || isAttachmentCollectionField(key),
+      key,
+      seen,
+    ),
+  );
+}
+
+function sanitizeDurableAttachment(
+  value: unknown,
+  attachmentContext = false,
+  requiredAttachment = false,
+  fieldName?: string,
+): unknown {
+  if (attachmentContext && isDataUrlReference(value)) {
+    return OMIT_DURABLE_DISPATCH_VALUE;
+  }
+  const attachmentPayloadField = DURABLE_ATTACHMENT_PAYLOAD_FIELDS.test(
+    fieldName ?? "",
+  );
+  const attachmentReferenceField = DURABLE_ATTACHMENT_REFERENCE_FIELDS.test(
+    fieldName ?? "",
+  );
+  if (
+    attachmentContext &&
+    ((attachmentPayloadField && isInlineAttachmentPayload(value)) ||
+      (attachmentReferenceField &&
+        typeof value === "string" &&
+        (isInlineBase64Payload(value) ||
+          (value.trim().length > 0 && !hasDurableAttachmentUrl(value)))))
+  ) {
+    return OMIT_DURABLE_DISPATCH_VALUE;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((item) =>
+        sanitizeDurableAttachment(
+          item,
+          attachmentContext,
+          requiredAttachment,
+          fieldName,
+        ),
+      )
+      .filter((item) => item !== OMIT_DURABLE_DISPATCH_VALUE);
+  }
+  if (typeof value === "string") {
+    return stripInlineBytes(value, "placeholder");
+  }
+  if (!value || typeof value !== "object") return value;
+
+  const item = value as Record<string, unknown>;
+  const typedAttachment =
+    item.type === "image" ||
+    item.type === "file" ||
+    item.type === "document" ||
+    [item.contentType, item.mediaType, item.mimeType].some(
+      (mimeType) => typeof mimeType === "string" && /^image\//i.test(mimeType),
+    );
+  const isAttachment = attachmentContext || typedAttachment;
+  const hasInlinePayload =
+    isAttachment && containsDurableAttachmentPayload(item, true);
+  const hasDurableReference =
+    item.type === "image"
+      ? hasDurableAttachmentUrl(item.url)
+      : hasDurableAttachmentUrl(item.url) ||
+        hasDurableAttachmentUrl(item.referenceUrl);
+  const hasInlineReference = [item.url, item.referenceUrl].some(
+    (reference) =>
+      typeof reference === "string" &&
+      reference.trim().length > 0 &&
+      !hasDurableAttachmentUrl(reference),
+  );
+  if (
+    (requiredAttachment || typedAttachment) &&
+    (hasInlinePayload || hasInlineReference) &&
+    !hasDurableReference
+  ) {
+    throw new DurableAttachmentReferenceRequiredError();
+  }
+
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(item)) {
+    const attachmentCollection = isAttachmentCollectionField(key);
+    const next = sanitizeDurableAttachment(
+      child,
+      isAttachment || attachmentCollection,
+      attachmentCollection,
+      key,
+    );
+    if (next !== OMIT_DURABLE_DISPATCH_VALUE)
+      Object.defineProperty(sanitized, key, {
+        value: next,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+  }
+  return sanitized;
+}
+
+export function serializeDurableDispatchPayload(
+  body: Record<string, unknown>,
+): string {
+  const sanitized = sanitizeDurableAttachment(body);
+  if (sanitized === OMIT_DURABLE_DISPATCH_VALUE) {
+    throw new TypeError("Durable dispatch payload could not be serialized");
+  }
+  const payload = JSON.stringify(sanitized);
+  if (typeof payload !== "string") {
+    throw new TypeError("Durable dispatch payload could not be serialized");
+  }
+  return payload;
+}
+
+function approvedInputRequiresForeground(input: unknown): boolean {
+  const originalPayload = JSON.stringify({ input });
+  try {
+    return serializeDurableDispatchPayload({ input }) !== originalPayload;
+  } catch (error) {
+    if (error instanceof DurableAttachmentReferenceRequiredError) return true;
+    throw error;
+  }
+}
+
 function toolInputActivityLabel(toolName?: string): string {
   return toolName ? `Preparing ${toolName} action` : "Preparing action input";
 }
@@ -822,22 +2380,10 @@ function toolInputActivityLabel(toolName?: string): string {
  */
 export function isContextTooLongError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
-  const msg = err.message.toLowerCase();
-  if (
-    msg.includes("context_length_exceeded") ||
-    msg.includes("input_too_long") ||
-    msg.includes("too many tokens") ||
-    msg.includes("prompt is too long") ||
-    msg.includes("reduce the length") ||
-    // Gemini phrasing
-    msg.includes("input token count exceeds") ||
-    msg.includes("request too large")
-  )
+  if (err instanceof EngineError && err.contextOverflow === true) return true;
+  if (isContextOverflowMessage(err.message)) return true;
+  if (err instanceof EngineError && isContextOverflowCode(err.errorCode)) {
     return true;
-  if (err instanceof EngineError) {
-    const code = (err.errorCode ?? "").toLowerCase();
-    if (code.includes("context_length") || code.includes("input_too_long"))
-      return true;
   }
   return false;
 }
@@ -849,7 +2395,6 @@ export function isRetryableError(err: unknown): boolean {
   const engineErr = err instanceof EngineError ? err : null;
   const code = (engineErr?.errorCode ?? "").toLowerCase();
 
-  // Hard non-retryable codes — check these first.
   if (code === "builder_gateway_timeout") return false;
   if (
     code === "rate_limit_exceeded" ||
@@ -857,13 +2402,10 @@ export function isRetryableError(err: unknown): boolean {
   )
     return false;
 
-  // Prefer structured fields from the engine before falling back to message
-  // keyword matching — avoids false positives on user-supplied text that
-  // happens to contain "rate_limit" etc.
   if (engineErr) {
-    // Provider explicitly said it is retryable.
-    if (engineErr.providerRetryable === true) return true;
-    // HTTP status-code checks (429, 500, 502, 503, 529 = Anthropic overloaded).
+    if (engineErr.providerRetryable !== undefined) {
+      return engineErr.providerRetryable;
+    }
     const sc = engineErr.statusCode;
     if (sc === 429 || sc === 500 || sc === 502 || sc === 503 || sc === 529)
       return true;
@@ -871,28 +2413,29 @@ export function isRetryableError(err: unknown): boolean {
 
   return (
     code === "builder_gateway_error" ||
+    code === BUILDER_GATEWAY_INTERNAL_ERROR_CODE ||
     code === "builder_gateway_network_error" ||
+    code === "provider_network_error" ||
+    code === "http_429" ||
     code === "http_500" ||
     code === "http_502" ||
     code === "http_503" ||
     code === "http_504" ||
     code === "timeout" ||
-    // Anthropic
     msg.includes("overloaded") ||
     msg.includes("rate_limit") ||
+    /\b429\b/.test(msg) ||
     msg.includes("529") ||
-    // OpenAI phrasing
     msg.includes("rate limit reached") ||
-    // Google / Gemini
     msg.includes("resource_exhausted") ||
     msg.includes("quota exceeded") ||
-    // Generic HTTP codes
     msg.includes("502") ||
     msg.includes("503") ||
     msg.includes("504") ||
     msg.includes("gateway error") ||
     msg.includes("socket hang up") ||
     msg.includes("connection reset") ||
+    isProviderConnectionErrorMessage(msg) ||
     msg.includes("too many requests") ||
     msg.includes("timeout") ||
     msg.includes("gateway timeout") ||
@@ -901,30 +2444,10 @@ export function isRetryableError(err: unknown): boolean {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Context-window overflow recovery
-// ---------------------------------------------------------------------------
-
-/**
- * Number of recent messages to protect when trimming tool results.
- * Messages in the tail of this length are left completely intact; only
- * older messages have their tool-result text replaced with a stub.
- */
 const CONTEXT_TRIM_KEEP_TAIL = 10;
 const CONTEXT_TRIM_STUB =
   "[result trimmed to save context — re-run the tool if needed]";
 
-/**
- * Attempt one aggressive trim of old tool-result content to reduce the
- * context window usage.  Tool-result messages older than the last
- * {@link CONTEXT_TRIM_KEEP_TAIL} messages have their text replaced with a
- * short stub.  All user/assistant text messages and the recent tail are
- * preserved exactly.
- *
- * Returns a new array — the original is not mutated.
- * Returns `null` when there are no trimable tool results (so the caller can
- * skip the retry).
- */
 export function trimOldToolResults(
   messages: EngineMessage[],
   keepTail = CONTEXT_TRIM_KEEP_TAIL,
@@ -933,10 +2456,8 @@ export function trimOldToolResults(
   let trimmed = false;
 
   const result = messages.map((msg, idx): EngineMessage => {
-    // Keep messages in the protected tail intact
     if (idx >= cutoff) return msg;
 
-    // Only touch user messages that contain tool-result parts
     if (msg.role !== "user") return msg;
 
     const hasToolResult = msg.content.some((p) => p.type === "tool-result");
@@ -956,11 +2477,44 @@ export function trimOldToolResults(
   return trimmed ? result : null;
 }
 
-/** Wait with exponential backoff, respecting abort signal */
-function retryDelay(attempt: number, signal: AbortSignal): Promise<void> {
+function maxRetryDelayMs(attempt: number, retryAfterMs?: number): number {
+  return Math.max(
+    RETRY_BASE_DELAY_MS * Math.pow(2, attempt) * 1.1,
+    retryAfterMs ?? 0,
+  );
+}
+
+export function remainingRunBudgetMs(startedAt: number): number {
+  const ceilingMs = resolveRunSoftTimeoutMs(undefined, {
+    useHostedDefault: true,
+    backgroundFunction: isInBackgroundFunctionRuntime(),
+  });
+  if (ceilingMs <= 0) return Number.POSITIVE_INFINITY;
+  return ceilingMs - (Date.now() - startedAt);
+}
+
+function hasBudgetForEngineRetry(
+  startedAt: number,
+  attempt: number,
+  retryAfterMs?: number,
+): boolean {
+  const remainingMs = remainingRunBudgetMs(startedAt);
+  if (remainingMs === Number.POSITIVE_INFINITY) return true;
+  return (
+    remainingMs - maxRetryDelayMs(attempt, retryAfterMs) >=
+    SELF_CHAIN_MIN_CONTINUATION_BUDGET_MS
+  );
+}
+
+function retryDelay(
+  attempt: number,
+  signal: AbortSignal,
+  retryAfterMs?: number,
+): Promise<void> {
   const baseMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
   const jitter = baseMs * 0.1;
-  const ms = Math.max(0, baseMs + (Math.random() * 2 - 1) * jitter);
+  const computedMs = Math.max(0, baseMs + (Math.random() * 2 - 1) * jitter);
+  const ms = Math.max(computedMs, retryAfterMs ?? 0);
   return new Promise((resolve, reject) => {
     if (signal.aborted) return reject(new Error("aborted"));
     const onAbort = () => {
@@ -973,23 +2527,6 @@ function retryDelay(attempt: number, signal: AbortSignal): Promise<void> {
     }, ms);
     signal.addEventListener("abort", onAbort, { once: true });
   });
-}
-
-type SupportedImageMediaType =
-  | "image/jpeg"
-  | "image/png"
-  | "image/gif"
-  | "image/webp";
-
-function isSupportedImageMediaType(
-  mediaType: string,
-): mediaType is SupportedImageMediaType {
-  return (
-    mediaType === "image/jpeg" ||
-    mediaType === "image/png" ||
-    mediaType === "image/gif" ||
-    mediaType === "image/webp"
-  );
 }
 
 function isSvgMediaType(mediaType: string | undefined): boolean {
@@ -1009,21 +2546,32 @@ function unwrapTextAttachmentEnvelope(text: string): string {
   return match ? match[1] : text;
 }
 
-function truncateTextAttachment(text: string, attachmentName?: string): string {
-  if (text.length <= MAX_TEXT_ATTACHMENT_CHARS) return text;
+function truncateTextAttachment(
+  text: string,
+  attachmentName?: string,
+  maxChars = MAX_TEXT_ATTACHMENT_CHARS,
+): string {
+  if (text.length <= maxChars) return text;
 
-  const omitted = text.length - MAX_TEXT_ATTACHMENT_CHARS;
+  const omitted = text.length - maxChars;
   const readHint = attachmentName
     ? ` Use the \`read-attachment\` tool with name="${escapeAttachmentAttribute(attachmentName)}" to read the rest.`
     : "";
-  return `${text.slice(0, MAX_TEXT_ATTACHMENT_CHARS)}\n\n[Attachment truncated after ${MAX_TEXT_ATTACHMENT_CHARS.toLocaleString()} characters; ${omitted.toLocaleString()} characters omitted.${readHint}]`;
+  if (maxChars === 0) {
+    return `[Attachment content omitted from the initial request; ${omitted.toLocaleString()} characters available.${readHint}]`;
+  }
+  return `${text.slice(0, maxChars)}\n\n[Attachment truncated after ${maxChars.toLocaleString()} characters; ${omitted.toLocaleString()} characters omitted.${readHint}]`;
 }
 
-function formatTextAttachment(att: AgentChatAttachment): string | null {
+function formatTextAttachment(
+  att: AgentChatAttachment,
+  maxChars = MAX_TEXT_ATTACHMENT_CHARS,
+): string | null {
   if (typeof att.text !== "string" || att.text.length === 0) return null;
   const text = truncateTextAttachment(
     unwrapTextAttachmentEnvelope(att.text),
     att.name,
+    maxChars,
   );
 
   const attrs = [
@@ -1041,24 +2589,98 @@ function dataUrlToFilePart(
   att: AgentChatAttachment,
 ): { type: "file"; data: string; mediaType: string; filename?: string } | null {
   if (att.type !== "file" || typeof att.data !== "string") return null;
-  const match = att.data.match(/^data:([^;]+);base64,(.+)$/);
-  if (!match) return null;
+  const parsed = parseBase64DataUrl(att.data);
+  if (!parsed) return null;
   return {
     type: "file",
-    data: match[2],
-    mediaType: att.contentType || match[1],
+    data: parsed.data,
+    mediaType:
+      att.contentType?.split(";", 1)[0]?.trim().toLowerCase() ||
+      parsed.mediaType,
     filename: att.name || undefined,
   };
+}
+
+function describeUnprocessedAttachment(att: AgentChatAttachment): string {
+  const name = escapeAttachmentAttribute(att.name || "attachment");
+  const contentType = att.contentType
+    ? ` contentType="${escapeAttachmentAttribute(att.contentType)}"`
+    : "";
+  return `<chat-attachment-processing-error code="unsupported-or-malformed-payload" name="${name}"${contentType}>The attachment included file data or a URL reference, but its contents were not sent to the model because the payload could not be converted to a supported attachment. Do not infer or describe its contents. Tell the user it could not be read and ask them to reattach it in a supported format.</chat-attachment-processing-error>`;
+}
+
+function describeReferenceOnlyAttachment(att: AgentChatAttachment): string {
+  const name = escapeAttachmentAttribute(att.name || "attachment");
+  const contentType = att.contentType
+    ? ` contentType="${escapeAttachmentAttribute(att.contentType)}"`
+    : "";
+  const url = escapeAttachmentAttribute(att.url || "");
+  return `<chat-attachment-reference-note code="reference-only-unavailable" name="${name}"${contentType} url="${url}">The attachment has a stored reference URL, but no readable contents were included in this request. Do not claim to have read or describe its contents. Use the URL only with an authorized tool or target that can retrieve it, or tell the user its contents were unavailable.</chat-attachment-reference-note>`;
+}
+
+function describeAttachmentPreUploadWarning(): string {
+  return '<chat-attachment-preparation-warning code="pre-upload-failed">The attachment pre-upload step failed. This may affect its durable URL, but it does not prove the contents are unreadable in this request. Inspect any inline payload or reference normally, and only report an attachment as unreadable if the actual payload is missing or invalid.</chat-attachment-preparation-warning>';
+}
+
+function describeMissingAttachmentPayload(att: AgentChatAttachment): string {
+  const name = escapeAttachmentAttribute(att.name || "attachment");
+  const contentType = att.contentType
+    ? ` contentType="${escapeAttachmentAttribute(att.contentType)}"`
+    : "";
+  return `<chat-attachment-processing-error code="missing-payload" name="${name}"${contentType}>The attachment arrived without readable file contents or a reference. Do not infer or describe its contents. Tell the user it could not be read and ask them to attach it again.</chat-attachment-processing-error>`;
+}
+
+function describeUnsupportedVisionAttachment(att: AgentChatAttachment): string {
+  const name = escapeAttachmentAttribute(att.name || "attachment");
+  const contentType = att.contentType
+    ? ` contentType="${escapeAttachmentAttribute(att.contentType)}"`
+    : "";
+  return `<chat-attachment-capability-note code="vision-not-supported" name="${name}"${contentType}>This request's selected model does not support vision, so the image pixels were not sent. Do not describe the image contents. Tell the user that ${name} could not be visually analyzed with the selected model and ask them to choose a vision-capable model.</chat-attachment-capability-note>`;
+}
+
+const MODEL_VISION_CAPABILITY_PATTERNS = [
+  /^(?:meta-llama\/)?llama-4-(?:scout|maverick)(?:-|$)/,
+  /^(?:qwen\/)?qwen3\.(?:6|8)-27b(?:[-:]|$)/,
+  /^(?:qwen\/)?qwen3-vl-32b-instruct(?:[-:]|$)/,
+  /^pixtral(?:[-:]|$)/,
+  /^mistral-(?:large-2512|large-latest|medium-2508|medium-latest|small-2506|small-latest)(?:[-:]|$)/,
+  /^ministral-(?:14b|8b|3b)-2512(?:[-:]|$)/,
+  /^command-a-vision(?:[-:]|$)/,
+  /(?:^|\/)(?:llama4|llama3\.2-vision|gemma3|gemma4|llava|llava-llama3|bakllava|moondream|qwen2\.5vl|qwen2\.5-vl|qwen3-vl|minicpm-v|mistral-small3\.[12])(?=[:/]|$)/,
+];
+
+const MODEL_TEXT_ONLY_IMAGE_PATTERNS = [
+  /(?:^|\/)(?:gemma3(?::|\/)|gemma-3-)(?:270m|1b)(?:[-:]|$)/,
+];
+
+/** @internal exported for unit tests only */
+export function isAgentModelVisionCapable(
+  model: string,
+  engineVision: boolean,
+): boolean {
+  const normalized = model.trim().toLowerCase();
+  if (
+    MODEL_TEXT_ONLY_IMAGE_PATTERNS.some((pattern) => pattern.test(normalized))
+  ) {
+    return false;
+  }
+  return (
+    engineVision ||
+    MODEL_VISION_CAPABILITY_PATTERNS.some((pattern) => pattern.test(normalized))
+  );
 }
 
 export function buildUserContentWithAttachments(opts: {
   text: string;
   attachments?: AgentChatAttachment[];
+  vision?: boolean;
 }): EngineContentPart[] {
   const userContent: EngineContentPart[] = [];
   const textAttachments: string[] = [];
+  let remainingTextAttachmentChars = MAX_TEXT_ATTACHMENTS_TOTAL_CHARS;
 
   for (const att of opts.attachments ?? []) {
+    if (att.displayOnly === true) continue;
     const uploadedUrl = (att as any).url as string | undefined;
     if ((att as any).referenceOnly === true && uploadedUrl) {
       const label = att.name ? `"${att.name}"` : "A file";
@@ -1070,28 +2692,67 @@ export function buildUserContentWithAttachments(opts: {
     }
 
     if (att.type === "image") {
+      if (opts.vision === false) {
+        textAttachments.push(describeUnsupportedVisionAttachment(att));
+        continue;
+      }
       if (!att.data) {
         if (uploadedUrl) {
           const label = att.name ? `"${att.name}"` : "An image";
           textAttachments.push(
             `[${label} was uploaded to ${uploadedUrl}, but was not sent as a vision image because no supported base64 image data was present. Use the URL for embedding/reference if needed.]`,
           );
+        } else {
+          textAttachments.push(describeMissingAttachmentPayload(att));
         }
         continue;
       }
-      const match = att.data.match(/^data:(image\/[^;]+);base64,(.+)$/);
-      if (match && isSupportedImageMediaType(match[1])) {
-        userContent.push({
-          type: "image",
-          data: match[2],
-          mediaType: match[1],
+      const parsed = parseBase64DataUrl(att.data);
+      const mediaType = parsed
+        ? normalizeImageMediaType(parsed.mediaType)
+        : null;
+      if (
+        parsed &&
+        mediaType &&
+        parsed.data.length > MAX_INLINE_IMAGE_BASE64_CHARS
+      ) {
+        const label = att.name ? `"${att.name}"` : "An image";
+        const limit = formatBase64CharBudget(MAX_INLINE_IMAGE_BASE64_CHARS);
+        textAttachments.push(
+          uploadedUrl
+            ? `[${label} exceeds the ${limit} per-image limit for inline vision analysis, so it was not sent as an image. It was uploaded to ${uploadedUrl}; use that URL for embedding/reference.]`
+            : `[${label} exceeds the ${limit} per-image limit for inline vision analysis, so you cannot see it. This is a size limit, not a storage-configuration problem: connecting file storage would not make this image readable. Tell the user the image is over the ${limit} limit and ask for a smaller or more compressed version.]`,
+        );
+        continue;
+      }
+      if (parsed && mediaType) {
+        const verdict = reconcileImageBytes({
+          base64: parsed.data,
+          declared: mediaType,
         });
+        if (verdict.kind === "ok") {
+          userContent.push({
+            type: "image",
+            data: parsed.data,
+            mediaType: verdict.mediaType,
+          });
+        } else {
+          const label = att.name ? `"${att.name}"` : "An image";
+          const uploadedHint = uploadedUrl
+            ? ` It is available at ${uploadedUrl}; use that URL for embedding/reference if the task does not require vision analysis.`
+            : "";
+          const logName = att.name ?? "(unnamed)";
+          console.warn(
+            `[attachments] dropped image block name=${logName} declared=${parsed.mediaType} verdict=${verdict.kind} base64Chars=${parsed.data.length}`,
+          );
+          textAttachments.push(
+            `[${label} could not be sent for vision analysis because ${describeAttachmentBytesVerdict(verdict)}.` +
+              uploadedHint +
+              ` Tell the user which file it was and what is wrong with it; do not describe its contents, and do not blame file storage or a size limit.]`,
+          );
+        }
       } else {
-        // The client sent an image in an unsupported format (HEIC, TIFF, AVIF,
-        // etc.). Inject a short text placeholder so the model knows the image
-        // was present but could not be processed, rather than silently omitting
-        // it and leaving the model confused ("I don't see an image").
-        const mime = match?.[1] ?? att.contentType ?? "unknown format";
+        const mime = parsed?.mediaType ?? att.contentType ?? "unknown format";
         const label = att.name ? `"${att.name}"` : "An image";
         const uploadedHint = uploadedUrl
           ? ` It is available at ${uploadedUrl}; use that URL for embedding/reference if the task does not require vision analysis.`
@@ -1116,13 +2777,76 @@ export function buildUserContentWithAttachments(opts: {
 
     const filePart = dataUrlToFilePart(att);
     if (filePart) {
+      if (filePart.data.length > MAX_INLINE_ATTACHMENT_BASE64_CHARS) {
+        const label = att.name ? `"${att.name}"` : "A file";
+        const limit = formatBase64CharBudget(
+          MAX_INLINE_ATTACHMENT_BASE64_CHARS,
+        );
+        textAttachments.push(
+          uploadedUrl
+            ? `[${label} exceeds the ${limit} per-file limit for inline reading. It was uploaded to ${uploadedUrl}; read it from that URL if its contents are needed.]`
+            : `[${label} exceeds the ${limit} per-file limit for inline reading, so you cannot read its contents. This is a size limit, not a storage-configuration problem. Tell the user the file is over the ${limit} limit and ask for a smaller one.]`,
+        );
+        continue;
+      }
+      if (filePart.mediaType === "application/pdf") {
+        const verdict = reconcilePdfBytes({
+          base64: filePart.data,
+          declared: filePart.mediaType,
+        });
+        if (verdict.kind !== "ok") {
+          const label = att.name ? `"${att.name}"` : "A file";
+          const logName = att.name ?? "(unnamed)";
+          console.warn(
+            `[attachments] dropped document block name=${logName} verdict=${verdict.kind} base64Chars=${filePart.data.length}`,
+          );
+          const why = describeAttachmentBytesVerdict(verdict);
+          textAttachments.push(
+            uploadedUrl
+              ? `[${label} could not be read as a PDF because ${why}. It was uploaded to ${uploadedUrl}; use that URL for reference. Tell the user the file is not a readable PDF.]`
+              : `[${label} could not be read as a PDF because ${why}. Tell the user which file it was and what is wrong with it; do not describe its contents.]`,
+          );
+          continue;
+        }
+      }
       userContent.push(filePart);
       continue;
     }
 
-    const textAttachment = formatTextAttachment(att);
+    const rawTextAttachment =
+      typeof att.text === "string"
+        ? unwrapTextAttachmentEnvelope(att.text)
+        : "";
+    const attachmentCharBudget = Math.min(
+      MAX_TEXT_ATTACHMENT_CHARS,
+      remainingTextAttachmentChars,
+    );
+    const textAttachment = formatTextAttachment(att, attachmentCharBudget);
     if (textAttachment) {
       textAttachments.push(textAttachment);
+      remainingTextAttachmentChars -= Math.min(
+        rawTextAttachment.length,
+        attachmentCharBudget,
+      );
+    }
+    if (!textAttachment && typeof att.data === "string") {
+      textAttachments.push(describeUnprocessedAttachment(att));
+    } else if (!textAttachment && typeof uploadedUrl === "string") {
+      textAttachments.push(describeReferenceOnlyAttachment(att));
+    } else if (
+      !textAttachment &&
+      !(
+        att.type === "file" &&
+        typeof att.text === "string" &&
+        att.text.length === 0 &&
+        att.contentType
+          ?.split(";", 1)[0]
+          ?.trim()
+          .toLowerCase()
+          .startsWith("text/")
+      )
+    ) {
+      textAttachments.push(describeMissingAttachmentPayload(att));
     }
   }
 
@@ -1135,6 +2859,112 @@ export function buildUserContentWithAttachments(opts: {
   });
 
   return userContent;
+}
+
+/** Images reach only a model that reads them; the model learns one was withheld. */
+function replaceImagesForModelWithoutVision(
+  messages: EngineMessage[],
+  model: string,
+): EngineMessage[] {
+  const note = `<chat-attachment-processing-error code="model-without-vision" model="${escapeAttachmentAttribute(model)}">An attached image was not sent because the active model cannot read images. Do not infer or describe its contents. Tell the user to switch to a vision-capable model if the image matters.</chat-attachment-processing-error>`;
+  return messages.map((message) =>
+    message.content.some((part) => part.type === "image")
+      ? {
+          ...message,
+          content: message.content.map((part) =>
+            part.type === "image"
+              ? { type: "text" as const, text: note }
+              : part,
+          ),
+        }
+      : message,
+  );
+}
+
+/**
+ * Every engine's stop error passes through here with the request in hand, so
+ * this is where a provider's rejection of an inline attachment becomes the
+ * non-retryable `invalid_attachment`: resending the same bytes fails the same
+ * way, and an `http_400` lets Retry loop on it.
+ */
+function engineStopError(
+  event: Extract<EngineEvent, { type: "stop" }>,
+  messages: EngineMessage[],
+): EngineError {
+  const error = event.error ?? "Engine stream error";
+  const parts = messages.flatMap((message) => message.content);
+  const hasInlineAttachment = parts.some(
+    (part) =>
+      part.type === "image" ||
+      part.type === "file" ||
+      (part.type === "tool-result" && (part.images?.length ?? 0) > 0),
+  );
+  const attachmentRejected =
+    event.errorCode === "invalid_attachment" ||
+    (hasInlineAttachment &&
+      (event.statusCode === 413 ||
+        ((event.statusCode === undefined ||
+          event.statusCode === 400 ||
+          event.statusCode === 422) &&
+          isInvalidAttachmentProviderMessage(error))));
+  const names = parts.flatMap((part) =>
+    part.type === "file" && part.filename ? [`"${part.filename}"`] : [],
+  );
+  return new EngineError(
+    attachmentRejected
+      ? `The model provider rejected an attachment in this request${names.length > 0 ? ` (${names.join(", ")})` : ""}: ${error}`
+      : error,
+    {
+      errorCode: attachmentRejected ? "invalid_attachment" : event.errorCode,
+      upgradeUrl: event.upgradeUrl,
+      statusCode: event.statusCode,
+      providerRetryable: attachmentRejected ? false : event.providerRetryable,
+      contextOverflow: event.contextOverflow,
+      requestId: event.requestId,
+      requestShape: event.requestShape,
+      retryAfterMs: event.retryAfterMs,
+    },
+  );
+}
+
+export function appendRequestAttachmentContextToResumedHistory(
+  messages: EngineMessage[],
+  attachments: AgentChatAttachment[] | undefined,
+  options: { vision?: boolean } = {},
+): void {
+  if (!attachments?.length) return;
+  const attachmentContent = buildUserContentWithAttachments({
+    text: "",
+    attachments,
+    vision: options.vision,
+  }).filter((part) => part.type !== "text" || part.text.trim());
+  if (!attachmentContent.length) return;
+
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]!;
+    if (
+      message.role !== "user" ||
+      message.content.some((part) => part.type === "tool-result")
+    )
+      continue;
+    const missingContent = attachmentContent.filter(
+      (candidate) =>
+        !message.content.some((existing) =>
+          existing.type === "image" && candidate.type === "image"
+            ? existing.data === candidate.data &&
+              existing.mediaType === candidate.mediaType
+            : existing.type === "file" && candidate.type === "file"
+              ? existing.data === candidate.data &&
+                existing.mediaType === candidate.mediaType &&
+                existing.filename === candidate.filename
+              : existing.type === "text" && candidate.type === "text"
+                ? existing.text.includes(candidate.text.trim())
+                : false,
+        ),
+    );
+    message.content.push(...missingContent);
+    return;
+  }
 }
 
 function coerceStructuredToolResultWire(part: {
@@ -1160,8 +2990,364 @@ function coerceStructuredToolResultWire(part: {
   return { toolCallId, content };
 }
 
+type StructuredHistoryImageReference = Extract<
+  AgentChatStructuredContentPart,
+  { type: "image-reference" }
+>;
+type StructuredHistoryImageResolution =
+  | EngineImagePart
+  | Extract<EngineContentPart, { type: "text" }>;
+
+function isStructuredHistoryImageReference(
+  part: unknown,
+): part is StructuredHistoryImageReference {
+  if (!part || typeof part !== "object") return false;
+  const reference = part as Record<string, unknown>;
+  return (
+    reference.type === "image-reference" &&
+    typeof reference.url === "string" &&
+    reference.url.length <= 2_048 &&
+    (reference.name === undefined ||
+      (typeof reference.name === "string" && reference.name.length <= 200)) &&
+    (reference.mediaType === undefined ||
+      (typeof reference.mediaType === "string" &&
+        reference.mediaType.length <= 100))
+  );
+}
+
+function structuredHistoryImageReferenceKey(
+  reference: StructuredHistoryImageReference,
+): string {
+  return JSON.stringify([
+    reference.url,
+    reference.name ?? "",
+    reference.mediaType ?? "",
+  ]);
+}
+
+function durableStructuredHistoryImageUrl(value: string): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch (error) {
+    if (error instanceof TypeError) return undefined;
+    throw error;
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    return undefined;
+  }
+  const durableUrl = url.toString();
+  return durableUrl.length <= 2_048 ? durableUrl : undefined;
+}
+
+function attemptedStructuredHistoryImageUrls(
+  history: AgentChatStructuredMessage[] | undefined,
+  resolutions: ReadonlyMap<string, StructuredHistoryImageResolution>,
+  vision: boolean,
+): string[] {
+  const urls = new Set<string>();
+  // Only a vision turn attempts hydration. A failed attempt still counts, so the
+  // prior-thread fallback must not retry the same URL and consume another slot.
+  if (!vision || !Array.isArray(history)) return [];
+  for (const message of history) {
+    if (message?.role !== "user" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (!isStructuredHistoryImageReference(part)) continue;
+      const resolution = resolutions.get(
+        structuredHistoryImageReferenceKey(part),
+      );
+      if (!resolution) continue;
+      urls.add(canonicalImageReferenceUrl(part.url));
+    }
+  }
+  return [...urls];
+}
+
+function safeHistoryImageName(name: string | undefined): string {
+  return (
+    name
+      ?.replace(/[\u0000-\u001f\u007f\[\]]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 200) || "image"
+  );
+}
+
+function unavailableHistoryImageText(
+  reference: StructuredHistoryImageReference,
+  reason: string,
+): string {
+  const name = safeHistoryImageName(reference.name);
+  return `[Earlier uploaded image "${name}" is unavailable for visual analysis because ${reason}. Its image contents were not sent; do not infer them. Ask the user to upload the image again if visual analysis is needed.]`;
+}
+
+interface StructuredHistoryResolutionIdentities {
+  imagesByMediaType: Map<string, Set<string>>;
+  texts: Set<string>;
+}
+
+function structuredHistoryResolutionIdentities(
+  messages: EngineMessage[],
+): StructuredHistoryResolutionIdentities {
+  const identities: StructuredHistoryResolutionIdentities = {
+    imagesByMediaType: new Map(),
+    texts: new Set(),
+  };
+  for (const message of messages) {
+    for (const part of message.content) {
+      addStructuredHistoryResolutionIdentity(identities, part);
+    }
+  }
+  return identities;
+}
+
+function addStructuredHistoryResolutionIdentity(
+  identities: StructuredHistoryResolutionIdentities,
+  part: EngineContentPart,
+): void {
+  if (part.type === "image") {
+    let data = identities.imagesByMediaType.get(part.mediaType);
+    if (!data) {
+      data = new Set();
+      identities.imagesByMediaType.set(part.mediaType, data);
+    }
+    data.add(part.data);
+  } else if (part.type === "text") {
+    identities.texts.add(part.text);
+  }
+}
+
+function hasStructuredHistoryResolutionIdentity(
+  identities: StructuredHistoryResolutionIdentities,
+  part: EngineContentPart,
+): boolean {
+  if (part.type === "image") {
+    return (
+      identities.imagesByMediaType.get(part.mediaType)?.has(part.data) === true
+    );
+  }
+  return part.type === "text" && identities.texts.has(part.text);
+}
+
+function structuredHistoryResolutionPartsMissingFromWindow(
+  beforeMemoryWindow: EngineMessage[],
+  afterMemoryWindow: EngineMessage[],
+  history: AgentChatStructuredMessage[] | undefined,
+  resolutions: ReadonlyMap<string, StructuredHistoryImageResolution>,
+): EngineContentPart[] {
+  const identitiesInWindow =
+    structuredHistoryResolutionIdentities(afterMemoryWindow);
+  const identitiesBeforeWindow =
+    structuredHistoryResolutionIdentities(beforeMemoryWindow);
+  const missing: EngineContentPart[] = [];
+  const missingIdentities: StructuredHistoryResolutionIdentities = {
+    imagesByMediaType: new Map(),
+    texts: new Set(),
+  };
+
+  if (!Array.isArray(history)) return missing;
+  for (const message of history) {
+    if (message?.role !== "user" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (!isStructuredHistoryImageReference(part)) continue;
+      const resolution = resolutions.get(
+        structuredHistoryImageReferenceKey(part),
+      );
+      if (!resolution) continue;
+      if (
+        !hasStructuredHistoryResolutionIdentity(
+          identitiesBeforeWindow,
+          resolution,
+        ) ||
+        hasStructuredHistoryResolutionIdentity(
+          identitiesInWindow,
+          resolution,
+        ) ||
+        hasStructuredHistoryResolutionIdentity(missingIdentities, resolution)
+      ) {
+        continue;
+      }
+      addStructuredHistoryResolutionIdentity(missingIdentities, resolution);
+      missing.push(resolution);
+    }
+  }
+  return missing;
+}
+
+function appendUniqueContentPartsToLastUserMessage(
+  messages: EngineMessage[],
+  parts: EngineContentPart[],
+): void {
+  if (parts.length === 0) return;
+  let message: EngineMessage | undefined;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index]?.role === "user") {
+      message = messages[index];
+      break;
+    }
+  }
+  if (!message) {
+    message = { role: "user", content: [] };
+    messages.push(message);
+  }
+  const existing = structuredHistoryResolutionIdentities([message]);
+  for (const part of parts) {
+    if (hasStructuredHistoryResolutionIdentity(existing, part)) continue;
+    addStructuredHistoryResolutionIdentity(existing, part);
+    message.content.push(part);
+  }
+}
+
+export async function hydrateStructuredHistoryImageReferences(
+  history: AgentChatStructuredMessage[] | undefined,
+  options: {
+    vision: boolean;
+    budget: OwnedAttachmentHydrationBudget;
+  },
+): Promise<Map<string, StructuredHistoryImageResolution>> {
+  const resolutions = new Map<string, StructuredHistoryImageResolution>();
+  const urlResolutions = new Map<
+    string,
+    | { kind: "image"; resolution: EngineImagePart }
+    | { kind: "failed"; code: OwnedImageReadFailureCode }
+  >();
+  if (!Array.isArray(history)) return resolutions;
+
+  // Spend the shared request budget on recent prior images first. Engine
+  // conversion still walks history forward, preserving message chronology.
+  for (
+    let messageIndex = history.length - 1;
+    messageIndex >= 0;
+    messageIndex--
+  ) {
+    const message = history[messageIndex];
+    if (message?.role !== "user" || !Array.isArray(message.content)) continue;
+    for (
+      let partIndex = message.content.length - 1;
+      partIndex >= 0;
+      partIndex--
+    ) {
+      const part = message.content[partIndex];
+      if (!isStructuredHistoryImageReference(part)) continue;
+      const key = structuredHistoryImageReferenceKey(part);
+      if (resolutions.has(key)) continue;
+
+      if (!options.vision) {
+        resolutions.set(key, {
+          type: "text",
+          text: `[Earlier uploaded image "${safeHistoryImageName(part.name)}" was not sent because the selected model does not support vision. Do not infer its contents. Ask the user to choose a vision-capable model if visual analysis is needed.]`,
+        });
+        continue;
+      }
+
+      const url = durableStructuredHistoryImageUrl(part.url);
+      const hydrationKey = url ?? part.url;
+      const cached = urlResolutions.get(hydrationKey);
+      if (cached) {
+        resolutions.set(
+          key,
+          cached.kind === "image"
+            ? cached.resolution
+            : {
+                type: "text",
+                text: unavailableHistoryImageText(
+                  part,
+                  describeOwnedImageReadFailure(cached.code),
+                ),
+              },
+        );
+        continue;
+      }
+
+      if (!url) {
+        urlResolutions.set(hydrationKey, {
+          kind: "failed",
+          code: "invalid-url",
+        });
+        resolutions.set(key, {
+          type: "text",
+          text: unavailableHistoryImageText(
+            part,
+            describeOwnedImageReadFailure("invalid-url"),
+          ),
+        });
+        continue;
+      }
+
+      if (!claimOwnedAttachmentHydrationCandidate(options.budget)) {
+        urlResolutions.set(hydrationKey, {
+          kind: "failed",
+          code: "request-candidate-limit",
+        });
+        resolutions.set(key, {
+          type: "text",
+          text: unavailableHistoryImageText(
+            part,
+            describeOwnedImageReadFailure("request-candidate-limit"),
+          ),
+        });
+        continue;
+      }
+
+      const result = await hydrateOwnedImageUrl(
+        url,
+        normalizeImageMediaType(part.mediaType) ?? undefined,
+        options.budget,
+      );
+      if (result.kind === "hydrated") {
+        const parsed = parseBase64DataUrl(result.dataUrl);
+        const mediaType = normalizeImageMediaType(result.mediaType);
+        if (parsed && mediaType) {
+          const resolution = {
+            type: "image" as const,
+            data: parsed.data,
+            mediaType,
+          };
+          urlResolutions.set(hydrationKey, { kind: "image", resolution });
+          resolutions.set(key, resolution);
+          continue;
+        }
+        urlResolutions.set(hydrationKey, {
+          kind: "failed",
+          code: "invalid-image",
+        });
+        resolutions.set(key, {
+          type: "text",
+          text: unavailableHistoryImageText(
+            part,
+            describeOwnedImageReadFailure("invalid-image"),
+          ),
+        });
+        continue;
+      }
+
+      const failureCode: OwnedImageReadFailureCode =
+        result.kind === "unowned" ? "unowned-url" : result.code;
+      urlResolutions.set(hydrationKey, {
+        kind: "failed",
+        code: failureCode,
+      });
+      resolutions.set(key, {
+        type: "text",
+        text: unavailableHistoryImageText(
+          part,
+          describeOwnedImageReadFailure(failureCode),
+        ),
+      });
+    }
+  }
+  return resolutions;
+}
+
 export function structuredHistoryToEngineMessages(
   history: AgentChatStructuredMessage[] | undefined,
+  imageResolutions?: ReadonlyMap<string, StructuredHistoryImageResolution>,
 ): EngineMessage[] | null {
   if (!Array.isArray(history)) return null;
 
@@ -1183,6 +3369,30 @@ export function structuredHistoryToEngineMessages(
       if (part.type === "text" && typeof part.text === "string") {
         if (part.text.length > 0) {
           content.push({ type: "text", text: part.text });
+        }
+        continue;
+      }
+
+      if (part.type === "image-reference" && message.role === "user") {
+        if (!isStructuredHistoryImageReference(part)) {
+          content.push({
+            type: "text",
+            text: "An earlier uploaded image reference could not be loaded for visual analysis. Its image contents were not sent; do not infer them.",
+          });
+          continue;
+        }
+        const resolution = imageResolutions?.get(
+          structuredHistoryImageReferenceKey(part),
+        );
+        if (resolution) content.push(resolution);
+        else {
+          content.push({
+            type: "text",
+            text: unavailableHistoryImageText(
+              part,
+              "it was not loaded for this turn",
+            ),
+          });
         }
         continue;
       }
@@ -1235,7 +3445,6 @@ export function structuredHistoryToEngineMessages(
           continue;
         }
         if (!wire.toolCallId) {
-          // Named tool but no id — cannot emit a valid paired `tool-result`.
           content.push({
             type: "text",
             text: unmatchedToolResultReplayText({
@@ -1257,6 +3466,12 @@ export function structuredHistoryToEngineMessages(
           toolInput,
           content: wire.content,
           ...(part.isError ? { isError: true } : {}),
+          ...(typeof part.approvalPause === "boolean"
+            ? { approvalPause: part.approvalPause }
+            : {}),
+          ...(typeof part.approvalAskId === "string"
+            ? { approvalAskId: part.approvalAskId }
+            : {}),
         });
       }
     }
@@ -1271,7 +3486,6 @@ export function structuredHistoryToEngineMessages(
     : null;
 }
 
-/** Build enriched message with file/skill/mention references */
 function capInlineSkillReferenceContent(text: string): string {
   const trimmed = text.trim();
   if (trimmed.length <= MAX_INLINE_SKILL_REFERENCE_CHARS) return trimmed;
@@ -1283,7 +3497,23 @@ function escapeReferenceAttribute(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
 }
 
-async function resolveSkillReferenceContent(
+async function isRuntimeVisibleSkillContent(
+  content: string,
+  userEmail?: string,
+): Promise<boolean> {
+  const meta = parseSkillFrontmatter(content);
+  if (!isRuntimeVisibleScope(meta.scope)) return false;
+  if (!meta.requiresLab) return true;
+  const { getEnabledSkillLabsForUser } =
+    await import("../server/agents-bundle.js");
+  const enabledLabs = await getEnabledSkillLabsForUser(
+    [meta.requiresLab],
+    userEmail,
+  );
+  return enabledLabs.has(meta.requiresLab);
+}
+
+export async function resolveSkillReferenceContent(
   ref: AgentChatReference,
 ): Promise<string | null> {
   if (!ref.path && !ref.name) return null;
@@ -1305,17 +3535,26 @@ async function resolveSkillReferenceContent(
       const full = await resourceGet(effective.effectiveResource.id, {
         ...resourceOptions,
       });
-      return full?.content ?? null;
+      if (
+        !full?.content ||
+        !(await isRuntimeVisibleSkillContent(full.content, ownerEmail))
+      ) {
+        return null;
+      }
+      return full.content;
     } catch {
       return null;
     }
   }
 
   try {
-    const { loadAgentsBundle } = await import("../server/agents-bundle.js");
+    const { loadAgentsBundle, getRuntimeSkillsForUser } =
+      await import("../server/agents-bundle.js");
     const bundle = await loadAgentsBundle();
-    const normalizedPath = ref.path.replace(/\/+$/g, "");
-    const skill = Object.values(bundle.skills).find((candidate) => {
+    const normalizedPath = ref.path?.replace(/\/+$/g, "");
+    const skill = (
+      await getRuntimeSkillsForUser(bundle, getRequestUserEmail())
+    ).find((candidate) => {
       const skillPath = candidate.dir.replace(/\/+$/g, "");
       return (
         candidate.meta.name === ref.name ||
@@ -1327,6 +3566,242 @@ async function resolveSkillReferenceContent(
   } catch {
     return null;
   }
+}
+
+export function createConnectedAgentReferenceEventRelay(input: {
+  agent: string;
+  send: (event: AgentChatEvent) => void;
+  agentCallId?: string;
+  now?: () => number;
+}) {
+  const agentCallId = input.agentCallId ?? randomUUID();
+  const now = input.now ?? Date.now;
+  const startedAt = now();
+  let lastActivitySequence = -1;
+  let hasRichActivity = false;
+
+  const emitResponseText = (text: string) => {
+    if (text) {
+      input.send({
+        type: "agent_call_text",
+        agent: input.agent,
+        text,
+        agentCallId,
+      });
+    }
+  };
+  const observeActivity = (task: Task) => {
+    const parts = task.status?.message?.parts;
+    const snapshot = Array.isArray(parts)
+      ? parts.map(parseA2AAgentActivityPart).find((value) => value !== null)
+      : undefined;
+    if (snapshot) {
+      hasRichActivity = true;
+    }
+    if (snapshot && snapshot.sequence > lastActivitySequence) {
+      lastActivitySequence = snapshot.sequence;
+      input.send({
+        type: "agent_call_activity",
+        agent: input.agent,
+        agentCallId,
+        snapshot,
+      });
+    }
+  };
+  const observePollUpdate = (task: Task) => {
+    observeActivity(task);
+    if (hasRichActivity) return;
+
+    const state = task.status?.state;
+    if (
+      state !== "submitted" &&
+      state !== "working" &&
+      state !== "processing"
+    ) {
+      return;
+    }
+    const currentTime = now();
+    const detail = extractConnectedAgentProgressDetail(task);
+    input.send({
+      type: "agent_call_progress",
+      agent: input.agent,
+      agentCallId,
+      state,
+      elapsedSeconds: Math.max(0, Math.round((currentTime - startedAt) / 1000)),
+      ...(detail ? { detail } : {}),
+    });
+  };
+
+  return {
+    agentCallId,
+    start() {
+      input.send({
+        type: "agent_call",
+        agent: input.agent,
+        status: "start",
+        agentCallId,
+      });
+    },
+    observeActivity,
+    observePollUpdate,
+    emitResponseText,
+    finish(status: "done" | "pending" | "error") {
+      input.send({
+        type: "agent_call",
+        agent: input.agent,
+        status,
+        agentCallId,
+        durationMs: Math.max(0, now() - startedAt),
+      });
+    },
+  };
+}
+
+type ConnectedAgentCall = typeof import("../a2a/client.js").callAgent;
+type ResolveConnectedAgentCallerAuth =
+  typeof import("../a2a/caller-auth.js").resolveA2ACallerAuth;
+
+export async function callConnectedAgentReference(input: {
+  agent: string;
+  path: string;
+  message: string;
+  send: (event: AgentChatEvent) => void;
+  callAgent: ConnectedAgentCall;
+  resolveCallerAuth: ResolveConnectedAgentCallerAuth;
+  agentCallId?: string;
+  now?: () => number;
+}): Promise<string> {
+  const relay = createConnectedAgentReferenceEventRelay({
+    agent: input.agent,
+    send: input.send,
+    agentCallId: input.agentCallId,
+    now: input.now,
+  });
+  relay.start();
+  try {
+    const callerAuth = await input.resolveCallerAuth({
+      includeGoogleToken: true,
+    });
+    const response = await input.callAgent(input.path, input.message, {
+      async: true,
+      apiKey: callerAuth.apiKey,
+      apiKeyFallbacks: callerAuth.apiKeyFallbacks,
+      metadata: callerAuth.metadata,
+      userEmail: callerAuth.userEmail,
+      orgDomain: callerAuth.orgDomain,
+      orgSecret: callerAuth.orgSecret,
+      ...(getRequestContext()?.isSyntheticTraffic === true
+        ? {
+            transportHeaders: {
+              [SYNTHETIC_TRAFFIC_HEADER]: SYNTHETIC_TRAFFIC_BETA_E2E,
+            },
+          }
+        : {}),
+      onUpdate: relay.observePollUpdate,
+    });
+    const responseText =
+      userFacingLlmCredentialError(response, {
+        agentName: input.agent,
+        visitorFacing: isBuilderGatewayDeployConfigured(),
+      }) ?? response;
+    relay.emitResponseText(responseText);
+    relay.finish("done");
+    return responseText;
+  } catch (error) {
+    const connectionRequest = parseA2AConnectionRequest(error);
+    if (connectionRequest) {
+      relay.finish("pending");
+      throw new AgentConnectionRequiredError(
+        connectionRequest.detail ??
+          `Connect ${connectionRequest.provider} to continue.`,
+        {
+          provider: connectionRequest.provider,
+          reason: connectionRequest.reason,
+          ...(connectionRequest.appId
+            ? { appId: connectionRequest.appId }
+            : {}),
+          source: connectionRequest.source ?? {
+            id: input.agent,
+            kind: "agent",
+            label: input.agent,
+          },
+        },
+      );
+    }
+    relay.finish("error");
+    throw error;
+  }
+}
+
+function parseA2AConnectionRequest(
+  error: unknown,
+): A2AConnectionRequestMetadata | null {
+  if (!error || typeof error !== "object" || !("task" in error)) return null;
+  const task = (error as { task?: Task }).task;
+  const value = task?.status.message?.metadata?.agentNativeConnectionRequest;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const request = value as Record<string, unknown>;
+  const provider =
+    typeof request.provider === "string" ? request.provider.trim() : "";
+  const reason = request.reason;
+  if (
+    request.version !== 1 ||
+    !provider ||
+    provider.length > 120 ||
+    (reason !== "connect" &&
+      reason !== "grant" &&
+      reason !== "reauthorize" &&
+      reason !== "admin_required")
+  ) {
+    return null;
+  }
+  const appId = typeof request.appId === "string" ? request.appId.trim() : "";
+  const detail =
+    typeof request.detail === "string" ? request.detail.trim() : "";
+  const sourceValue =
+    request.source && typeof request.source === "object"
+      ? (request.source as Record<string, unknown>)
+      : null;
+  const sourceId =
+    typeof sourceValue?.id === "string" ? sourceValue.id.trim() : "";
+  const sourceLabel =
+    typeof sourceValue?.label === "string" ? sourceValue.label.trim() : "";
+  return {
+    version: 1,
+    provider,
+    reason,
+    ...(appId && appId.length <= 120 ? { appId } : {}),
+    ...(detail && detail.length <= 1_000 ? { detail } : {}),
+    ...(sourceValue?.kind === "workspace_connection" &&
+    sourceId === provider &&
+    sourceId.length <= 120
+      ? {
+          source: {
+            id: sourceId,
+            kind: "workspace_connection" as const,
+            ...(sourceLabel ? { label: sourceLabel.slice(0, 120) } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+const MAX_CONNECTED_AGENT_PROGRESS_DETAIL_CHARS = 200;
+function extractConnectedAgentProgressDetail(task: Task): string | undefined {
+  const parts = task.status?.message?.parts;
+  if (!Array.isArray(parts)) return undefined;
+  const text = parts
+    .filter(
+      (part): part is { type: "text"; text: string } => part.type === "text",
+    )
+    .map((part) => part.text)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return undefined;
+  return text.length > MAX_CONNECTED_AGENT_PROGRESS_DETAIL_CHARS
+    ? `${text.slice(0, MAX_CONNECTED_AGENT_PROGRESS_DETAIL_CHARS - 1)}…`
+    : text;
 }
 
 async function enrichMessage(
@@ -1396,14 +3871,75 @@ async function enrichMessage(
   return `${parts.join("\n\n")}\n\n${message}`;
 }
 
-/** Accumulated token usage from an agent loop run */
 export interface AgentLoopUsage {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
+  builderCreditsUsed?: number;
+  engineName?: string;
   model: string;
+  llmCalls?: number;
+  /** Wall time and input tokens of the end-of-turn follow-up suggestions call. */
+  followUpMs?: number;
+  followUpInputTokens?: number;
+  /** Write receipts this run with `verified` other than true / with `changed: false`. */
+  receiptUnverifiedCount?: number;
+  receiptChangedFalseCount?: number;
+  /**
+   * True once the engine reported at least one real `usage` event for this
+   * run. The token fields above start at 0 and are only ever incremented —
+   * when this is not true, those zeros are placeholders for "never
+   * reported", not a measured empty usage, and callers must not treat them
+   * as real counts.
+   */
+  usageReported?: boolean;
+  firstEngineEventAtMs?: number;
 }
+
+/**
+ * Folds one loop attempt's usage into a running total. Every wrapper that
+ * re-enters `runAgentLoop` merges through this, so a field added to
+ * `AgentLoopUsage` cannot be reported by the loop and dropped by a wrapper.
+ */
+export function mergeAgentLoopUsage(
+  total: AgentLoopUsage,
+  next: AgentLoopUsage,
+): void {
+  total.inputTokens += next.inputTokens;
+  total.outputTokens += next.outputTokens;
+  total.cacheReadTokens += next.cacheReadTokens;
+  total.cacheWriteTokens += next.cacheWriteTokens;
+  for (const key of [
+    "builderCreditsUsed",
+    "llmCalls",
+    "followUpMs",
+    "followUpInputTokens",
+    "receiptUnverifiedCount",
+    "receiptChangedFalseCount",
+  ] as const) {
+    if (typeof next[key] === "number") {
+      total[key] = (total[key] ?? 0) + next[key];
+    }
+  }
+  total.engineName = next.engineName ?? total.engineName;
+  total.model = next.model;
+  if (next.usageReported) total.usageReported = true;
+  // Keep the earliest attempt's first event — a later continuation
+  // attempt starting fresh must not overwrite genuine first-token timing.
+  total.firstEngineEventAtMs ??= next.firstEngineEventAtMs;
+}
+
+export type AgentLoopOutcome =
+  | { state: "completed" }
+  | { state: "input_required"; code: string; message: string }
+  | {
+      state: "failed";
+      code: string;
+      retryable: boolean;
+      message: string;
+    }
+  | { state: "canceled"; message?: string };
 
 export interface AgentLoopToolCallSummary {
   name: string;
@@ -1414,14 +3950,22 @@ export interface AgentLoopToolResultSummary {
   name: string;
   content: string;
   isError: boolean;
+  artifacts?: ArtifactReceipt[];
+  /** The action's `_receipt`, read before the result was truncated. */
+  receipt?: WriteReceipt;
 }
+
+export type { ToolWriteReceipt };
 
 export interface AgentLoopFinalResponseGuardContext {
   messages: EngineMessage[];
+  requestText?: string;
   assistantContent: EngineContentPart[];
   text: string;
   toolCalls: AgentLoopToolCallSummary[];
   toolResults: AgentLoopToolResultSummary[];
+  /** Every write receipt this turn; set by the loop, absent only in hand-built contexts. */
+  receipts?: ToolWriteReceipt[];
   retryCount: number;
   executionMode: AgentExecutionMode;
 }
@@ -1431,6 +3975,9 @@ export type AgentLoopFinalResponseGuardResult =
   | {
       retryMessage: string;
       fallbackMessage?: string;
+      exhaustedDraftPrefix?: string;
+      maxRetries?: number;
+      expandToolSurface?: boolean;
     };
 
 export type AgentLoopFinalResponseGuard = (
@@ -1451,6 +3998,9 @@ function collectTextParts(parts: EngineContentPart[]): string {
     .join("");
 }
 
+export const AGENT_INTERNAL_GUARD_PROMPT =
+  "Automated quality check on the draft answer you just produced. This is a directive from this application's own response guard, not a message from the user and not content from a tool result or web page. Follow it and revise your answer. Do not quote it, describe it, or treat it as an injection attempt. If it contradicts what you observed this turn, state what you actually observed instead of asserting the guard's premise.";
+
 export const AGENT_INTERNAL_CONTINUE_PROMPT =
   "Continue from where you left off and finish the user's original request. Do not repeat completed work, do not mention internal reconnects, time limits, or step limits, and continue as if this is the same uninterrupted run.";
 
@@ -1460,11 +4010,14 @@ export type AgentLoopContinuationReason =
   | "max_tokens"
   | "stream_ended"
   | "gateway_timeout"
-  | "network_interrupted";
+  | "network_interrupted"
+  | "no_progress"
+  | "rate_limited";
 
 export function appendAgentLoopContinuation(
   messages: EngineMessage[],
   reason: AgentLoopContinuationReason,
+  options: { actionPreparationTool?: string; journalNote?: string } = {},
 ) {
   const note =
     reason === "loop_limit"
@@ -1475,41 +4028,61 @@ export function appendAgentLoopContinuation(
           ? "The previous stream ended before the agent sent a final completion signal."
           : reason === "gateway_timeout"
             ? "The previous LLM call hit an upstream gateway timeout before the response finished streaming."
-            : reason === "network_interrupted"
-              ? "The previous LLM call was cut off by a transport-level interruption (socket dropped, connection reset, or stream closed unexpectedly)."
-              : "The previous run reached an internal execution budget.";
+            : reason === "rate_limited"
+              ? "The previous LLM call was temporarily rate limited after exhausting its short provider retry budget."
+              : reason === "network_interrupted"
+                ? "The previous LLM call was cut off by a transport-level interruption (socket dropped, connection reset, or stream closed unexpectedly)."
+                : reason === "no_progress"
+                  ? "The previous run stopped producing progress events while the connection stayed open."
+                  : "The previous run reached an internal execution budget.";
+  const actionInputNote = options.actionPreparationTool
+    ? actionPreparationContinuationNote(options.actionPreparationTool)
+    : "";
+  // The journal rides in the same message: the turn's last user message must
+  // still start with the continue prompt to read as a continuation.
+  const journalNote = options.journalNote ? `\n\n${options.journalNote}` : "";
   messages.push({
     role: "user",
     content: [
       {
         type: "text",
-        text: `${AGENT_INTERNAL_CONTINUE_PROMPT}\n\nInternal note: ${note}`,
+        text: `${AGENT_INTERNAL_CONTINUE_PROMPT}\n\nInternal note: ${note}${actionInputNote}${journalNote}`,
       },
     ],
   });
 }
 
-/**
- * True when an error thrown by `runAgentLoop` is a recoverable transport- or
- * gateway-level interruption that the agent can resume from rather than a
- * terminal failure. The continuation pattern works because the LLM call's
- * conversation prefix is preserved on the next attempt — Anthropic's prompt
- * cache rescues the latency, and the agent gets a "you got cut off, continue"
- * nudge so it doesn't redo work it already finished.
- *
- * Distinct from `isRetryableError` which guides per-engine quick retries:
- * `isResumableEngineError` is checked AFTER engine retries are exhausted, at
- * the run level. It catches both gateway-reported timeouts (where engine
- * retries don't apply because the gateway already gave up) and transport
- * errors that survived engine retry budgets.
- */
+function isAgentLoopContinuationReason(
+  reason: unknown,
+): reason is AgentLoopContinuationReason {
+  return (
+    reason === "run_timeout" ||
+    reason === "loop_limit" ||
+    reason === "max_tokens" ||
+    reason === "stream_ended" ||
+    reason === "gateway_timeout" ||
+    reason === "network_interrupted" ||
+    reason === "no_progress" ||
+    reason === "rate_limited"
+  );
+}
+
 export function isResumableEngineError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   const code =
     err instanceof EngineError ? (err.errorCode ?? "").toLowerCase() : "";
   if (
+    (err instanceof EngineError && err.providerRetryable === false) ||
+    code === "invalid_request" ||
+    code === "invalid_request_error"
+  ) {
+    return false;
+  }
+  if (
     code === "builder_gateway_timeout" ||
-    code === "builder_gateway_network_error"
+    code === "builder_gateway_network_error" ||
+    code === "builder_gateway_stream_ended" ||
+    code === "provider_network_error"
   ) {
     return true;
   }
@@ -1517,6 +4090,9 @@ export function isResumableEngineError(err: unknown): boolean {
     code === "http_502" ||
     code === "http_503" ||
     code === "http_504" ||
+    (code === "overloaded_error" &&
+      err instanceof EngineError &&
+      err.providerRetryable === true) ||
     code === "timeout"
   ) {
     return true;
@@ -1529,6 +4105,7 @@ export function isResumableEngineError(err: unknown): boolean {
     text.includes("econnaborted") ||
     text.includes("fetch failed") ||
     text.includes("network error") ||
+    isProviderConnectionErrorMessage(text) ||
     text.includes("connection reset") ||
     text.includes("connection closed") ||
     text.includes("stream closed") ||
@@ -1541,17 +4118,61 @@ export function isResumableEngineError(err: unknown): boolean {
   );
 }
 
-/**
- * Map a resumable error to the most descriptive continuation reason. Used
- * when surfacing the resume to the agent and to clients via the
- * `auto_continue` event.
- */
+export function isTransientProviderRateLimitError(err: unknown): boolean {
+  if (!(err instanceof EngineError)) return false;
+  const code = (err.errorCode ?? "").toLowerCase();
+  const text = errorSearchText(err);
+
+  if (
+    code === "rate_limit_exceeded" ||
+    text.includes("daily gateway request cap")
+  ) {
+    return false;
+  }
+  if (err.statusCode === 429 || err.statusCode === 529) {
+    return true;
+  }
+  if (code === "http_429" || code === "http_529") return true;
+  if (code === PROVIDER_TRANSIENT_REJECTION_ERROR_CODE) return true;
+  if (code === "overloaded_error" && err.providerRetryable === true)
+    return true;
+  if (code === "rate_limited" && err.providerRetryable === true) return true;
+  return false;
+}
+
 export function continuationReasonForResumableError(
   err: unknown,
-): "gateway_timeout" | "network_interrupted" {
+): "gateway_timeout" | "network_interrupted" | "rate_limited" {
   const code =
     err instanceof EngineError ? (err.errorCode ?? "").toLowerCase() : "";
   if (code === "builder_gateway_timeout") return "gateway_timeout";
+  if (
+    err instanceof EngineError &&
+    (err.statusCode === 408 || err.statusCode === 504)
+  ) {
+    return "gateway_timeout";
+  }
+  // Provider throttling, named so the chain-cap below (`shouldChainBackgroundContinuation`)
+  // can see it — this used to fall through to `network_interrupted`, which
+  // carries no budget of its own and let a sustained 429 chain for as long as
+  // the turn's run ledger allowed. A bare 403 counts only when the gateway
+  // marked it retryable (`PROVIDER_TRANSIENT_REJECTION_ERROR_CODE` or a raw
+  // `providerRetryable` 403) — a real credential rejection must stay terminal.
+  if (
+    code === "http_429" ||
+    code === "http_529" ||
+    code === "rate_limited" ||
+    code === PROVIDER_TRANSIENT_REJECTION_ERROR_CODE ||
+    (code === "overloaded_error" &&
+      err instanceof EngineError &&
+      err.providerRetryable === true) ||
+    (err instanceof EngineError &&
+      (err.statusCode === 429 ||
+        err.statusCode === 529 ||
+        (err.statusCode === 403 && err.providerRetryable === true)))
+  ) {
+    return "rate_limited";
+  }
   const text = err instanceof Error ? err.message.toLowerCase() : "";
   if (
     text.includes("gateway timeout") ||
@@ -1605,7 +4226,6 @@ function isToolResultOnlyUserMessage(message: EngineMessage): boolean {
   );
 }
 
-/** Start of the active turn on an internal continuation (real user prompt). */
 function findCurrentTurnStartForContinuation(
   messages: EngineMessage[],
 ): number {
@@ -1630,13 +4250,16 @@ function findCurrentTurnStartForContinuation(
   return 0;
 }
 
-/**
- * First message index that is safe to start a trimmed window on. A window must
- * not begin with a tool-result-only user message — that would orphan it from
- * the assistant tool-call turn it answers and break Anthropic's tool_use /
- * tool_result pairing. We walk forward from `desiredStart` to the first
- * non-orphaned boundary; if none exists we refuse to trim (return -1).
- */
+export function resolveFinalResponseGuardRequestText(
+  messages: EngineMessage[],
+): string | undefined {
+  const message = messages[findCurrentTurnStartForContinuation(messages)];
+  if (!message || message.role !== "user") return undefined;
+  const text = textFromEngineMessage(message).trim();
+  if (text.startsWith(AGENT_INTERNAL_CONTINUE_PROMPT)) return undefined;
+  return text || undefined;
+}
+
 function findSafeWindowStart(
   messages: EngineMessage[],
   desiredStart: number,
@@ -1647,23 +4270,6 @@ function findSafeWindowStart(
   return -1;
 }
 
-/**
- * Observational Memory consumer (threshold-gated, conservative).
- *
- * Builds the three-tier OM context for a thread and, ONLY when the thread has
- * already crossed the compaction threshold (i.e. it has at least one persisted
- * observation/reflection), returns a rewritten message list that:
- *   - prepends a single system-role "Observational Memory" block holding the
- *     reflections + observations, and
- *   - replaces the raw older history with just the recent-raw-message window,
- *     keeping the current user turn and any pending tool results intact.
- *
- * For threads with NO OM entries (every short thread) it returns the input
- * array unchanged by reference, so the common path is byte-for-byte identical.
- *
- * Best-effort: any failure returns the input unchanged so OM can never break a
- * normal turn.
- */
 async function applyObservationalMemoryToContext(
   messages: EngineMessage[],
   opts: {
@@ -1682,27 +4288,16 @@ async function applyObservationalMemoryToContext(
       messages,
     });
 
-    // No compacted memory yet → short thread, leave context untouched.
     if (!hasObservationalMemory(context)) return messages;
 
     const block = serializeObservationalMemoryBlock(context);
     if (!block.trim()) return messages;
 
-    // EngineMessage has no "system" role; the framework injects auxiliary
-    // context as leading user messages (same convention as the continuation
-    // nudge and the resume journal note), and the serialized block is clearly
-    // self-labeled "[Observational Memory]".
     const omMessage: EngineMessage = {
       role: "user",
       content: [{ type: "text", text: block }],
     };
 
-    // Trim the raw prefix to only the recent-raw window. The window is the tail
-    // of `messages`, so it always contains the latest user turn and any pending
-    // tool results. Guard the boundary so we never start mid tool_use/result
-    // pair; if a safe boundary can't be found, additively inject the memory
-    // block WITHOUT trimming (the conservative fallback) so we never drop a
-    // pending tool result.
     const recentCount = context.recentMessages.length;
     if (recentCount === 0 || recentCount >= messages.length) {
       return [omMessage, ...messages];
@@ -1710,7 +4305,6 @@ async function applyObservationalMemoryToContext(
     const desiredStart = messages.length - recentCount;
     const safeStart = findSafeWindowStart(messages, desiredStart);
     if (safeStart < 0) {
-      // Whole tail is tool-result-only (degenerate) — don't trim.
       return [omMessage, ...messages];
     }
     return [omMessage, ...messages.slice(safeStart)];
@@ -1723,23 +4317,38 @@ async function applyObservationalMemoryToContext(
   }
 }
 
+type CachedReadOnlyToolResult = {
+  content: string;
+  images?: EngineToolResultPart["images"];
+};
+
 function seedReadOnlyToolResultsFromHistory(
   messages: EngineMessage[],
   actions: Record<string, ActionEntry>,
-): Map<string, string> {
-  const cache = new Map<string, string>();
+  seed?: Map<string, CachedReadOnlyToolResult>,
+): Map<string, CachedReadOnlyToolResult> {
+  const cache = new Map<string, CachedReadOnlyToolResult>(seed);
   if (!isInternalContinuationTurn(messages)) return cache;
 
-  const pendingToolCalls = new Map<string, { name: string; input: unknown }>();
-  for (const message of messages) {
+  const turnStart = findCurrentTurnStartForContinuation(messages);
+  const turnMessages = messages.slice(turnStart);
+
+  const pendingToolCalls = new Map<
+    string,
+    { name: string; input: unknown; readOnly: boolean; dedupe: boolean }
+  >();
+  for (const message of turnMessages) {
     if (message.role === "assistant") {
       for (const part of message.content) {
         if (part.type !== "tool-call") continue;
         const entry = actions[part.name];
-        if (entry?.readOnly !== true) continue;
         pendingToolCalls.set(part.id, {
           name: part.name,
           input: part.input,
+          readOnly: entry
+            ? actionCallIsReadOnly(entry, part.input, false)
+            : false,
+          dedupe: entry?.dedupe !== false,
         });
       }
       continue;
@@ -1749,19 +4358,126 @@ function seedReadOnlyToolResultsFromHistory(
       if (part.type !== "tool-result") continue;
       const call = pendingToolCalls.get(part.toolCallId);
       if (!call) continue;
+      if (!call.readOnly) {
+        if (part.isError !== true || part.outcome === "unknown") cache.clear();
+        continue;
+      }
+      if (!call.dedupe) continue;
       if (!isReusableReadOnlyToolResult(part)) continue;
-      cache.set(toolCallCacheKey(call.name, call.input), part.content);
+      cache.set(toolCallCacheKey(call.name, call.input), {
+        content: part.content,
+        ...(part.images?.length ? { images: part.images } : {}),
+      });
     }
   }
 
   return cache;
 }
 
+function visibleDuplicateReadOnlyToolResult(toolName: string): string {
+  return (
+    `Skipped duplicate read-only call to ${toolName}: identical input already ran in this turn. ` +
+    `Use the previous result already in the conversation instead of calling this tool again.`
+  );
+}
+
+function resurfacedDuplicateReadOnlyToolResultPrefix(toolName: string): string {
+  return (
+    `Skipped duplicate read-only call to ${toolName}: identical input already ran in this turn. ` +
+    `Its earlier result is no longer in view, so here it is again:\n\n`
+  );
+}
+
+function resurfacedDuplicateReadOnlyToolResult(
+  toolName: string,
+  cachedResult: string,
+): string {
+  return `${resurfacedDuplicateReadOnlyToolResultPrefix(toolName)}${cachedResult}`;
+}
+
+function seedDuplicateReadOnlyToolCallsFromHistory(
+  messages: EngineMessage[],
+  actions: Record<string, ActionEntry>,
+): Map<string, number> {
+  const repeats = new Map<string, number>();
+  if (!isInternalContinuationTurn(messages)) return repeats;
+
+  const turnStart = findCurrentTurnStartForContinuation(messages);
+  const pendingToolCalls = new Map<
+    string,
+    { name: string; input: unknown; readOnly: boolean; dedupe: boolean }
+  >();
+  const reusableReadKeys = new Set<string>();
+
+  for (const message of messages.slice(turnStart)) {
+    if (message.role === "assistant") {
+      for (const part of message.content) {
+        if (part.type !== "tool-call") continue;
+        const entry = actions[part.name];
+        pendingToolCalls.set(part.id, {
+          name: part.name,
+          input: part.input,
+          readOnly: entry
+            ? actionCallIsReadOnly(entry, part.input, false)
+            : false,
+          dedupe: entry?.dedupe !== false,
+        });
+      }
+      continue;
+    }
+
+    for (const part of message.content) {
+      if (part.type !== "tool-result") continue;
+      const call = pendingToolCalls.get(part.toolCallId);
+      if (!call) continue;
+      if (!call.readOnly) {
+        if (part.isError !== true || part.outcome === "unknown") {
+          repeats.clear();
+          reusableReadKeys.clear();
+        }
+        continue;
+      }
+      if (!call.dedupe || part.isError === true) continue;
+
+      const cacheKey = toolCallCacheKey(call.name, call.input);
+      if (part.content === visibleDuplicateReadOnlyToolResult(call.name)) {
+        if (reusableReadKeys.has(cacheKey)) {
+          repeats.set(cacheKey, (repeats.get(cacheKey) ?? 0) + 1);
+        }
+        continue;
+      }
+      if (
+        part.content.startsWith(
+          resurfacedDuplicateReadOnlyToolResultPrefix(call.name),
+        )
+      ) {
+        if (reusableReadKeys.has(cacheKey)) repeats.set(cacheKey, 0);
+        continue;
+      }
+      if (isReusableReadOnlyToolResult(part)) {
+        reusableReadKeys.add(cacheKey);
+      }
+    }
+  }
+
+  return repeats;
+}
+
 function isReusableReadOnlyToolResult(part: EngineToolResultPart): boolean {
-  if (part.isError) return false;
+  if (part.isError || part.outcome === "unknown") return false;
   const lower = part.content.trim().toLowerCase();
   if (!lower) return false;
+  if (
+    !part.images?.length &&
+    /\[image(?:\s+#\d+|\s*:)[^\n\]]*\battached(?:\s+#\d+|:)[^\n\]]*\]/i.test(
+      part.content,
+    )
+  ) {
+    return false;
+  }
   return !(
+    lower.startsWith("skipped duplicate read-only call to ") ||
+    lower.startsWith("invalid action parameters for ") ||
     lower.startsWith("error running ") ||
     lower.includes("run aborted") ||
     lower.includes("tool call timed out") ||
@@ -1770,18 +4486,113 @@ function isReusableReadOnlyToolResult(part: EngineToolResultPart): boolean {
   );
 }
 
-/**
- * Counts how many times each write (non-read-only) tool call was interrupted
- * before returning a result in the continuation history. When a connection
- * drops mid-tool-execution the client sends a placeholder result
- * ("Interrupted before this tool returned a result.") so the model knows
- * what was attempted. If the same write tool is called again with identical
- * input in the next continuation, this count prevents infinite retry loops.
- */
-const INTERRUPTED_TOOL_RESULT_MARKER =
-  "Interrupted before this tool returned a result.";
-const MAX_WRITE_TOOL_INTERRUPTIONS = 2;
+export function isCachedToolResultVisibleInContext(
+  contextMessages: EngineMessage[],
+  toolCall: { name: string; input: unknown },
+  cachedResult: string,
+): boolean {
+  if (cachedResult.length === 0) return true;
+  const cacheKey = toolCallCacheKey(toolCall.name, toolCall.input);
+  const matchingToolCallIds = new Set<string>();
+  for (const message of contextMessages) {
+    if (message.role !== "assistant") continue;
+    for (const part of message.content) {
+      if (part.type !== "tool-call") continue;
+      if (toolCallCacheKey(part.name, part.input) === cacheKey) {
+        matchingToolCallIds.add(part.id);
+      }
+    }
+  }
+
+  const resurfacedResult = resurfacedDuplicateReadOnlyToolResult(
+    toolCall.name,
+    cachedResult,
+  );
+  for (const message of contextMessages) {
+    if (message.role !== "user") continue;
+    for (const part of message.content) {
+      if (part.type !== "tool-result") continue;
+      if (!matchingToolCallIds.has(part.toolCallId)) continue;
+      if (part.content === cachedResult || part.content === resurfacedResult) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+const INTERRUPTED_TOOL_LEDGER_RECOVERY_TIMEOUT_MS = 5_000;
 const MAX_IDENTICAL_TOOL_ERRORS = 3;
+export const MAX_SAME_ERROR_ACROSS_ARGUMENTS = 3;
+export const MAX_IDENTICAL_TOOL_CALLS = 8;
+const MAX_ALREADY_LOADED_TOOL_SEARCHES = 4;
+const MAX_STOP_ERROR_LINE_CHARS = 300;
+
+/** `error: message` for a JSON `{ error, message }` result; `undefined` when the text is not one. */
+function jsonErrorCause(text: string): string | undefined {
+  if (!text.startsWith("{")) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+    // coercion-ok: unparseable text is not a JSON error result; the caller reads its first line
+  } catch {
+    return undefined;
+  }
+  const { error, message } = (parsed ?? {}) as Record<string, unknown>;
+  if (typeof error !== "string" || !error.trim()) return undefined;
+  return typeof message === "string" && message.trim()
+    ? `${error}: ${message}`
+    : error;
+}
+
+function errorCauseLine(text: string): string {
+  const body = text.trim().replace(/^Error running [^\s:]+:\s*/, "");
+  return (
+    (jsonErrorCause(body) ?? body)
+      .split(/\r?\n/)
+      .find((line) => line.trim())
+      ?.trim() ?? ""
+  );
+}
+
+/**
+ * The line of a failed tool result that names the cause, for a message the
+ * user reads. It takes the credential-sanitized text and keeps identifiers and
+ * emails, since a column or account name is the diagnosis; the trace-grade
+ * `toolErrorSignature` redacts those. A pretty-printed JSON error opens with
+ * `Error running x: {`, and a `(errorCode: ...)` suffix keeps it from parsing,
+ * so a bare first line can be only a bracket.
+ */
+function stopErrorLine(sanitizedResult: string): string {
+  const lines = sanitizedResult.split(/\r?\n/).filter((line) => line.trim());
+  for (const candidate of [sanitizedResult, ...lines]) {
+    const cause = errorCauseLine(candidate);
+    if (/[\p{L}\p{N}]/u.test(cause)) return cause;
+  }
+  return errorCauseLine(sanitizedResult) || "(no error text)";
+}
+
+function isToolCallTimeoutResult(content: string): boolean {
+  return /tool call timed out after \d+(?:\.\d+)? seconds?/i.test(content);
+}
+
+export interface TerminalActionStop {
+  message: string;
+  transcriptMessage?: string;
+  errorCode?: string;
+  details?: string;
+}
+
+const LOOP_BREAKER_STOP_CODES = new Set([
+  "repeated_tool_call",
+  "repeated_identical_tool_error",
+  "repeated_tool_error_across_arguments",
+  "duplicate_read_only_tool",
+]);
+
+function isLoopBreakerStop(stop: TerminalActionStop): boolean {
+  return LOOP_BREAKER_STOP_CODES.has(stop.errorCode ?? "");
+}
 
 function seedWriteToolInterruptionsFromHistory(
   messages: EngineMessage[],
@@ -1799,7 +4610,7 @@ function seedWriteToolInterruptionsFromHistory(
       for (const part of message.content) {
         if (part.type !== "tool-call") continue;
         const entry = actions[part.name];
-        if (entry?.readOnly === true) continue;
+        if (entry && actionCallIsReadOnly(entry, part.input, false)) continue;
         pendingToolCalls.set(part.id, { name: part.name, input: part.input });
       }
       continue;
@@ -1810,8 +4621,11 @@ function seedWriteToolInterruptionsFromHistory(
       const call = pendingToolCalls.get(part.toolCallId);
       if (!call) continue;
       if (
-        typeof part.content === "string" &&
-        part.content.includes(INTERRUPTED_TOOL_RESULT_MARKER)
+        part.outcome === "unknown" ||
+        isInterruptedToolResult(part.content) ||
+        (part.isError === true &&
+          typeof part.content === "string" &&
+          isToolCallTimeoutResult(part.content))
       ) {
         const key = toolCallCacheKey(call.name, call.input);
         interruptions.set(key, (interruptions.get(key) ?? 0) + 1);
@@ -1822,15 +4636,12 @@ function seedWriteToolInterruptionsFromHistory(
   return interruptions;
 }
 
-/**
- * Convert ActionEntry registry to EngineTool array.
- */
 export function actionsToEngineTools(
   actions: Record<string, ActionEntry>,
 ): EngineTool[] {
   const tools: EngineTool[] = [];
   for (const [name, entry] of Object.entries(actions)) {
-    if (entry.agentTool === false) continue;
+    if (entry.agentTool === false || entry.uiOnly === true) continue;
     const inputSchema = normalizeToolInputSchema(entry.tool.parameters);
     if (!inputSchema) {
       console.warn(
@@ -1847,36 +4658,299 @@ export function actionsToEngineTools(
   return tools;
 }
 
-function filterInitialEngineTools(
+export type AgentToolCallExecutionResult =
+  | {
+      status: "completed";
+      output: string;
+      completedSideEffect?: boolean;
+    }
+  | {
+      status: "approval_required";
+      output: string;
+      approvalKey: string;
+    }
+  | {
+      status: "failed";
+      output: string;
+      terminalError?: Extract<AgentChatEvent, { type: "error" }>;
+    };
+
+export interface ExecuteAgentToolCallOptions {
+  actions: Record<string, ActionEntry>;
+  name: string;
+  input?: unknown;
+  callId: string;
+  signal?: AbortSignal;
+  ownerEmail?: string | null;
+  orgId?: string | null;
+  appId?: string;
+  caller?: ActionCaller;
+  networkProtocol?: "a2a" | "mcp" | "provider-api";
+  networkId?: string;
+  networkPeer?: string;
+  delegationDepth?: number;
+  visitedApps?: string[];
+  threadId?: string;
+  turnId?: string;
+  approvedToolCalls?: string[];
+  approvedToolCallAskId?: string;
+  onApprovalRequired?: (
+    binding: AgentApprovalBinding,
+  ) => Promise<string | void>;
+  consumeApproval?: (binding: AgentApprovalBinding) => Promise<boolean>;
+  isToolAlwaysAllowed?: (binding: AgentApprovalBinding) => Promise<boolean>;
+  send?: (event: AgentChatEvent) => void;
+}
+
+export interface AgentApprovalBinding {
+  toolName: string;
+  input: unknown;
+  callId: string;
+  approvalKey: string;
+  approvalId?: string;
+}
+
+export async function executeAgentToolCall(
+  options: ExecuteAgentToolCallOptions,
+): Promise<AgentToolCallExecutionResult> {
+  const entry = options.actions[options.name];
+  if (!entry || isActionHiddenFromEveryAgentSurface(entry)) {
+    return {
+      status: "failed",
+      output: `Unknown or unavailable tool: ${options.name}`,
+    };
+  }
+
+  let streamCalls = 0;
+  const engine: AgentEngine = {
+    name: "agent-native:single-tool",
+    label: "Agent-Native tool runtime",
+    defaultModel: "agent-native:single-tool",
+    supportedModels: ["agent-native:single-tool"],
+    capabilities: {
+      thinking: false,
+      promptCaching: false,
+      vision: false,
+      computerUse: false,
+      parallelToolCalls: false,
+    },
+    async *stream(): AsyncIterable<EngineEvent> {
+      streamCalls += 1;
+      if (streamCalls === 1) {
+        yield {
+          type: "assistant-content",
+          parts: [
+            {
+              type: "tool-call",
+              id: options.callId,
+              name: options.name,
+              input: options.input ?? {},
+            },
+          ],
+        };
+        yield { type: "stop", reason: "tool_use" };
+        return;
+      }
+      yield {
+        type: "assistant-content",
+        parts: [{ type: "text", text: "Tool execution complete." }],
+      };
+      yield { type: "stop", reason: "end_turn" };
+    },
+  };
+
+  const events: AgentChatEvent[] = [];
+  const send = (event: AgentChatEvent) => {
+    events.push(event);
+    if (event.type === "text" && event.text === "Tool execution complete.") {
+      return;
+    }
+    options.send?.(event);
+  };
+  const controller = options.signal ? null : new AbortController();
+  const signal = options.signal ?? controller!.signal;
+  const tools = actionsToEngineTools(options.actions);
+
+  try {
+    await runAgentLoop({
+      engine,
+      model: engine.defaultModel,
+      systemPrompt: "Execute the selected Agent-Native tool call.",
+      tools,
+      availableTools: tools,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `Execute the ${options.name} tool call.`,
+            },
+          ],
+        },
+      ],
+      actions: options.actions,
+      send,
+      signal,
+      ownerEmail: options.ownerEmail,
+      orgId: options.orgId,
+      appId: options.appId,
+      actionCaller: options.caller,
+      networkProtocol: options.networkProtocol,
+      networkId: options.networkId,
+      networkPeer: options.networkPeer,
+      executionMode: "act",
+      maxIterations: 2,
+      threadId: options.threadId,
+      turnId: options.turnId,
+      approvedToolCalls: options.approvedToolCalls,
+      approvedToolCallAskId: options.approvedToolCallAskId,
+      onApprovalRequired: options.onApprovalRequired,
+      consumeApproval: options.consumeApproval,
+      isToolAlwaysAllowed: options.isToolAlwaysAllowed,
+    });
+  } catch (error) {
+    return {
+      status: "failed",
+      output: sanitizeToolErrorValue(error),
+    };
+  }
+
+  const approval = events.find(
+    (event): event is Extract<AgentChatEvent, { type: "approval_required" }> =>
+      event.type === "approval_required" && event.tool === options.name,
+  );
+  const completed = [...events]
+    .reverse()
+    .find(
+      (event): event is Extract<AgentChatEvent, { type: "tool_done" }> =>
+        event.type === "tool_done" && event.tool === options.name,
+    );
+  const terminalError = events.find(
+    (event): event is Extract<AgentChatEvent, { type: "error" }> =>
+      event.type === "error" && event.recoverable === false,
+  );
+
+  if (approval) {
+    return {
+      status: "approval_required",
+      approvalKey: approval.approvalKey,
+      output:
+        completed?.result ?? `Awaiting human approval to run ${options.name}.`,
+    };
+  }
+  if (terminalError) {
+    return {
+      status: "failed",
+      output: completed?.result ?? terminalError.error,
+      terminalError,
+    };
+  }
+  if (!completed) {
+    return {
+      status: "failed",
+      output: `The ${options.name} tool did not return a result.`,
+    };
+  }
+  if (completed.isError) {
+    return { status: "failed", output: completed.result };
+  }
+  return {
+    status: "completed",
+    output: completed.result,
+    ...(typeof completed.completedSideEffect === "boolean"
+      ? { completedSideEffect: completed.completedSideEffect }
+      : {}),
+  };
+}
+
+export function filterInitialEngineTools(
   tools: EngineTool[],
   initialToolNames?: string[],
 ): EngineTool[] {
   if (!initialToolNames) return tools;
   const names = new Set(initialToolNames);
   names.add(TOOL_SEARCH_ACTION_NAME);
+  for (const tool of tools) {
+    if (isDefaultInitialToolName(tool.name)) {
+      names.add(tool.name);
+    }
+  }
   return tools.filter((tool) => names.has(tool.name));
 }
 
-function extractToolSearchResultNames(value: unknown): string[] {
-  if (!value || typeof value !== "object") return [];
-  const result = value as { query?: unknown; results?: unknown };
-  if (typeof result.query !== "string" || result.query.trim().length === 0) {
-    return [];
-  }
-  if (!Array.isArray(result.results)) return [];
-  const names: string[] = [];
-  for (const item of result.results) {
-    if (!item || typeof item !== "object") continue;
-    const name = (item as Record<string, unknown>).name;
-    if (typeof name === "string" && name.trim()) names.push(name);
-  }
-  return names;
+export function preloadPlanModeEngineTools(options: {
+  request: string;
+  registry: Record<string, ActionEntry>;
+  initialTools: EngineTool[];
+  availableTools: EngineTool[];
+  limit?: number;
+}): EngineTool[] {
+  const query = options.request.trim();
+  if (!query) return options.initialTools;
+
+  const activeNames = new Set(options.initialTools.map((tool) => tool.name));
+  const preloadLimit = Math.max(0, Math.min(options.limit ?? 3, 5));
+  if (preloadLimit === 0) return options.initialTools;
+
+  const ranked = searchToolRegistry(
+    options.registry,
+    { query, limit: 25, includeSchemas: true },
+    { defaultLimit: 25, maxLimit: 25 },
+  );
+  const preloadNames = ranked.results
+    .filter(
+      (result) =>
+        result.callable &&
+        result.planAvailability !== "act-only" &&
+        !activeNames.has(result.name),
+    )
+    .slice(0, preloadLimit)
+    .map((result) => result.name);
+  if (preloadNames.length === 0) return options.initialTools;
+
+  for (const name of preloadNames) activeNames.add(name);
+  return options.availableTools.filter((tool) => activeNames.has(tool.name));
 }
 
-function extractToolSearchResultNamesFromMessages(
-  messages: EngineMessage[],
-): string[] {
+export function buildFirstRequestPayloadDetail(input: {
+  isFirstRequest: boolean;
+  systemPrompt: string;
+  messages: EngineMessage[];
+  tools: EngineTool[];
+  availableToolCount: number;
+}): string {
+  if (!input.isFirstRequest) return "";
+  return (
+    ` first_request_system_chars=${input.systemPrompt.length}` +
+    ` first_request_message_chars=${JSON.stringify(input.messages).length}` +
+    ` first_request_tool_count=${input.tools.length}` +
+    ` first_request_tool_chars=${JSON.stringify(input.tools).length}` +
+    ` first_request_available_tool_count=${input.availableToolCount}`
+  );
+}
+
+const DEFAULT_INITIAL_TOOL_NAMES = new Set([
+  "resources",
+  "framework-search",
+  "docs-search",
+  "get-framework-context",
+  "read-attachment",
+  "web-request",
+  "describe-workspace-apps",
+  "call-agent",
+]);
+
+function isDefaultInitialToolName(name: string): boolean {
+  return DEFAULT_INITIAL_TOOL_NAMES.has(name);
+}
+
+function readToolSearchHistory(messages: EngineMessage[]): {
+  names: string[];
+  unreadable: number;
+} {
   const names: string[] = [];
+  let unreadable = 0;
   for (const message of messages) {
     if (message.role !== "user") continue;
     for (const part of message.content) {
@@ -1887,29 +4961,37 @@ function extractToolSearchResultNamesFromMessages(
       ) {
         continue;
       }
-      try {
-        names.push(...extractToolSearchResultNames(JSON.parse(part.content)));
-      } catch {
-        // Tool results are best-effort history hints; ignore non-JSON content.
-      }
+      const loaded = readLoadedToolNames(part.content);
+      if (loaded) names.push(...loaded);
+      else unreadable += 1;
     }
   }
-  return names;
+  return { names, unreadable };
 }
 
 function normalizeToolInputSchema(
   schema: ActionTool["parameters"] | undefined,
 ): EngineTool["inputSchema"] | null {
   if (!schema) return { type: "object", properties: {} };
-  if (schema.type !== "object") return null;
+  if (!isObjectOnly(schema)) return null;
+  type ToolParams = NonNullable<ActionTool["parameters"]>;
+  let cloned: ToolParams;
+  try {
+    cloned = JSON.parse(JSON.stringify(schema)) as ToolParams;
+  } catch {
+    // A schema that will not round-trip cannot be safely rewritten, and
+    // shipping it unsanitized is how this class of 400 reaches the provider.
+    return null;
+  }
+  const safe = stripUnsupportedSchemaKeywords(cloned);
   return {
-    ...schema,
+    ...safe,
     type: "object",
     properties:
-      schema.properties && typeof schema.properties === "object"
-        ? schema.properties
+      safe.properties && typeof safe.properties === "object"
+        ? safe.properties
         : {},
-    required: Array.isArray(schema.required) ? schema.required : [],
+    required: Array.isArray(safe.required) ? safe.required : [],
   };
 }
 
@@ -1937,27 +5019,306 @@ function stableStringify(value: unknown): string {
     .join(",")}}`;
 }
 
-function toolCallCacheKey(toolName: string, input: unknown): string {
-  return `${toolName}:${stableStringify(normalizeToolCallInputForHistory(input))}`;
+export function toolCallCacheKey(toolName: string, input: unknown): string {
+  return `${toolName}:${stableStringify(normalizeToolCallInputForHistory(input, toolName))}`;
 }
 
-function normalizeToolErrorForBreaker(error: string): string {
-  return error.replace(/\s+/g, " ").trim();
+export function findApprovedStructuredToolCall(
+  history: AgentChatStructuredMessage[] | undefined,
+  approvedToolCalls: readonly string[] | undefined,
+  approvedToolCallAskIds?: readonly string[],
+):
+  | {
+      status: "found";
+      toolCall: {
+        name: string;
+        input: unknown;
+        callId: string;
+        approvalAskId?: string;
+      };
+    }
+  | { status: "ambiguous" }
+  | { status: "missing" } {
+  if (!Array.isArray(history) || !approvedToolCalls?.length) {
+    return { status: "missing" };
+  }
+  const approved = new Set(approvedToolCalls);
+  const approvedAskIds = new Set(approvedToolCallAskIds ?? []);
+  const calls = new Map<
+    string,
+    {
+      name: string;
+      input: unknown;
+      approvalKey?: string;
+      approvalAskId?: string;
+    }
+  >();
+  const matches: Array<{
+    name: string;
+    input: unknown;
+    callId: string;
+    approvalAskId?: string;
+  }> = [];
+
+  for (const message of history) {
+    if (message.role === "assistant") {
+      for (const part of message.content) {
+        if (part.type !== "tool-call") continue;
+        const callId =
+          typeof part.id === "string"
+            ? part.id
+            : typeof part.toolCallId === "string"
+              ? part.toolCallId
+              : "";
+        const name =
+          typeof part.name === "string"
+            ? part.name
+            : typeof part.toolName === "string"
+              ? part.toolName
+              : "";
+        if (!callId || !name) continue;
+        calls.set(callId, {
+          name,
+          input:
+            part.input !== undefined
+              ? part.input
+              : (part.args ?? { omitted: "tool-input" }),
+          ...(part.approvalKey ? { approvalKey: part.approvalKey } : {}),
+          ...(part.approvalAskId ? { approvalAskId: part.approvalAskId } : {}),
+        });
+      }
+      continue;
+    }
+
+    for (const part of message.content) {
+      if (part.type !== "tool-result") continue;
+      const call = calls.get(part.toolCallId);
+      if (!call) {
+        continue;
+      }
+      const matchesApproval =
+        approvedAskIds.size > 0
+          ? Boolean(
+              call.approvalAskId && approvedAskIds.has(call.approvalAskId),
+            )
+          : approved.has(
+              call.approvalKey ?? toolCallCacheKey(call.name, call.input),
+            );
+      if (!matchesApproval) {
+        continue;
+      }
+      if (part.approvalPause !== true) continue;
+      if (
+        approvedAskIds.size > 0 &&
+        (!call.approvalAskId ||
+          !approvedAskIds.has(call.approvalAskId) ||
+          part.approvalAskId !== call.approvalAskId)
+      ) {
+        continue;
+      }
+      if (
+        call.approvalAskId &&
+        part.approvalAskId &&
+        call.approvalAskId !== part.approvalAskId
+      ) {
+        continue;
+      }
+      matches.push({
+        name: call.name,
+        input: call.input,
+        callId: part.toolCallId,
+        ...((part.approvalAskId ?? call.approvalAskId)
+          ? { approvalAskId: part.approvalAskId ?? call.approvalAskId }
+          : {}),
+      });
+    }
+  }
+
+  if (approvedAskIds.size > 0) {
+    const distinctAskIds = new Set(
+      matches.map((match) => match.approvalAskId).filter(Boolean),
+    );
+    if (
+      distinctAskIds.size !== 1 ||
+      distinctAskIds.size !== approvedAskIds.size
+    ) {
+      return { status: matches.length === 0 ? "missing" : "ambiguous" };
+    }
+    const exactMatches = matches.filter((match) =>
+      approvedAskIds.has(match.approvalAskId ?? ""),
+    );
+    if (exactMatches.length === 0) return { status: "missing" };
+    return { status: "found", toolCall: exactMatches.at(-1)! };
+  }
+
+  if (matches.length > 1) return { status: "ambiguous" };
+  const toolCall = matches[0];
+  return toolCall ? { status: "found", toolCall } : { status: "missing" };
 }
 
-function rateLimitRecoveryHint(message: string): string {
+const INTERRUPTED_TOOL_LEDGER_POLL_MS =
+  process.env.NODE_ENV === "test" ? 0 : 2_000;
+
+async function waitForInterruptedToolLedgerEntry(opts: {
+  threadId: string;
+  toolKey: string;
+  toolName: string;
+  timeoutMs: number;
+  signal: AbortSignal;
+  send: (event: AgentChatEvent) => void;
+}): Promise<Awaited<ReturnType<typeof readLedgerEntry>>> {
+  const pollMs = INTERRUPTED_TOOL_LEDGER_POLL_MS;
+  const maxWaitMs =
+    process.env.NODE_ENV === "test" ? 1 : Math.max(0, opts.timeoutMs);
+  const maxPolls =
+    process.env.NODE_ENV === "test"
+      ? 3
+      : Math.max(1, Math.ceil(maxWaitMs / Math.max(1, pollMs)) + 1);
+
+  for (let attempt = 0; attempt < maxPolls; attempt++) {
+    if (opts.signal.aborted) return null;
+    const ledgerResult = await readLedgerEntry(opts.threadId, opts.toolKey);
+    if (ledgerResult !== null) return ledgerResult;
+
+    if (attempt >= maxPolls - 1) break;
+    opts.send({
+      type: "activity",
+      tool: opts.toolName,
+      label: `Waiting for previous ${opts.toolName} result.`,
+    });
+    if (pollMs <= 0) continue;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        opts.signal.removeEventListener("abort", done);
+        resolve();
+      };
+      const timer = setTimeout(done, pollMs);
+      opts.signal.addEventListener("abort", done, { once: true });
+    });
+  }
+
+  return null;
+}
+
+export function normalizeToolErrorForBreaker(error: string): string {
+  return (
+    stripDiagnosticSnippets(error)
+      // The argument echo, up to the next sentence boundary.
+      .replace(
+        /Received:\s*[\s\S]*?\.\s(?=Expected:|The tool was not executed)/g,
+        "",
+      )
+      // Bare JSON payloads some providers inline instead of a Received: span.
+      .replace(/\{[\s\S]{0,2000}?\}/g, "{}")
+      .replace(
+        /\bready again in about \d+s\b/g,
+        "ready again after the cooldown",
+      )
+      .replace(/\s+/g, " ")
+      .trim()
+  );
+}
+
+function rateLimitRecoveryHint(message: string, error?: unknown): string {
+  const statusCode =
+    typeof error === "object" && error !== null && "statusCode" in error
+      ? error.statusCode
+      : undefined;
+  const errorCode =
+    typeof error === "object" && error !== null && "errorCode" in error
+      ? error.errorCode
+      : undefined;
   if (
+    statusCode !== 429 &&
     !/\b(?:429|rate[-\s]?limit|rate limited|quota exceeded|too many requests|calls limit exceeded)\b/i.test(
       message,
-    )
+    ) &&
+    !(typeof errorCode === "string" && /rate[-_]?limit|quota/i.test(errorCode))
   ) {
     return "";
   }
   return "\n\nProvider rate-limit guidance: stop retrying this provider in this turn. Report the rate limit as a coverage gap, include any evidence already gathered, and ask the user to retry after the provider quota resets if full coverage is required.";
 }
 
+/**
+ * Tool errors the model has no way to clear: the missing thing lives outside
+ * the turn (a credential, a connected account, a runtime, the user's own
+ * approval). Role errors can depend on the arguments, so their text is not a
+ * permanent precondition. Every retry costs a full round-trip carrying the whole
+ * transcript and lands on the identical error, so these stop on the FIRST
+ * occurrence rather than after `MAX_SAME_ERROR_ACROSS_ARGUMENTS` of them.
+ *
+ * The distinction is the one `stopForBigQueryNotConfigured` draws in
+ * templates/analytics: a *configuration* gap is permanent for this turn, a
+ * *query* failure is not. Anything the model can act on — a stale read to
+ * rebase, a bad argument, a full quota it can free, a wrong dataset name, a
+ * statement timeout — must stay out of this list and keep its retries.
+ * Precision over recall: a wrong match kills a turn that would have succeeded,
+ * which is worse than one more retry.
+ */
+export function permanentPreconditionRemedy(message: string): string | null {
+  const unfenced = stripDiagnosticSnippets(message);
+  const trimmed = unfenced.replace(/\s+/g, " ").trim();
+  for (const pattern of PERMANENT_PRECONDITION_PATTERNS) {
+    if (pattern.test(trimmed)) return trimmed;
+  }
+  return null;
+}
+
+const PERMANENT_PRECONDITION_PATTERNS: readonly RegExp[] = [
+  /\b(?:api[ -]?keys?|access tokens?|credentials?|secrets?)\b[^.]{0,60}\bnot (?:configured|set|connected|available)\b/i,
+  /\bsave [A-Z][A-Z0-9_]{3,} in (?:the )?settings\b/i,
+  /(?:^|[.:!?]\s+)(?:Connect|Use) [A-Z][\w.-]*[^;]{0,40}?\b(?:before|first|in settings|to)\b/,
+  /\bplan mode blocked\b/i,
+  /\bno authenticated user\b/i,
+  /\bssrf blocked\b/i,
+  // Deliberately absent: "only available in …". Retention windows ("only
+  // available from the last 90 days") share its wording and are fixed by
+  // narrowing the range, so it stopped turns that were one argument away from
+  // succeeding. The count-based breaker still ends a genuine runtime gate
+  // after six.
+];
+
+const PERMANENT_PRECONDITION_REASON_MAX_CHARS = 240;
+
+export function permanentPreconditionReason(
+  toolName: string,
+  message: string,
+): string | null {
+  const escapedName = toolName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const reason = message
+    .replace(new RegExp(`^Error running ${escapedName}:\\s*`), "")
+    .replace(new RegExp(`^${escapedName}:\\s*`), "")
+    // `runToolCall` suffixes a contract error's own code; it is the marker
+    // that classified this stop, not part of the reason.
+    .replace(/\s*\(errorCode: permanent_precondition\)\s*$/i, "")
+    .trim()
+    // The headline appends its own sentence punctuation.
+    .replace(/[.。]+$/, "");
+  const nestedPrecondition = reason
+    .match(
+      /\bI stopped because [\w-]+ can't run yet:\s*(.+?)\. That needs to be fixed outside this chat\b/i,
+    )?.[1]
+    ?.trim();
+  if (nestedPrecondition) return nestedPrecondition;
+  if (!reason) return null;
+  if (
+    /\bI stopped because\b/i.test(reason) ||
+    /permanent_precondition/i.test(reason)
+  ) {
+    return null;
+  }
+  return reason.length > PERMANENT_PRECONDITION_REASON_MAX_CHARS
+    ? `${reason.slice(0, PERMANENT_PRECONDITION_REASON_MAX_CHARS).trim()}…`
+    : reason;
+}
+
 const SOURCE_SWEEP_TOOL_NAME =
-  /\b(?:api|calls?|deals?|events?|issues?|messages?|metrics?|provider|query|records?|request|search|tickets?|transcripts?)\b/i;
+  /\b(?:api|calls?|deals?|docs?|events?|issues?|messages?|metrics?|provider|query|records?|request|search|source|tickets?|transcripts?)\b/i;
 
 const SOURCE_SWEEP_PROVIDER_TOKEN =
   /\b(?:amplitude|apollo|bigquery|commonroom|data-source|ga4|github|gong|grafana|hubspot|jira|mixpanel|notion|posthog|postgres|postgresql|pylon|sentry|slack|stripe)\b/i;
@@ -1978,6 +5339,15 @@ const SOURCE_SWEEP_EXCLUDED_TOOLS = new Set([
   "view-screen",
 ]);
 
+const SOURCE_SWEEP_AGGREGATE_EXCLUDED_TOOLS = new Set([
+  "docs-search",
+  "list-docs",
+  "read-doc",
+  "read-source-file",
+  "search-docs",
+  "search-source",
+]);
+
 function normalizeToolNameForHeuristics(name: string): string {
   return name.replace(/[_-]+/g, " ");
 }
@@ -1996,20 +5366,27 @@ function isLikelySourceSweepTool(
   );
 }
 
+function isLikelyAggregateSourceSweepTool(
+  name: string,
+  entry: ActionEntry | undefined,
+): boolean {
+  return (
+    !SOURCE_SWEEP_AGGREGATE_EXCLUDED_TOOLS.has(name.toLowerCase()) &&
+    isLikelySourceSweepTool(name, entry)
+  );
+}
+
 function hasExhaustedSourceSweepBudget(opts: {
   priorToolCalls: readonly AgentLoopToolCallSummary[];
   actions: Record<string, ActionEntry>;
   threshold?: number;
 }): boolean {
-  const threshold = opts.threshold ?? SOURCE_SWEEP_TOOL_CALL_THRESHOLD;
-  const counts = new Map<string, number>();
-  for (const call of opts.priorToolCalls) {
-    if (!isLikelySourceSweepTool(call.name, opts.actions[call.name])) continue;
-    const next = (counts.get(call.name) ?? 0) + 1;
-    if (next >= threshold) return true;
-    counts.set(call.name, next);
-  }
-  return false;
+  const threshold = opts.threshold ?? resolveSourceSweepToolCallThreshold();
+  return (
+    opts.priorToolCalls.filter((call) =>
+      isLikelyAggregateSourceSweepTool(call.name, opts.actions[call.name]),
+    ).length >= threshold
+  );
 }
 
 function sourceSweepDelegationText(input: unknown): string {
@@ -2080,14 +5457,17 @@ function restrictAgentTeamsAfterSourceSweep(tools: EngineTool[]): EngineTool[] {
 
 export function repeatedSourceSweepGuardMessage(opts: {
   toolName: string;
-  priorCalls: number;
   threshold?: number;
+  scope?: "tool" | "aggregate";
 }): string {
-  const threshold = opts.threshold ?? SOURCE_SWEEP_TOOL_CALL_THRESHOLD;
+  const threshold = opts.threshold ?? resolveSourceSweepToolCallThreshold();
+  const target =
+    opts.scope === "aggregate"
+      ? "read-only source/search tools"
+      : "the same read-only source/search tool";
   return (
-    `Skipped ${opts.toolName}: this turn already made ${opts.priorCalls} ` +
-    `call(s) to the same read-only source/search tool, which exceeds the ` +
-    `${threshold}-call convergence budget. Stop calling ${opts.toolName} ` +
+    `Skipped ${opts.toolName}: this turn already exhausted its ` +
+    `${threshold}-call convergence budget for ${target}. Stop calling ${opts.toolName} ` +
     `one item at a time and change strategy before answering. If a broader ` +
     `read-only bulk/source mechanism is available, use it now: provider API ` +
     `catalog/docs/request tools with pagination or staging, code execution ` +
@@ -2110,21 +5490,40 @@ export function shouldGuardRepeatedSourceSweep(opts: {
   toolName: string;
   entry: ActionEntry | undefined;
   priorToolCalls: readonly AgentLoopToolCallSummary[];
+  actions?: Record<string, ActionEntry>;
   threshold?: number;
 }): { toolName: string; priorCalls: number; message: string } | null {
   if (!isLikelySourceSweepTool(opts.toolName, opts.entry)) return null;
-  const threshold = opts.threshold ?? SOURCE_SWEEP_TOOL_CALL_THRESHOLD;
+  const threshold = opts.threshold ?? resolveSourceSweepToolCallThreshold();
   const priorCalls = opts.priorToolCalls.filter(
     (call) => call.name === opts.toolName,
   ).length;
+  const priorSourceSweepCalls = opts.priorToolCalls.filter((call) =>
+    isLikelyAggregateSourceSweepTool(
+      call.name,
+      opts.actions?.[call.name] ??
+        (call.name === opts.toolName ? opts.entry : undefined),
+    ),
+  ).length;
+  if (priorSourceSweepCalls >= threshold) {
+    return {
+      toolName: opts.toolName,
+      priorCalls: priorSourceSweepCalls,
+      message: repeatedSourceSweepGuardMessage({
+        toolName: opts.toolName,
+        threshold,
+        scope: "aggregate",
+      }),
+    };
+  }
   if (priorCalls < threshold) return null;
   return {
     toolName: opts.toolName,
     priorCalls,
     message: repeatedSourceSweepGuardMessage({
       toolName: opts.toolName,
-      priorCalls,
       threshold,
+      scope: "tool",
     }),
   };
 }
@@ -2144,7 +5543,7 @@ function seedSourceSweepToolCallsFromHistory(
       if (!isLikelySourceSweepTool(part.name, actions[part.name])) continue;
       seeded.push({
         name: part.name,
-        input: normalizeToolCallInputForHistory(part.input),
+        input: normalizeToolCallInputForHistory(part.input, part.name),
       });
     }
   }
@@ -2153,22 +5552,69 @@ function seedSourceSweepToolCallsFromHistory(
 
 function normalizeToolCallInputForHistory(
   input: unknown,
+  toolName?: string,
 ): Record<string, unknown> {
   if (input && typeof input === "object" && !Array.isArray(input)) {
-    return input as Record<string, unknown>;
+    const record = input as Record<string, unknown>;
+    if (toolName !== "docs-search" || typeof record.query !== "string") {
+      return record;
+    }
+    return {
+      ...record,
+      query: record.query.trim().replace(/\s+/g, " ").toLowerCase(),
+    };
   }
   return { rawInput: input };
+}
+
+function dedupeAssistantToolCallsById(
+  content: import("./engine/types.js").EngineContentPart[],
+): import("./engine/types.js").EngineContentPart[] {
+  const seenToolCallIds = new Set<string>();
+  const deduped: import("./engine/types.js").EngineContentPart[] = [];
+  for (const part of content) {
+    if (part.type === "tool-call") {
+      if (seenToolCallIds.has(part.id)) continue;
+      seenToolCallIds.add(part.id);
+    }
+    deduped.push(part);
+  }
+  return deduped;
+}
+
+function schemaErrorPropertyNames(error: string): string[] {
+  const names = new Set<string>();
+  for (const match of error.matchAll(/\binput\/([A-Za-z0-9_$-]+)/g)) {
+    names.add(match[1]);
+  }
+  for (const match of error.matchAll(
+    /must have required property '([^']+)'/g,
+  )) {
+    names.add(match[1]);
+  }
+  return [...names];
 }
 
 function toolInputSchemaErrorResult(
   toolName: string,
   input: unknown,
   error: string,
+  parameters?: ActionTool["parameters"],
+  outputCapTruncated = false,
 ): string {
+  const signature = describeToolParameterSignature(
+    parameters,
+    schemaErrorPropertyNames(error),
+  );
   return (
     `Invalid action parameters for ${toolName}: ${sanitizeToolErrorText(error)}. ` +
     `Received: ${stringifyToolInput(input)}. ` +
-    "The tool was not executed; retry with arguments that match the tool schema."
+    (signature
+      ? `Expected: ${signature} (where * = required, ? = optional). `
+      : "") +
+    (outputCapTruncated
+      ? "The tool was not executed: the response hit the model output-token cap before these arguments finished, so they are truncated, not wrong. Retry with a smaller payload — split the work across several calls, or shorten the longest field."
+      : "The tool was not executed; retry with arguments that match the tool schema.")
   );
 }
 
@@ -2177,18 +5623,261 @@ type RawJsonSchema = AgentNativeJsonSchema;
 const rawToolInputAjv = new Ajv({
   strict: false,
   allErrors: true,
+  coerceTypes: true,
+  useDefaults: false,
+  removeAdditional: false,
+  verbose: true,
+});
+
+const rawToolInputAjv2020 = new Ajv2020({
+  strict: false,
+  allErrors: true,
+  coerceTypes: true,
+  useDefaults: false,
+  removeAdditional: false,
+  verbose: true,
+});
+
+const rawToolInputValidatorCache = new WeakMap<
+  object,
+  Map<boolean, ValidateFunction>
+>();
+
+const optionalPlaceholderAjv = new Ajv({
+  strict: false,
+  allErrors: false,
   coerceTypes: false,
   useDefaults: false,
   removeAdditional: false,
 });
 
-const rawToolInputValidatorCache = new WeakMap<object, ValidateFunction>();
+const optionalPlaceholderValidatorCache = new WeakMap<
+  object,
+  ValidateFunction
+>();
 
-function getRawToolInputValidator(schema: RawJsonSchema): ValidateFunction {
-  const cached = rawToolInputValidatorCache.get(schema);
+function isStructurallyEmptyToolValue(value: unknown): boolean {
+  if (value === false) return true;
+  if (value === null) return true;
+  if (typeof value === "string") return value.trim().length === 0;
+  if (Array.isArray(value)) {
+    return (
+      value.length === 0 ||
+      value.every(
+        (item) =>
+          item !== null &&
+          typeof item === "object" &&
+          !Array.isArray(item) &&
+          Object.keys(item).length === 0,
+      )
+    );
+  }
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    Object.keys(value).length === 0
+  );
+}
+
+function compileToolValueValidator(schema: object): ValidateFunction | null {
+  const cached = optionalPlaceholderValidatorCache.get(schema);
   if (cached) return cached;
-  const validator = rawToolInputAjv.compile(schema);
-  rawToolInputValidatorCache.set(schema, validator);
+  try {
+    const validator = optionalPlaceholderAjv.compile(schema);
+    optionalPlaceholderValidatorCache.set(schema, validator);
+    return validator;
+  } catch {
+    return null;
+  }
+}
+
+function schemaAcceptsToolValue(schema: object, value: unknown): boolean {
+  const validator = compileToolValueValidator(schema);
+  return validator ? Boolean(validator(value)) : false;
+}
+
+function schemaRejectsToolValue(schema: object, value: unknown): boolean {
+  const validator = compileToolValueValidator(schema);
+  return validator ? !validator(value) : false;
+}
+
+function schemaDiscriminatorValue(
+  schema: AgentNativeJsonSchema | undefined,
+): unknown {
+  if (!schema) return undefined;
+  if (schema.const !== undefined) return schema.const;
+  if (Array.isArray(schema.enum) && schema.enum.length === 1) {
+    return schema.enum[0];
+  }
+  return undefined;
+}
+
+function discriminatedBranchIndex(
+  branches: readonly AgentNativeJsonSchema[],
+  value: unknown,
+): number {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return -1;
+  const record = value as Record<string, unknown>;
+  return branches.findIndex((branch) => {
+    const properties = branch.properties;
+    if (!properties) return false;
+    const discriminators = Object.entries(properties).filter(
+      ([, spec]) => schemaDiscriminatorValue(spec) !== undefined,
+    );
+    if (discriminators.length === 0) return false;
+    return discriminators.every(
+      ([key, spec]) => record[key] === schemaDiscriminatorValue(spec),
+    );
+  });
+}
+
+function resolveObjectSchemaBranch(
+  schema: RawJsonSchema,
+  value: unknown,
+): RawJsonSchema | undefined {
+  const branches = schema.oneOf ?? schema.anyOf;
+  if (!branches?.length) return schema;
+  const index = discriminatedBranchIndex(branches, value);
+  return index >= 0 ? branches[index] : undefined;
+}
+
+function stripOptionalToolPlaceholders(
+  schema: RawJsonSchema | undefined,
+  value: unknown,
+): { value: unknown; changed: boolean } {
+  if (!schema) return { value, changed: false };
+
+  if (Array.isArray(value)) {
+    const itemSchema = schema.items;
+    if (!itemSchema) return { value, changed: false };
+    let changed = false;
+    const items = value.map((item) => {
+      const result = stripOptionalToolPlaceholders(itemSchema, item);
+      if (result.changed) changed = true;
+      return result.value;
+    });
+    return changed
+      ? { value: items, changed: true }
+      : { value, changed: false };
+  }
+
+  if (!value || typeof value !== "object") return { value, changed: false };
+
+  const objectSchema = resolveObjectSchemaBranch(schema, value);
+  const properties = objectSchema?.properties;
+  if (!properties) return { value, changed: false };
+
+  const required = new Set(
+    Array.isArray(objectSchema.required) ? objectSchema.required : [],
+  );
+  const record = value as Record<string, unknown>;
+  const placeholders: string[] = [];
+  let hasSchemaInvalidPlaceholder = false;
+  let normalized: Record<string, unknown> | null = null;
+
+  for (const [key, entry] of Object.entries(record)) {
+    const propertySchema = properties[key];
+    if (!propertySchema || typeof propertySchema !== "object") continue;
+    if (!required.has(key) && isStructurallyEmptyToolValue(entry)) {
+      placeholders.push(key);
+      if (schemaRejectsToolValue(propertySchema, entry)) {
+        hasSchemaInvalidPlaceholder = true;
+      }
+      continue;
+    }
+    const nested = stripOptionalToolPlaceholders(propertySchema, entry);
+    if (nested.changed) {
+      normalized ??= { ...record };
+      normalized[key] = nested.value;
+    }
+  }
+
+  if (hasSchemaInvalidPlaceholder) {
+    normalized ??= { ...record };
+    for (const key of placeholders) delete normalized[key];
+  }
+
+  return normalized
+    ? { value: normalized, changed: true }
+    : { value, changed: false };
+}
+
+function normalizeOptionalToolPlaceholders(
+  schema: RawJsonSchema | undefined,
+  input: unknown,
+): { input: unknown; changed: boolean } {
+  if (!schema?.properties || !input || typeof input !== "object") {
+    return { input, changed: false };
+  }
+  if (Array.isArray(input)) return { input, changed: false };
+  const result = stripOptionalToolPlaceholders(schema, input);
+  return { input: result.value, changed: result.changed };
+}
+
+function coerceStringifiedJsonToolValues(
+  schema: RawJsonSchema | undefined,
+  input: unknown,
+): { input: unknown; changed: boolean } {
+  if (!schema?.properties || !input || typeof input !== "object") {
+    return { input, changed: false };
+  }
+  if (Array.isArray(input)) return { input, changed: false };
+
+  let normalized: Record<string, unknown> | null = null;
+  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+    if (typeof value !== "string" || value.trim().length === 0) continue;
+    const propertySchema = schema.properties[key];
+    if (!propertySchema || typeof propertySchema !== "object") continue;
+    const expectedType = (propertySchema as { type?: unknown }).type;
+    const expectsObjectOrArray =
+      expectedType === "object" ||
+      expectedType === "array" ||
+      (Array.isArray(expectedType) &&
+        (expectedType.includes("object") || expectedType.includes("array")));
+    if (!expectsObjectOrArray) continue;
+    if (schemaAcceptsToolValue(propertySchema, value)) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null) continue;
+    const parsedContainer = Array.isArray(parsed) ? "array" : "object";
+    const containerMatches = Array.isArray(expectedType)
+      ? expectedType.includes(parsedContainer)
+      : expectedType === parsedContainer;
+    if (!containerMatches) continue;
+    normalized ??= { ...(input as Record<string, unknown>) };
+    normalized[key] = parsed;
+  }
+  return normalized
+    ? { input: normalized, changed: true }
+    : { input, changed: false };
+}
+
+function getRawToolInputValidator(
+  schema: RawJsonSchema,
+  useMcpDefaultDialect = false,
+): ValidateFunction {
+  const cached = rawToolInputValidatorCache
+    .get(schema)
+    ?.get(useMcpDefaultDialect);
+  if (cached) return cached;
+  const declaredDialect = (schema as { $schema?: unknown }).$schema;
+  const normalizedDialect =
+    typeof declaredDialect === "string"
+      ? declaredDialect.replace(/#$/, "")
+      : undefined;
+  const ajv =
+    normalizedDialect === "https://json-schema.org/draft/2020-12/schema" ||
+    (declaredDialect === undefined && useMcpDefaultDialect)
+      ? rawToolInputAjv2020
+      : rawToolInputAjv;
+  const validator = ajv.compile(schema);
+  const validators = rawToolInputValidatorCache.get(schema) ?? new Map();
+  validators.set(useMcpDefaultDialect, validator);
+  rawToolInputValidatorCache.set(schema, validators);
   return validator;
 }
 
@@ -2200,31 +5889,130 @@ function shouldValidateRawToolParameters(entry: ActionEntry): boolean {
   return !maybeSchema?.["~standard"] && Boolean(entry.tool.parameters);
 }
 
+function isWithinInstancePath(candidate: string, root: string): boolean {
+  return candidate === root || candidate.startsWith(`${root}/`);
+}
+
+function narrowUnionBranchErrors(
+  errors: ErrorObject[] | null | undefined,
+): ErrorObject[] | null | undefined {
+  if (!errors?.length) return errors;
+  let kept = errors;
+  for (const error of errors) {
+    const keyword = error.keyword;
+    if (keyword !== "oneOf" && keyword !== "anyOf") continue;
+    const branches = (error.parentSchema as RawJsonSchema | undefined)?.[
+      keyword
+    ];
+    if (!branches?.length) continue;
+    const index = discriminatedBranchIndex(branches, error.data);
+    if (index < 0) continue;
+    const branchPrefix = `${error.schemaPath}/`;
+    kept = kept.filter((candidate) => {
+      if (candidate === error) return false;
+      if (!isWithinInstancePath(candidate.instancePath, error.instancePath)) {
+        return true;
+      }
+      if (!candidate.schemaPath.startsWith(branchPrefix)) return true;
+      return candidate.schemaPath.startsWith(`${branchPrefix}${index}/`);
+    });
+  }
+  return kept.length ? kept : errors;
+}
+
 function validateRawToolInput(
   entry: ActionEntry,
   input: unknown,
 ): string | null {
+  const strict = getStrictToolInputValidator(entry);
+  if (strict) return strict(input);
   if (!shouldValidateRawToolParameters(entry)) return null;
   const parameters = entry.tool.parameters;
   if (!parameters) return null;
   let validator: ValidateFunction;
   try {
-    validator = getRawToolInputValidator(parameters);
+    validator = getRawToolInputValidator(
+      parameters,
+      entry.fromMcpServer === true,
+    );
   } catch (err) {
     return `tool schema is invalid: ${sanitizeToolErrorValue(err)}`;
   }
   if (validator(input === undefined ? {} : input)) return null;
-  return rawToolInputAjv.errorsText(validator.errors, {
+  return rawToolInputAjv.errorsText(narrowUnionBranchErrors(validator.errors), {
     separator: "; ",
     dataVar: "input",
   });
 }
 
-/**
- * The core agent loop — calls the engine iteratively until no more tool calls.
- * Decoupled from HTTP transport so it can run in the background.
- * Returns accumulated token usage for cost tracking.
- */
+type ModelInputObserver = (
+  messages: readonly unknown[],
+) => void | Promise<void>;
+
+function projectModelInputForObserver(messages: readonly unknown[]): unknown[] {
+  const seen = new WeakMap<object, unknown>();
+  const project = (value: unknown, isImageListEntry = false): unknown => {
+    if (!value || typeof value !== "object") return value;
+    const existing = seen.get(value);
+    if (existing !== undefined) return existing;
+    if (Array.isArray(value)) {
+      const projected: unknown[] = [];
+      seen.set(value, projected);
+      for (const entry of value) {
+        projected.push(project(entry, isImageListEntry));
+      }
+      return projected;
+    }
+
+    const part = value as Record<string, unknown>;
+    const isMedia =
+      isImageListEntry || part.type === "image" || part.type === "file";
+    if (isMedia) {
+      const mediaType =
+        typeof part.mediaType === "string" ? part.mediaType : "unknown";
+      const filename =
+        part.type === "file" && typeof part.filename === "string"
+          ? ` ${part.filename}`
+          : "";
+      const label = part.type === "file" ? `file${filename}` : "image";
+      const data = typeof part.data === "string" ? part.data : "";
+      return {
+        type: "text",
+        text: `[${label}: ${mediaType}, ~${Math.floor((data.length * 3) / 4)} bytes]`,
+      };
+    }
+
+    const projected: Record<string, unknown> = {};
+    seen.set(value, projected);
+    for (const [key, nested] of Object.entries(part)) {
+      projected[key] =
+        key === "images" && Array.isArray(nested)
+          ? project(nested, true)
+          : project(nested);
+    }
+    return projected;
+  };
+
+  return project(messages) as unknown[];
+}
+
+function notifyModelInputObserver(
+  observer: ModelInputObserver | undefined,
+  messages: readonly unknown[],
+): void {
+  if (!observer) return;
+  try {
+    const result = observer(projectModelInputForObserver(messages));
+    if (result !== undefined) {
+      void Promise.resolve(result).catch(() => {
+        // coercion-ok: observer failures cannot change agent execution.
+      });
+    }
+  } catch {
+    // coercion-ok: observer failures cannot change agent execution.
+  }
+}
+
 export async function runAgentLoop(opts: {
   engine: AgentEngine;
   model: string;
@@ -2232,87 +6020,267 @@ export async function runAgentLoop(opts: {
   tools: EngineTool[];
   availableTools?: EngineTool[];
   messages: EngineMessage[];
+  structuredHistoryImages?: {
+    history: AgentChatStructuredMessage[];
+    resolutions: ReadonlyMap<string, StructuredHistoryImageResolution>;
+  };
+  systemSections?: import("../shared/context-xray.js").ContextManifestSystemSection[];
   actions: Record<string, ActionEntry>;
   send: (event: AgentChatEvent) => void;
   signal: AbortSignal;
+  beforeWrite?: () => Promise<void>;
+  unknownWriteToolNames?: Set<string>;
+  internalContinuation?: boolean;
+  onModelInput?: ModelInputObserver;
+  onUsage?: (usage: AgentLoopUsage) => void;
+  onOutcome?: (outcome: AgentLoopOutcome) => void;
   ownerEmail?: string | null;
   orgId?: string | null;
-  /**
-   * Attachments submitted with this turn (pasted text, files, images), passed
-   * through to each tool's `ActionRunContext.attachments` so actions can
-   * consume a large pasted artifact by reference instead of having the model
-   * re-emit it as a tool argument. See `create-extension`'s
-   * `contentFromAttachment`.
-   */
+  appId?: string;
+  appAuthorization?:
+    | import("../org/app-roles.js").AppAuthorizationContext
+    | null;
+  actionCaller?: ActionCaller;
+  automation?: ActionAutomationContext;
+  runId?: string;
+  /** Enable same-turn, agent-authored response metadata for interactive chat. */
+  followUpSuggestions?: boolean;
+  budgetStartedAt?: number;
+  networkProtocol?: "a2a" | "mcp" | "provider-api";
+  networkId?: string;
+  networkPeer?: string;
+  delegationDepth?: number;
+  visitedApps?: string[];
   attachments?: AgentChatAttachment[];
   reasoningEffort?: ReasoningEffort;
   providerOptions?: any;
   maxOutputTokens?: number;
   executionMode?: AgentExecutionMode;
   maxIterations?: number;
+  /**
+   * Per-TURN input-token ceiling. Iteration count and wall clock do not bound
+   * spend — retained tool results are re-sent every iteration, so cost is
+   * quadratic in tool-call count. Crossing this stops the turn outright
+   * (unlike `maxIterations`, which hands off to the next chunk).
+   */
+  maxRunInputTokens?: number;
+  priorTurnInputTokens?: number;
   finalResponseGuard?: AgentLoopFinalResponseGuard;
+  finalResponseGuardRequestText?: string;
   threadId?: string;
   turnId?: string;
-  /**
-   * App-level default limits applied to every tool call unless the individual
-   * ActionEntry overrides them with its own timeoutMs / maxResultChars.
-   */
-  toolLimits?: { timeoutMs?: number; maxResultChars?: number };
-  /**
-   * Stable approval keys granted by a human for actions declared
-   * `needsApproval`. A call whose key is present here runs even though the
-   * action requires approval; otherwise the loop pauses with
-   * `approval_required`. See `AgentChatRequest.approvedToolCalls`.
-   */
+  loadedSkillSlugs?: readonly string[];
+  runSoftTimeoutMs?: number;
+  toolLimits?: {
+    timeoutMs?: number;
+    maxResultChars?: number;
+    hardMaxResultChars?: number;
+  };
   approvedToolCalls?: string[];
+  approvedToolCallAskId?: string;
   /**
-   * In-loop processor seam (see `processors.ts`). Each processor can observe
-   * streamed chunks, observe model responses around tool execution, and
-   * `abort()` the run. Loop-internal config, NOT a tool/authoring surface —
-   * processors only observe/mutate-stream/abort; they never define app
-   * behavior or replace actions. When omitted or empty, none of the seam code
-   * runs and the loop is byte-for-byte unchanged (zero overhead).
+   * Server-side approval persistence hooks. The HTTP transport supplies these
+   * so client-supplied history is never the authorization source; direct loop
+   * callers may omit them when they own the surrounding approval boundary.
    */
+  onApprovalRequired?: (
+    binding: AgentApprovalBinding,
+  ) => Promise<string | void>;
+  consumeApproval?: (binding: AgentApprovalBinding) => Promise<boolean>;
+  isToolAlwaysAllowed?: (binding: AgentApprovalBinding) => Promise<boolean>;
   processors?: Processor[];
 }): Promise<AgentLoopUsage> {
   const {
     engine,
-    model,
-    systemPrompt,
-    tools,
-    availableTools,
+    systemPrompt: providedSystemPrompt,
+    tools: providedTools,
+    availableTools: providedAvailableTools,
     messages,
     actions,
     send,
     signal,
   } = opts;
+  // Delegation context can prepend the synthetic continuation instruction.
+  const internalContinuationTurn =
+    opts.internalContinuation === true || isInternalContinuationTurn(messages);
+  const followUpRunId = opts.followUpSuggestions ? opts.runId : undefined;
+  if (opts.followUpSuggestions && !followUpRunId) {
+    throw new Error("Follow-up suggestions require the canonical run id.");
+  }
+  const systemPrompt = followUpRunId
+    ? `${providedSystemPrompt}\n\n${FOLLOW_UP_SUGGESTIONS_INSTRUCTION}`
+    : providedSystemPrompt;
+  const tools = followUpRunId
+    ? [
+        followUpSuggestionsTool,
+        ...providedTools.filter(
+          (tool) => tool.name !== FOLLOW_UP_SUGGESTIONS_TOOL_NAME,
+        ),
+      ]
+    : providedTools;
+  const availableTools = followUpRunId
+    ? [
+        followUpSuggestionsTool,
+        ...(providedAvailableTools ?? providedTools).filter(
+          (tool) => tool.name !== FOLLOW_UP_SUGGESTIONS_TOOL_NAME,
+        ),
+      ]
+    : providedAvailableTools;
+  let completedFollowUpSuggestions: AgentSuggestion[] | undefined;
+  let completingFollowUpSuggestions = false;
+  let followUpCompletionContext: EngineMessage[] = [];
+  let followUpStartedAt: number | undefined;
+  let followUpCompletionFailed = false;
+  const failFollowUpCompletion = (code: FollowUpSuggestionsFailure) => {
+    if (followUpCompletionFailed) return;
+    followUpCompletionFailed = true;
+    completedFollowUpSuggestions = undefined;
+    send({
+      type: "rich_event",
+      event: {
+        namespace: "agent-native.follow-up-suggestions",
+        name: "generation_failed",
+        version: 1,
+        data: { code, runId: followUpRunId },
+      },
+    });
+  };
+  if (followUpRunId) send({ type: "suggestions", suggestions: [] });
+  let model = normalizeModelForEngine(engine, opts.model);
+  let outcomeReported = false;
+  const reportOutcome = (outcome: AgentLoopOutcome) => {
+    if (outcomeReported) return;
+    outcomeReported = true;
+    try {
+      opts.onOutcome?.(outcome);
+    } catch {
+      // Outcome observers are telemetry/protocol adapters and cannot alter the run.
+    }
+  };
+  const budgetStartedAt = opts.budgetStartedAt ?? Date.now();
+  const finalResponseGuardRequestText =
+    opts.finalResponseGuardRequestText ??
+    resolveFinalResponseGuardRequestText(messages);
   const availableToolMap = new Map(
     (availableTools ?? tools).map((tool) => [tool.name, tool]),
   );
-  const activeToolNames = new Set(tools.map((tool) => tool.name));
-  let activeTools = tools;
-
-  const expandActiveTools = (names: string[]): string[] => {
-    const added: string[] = [];
-    for (const name of names) {
-      if (activeToolNames.has(name)) continue;
-      const tool = availableToolMap.get(name);
-      if (!tool) continue;
-      activeToolNames.add(name);
-      added.push(name);
+  let activeTools = limitProviderTools(tools, PROVIDER_CORE_TOOL_NAMES);
+  const activeToolNames = new Set(activeTools.map((tool) => tool.name));
+  let appAuthorizationPromise:
+    | Promise<import("../org/app-roles.js").AppAuthorizationContext | null>
+    | undefined;
+  const resolveTurnAppAuthorization = (
+    userEmail: string | undefined,
+    orgId: string | null,
+  ) => {
+    if (!appAuthorizationPromise) {
+      appAuthorizationPromise =
+        opts.appAuthorization !== undefined
+          ? Promise.resolve(opts.appAuthorization)
+          : opts.appId && userEmail && orgId
+            ? import("../org/app-roles.js").then(
+                ({ resolveAppAuthorizationContext }) =>
+                  resolveAppAuthorizationContext(opts.appId!, {
+                    userEmail,
+                    orgId,
+                  }),
+              )
+            : Promise.resolve(null);
     }
-    if (added.length > 0) {
-      activeTools = (availableTools ?? tools).filter((tool) =>
-        activeToolNames.has(tool.name),
-      );
-    }
-    return added;
+    return appAuthorizationPromise;
   };
 
-  expandActiveTools(extractToolSearchResultNamesFromMessages(messages));
+  let expandedToolSchemaBytes = 0;
+  let reportedExpandedToolSchemaBytes = false;
+  let alreadyLoadedToolSearches = 0;
+  // Tools loaded after the first request, least recently needed first.
+  const loadedToolNames = new Set<string>();
+  const noteToolNeeded = (name: string) => {
+    if (loadedToolNames.delete(name)) loadedToolNames.add(name);
+  };
+  // `names` lead with what the model needs most. Below MAX_PROVIDER_TOOLS they
+  // append in registry order, so the tools prefix of the prompt cache survives.
+  // Past it the request keeps, in this order: tool-search and the follow-up
+  // tool, `pinned` (already promised this step) and `names`, the initial
+  // tools, then the other loaded tools most recently needed first, so the least
+  // recently needed loaded tools are evicted before any initial one. A tool
+  // that still does not fit is returned as overflow and never becomes active,
+  // so `activeTools` is exactly what the engine sends and nothing it dropped is
+  // reported as loaded.
+  const expandActiveTools = (
+    names: string[],
+    pinned: ReadonlySet<string> = new Set(),
+  ): { added: string[]; overflow: string[] } => {
+    const requested = new Set(names);
+    for (const name of requested) noteToolNeeded(name);
+    const wanted = [...requested].flatMap((name) => {
+      const tool = availableToolMap.get(name);
+      return tool && !activeToolNames.has(name) ? [tool] : [];
+    });
+    const added: string[] = [];
+    const overflow: string[] = [];
+    if (wanted.length > 0) {
+      if (activeTools.length + wanted.length <= MAX_PROVIDER_TOOLS) {
+        const wantedNames = new Set(wanted.map((tool) => tool.name));
+        activeTools = [
+          ...activeTools,
+          ...(availableTools ?? tools).filter((tool) =>
+            wantedNames.has(tool.name),
+          ),
+        ];
+      } else {
+        const byName = new Map(
+          [...activeTools, ...wanted].map((tool) => [tool.name, tool] as const),
+        );
+        const priority = new Set([
+          ...PROVIDER_CORE_TOOL_NAMES,
+          ...pinned,
+          ...names,
+          ...activeTools
+            .map((tool) => tool.name)
+            .filter((name) => !loadedToolNames.has(name)),
+          ...[...loadedToolNames].reverse(),
+        ]);
+        activeTools = [...priority]
+          .flatMap((name) => byName.get(name) ?? [])
+          .slice(0, MAX_PROVIDER_TOOLS);
+      }
+      activeToolNames.clear();
+      for (const tool of activeTools) activeToolNames.add(tool.name);
+      for (const name of loadedToolNames) {
+        if (!activeToolNames.has(name)) loadedToolNames.delete(name);
+      }
+      for (const tool of wanted) {
+        if (!activeToolNames.has(tool.name)) {
+          overflow.push(tool.name);
+          continue;
+        }
+        added.push(tool.name);
+        loadedToolNames.add(tool.name);
+        expandedToolSchemaBytes += JSON.stringify(tool).length;
+      }
+    }
+    if (
+      !reportedExpandedToolSchemaBytes &&
+      expandedToolSchemaBytes > EXPANDED_TOOL_SCHEMA_WARN_BYTES
+    ) {
+      reportedExpandedToolSchemaBytes = true;
+      console.warn(
+        `[agent-loop] expanded tool schemas reached ${expandedToolSchemaBytes} bytes across ${activeToolNames.size} active tools (runId=${opts.runId ?? "none"})`,
+      );
+    }
+    return { added, overflow };
+  };
 
-  // Build the processor chain only when at least one processor is supplied so
-  // the common (no-processors) path is unchanged and carries zero overhead.
+  const priorSearches = readToolSearchHistory(messages);
+  if (priorSearches.unreadable > 0) {
+    console.warn(
+      `[agent-loop] ${priorSearches.unreadable} earlier tool-search result(s) could not be read, so the tools they loaded were not restored (runId=${opts.runId ?? "none"})`,
+    );
+  }
+  // Newest searches lead, so they win if history alone overflows the cap.
+  expandActiveTools(priorSearches.names.reverse());
+
   const processorChain =
     opts.processors && opts.processors.length > 0
       ? new ProcessorChain(opts.processors)
@@ -2323,12 +6291,29 @@ export async function runAgentLoop(opts: {
     outputTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
+    engineName: opts.engine.name,
     model,
   };
 
   const maxIterations = normalizeMaxIterations(
     opts.maxIterations,
     getDefaultMaxIterations(),
+  );
+  const maxRunInputTokens = normalizeMaxRunInputTokens(
+    opts.maxRunInputTokens,
+    getDefaultMaxRunInputTokens(),
+  );
+  const priorTurnInputTokens =
+    typeof opts.priorTurnInputTokens === "number" &&
+    Number.isFinite(opts.priorTurnInputTokens)
+      ? Math.max(0, opts.priorTurnInputTokens)
+      : 0;
+  const runToolTimeoutCeilingMs = resolveRunToolTimeoutCeilingMs(
+    opts.runSoftTimeoutMs ??
+      resolveRunSoftTimeoutMs(undefined, {
+        useHostedDefault: true,
+        backgroundFunction: isInBackgroundFunctionRuntime(),
+      }),
   );
   const toolCallHistory: AgentLoopToolCallSummary[] = [];
   const sourceSweepToolCallHistory = seedSourceSweepToolCallsFromHistory(
@@ -2340,53 +6325,185 @@ export async function runAgentLoop(opts: {
     actions,
   });
   const toolResultHistory: AgentLoopToolResultSummary[] = [];
+  const turnReceipts = (): ToolWriteReceipt[] =>
+    toolResultHistory.flatMap((result) =>
+      result.receipt ? [{ tool: result.name, ...result.receipt }] : [],
+    );
+  let receiptGuardRetried = false;
   const runCtx = getRequestRunContext();
   if (runCtx) {
     runCtx.toolCalls = toolCallHistory;
     runCtx.toolResults = toolResultHistory;
   }
+  const consumedJournalKeys = new Set<string>();
+  const journalRead = await loadPriorTurnToolCallJournal(
+    opts.threadId,
+    opts.turnId,
+  );
+  const toolCallJournal =
+    journalRead.status === "read" ? journalRead.toolCallJournal : null;
+  const journaledPriorToolCalls =
+    journalRead.status === "read" ? journalRead.priorToolCalls : [];
+  const journaledPriorToolResults =
+    journalRead.status === "read" ? journalRead.priorToolResults : [];
+  let threadSkillPages = new Map<string, string>();
+  let currentJournalSkillBodies = new Map<string, string>();
+  const hasLoadedSkillPage = journaledPriorToolResults.some((result) => {
+    const input =
+      result.input && typeof result.input === "object"
+        ? (result.input as Record<string, unknown>)
+        : null;
+    return (
+      result.name === "docs-search" &&
+      !result.isError &&
+      typeof input?.slug === "string" &&
+      input.slug.startsWith("skill-") &&
+      result.content.startsWith("# Skill:")
+    );
+  });
+  const reuseJournaledSkillPages =
+    internalContinuationTurn && hasLoadedSkillPage;
+  const threadSkillSlugs = opts.loadedSkillSlugs ?? [];
+  if (reuseJournaledSkillPages || threadSkillSlugs.length > 0) {
+    const skillUserEmail = opts.ownerEmail ?? getRequestUserEmail();
+    const { loadSkillDocPages } = await import("../scripts/docs/search.js");
+    threadSkillPages = await loadSkillDocPages(
+      threadSkillSlugs,
+      skillUserEmail,
+    );
+    if (reuseJournaledSkillPages) {
+      const { loadAgentsBundle, getRuntimeSkillsForUser, skillDocsSlug } =
+        await import("../server/agents-bundle.js");
+      const runtimeSkills = await getRuntimeSkillsForUser(
+        await loadAgentsBundle(),
+        skillUserEmail,
+      );
+      currentJournalSkillBodies = new Map(
+        runtimeSkills.map((skill) => [
+          skillDocsSlug(skill.meta.name),
+          skill.content,
+        ]),
+      );
+    }
+  }
+  // Dedupe against the messages the model actually receives: memory
+  // compaction and retry trimming can remove a page that `messages` still has.
+  const continuationSystemPromptFor = (
+    sentMessages: readonly EngineMessage[],
+  ): string => {
+    const loadedSkillsContext = loadedSkillPagesContext(
+      reuseJournaledSkillPages ? journaledPriorToolResults : [],
+      threadSkillPages,
+      currentJournalSkillBodies,
+      (slug, page) => skillPageIntactInHistory(sentMessages, slug, page),
+    );
+    return loadedSkillsContext
+      ? `${systemPrompt}\n\n${loadedSkillsContext}`
+      : systemPrompt;
+  };
+  toolCallHistory.push(...journaledPriorToolCalls);
+  toolResultHistory.push(...journaledPriorToolResults);
+  const unreadableJournalStop: TerminalActionStop | null =
+    journalRead.status === "unreadable" && internalContinuationTurn
+      ? {
+          message:
+            "I stopped because I could not read this turn's run ledger, so I could not tell which steps had already finished. " +
+            "Retrying would risk repeating a step that already completed. Please send the request again.",
+          errorCode: "tool_call_journal_unreadable",
+          details: journalRead.error,
+        }
+      : null;
+
   const readOnlyToolResultCache = seedReadOnlyToolResultsFromHistory(
     messages,
     actions,
   );
-  const duplicateReadOnlyToolCalls = new Map<string, number>();
+  const duplicateReadOnlyToolCalls = seedDuplicateReadOnlyToolCallsFromHistory(
+    messages,
+    actions,
+  );
   const writeToolInterruptions = seedWriteToolInterruptionsFromHistory(
     messages,
     actions,
   );
-  const repeatedToolErrors = new Map<string, number>();
-
-  // Tool-call journal hard-block (resume safety). Snapshot the per-turn journal
-  // ONCE here, before any tool runs in this chunk, so it reflects only PRIOR
-  // run chunks of this logical turn. A write tool whose exact call already
-  // completed in an earlier interrupted chunk must not re-fire its side effect;
-  // when matched, runToolCall returns the journaled result instead of executing.
-  // Loaded eagerly (not lazily mid-loop) so the current chunk's own
-  // asynchronously-persisted tool_done events can never leak in and make a
-  // same-chunk call wrongly short-circuit. Best-effort: any ledger failure
-  // leaves the journal empty and all calls run normally. Fresh first-turn calls
-  // see an empty journal and are unaffected.
-  let toolCallJournal: ToolCallJournal | null = null;
-  const consumedJournalKeys = new Set<string>();
-  if (opts.threadId) {
-    try {
-      const priorEvents = await getCurrentTurnEventsForThread(opts.threadId);
-      if (priorEvents.length > 0) {
-        toolCallJournal = classifyToolCallJournal(priorEvents);
-      }
-    } catch {
-      // Journal is a hardening layer, never a gate — a failed ledger read just
-      // means no hard-block this turn.
+  const unknownWriteToolNames = opts.unknownWriteToolNames ?? new Set<string>();
+  const {
+    sameArguments: repeatedToolErrors,
+    sameTool: repeatedToolErrorsAnyArgs,
+  } = seedRepeatedToolErrorCountsFromJournal(
+    journalRead.status === "read" ? journalRead.priorToolCallSequence : [],
+    toolCallCacheKey,
+    normalizeToolErrorForBreaker,
+  );
+  const repeatedToolCalls = seedRepeatedToolCallCountsFromJournal(
+    journalRead.status === "read" ? journalRead.priorToolCallSequence : [],
+    toolCallCacheKey,
+    (name, result) =>
+      result.startsWith(resurfacedDuplicateReadOnlyToolResultPrefix(name)),
+  );
+  const inFlightRepeatToolCalls = new Map<
+    string,
+    { key: string; counted: boolean; countOnCompletion: boolean }
+  >();
+  const resetAfterSuccessfulWrite = (name: string, input: unknown) => {
+    readOnlyToolResultCache.clear();
+    duplicateReadOnlyToolCalls.clear();
+    const successfulWriteKey = toolCallCacheKey(name, input);
+    for (const call of inFlightRepeatToolCalls.values()) {
+      if (call.key !== successfulWriteKey) call.counted = false;
     }
-  }
-
-  const bufferTextUntilFinalGuard = Boolean(opts.finalResponseGuard);
+    for (const key of repeatedToolCalls.keys()) {
+      if (key !== successfulWriteKey) repeatedToolCalls.delete(key);
+    }
+    for (const key of repeatedToolErrors.keys()) {
+      if (!key.startsWith(`${successfulWriteKey}:`)) {
+        repeatedToolErrors.delete(key);
+      }
+    }
+    for (const key of repeatedToolErrorsAnyArgs.keys()) {
+      if (!key.startsWith(`${name}:`)) repeatedToolErrorsAnyArgs.delete(key);
+    }
+  };
+  const settleRepeatedToolCall = (callId: string) => {
+    const call = inFlightRepeatToolCalls.get(callId);
+    if (!call) return;
+    if (call.countOnCompletion && !call.counted) {
+      repeatedToolCalls.set(
+        call.key,
+        (repeatedToolCalls.get(call.key) ?? 0) + 1,
+      );
+    }
+    inFlightRepeatToolCalls.delete(callId);
+  };
+  const blockedA2ATargets = new Map<string, string>();
   let finalGuardRetries = 0;
+  let emptyFinalResponseRetries = 0;
+  let truncatedToolCallRetries = 0;
   let iterations = 0;
+  let endedAtLoopLimit = false;
+  let terminalActionStop: TerminalActionStop | null = null;
+  let loopBreakerCloseout: TerminalActionStop | null = null;
+  let loopBreakerStopped = false;
+  const sendTerminalActionStop = (stop: TerminalActionStop) => {
+    if (
+      stop.errorCode === "needs-approval" ||
+      stop.errorCode === "awaiting-user-input"
+    ) {
+      send({ type: "text", text: stop.transcriptMessage ?? stop.message });
+      return;
+    }
+    send({
+      type: "error",
+      error: stop.message,
+      errorCode: stop.errorCode ?? "tool_failed",
+      ...(stop.details ? { details: stop.details } : {}),
+      recoverable: false,
+    });
+  };
+  let effectiveMaxOutputTokens = opts.maxOutputTokens;
+  let effectiveReasoningEffort = opts.reasoningEffort;
+  let fallbackModelAttempted = false;
 
-  // Set when an in-loop processor aborts via `abort()` / throws a `TripWire`.
-  // The loop emits the `tripwire` event, surfaces the reason as a final
-  // assistant message, and stops cleanly.
   let tripwire: TripWire | null = null;
   const emitTripwire = (err: TripWire) => {
     tripwire = err;
@@ -2395,7 +6512,17 @@ export async function runAgentLoop(opts: {
       reason: err.message,
       ...(err.processor ? { processor: err.processor } : {}),
     });
-    send({ type: "text", text: err.message });
+    const errorCode =
+      err.processor === "run-input-token-budget"
+        ? "budget_exhausted"
+        : err.processor
+          ? `guardrail:${err.processor}`
+          : "guardrail";
+    terminalActionStop = {
+      message: err.message,
+      errorCode,
+    };
+    sendTerminalActionStop(terminalActionStop);
     messages.push({
       role: "assistant",
       content: [{ type: "text", text: err.message }],
@@ -2404,67 +6531,67 @@ export async function runAgentLoop(opts: {
 
   while (true) {
     if (signal.aborted) break;
-    if (++iterations > maxIterations) {
-      appendAgentLoopContinuation(messages, "loop_limit");
-      iterations = 1;
+    if (unreadableJournalStop) {
+      terminalActionStop = unreadableJournalStop;
+      sendTerminalActionStop(unreadableJournalStop);
+      break;
+    }
+    const turnInputTokens = priorTurnInputTokens + usage.inputTokens;
+    if (turnInputTokens > maxRunInputTokens) {
+      if (completingFollowUpSuggestions) {
+        failFollowUpCompletion("budget_exhausted");
+        break;
+      }
+      emitTripwire(
+        new TripWire(
+          `I stopped because this request consumed ${turnInputTokens.toLocaleString()} input tokens, past the ${maxRunInputTokens.toLocaleString()} budget for a single turn. ` +
+            `Anything already completed above is saved. Please retry as a smaller, more specific follow-up.`,
+          { processor: "run-input-token-budget" },
+        ),
+      );
+      break;
+    }
+    if (++iterations > maxIterations + (loopBreakerCloseout ? 1 : 0)) {
+      if (completingFollowUpSuggestions) {
+        failFollowUpCompletion("iteration_limit");
+        break;
+      }
+      send({ type: "loop_limit", maxIterations });
+      endedAtLoopLimit = true;
+      break;
     }
 
     let assistantContent: EngineContentPart[] | undefined;
-    let bufferedAssistantText = "";
+    let streamedAssistantText = "";
+    const streamedAssistantToolCalls: import("./engine/types.js").EngineToolCallPart[] =
+      [];
     let terminalStopReason:
       | Extract<EngineEvent, { type: "stop" }>["reason"]
       | undefined;
+    let terminalStopErrorCode: string | undefined;
     const toolCallErrors = new Map<
       string,
       { name: string; input: unknown; error: string }
     >();
-    let contextMessages = messages;
+    let contextMessages = completingFollowUpSuggestions
+      ? followUpCompletionContext
+      : messages;
 
-    if (opts.threadId) {
-      try {
-        const directives = await loadContextDirectives(opts.threadId, {
-          ownerEmail: opts.ownerEmail ?? null,
-        });
-        const protectedSegmentIds = computeProtectedSegmentIds(messages);
-        const { messages: transformedMessages, appliedStatus } =
-          applyContextDirectives(messages, directives, {
-            protectedSegmentIds,
-          });
-        const manifest = await buildManifest({
-          threadId: opts.threadId,
-          ...(opts.turnId ? { turnId: opts.turnId } : {}),
-          model,
-          rawMessages: messages,
-          sentMessages: transformedMessages,
-          appliedStatus,
-          directives,
-          protectedSegmentIds,
-          source: "structured",
-          enforceable: true,
-        });
-        contextMessages = transformedMessages;
-        void writeContextManifest(opts.threadId, manifest).catch((err) => {
-          console.warn(
-            "[context-xray] failed to write manifest:",
-            err instanceof Error ? err.message : String(err),
-          );
-        });
-      } catch (err) {
-        console.warn(
-          "[context-xray] context transform skipped:",
-          err instanceof Error ? err.message : String(err),
-        );
-      }
+    // The completion call carries a digest, not the conversation: the manifest
+    // and memory window describe the full thread, and the transform would
+    // overwrite this turn's manifest with the digest.
+    if (opts.threadId && !completingFollowUpSuggestions) {
+      contextMessages = await applyContextXrayTransformForIteration({
+        threadId: opts.threadId,
+        ownerEmail: opts.ownerEmail,
+        turnId: opts.turnId,
+        model,
+        messages: contextMessages,
+        systemSections: opts.systemSections,
+      });
 
-      // Observational Memory (consumer): for long threads that have already been
-      // compacted, fold the reflections+observations in as a leading context
-      // block and prefer the recent-raw-message window over the full raw
-      // history. No-op (returns the same array) for short threads with no OM
-      // entries, so the common path is unchanged. Runs after the context-xray
-      // transform so the two compose; best-effort inside the helper. Gated on an
-      // authenticated owner so anonymous threads never read OM scoped to a
-      // shared default identity.
       if (opts.ownerEmail) {
+        const beforeMemoryWindow = contextMessages;
         contextMessages = await applyObservationalMemoryToContext(
           contextMessages,
           {
@@ -2473,37 +6600,121 @@ export async function runAgentLoop(opts: {
             orgId: opts.orgId ?? null,
           },
         );
+        if (opts.structuredHistoryImages) {
+          const omittedParts =
+            structuredHistoryResolutionPartsMissingFromWindow(
+              beforeMemoryWindow,
+              contextMessages,
+              opts.structuredHistoryImages.history,
+              opts.structuredHistoryImages.resolutions,
+            );
+          appendUniqueContentPartsToLastUserMessage(
+            contextMessages,
+            omittedParts,
+          );
+          appendUniqueContentPartsToLastUserMessage(messages, omittedParts);
+        }
       }
     }
+    if (signal.aborted) break;
 
     for (let retry = 0; ; retry++) {
+      const attemptStartedAt = Date.now();
       assistantContent = undefined;
-      bufferedAssistantText = "";
+      streamedAssistantText = "";
+      streamedAssistantToolCalls.length = 0;
       terminalStopReason = undefined;
+      terminalStopErrorCode = undefined;
       toolCallErrors.clear();
       try {
+        let providerOptions = opts.providerOptions;
+        if (
+          completingFollowUpSuggestions &&
+          providerOptions?.anthropic?.thinking
+        ) {
+          const { thinking: _thinking, ...anthropic } =
+            providerOptions.anthropic;
+          providerOptions = { ...providerOptions, anthropic };
+        }
+        const engineMessages = isAgentModelVisionCapable(
+          model,
+          engine.capabilities.vision === true,
+        )
+          ? contextMessages
+          : replaceImagesForModelWithoutVision(contextMessages, model);
         const streamOpts = {
           model,
-          systemPrompt,
-          messages: contextMessages,
-          tools: sourceSweepDelegationGuardActive
-            ? restrictAgentTeamsAfterSourceSweep(activeTools)
-            : activeTools,
+          systemPrompt: completingFollowUpSuggestions
+            ? FOLLOW_UP_SUGGESTIONS_COMPLETION_SYSTEM_PROMPT
+            : continuationSystemPromptFor(engineMessages),
+          messages: engineMessages,
+          tools: loopBreakerCloseout
+            ? []
+            : completingFollowUpSuggestions
+              ? [followUpSuggestionsTool]
+              : sourceSweepDelegationGuardActive
+                ? restrictAgentTeamsAfterSourceSweep(activeTools)
+                : activeTools,
           abortSignal: signal,
           maxOutputTokens: resolveMaxOutputTokensForEngine(
             engine.name,
-            opts.maxOutputTokens,
+            completingFollowUpSuggestions
+              ? Math.min(
+                  effectiveMaxOutputTokens ??
+                    FOLLOW_UP_SUGGESTIONS_MAX_OUTPUT_TOKENS,
+                  FOLLOW_UP_SUGGESTIONS_MAX_OUTPUT_TOKENS,
+                )
+              : effectiveMaxOutputTokens,
+            model,
           ),
-          reasoningEffort: opts.reasoningEffort,
-          providerOptions: opts.providerOptions,
+          reasoningEffort: completingFollowUpSuggestions
+            ? ("none" as const)
+            : effectiveReasoningEffort,
+          providerOptions,
         };
 
+        usage.llmCalls = (usage.llmCalls ?? 0) + 1;
+        notifyModelInputObserver(opts.onModelInput, engineMessages);
         const eventStream = engine.stream(streamOpts);
         let thinkingBuffer = "";
         const toolInputNames = new Map<string, string>();
+        const toolInputBytes = new Map<string, number>();
         let lastToolInputActivityAt = 0;
+        type ActiveToolInputPreparation = {
+          id: string;
+          toolName?: string;
+          startedAt: number;
+          lastProgressAt: number;
+          bytes: number;
+        };
+        const activeToolInputs = new Map<string, ActiveToolInputPreparation>();
+        let endedForNoProgress = false;
+        let modelStreamBracketOpen = false;
+        const openModelStreamBracket = () => {
+          if (modelStreamBracketOpen) return;
+          modelStreamBracketOpen = true;
+          send({ type: "model_stream", status: "start" });
+        };
+        const closeModelStreamBracket = () => {
+          if (!modelStreamBracketOpen) return;
+          modelStreamBracketOpen = false;
+          send({
+            type: "model_stream",
+            status: "end",
+            ...(terminalStopReason ? { reason: terminalStopReason } : {}),
+            ...(terminalStopErrorCode
+              ? { errorCode: terminalStopErrorCode }
+              : {}),
+          });
+        };
+        let lastModelStreamProgressAt = Date.now();
+        let hasReceivedFirstEngineEvent = false;
+        const isClampedForegroundRuntimeForThisCall =
+          isHostedRuntime() && !isInBackgroundFunctionRuntime();
         const sendToolInputActivity = (
           toolName: string | undefined,
+          toolInputId?: string,
+          progressBytes?: number,
           force = false,
         ) => {
           const now = Date.now();
@@ -2518,89 +6729,296 @@ export async function runAgentLoop(opts: {
             type: "activity",
             label: toolInputActivityLabel(toolName),
             ...(toolName ? { tool: toolName } : {}),
+            ...(toolInputId ? { id: toolInputId } : {}),
+            ...(typeof progressBytes === "number" ? { progressBytes } : {}),
           });
         };
-
-        for await (const event of eventStream) {
-          // In-loop processor seam (stream hook). Each chunk is offered to every
-          // processor's `processOutputStream` before the loop handles it. A
-          // processor `abort()` throws a TripWire; catch it locally so it is not
-          // mistaken for a retryable engine error, then break out cleanly.
-          if (processorChain) {
-            try {
-              await processorChain.runStream(event);
-            } catch (err) {
-              if (err instanceof TripWire) {
-                emitTripwire(err);
-                break;
+        const noProgressDeadlineAt = () => {
+          if (
+            hasReceivedFirstEngineEvent ||
+            !isClampedForegroundRuntimeForThisCall
+          ) {
+            return Number.POSITIVE_INFINITY;
+          }
+          return (
+            lastModelStreamProgressAt + FOREGROUND_FIRST_MODEL_EVENT_TIMEOUT_MS
+          );
+        };
+        const hasNoProgressStalled = () => Date.now() >= noProgressDeadlineAt();
+        const checkpointNoProgress = () => {
+          if (endedForNoProgress) return;
+          closeModelStreamBracket();
+          if (completingFollowUpSuggestions)
+            failFollowUpCompletion("interrupted");
+          else send({ type: "auto_continue", reason: "no_progress" });
+          endedForNoProgress = true;
+        };
+        let eventIteratorReturnRequested = false;
+        const requestEventIteratorReturn = (
+          iterator: AsyncIterator<EngineEvent>,
+          awaitReturn: boolean,
+        ) => {
+          if (eventIteratorReturnRequested) return;
+          eventIteratorReturnRequested = true;
+          let returnPromise:
+            | ReturnType<NonNullable<typeof iterator.return>>
+            | undefined;
+          try {
+            returnPromise = iterator.return?.();
+          } catch {
+            return;
+          }
+          if (!returnPromise) return;
+          if (awaitReturn) return returnPromise.catch(() => undefined);
+          void returnPromise.catch(() => undefined);
+        };
+        const nextEngineEventWithNoProgressTimeout = async (
+          iterator: AsyncIterator<EngineEvent>,
+        ): Promise<IteratorResult<EngineEvent>> => {
+          const deadlineAt = noProgressDeadlineAt();
+          if (!Number.isFinite(deadlineAt)) return iterator.next();
+          const timeoutMs = Math.max(0, deadlineAt - Date.now());
+          if (timeoutMs <= 0) {
+            checkpointNoProgress();
+            void requestEventIteratorReturn(iterator, false);
+            return { done: true, value: undefined };
+          }
+          let timeoutId: ReturnType<typeof setTimeout> | undefined;
+          const next = iterator.next();
+          void next.catch(() => undefined);
+          const timeout = new Promise<"timeout">((resolve) => {
+            timeoutId = setTimeout(() => resolve("timeout"), timeoutMs);
+          });
+          try {
+            const result = await Promise.race([next, timeout]);
+            if (result === "timeout") {
+              checkpointNoProgress();
+              void requestEventIteratorReturn(iterator, false);
+              return { done: true, value: undefined };
+            }
+            return result;
+          } finally {
+            if (timeoutId) clearTimeout(timeoutId);
+          }
+        };
+        const trackActiveToolInput = (
+          key: string,
+          toolName: string | undefined,
+          bytes: number,
+        ) => {
+          const now = Date.now();
+          const previous = activeToolInputs.get(key);
+          const resolvedToolName = toolName ?? previous?.toolName;
+          activeToolInputs.set(key, {
+            id: key,
+            ...(resolvedToolName ? { toolName: resolvedToolName } : {}),
+            startedAt: previous?.startedAt ?? now,
+            lastProgressAt: now,
+            bytes,
+          });
+        };
+        const eventIterator = eventStream[Symbol.asyncIterator]();
+        let eventIteratorDone = false;
+        openModelStreamBracket();
+        try {
+          while (true) {
+            const nextEvent =
+              await nextEngineEventWithNoProgressTimeout(eventIterator);
+            if (nextEvent.done) {
+              eventIteratorDone = true;
+              break;
+            }
+            const event = nextEvent.value;
+            if (hasNoProgressStalled()) {
+              checkpointNoProgress();
+              break;
+            }
+            if (event.type !== "gateway-heartbeat") {
+              hasReceivedFirstEngineEvent = true;
+              lastModelStreamProgressAt = Date.now();
+              usage.firstEngineEventAtMs ??= lastModelStreamProgressAt;
+            }
+            if (processorChain) {
+              try {
+                await processorChain.runStream(event);
+              } catch (err) {
+                if (signal.aborted) throw err;
+                if (completingFollowUpSuggestions) {
+                  failFollowUpCompletion("processor_error");
+                  break;
+                }
+                if (err instanceof TripWire) {
+                  emitTripwire(err);
+                  break;
+                }
+                throw err;
               }
-              throw err;
             }
-          }
-          if (event.type === "text-delta") {
-            if (bufferTextUntilFinalGuard) {
-              bufferedAssistantText += event.text;
-            } else {
-              send({ type: "text", text: event.text });
-            }
-          } else if (event.type === "thinking-delta") {
-            thinkingBuffer += event.text;
-            // Forward thinking deltas as a distinct event type so the UI
-            // can render a collapsible "Thinking…" cell while the model
-            // reasons, then collapse it when content arrives.
-            send({ type: "thinking", text: event.text });
-          } else if (event.type === "tool-input-start") {
-            if (event.id && event.name) {
-              toolInputNames.set(event.id, event.name);
-            }
-            sendToolInputActivity(event.name, true);
-          } else if (event.type === "tool-input-delta") {
-            const toolName =
-              event.name ??
-              (event.id ? toolInputNames.get(event.id) : undefined);
-            sendToolInputActivity(toolName);
-          } else if (event.type === "tool-call") {
-            // The authoritative tool-call blocks arrive in assistant-content.
-          } else if (event.type === "tool-call-error") {
-            toolCallErrors.set(event.id, {
-              name: event.name,
-              input: event.input,
-              error: event.error,
-            });
-          } else if (event.type === "assistant-content") {
-            assistantContent = event.parts;
-          } else if (event.type === "usage") {
-            usage.inputTokens += event.inputTokens;
-            usage.outputTokens += event.outputTokens;
-            usage.cacheReadTokens += event.cacheReadTokens ?? 0;
-            usage.cacheWriteTokens += event.cacheWriteTokens ?? 0;
-          } else if (event.type === "stop") {
-            terminalStopReason = event.reason;
-            if (event.reason === "error") {
-              throw new EngineError(event.error ?? "Engine stream error", {
-                errorCode: event.errorCode,
-                upgradeUrl: event.upgradeUrl,
-                statusCode: event.statusCode,
-                providerRetryable: event.providerRetryable,
+            if (event.type === "text-delta") {
+              streamedAssistantText += event.text;
+              if (!completingFollowUpSuggestions)
+                send({ type: "text", text: event.text });
+            } else if (event.type === "thinking-delta") {
+              thinkingBuffer += event.text;
+              if (!completingFollowUpSuggestions)
+                send({ type: "thinking", text: event.text });
+            } else if (event.type === "tool-input-start") {
+              const key = event.id ?? event.name;
+              if (key && event.name) {
+                toolInputNames.set(key, event.name);
+                toolInputBytes.set(key, 0);
+                trackActiveToolInput(key, event.name, 0);
+              }
+              if (
+                completingFollowUpSuggestions ||
+                (followUpRunId &&
+                  event.name === FOLLOW_UP_SUGGESTIONS_TOOL_NAME)
+              )
+                continue;
+              send({
+                type: "tool_input_start",
+                ...(event.name ? { tool: event.name } : {}),
+                ...(event.id ? { id: event.id } : {}),
               });
+              sendToolInputActivity(event.name, key, undefined, true);
+            } else if (event.type === "tool-input-delta") {
+              const key = event.id ?? event.name;
+              const toolName =
+                event.name ??
+                (event.id ? toolInputNames.get(event.id) : undefined);
+              let progressBytes: number | undefined;
+              if (key) {
+                const hadByteRecord = toolInputBytes.has(key);
+                const previous = hadByteRecord
+                  ? (toolInputBytes.get(key) ?? 0)
+                  : 0;
+                progressBytes =
+                  previous +
+                  new TextEncoder().encode(event.text ?? "").byteLength;
+                toolInputBytes.set(key, progressBytes);
+                if (!hadByteRecord || progressBytes > previous) {
+                  trackActiveToolInput(key, toolName, progressBytes);
+                }
+              }
+              if (
+                completingFollowUpSuggestions ||
+                (followUpRunId && toolName === FOLLOW_UP_SUGGESTIONS_TOOL_NAME)
+              )
+                continue;
+              if (event.text) {
+                send({
+                  type: "tool_input_delta",
+                  ...(toolName ? { tool: toolName } : {}),
+                  ...(event.id ? { id: event.id } : {}),
+                  text: event.text,
+                });
+              }
+              sendToolInputActivity(toolName, key, progressBytes);
+            } else if (event.type === "gateway-heartbeat") {
+              send({ type: "stream_keepalive" });
+            } else if (event.type === "tool-call") {
+              streamedAssistantToolCalls.push({
+                type: "tool-call",
+                id: event.id,
+                name: event.name,
+                input: event.input,
+              });
+            } else if (event.type === "tool-call-error") {
+              toolCallErrors.set(event.id, {
+                name: event.name,
+                input: event.input,
+                error: event.error,
+              });
+            } else if (event.type === "assistant-content") {
+              assistantContent = event.parts;
+            } else if (event.type === "usage") {
+              const eventUsage = {
+                inputTokens: event.inputTokens,
+                outputTokens: event.outputTokens,
+                cacheReadTokens: event.cacheReadTokens ?? 0,
+                cacheWriteTokens: event.cacheWriteTokens ?? 0,
+                engineName: opts.engine.name,
+                model,
+                ...(event.builderCreditsUsed !== undefined
+                  ? { builderCreditsUsed: event.builderCreditsUsed }
+                  : {}),
+              };
+              usage.inputTokens += eventUsage.inputTokens;
+              usage.outputTokens += eventUsage.outputTokens;
+              usage.cacheReadTokens += eventUsage.cacheReadTokens;
+              usage.cacheWriteTokens += eventUsage.cacheWriteTokens;
+              if (completingFollowUpSuggestions) {
+                usage.followUpInputTokens =
+                  (usage.followUpInputTokens ?? 0) + eventUsage.inputTokens;
+              }
+              if (eventUsage.builderCreditsUsed !== undefined) {
+                usage.builderCreditsUsed =
+                  (usage.builderCreditsUsed ?? 0) +
+                  eventUsage.builderCreditsUsed;
+              }
+              usage.usageReported = true;
+              opts.onUsage?.(eventUsage);
+            } else if (event.type === "stop") {
+              terminalStopReason = event.reason;
+              if (event.reason === "error") {
+                terminalStopErrorCode = event.errorCode;
+                throw engineStopError(event, engineMessages);
+              }
+            }
+            if (hasNoProgressStalled()) {
+              checkpointNoProgress();
+              break;
             }
           }
+        } catch (err: unknown) {
+          // A thrown engine error skips the `stop` event, so its code must
+          // reach the bracket end here or the failed attempt goes unlabeled.
+          const thrownCode = (err as { errorCode?: unknown } | null)?.errorCode;
+          if (typeof thrownCode === "string")
+            terminalStopErrorCode ??= thrownCode;
+          throw err;
+        } finally {
+          closeModelStreamBracket();
+          if (!eventIteratorDone) {
+            await requestEventIteratorReturn(
+              eventIterator,
+              !eventIteratorReturnRequested,
+            );
+          }
+        }
+
+        if (endedForNoProgress) {
+          if (completingFollowUpSuggestions) break;
+          return usage;
+        }
+        if (followUpCompletionFailed) break;
+
+        const hasCompleteToolCall =
+          streamedAssistantToolCalls.length > 0 ||
+          toolCallErrors.size > 0 ||
+          assistantContent?.some((part) => part.type === "tool-call") === true;
+        const hasUnfinishedToolInput =
+          activeToolInputs.size > 0 && !hasCompleteToolCall;
+        if (hasUnfinishedToolInput) {
+          if (completingFollowUpSuggestions) {
+            failFollowUpCompletion("interrupted");
+            break;
+          }
+          send({ type: "auto_continue", reason: "stream_ended" });
+          return usage;
         }
 
         break;
       } catch (err: unknown) {
         if (signal.aborted) throw err;
+        if (completingFollowUpSuggestions) {
+          failFollowUpCompletion("provider_error");
+          break;
+        }
         if (isContextTooLongError(err)) {
-          // ── One-shot recovery: trim old tool results and retry once ────────
-          // Only attempt recovery on the first overflow (retry === 0) to avoid
-          // infinite trim loops. On subsequent overflows fall through to the
-          // terminal error.
           if (retry === 0) {
             const trimmed = trimOldToolResults(contextMessages);
             if (trimmed !== null) {
-              // Replace the sent messages for this iteration with the trimmed
-              // version, clear any partial output, and retry immediately
-              // (no delay — context errors are not transient).
               contextMessages = trimmed;
               send({ type: "clear" });
               continue;
@@ -2611,30 +7029,108 @@ export async function runAgentLoop(opts: {
             { errorCode: "context_length_exceeded" },
           );
         }
-        if (retry < maxRetriesForError(err) && isRetryableError(err)) {
-          // Clear partial text from the failed attempt so the retry
-          // doesn't produce garbled duplicate output. Keep the retry itself
-          // silent so transient provider/backend failures do not leak into
-          // the assistant's final answer.
+        const retryAfterMs =
+          err instanceof EngineError ? err.retryAfterMs : undefined;
+        if (
+          retry < maxRetriesForError(err) &&
+          isRetryableError(err) &&
+          hasBudgetForEngineRetry(budgetStartedAt, retry, retryAfterMs)
+        ) {
+          const stalledMs = Date.now() - attemptStartedAt;
+          if (stalledMs >= VISIBLE_RETRY_THRESHOLD_MS) {
+            send({
+              type: "activity",
+              label: `Model did not respond — retrying (${retry + 2}/${maxRetriesForError(err) + 1})`,
+            });
+          }
           send({ type: "clear" });
-          await retryDelay(retry, signal);
+          await retryDelay(retry, signal, retryAfterMs);
           continue;
+        }
+        if (
+          !fallbackModelAttempted &&
+          isTransientProviderRateLimitError(err) &&
+          hasBudgetForEngineRetry(budgetStartedAt, 0)
+        ) {
+          const fallbackModel = resolveFallbackModel(
+            model,
+            engine.supportedModels,
+          );
+          // A sibling with a smaller window (sonnet → haiku) must not inherit
+          // a context that only fit the primary: that fails deterministically
+          // as a context-length error instead of recovering from throttling.
+          // ponytail: chars/4 is a coarse token estimate; swap in the engine's
+          // count when one is exposed.
+          const fallbackFits =
+            fallbackModel !== undefined &&
+            JSON.stringify(contextMessages).length / 4 <=
+              getContextWindowForModel(fallbackModel) * 0.8;
+          if (fallbackModel && fallbackFits) {
+            fallbackModelAttempted = true;
+            send({
+              type: "activity",
+              label: `${model} is rate limited — switching to ${fallbackModel}`,
+            });
+            send({ type: "clear" });
+            model = fallbackModel;
+            usage.inputTokens = 0;
+            usage.outputTokens = 0;
+            usage.cacheReadTokens = 0;
+            usage.cacheWriteTokens = 0;
+            usage.model = fallbackModel;
+            retry = -1;
+            continue;
+          }
         }
         throw err;
       }
     }
 
-    // A processor aborted mid-stream. The tripwire event + final message were
-    // already emitted; halt the loop without sending a normal `done`.
-    if (tripwire) break;
+    if (completingFollowUpSuggestions && followUpStartedAt !== undefined) {
+      usage.followUpMs = Date.now() - followUpStartedAt;
+    }
+
+    if (tripwire || followUpCompletionFailed) break;
 
     if (!assistantContent && toolCallErrors.size > 0) {
       assistantContent = [];
     }
 
+    if (
+      (!assistantContent || assistantContent.length === 0) &&
+      (streamedAssistantText.trim() || streamedAssistantToolCalls.length > 0)
+    ) {
+      assistantContent = [
+        ...(streamedAssistantText.trim()
+          ? [{ type: "text" as const, text: streamedAssistantText }]
+          : []),
+        ...streamedAssistantToolCalls,
+      ];
+    } else if (assistantContent && streamedAssistantToolCalls.length > 0) {
+      const existingToolCallIds = new Set(
+        assistantContent
+          .filter(
+            (part): part is import("./engine/types.js").EngineToolCallPart =>
+              part.type === "tool-call",
+          )
+          .map((part) => part.id),
+      );
+      for (const toolCall of streamedAssistantToolCalls) {
+        if (!existingToolCallIds.has(toolCall.id)) {
+          assistantContent.push(toolCall);
+        }
+      }
+    }
     if (!assistantContent) {
-      // No content — done
-      break;
+      if (!terminalStopReason) {
+        if (completingFollowUpSuggestions) {
+          failFollowUpCompletion("interrupted");
+          break;
+        }
+        send({ type: "auto_continue", reason: "stream_ended" });
+        return usage;
+      }
+      assistantContent = [];
     }
 
     if (toolCallErrors.size > 0) {
@@ -2658,26 +7154,85 @@ export async function runAgentLoop(opts: {
       }
     }
 
+    assistantContent = dedupeAssistantToolCallsById(assistantContent);
+
     const assistantContentForHistory = assistantContent.map((part) =>
       part.type === "tool-call"
         ? {
             ...part,
-            input: normalizeToolCallInputForHistory(part.input),
+            input: normalizeToolCallInputForHistory(part.input, part.name),
           }
         : part,
     );
 
-    messages.push({ role: "assistant", content: assistantContentForHistory });
+    if (
+      !completingFollowUpSuggestions &&
+      assistantContentForHistory.length > 0
+    ) {
+      messages.push({ role: "assistant", content: assistantContentForHistory });
+    }
 
-    const toolCallParts = assistantContent.filter(
+    const allToolCallParts = assistantContent.filter(
       (p): p is import("./engine/types.js").EngineToolCallPart =>
         p.type === "tool-call",
     );
+    const followUpCalls = followUpRunId
+      ? allToolCallParts.filter(
+          (part) => part.name === FOLLOW_UP_SUGGESTIONS_TOOL_NAME,
+        )
+      : [];
+    const toolCallParts = followUpRunId
+      ? allToolCallParts.filter(
+          (part) => part.name !== FOLLOW_UP_SUGGESTIONS_TOOL_NAME,
+        )
+      : allToolCallParts;
+    if (
+      toolCallParts.length > 0 ||
+      followUpCalls.length > 0 ||
+      terminalStopReason === "max_tokens" ||
+      !terminalStopReason
+    ) {
+      completedFollowUpSuggestions = undefined;
+    }
+    const followUpResults: EngineContentPart[] = followUpCalls.map((call) => {
+      const parsed = parseFollowUpSuggestions(call.input);
+      const error = !parsed.success
+        ? `Invalid follow-up suggestions: ${parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; ")}`
+        : followUpCalls.length !== 1 || toolCallParts.length > 0
+          ? "Provide follow-ups before or alongside the final reply, after other tool results are known."
+          : toolCallErrors.has(call.id)
+            ? "Follow-up tool input was not completed successfully."
+            : terminalStopReason !== "end_turn" &&
+                terminalStopReason !== "tool_use"
+              ? "Follow-up publication was interrupted; provide it again after completing the work."
+              : undefined;
+      if (!error && parsed.success && followUpRunId) {
+        completedFollowUpSuggestions = identifyFollowUpSuggestions(
+          parsed.data.suggestions,
+          followUpRunId,
+        );
+      }
+      return {
+        type: "tool-result",
+        toolCallId: call.id,
+        toolName: call.name,
+        toolInput: JSON.stringify(call.input ?? {}),
+        content:
+          error ??
+          "Follow-ups validated; displayed only if this turn completes successfully.",
+        ...(error ? { isError: true } : {}),
+      };
+    });
 
-    // In-loop processor seam (step hook). Fires once per model response, around
-    // tool execution, with the tool calls the model just requested (empty for a
-    // final answer) plus the stop reason and cumulative usage. A coverage gate
-    // can inspect what the model is about to do and `abort()` before tools run.
+    if (loopBreakerCloseout && toolCallParts.length > 0) {
+      const finalText = collectTextParts(assistantContentForHistory);
+      if (!streamedAssistantText && finalText) {
+        send({ type: "text", text: finalText });
+      }
+      loopBreakerStopped = true;
+      break;
+    }
+
     if (processorChain) {
       try {
         await processorChain.runStep({
@@ -2691,6 +7246,11 @@ export async function runAgentLoop(opts: {
           },
         });
       } catch (err) {
+        if (signal.aborted) throw err;
+        if (completingFollowUpSuggestions) {
+          failFollowUpCompletion("processor_error");
+          break;
+        }
         if (err instanceof TripWire) {
           emitTripwire(err);
           break;
@@ -2699,98 +7259,328 @@ export async function runAgentLoop(opts: {
       }
     }
 
-    const flushBufferedAssistantText = () => {
-      if (!bufferTextUntilFinalGuard) return;
-      const text =
-        bufferedAssistantText || collectTextParts(assistantContentForHistory);
+    if (completingFollowUpSuggestions) {
+      if (completedFollowUpSuggestions === undefined)
+        failFollowUpCompletion("invalid_or_missing");
+      break;
+    }
+
+    const flushUnstreamedAssistantText = () => {
+      if (streamedAssistantText) return;
+      const text = collectTextParts(assistantContentForHistory);
       if (text) send({ type: "text", text });
     };
 
     if (toolCallParts.length === 0) {
+      if (followUpResults.length > 0)
+        messages.push({ role: "user", content: followUpResults });
       if (terminalStopReason === "max_tokens") {
-        flushBufferedAssistantText();
+        flushUnstreamedAssistantText();
         appendAgentLoopContinuation(messages, "max_tokens");
         continue;
       }
-      const guard = opts.finalResponseGuard
-        ? await opts.finalResponseGuard({
+
+      const hasEmptyFinalResponse =
+        collectTextParts(assistantContentForHistory).trim().length === 0 &&
+        streamedAssistantText.trim().length === 0;
+      if (
+        followUpResults.length > 0 &&
+        (terminalStopReason === "tool_use" || hasEmptyFinalResponse)
+      ) {
+        flushUnstreamedAssistantText();
+        continue;
+      }
+      if (hasEmptyFinalResponse) {
+        completedFollowUpSuggestions = undefined;
+        if (emptyFinalResponseRetries < EMPTY_FINAL_RESPONSE_RETRY_LIMIT) {
+          emptyFinalResponseRetries += 1;
+          effectiveMaxOutputTokens =
+            resolveEmptyResponseRetryMaxOutputTokens(model);
+          effectiveReasoningEffort = stepDownReasoningEffort(
+            effectiveReasoningEffort,
+          );
+          send({ type: "clear" });
+          appendAgentLoopContinuation(messages, "max_tokens");
+          continue;
+        }
+        send({ type: "clear" });
+        terminalActionStop = {
+          message:
+            "The model returned an empty response. This usually means reasoning used the full output-token budget. Try again, or pick a different model from the model menu.",
+          errorCode: "empty_final_response",
+        };
+        sendTerminalActionStop(terminalActionStop);
+        break;
+      }
+
+      let guard: Awaited<ReturnType<AgentLoopFinalResponseGuard>> | null = null;
+      const finalResponseDraftText = collectTextParts(
+        assistantContentForHistory,
+      );
+      const receipts = turnReceipts();
+      const receiptGuard = writeReceiptGuard(receipts, receiptGuardRetried);
+      if (opts.finalResponseGuard) {
+        try {
+          guard = await opts.finalResponseGuard({
             messages,
+            requestText: finalResponseGuardRequestText,
             assistantContent: assistantContentForHistory,
-            text: collectTextParts(assistantContentForHistory),
+            text: finalResponseDraftText,
             toolCalls: [...toolCallHistory],
             toolResults: [...toolResultHistory],
+            receipts,
             retryCount: finalGuardRetries,
             executionMode: opts.executionMode ?? "act",
-          })
-        : null;
-      let guardEmittedFallback = false;
+          });
+        } catch (err) {
+          send({ type: "clear" });
+          throw err;
+        }
+      }
+      if (receiptGuard) {
+        guard = guard
+          ? mergeFinalResponseGuards(receiptGuard, guard)
+          : receiptGuard;
+      }
       if (guard) {
+        completedFollowUpSuggestions = undefined;
         const retryMessage =
           typeof guard === "string" ? guard : guard.retryMessage;
         const fallbackMessage =
           typeof guard === "string" ? guard : guard.fallbackMessage;
-        if (finalGuardRetries < 1) {
+        const maxGuardRetries =
+          typeof guard === "string"
+            ? 1
+            : Math.max(0, Math.min(3, Math.trunc(guard.maxRetries ?? 1)));
+        if (finalGuardRetries < maxGuardRetries) {
+          if (typeof guard !== "string" && guard.expandToolSurface) {
+            expandActiveTools([...activeToolNames, ...availableToolMap.keys()]);
+          }
+          if (receiptGuard && receiptGuard.maxRetries > 0) {
+            receiptGuardRetried = true;
+          }
           finalGuardRetries += 1;
+          send({ type: "clear" });
           messages.push({
             role: "user",
-            content: [{ type: "text", text: retryMessage }],
+            content: [
+              {
+                type: "text",
+                text: `${AGENT_INTERNAL_GUARD_PROMPT}\n\n<response-guard>\n${retryMessage}\n</response-guard>`,
+              },
+            ],
           });
           continue;
         }
-        send({ type: "text", text: fallbackMessage ?? retryMessage });
-        guardEmittedFallback = true;
-      } else {
-        flushBufferedAssistantText();
-      }
-      // Some providers (notably OpenAI Responses for gpt-5+) can stream a
-      // successful turn that contains only reasoning content and zero output
-      // text — typically when reasoning consumes the entire output-token
-      // budget. Without a final text part the SSE stream still ends with a
-      // clean `done`, which renders as a totally empty assistant bubble.
-      // Surface a plain-language error so the user knows what happened.
-      if (
-        !guardEmittedFallback &&
-        collectTextParts(assistantContentForHistory).trim().length === 0 &&
-        bufferedAssistantText.trim().length === 0
-      ) {
+        send({ type: "clear" });
+        const exhaustedDraftPrefix =
+          typeof guard === "string" ? undefined : guard.exhaustedDraftPrefix;
         send({
           type: "text",
-          text: "The model returned an empty response. This usually means reasoning used the full output-token budget. Try again, or pick a different model from the model menu.",
+          text:
+            exhaustedDraftPrefix && finalResponseDraftText.trim()
+              ? `${exhaustedDraftPrefix}\n\n${finalResponseDraftText}`
+              : (fallbackMessage ?? retryMessage),
         });
+      } else {
+        flushUnstreamedAssistantText();
+        if (
+          followUpRunId &&
+          completedFollowUpSuggestions === undefined &&
+          terminalStopReason === "end_turn"
+        ) {
+          completingFollowUpSuggestions = true;
+          followUpStartedAt = Date.now();
+          followUpCompletionContext = buildFollowUpCompletionMessages({
+            requestText: finalResponseGuardRequestText,
+            replyText: finalResponseDraftText,
+            toolNames: toolCallHistory.map((call) => call.name),
+          });
+          continue;
+        }
       }
+      emptyFinalResponseRetries = 0;
+      effectiveMaxOutputTokens = opts.maxOutputTokens;
+      effectiveReasoningEffort = opts.reasoningEffort;
+      if (loopBreakerCloseout) loopBreakerStopped = true;
       break;
     }
 
-    // Reached only when the model made tool calls (toolCallParts.length > 0),
-    // i.e. it's about to do more work and produce a *new* final answer. Give
-    // that next final-answer cycle a fresh guard-retry budget; otherwise
-    // finalGuardRetries stays at 1 from a prior cycle and the guard is
-    // permanently disabled for the rest of a long multi-step run.
     finalGuardRetries = 0;
+    emptyFinalResponseRetries = 0;
 
-    flushBufferedAssistantText();
+    const toolCallTruncatedByOutputCap = terminalStopReason === "max_tokens";
+    if (toolCallTruncatedByOutputCap) {
+      if (truncatedToolCallRetries < TRUNCATED_TOOL_CALL_RETRY_LIMIT) {
+        truncatedToolCallRetries += 1;
+        effectiveMaxOutputTokens =
+          resolveEmptyResponseRetryMaxOutputTokens(model);
+      } else {
+        effectiveMaxOutputTokens = opts.maxOutputTokens;
+      }
+    } else {
+      truncatedToolCallRetries = 0;
+      effectiveMaxOutputTokens = opts.maxOutputTokens;
+    }
 
-    let requestedActionStop: { message: string; errorCode?: string } | null =
-      null;
+    flushUnstreamedAssistantText();
 
-    // Human-in-the-loop approvals granted by the user for this turn (opt-in;
-    // empty for the overwhelming majority of turns). Keyed by the stable
-    // tool-call approval key so a re-issued continuation can let an approved
-    // call run. The model cannot populate this — it comes from the request.
+    let requestedActionStop: TerminalActionStop | null = null;
+    let requestedConnection:
+      | {
+          requestId: string;
+          provider: string;
+          reason: "connect" | "grant" | "reauthorize" | "admin_required";
+          appId?: string;
+          detail: string;
+          source?: { id: string; kind?: string; label?: string };
+        }
+      | undefined;
+    let turnYieldedToUser = false;
+
+    const noteToolCallSucceeded = (
+      actionEntry: ActionEntry,
+      toolName: string,
+      toolInput: unknown,
+    ) => {
+      if (actionEntry.endsTurn !== true) return;
+      turnYieldedToUser = true;
+      const question =
+        toolName === "ask-question" &&
+        typeof toolInput === "object" &&
+        toolInput !== null &&
+        "question" in toolInput &&
+        typeof toolInput.question === "string"
+          ? toolInput.question.trim()
+          : "";
+      const waitingMessage = "Waiting for your answer before continuing";
+      requestedActionStop ??= {
+        message: question
+          ? `${waitingMessage}: ${question}`
+          : `${waitingMessage}.`,
+        transcriptMessage: `${waitingMessage}.`,
+        errorCode: "awaiting-user-input",
+      };
+    };
+
+    const noteRepeatedToolCall = (
+      toolName: string,
+      input: unknown,
+      callId: string,
+    ): TerminalActionStop | null => {
+      const key = toolCallCacheKey(toolName, input);
+      const count = (repeatedToolCalls.get(key) ?? 0) + 1;
+      repeatedToolCalls.set(key, count);
+      inFlightRepeatToolCalls.set(callId, {
+        key,
+        counted: true,
+        countOnCompletion: true,
+      });
+      if (count < MAX_IDENTICAL_TOOL_CALLS) return null;
+      const stop: TerminalActionStop = {
+        message:
+          `Stopped because ${toolName} was called ${count} times with identical arguments in one turn, ` +
+          `which means the same step is repeating rather than making progress. ` +
+          `Everything completed before this point is preserved above.`,
+        errorCode: "repeated_tool_call",
+      };
+      requestedActionStop ??= stop;
+      return requestedActionStop === stop ? stop : null;
+    };
+
     const approvedToolCallKeys = new Set<string>(opts.approvedToolCalls ?? []);
+
+    // A tool-search in this step loads schemas the model can call only on the
+    // next step, so a sibling search must not read them as already callable.
+    const toolNamesLoadedThisStep = new Set<string>();
+    let countedAlreadyLoadedSearchThisStep = false;
 
     const runToolCall = async (
       toolCall: import("./engine/types.js").EngineToolCallPart,
     ): Promise<EngineContentPart> => {
+      noteToolNeeded(toolCall.name);
+      const actionEntry = actions[toolCall.name];
+      const strictToolInput = getStrictToolInputValidator(actionEntry);
+      const placeholderNormalization =
+        actionEntry && !strictToolInput
+          ? normalizeOptionalToolPlaceholders(
+              actionEntry.tool.parameters,
+              toolCall.input,
+            )
+          : { input: toolCall.input, changed: false };
+      if (placeholderNormalization.changed) {
+        toolCall = { ...toolCall, input: placeholderNormalization.input };
+      }
+      const jsonStringCoercion =
+        actionEntry && !strictToolInput
+          ? coerceStringifiedJsonToolValues(
+              actionEntry.tool.parameters,
+              toolCall.input,
+            )
+          : { input: toolCall.input, changed: false };
+      if (jsonStringCoercion.changed) {
+        toolCall = { ...toolCall, input: jsonStringCoercion.input };
+      }
+      const actionIsReadOnly = actionEntry
+        ? actionCallIsReadOnly(actionEntry, toolCall.input, false)
+        : false;
+      const repeatGuardStopFromThisCall = noteRepeatedToolCall(
+        toolCall.name,
+        toolCall.input,
+        toolCall.id,
+      );
+      const rollbackRepeatedToolCall = () => {
+        const repeatKey = toolCallCacheKey(toolCall.name, toolCall.input);
+        const repeatCall = inFlightRepeatToolCalls.get(toolCall.id);
+        if (repeatCall?.counted) {
+          const repeatCount = repeatedToolCalls.get(repeatKey) ?? 0;
+          const repeatCountAfterRollback = Math.max(0, repeatCount - 1);
+          if (repeatCountAfterRollback > 0) {
+            repeatedToolCalls.set(repeatKey, repeatCountAfterRollback);
+          } else {
+            repeatedToolCalls.delete(repeatKey);
+          }
+          repeatCall.counted = false;
+        }
+        if (repeatCall) repeatCall.countOnCompletion = false;
+        const repeatCountAfterRollback = repeatedToolCalls.get(repeatKey) ?? 0;
+        if (
+          repeatGuardStopFromThisCall &&
+          requestedActionStop === repeatGuardStopFromThisCall &&
+          repeatCountAfterRollback < MAX_IDENTICAL_TOOL_CALLS
+        ) {
+          requestedActionStop = null;
+        }
+      };
       const wireToolInput = JSON.stringify(toolCall.input ?? {});
+      const journalToolInput = JSON.parse(wireToolInput);
+      let toolDoneEmitted = false;
+      let actionInvoked = false;
+      let actionRefused = false;
+      const actionExecutionOutcome = { refused: false };
+      const emitToolDone = (
+        event: Extract<AgentChatEvent, { type: "tool_done" }>,
+      ) => {
+        if (event.outcomeUnknown) {
+          unknownWriteToolNames.add(toolCall.name);
+          readOnlyToolResultCache.clear();
+          duplicateReadOnlyToolCalls.clear();
+        }
+        if (event.id) settleRepeatedToolCall(event.id);
+        send(event);
+        toolDoneEmitted = true;
+      };
+      const toolInputNormalized =
+        placeholderNormalization.changed || jsonStringCoercion.changed;
       const normalizedToolInput = normalizeToolCallInputForHistory(
         toolCall.input,
+        toolCall.name,
       );
-      const actionEntry = actions[toolCall.name];
       const sourceSweepGuard = shouldGuardRepeatedSourceSweep({
         toolName: toolCall.name,
         entry: actionEntry,
         priorToolCalls: sourceSweepToolCallHistory,
+        actions,
       });
       const sourceSweepDelegationGuard =
         sourceSweepDelegationGuardActive &&
@@ -2810,43 +7600,112 @@ export async function runAgentLoop(opts: {
         name: toolCall.name,
         input: normalizedToolInput,
       });
-      const recordToolResult = (content: string, isError: boolean) => {
+      const recordToolResult = (
+        content: string,
+        isError: boolean,
+        artifacts?: ArtifactReceipt[],
+        receipt?: WriteReceipt,
+      ) => {
         toolResultHistory.push({
           name: toolCall.name,
           content,
           isError,
+          ...(artifacts?.length ? { artifacts } : {}),
+          ...(receipt ? { receipt } : {}),
         });
       };
+      let directStop: { message: string; explicit: boolean } | null = null;
       const finalizeToolErrorResult = (rawResult: string): string => {
         const sanitizedResult = sanitizeToolErrorText(rawResult);
+        const permanentRemedy = directStop?.explicit
+          ? directStop.message
+          : permanentPreconditionRemedy(directStop?.message ?? sanitizedResult);
+        if (permanentRemedy) {
+          const reason = permanentPreconditionReason(
+            toolCall.name,
+            permanentRemedy,
+          );
+          requestedActionStop ??= {
+            message: reason
+              ? `I stopped because ${toolCall.name} can't run yet: ${reason}. ` +
+                "That needs to be fixed outside this chat (a credential, a role, a connected account, or an approval), then you can retry."
+              : `I stopped because ${toolCall.name} needs a setup step outside this turn — a credential, a role, a connected account, or an approval — before it can run. ` +
+                "Retrying would not have changed it, and anything completed before this is saved.",
+            errorCode: "permanent_precondition",
+            details: sanitizedResult,
+          };
+          return reason
+            ? `Stopped: ${toolCall.name} can't run yet: ${reason}. ` +
+                `Do not retry it with different arguments. ${sanitizedResult}`
+            : `Stopped: ${toolCall.name} cannot run until a setup step outside this turn is fixed. ` +
+                `Do not retry it with different arguments. ${sanitizedResult}`;
+        }
         const errorKey = `${toolCallCacheKey(
           toolCall.name,
           toolCall.input,
         )}:${normalizeToolErrorForBreaker(sanitizedResult)}`;
         const count = (repeatedToolErrors.get(errorKey) ?? 0) + 1;
         repeatedToolErrors.set(errorKey, count);
+
+        const anyArgsKey = `${toolCall.name}:${normalizeToolErrorForBreaker(
+          sanitizedResult,
+        )}`;
+        const anyArgsCount =
+          (repeatedToolErrorsAnyArgs.get(anyArgsKey) ?? 0) + 1;
+        repeatedToolErrorsAnyArgs.set(anyArgsKey, anyArgsCount);
+        if (
+          count < MAX_IDENTICAL_TOOL_ERRORS &&
+          anyArgsCount >= MAX_SAME_ERROR_ACROSS_ARGUMENTS
+        ) {
+          const result =
+            `Stopped after ${anyArgsCount} attempts at ${toolCall.name} that all failed the same way ` +
+            `with different arguments. Last error: ${sanitizedResult}`;
+          const lastErrorLine = stopErrorLine(sanitizedResult);
+          requestedActionStop ??= {
+            message:
+              `I stopped because the ${toolCall.name} action rejected ${anyArgsCount} different attempts the same way. ` +
+              `Last error: ${
+                lastErrorLine.length > MAX_STOP_ERROR_LINE_CHARS
+                  ? `${clipHead(lastErrorLine, MAX_STOP_ERROR_LINE_CHARS)}…`
+                  : lastErrorLine
+              }\n\nAnything completed before this is saved.`,
+            errorCode: "repeated_tool_error_across_arguments",
+            details: sanitizedResult,
+          };
+          return result;
+        }
+
         if (count < MAX_IDENTICAL_TOOL_ERRORS) return sanitizedResult;
         const result =
           `Stopped after ${count} identical errors from ${toolCall.name} with the same arguments. ` +
           `Last error: ${sanitizedResult}`;
         requestedActionStop ??= {
           message:
-            `Stopped because ${toolCall.name} failed ${count} times with the same arguments and error. ` +
-            "Fix the underlying issue or change the arguments before retrying.",
+            `I stopped because the ${toolCall.name} action failed ${count} times in a row the same way, ` +
+            "so retrying it again would not have worked. Anything completed before this is saved.",
           errorCode: "repeated_identical_tool_error",
+          details: sanitizedResult,
         };
         return result;
       };
-      if (sourceSweepGuard) {
-        sourceSweepDelegationGuardActive = true;
-        const result = sourceSweepGuard.message;
+      const declineToolCall = (guidance: string): EngineContentPart => {
+        const result = finalizeToolErrorResult(guidance);
         send({
           type: "tool_start",
+          id: toolCall.id,
           tool: toolCall.name,
-          input: toolCall.input as Record<string, string>,
+          input: journalToolInput as Record<string, string>,
         });
-        send({ type: "tool_done", tool: toolCall.name, result });
-        recordToolResult(result, false);
+        emitToolDone({
+          type: "tool_done",
+          id: toolCall.id,
+          tool: toolCall.name,
+          input: journalToolInput as Record<string, unknown>,
+          result,
+          isError: true,
+          completedSideEffect: false,
+        });
+        recordToolResult(result, true);
         return {
           type: "tool-result" as const,
           toolCallId: toolCall.id,
@@ -2854,24 +7713,15 @@ export async function runAgentLoop(opts: {
           toolInput: wireToolInput,
           content: result,
         };
+      };
+
+      if (sourceSweepGuard) {
+        sourceSweepDelegationGuardActive = true;
+        return declineToolCall(sourceSweepGuard.message);
       }
 
       if (sourceSweepDelegationGuard) {
-        const result = sourceSweepDelegationGuard;
-        send({
-          type: "tool_start",
-          tool: toolCall.name,
-          input: toolCall.input as Record<string, string>,
-        });
-        send({ type: "tool_done", tool: toolCall.name, result });
-        recordToolResult(result, false);
-        return {
-          type: "tool-result" as const,
-          toolCallId: toolCall.id,
-          toolName: toolCall.name,
-          toolInput: wireToolInput,
-          content: result,
-        };
+        return declineToolCall(sourceSweepDelegationGuard);
       }
 
       if (!actionEntry) {
@@ -2880,10 +7730,19 @@ export async function runAgentLoop(opts: {
         );
         send({
           type: "tool_start",
+          id: toolCall.id,
           tool: toolCall.name,
-          input: toolCall.input as Record<string, string>,
+          input: journalToolInput as Record<string, string>,
         });
-        send({ type: "tool_done", tool: toolCall.name, result });
+        emitToolDone({
+          type: "tool_done",
+          id: toolCall.id,
+          tool: toolCall.name,
+          input: journalToolInput as Record<string, unknown>,
+          result,
+          isError: true,
+          completedSideEffect: false,
+        });
         recordToolResult(result, true);
         return {
           type: "tool-result" as const,
@@ -2895,13 +7754,49 @@ export async function runAgentLoop(opts: {
         };
       }
 
-      // Human-in-the-loop approval gate (opt-in via defineAction
-      // `needsApproval`; default off). When an action requires approval and
-      // this specific call has NOT been approved by a human, pause the turn
-      // instead of executing. The action's side effect never happens until a
-      // human re-issues the turn approving this call's stable key.
+      // Before approval, so a human is never asked to approve a call the
+      // principal's grant already forbids. Covers framework tools that bypass
+      // `defineAction`, which enforces the same grant for the actions.
+      const userEmail = opts.ownerEmail ?? getRequestUserEmail();
+      if (parseServiceIdentityEmail(userEmail)) {
+        const {
+          enforceServicePrincipalActionGrant,
+          ServicePrincipalRefusedError,
+        } = await import("../org/service-principal-guard.js");
+        try {
+          await enforceServicePrincipalActionGrant({
+            email: userEmail,
+            orgId: opts.orgId ?? getRequestOrgId() ?? null,
+            actionName: toolCall.name,
+            caller: opts.actionCaller ?? "tool",
+          });
+        } catch (error) {
+          if (
+            !(error instanceof ServicePrincipalRefusedError) ||
+            error.statusCode !== 403
+          ) {
+            throw error;
+          }
+          return declineToolCall(error.message);
+        }
+      }
+
       const approvalKey = toolCallCacheKey(toolCall.name, toolCall.input);
-      if (actionEntry.needsApproval && !approvedToolCallKeys.has(approvalKey)) {
+      const requestedApproval = approvedToolCallKeys.delete(approvalKey);
+      const approvalBinding: AgentApprovalBinding = {
+        toolName: toolCall.name,
+        input: toolCall.input,
+        callId: toolCall.id,
+        approvalKey,
+        ...(requestedApproval && opts.approvedToolCallAskId
+          ? { approvalId: opts.approvedToolCallAskId }
+          : {}),
+      };
+      const wasApproved =
+        requestedApproval && opts.consumeApproval
+          ? await opts.consumeApproval(approvalBinding)
+          : requestedApproval;
+      if (actionEntry.needsApproval && !wasApproved) {
         let mustApprove = false;
         try {
           mustApprove =
@@ -2910,34 +7805,87 @@ export async function runAgentLoop(opts: {
                   await actionEntry.needsApproval(toolCall.input, {
                     userEmail: getRequestUserEmail(),
                     orgId: getRequestOrgId() ?? null,
-                    caller: "tool",
+                    appId: opts.appId,
+                    caller: opts.actionCaller ?? "tool",
+                    automation: opts.automation,
+                    networkProtocol: opts.networkProtocol,
+                    networkId: opts.networkId,
+                    networkPeer: opts.networkPeer,
                   }),
                 )
               : actionEntry.needsApproval === true;
         } catch {
-          // Fail closed: a throwing predicate means we require approval rather
-          // than silently running a high-consequence action.
           mustApprove = true;
         }
+        if (
+          mustApprove &&
+          actionEntry.allowPersistentApproval !== false &&
+          opts.isToolAlwaysAllowed
+        ) {
+          try {
+            mustApprove = !(await opts.isToolAlwaysAllowed(approvalBinding));
+          } catch {
+            // Fail closed: an unreadable policy must leave the approval gate in
+            // place instead of turning a storage outage into authorization.
+            mustApprove = true;
+          }
+        }
         if (mustApprove) {
+          const askId =
+            (await opts.onApprovalRequired?.(approvalBinding)) || undefined;
           send({
             type: "tool_start",
+            id: toolCall.id,
             tool: toolCall.name,
-            input: toolCall.input as Record<string, string>,
+            input: journalToolInput as Record<string, string>,
           });
           send({
             type: "approval_required",
             tool: toolCall.name,
-            input: toolCall.input as Record<string, string>,
+            input: journalToolInput as Record<string, string>,
             approvalKey,
+            ...(actionEntry.allowPersistentApproval === false
+              ? { allowPersistentApproval: false }
+              : {}),
+            ...(askId ? { askId } : {}),
             ...(toolCall.id ? { toolCallId: toolCall.id } : {}),
           });
+          try {
+            const { recordActionAudit } = await import("../audit/record.js");
+            await recordActionAudit({
+              config: undefined,
+              args: toolCall.input,
+              ctx: {
+                actionName: toolCall.name,
+                caller: opts.actionCaller ?? "tool",
+                networkProtocol: opts.networkProtocol,
+                networkId: opts.networkId,
+                networkPeer: opts.networkPeer,
+                userEmail: getRequestUserEmail(),
+                orgId: getRequestOrgId() ?? null,
+                ...(opts.threadId ? { threadId: opts.threadId } : {}),
+                ...(opts.turnId ? { turnId: opts.turnId } : {}),
+              },
+              status: "denied",
+            });
+          } catch {
+            // Best-effort — auditing must never break the approval pause.
+          }
           const result =
             `Awaiting human approval to run "${toolCall.name}". This action did ` +
             `NOT execute — a human must approve this specific call before it ` +
             `can run. The turn is paused; do not retry.`;
-          send({ type: "tool_done", tool: toolCall.name, result });
+          emitToolDone({
+            type: "tool_done",
+            id: toolCall.id,
+            tool: toolCall.name,
+            input: journalToolInput as Record<string, unknown>,
+            result,
+            completedSideEffect: false,
+            approvalPause: true,
+          });
           recordToolResult(result, false);
+          turnYieldedToUser = true;
           requestedActionStop ??= {
             message: `Waiting for your approval to run ${toolCall.name}.`,
             errorCode: "needs-approval",
@@ -2952,54 +7900,29 @@ export async function runAgentLoop(opts: {
         }
       }
 
-      const cacheKey =
-        actionEntry.readOnly === true
-          ? toolCallCacheKey(toolCall.name, toolCall.input)
-          : null;
-      if (cacheKey && readOnlyToolResultCache.has(cacheKey)) {
-        const repeats = (duplicateReadOnlyToolCalls.get(cacheKey) ?? 0) + 1;
-        duplicateReadOnlyToolCalls.set(cacheKey, repeats);
-        const previousResult = readOnlyToolResultCache.get(cacheKey) ?? "";
-        const result =
-          `Skipped duplicate read-only call to ${toolCall.name}: identical input already ran in this turn. ` +
-          `Use the previous result already in the conversation instead of calling this tool again.\n\n` +
-          `Previous result:\n${previousResult}`;
-        send({
-          type: "tool_start",
-          tool: toolCall.name,
-          input: toolCall.input as Record<string, string>,
-        });
-        send({ type: "tool_done", tool: toolCall.name, result });
-        recordToolResult(result, false);
-        if (repeats >= 3) {
-          requestedActionStop ??= {
-            message:
-              "I stopped because the agent kept asking for the same read-only context it already had. Please send the request again if you want me to retry from a fresh turn.",
-            errorCode: "duplicate_read_only_tool",
-          };
-        }
-        return {
-          type: "tool-result" as const,
-          toolCallId: toolCall.id,
-          toolName: toolCall.name,
-          toolInput: wireToolInput,
-          content: result,
-        };
-      }
+      const DEFAULT_TOOL_RESULT_CHARS = 50_000;
+      const DEFAULT_TOOL_TIMEOUT_MS = 12 * 60_000;
+      const requestedToolTimeoutMs =
+        actionEntry.timeoutMs ??
+        opts.toolLimits?.timeoutMs ??
+        DEFAULT_TOOL_TIMEOUT_MS;
+      const toolTimeoutMs =
+        runToolTimeoutCeilingMs > 0
+          ? Math.min(requestedToolTimeoutMs, runToolTimeoutCeilingMs)
+          : requestedToolTimeoutMs;
+      const configuredToolMaxResultChars =
+        actionEntry.maxResultChars ??
+        opts.toolLimits?.maxResultChars ??
+        DEFAULT_TOOL_RESULT_CHARS;
+      const toolMaxResultChars =
+        typeof opts.toolLimits?.hardMaxResultChars === "number"
+          ? Math.min(
+              configuredToolMaxResultChars,
+              opts.toolLimits.hardMaxResultChars,
+            )
+          : configuredToolMaxResultChars;
 
-      // TOOL-CALL JOURNAL HARD-BLOCK (resume safety, tool-layer enforcement).
-      // The prompt-level resume journal already TELLS a resuming model not to
-      // re-run completed tool calls; this enforces it at the tool layer so a
-      // re-dispatched write call whose exact (tool name + input) already
-      // completed in an earlier interrupted chunk of this turn does NOT execute
-      // its side effect again — we return the journaled result instead and emit
-      // the normal tool_start/tool_done so the transcript stays coherent.
-      //
-      // Gated on a non-readOnly tool + an existing prior-chunk journal (so fresh
-      // calls with no completed journal entry are completely unaffected). The
-      // snapshot was taken before this chunk's tools ran, so it can only match a
-      // PRIOR completion, never one from the current chunk.
-      if (!actionEntry.readOnly && toolCallJournal) {
+      if (!actionIsReadOnly && toolCallJournal) {
         const journaled = findCompletedJournalEntry(
           toolCallJournal,
           toolCall.name,
@@ -3007,17 +7930,36 @@ export async function runAgentLoop(opts: {
           consumedJournalKeys,
         );
         if (journaled) {
+          rollbackRepeatedToolCall();
           const recordedResult = journaled.result ?? "";
-          const result =
-            `(Already completed in an earlier interrupted attempt - not re-run to avoid a duplicate side effect.)\n\n` +
-            recordedResult;
+          const result = `${JOURNALED_TOOL_REPLAY_PREFIX}${recordedResult}`;
           send({
             type: "tool_start",
+            id: toolCall.id,
             tool: toolCall.name,
-            input: toolCall.input as Record<string, string>,
+            input: journalToolInput as Record<string, string>,
           });
-          send({ type: "tool_done", tool: toolCall.name, result });
-          recordToolResult(result, false);
+          emitToolDone({
+            type: "tool_done",
+            id: toolCall.id,
+            tool: toolCall.name,
+            input: journalToolInput as Record<string, unknown>,
+            result,
+            completedSideEffect: true,
+            replayed: true,
+            ...(journaled.artifacts?.length
+              ? { artifacts: journaled.artifacts }
+              : {}),
+            ...(journaled.chatUI && journaled.chatUIResult !== undefined
+              ? {
+                  chatUI: journaled.chatUI,
+                  chatUIResult: journaled.chatUIResult,
+                }
+              : {}),
+          });
+          recordToolResult(result, false, journaled.artifacts);
+          noteToolCallSucceeded(actionEntry, toolCall.name, toolCall.input);
+          resetAfterSuccessfulWrite(toolCall.name, toolCall.input);
           return {
             type: "tool-result" as const,
             toolCallId: toolCall.id,
@@ -3028,43 +7970,81 @@ export async function runAgentLoop(opts: {
         }
       }
 
-      // Guard against write tools that have been interrupted too many times in
-      // this turn (connection drop mid-execution → agent retries → repeat).
-      // A write tool that keeps failing likely has a timeout / large-payload
-      // problem; retrying indefinitely creates duplicates and confuses users.
-      //
-      // LEDGER RECOVERY: before applying the give-up budget, check whether the
-      // previous invocation's zombie actually completed and wrote its result to
-      // the durable ledger. If so, return the ledger result without re-executing
-      // (prevents the duplicate side effect) and skip counting it toward the
-      // interruption budget.
-      if (!actionEntry.readOnly) {
+      if (!actionIsReadOnly) {
         const writeCacheKey = toolCallCacheKey(toolCall.name, toolCall.input);
-        const priorInterruptions =
-          writeToolInterruptions.get(writeCacheKey) ?? 0;
+        // An unknown write cannot become fresh work merely by rewording its
+        // arguments, or by eliding its tool pair from the replayed history.
+        const unknownJournalCalls = internalContinuationTurn
+          ? (toolCallJournal?.interrupted.filter(
+              (entry) => entry.tool === toolCall.name,
+            ).length ?? 0)
+          : 0;
+        const priorInterruptions = Math.max(
+          writeToolInterruptions.get(writeCacheKey) ?? 0,
+          unknownJournalCalls,
+          unknownWriteToolNames.has(toolCall.name) ? 1 : 0,
+        );
 
-        if (priorInterruptions > 0 && opts.threadId) {
-          const ledgerResult = await readLedgerEntry(
-            opts.threadId,
-            writeCacheKey,
-          );
+        if (priorInterruptions > 0) {
+          const ledgerResult = opts.threadId
+            ? await waitForInterruptedToolLedgerEntry({
+                threadId: opts.threadId,
+                toolKey: writeCacheKey,
+                toolName: toolCall.name,
+                timeoutMs: Math.min(
+                  toolTimeoutMs,
+                  INTERRUPTED_TOOL_LEDGER_RECOVERY_TIMEOUT_MS,
+                ),
+                signal,
+                send,
+              })
+            : null;
           if (ledgerResult !== null) {
-            // Zombie completed — recover the real result without re-executing.
-            const result =
-              `(Recovered from prior interrupted chunk — action already completed.)\n\n` +
-              ledgerResult;
+            rollbackRepeatedToolCall();
+            const result = RECOVERED_TOOL_REPLAY_PREFIX + ledgerResult.result;
+            const recoveredActionResult = parseRecoveredActionResult(
+              ledgerResult.result,
+              ledgerResult.resultIsString,
+            );
+            const hasStoredChatUIResult = "chatUIResult" in ledgerResult;
+            const recoveredChatUIResult = hasStoredChatUIResult
+              ? { value: ledgerResult.chatUIResult }
+              : recoveredActionResult;
+            const resolvedChatUI = recoveredChatUIResult
+              ? actionChatUIForResult(
+                  toolCall.name,
+                  actionEntry,
+                  toolCall.input as Record<string, unknown>,
+                  recoveredChatUIResult?.value,
+                  false,
+                  hasStoredChatUIResult,
+                )
+              : undefined;
             send({
               type: "tool_start",
+              id: toolCall.id,
               tool: toolCall.name,
-              input: toolCall.input as Record<string, string>,
+              input: journalToolInput as Record<string, string>,
             });
-            send({
+            emitToolDone({
               type: "tool_done",
+              id: toolCall.id,
               tool: toolCall.name,
+              input: journalToolInput as Record<string, unknown>,
               result,
-              ...(actionEntry.chatUI ? { chatUI: actionEntry.chatUI } : {}),
+              completedSideEffect: true,
+              replayed: true,
+              ...(ledgerResult.artifacts.length > 0
+                ? { artifacts: ledgerResult.artifacts }
+                : {}),
+              ...(resolvedChatUI ? { chatUI: resolvedChatUI.chatUI } : {}),
+              ...(resolvedChatUI
+                ? { chatUIResult: resolvedChatUI.result }
+                : {}),
             });
-            recordToolResult(result, false);
+            recordToolResult(result, false, ledgerResult.artifacts);
+            noteToolCallSucceeded(actionEntry, toolCall.name, toolCall.input);
+            resetAfterSuccessfulWrite(toolCall.name, toolCall.input);
             return {
               type: "tool-result" as const,
               toolCallId: toolCall.id,
@@ -3073,26 +8053,29 @@ export async function runAgentLoop(opts: {
               content: result,
             };
           }
-        }
-
-        if (priorInterruptions >= MAX_WRITE_TOOL_INTERRUPTIONS) {
           const result =
-            `The ${toolCall.name} action was interrupted ${priorInterruptions} time(s) in this session — ` +
-            `likely a connection timeout with a large payload. Please start a new chat and try again, ` +
-            `or split the request into smaller pieces.`;
+            `The ${toolCall.name} action was interrupted ${priorInterruptions} time(s), and I could not recover its result. ` +
+            `I stopped without running it again. Check whether it completed before asking me to retry.`;
           send({
             type: "tool_start",
+            id: toolCall.id,
             tool: toolCall.name,
-            input: toolCall.input as Record<string, string>,
+            input: journalToolInput as Record<string, string>,
           });
-          send({ type: "tool_done", tool: toolCall.name, result });
+          emitToolDone({
+            type: "tool_done",
+            id: toolCall.id,
+            tool: toolCall.name,
+            input: journalToolInput as Record<string, unknown>,
+            result,
+            isError: true,
+          });
           recordToolResult(result, true);
           requestedActionStop ??= {
             message:
-              `I stopped because the ${toolCall.name} action was interrupted ${priorInterruptions} time(s) in a row. ` +
-              `This usually means the connection timed out while processing a large request. ` +
-              `Please start a new chat and try again, or break the request into smaller parts.`,
-            errorCode: "repeated_write_tool_interruption",
+              `I stopped because the ${toolCall.name} action was interrupted ${priorInterruptions} time(s) and its result is unknown. ` +
+              `Check whether it completed before asking me to retry.`,
+            errorCode: "write_tool_outcome_unknown",
           };
           return {
             type: "tool-result" as const,
@@ -3105,274 +8088,693 @@ export async function runAgentLoop(opts: {
         }
       }
 
+      if (signal.aborted) {
+        recordToolResult(INTERRUPTED_TOOL_RESULT_MARKER, false);
+        return {
+          type: "tool-result" as const,
+          toolCallId: toolCall.id,
+          toolName: toolCall.name,
+          toolInput: wireToolInput,
+          content: INTERRUPTED_TOOL_RESULT_MARKER,
+        };
+      }
+
       send({
         type: "tool_start",
+        id: toolCall.id,
         tool: toolCall.name,
-        input: toolCall.input as Record<string, string>,
+        input: journalToolInput as Record<string, string>,
       });
 
-      const toolCallSchemaError = toolCallErrors.get(toolCall.id);
-      if (toolCallSchemaError) {
-        const result = finalizeToolErrorResult(
-          toolInputSchemaErrorResult(
-            toolCall.name,
-            toolCallSchemaError.input,
-            toolCallSchemaError.error,
-          ),
-        );
-        send({ type: "tool_done", tool: toolCall.name, result });
-        recordToolResult(result, true);
-        return {
-          type: "tool-result" as const,
-          toolCallId: toolCall.id,
-          toolName: toolCall.name,
-          toolInput: wireToolInput,
-          content: result,
-          isError: true,
-        };
-      }
-
-      const rawToolInputError = validateRawToolInput(
-        actionEntry,
-        toolCall.input,
-      );
-      if (rawToolInputError) {
-        const result = finalizeToolErrorResult(
-          toolInputSchemaErrorResult(
-            toolCall.name,
-            toolCall.input,
-            rawToolInputError,
-          ),
-        );
-        send({ type: "tool_done", tool: toolCall.name, result });
-        recordToolResult(result, true);
-        return {
-          type: "tool-result" as const,
-          toolCallId: toolCall.id,
-          toolName: toolCall.name,
-          toolInput: wireToolInput,
-          content: result,
-          isError: true,
-        };
-      }
-
-      if (
-        opts.executionMode === "plan" &&
-        !isPlanModeToolCallAllowed(toolCall.name, toolCall.input, actionEntry)
-      ) {
-        const result = planModeBlockedMessage(toolCall.name);
-        send({ type: "tool_done", tool: toolCall.name, result });
-        recordToolResult(result, true);
-        return {
-          type: "tool-result" as const,
-          toolCallId: toolCall.id,
-          toolName: toolCall.name,
-          toolInput: wireToolInput,
-          content: result,
-          isError: true,
-        };
-      }
-
-      const DEFAULT_TOOL_RESULT_CHARS = 50_000;
-      const DEFAULT_TOOL_TIMEOUT_MS = 60_000;
-      const toolTimeoutMs =
-        actionEntry.timeoutMs ??
-        opts.toolLimits?.timeoutMs ??
-        DEFAULT_TOOL_TIMEOUT_MS;
-      const toolMaxResultChars =
-        actionEntry.maxResultChars ??
-        opts.toolLimits?.maxResultChars ??
-        DEFAULT_TOOL_RESULT_CHARS;
-      let result: string;
-      let isError = false;
-      let mcpApp:
-        | import("../mcp-client/app-result.js").AgentMcpAppPayload
-        | undefined;
       try {
-        const timeoutSignal = AbortSignal.timeout(toolTimeoutMs);
-        // Keep a reference to the action promise so we can attach a zombie-
-        // detection continuation AFTER Promise.race abandons it on run abort.
-        // The promise itself is not awaited here — Promise.race owns the await.
-        const actionPromise = Promise.resolve(
-          actionEntry.run(toolCall.input as Record<string, string>, {
-            send,
-            userEmail: getRequestUserEmail(),
-            orgId: getRequestOrgId() ?? null,
-            caller: "tool",
-            attachments: opts.attachments,
-            signal,
-          }),
+        const toolCallSchemaError = toolCallErrors.get(toolCall.id);
+        if (toolCallSchemaError && !toolInputNormalized) {
+          const result = finalizeToolErrorResult(
+            toolInputSchemaErrorResult(
+              toolCall.name,
+              toolCallSchemaError.input,
+              toolCallSchemaError.error,
+              actionEntry?.tool.parameters,
+              toolCallTruncatedByOutputCap,
+            ),
+          );
+          emitToolDone({
+            type: "tool_done",
+            id: toolCall.id,
+            tool: toolCall.name,
+            input: journalToolInput as Record<string, unknown>,
+            result,
+            isError: true,
+            completedSideEffect: false,
+          });
+          recordToolResult(result, true);
+          return {
+            type: "tool-result" as const,
+            toolCallId: toolCall.id,
+            toolName: toolCall.name,
+            toolInput: wireToolInput,
+            content: result,
+            isError: true,
+          };
+        }
+
+        const rawToolInputError = validateRawToolInput(
+          actionEntry,
+          toolCall.input,
         );
-
-        // When the run is aborted (soft-timeout / user cancel) while this tool
-        // call is in flight, Promise.race below will throw "Run aborted" and the
-        // action's promise becomes a zombie — it keeps running but its result is
-        // never returned to the loop. If the zombie eventually resolves, write
-        // the result to the durable ledger keyed by (threadId, toolKey) so the
-        // next continuation chunk can recover it instead of re-executing the
-        // side effect.
-        if (opts.threadId && !actionEntry.readOnly) {
-          const ledgerThreadId = opts.threadId;
-          const ledgerToolKey = toolCallCacheKey(toolCall.name, toolCall.input);
-          actionPromise
-            .then((zombieRaw: unknown) => {
-              const zombieMcp = isMcpActionResult(zombieRaw) ? zombieRaw : null;
-              const zombieText = zombieMcp ? zombieMcp.text : zombieRaw;
-              const zombieStr =
-                typeof zombieText === "string"
-                  ? zombieText
-                  : JSON.stringify(zombieText, null, 2);
-              void writeLedgerEntry(ledgerThreadId, ledgerToolKey, zombieStr);
-            })
-            .catch(() => {
-              // Action errored in the zombie — no result to ledger.
-            });
+        if (rawToolInputError) {
+          const result = finalizeToolErrorResult(
+            toolInputSchemaErrorResult(
+              toolCall.name,
+              toolCall.input,
+              rawToolInputError,
+              actionEntry.tool.parameters,
+              toolCallTruncatedByOutputCap,
+            ),
+          );
+          emitToolDone({
+            type: "tool_done",
+            id: toolCall.id,
+            tool: toolCall.name,
+            input: journalToolInput as Record<string, unknown>,
+            result,
+            isError: true,
+            completedSideEffect: false,
+          });
+          recordToolResult(result, true);
+          return {
+            type: "tool-result" as const,
+            toolCallId: toolCall.id,
+            toolName: toolCall.name,
+            toolInput: wireToolInput,
+            content: result,
+            isError: true,
+          };
         }
 
-        const raw = await Promise.race([
-          actionPromise,
-          new Promise<never>((_, reject) => {
-            timeoutSignal.addEventListener("abort", () =>
-              reject(
-                new Error(
-                  `Tool call timed out after ${toolTimeoutMs / 1000} seconds`,
-                ),
-              ),
-            );
-          }),
-          // Stop waiting on the tool when the run itself is aborted (e.g. the
-          // run-manager soft timeout, or a user cancel). Without this leg the
-          // loop blocks on an in-flight tool for up to TOOL_TIMEOUT_MS after
-          // the run signal has already fired.
-          new Promise<never>((_, reject) => {
-            if (signal.aborted) {
-              reject(new Error("Run aborted"));
-              return;
+        const cacheKey =
+          actionIsReadOnly && actionEntry.dedupe !== false
+            ? toolCallCacheKey(toolCall.name, toolCall.input)
+            : null;
+        const cachedResult = cacheKey
+          ? readOnlyToolResultCache.get(cacheKey)
+          : undefined;
+        if (cacheKey && cachedResult) {
+          const previousResult = cachedResult.content;
+          const visible = isCachedToolResultVisibleInContext(
+            contextMessages,
+            toolCall,
+            previousResult,
+          );
+          let result: string;
+          if (visible) {
+            const repeats = (duplicateReadOnlyToolCalls.get(cacheKey) ?? 0) + 1;
+            duplicateReadOnlyToolCalls.set(cacheKey, repeats);
+            result = visibleDuplicateReadOnlyToolResult(toolCall.name);
+            if (repeats >= 3) {
+              requestedActionStop ??= {
+                message:
+                  "I stopped because the agent kept asking for the same read-only context it already had. Please send the request again if you want me to retry from a fresh turn.",
+                errorCode: "duplicate_read_only_tool",
+              };
             }
-            signal.addEventListener(
-              "abort",
-              () => reject(new Error("Run aborted")),
-              { once: true },
+          } else {
+            duplicateReadOnlyToolCalls.set(cacheKey, 0);
+            rollbackRepeatedToolCall();
+            result = resurfacedDuplicateReadOnlyToolResult(
+              toolCall.name,
+              previousResult,
             );
-          }),
-        ]);
-        const mcpResult = isMcpActionResult(raw) ? raw : null;
-        const rawForAgent = mcpResult ? mcpResult.text : raw;
-        if (
-          mcpResult &&
-          mcpResult.raw &&
-          typeof mcpResult.raw === "object" &&
-          (mcpResult.raw as Record<string, unknown>).isError === true
-        ) {
-          isError = true;
+          }
+          emitToolDone({
+            type: "tool_done",
+            id: toolCall.id,
+            tool: toolCall.name,
+            input: journalToolInput as Record<string, unknown>,
+            result,
+            completedSideEffect: false,
+          });
+          recordToolResult(result, false);
+          return {
+            type: "tool-result" as const,
+            toolCallId: toolCall.id,
+            toolName: toolCall.name,
+            toolInput: wireToolInput,
+            content: result,
+            ...(cachedResult.images?.length
+              ? { images: cachedResult.images }
+              : {}),
+          };
         }
-        mcpApp = mcpResult?.mcpApp;
-        // Demo mode: the agent must see the same fake data the UI shows, so
-        // it can't read out a real name/email on a live screen share. Redact
-        // the structured result (not the JSON string) so IDs/dates/URLs stay
-        // intact and follow-up tool calls still work. Gated — the expensive
-        // walk only runs when demo mode is on.
-        let redacted: unknown = rawForAgent;
-        const demoMode = await isDemoModeEnabled();
-        if (demoMode) {
-          mcpApp = undefined;
-          if (typeof rawForAgent === "string") {
-            try {
-              redacted = JSON.stringify(
-                redactDemoData(JSON.parse(rawForAgent)),
+
+        if (
+          opts.executionMode === "plan" &&
+          !isPlanModeToolCallAllowed(toolCall.name, toolCall.input, actionEntry)
+        ) {
+          const result = planModeBlockedMessage(toolCall.name);
+          emitToolDone({
+            type: "tool_done",
+            id: toolCall.id,
+            tool: toolCall.name,
+            input: journalToolInput as Record<string, unknown>,
+            result,
+            isError: true,
+            completedSideEffect: false,
+          });
+          recordToolResult(result, true);
+          return {
+            type: "tool-result" as const,
+            toolCallId: toolCall.id,
+            toolName: toolCall.name,
+            toolInput: wireToolInput,
+            content: result,
+            isError: true,
+          };
+        }
+
+        let result: string;
+        let chatUIResult: unknown;
+        let isError = false;
+        let toolErrorCode: string | undefined;
+        let mcpApp:
+          | import("../mcp-client/app-result.js").AgentMcpAppPayload
+          | undefined;
+        let toolResultImages:
+          | import("./engine/types.js").EngineToolResultImagePart[]
+          | undefined;
+        let toolArtifacts: ArtifactReceipt[] = [];
+        let fileMutation: AgentFileMutationProof | undefined;
+        let receipt: WriteReceipt | undefined;
+        try {
+          // The run may have been aborted while we waited above for an
+          // interrupted tool's ledger result (the wait can poll for minutes).
+          // Re-check before invoking the action: starting it now would spawn a
+          // fresh zombie execution — a duplicate side effect / double charge —
+          // which the ledger-recovery path exists to prevent. The Promise.race
+          // "Run aborted" leg below only rejects AFTER the action is invoked, so
+          // it cannot guard this. Throw here instead, handled like any abort.
+          if (signal.aborted) {
+            throw new Error("Run aborted");
+          }
+          const timeoutSignal = AbortSignal.timeout(toolTimeoutMs);
+          // Only the invoked wording marks a write as possibly run (see
+          // isToolCallTimeoutResult); a timeout before invocation must not use it.
+          const timeoutMessage = () =>
+            actionInvoked
+              ? `Tool call timed out after ${toolTimeoutMs / 1000} seconds`
+              : `Tool call timed out before the action started after ${toolTimeoutMs / 1000} seconds`;
+          const actionUserEmail = opts.ownerEmail ?? getRequestUserEmail();
+          const actionOrgId = opts.orgId ?? getRequestOrgId() ?? null;
+          const requestContext = getRequestContext();
+          // The app-authorization lookup must stay inside the raced action. If it
+          // were awaited before the race, a deadline firing during the await would
+          // reject nothing: the abort listener is attached only inside the race,
+          // and listeners added after an AbortSignal fires never run.
+          const invokeAction = async () => {
+            const appAuthorization = await resolveTurnAppAuthorization(
+              actionUserEmail ?? undefined,
+              actionOrgId,
+            );
+            if (!actionIsReadOnly) await opts.beforeWrite?.();
+            if (timeoutSignal.aborted) {
+              throw new Error(timeoutMessage());
+            }
+            if (signal.aborted) {
+              throw new Error("Run aborted");
+            }
+            const actionContext = {
+              send,
+              userEmail: actionUserEmail ?? undefined,
+              orgId: actionOrgId,
+              appId: opts.appId,
+              ...(appAuthorization
+                ? {
+                    appRoles: appAuthorization.roles,
+                    appPermissions: Object.entries(appAuthorization.permissions)
+                      .filter(([, roles]) =>
+                        roles.some((role) =>
+                          appAuthorization.roles.includes(role),
+                        ),
+                      )
+                      .map(([permission]) => permission),
+                  }
+                : {}),
+              caller: opts.actionCaller ?? "tool",
+              automation: opts.automation,
+              networkProtocol: opts.networkProtocol,
+              networkId: opts.networkId,
+              networkPeer: opts.networkPeer,
+              delegationDepth: opts.delegationDepth,
+              visitedApps: opts.visitedApps,
+              blockedA2ATargets,
+              attachments: opts.attachments,
+              signal,
+              actionName: toolCall.name,
+              toolCallId: toolCall.id,
+              ...(wasApproved ? { approvedToolCallKey: approvalKey } : {}),
+              ...(opts.threadId ? { threadId: opts.threadId } : {}),
+              ...(opts.runId ? { runId: opts.runId } : {}),
+              ...(opts.turnId ? { turnId: opts.turnId } : {}),
+            };
+            actionInvoked = true;
+            return runActionWithExecutionOutcome(
+              actionEntry.run,
+              toolCall.input as Record<string, string>,
+              actionContext,
+              actionExecutionOutcome,
+            );
+          };
+          const actionPromise = Promise.resolve(
+            runWithRequestContext(
+              {
+                ...(requestContext ?? {}),
+                ...(actionUserEmail ? { userEmail: actionUserEmail } : {}),
+                ...(actionOrgId ? { orgId: actionOrgId } : {}),
+                ...(requestContext?.run ? { run: requestContext.run } : {}),
+              },
+              invokeAction,
+            ),
+          );
+
+          // When the run is aborted (soft-timeout / user cancel) while this tool
+          // call is in flight, Promise.race below will throw "Run aborted" and the
+          // action's promise becomes a zombie — it keeps running but its result is
+          // never returned to the loop. If the zombie eventually resolves, write
+          // the result to the durable ledger keyed by (threadId, toolKey) so the
+          // next continuation chunk can recover it instead of re-executing the
+          // side effect.
+          if (opts.threadId && !actionIsReadOnly) {
+            const ledgerThreadId = opts.threadId;
+            const ledgerToolKey = toolCallCacheKey(
+              toolCall.name,
+              toolCall.input,
+            );
+            const zombieLedgerPromise = actionPromise
+              .then(async (zombieRaw: unknown) => {
+                const zombieMcp = isMcpActionResult(zombieRaw)
+                  ? zombieRaw
+                  : null;
+                if (
+                  zombieMcp &&
+                  zombieMcp.raw &&
+                  typeof zombieMcp.raw === "object" &&
+                  (zombieMcp.raw as Record<string, unknown>).isError === true
+                ) {
+                  return;
+                }
+                const zombieResultForAgent = zombieMcp
+                  ? zombieMcp.text
+                  : extractAgentImagesFromActionResult(zombieRaw).value;
+                const zombieStr =
+                  typeof zombieResultForAgent === "string"
+                    ? zombieResultForAgent
+                    : JSON.stringify(zombieResultForAgent, null, 2);
+                const zombieArtifacts = detectArtifactReceipts(
+                  zombieResultForAgent,
+                  toolCall.name,
+                );
+                const zombieChatUI = actionChatUIForResult(
+                  toolCall.name,
+                  actionEntry,
+                  toolCall.input as Record<string, unknown>,
+                  zombieResultForAgent,
+                  false,
+                );
+                await writeLedgerEntry(
+                  ledgerThreadId,
+                  ledgerToolKey,
+                  zombieStr,
+                  zombieArtifacts,
+                  typeof zombieResultForAgent === "string",
+                  zombieChatUI
+                    ? JSON.stringify(zombieChatUI.result)
+                    : undefined,
+                );
+              })
+              .catch(() => {
+                // Action errored in the zombie — no result to ledger.
+              });
+            void retainRequestDbPoolScope(zombieLedgerPromise);
+          }
+
+          const raw = await Promise.race([
+            actionPromise,
+            new Promise<never>((_, reject) => {
+              timeoutSignal.addEventListener("abort", () =>
+                reject(new Error(timeoutMessage())),
+              );
+            }),
+            new Promise<never>((_, reject) => {
+              if (signal.aborted) {
+                reject(new Error("Run aborted"));
+                return;
+              }
+              signal.addEventListener(
+                "abort",
+                () => reject(new Error("Run aborted")),
+                { once: true },
+              );
+            }),
+          ]);
+          const mcpResult = isMcpActionResult(raw) ? raw : null;
+          const rawForAgent = mcpResult ? mcpResult.text : raw;
+          if (
+            mcpResult &&
+            mcpResult.raw &&
+            typeof mcpResult.raw === "object" &&
+            (mcpResult.raw as Record<string, unknown>).isError === true
+          ) {
+            isError = true;
+          }
+          mcpApp = mcpResult?.mcpApp;
+          let resultForAgent: unknown = rawForAgent;
+          let imageNotes: string[] = [];
+          if (mcpResult) {
+            const mcpImages = extractMcpToolResultImages(mcpResult.raw);
+            if (mcpImages.length > 0) toolResultImages = mcpImages;
+          } else {
+            const extracted =
+              extractAgentImagesFromActionResult(resultForAgent);
+            resultForAgent = extracted.value;
+            imageNotes = extracted.notes;
+            if (extracted.images.length > 0) {
+              toolResultImages = extracted.images;
+            }
+          }
+          chatUIResult = resultForAgent;
+          // Before stringify and truncation: a large result must not lose it.
+          receipt = readWriteReceipt(resultForAgent);
+          toolArtifacts = detectArtifactReceipts(resultForAgent, toolCall.name);
+          if (toolResultImages) {
+            imageNotes = [
+              ...describeToolResultImages(toolResultImages),
+              ...imageNotes,
+            ];
+          }
+          let toolSearch:
+            | {
+                matched: string[];
+                overflow: string[];
+                loadedThisStep: string[];
+              }
+            | undefined;
+          if (toolCall.name === TOOL_SEARCH_ACTION_NAME && !isError) {
+            const matched = extractToolSearchResultNames(rawForAgent);
+            const { added, overflow } = expandActiveTools(
+              matched,
+              toolNamesLoadedThisStep,
+            );
+            for (const name of added) toolNamesLoadedThisStep.add(name);
+            const loadedThisStep = matched.filter((name) =>
+              toolNamesLoadedThisStep.has(name),
+            );
+            toolSearch = { matched, overflow, loadedThisStep };
+            if (matched.length > 0) {
+              resultForAgent = withLoadedToolNames(
+                rawForAgent as Record<string, unknown>,
+                loadedThisStep,
+              );
+            }
+          }
+          let resultStr =
+            typeof resultForAgent === "string"
+              ? resultForAgent
+              : JSON.stringify(resultForAgent, null, 2);
+          if (resultStr.length > toolMaxResultChars) {
+            const truncated = resultStr.slice(0, toolMaxResultChars);
+            resultStr = `${truncated}\n\n...[truncated — full result was ${resultStr.length.toLocaleString()} chars; only first ${toolMaxResultChars.toLocaleString()} shown]`;
+          }
+          if (imageNotes.length > 0) {
+            resultStr = `${resultStr}\n\n${imageNotes.join("\n")}`;
+          }
+          result = resultStr;
+          if (toolSearch) {
+            const { matched, overflow, loadedThisStep } = toolSearch;
+            const loadedNote = `Loaded matching tool schemas for the next step, not this one: ${loadedThisStep.join(", ")}`;
+            if (loadedThisStep.length > 0) {
+              result += `\n\n${loadedNote}`;
+              alreadyLoadedToolSearches = 0;
+            } else if (
+              matched.length > 0 &&
+              matched.every((name) => activeToolNames.has(name))
+            ) {
+              const priorMessage = (rawForAgent as { message?: unknown })
+                .message;
+              result = JSON.stringify(
+                {
+                  ...(resultForAgent as Record<string, unknown>),
+                  alreadyLoaded: true,
+                  message: [
+                    `All ${matched.length} matches are already callable; call them directly.`,
+                    typeof priorMessage === "string" ? priorMessage : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" "),
+                },
                 null,
                 2,
               );
-            } catch {
-              redacted = redactDemoString(rawForAgent);
+              // One count per step, reset by any progress: parallel searches
+              // are one repeat, and a run that searches between writes is not
+              // repeating.
+              if (!countedAlreadyLoadedSearchThisStep) {
+                countedAlreadyLoadedSearchThisStep = true;
+                alreadyLoadedToolSearches += 1;
+              }
+              if (
+                alreadyLoadedToolSearches >= MAX_ALREADY_LOADED_TOOL_SEARCHES
+              ) {
+                requestedActionStop ??= {
+                  message:
+                    `Stopped because tool-search was used ${alreadyLoadedToolSearches} times in a row to look for tools that were already callable, ` +
+                    "which means the same step is repeating rather than making progress. " +
+                    "Everything completed before this point is preserved above.",
+                  errorCode: "repeated_tool_call",
+                };
+              }
             }
+            if (overflow.length > 0) {
+              const shown = overflow.slice(
+                0,
+                MAX_TOOL_SEARCH_OVERFLOW_NAMES_SHOWN,
+              );
+              const more =
+                overflow.length > shown.length
+                  ? `, and ${overflow.length - shown.length} more`
+                  : "";
+              const overflowNote = `Could not load ${overflow.length} matched ${overflow.length === 1 ? "tool" : "tools"} because the per-request tool limit (${MAX_PROVIDER_TOOLS}) was reached: ${shown.join(", ")}${more}. They are not callable; use tools you already have.`;
+              // A repeated search's own message says its matches are
+              // available, which these are not.
+              result =
+                (rawForAgent as { repeated?: unknown }).repeated === true
+                  ? JSON.stringify(
+                      {
+                        ...(resultForAgent as Record<string, unknown>),
+                        message: [
+                          loadedThisStep.length > 0 ? loadedNote : "",
+                          overflowNote,
+                        ]
+                          .filter(Boolean)
+                          .join(" "),
+                      },
+                      null,
+                      2,
+                    )
+                  : `${result}\n\n${overflowNote}`;
+            }
+          }
+        } catch (err: any) {
+          actionRefused = actionExecutionOutcome.refused;
+          toolErrorCode = isActionContractError(err)
+            ? err.errorCode
+            : undefined;
+          if (signal.aborted) {
+            result = INTERRUPTED_TOOL_RESULT_MARKER;
+          } else if (isAgentConnectionRequiredError(err)) {
+            const message = connectionRequiredMessage(
+              sanitizeToolErrorValue(err.message) ||
+                `Connect ${err.provider} to continue.`,
+              err.reason,
+            );
+            result = sanitizeToolErrorValue(err.toolResult || message);
+            requestedConnection ??= {
+              requestId: randomUUID(),
+              provider: err.provider,
+              reason: err.reason,
+              appId: err.appId,
+              detail: message,
+              source: err.source,
+            };
+            turnYieldedToUser = true;
+            requestedActionStop ??= {
+              message,
+              errorCode: "connection-required",
+            };
+          } else if (isAgentActionStopError(err)) {
+            const message =
+              sanitizeToolErrorValue(err.message) ||
+              `Stopped after ${toolCall.name} failed.`;
+            result = sanitizeToolErrorValue(err.toolResult || message);
+            directStop = {
+              message,
+              explicit: err.errorCode === "permanent_precondition",
+            };
+            if (!directStop.explicit && !permanentPreconditionRemedy(message)) {
+              requestedActionStop ??= {
+                message,
+                ...(err.errorCode ? { errorCode: err.errorCode } : {}),
+              };
+            }
+          } else if (
+            isActionContractError(err) &&
+            err.errorCode === "permanent_precondition"
+          ) {
+            const message = sanitizeToolErrorValue(err.message);
+            directStop = { message, explicit: true };
+            result = `Error running ${toolCall.name}: ${message}`;
           } else {
-            redacted = redactDemoData(rawForAgent);
+            const message = sanitizeToolErrorValue(err);
+            const errorCode =
+              isActionContractError(err) && err.errorCode !== "action_failed"
+                ? ` (errorCode: ${err.errorCode})`
+                : "";
+            result = `Error running ${toolCall.name}: ${message}${errorCode}${rateLimitRecoveryHint(message, err)}`;
           }
+          isError = true;
         }
-        let resultStr =
-          typeof redacted === "string"
-            ? redacted
-            : JSON.stringify(redacted, null, 2);
-        if (resultStr.length > toolMaxResultChars) {
-          const truncated = resultStr.slice(0, toolMaxResultChars);
-          resultStr = `${truncated}\n\n...[truncated — full result was ${resultStr.length.toLocaleString()} chars; only first ${toolMaxResultChars.toLocaleString()} shown]`;
-        }
-        result = resultStr;
-        if (toolCall.name === TOOL_SEARCH_ACTION_NAME && !isError) {
-          const added = expandActiveTools(
-            extractToolSearchResultNames(rawForAgent),
-          );
-          if (added.length > 0) {
-            result += `\n\nLoaded matching tool schemas for next step: ${added.join(", ")}`;
+        if (isError) {
+          receipt = undefined;
+          if (result !== INTERRUPTED_TOOL_RESULT_MARKER) {
+            result = finalizeToolErrorResult(result);
           }
-        }
-      } catch (err: any) {
-        if (isAgentActionStopError(err)) {
-          const message =
-            sanitizeToolErrorValue(err.message) ||
-            `Stopped after ${toolCall.name} failed.`;
-          result = sanitizeToolErrorValue(err.toolResult || message);
-          requestedActionStop ??= {
-            message,
-            ...(err.errorCode ? { errorCode: err.errorCode } : {}),
-          };
         } else {
-          const message = sanitizeToolErrorValue(err);
-          result = `Error running ${toolCall.name}: ${message}${rateLimitRecoveryHint(message)}`;
+          fileMutation = actionEntry.fileMutationProof?.(toolCall.input);
+          // Only a write or a receipt is progress; a read-only call between
+          // redundant searches is the same repeating step.
+          if (!actionIsReadOnly || receipt) alreadyLoadedToolSearches = 0;
+          if (receipt && receipt.verified !== true) {
+            usage.receiptUnverifiedCount =
+              (usage.receiptUnverifiedCount ?? 0) + 1;
+          }
+          if (receipt && !receipt.changed) {
+            usage.receiptChangedFalseCount =
+              (usage.receiptChangedFalseCount ?? 0) + 1;
+          }
         }
-        isError = true;
-      }
-      if (isError) {
-        result = finalizeToolErrorResult(result);
-      }
 
-      // Auto-refresh the UI after a successful mutating tool call. Any action
-      // that isn't explicitly read-only is assumed to mutate. The client's
-      // useDbSync listener sees a change event with source:"action" and
-      // invalidates ["action"] queries so list-* / get-* refetch. This makes
-      // refresh after agent writes reliable without the model needing to
-      // remember to call `refresh-screen` itself.
-      if (!isError && actionEntry.readOnly !== true) {
-        try {
-          const { notifyActionChange } =
-            await import("../server/action-change.js");
-          const owner = opts.ownerEmail ?? getRequestUserEmail() ?? undefined;
-          const orgId = opts.orgId ?? getRequestOrgId() ?? undefined;
-          await notifyActionChange({
-            actionName: toolCall.name,
-            ...(owner ? { owner } : {}),
-            ...(orgId ? { orgId } : {}),
+        const agentWarnings = drainAgentWarnings();
+        if (agentWarnings.length > 0) {
+          result = `${result}\n\n${formatAgentWarningsForToolResult(agentWarnings)}`;
+        }
+
+        const resolvedChatUI = actionChatUIForResult(
+          toolCall.name,
+          actionEntry,
+          toolCall.input as Record<string, unknown>,
+          chatUIResult,
+          isError,
+        );
+
+        if (!isError) {
+          try {
+            const { notifyActionChangeInBackground } =
+              await import("../server/action-change.js");
+            if (actionCallEmitsChange(actionEntry, toolCall.input, false)) {
+              const owner =
+                opts.ownerEmail ?? getRequestUserEmail() ?? undefined;
+              const orgId = opts.orgId ?? getRequestOrgId() ?? undefined;
+              notifyActionChangeInBackground({
+                actionName: toolCall.name,
+                ...actionChangeResource(
+                  actionEntry,
+                  toolCall.input,
+                  chatUIResult,
+                ),
+                ...(owner ? { owner } : {}),
+                ...(orgId ? { orgId } : {}),
+              });
+            }
+          } catch (error) {
+            console.warn(
+              "Could not notify the action-change poller after a tool call",
+              error,
+            );
+          }
+        }
+
+        emitToolDone({
+          type: "tool_done",
+          id: toolCall.id,
+          tool: toolCall.name,
+          input: journalToolInput as Record<string, unknown>,
+          result,
+          ...(isError ? { isError: true } : {}),
+          ...(toolErrorCode ? { errorCode: toolErrorCode } : {}),
+          ...(isError
+            ? actionInvoked && !actionIsReadOnly && !actionRefused
+              ? { outcomeUnknown: true as const }
+              : { completedSideEffect: false }
+            : receipt
+              ? { completedSideEffect: receipt.changed }
+              : !actionIsReadOnly
+                ? { completedSideEffect: true }
+                : {}),
+          ...(mcpApp ? { mcpApp } : {}),
+          ...(resolvedChatUI ? { chatUI: resolvedChatUI.chatUI } : {}),
+          ...(resolvedChatUI ? { chatUIResult: resolvedChatUI.result } : {}),
+          ...(fileMutation ? { fileMutation } : {}),
+          ...(toolArtifacts.length > 0 ? { artifacts: toolArtifacts } : {}),
+        });
+        recordToolResult(result, isError, toolArtifacts, receipt);
+        if (!isError) {
+          noteToolCallSucceeded(actionEntry, toolCall.name, toolCall.input);
+          if (cacheKey) {
+            readOnlyToolResultCache.set(cacheKey, {
+              content: result,
+              ...(toolResultImages?.length ? { images: toolResultImages } : {}),
+            });
+          } else if (!actionIsReadOnly) {
+            resetAfterSuccessfulWrite(toolCall.name, toolCall.input);
+          }
+        }
+        return {
+          type: "tool-result" as const,
+          toolCallId: toolCall.id,
+          toolName: toolCall.name,
+          toolInput: wireToolInput,
+          content: result,
+          ...(isError ? { isError } : {}),
+          ...(!isError && toolResultImages && toolResultImages.length > 0
+            ? { images: toolResultImages }
+            : {}),
+        };
+      } finally {
+        if (!toolDoneEmitted) {
+          const result = `Error running ${toolCall.name}: tool execution ended before returning a result.`;
+          emitToolDone({
+            type: "tool_done",
+            id: toolCall.id,
+            tool: toolCall.name,
+            input: journalToolInput as Record<string, unknown>,
+            result,
+            isError: true,
+            ...(actionInvoked && !actionIsReadOnly && !actionRefused
+              ? { outcomeUnknown: true as const }
+              : { completedSideEffect: false }),
           });
-        } catch {
-          // poll module may be unavailable in non-server contexts — ignore
+          recordToolResult(result, true);
         }
       }
+    };
 
-      send({
-        type: "tool_done",
-        tool: toolCall.name,
-        result,
-        ...(mcpApp ? { mcpApp } : {}),
-        ...(actionEntry.chatUI ? { chatUI: actionEntry.chatUI } : {}),
-      });
-      recordToolResult(result, isError);
-      if (!isError) {
-        if (cacheKey) {
-          readOnlyToolResultCache.set(cacheKey, result);
-        } else {
-          readOnlyToolResultCache.clear();
-          duplicateReadOnlyToolCalls.clear();
-        }
+    const runTrackedToolCall = async (
+      toolCall: import("./engine/types.js").EngineToolCallPart,
+    ) => {
+      try {
+        return await runToolCall(toolCall);
+      } finally {
+        settleRepeatedToolCall(toolCall.id);
       }
-      return {
-        type: "tool-result" as const,
-        toolCallId: toolCall.id,
-        toolName: toolCall.name,
-        toolInput: wireToolInput,
-        content: result,
-        ...(isError ? { isError } : {}),
-      };
     };
 
     type ParallelBatchKind = "read" | "parallel-write";
@@ -3380,22 +8782,16 @@ export async function runAgentLoop(opts: {
       toolCall: import("./engine/types.js").EngineToolCallPart,
     ): ParallelBatchKind | null => {
       const entry = actions[toolCall.name];
-      // Unknown tool name → serialize (null), don't fold it into the read-only
-      // parallel batch. Misclassifying it as "read" lets it run via Promise.all
-      // alongside genuine reads, which can reorder it ahead of a later mutating
-      // call and break the model's intended sequencing.
       if (!entry) return null;
-      if (entry.readOnly === true) return "read";
+      if (entry.needsApproval !== undefined || entry.endsTurn === true) {
+        return null;
+      }
+      if (actionCallIsReadOnly(entry, toolCall.input, false)) return "read";
       if (entry.parallelSafe === true) return "parallel-write";
       return null;
     };
 
-    // Engines can emit several tool-call blocks in one turn. Read-only calls
-    // are always parallel. Mutating calls remain serialized by default, but
-    // consecutive actions that explicitly declare `parallelSafe` can run in a
-    // write batch. Reads and writes are separate batches so the model's stated
-    // order still controls what data a same-turn read can observe.
-    const toolResultParts: EngineContentPart[] = [];
+    const toolResultParts: EngineContentPart[] = [...followUpResults];
     let parallelBatch: import("./engine/types.js").EngineToolCallPart[] = [];
     let parallelBatchKind: ParallelBatchKind | null = null;
     const flushParallelBatch = async () => {
@@ -3403,41 +8799,108 @@ export async function runAgentLoop(opts: {
       const batch = parallelBatch;
       parallelBatch = [];
       parallelBatchKind = null;
-      toolResultParts.push(...(await Promise.all(batch.map(runToolCall))));
+      const calls: Array<Promise<EngineContentPart> | EngineContentPart> = [];
+      for (const toolCall of batch) {
+        calls.push(
+          turnYieldedToUser || requestedActionStop
+            ? skipToolCallAfterStop(toolCall)
+            : runTrackedToolCall(toolCall),
+        );
+      }
+      toolResultParts.push(...(await Promise.all(calls)));
+    };
+
+    const skipToolCallAfterStop = (
+      toolCall: import("./engine/types.js").EngineToolCallPart,
+    ): EngineContentPart => {
+      const result =
+        `Not executed: ${toolCall.name} was called after an earlier action stopped or paused this turn. ` +
+        "Continue with the results already collected.";
+      send({
+        type: "tool_start",
+        id: toolCall.id,
+        tool: toolCall.name,
+        input: toolCall.input as Record<string, string>,
+      });
+      send({
+        type: "tool_done",
+        id: toolCall.id,
+        tool: toolCall.name,
+        input: toolCall.input as Record<string, unknown>,
+        result,
+        completedSideEffect: false,
+      });
+      toolResultHistory.push({
+        name: toolCall.name,
+        content: result,
+        isError: false,
+      });
+      return {
+        type: "tool-result" as const,
+        toolCallId: toolCall.id,
+        toolName: toolCall.name,
+        toolInput: JSON.stringify(toolCall.input ?? {}),
+        content: result,
+      };
     };
 
     for (const toolCall of toolCallParts) {
+      if (turnYieldedToUser || requestedActionStop) {
+        toolResultParts.push(skipToolCallAfterStop(toolCall));
+        continue;
+      }
       const batchKind = getParallelBatchKind(toolCall);
       if (batchKind) {
         if (parallelBatchKind && parallelBatchKind !== batchKind) {
           await flushParallelBatch();
+          if (turnYieldedToUser || requestedActionStop) {
+            toolResultParts.push(skipToolCallAfterStop(toolCall));
+            continue;
+          }
         }
         parallelBatchKind = batchKind;
         parallelBatch.push(toolCall);
       } else {
         await flushParallelBatch();
-        toolResultParts.push(await runToolCall(toolCall));
+        if (turnYieldedToUser || requestedActionStop) {
+          toolResultParts.push(skipToolCallAfterStop(toolCall));
+          continue;
+        }
+        toolResultParts.push(await runTrackedToolCall(toolCall));
       }
     }
     await flushParallelBatch();
 
     messages.push({ role: "user", content: toolResultParts });
     if (requestedActionStop) {
-      // TypeScript can't track ??= through async closures; cast to known type.
-      const stop = requestedActionStop as {
-        message: string;
-        errorCode?: string;
-      };
-      send({ type: "text", text: stop.message });
+      const stop = requestedActionStop as TerminalActionStop;
+      if (isLoopBreakerStop(stop)) {
+        loopBreakerCloseout = stop;
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                `This turn stopped to prevent a repeating tool loop: ${stop.message}\n` +
+                "Write one concise closing message saying what you completed and what remains. Use the tool results above as evidence. Do not call tools or repeat checks.",
+            },
+          ],
+        });
+        continue;
+      }
+      terminalActionStop = stop;
+      if (requestedConnection) {
+        send({ type: "connection_required", ...requestedConnection });
+      } else {
+        sendTerminalActionStop(stop);
+      }
       break;
     }
   }
 
-  // A processor halted the run: the `tripwire` event and final message were
-  // already emitted at the abort site. Do NOT send the normal `done` — the run
-  // ended on a guardrail, not a clean turn. The result hook still fires below
-  // so processors can observe the (halted) final text.
   if (tripwire) {
+    const terminalTripwire = tripwire as TripWire;
     if (processorChain) {
       try {
         await processorChain.runResult(
@@ -3450,14 +8913,16 @@ export async function runAgentLoop(opts: {
         // A result-hook abort is a no-op: the run is already halting.
       }
     }
+    reportOutcome({
+      state: "failed",
+      code: terminalActionStop?.errorCode ?? "guardrail",
+      retryable: false,
+      message: terminalTripwire.message,
+    });
     return usage;
   }
 
-  if (!signal.aborted) {
-    // In-loop processor seam (result hook). Fires once at clean run end with the
-    // final assistant text so processors (e.g. a proof-of-done gate) can record
-    // a verdict. A result-hook abort cannot un-finish a completed run, so a
-    // TripWire here is swallowed.
+  if (!signal.aborted && !endedAtLoopLimit && !terminalActionStop) {
     if (processorChain) {
       try {
         await processorChain.runResult(
@@ -3467,14 +8932,33 @@ export async function runAgentLoop(opts: {
         );
       } catch (err) {
         if (!(err instanceof TripWire)) throw err;
+        emitTripwire(err);
+        reportOutcome({
+          state: "failed",
+          code: "guardrail",
+          retryable: false,
+          message: err.message,
+        });
+        return usage;
       }
     }
-    send({ type: "done" });
-    // Clean up any zombie-completion ledger entries for this thread now that
-    // the turn completed normally. If the run was aborted the ledger must stay
-    // intact so the next continuation chunk can still recover from it.
+    if (followUpRunId && completedFollowUpSuggestions !== undefined)
+      send({ type: "suggestions", suggestions: completedFollowUpSuggestions });
+    send({
+      type: "done",
+      ...(loopBreakerStopped
+        ? {
+            reason: "loop_breaker",
+            ...(loopBreakerCloseout
+              ? { message: loopBreakerCloseout.message }
+              : {}),
+          }
+        : {}),
+    });
     if (opts.threadId) {
-      void clearLedgerForThread(opts.threadId).catch(() => {});
+      void retainRequestDbPoolScope(
+        clearLedgerForThread(opts.threadId).catch(() => {}),
+      );
 
       // Observational Memory (producer): after a clean turn, run a best-effort
       // compaction pass so long threads accrue observations/reflections that the
@@ -3484,7 +8968,7 @@ export async function runAgentLoop(opts: {
       // the user-visible turn.
       if (opts.ownerEmail) {
         const compactThreadId = opts.threadId;
-        void maybeCompactThread({
+        const compaction = maybeCompactThread({
           threadId: compactThreadId,
           ownerEmail: opts.ownerEmail,
           orgId: opts.orgId ?? null,
@@ -3495,8 +8979,51 @@ export async function runAgentLoop(opts: {
             err instanceof Error ? err.message : String(err),
           );
         });
+        const waitUntil = getRequestRunContext()?.waitUntil;
+        if (waitUntil) waitUntil(compaction);
+        else void retainRequestDbPoolScope(compaction);
       }
     }
+  }
+
+  const finalTerminalActionStop =
+    terminalActionStop as TerminalActionStop | null;
+  if (signal.aborted) {
+    reportOutcome({ state: "canceled", message: "Agent run was aborted." });
+  } else if (endedAtLoopLimit) {
+    reportOutcome({
+      state: "failed",
+      code: "loop_limit",
+      retryable: false,
+      message: `Agent stopped after ${maxIterations} iterations.`,
+    });
+  } else if (finalTerminalActionStop?.errorCode === "needs-approval") {
+    reportOutcome({
+      state: "input_required",
+      code: "needs_approval",
+      message: finalTerminalActionStop.message,
+    });
+  } else if (finalTerminalActionStop?.errorCode === "awaiting-user-input") {
+    reportOutcome({
+      state: "input_required",
+      code: "awaiting_user_input",
+      message: finalTerminalActionStop.message,
+    });
+  } else if (finalTerminalActionStop?.errorCode === "connection-required") {
+    reportOutcome({
+      state: "input_required",
+      code: "connection_required",
+      message: finalTerminalActionStop.message,
+    });
+  } else if (finalTerminalActionStop) {
+    reportOutcome({
+      state: "failed",
+      code: finalTerminalActionStop.errorCode ?? "tool_failed",
+      retryable: false,
+      message: finalTerminalActionStop.message,
+    });
+  } else {
+    reportOutcome({ state: "completed" });
   }
   return usage;
 }
@@ -3510,26 +9037,48 @@ function backgroundChatProgressRunId(turnId: string): string {
   return `agent-chat-${normalized || "turn"}`;
 }
 
-function isRecoverableContinuationError(event: {
+/** @internal exported for unit tests only */
+export function isRecoverableContinuationError(event: {
   type: "error";
   error: string;
   errorCode?: string;
   recoverable?: boolean;
+  providerRetryable?: boolean;
 }): boolean {
   const code = String(event.errorCode ?? "").toLowerCase();
   const message = event.error.toLowerCase();
-  if (code === "builder_gateway_error") return false;
+  if (
+    event.providerRetryable === false ||
+    event.recoverable === false ||
+    code === "builder_gateway_error" ||
+    code === "invalid_request" ||
+    code === "invalid_request_error"
+  ) {
+    return false;
+  }
   return (
     event.recoverable === true ||
     code === "builder_gateway_timeout" ||
+    code === "builder_gateway_network_error" ||
+    code === "builder_gateway_stream_ended" ||
+    code === "provider_network_error" ||
     code === "stale_run" ||
     code === "timeout" ||
     code === "timeout_error" ||
     code === "http_408" ||
     code === "http_429" ||
+    code === "rate_limited" ||
+    code === PROVIDER_TRANSIENT_REJECTION_ERROR_CODE ||
+    code === "http_500" ||
+    code === BUILDER_GATEWAY_INTERNAL_ERROR_CODE ||
+    code === "http_502" ||
+    code === "http_503" ||
+    code === "http_504" ||
     code === "http_529" ||
     code === "run_timeout" ||
+    (code === "overloaded_error" && event.providerRetryable === true) ||
     message.includes("timeout") ||
+    isProviderConnectionErrorMessage(message) ||
     message.includes("temporarily unavailable")
   );
 }
@@ -3541,6 +9090,1485 @@ function endsAtInternalContinuationBoundary(run: ActiveRun): boolean {
     return true;
   }
   return last.type === "error" && isRecoverableContinuationError(last);
+}
+
+function isPreparingActionActivityEvent(
+  event: AgentChatEvent,
+): event is Extract<AgentChatEvent, { type: "activity" }> {
+  if (event.type !== "activity") return false;
+  const label = event.label.trim().toLowerCase();
+  return label.startsWith("preparing ") && label.includes(" action");
+}
+
+export function lastUnfinishedPreparingActionToolFromEvents(
+  events: readonly AgentChatEvent[],
+): string | undefined {
+  const active = new Map<
+    string,
+    {
+      id?: string;
+      order: number;
+      tool: string;
+    }
+  >();
+  const idlessToolStarts = new Map<string, number>();
+  const removeOldestMatchingActivePreparation = (
+    tool: string,
+    shouldRemove: (value: {
+      id?: string;
+      order: number;
+      tool: string;
+    }) => boolean = () => true,
+  ) => {
+    let oldest:
+      | {
+          key: string;
+          order: number;
+        }
+      | undefined;
+    for (const [key, value] of active) {
+      if (value.tool !== tool || !shouldRemove(value)) continue;
+      if (!oldest || value.order < oldest.order) {
+        oldest = {
+          key,
+          order: value.order,
+        };
+      }
+    }
+    if (oldest) active.delete(oldest.key);
+    return Boolean(oldest);
+  };
+  const removeMatchingActivePreparation = (event: {
+    id?: string;
+    tool?: string;
+    type: "tool_done" | "tool_start";
+  }) => {
+    const id = event.id?.trim();
+    const tool = event.tool?.trim();
+    if (!tool) return;
+    if (id) {
+      if (!active.delete(`id:${id}`)) {
+        removeOldestMatchingActivePreparation(tool, (value) => !value.id);
+      }
+      return;
+    }
+
+    if (event.type === "tool_start") {
+      if (removeOldestMatchingActivePreparation(tool)) {
+        idlessToolStarts.set(tool, (idlessToolStarts.get(tool) ?? 0) + 1);
+      }
+      return;
+    }
+
+    const startedCount = idlessToolStarts.get(tool) ?? 0;
+    if (startedCount > 0) {
+      if (startedCount === 1) {
+        idlessToolStarts.delete(tool);
+      } else {
+        idlessToolStarts.set(tool, startedCount - 1);
+      }
+      return;
+    }
+    removeOldestMatchingActivePreparation(tool);
+  };
+  events.forEach((event, order) => {
+    if (isPreparingActionActivityEvent(event)) {
+      const tool = event.tool?.trim();
+      if (tool) {
+        const id = event.id?.trim();
+        const key = id ? `id:${id}` : `tool:${tool}:${order}`;
+        active.set(key, {
+          tool,
+          order,
+          ...(id ? { id } : {}),
+        });
+      }
+      return;
+    }
+    if (event.type === "tool_start" || event.type === "tool_done") {
+      removeMatchingActivePreparation(event);
+      return;
+    }
+    if (event.type === "error" && isRecoverableContinuationError(event)) {
+      return;
+    }
+    if (
+      event.type === "clear" ||
+      event.type === "done" ||
+      event.type === "error" ||
+      event.type === "missing_api_key"
+    ) {
+      active.clear();
+      idlessToolStarts.clear();
+    }
+  });
+  let latest:
+    | {
+        order: number;
+        tool: string;
+      }
+    | undefined;
+  for (const value of active.values()) {
+    if (!latest || value.order > latest.order) {
+      latest = value;
+    }
+  }
+  return latest?.tool;
+}
+
+function lastUnfinishedPreparingActionTool(run: ActiveRun): string | undefined {
+  return lastUnfinishedPreparingActionToolFromEvents(
+    run.events.map(({ event }) => event),
+  );
+}
+
+export function backgroundContinuationReasonForRun(
+  run: ActiveRun,
+): AgentLoopContinuationReason {
+  const last = run.events.at(-1)?.event;
+  if (last?.type === "loop_limit") return "loop_limit";
+  if (
+    last?.type === "auto_continue" &&
+    isAgentLoopContinuationReason(last.reason)
+  ) {
+    return last.reason;
+  }
+  if (last?.type === "error" && isRecoverableContinuationError(last)) {
+    return continuationReasonForResumableError(
+      new EngineError(last.error, {
+        errorCode: last.errorCode,
+        providerRetryable: last.providerRetryable,
+      }),
+    );
+  }
+  if (
+    endsAfterToolResultWithoutAssistantFinal(run) ||
+    endsDuringActionPreparation(run)
+  ) {
+    return "stream_ended";
+  }
+  return "run_timeout";
+}
+
+export async function runAgentLoopWithMainChatInternalContinuations(
+  opts: Parameters<typeof runAgentLoop>[0] & {
+    resumeResumableErrorsInProcess?: boolean;
+    maxContinuations?: number;
+  },
+): Promise<Awaited<ReturnType<typeof runAgentLoop>>> {
+  const finalResponseGuardRequestText =
+    opts.finalResponseGuardRequestText ??
+    resolveFinalResponseGuardRequestText(opts.messages);
+  const usage: Awaited<ReturnType<typeof runAgentLoop>> = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    engineName: opts.engine.name,
+    model: opts.model,
+  };
+  const addUsage = (next: Awaited<ReturnType<typeof runAgentLoop>>) =>
+    mergeAgentLoopUsage(usage, next);
+
+  const budgetStartedAt = opts.budgetStartedAt ?? Date.now();
+  const resumeResumableErrorsInProcess =
+    opts.resumeResumableErrorsInProcess === true;
+  const maxContinuations =
+    typeof opts.maxContinuations === "number" && opts.maxContinuations > 0
+      ? opts.maxContinuations
+      : MAIN_CHAT_INTERNAL_CONTINUATION_LIMIT;
+
+  const localTurnEvents: AgentChatEvent[] = [];
+  let lastAttemptWasUnfinishedContinuation = false;
+  for (
+    let attempt = 0;
+    !opts.signal.aborted && attempt < maxContinuations;
+    attempt++
+  ) {
+    lastAttemptWasUnfinishedContinuation = false;
+    let continuationReason: AgentLoopContinuationReason | undefined;
+    const attemptStartIndex = localTurnEvents.length;
+    const send = (event: AgentChatEvent) => {
+      localTurnEvents.push(event);
+      if (
+        event.type === "auto_continue" &&
+        isAgentLoopContinuationReason(event.reason)
+      ) {
+        continuationReason = event.reason;
+        return;
+      }
+      opts.send(event);
+    };
+
+    try {
+      const nextUsage = await runAgentLoop({
+        ...opts,
+        budgetStartedAt,
+        send,
+        finalResponseGuardRequestText,
+      });
+      addUsage(nextUsage);
+    } catch (err) {
+      if (opts.signal.aborted || !isResumableEngineError(err)) throw err;
+      if (
+        !resumeResumableErrorsInProcess &&
+        remainingRunBudgetMs(budgetStartedAt) <
+          SELF_CHAIN_MIN_CONTINUATION_BUDGET_MS
+      ) {
+        throw err;
+      }
+      continuationReason = continuationReasonForResumableError(err);
+    }
+
+    if (!continuationReason || opts.signal.aborted) {
+      return usage;
+    }
+
+    lastAttemptWasUnfinishedContinuation = true;
+    const attemptEvents = localTurnEvents.slice(attemptStartIndex);
+    const completedSideEffect = attemptEvents.some(
+      (event) =>
+        event.type === "tool_done" &&
+        event.completedSideEffect === true &&
+        event.isError !== true,
+    );
+    if (!completedSideEffect) {
+      opts.send({ type: "clear" });
+    }
+    const actionPreparationTool =
+      lastUnfinishedPreparingActionToolFromEvents(localTurnEvents);
+    appendAgentLoopContinuation(opts.messages, continuationReason, {
+      ...(actionPreparationTool ? { actionPreparationTool } : {}),
+    });
+  }
+
+  if (!opts.signal.aborted && lastAttemptWasUnfinishedContinuation) {
+    opts.send({
+      type: "error",
+      error: RUN_BUDGET_EXHAUSTED_MESSAGE,
+      errorCode: RUN_BUDGET_EXHAUSTED_ERROR_CODE,
+      recoverable: false,
+    });
+  }
+  return usage;
+}
+
+/** True when the run stopped where its turn carries on in a continuation run. */
+export function endsAtContinuationBoundary(run: ActiveRun): boolean {
+  return (
+    endsAtInternalContinuationBoundary(run) ||
+    endsAfterToolResultWithoutAssistantFinal(run) ||
+    endsDuringActionPreparation(run)
+  );
+}
+
+function chunkMadeForwardProgress(run: ActiveRun): boolean {
+  return run.events.some(
+    ({ event }) =>
+      (event.type === "text" && event.text.trim().length > 0) ||
+      event.type === "tool_start" ||
+      event.type === "tool_done",
+  );
+}
+
+export interface BackgroundNoProgressRepeat {
+  errorCode?: string;
+  count: number;
+  tripped: boolean;
+}
+
+export function resolveBackgroundNoProgressRepeat(opts: {
+  run: ActiveRun;
+  priorErrorCode?: string;
+  priorCount?: number;
+}): BackgroundNoProgressRepeat {
+  const last = opts.run.events.at(-1)?.event;
+  const errorCode = last?.type === "error" ? (last.errorCode ?? "").trim() : "";
+  if (!errorCode || chunkMadeForwardProgress(opts.run)) {
+    return { count: 0, tripped: false };
+  }
+  const prior =
+    opts.priorErrorCode === errorCode &&
+    typeof opts.priorCount === "number" &&
+    Number.isFinite(opts.priorCount)
+      ? Math.max(0, Math.floor(opts.priorCount))
+      : 0;
+  const count = prior + 1;
+  return {
+    errorCode,
+    count,
+    tripped: count >= MAX_CONSECUTIVE_NO_PROGRESS_CONTINUATIONS,
+  };
+}
+
+export function backgroundNoProgressTerminalEvent(
+  run: ActiveRun,
+  repeat: BackgroundNoProgressRepeat,
+): Extract<AgentChatEvent, { type: "error" }> | null {
+  const last = run.events.at(-1)?.event;
+  if (last?.type !== "error") return null;
+  return {
+    ...last,
+    error:
+      `${last.error}\n\nThis failed ${repeat.count} times in a row without ` +
+      `making any progress, so I stopped instead of retrying again.`,
+    recoverable: false,
+  };
+}
+
+export function installBackgroundNoProgressTerminalEvent(
+  run: ActiveRun,
+  repeat: BackgroundNoProgressRepeat,
+): boolean {
+  const terminalEvent = backgroundNoProgressTerminalEvent(run, repeat);
+  const lastRunEvent = run.events.at(-1);
+  if (!terminalEvent || lastRunEvent?.event.type !== "error") return false;
+  run.events = [
+    ...run.events.slice(0, -1),
+    { ...lastRunEvent, event: terminalEvent },
+  ];
+  run.continuationTerminalEvent = terminalEvent;
+  return true;
+}
+
+export function rateLimitChainCapTripped(opts: {
+  run: ActiveRun;
+  priorContinuationReason?: string;
+}): boolean {
+  return (
+    opts.priorContinuationReason === "rate_limited" &&
+    backgroundContinuationReasonForRun(opts.run) === "rate_limited"
+  );
+}
+
+export const PROVIDER_RATE_LIMITED_TERMINAL_MESSAGE =
+  "The AI provider is rate limiting requests right now. Wait a minute and try again.";
+
+export function rateLimitChainCapTerminalEvent(
+  run: ActiveRun,
+): Extract<AgentChatEvent, { type: "error" }> | null {
+  const last = run.events.at(-1)?.event;
+  if (last?.type !== "error") return null;
+  return {
+    ...last,
+    error: PROVIDER_RATE_LIMITED_TERMINAL_MESSAGE,
+    errorCode: PROVIDER_RATE_LIMITED_ERROR_CODE,
+    recoverable: false,
+  };
+}
+
+export function installRateLimitChainCapTerminalEvent(run: ActiveRun): boolean {
+  const terminalEvent = rateLimitChainCapTerminalEvent(run);
+  const lastRunEvent = run.events.at(-1);
+  if (!terminalEvent || lastRunEvent?.event.type !== "error") return false;
+  run.events = [
+    ...run.events.slice(0, -1),
+    { ...lastRunEvent, event: terminalEvent },
+  ];
+  run.continuationTerminalEvent = terminalEvent;
+  return true;
+}
+
+export function shouldChainBackgroundContinuation(opts: {
+  isBackgroundWorker: boolean;
+  run: ActiveRun;
+  continuationCount: number;
+  foregroundSelfChainEligible?: boolean;
+  dispatchedToBackground?: boolean;
+  priorNoProgressErrorCode?: string;
+  priorNoProgressCount?: number;
+  priorContinuationReason?: string;
+}): boolean {
+  const eligible =
+    opts.isBackgroundWorker ||
+    (opts.foregroundSelfChainEligible === true &&
+      opts.dispatchedToBackground !== true);
+  return (
+    eligible &&
+    opts.run.status !== "aborted" &&
+    endsAtContinuationBoundary(opts.run) &&
+    opts.continuationCount < MAX_BACKGROUND_RUN_CONTINUATIONS &&
+    !resolveBackgroundNoProgressRepeat({
+      run: opts.run,
+      priorErrorCode: opts.priorNoProgressErrorCode,
+      priorCount: opts.priorNoProgressCount,
+    }).tripped &&
+    !rateLimitChainCapTripped({
+      run: opts.run,
+      priorContinuationReason: opts.priorContinuationReason,
+    })
+  );
+}
+
+export const SELF_CHAIN_MIN_CONTINUATION_BUDGET_MS = 8_000;
+
+export interface SelfChainContinuationBudget {
+  skipToBoundary: boolean;
+  softTimeoutMs: number;
+}
+
+export function resolveSelfChainContinuationBudget(
+  elapsedSinceHandlerEntryMs: number,
+  chunkCeilingMs: number,
+  minContinuationBudgetMs: number = SELF_CHAIN_MIN_CONTINUATION_BUDGET_MS,
+): SelfChainContinuationBudget {
+  const remaining = chunkCeilingMs - Math.max(0, elapsedSinceHandlerEntryMs);
+  if (remaining < minContinuationBudgetMs) {
+    return { skipToBoundary: true, softTimeoutMs: 0 };
+  }
+  return { skipToBoundary: false, softTimeoutMs: remaining };
+}
+
+export function resolvePresendWithCap<T>(opts: {
+  enabled: boolean;
+  thunk: () => Promise<T>;
+  fallback: T;
+  timeoutMs: number;
+  onTimeout?: () => void;
+}): Promise<T> {
+  if (!opts.enabled) return opts.thunk();
+  return new Promise<T>((resolve) => {
+    const timer = setTimeout(() => {
+      opts.onTimeout?.();
+      resolve(opts.fallback);
+    }, opts.timeoutMs);
+    void Promise.resolve()
+      .then(opts.thunk)
+      .then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        () => {
+          clearTimeout(timer);
+          resolve(opts.fallback);
+        },
+      );
+  });
+}
+
+export async function markBackgroundContinuationChunkTerminal(opts: {
+  runId: string;
+  continuationReason: AgentLoopContinuationReason;
+  terminalEvent?: AgentChatEvent;
+  deps?: {
+    updateRunStatusIfRunning?: typeof updateRunStatusIfRunning;
+    setRunError?: typeof setRunError;
+    setRunTerminalReason?: typeof setRunTerminalReason;
+  };
+}): Promise<boolean> {
+  const updateStatus =
+    opts.deps?.updateRunStatusIfRunning ?? updateRunStatusIfRunning;
+  const persistError = opts.deps?.setRunError ?? setRunError;
+  const setTerminalReason =
+    opts.deps?.setRunTerminalReason ?? setRunTerminalReason;
+  const terminalEvent = opts.terminalEvent;
+  const isTerminalFailure =
+    terminalEvent?.type === "error" ||
+    terminalEvent?.type === "missing_api_key";
+  const terminalReason =
+    terminalEvent?.type === "error"
+      ? `error:${terminalEvent.errorCode || "unknown"}`
+      : terminalEvent?.type === "missing_api_key"
+        ? "missing_api_key"
+        : opts.continuationReason;
+  const updated = await updateStatus(
+    opts.runId,
+    isTerminalFailure ? "errored" : "completed",
+  );
+  if (updated) {
+    await setTerminalReason(opts.runId, terminalReason);
+    if (terminalEvent?.type === "error") {
+      await persistError(
+        opts.runId,
+        terminalEvent.errorCode,
+        terminalEvent.details || terminalEvent.error,
+      );
+    } else if (terminalEvent?.type === "missing_api_key") {
+      await persistError(
+        opts.runId,
+        LLM_MISSING_CREDENTIALS_ERROR_CODE,
+        LLM_MISSING_CREDENTIALS_MESSAGE,
+      );
+    }
+  }
+  return updated;
+}
+
+export async function claimBackgroundWorkerRunEarly(opts: {
+  runId: string;
+  threadId?: string | null;
+  markerTurnId?: string | null;
+  requestTurnId?: string | null;
+  continuationCount: number;
+  runsInBackgroundFunction: boolean;
+  backgroundRuntimeDetail?: string;
+  deps?: {
+    recordRunDiagnostic?: typeof recordRunDiagnostic;
+    insertRun?: typeof insertRun;
+    claimBackgroundRun?: typeof claimBackgroundRun;
+    updateRunHeartbeat?: typeof updateRunHeartbeat;
+    isTurnAborted?: typeof isTurnAborted;
+    markRunAborted?: typeof markRunAborted;
+  };
+}): Promise<{ claimed: true } | { claimed: false; skipped: string }> {
+  const record = opts.deps?.recordRunDiagnostic ?? recordRunDiagnostic;
+  const insert = opts.deps?.insertRun ?? insertRun;
+  const claim = opts.deps?.claimBackgroundRun ?? claimBackgroundRun;
+  const heartbeat = opts.deps?.updateRunHeartbeat ?? updateRunHeartbeat;
+  const turnAborted = opts.deps?.isTurnAborted ?? isTurnAborted;
+  const abortRun = opts.deps?.markRunAborted ?? markRunAborted;
+  const threadId =
+    typeof opts.threadId === "string" && opts.threadId.trim()
+      ? opts.threadId.trim()
+      : opts.runId;
+  const turnId =
+    typeof opts.markerTurnId === "string" && opts.markerTurnId.trim()
+      ? opts.markerTurnId.trim()
+      : typeof opts.requestTurnId === "string" && opts.requestTurnId.trim()
+        ? opts.requestTurnId.trim()
+        : opts.runId;
+
+  let preclaimHeartbeatInFlight = false;
+  let preclaimHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  const preclaimHeartbeatStartedAt = Date.now();
+  const heartbeatWhileUnclaimed = () => {
+    if (
+      Date.now() - preclaimHeartbeatStartedAt >=
+      BACKGROUND_PRECLAIM_HEARTBEAT_MAX_MS
+    ) {
+      stopPreclaimHeartbeat();
+      return;
+    }
+    if (preclaimHeartbeatInFlight) return;
+    preclaimHeartbeatInFlight = true;
+    void heartbeat(opts.runId)
+      .catch(() => {})
+      .finally(() => {
+        preclaimHeartbeatInFlight = false;
+      });
+  };
+  const stopPreclaimHeartbeat = () => {
+    if (preclaimHeartbeatTimer !== undefined) {
+      clearInterval(preclaimHeartbeatTimer);
+      preclaimHeartbeatTimer = undefined;
+    }
+  };
+
+  preclaimHeartbeatTimer = setInterval(
+    heartbeatWhileUnclaimed,
+    BACKGROUND_PRECLAIM_HEARTBEAT_MS,
+  );
+  heartbeatWhileUnclaimed();
+  try {
+    await record(
+      opts.runId,
+      RUN_DIAG_STAGE.workerEntered,
+      [
+        `runsInBackgroundFunction=${opts.runsInBackgroundFunction}`,
+        `continuationCount=${opts.continuationCount}`,
+        opts.backgroundRuntimeDetail,
+      ]
+        .filter(Boolean)
+        .join(" "),
+    ).catch(() => {});
+
+    if (await turnAborted(threadId, turnId)) {
+      await abortRun(opts.runId, "user").catch(() => {});
+      return { claimed: false, skipped: "turn-aborted" };
+    }
+
+    if (opts.continuationCount > 0) {
+      await insert(opts.runId, threadId, turnId, {
+        dispatchMode: "background",
+      }).catch(() => {});
+    }
+
+    if (await turnAborted(threadId, turnId)) {
+      await abortRun(opts.runId, "user").catch(() => {});
+      return { claimed: false, skipped: "turn-aborted" };
+    }
+
+    const won = await claim(opts.runId);
+    stopPreclaimHeartbeat();
+    if (!won) {
+      await record(opts.runId, RUN_DIAG_STAGE.workerClaimLost).catch(() => {});
+      return { claimed: false, skipped: "already-claimed" };
+    }
+
+    await record(opts.runId, RUN_DIAG_STAGE.workerClaimed).catch(() => {});
+    await heartbeat(opts.runId).catch(() => {});
+    if (await turnAborted(threadId, turnId)) {
+      await abortRun(opts.runId, "user").catch(() => {});
+      return { claimed: false, skipped: "turn-aborted" };
+    }
+    return { claimed: true };
+  } finally {
+    stopPreclaimHeartbeat();
+  }
+}
+
+/**
+ * Request-body field carrying the turn's running input-token total across
+ * chunks. It rides the BODY (not the background-run marker) because the marker
+ * is stripped from `continuationBody` on every handoff while the body is the
+ * successor's persisted rehydration payload.
+ */
+export const AGENT_CHAT_TURN_INPUT_TOKENS_FIELD =
+  "__agentNativeTurnInputTokens";
+
+export const AGENT_CHAT_PRIOR_CONTINUATION_REASON_FIELD =
+  "__agentNativePriorContinuationReason";
+
+export const AGENT_CHAT_PRIOR_NO_PROGRESS_ERROR_CODE_FIELD =
+  "__agentNativePriorNoProgressErrorCode";
+export const AGENT_CHAT_PRIOR_NO_PROGRESS_COUNT_FIELD =
+  "__agentNativePriorNoProgressCount";
+
+export function resolvePriorContinuationState(
+  backgroundRunMarker: Record<string, unknown> | null | undefined,
+  body: Record<string, unknown>,
+): {
+  continuationReason: string | undefined;
+  noProgressErrorCode: string | undefined;
+  noProgressCount: number;
+} {
+  const continuationReason =
+    typeof backgroundRunMarker?.continuationReason === "string"
+      ? backgroundRunMarker.continuationReason
+      : typeof body[AGENT_CHAT_PRIOR_CONTINUATION_REASON_FIELD] === "string"
+        ? (body[AGENT_CHAT_PRIOR_CONTINUATION_REASON_FIELD] as string)
+        : undefined;
+  const noProgressErrorCode =
+    typeof backgroundRunMarker?.noProgressErrorCode === "string"
+      ? backgroundRunMarker.noProgressErrorCode
+      : typeof body[AGENT_CHAT_PRIOR_NO_PROGRESS_ERROR_CODE_FIELD] === "string"
+        ? (body[AGENT_CHAT_PRIOR_NO_PROGRESS_ERROR_CODE_FIELD] as string)
+        : undefined;
+  const noProgressCountSource =
+    typeof backgroundRunMarker?.noProgressCount === "number" &&
+    Number.isFinite(backgroundRunMarker.noProgressCount)
+      ? backgroundRunMarker.noProgressCount
+      : body[AGENT_CHAT_PRIOR_NO_PROGRESS_COUNT_FIELD];
+  const noProgressCount =
+    typeof noProgressCountSource === "number" &&
+    Number.isFinite(noProgressCountSource)
+      ? Math.max(0, Math.floor(noProgressCountSource))
+      : 0;
+  return { continuationReason, noProgressErrorCode, noProgressCount };
+}
+
+export function resolvePriorContinuationReason(
+  backgroundRunMarker: Record<string, unknown> | null | undefined,
+  body: Record<string, unknown>,
+): string | undefined {
+  return resolvePriorContinuationState(backgroundRunMarker, body)
+    .continuationReason;
+}
+
+async function readTurnStartedAt(
+  threadId: string,
+  turnId: string,
+): Promise<number | null> {
+  const { rows } = await getDbExec().execute({
+    sql: `SELECT MIN(started_at) AS turn_started_at FROM agent_runs WHERE thread_id = ? AND turn_id = ?`,
+    args: [threadId, turnId],
+  });
+  const raw = (rows?.[0] as { turn_started_at?: unknown } | undefined)
+    ?.turn_started_at;
+  const startedAt = Number(raw);
+  return Number.isFinite(startedAt) && startedAt > 0 ? startedAt : null;
+}
+
+interface AdmittedQueuedMessagePromotion {
+  id: string;
+  text: string;
+  attachments?: unknown[];
+  requestAttachments?: Record<string, unknown>[];
+  metadata?: Record<string, unknown>;
+  options?: Record<string, unknown>;
+}
+
+function queuedPromotionRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function validateQueuedPromotionRequestAttachments(
+  value: unknown,
+): Record<string, unknown>[] | null {
+  if (!Array.isArray(value) || value.length > MAX_AGENT_REQUEST_ATTACHMENTS) {
+    return null;
+  }
+
+  let totalDataChars = 0;
+  const attachments: Record<string, unknown>[] = [];
+  for (const entry of value) {
+    const attachment = queuedPromotionRecord(entry);
+    if (
+      !attachment ||
+      attachment.type !== "image" ||
+      typeof attachment.name !== "string"
+    ) {
+      return null;
+    }
+    for (const key of [
+      "contentType",
+      "data",
+      "url",
+      "referenceUrl",
+      "id",
+      "fileId",
+    ]) {
+      if (hasOwn(attachment, key) && typeof attachment[key] !== "string") {
+        return null;
+      }
+    }
+    const data = attachment.data;
+    const url = attachment.url;
+    if (typeof data === "string") {
+      const parsed = parseBase64DataUrl(data);
+      if (
+        data.length > 3_000_000 ||
+        !/^data:image\/(?:gif|jpeg|png|webp);base64,/i.test(data) ||
+        !parsed ||
+        !/^image\/(?:gif|jpeg|png|webp)$/i.test(parsed.mediaType)
+      ) {
+        return null;
+      }
+      totalDataChars += data.length;
+      if (totalDataChars > MAX_AGENT_REQUEST_ATTACHMENT_DATA_CHARS) {
+        return null;
+      }
+    }
+    if (
+      (typeof url === "string" && !hasDurableAttachmentUrl(url)) ||
+      (typeof attachment.referenceUrl === "string" &&
+        !hasDurableAttachmentUrl(attachment.referenceUrl)) ||
+      (typeof data !== "string" &&
+        !hasDurableAttachmentUrl(url) &&
+        !hasDurableAttachmentUrl(attachment.referenceUrl))
+    ) {
+      return null;
+    }
+    attachments.push(attachment);
+  }
+  return attachments;
+}
+
+async function readAdmittedQueuedMessagePromotion(opts: {
+  ownerEmail: string | null;
+  orgId: string | null;
+  threadId?: string;
+  messageId: unknown;
+  claimId: unknown;
+  message: string;
+  continuationRequested: boolean;
+}): Promise<AdmittedQueuedMessagePromotion | null> {
+  const messageId =
+    typeof opts.messageId === "string" ? opts.messageId.trim() : "";
+  const claimId = typeof opts.claimId === "string" ? opts.claimId.trim() : "";
+  if (
+    !opts.ownerEmail ||
+    !opts.threadId ||
+    !messageId ||
+    !claimId ||
+    opts.continuationRequested
+  ) {
+    return null;
+  }
+
+  const { resolveThreadAccess } = await import("../chat-threads/store.js");
+  const thread = await resolveThreadAccess(
+    opts.ownerEmail,
+    opts.threadId,
+    "editor",
+    { orgId: opts.orgId ?? undefined },
+  );
+  if (!thread) return null;
+
+  let repository: unknown;
+  try {
+    repository = JSON.parse(thread.threadData || "{}");
+  } catch {
+    // coercion-ok: malformed persisted queue data cannot authorize a continuation.
+    return null;
+  }
+  if (!hasOwn(repository, "queuedMessages")) return null;
+  const queuedMessages = repository.queuedMessages;
+  if (!Array.isArray(queuedMessages)) return null;
+  const queuedMessage = queuedMessages.find(
+    (candidate) => hasOwn(candidate, "id") && candidate.id === messageId,
+  );
+  if (!queuedMessage || !hasOwn(queuedMessage, "promotionClaim")) {
+    return null;
+  }
+
+  const promotionClaim = queuedMessage.promotionClaim;
+  if (
+    !(
+      hasOwn(queuedMessage, "text") &&
+      queuedMessage.text === opts.message &&
+      hasOwn(promotionClaim, "id") &&
+      promotionClaim.id === claimId &&
+      hasOwn(promotionClaim, "expiresAt") &&
+      typeof promotionClaim.expiresAt === "number" &&
+      Number.isFinite(promotionClaim.expiresAt) &&
+      promotionClaim.expiresAt > Date.now()
+    )
+  ) {
+    return null;
+  }
+
+  if (typeof queuedMessage.text !== "string") return null;
+  const attachments = hasOwn(queuedMessage, "attachments")
+    ? queuedMessage.attachments
+    : undefined;
+  const requestAttachments = hasOwn(queuedMessage, "requestAttachments")
+    ? validateQueuedPromotionRequestAttachments(
+        queuedMessage.requestAttachments,
+      )
+    : undefined;
+  const metadata = hasOwn(queuedMessage, "metadata")
+    ? queuedMessage.metadata
+    : undefined;
+  const options = hasOwn(queuedMessage, "options")
+    ? queuedMessage.options
+    : undefined;
+  if (
+    (attachments !== undefined && !Array.isArray(attachments)) ||
+    (Array.isArray(attachments) &&
+      attachments.some((attachment) => {
+        const file = queuedPromotionRecord(attachment);
+        return !file || file.type !== "file" || typeof file.name !== "string";
+      })) ||
+    (hasOwn(queuedMessage, "requestAttachments") &&
+      requestAttachments === null) ||
+    (metadata !== undefined &&
+      (!metadata || typeof metadata !== "object" || Array.isArray(metadata))) ||
+    (options !== undefined &&
+      (!options || typeof options !== "object" || Array.isArray(options)))
+  ) {
+    return null;
+  }
+
+  return {
+    id: messageId,
+    text: queuedMessage.text,
+    ...(Array.isArray(attachments) ? { attachments } : {}),
+    ...(requestAttachments ? { requestAttachments } : {}),
+    ...(metadata ? { metadata: metadata as Record<string, unknown> } : {}),
+    ...(options ? { options: options as Record<string, unknown> } : {}),
+  };
+}
+
+/** @internal exported for unit tests only */
+export function queuedPromotionAttachments(
+  attachments: unknown[],
+  requestAttachments: Record<string, unknown>[] = [],
+): AgentChatAttachment[] {
+  const promoted = attachments.map((value) => {
+    const file = queuedPromotionRecord(value)!;
+    const data =
+      typeof file.data === "string" && parseBase64DataUrl(file.data)
+        ? file.data
+        : undefined;
+    const mediaType =
+      (typeof file.mediaType === "string" && file.mediaType) ||
+      (typeof file.contentType === "string" && file.contentType) ||
+      (data ? parseBase64DataUrl(data)?.mediaType : undefined);
+    // A saved queue entry is always a file part; the media type decides whether
+    // the model sees pixels (image) or a file reference.
+    const isImage =
+      typeof mediaType === "string" &&
+      mediaType.split(";", 1)[0]!.trim().toLowerCase().startsWith("image/");
+    return {
+      type: isImage ? "image" : "file",
+      name: file.name,
+      ...(typeof file.fileId === "string" ? { id: file.fileId } : {}),
+      ...(mediaType ? { mediaType, contentType: mediaType } : {}),
+      ...(data ? { data } : {}),
+      ...(typeof file.url === "string" ? { url: file.url } : {}),
+    } as AgentChatAttachment;
+  });
+
+  for (const requestAttachment of requestAttachments) {
+    const name = requestAttachment.name as string;
+    const data = requestAttachment.data as string | undefined;
+    const url = requestAttachment.url as string | undefined;
+    const referenceUrl = requestAttachment.referenceUrl as string | undefined;
+    const fileId =
+      (typeof requestAttachment.fileId === "string" &&
+        requestAttachment.fileId) ||
+      (typeof requestAttachment.id === "string" && requestAttachment.id) ||
+      undefined;
+    const imageUrl = url || referenceUrl;
+    const originalIndex = referenceUrl
+      ? promoted.findIndex((attachment) => attachment.url === referenceUrl)
+      : -1;
+    const urlMatchIndex = promoted.findIndex(
+      (attachment) =>
+        attachment.type === "file" &&
+        imageUrl !== undefined &&
+        attachment.url === imageUrl,
+    );
+    const fileIdMatchIndex = fileId
+      ? promoted.findIndex(
+          (attachment) =>
+            attachment.type === "file" &&
+            (attachment as AgentChatAttachment & { id?: string }).id === fileId,
+        )
+      : -1;
+    const matchingIndex = urlMatchIndex >= 0 ? urlMatchIndex : fileIdMatchIndex;
+    const keepsOriginalReference =
+      referenceUrl !== undefined &&
+      imageUrl !== undefined &&
+      referenceUrl !== imageUrl;
+    const fileIdReferenceIndex =
+      keepsOriginalReference &&
+      fileIdMatchIndex >= 0 &&
+      promoted[fileIdMatchIndex]?.url !== imageUrl
+        ? fileIdMatchIndex
+        : -1;
+    const referenceIndex =
+      originalIndex >= 0 ? originalIndex : fileIdReferenceIndex;
+
+    if (keepsOriginalReference) {
+      if (referenceIndex >= 0) {
+        const original = promoted[referenceIndex];
+        promoted[referenceIndex] = {
+          ...original,
+          type: "file",
+          name: original?.name || name,
+          url: originalIndex >= 0 ? referenceUrl : original?.url,
+          referenceOnly: true,
+        };
+      } else {
+        promoted.push({
+          type: "file",
+          name,
+          contentType: requestAttachment.contentType as string | undefined,
+          url: referenceUrl,
+          referenceOnly: true,
+        });
+      }
+    }
+
+    const image: AgentChatAttachment = {
+      type: "image",
+      name,
+      ...(typeof requestAttachment.contentType === "string"
+        ? { contentType: requestAttachment.contentType }
+        : {}),
+      ...(data ? { data } : {}),
+      ...(imageUrl ? { url: imageUrl } : {}),
+      ...(fileId ? { id: fileId } : {}),
+    } as AgentChatAttachment;
+    const replacementIndex =
+      matchingIndex >= 0 && matchingIndex !== referenceIndex
+        ? matchingIndex
+        : -1;
+    if (replacementIndex >= 0) {
+      const existing = promoted[replacementIndex];
+      promoted[replacementIndex] = {
+        ...image,
+        ...("id" in existing ? { id: existing.id } : {}),
+      } as AgentChatAttachment;
+      continue;
+    }
+
+    const duplicateIndex = promoted.findIndex(
+      (attachment) =>
+        attachment.type === "image" &&
+        ((imageUrl !== undefined && attachment.url === imageUrl) ||
+          (fileId !== undefined &&
+            (attachment as AgentChatAttachment & { id?: string }).id ===
+              fileId) ||
+          (data !== undefined && attachment.data === data)),
+    );
+    if (duplicateIndex >= 0) {
+      const existing = promoted[duplicateIndex];
+      promoted[duplicateIndex] = {
+        ...existing,
+        ...image,
+        ...(existing && "id" in existing ? { id: existing.id } : {}),
+      } as AgentChatAttachment;
+    } else {
+      promoted.push(image);
+    }
+  }
+
+  return promoted;
+}
+
+async function emitRunText(run: ActiveRun, text: string): Promise<void> {
+  const runEvent: RunEvent = {
+    seq: run.events.length,
+    event: { type: "text", text },
+  };
+  run.events.push(runEvent);
+  for (const subscriber of run.subscribers) {
+    try {
+      subscriber(runEvent);
+    } catch {}
+  }
+  await insertRunEvent(
+    run.runId,
+    runEvent.seq,
+    JSON.stringify(runEvent.event),
+  ).catch(() => {});
+}
+
+async function describeTurnProgress(
+  threadId: string,
+  turnId?: string,
+): Promise<string> {
+  const journalRead = await loadPriorTurnToolCallJournal(threadId, turnId);
+  if (journalRead.status === "unreadable") {
+    return "I could not read the run ledger, so I cannot say which steps completed.";
+  }
+  const completed = journalRead.toolCallJournal?.completed ?? [];
+  if (completed.length === 0) return "No steps had completed yet.";
+  const names = [...new Set(completed.map((entry) => entry.tool))];
+  const shown = names.slice(0, 8).join(", ");
+  return (
+    `${completed.length} step(s) completed before I stopped (${shown}` +
+    `${names.length > 8 ? ", …" : ""}). Their results are in the messages above.`
+  );
+}
+
+export interface ChainServerDrivenContinuationDeps {
+  countRunsForTurn?: typeof countRunsForTurn;
+  readTurnStartedAt?: typeof readTurnStartedAt;
+  isTurnAborted?: typeof isTurnAborted;
+  emitRunText?: typeof emitRunText;
+  insertRun?: typeof insertRun;
+  fireInternalDispatch?: typeof fireInternalDispatch;
+  readBackgroundRunClaim?: typeof readBackgroundRunClaim;
+  updateRunHeartbeat?: typeof updateRunHeartbeat;
+  updateRunStatusIfRunning?: typeof updateRunStatusIfRunning;
+  markRunAborted?: typeof markRunAborted;
+  setRunTerminalReason?: typeof setRunTerminalReason;
+  setRunError?: typeof setRunError;
+  recordRunDiagnostic?: typeof recordRunDiagnostic;
+  markBackgroundContinuationChunkTerminal?: typeof markBackgroundContinuationChunkTerminal;
+  generateRunId?: typeof generateRunId;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export interface ContinuationDispatchBudget {
+  maxDispatchAttempts: number;
+  dispatchResponseTimeoutMs: number;
+  backoffCapMs: number;
+}
+
+export function resolveContinuationDispatchBudget(opts: {
+  chainViaDurableBackground: boolean;
+  workerProvenInBackgroundFunction: boolean;
+}): ContinuationDispatchBudget {
+  if (opts.chainViaDurableBackground) {
+    return {
+      maxDispatchAttempts: 3,
+      dispatchResponseTimeoutMs: 15_000,
+      backoffCapMs: Infinity,
+    };
+  }
+  if (opts.workerProvenInBackgroundFunction) {
+    return {
+      maxDispatchAttempts: 5,
+      dispatchResponseTimeoutMs: 15_000,
+      backoffCapMs: 4_000,
+    };
+  }
+  return {
+    maxDispatchAttempts: 2,
+    dispatchResponseTimeoutMs: 10_000,
+    backoffCapMs: Infinity,
+  };
+}
+
+export function isLoopProtectionDispatchError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return /\bHTTP\s*508\b/i.test(err.message);
+}
+
+export const MAX_NESTED_SELF_DISPATCH_DEPTH = 6;
+
+export async function chainServerDrivenContinuation(opts: {
+  event: unknown;
+  run: ActiveRun;
+  effectiveThreadId: string;
+  effectiveTurnId: string;
+  requestBody: Record<string, unknown>;
+  backgroundContinuationCount: number;
+  noProgressRepeat?: BackgroundNoProgressRepeat;
+  turnInputTokens?: number;
+  chainViaDurableBackground: boolean;
+  turnInitiator?: AgentTurnInitiator;
+  workerProvenInBackgroundFunction?: boolean;
+  deps?: ChainServerDrivenContinuationDeps;
+}): Promise<void> {
+  const d = {
+    countRunsForTurn: opts.deps?.countRunsForTurn ?? countRunsForTurn,
+    readTurnStartedAt: opts.deps?.readTurnStartedAt ?? readTurnStartedAt,
+    isTurnAborted: opts.deps?.isTurnAborted ?? isTurnAborted,
+    emitRunText: opts.deps?.emitRunText ?? emitRunText,
+    insertRun: opts.deps?.insertRun ?? insertRun,
+    fireInternalDispatch:
+      opts.deps?.fireInternalDispatch ?? fireInternalDispatch,
+    readBackgroundRunClaim:
+      opts.deps?.readBackgroundRunClaim ?? readBackgroundRunClaim,
+    updateRunHeartbeat: opts.deps?.updateRunHeartbeat ?? updateRunHeartbeat,
+    updateRunStatusIfRunning:
+      opts.deps?.updateRunStatusIfRunning ?? updateRunStatusIfRunning,
+    markRunAborted: opts.deps?.markRunAborted ?? markRunAborted,
+    setRunTerminalReason:
+      opts.deps?.setRunTerminalReason ?? setRunTerminalReason,
+    setRunError: opts.deps?.setRunError ?? setRunError,
+    recordRunDiagnostic: opts.deps?.recordRunDiagnostic ?? recordRunDiagnostic,
+    markBackgroundContinuationChunkTerminal:
+      opts.deps?.markBackgroundContinuationChunkTerminal ??
+      markBackgroundContinuationChunkTerminal,
+    generateRunId: opts.deps?.generateRunId ?? generateRunId,
+    sleep:
+      opts.deps?.sleep ??
+      ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+  };
+  const { run, effectiveThreadId, effectiveTurnId } = opts;
+  const runId = run.runId;
+
+  const turnRunCount = await d
+    .countRunsForTurn(effectiveThreadId, effectiveTurnId)
+    .catch(() => null);
+  const stopTurn = async (
+    terminalReason: string,
+    logLine: string,
+    userMessage: string,
+  ) => {
+    console.error(`[agent-chat] ${logLine}`, runId);
+    const progress = await describeTurnProgress(
+      effectiveThreadId,
+      effectiveTurnId,
+    ).catch(() => "");
+    await d
+      .emitRunText(
+        run,
+        progress ? `${userMessage}\n\n${progress}` : userMessage,
+      )
+      .catch(() => {});
+    const statusUpdated = await d
+      .updateRunStatusIfRunning(runId, "errored")
+      .catch(() => false);
+    if (statusUpdated) {
+      await d.setRunTerminalReason(runId, terminalReason).catch(() => {});
+    }
+  };
+
+  if (turnRunCount === null) {
+    await stopTurn(
+      "turn_budget_unreadable",
+      `turn ${effectiveTurnId} run-count ledger unreadable — refusing to chain further`,
+      `I stopped because I could not verify this request's continuation budget.`,
+    );
+    return;
+  }
+  if (turnRunLedgerExhausted(turnRunCount)) {
+    await stopTurn(
+      "turn_continuation_budget_exhausted",
+      `turn ${effectiveTurnId} consumed ${turnRunCount} runs — refusing to chain further`,
+      `I stopped after ${turnRunCount} internal continuations without finishing this request.`,
+    );
+    return;
+  }
+
+  const turnStartedAt = await d
+    .readTurnStartedAt(effectiveThreadId, effectiveTurnId)
+    .catch(() => null);
+  const turnElapsedMs = turnStartedAt === null ? 0 : Date.now() - turnStartedAt;
+  if (turnElapsedMs > MAX_TURN_WALL_CLOCK_MS) {
+    const elapsedMinutes = Math.round(turnElapsedMs / 60_000);
+    await stopTurn(
+      "turn_wall_clock_budget_exhausted",
+      `turn ${effectiveTurnId} ran ${elapsedMinutes}min (limit ${Math.round(
+        MAX_TURN_WALL_CLOCK_MS / 60_000,
+      )}min) — refusing to chain further`,
+      `I stopped after ${elapsedMinutes} minutes without finishing this request.`,
+    );
+    return;
+  }
+
+  const nextRunId = d.generateRunId();
+  const actionPreparationTool = lastUnfinishedPreparingActionTool(run);
+  const continuationReason = backgroundContinuationReasonForRun(run);
+  const continuationDispatchPath = opts.chainViaDurableBackground
+    ? resolveAgentChatProcessRunDispatchPath()
+    : AGENT_CHAT_PROCESS_RUN_PATH;
+  const continuationExpectsNetlifyBackgroundFunction =
+    dispatchPathTargetsNetlifyBackgroundFunction(continuationDispatchPath);
+  const dispatchBudget = resolveContinuationDispatchBudget({
+    chainViaDurableBackground: opts.chainViaDurableBackground,
+    workerProvenInBackgroundFunction:
+      opts.workerProvenInBackgroundFunction === true,
+  });
+  const maxDispatchAttempts = dispatchBudget.maxDispatchAttempts;
+  const continuationMarker = {
+    runId: nextRunId,
+    turnId: effectiveTurnId,
+    continuationCount: opts.backgroundContinuationCount + 1,
+    continuationReason,
+    ...(actionPreparationTool ? { actionPreparationTool } : {}),
+    ...(opts.noProgressRepeat?.errorCode
+      ? {
+          noProgressErrorCode: opts.noProgressRepeat.errorCode,
+          noProgressCount: opts.noProgressRepeat.count,
+        }
+      : {}),
+    backgroundFunctionRuntimeExpected:
+      continuationExpectsNetlifyBackgroundFunction,
+  };
+  const continuationBody: Record<string, unknown> = {
+    ...opts.requestBody,
+    internalContinuation: true,
+    ...(typeof opts.turnInputTokens === "number"
+      ? { [AGENT_CHAT_TURN_INPUT_TOKENS_FIELD]: opts.turnInputTokens }
+      : {}),
+    [AGENT_CHAT_PRIOR_CONTINUATION_REASON_FIELD]: continuationReason,
+    ...(opts.noProgressRepeat?.errorCode
+      ? {
+          [AGENT_CHAT_PRIOR_NO_PROGRESS_ERROR_CODE_FIELD]:
+            opts.noProgressRepeat.errorCode,
+          [AGENT_CHAT_PRIOR_NO_PROGRESS_COUNT_FIELD]:
+            opts.noProgressRepeat.count,
+        }
+      : {}),
+  };
+  // Approval selectors apply only to the request that consumes their one-shot grants.
+  delete continuationBody.approvedToolCalls;
+  delete continuationBody.approvedToolCallAskIds;
+  delete continuationBody[AGENT_CHAT_BACKGROUND_RUN_FIELD];
+  try {
+    if (await d.isTurnAborted(effectiveThreadId, effectiveTurnId)) {
+      await d.markRunAborted(runId, "user").catch(() => {});
+      return;
+    }
+    await d
+      .recordRunDiagnostic(
+        runId,
+        RUN_DIAG_STAGE.workerSetupStep,
+        `chain_dispatch_start nextRunId=${nextRunId} reason=${continuationReason} path=${continuationDispatchPath}`,
+      )
+      .catch(() => {});
+    let nextRowInserted = false;
+    try {
+      await d.insertRun(nextRunId, effectiveThreadId, effectiveTurnId, {
+        dispatchMode: "background",
+        dispatchPayload: serializeDurableDispatchPayload(continuationBody),
+        ...(opts.turnInitiator ? { turnInitiator: opts.turnInitiator } : {}),
+      });
+      nextRowInserted = true;
+    } catch (insertErr) {
+      if (
+        insertErr instanceof AgentTurnInitiatorMismatchError ||
+        insertErr instanceof AgentTurnInitiatorUnavailableError ||
+        insertErr instanceof ServicePrincipalRefusedError ||
+        insertErr instanceof DurableAttachmentReferenceRequiredError
+      ) {
+        throw insertErr;
+      }
+      await d
+        .recordRunDiagnostic(
+          runId,
+          RUN_DIAG_STAGE.workerSetupStep,
+          `chain_successor_insert_failed nextRunId=${nextRunId} ${
+            insertErr instanceof Error ? insertErr.message : String(insertErr)
+          }`,
+        )
+        .catch(() => {});
+      console.error(
+        "[agent-chat] continuation insertRun failed; dispatching with inline body:",
+        insertErr instanceof Error ? insertErr.message : insertErr,
+      );
+    }
+    if (await d.isTurnAborted(effectiveThreadId, effectiveTurnId)) {
+      if (nextRowInserted)
+        await d.markRunAborted(nextRunId, "user").catch(() => {});
+      await d.markRunAborted(runId, "user").catch(() => {});
+      return;
+    }
+    const dispatchBody = nextRowInserted
+      ? {
+          internalContinuation: true,
+          [AGENT_CHAT_BACKGROUND_RUN_FIELD]: {
+            ...continuationMarker,
+            payloadRef: true,
+          },
+        }
+      : {
+          ...continuationBody,
+          [AGENT_CHAT_BACKGROUND_RUN_FIELD]: continuationMarker,
+        };
+    const { dispatched, lastDispatchErr, nestedDepthExceeded } =
+      await attemptContinuationDispatch({
+        event: opts.event,
+        chainViaDurableBackground: opts.chainViaDurableBackground,
+        backgroundContinuationCount: opts.backgroundContinuationCount,
+        nextRunId,
+        nextRowInserted,
+        continuationDispatchPath,
+        dispatchBody,
+        dispatchBudget,
+        isLoopProtectionDispatchError,
+        maxNestedSelfDispatchDepth: MAX_NESTED_SELF_DISPATCH_DEPTH,
+        deps: {
+          sleep: d.sleep,
+          updateRunHeartbeat: d.updateRunHeartbeat,
+          fireInternalDispatch: d.fireInternalDispatch,
+          readBackgroundRunClaim: d.readBackgroundRunClaim,
+        },
+      });
+    if (!dispatched) {
+      if (nextRowInserted) {
+        const deferralClassification = nestedDepthExceeded
+          ? "proactive_depth_cap"
+          : isLoopProtectionDispatchError(lastDispatchErr)
+            ? "netlify_loop_protection"
+            : "dispatch_budget_exhausted";
+        // RECOVERABLE: the successor row already exists in SQL with its
+        // rehydration payload (`dispatch_payload`) intact and is still
+        // `status='running', dispatch_mode='background'` — exactly the state
+        // the unclaimed-background-run sweep (`agent-chat-plugin.ts`) already
+        // scans for. Do NOT error it here: leave it alone so the sweep can
+        // redispatch it once `UNCLAIMED_BACKGROUND_RUN_GRACE_MS` has passed,
+        // bounded by `UNCLAIMED_BACKGROUND_RUN_REDISPATCH_BOUND_MS` before it
+        // falls back to the existing loud reap
+        // (`background_worker_never_started`) — so this is deferred, never a
+        // silent hang. This chunk still goes terminal (its own soft-timeout
+        // budget is genuinely spent), but with an honest reason: the TURN is
+        // not dead, only this handoff attempt was.
+        //
+        // THREE-SITE INVARIANT (keep in lockstep — a future reader must not
+        // "fix" one without the others): this deferral only survives because
+        // the ~1s client poll in `getActiveRunForThreadAsync`
+        // (run-manager.ts) ALSO skips `reapUnclaimedBackgroundRun` while the
+        // successor is within `UNCLAIMED_BACKGROUND_RUN_REDISPATCH_BOUND_MS`
+        // (via `shouldRedispatchUnclaimedBackgroundRun`). Without that guard a
+        // connected client would reap this row at the 25s grace, before the
+        // sweep(s) get a chance, defeating the deferral. That same client
+        // poll also surfaces `awaitingRedispatch: true` on `/runs/active`
+        // for exactly this state so the client's background follow loop
+        // (`agent-chat-adapter.ts`) does not count the quiet gap against its
+        // own `BACKGROUND_FOLLOW_IDLE_TIMEOUT_MS` and report a fatal error
+        // for a turn the server is silently recovering. agent-chat-plugin.ts
+        // runs the actual recovery actors: a FAST redispatch-only sweep
+        // (`UNCLAIMED_BACKGROUND_RUN_FAST_SWEEP_MS`, ~20s ticks) that puts the
+        // first redispatch attempt well inside the client's idle timeout, and
+        // the original SLOW sweep (2 min) that also falls back to the loud
+        // reap once `UNCLAIMED_BACKGROUND_RUN_REDISPATCH_BOUND_MS` is
+        // exceeded. run-manager.ts is the guard + wire-signal source; this is
+        // the producer.
+        await d
+          .recordRunDiagnostic(
+            nextRunId,
+            RUN_DIAG_STAGE.workerThrew,
+            `chain_dispatch_deferred[${deferralClassification}]: dispatch budget exhausted (${maxDispatchAttempts} attempts) awaiting unclaimed-run sweep redispatch; ${
+              lastDispatchErr instanceof Error
+                ? lastDispatchErr.message
+                : String(lastDispatchErr)
+            }`,
+          )
+          .catch(() => {});
+        await d
+          .recordRunDiagnostic(
+            runId,
+            RUN_DIAG_STAGE.workerThrew,
+            `chain_dispatch_deferred[${deferralClassification}] nextRunId=${nextRunId} ${
+              lastDispatchErr instanceof Error
+                ? lastDispatchErr.message
+                : String(lastDispatchErr)
+            }`,
+          )
+          .catch(() => {});
+        console.error(
+          `[agent-chat] background continuation dispatch deferred (${deferralClassification}); leaving the pre-inserted successor for the unclaimed-run sweep to redispatch:`,
+          lastDispatchErr instanceof Error
+            ? lastDispatchErr.message
+            : lastDispatchErr,
+        );
+        // The turn continues in the pre-inserted successor, so this chunk is
+        // truncated, never completed, and its stream ends with the same
+        // continuation signal a dispatched handoff sends.
+        const statusUpdated = await d
+          .updateRunStatusIfRunning(runId, "truncated")
+          .catch(() => false);
+        if (statusUpdated) {
+          await d
+            .setRunTerminalReason(
+              runId,
+              "background_continuation_dispatch_deferred",
+            )
+            .catch(() => {});
+        }
+        run.continuationTerminalEvent = {
+          type: "auto_continue",
+          reason: continuationReason,
+        };
+        return;
+      }
+      throw lastDispatchErr instanceof Error
+        ? lastDispatchErr
+        : new Error(String(lastDispatchErr));
+    }
+    await d
+      .recordRunDiagnostic(
+        runId,
+        RUN_DIAG_STAGE.workerSetupStep,
+        `chain_dispatch_sent nextRunId=${nextRunId} reason=${continuationReason}`,
+      )
+      .catch(() => {});
+    await d
+      .markBackgroundContinuationChunkTerminal({
+        runId,
+        continuationReason,
+        terminalEvent: run.events.at(-1)?.event,
+      })
+      .catch(() => {});
+    run.continuationTerminalEvent = {
+      type: "auto_continue",
+      reason: continuationReason,
+    };
+  } catch (chainErr) {
+    const failureCode =
+      chainErr instanceof DurableAttachmentReferenceRequiredError
+        ? chainErr.code
+        : "background_continuation_dispatch_failed";
+    await d
+      .recordRunDiagnostic(
+        runId,
+        RUN_DIAG_STAGE.workerThrew,
+        `chain_dispatch_failed nextRunId=${nextRunId} ${
+          chainErr instanceof Error ? chainErr.message : String(chainErr)
+        }`,
+      )
+      .catch(() => {});
+    console.error(
+      "[agent-chat] background continuation dispatch failed:",
+      chainErr instanceof Error ? chainErr.message : chainErr,
+    );
+    const statusUpdated = await d
+      .updateRunStatusIfRunning(runId, "errored")
+      .catch(() => false);
+    if (statusUpdated) {
+      await d.setRunTerminalReason(runId, failureCode).catch(() => {});
+      await d
+        .setRunError(
+          runId,
+          failureCode,
+          chainErr instanceof Error ? chainErr.message : String(chainErr),
+        )
+        .catch(() => {});
+    }
+  }
 }
 
 function progressStepFromAgentChatEvent(event: AgentChatEvent): string | null {
@@ -3556,7 +10584,9 @@ function progressStepFromAgentChatEvent(event: AgentChatEvent): string | null {
         ? `Calling ${event.agent}.`
         : event.status === "done"
           ? `Finished ${event.agent}.`
-          : `${event.agent} failed.`;
+          : event.status === "pending"
+            ? `${event.agent} is still working.`
+            : `${event.agent} failed.`;
     case "agent_task":
       return event.status === "running"
         ? "Started background task."
@@ -3572,13 +10602,88 @@ function progressStepFromAgentChatEvent(event: AgentChatEvent): string | null {
   }
 }
 
+export function resolveAgentRequestReasoningEffort({
+  model,
+  requestEffort,
+  configuredEffort,
+}: {
+  model: string;
+  requestEffort?: unknown;
+  configuredEffort?: ReasoningEffort;
+}): ReasoningEffort | undefined {
+  return normalizeReasoningEffortForRequest(
+    model,
+    isReasoningEffort(requestEffort) ? requestEffort : configuredEffort,
+  );
+}
+
+export type AgentModelSelectionSource =
+  | "request"
+  | "configured"
+  | "stored"
+  | "default"
+  | "provider-selection-fallback";
+
+function isConcreteModelSelection(
+  model: string | null | undefined,
+): model is string {
+  const normalized = typeof model === "string" ? model.trim() : "";
+  return normalized.length > 0 && normalized !== "auto";
+}
+
+export function resolveAgentExperimentModelOverride(options: {
+  requestModel?: string | null;
+  experimentModel?: string | null;
+}): string | undefined {
+  if (isConcreteModelSelection(options.requestModel)) return undefined;
+  return isConcreteModelSelection(options.experimentModel)
+    ? options.experimentModel
+    : undefined;
+}
+
+export function resolveAgentExperimentSelection(options: {
+  requestModel?: string | null;
+  experimentModel?: string | null;
+  assignments: readonly { experimentId: string; variantId: string }[];
+}): {
+  model?: string;
+  assignments: Array<{ experimentId: string; variantId: string }>;
+} {
+  const model = resolveAgentExperimentModelOverride(options);
+  return {
+    ...(model ? { model } : {}),
+    assignments: isConcreteModelSelection(options.requestModel)
+      ? []
+      : [...options.assignments],
+  };
+}
+
+export function resolveAgentModelSelection(options: {
+  requestModel?: string | null;
+  configuredModel?: string | null;
+  storedModel?: string | null;
+  defaultModel: string;
+}): { model: string; source: AgentModelSelectionSource } {
+  if (isConcreteModelSelection(options.requestModel)) {
+    return { model: options.requestModel, source: "request" };
+  }
+  if (isConcreteModelSelection(options.configuredModel)) {
+    return { model: options.configuredModel, source: "configured" };
+  }
+  if (isConcreteModelSelection(options.storedModel)) {
+    return { model: options.storedModel, source: "stored" };
+  }
+  return { model: options.defaultModel, source: "default" };
+}
+
 export function createProductionAgentHandler(
   options: ProductionAgentOptions,
 ): H3EventHandler {
-  // Undefined = let each engine pick its own defaultModel at request time.
+  if (options.resolveActionSurface) {
+    assertRequestActionSurfaceIsolation();
+  }
   const configuredModel = options.model;
 
-  // Resolve actions — prefer `actions`, fall back to deprecated `scripts`
   const resolvedActions = options.actions ?? options.scripts ?? {};
 
   // Engine tools are derived from the action registry at request time so that
@@ -3586,7 +10691,7 @@ export function createProductionAgentHandler(
   // the settings UI) show up to the LLM without a process restart. MCP tools
   // are also scope-filtered per request — a user-scope server added by Alice
   // must not appear in Bob's tool list in a shared-process deployment.
-  const getEngineTools = (
+  const getRequestActions = (
     actions: Record<string, ActionEntry> = resolvedActions,
   ) => {
     const filtered: Record<string, ActionEntry> = {};
@@ -3596,75 +10701,601 @@ export function createProductionAgentHandler(
       }
       filtered[name] = entry;
     }
-    return actionsToEngineTools(filtered);
+    return filtered;
   };
+  const getEngineTools = (actions: Record<string, ActionEntry>) =>
+    actionsToEngineTools(getRequestActions(actions));
 
   return defineEventHandler(async (event) => {
+    let completionTrackingSource = options.onRunComplete
+      ? snapshotAgentRunTrackingSource()
+      : undefined;
+    const setupT0 = Date.now();
+    const setupMarks: Record<string, number> = {};
+    const setupMark = (k: string) => {
+      setupMarks[k] = Date.now() - setupT0;
+    };
     if (getMethod(event) !== "POST") {
       setResponseStatus(event, 405);
       return { error: "Method not allowed" };
     }
 
     let body: AgentChatRequest;
-    try {
-      body = await readBody(event);
-    } catch {
-      setResponseStatus(event, 400);
-      return { error: "Invalid request body" };
+    const preInjectedBody = (event as any)?.context
+      ?.__agentChatBackgroundBody as AgentChatRequest | undefined;
+    if (preInjectedBody && typeof preInjectedBody === "object") {
+      body = preInjectedBody;
+    } else {
+      try {
+        body = await readBody(event);
+      } catch {
+        setResponseStatus(event, 400);
+        return { error: "Invalid request body" };
+      }
     }
 
     const {
       message,
-      history = [],
-      structuredHistory,
-      references = [],
+      history: submittedHistory = [],
+      structuredHistory: submittedStructuredHistory,
+      loadedSkillSlugs: requestedLoadedSkillSlugs,
+      references: submittedReferences = [],
       threadId,
       attachments,
       displayMessage,
-      internalContinuation,
+      parentId,
+      queuedMessageId,
+      queuedMessageClaimId,
+      agentKitMessageId: requestedAgentKitMessageId,
+      internalContinuation: submittedInternalContinuation,
+      autoContinueOfRunId: requestedAutoContinueOfRunId,
+      continueOfRunId: requestedContinueOfRunId,
       turnId: requestTurnId,
-      model: requestModel,
-      engine: requestEngine,
-      effort: requestEffort,
+      model: submittedModel,
+      engine: submittedEngine,
+      effort: submittedEffort,
       browserTabId,
       scope,
+      harness: submittedHarness,
       trackInRunsTray,
+      skipPendingSelectionContext,
     } = body;
-    const requestBrowserTabId = normalizeBrowserTabId(browserTabId);
+    let requestHistory = submittedHistory;
+    let requestStructuredHistory = submittedStructuredHistory;
+    let requestReferences = submittedReferences;
+    let requestContextAttachments: AgentChatAttachment[] = [];
+    let requestContextNote = "";
+    let requestModel = submittedModel;
+    let requestEngine = submittedEngine;
+    let requestEffort = submittedEffort;
+    let internalContinuation = submittedInternalContinuation;
+    let requestHarness = submittedHarness;
+    let requestSkipPendingSelectionContext = skipPendingSelectionContext;
+    let requestParentId =
+      parentId === null
+        ? null
+        : typeof parentId === "string" && parentId.trim()
+          ? parentId.trim()
+          : undefined;
+    let requestMetadata = body.metadata;
+    const continuedRunId = (requested: unknown) =>
+      internalContinuation === true &&
+      typeof requested === "string" &&
+      requested.trim().length <= 200
+        ? requested.trim() || undefined
+        : undefined;
+    const autoContinueOfRunId = continuedRunId(requestedAutoContinueOfRunId);
+    // The stopped run this request resumes in its own turn, from the turn's
+    // history and journal, whether the chat or a person asked.
+    const continueOf: { runId: string; trigger: ContinueTrigger } | undefined =
+      autoContinueOfRunId
+        ? { runId: autoContinueOfRunId, trigger: "auto" }
+        : (() => {
+            const runId = continuedRunId(requestedContinueOfRunId);
+            return runId ? { runId, trigger: "manual" } : undefined;
+          })();
+    const continueRefusal = (code: string) => ({
+      error:
+        continueOf?.trigger === "manual"
+          ? "This turn can no longer be continued."
+          : "This turn will not continue automatically.",
+      code,
+      retryable: false,
+    });
+    if (requestEngine !== undefined && typeof requestEngine !== "string") {
+      setResponseStatus(event, 400);
+      return { error: "engine must be a string" };
+    }
+    setupMark("bodyParsed");
+
+    let agentKitMessageId =
+      typeof requestedAgentKitMessageId === "string" &&
+      requestedAgentKitMessageId.trim().length <= 200
+        ? requestedAgentKitMessageId.trim() || undefined
+        : undefined;
+
+    const backgroundRunMarker =
+      preInjectedBody &&
+      body[AGENT_CHAT_BACKGROUND_RUN_FIELD] &&
+      typeof body[AGENT_CHAT_BACKGROUND_RUN_FIELD] === "object" &&
+      typeof body[AGENT_CHAT_BACKGROUND_RUN_FIELD]!.runId === "string"
+        ? body[AGENT_CHAT_BACKGROUND_RUN_FIELD]!
+        : null;
+    const isBackgroundWorker = backgroundRunMarker !== null;
+    if (!isBackgroundWorker) {
+      delete body[AGENT_CHAT_BACKGROUND_RUN_FIELD];
+      delete (body as unknown as Record<string, unknown>)[
+        AGENT_CHAT_RECOVERY_OF_RUN_FIELD
+      ];
+      delete body.__resolvedActionSurface;
+      delete body.__resolvedAdditionalActionNames;
+    }
+    let requestedActionScope: AgentActionScope | undefined;
+    if (hasOwn(body, "actionScope")) {
+      try {
+        requestedActionScope = normalizeAgentActionScope(body.actionScope);
+        body.actionScope = requestedActionScope;
+      } catch (error) {
+        setResponseStatus(event, 400);
+        return {
+          error: error instanceof Error ? error.message : "Invalid actionScope",
+        };
+      }
+    }
+    if (requestedActionScope && !options.resolveActionSurface) {
+      setResponseStatus(event, 400);
+      return { error: "actionScope requires resolveActionSurface" };
+    }
+    const bgRunId = isBackgroundWorker
+      ? (backgroundRunMarker?.runId as string)
+      : null;
+    const workerStep = (s: string) => {
+      if (bgRunId)
+        void retainRequestDbPoolScope(
+          recordRunDiagnostic(
+            bgRunId,
+            RUN_DIAG_STAGE.workerSetupStep,
+            `${s}=${Date.now() - setupT0}ms`,
+          ).catch(() => {}),
+        ).catch(() => {});
+    };
+    const runsInBackgroundFunction =
+      isBackgroundWorker &&
+      shouldUseBackgroundFunctionTimeoutForWorker(backgroundRunMarker);
+    const backgroundRuntimeDetail = isBackgroundWorker
+      ? backgroundRuntimeDiagnosticDetail(backgroundRunMarker)
+      : "";
+    const backgroundContinuationCount =
+      isBackgroundWorker &&
+      typeof backgroundRunMarker?.continuationCount === "number" &&
+      Number.isFinite(backgroundRunMarker.continuationCount)
+        ? Math.max(0, Math.floor(backgroundRunMarker.continuationCount))
+        : 0;
+    const priorContinuationState = resolvePriorContinuationState(
+      backgroundRunMarker,
+      body as unknown as Record<string, unknown>,
+    );
+    const priorNoProgressErrorCode = priorContinuationState.noProgressErrorCode;
+    const priorNoProgressCount = priorContinuationState.noProgressCount;
+    const priorContinuationReason = priorContinuationState.continuationReason;
+    let backgroundRunClaimedEarly = false;
+    if (isBackgroundWorker && bgRunId) {
+      const earlyClaim = await claimBackgroundWorkerRunEarly({
+        runId: bgRunId,
+        threadId,
+        markerTurnId:
+          typeof backgroundRunMarker?.turnId === "string"
+            ? backgroundRunMarker.turnId
+            : null,
+        requestTurnId,
+        continuationCount: backgroundContinuationCount,
+        runsInBackgroundFunction,
+        backgroundRuntimeDetail,
+      });
+      if (!earlyClaim.claimed) {
+        return { ok: true, skipped: earlyClaim.skipped };
+      }
+      backgroundRunClaimedEarly = true;
+    }
+    let dispatchToBackground =
+      !isBackgroundWorker &&
+      isAgentChatDurableBackgroundEnabled({
+        appOptIn: options.durableBackgroundRuns,
+      });
+    const mutableBody = body as unknown as Record<string, unknown>;
+    if (!isBackgroundWorker) {
+      // A client can submit this private field, so overwrite it at the boundary.
+      mutableBody[AGENT_CHAT_BROWSER_SESSION_ID_FIELD] =
+        getRequestContext()?.browserSessionId ?? null;
+      delete mutableBody[ANALYTICS_CLIENT_PLATFORM_BODY_FIELD];
+    }
+    if (dispatchToBackground) {
+      const clientPlatform = getRequestContext()?.clientPlatform;
+      if (clientPlatform) {
+        mutableBody[ANALYTICS_CLIENT_PLATFORM_BODY_FIELD] = clientPlatform;
+      }
+    }
+    const requestBrowserTabId =
+      normalizeBrowserTabId(browserTabId) ??
+      normalizeBrowserTabId(getRequestRunContext()?.browserTabId);
     const requestChatScope = normalizeChatScope(scope);
     const requestRunCtx = ensureRequestRunContext();
     if (requestRunCtx) {
       requestRunCtx.browserTabId = requestBrowserTabId;
       requestRunCtx.chatScope = requestChatScope;
+      requestRunCtx.isBackgroundWorker = isBackgroundWorker;
     }
-    const requestMode: AgentExecutionMode =
-      body.mode === "plan" ? "plan" : "act";
+    let requestMode: AgentExecutionMode = body.mode === "plan" ? "plan" : "act";
     const hasMessageText =
       typeof message === "string" && message.trim().length > 0;
-    const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
+    let hasAttachments = Array.isArray(attachments) && attachments.length > 0;
     if (!hasMessageText && !hasAttachments) {
       setResponseStatus(event, 400);
       return { error: "message is required" };
     }
     let requestMessage = hasMessageText ? message : "Use the attached context.";
     let requestAttachments = Array.isArray(attachments) ? attachments : [];
+    let attachmentHydrationBudget: OwnedAttachmentHydrationBudget | undefined;
     let requestDisplayMessage = displayMessage;
+    let requestContext = buildRecentUserRequestContext({
+      request: requestMessage,
+      history: requestHistory,
+      structuredHistory: requestStructuredHistory,
+    });
 
-    // Resolve owner first so we can look up a per-owner API key. Users
-    // who bring their own key use their key for this request (durable
-    // across serverless cold starts via the settings table).
     const ownerEmail = await resolveAgentOwnerEmail(options, event);
+    const runRequestContext = getRequestContext();
+    const turnInitiator: AgentTurnInitiator | undefined = ownerEmail
+      ? {
+          email: ownerEmail,
+          authUserId: runRequestContext?.authUserId ?? null,
+          orgId: getRequestOrgId() ?? null,
+          orgScope: runRequestContext?.orgScope ?? null,
+          anonymous: runRequestContext?.agentRunAnonymous === true,
+        }
+      : undefined;
+    if (dispatchToBackground && !turnInitiator) {
+      setResponseStatus(event, 401);
+      return { error: "Background agent runs require a persisted initiator" };
+    }
+    const submittedApprovedToolCalls: unknown = (
+      body as unknown as Record<string, unknown>
+    ).approvedToolCalls;
+    if (
+      submittedApprovedToolCalls !== undefined &&
+      (!Array.isArray(submittedApprovedToolCalls) ||
+        submittedApprovedToolCalls.length > 200 ||
+        submittedApprovedToolCalls.some(
+          (key: unknown) => typeof key !== "string" || key.length === 0,
+        ))
+    ) {
+      setResponseStatus(event, 422);
+      return {
+        error: "The agent run failed.",
+        code: "approved_tool_call_invalid",
+        retryable: false,
+      };
+    }
+    const requestedApprovedToolCalls =
+      Array.isArray(submittedApprovedToolCalls) &&
+      submittedApprovedToolCalls.length > 0
+        ? (submittedApprovedToolCalls as string[])
+        : undefined;
+    const submittedApprovedToolCallAskIds: unknown = (
+      body as unknown as Record<string, unknown>
+    ).approvedToolCallAskIds;
+    if (
+      submittedApprovedToolCallAskIds !== undefined &&
+      (!Array.isArray(submittedApprovedToolCallAskIds) ||
+        submittedApprovedToolCallAskIds.length > 200 ||
+        submittedApprovedToolCallAskIds.some(
+          (id: unknown) =>
+            typeof id !== "string" || id.length === 0 || id.trim() !== id,
+        ))
+    ) {
+      setResponseStatus(event, 422);
+      return {
+        error: "The agent run failed.",
+        code: "approved_tool_call_ask_id_invalid",
+        retryable: false,
+      };
+    }
+    const requestedApprovedToolCallAskIds =
+      Array.isArray(submittedApprovedToolCallAskIds) &&
+      submittedApprovedToolCallAskIds.length > 0
+        ? (submittedApprovedToolCallAskIds as string[])
+        : undefined;
+    // The approval fast path replays one call, so reject batches before any key can be dropped.
+    if (requestedApprovedToolCalls && requestedApprovedToolCalls.length > 1) {
+      setResponseStatus(event, 422);
+      return {
+        error: "The agent run failed.",
+        code: "approved_tool_call_count_unsupported",
+        retryable: false,
+      };
+    }
+    if (
+      requestedApprovedToolCallAskIds &&
+      (requestedApprovedToolCallAskIds.length !== 1 ||
+        requestedApprovedToolCalls?.length !== 1)
+    ) {
+      setResponseStatus(event, 422);
+      return {
+        error: "The agent run failed.",
+        code: "approved_tool_call_ask_id_count_unsupported",
+        retryable: false,
+      };
+    }
+    const approvedToolCallLookup = findApprovedStructuredToolCall(
+      requestStructuredHistory,
+      requestedApprovedToolCalls,
+      requestedApprovedToolCallAskIds,
+    );
+    if (approvedToolCallLookup.status === "ambiguous") {
+      setResponseStatus(event, 422);
+      return {
+        error: "The agent run failed.",
+        code: "approved_tool_call_history_ambiguous",
+        retryable: false,
+      };
+    }
+    const exactApprovedToolCall =
+      approvedToolCallLookup.status === "found"
+        ? approvedToolCallLookup.toolCall
+        : undefined;
+    if (requestedApprovedToolCalls?.length && !exactApprovedToolCall) {
+      setResponseStatus(event, 422);
+      return {
+        error: "The agent run failed.",
+        code: "approved_tool_call_history_missing",
+        retryable: false,
+      };
+    }
+    if (
+      exactApprovedToolCall &&
+      isUnavailableToolCallInput(exactApprovedToolCall.input)
+    ) {
+      setResponseStatus(event, 422);
+      return {
+        error: "The agent run failed.",
+        code: "approved_tool_call_input_unavailable",
+        retryable: false,
+      };
+    }
+    if (dispatchToBackground && exactApprovedToolCall) {
+      if (approvedInputRequiresForeground(exactApprovedToolCall.input)) {
+        // The dispatch payload must not persist raw bytes; execute while this request still has them.
+        dispatchToBackground = false;
+      }
+    }
+    const approvedToolCallsForExecution = exactApprovedToolCall
+      ? [
+          toolCallCacheKey(
+            exactApprovedToolCall.name,
+            exactApprovedToolCall.input,
+          ),
+        ]
+      : requestedApprovedToolCalls;
+    const resolvedApprovalTurnId =
+      ownerEmail && threadId && approvedToolCallsForExecution?.length
+        ? await resolveAgentToolApprovalTurnId({
+            ownerEmail,
+            orgId: getRequestOrgId() ?? null,
+            threadId,
+            requestedTurnId: requestTurnId,
+            approvalKeys: approvedToolCallsForExecution,
+            ...(requestedApprovedToolCallAskIds
+              ? { approvalId: requestedApprovedToolCallAskIds[0] }
+              : {}),
+          })
+        : null;
+    if (requestedApprovedToolCallAskIds?.length && !resolvedApprovalTurnId) {
+      setResponseStatus(event, 409);
+      return {
+        error: "The agent run failed.",
+        code: "approved_tool_call_not_pending",
+        retryable: false,
+      };
+    }
+    // The continuation marker is client-controlled. Defer setup admission only
+    // for automatic successors when the named stop and turn can be checked
+    // under the run-slot lock. A user's manual Continue starts new work and
+    // still requires current provider readiness.
+    const canDeferSetupGateForContinuationAdmission = Boolean(
+      continueOf?.trigger === "auto" &&
+      continueOf &&
+      typeof threadId === "string" &&
+      threadId.trim() &&
+      typeof requestTurnId === "string" &&
+      requestTurnId.trim(),
+    );
+    const admittedQueuedMessage = await readAdmittedQueuedMessagePromotion({
+      ownerEmail,
+      orgId: getRequestOrgId() ?? null,
+      threadId,
+      messageId: queuedMessageId,
+      claimId: queuedMessageClaimId,
+      message: typeof message === "string" ? message : "",
+      continuationRequested:
+        submittedInternalContinuation === true ||
+        typeof requestedAutoContinueOfRunId === "string" ||
+        typeof requestedContinueOfRunId === "string",
+    });
+    const isQueuedPromotion = admittedQueuedMessage !== null;
+    if (admittedQueuedMessage) {
+      // A claim admits the persisted queue payload, not extra fields in this request.
+      const promotionOptions = admittedQueuedMessage.options ?? {};
+      const promotionMetadata = {
+        ...(admittedQueuedMessage.metadata ?? {}),
+        ...(queuedPromotionRecord(promotionOptions.metadata) ?? {}),
+      };
+      requestMessage = admittedQueuedMessage.text;
+      agentKitMessageId = admittedQueuedMessage.id;
+      requestDisplayMessage = admittedQueuedMessage.text;
+      requestAttachments = queuedPromotionAttachments(
+        admittedQueuedMessage.attachments ?? [],
+        admittedQueuedMessage.requestAttachments,
+      );
+      hasAttachments = requestAttachments.length > 0;
+      requestReferences = [];
+      requestHistory = [];
+      requestStructuredHistory = undefined;
+      internalContinuation = false;
+      requestHarness = undefined;
+      requestSkipPendingSelectionContext = false;
+      requestParentId = undefined;
+      requestMetadata = promotionMetadata;
+      requestModel =
+        typeof promotionOptions.model === "string"
+          ? promotionOptions.model
+          : undefined;
+      const promotionOptionMetadata = queuedPromotionRecord(
+        promotionOptions.metadata,
+      );
+      const promotionEngine =
+        admittedQueuedMessage.metadata?.engine ??
+        promotionOptionMetadata?.engine;
+      requestEngine =
+        typeof promotionEngine === "string" ? promotionEngine : undefined;
+      requestEffort = isReasoningEffort(promotionOptions.reasoningEffort)
+        ? promotionOptions.reasoningEffort
+        : undefined;
+      requestMode = promotionOptions.mode === "plan" ? "plan" : "act";
+      requestContext = buildRecentUserRequestContext({
+        request: requestMessage,
+        history: requestHistory,
+      });
+      const mutableBody = body as unknown as Record<string, unknown>;
+      mutableBody.message = requestMessage;
+      mutableBody.displayMessage = requestDisplayMessage;
+      mutableBody.attachments = requestAttachments;
+      mutableBody.references = requestReferences;
+      mutableBody.history = requestHistory;
+      delete mutableBody.structuredHistory;
+      mutableBody.metadata = requestMetadata;
+      mutableBody.model = requestModel;
+      if (requestEngine === undefined) {
+        delete mutableBody.engine;
+      } else {
+        mutableBody.engine = requestEngine;
+      }
+      mutableBody.effort = requestEffort;
+      mutableBody.mode = requestMode;
+      delete mutableBody.internalContinuation;
+      delete mutableBody.autoContinueOfRunId;
+      delete mutableBody.continueOfRunId;
+      delete mutableBody.harness;
+      delete mutableBody.parentId;
+      delete mutableBody.options;
+      delete mutableBody.skipPendingSelectionContext;
+    }
+    const recordUnstartedTurn = async (failure: {
+      code: string;
+      message: string;
+    }) => {
+      const unstartedTurnId =
+        typeof requestTurnId === "string" && requestTurnId.trim()
+          ? requestTurnId.trim()
+          : undefined;
+      const normalizedThreadId =
+        typeof threadId === "string" ? threadId.trim() : "";
+      if (
+        !options.onRunNotStarted ||
+        !normalizedThreadId ||
+        !unstartedTurnId ||
+        continueOf ||
+        isBackgroundWorker ||
+        runRequestContext?.agentRunAnonymous === true
+      ) {
+        return;
+      }
+      try {
+        await options.onRunNotStarted({
+          runId: unstartedTurnId,
+          turnId: unstartedTurnId,
+          threadId: normalizedThreadId,
+          message:
+            typeof requestDisplayMessage === "string" &&
+            requestDisplayMessage.trim()
+              ? requestDisplayMessage
+              : requestMessage,
+          attachments: requestAttachments,
+          ...(typeof queuedMessageId === "string" && queuedMessageId.trim()
+            ? { queuedMessageId: queuedMessageId.trim() }
+            : {}),
+          ...(agentKitMessageId ? { agentKitMessageId } : {}),
+          retryContext: retryContextFromRequest(body, (dropped) =>
+            console.warn(
+              `[agent-chat] dropped ${dropped} invalid reference(s) from a refused turn's retry context`,
+            ),
+          ),
+          failure,
+        });
+      } catch (error) {
+        console.error(
+          "[agent-chat] could not record a refused turn in its thread:",
+          error,
+        );
+        captureError(error, {
+          route: "agent-chat",
+          tags: {
+            source: "agent-chat",
+            failureClass: "unstarted-turn-persist",
+          },
+          extra: { threadId: normalizedThreadId, runId: unstartedTurnId },
+        });
+      }
+    };
+    if (
+      !isBackgroundWorker &&
+      runRequestContext?.agentRunAnonymous !== true &&
+      !resolvedApprovalTurnId &&
+      !canDeferSetupGateForContinuationAdmission &&
+      !isQueuedPromotion
+    ) {
+      try {
+        await options.assertAiSetupReady();
+      } catch (error) {
+        if (isAgentChatAiSetupRequiredError(error)) {
+          const setupError = error as {
+            statusMessage?: unknown;
+            message?: unknown;
+          };
+          await recordUnstartedTurn({
+            code: AGENT_CHAT_AI_SETUP_REQUIRED_CODE,
+            message:
+              (typeof setupError.statusMessage === "string" &&
+                setupError.statusMessage) ||
+              (typeof setupError.message === "string" && setupError.message) ||
+              "Connect an AI provider before chatting.",
+          });
+        }
+        throw error;
+      }
+    }
+    setupMark("aiGate");
+    const contextPrefetchDeadlineAt = Date.now() + 1_300;
     const preparedRequest = await options.prepareRequest?.({
       event,
       ownerEmail,
       message: requestMessage,
       displayMessage: requestDisplayMessage,
       attachments: requestAttachments,
-      references,
+      ...(requestStructuredHistory
+        ? { structuredHistory: requestStructuredHistory }
+        : {}),
+      references: requestReferences,
       threadId,
+      requestContext,
+      contextPrefetchDeadlineAt,
       internalContinuation: Boolean(internalContinuation),
+      dispatchToBackground,
+      isBackgroundWorker,
       mode: requestMode,
     });
+    let jevPromptCandidates: JevPromptContextCandidate[] = [];
+    let jevFallbackCandidateIds: string[] = [];
+    const preparedReferenceStatus = readReportedContextStatus(preparedRequest);
     if (preparedRequest) {
       if (
         typeof preparedRequest.message === "string" &&
@@ -3678,29 +11309,206 @@ export function createProductionAgentHandler(
       if (Array.isArray(preparedRequest.attachments)) {
         requestAttachments = preparedRequest.attachments;
       }
+      if (Array.isArray(preparedRequest.contextAttachments)) {
+        requestContextAttachments = preparedRequest.contextAttachments;
+      }
+      if (typeof preparedRequest.contextNote === "string") {
+        requestContextNote = preparedRequest.contextNote;
+      }
+      if (Array.isArray(preparedRequest.jevPromptCandidates)) {
+        jevPromptCandidates = preparedRequest.jevPromptCandidates;
+      }
+      if (Array.isArray(preparedRequest.jevFallbackCandidateIds)) {
+        jevFallbackCandidateIds = preparedRequest.jevFallbackCandidateIds;
+      }
     }
+    const jevRequestContext = buildJevRequestContext({
+      request: requestMessage,
+      history: requestHistory,
+      structuredHistory: requestStructuredHistory,
+    });
+    const requestedHostedHarness = normalizeHostedHarnessRuntime(
+      requestHarness?.runtime,
+    );
+    if (requestHarness !== undefined && !requestedHostedHarness) {
+      setResponseStatus(event, 400);
+      return { error: "Unsupported hosted harness runtime" };
+    }
+    const hostedHarnessPolicy = requestedHostedHarness
+      ? await resolveHostedHarnessPolicy({
+          config: options.hostedHarnessConfig,
+          orgId: getRequestOrgId() ?? null,
+          userEmail: ownerEmail,
+        })
+      : null;
+    if (
+      requestedHostedHarness &&
+      (!hostedHarnessPolicy?.enabled ||
+        !hostedHarnessPolicy.runtimes.includes(requestedHostedHarness))
+    ) {
+      setResponseStatus(event, hostedHarnessPolicy?.configEnabled ? 403 : 404);
+      return {
+        error: hostedHarnessPolicy?.configEnabled
+          ? "Hosted harness is not enabled for this organization"
+          : "Hosted harness is not configured for this app",
+      };
+    }
+    const runContext = ensureRequestRunContext();
+    if (runContext && requestedHostedHarness) {
+      runContext.hostedHarnessRuntime = requestedHostedHarness;
+    }
+    let availableRequestActions = getRequestActions();
+    if (
+      options.resolveAdditionalActions &&
+      ownerEmail &&
+      getRequestContext()?.agentRunAnonymous !== true
+    ) {
+      const resolvedAdditionalActions = await options.resolveAdditionalActions({
+        event,
+        ownerEmail,
+        orgId: getRequestOrgId() ?? null,
+      });
+      const turnAdditionalActionNames = isBackgroundWorker
+        ? readPersistedAdditionalActionNames(body)
+        : undefined;
+      const additionalActions = turnAdditionalActionNames
+        ? pinAdditionalActionsToTurn(
+            resolvedAdditionalActions,
+            turnAdditionalActionNames,
+            resolvedActions,
+          )
+        : resolvedAdditionalActions;
+      if (!isBackgroundWorker) {
+        body.__resolvedAdditionalActionNames = Object.keys(additionalActions);
+      }
+      const requestActions = { ...resolvedActions, ...additionalActions };
+      if (requestActions[TOOL_SEARCH_ACTION_NAME]) {
+        requestActions[TOOL_SEARCH_ACTION_NAME] = createToolSearchEntry(() =>
+          getRequestActions(requestActions),
+        );
+      }
+      availableRequestActions = getRequestActions(requestActions);
+    }
+    if (requestedHostedHarness) {
+      availableRequestActions = filterActionsByAllowedNames(
+        availableRequestActions,
+        filterHostedHarnessToolNames(Object.keys(availableRequestActions)),
+      );
+    }
+    let surfacedRequestActions = availableRequestActions;
+    let shouldFilterInitialRequestTools = !options.resolveActionSurface;
+    if (options.resolveActionSurface) {
+      const persistedSurface = isBackgroundWorker
+        ? readPersistedActionSurface(body, "__resolvedActionSurface")
+        : undefined;
+      if (
+        isBackgroundWorker &&
+        requestedActionScope &&
+        (!persistedSurface || !("actionScope" in persistedSurface))
+      ) {
+        setResponseStatus(event, 400);
+        return { error: "Resolved actionScope is required for continuation" };
+      }
+      const surface =
+        persistedSurface !== undefined
+          ? persistedSurface
+          : await options.resolveActionSurface({
+              event,
+              ownerEmail,
+              orgId: getRequestOrgId() ?? null,
+              threadId,
+              mode: requestMode,
+              internalContinuation: Boolean(internalContinuation),
+              ...(typeof requestTurnId === "string" && requestTurnId.trim()
+                ? { requestedTurnId: requestTurnId.trim() }
+                : {}),
+              ...(typeof queuedMessageId === "string" && queuedMessageId.trim()
+                ? { queuedMessageId: queuedMessageId.trim() }
+                : {}),
+              ...(requestedActionScope
+                ? { actionScope: requestedActionScope }
+                : {}),
+              availableActionNames: Object.keys(availableRequestActions),
+            });
+      const normalizedSurface = normalizeAgentActionSurfaceResolution(surface);
+      shouldFilterInitialRequestTools =
+        normalizedSurface.mode === "default" || !normalizedSurface.actionScope;
+      if (
+        requestedActionScope &&
+        (normalizedSurface.mode === "default" || !normalizedSurface.actionScope)
+      ) {
+        throw new Error(
+          "resolveActionSurface must return actionScope for a scoped request",
+        );
+      }
+      const runCtx = ensureRequestRunContext();
+      if (normalizedSurface.mode === "default") {
+        if (runCtx) {
+          delete runCtx.allowedActionNames;
+          delete runCtx.actionScope;
+        }
+        if (!isBackgroundWorker) {
+          body.__resolvedActionSurface = {
+            orgId: getRequestOrgId() ?? null,
+            mode: "default",
+          };
+        }
+      } else {
+        surfacedRequestActions = filterActionsByAllowedNames(
+          availableRequestActions,
+          normalizedSurface.allowedActionNames,
+        );
+        if (requestedHostedHarness) {
+          surfacedRequestActions = filterActionsByAllowedNames(
+            surfacedRequestActions,
+            filterHostedHarnessToolNames(Object.keys(surfacedRequestActions)),
+          );
+        }
+        const allowedNames = Object.keys(surfacedRequestActions);
+        if (runCtx) {
+          runCtx.allowedActionNames = allowedNames;
+          if (normalizedSurface.actionScope) {
+            runCtx.actionScope = normalizedSurface.actionScope;
+          } else {
+            delete runCtx.actionScope;
+          }
+        }
+        if (!isBackgroundWorker) {
+          body.__resolvedActionSurface = {
+            orgId: getRequestOrgId() ?? null,
+            allowedActionNames: allowedNames,
+            ...(normalizedSurface.actionScope
+              ? { actionScope: normalizedSurface.actionScope }
+              : {}),
+          };
+        }
+      }
+    }
+    workerStep("db_request_ctx");
 
-    // Pre-upload chat attachments (images AND files/PDFs) through the framework
-    // file-upload provider (Builder.io by default). The model still sees the
-    // base64 multimodal content for the current turn; each uploaded attachment
-    // also gets a hosted `url` injected so the agent can embed it in slides,
-    // docs, or outbound messages, and callers can persist a URL reference
-    // instead of the raw base64.
-    //
-    // When no provider is configured, leave attachments untouched and inject a
-    // hint recommending Builder.io connect — the model can still see images via
-    // base64, and files via their data URL / text, but has no hosted URL.
+    workerStep("attach_start");
     if (
       hasAttachments &&
       requestAttachments.some(
-        (a) => a.type === "image" || a.type === "file" || a.type === "document",
+        (a) =>
+          a.displayOnly !== true &&
+          (a.type === "image" || a.type === "file" || a.type === "document"),
       )
     ) {
+      // A busy thread refuses this message (409) and the client sends it again
+      // once the thread frees up; uploading first would store every
+      // attachment again on each refusal.
+      if (threadId && !isBackgroundWorker) {
+        const activeRunId = await getSlotHoldingRunId(threadId);
+        if (activeRunId) return runSlotBusy(event, activeRunId);
+      }
       try {
+        attachmentHydrationBudget ??= createOwnedAttachmentHydrationBudget();
         const preUpload = await preUploadAttachments({
           attachments: requestAttachments,
           ownerEmail,
           includeFiles: true,
+          hydrationBudget: attachmentHydrationBudget,
         });
         if (preUpload.injectedText) {
           requestMessage = requestMessage
@@ -3712,13 +11520,12 @@ export function createProductionAgentHandler(
           "[agent-native] preUploadAttachments failed:",
           err instanceof Error ? err.message : String(err),
         );
+        requestMessage = requestMessage
+          ? `${requestMessage}\n\n${describeAttachmentPreUploadWarning()}`
+          : describeAttachmentPreUploadWarning();
       }
     }
 
-    // Persist text-ish attachments as thread-scoped agent_scratch resources so
-    // the model can page through them with the `read-attachment` tool. We do
-    // this here — before buildUserContentWithAttachments — so the resource IDs
-    // are available when we inject the truncation notice into the text content.
     const textAttachmentResourceMap = new Map<
       number,
       { resourceId: string; path: string; totalChars: number }
@@ -3742,97 +11549,162 @@ export function createProductionAgentHandler(
         );
       }
     }
+    workerStep("attach_done");
 
-    // When a per-request engine override is specified, resolve the API key
-    // for that provider instead of the global active engine's provider.
-    let userApiKey: string | undefined;
-    if (requestEngine) {
-      const provider = engineToProvider(requestEngine);
-      userApiKey = await getOwnerApiKey(provider, ownerEmail);
-      if (!userApiKey && !shouldBlockDeployCredentialFallback()) {
-        // Single-tenant only: env fallback for the requested provider. Shared
-        // hosted deploys never silently substitute the deploy-level key for
-        // an authenticated user (see getOwnerActiveApiKey for the full
-        // rationale).
-        const envVar = PROVIDER_TO_ENV[provider];
-        userApiKey = envVar ? readDeployCredentialEnv(envVar) : undefined;
-      }
-    } else {
-      userApiKey = await getOwnerActiveApiKey(ownerEmail);
-    }
+    workerStep("apikey_start");
+    const engineOption = requestEngine ?? options.engine;
+    const ownerKey = await resolveOwnerEngineApiKey({
+      engineOption,
+      ownerEmail,
+      anthropicFallback:
+        options.apiKey ?? readDeployCredentialEnv("ANTHROPIC_API_KEY"),
+    });
+    const effectiveApiKey = ownerKey.apiKey;
+    workerStep("apikey_done");
 
-    // `options.apiKey` is the value the template constructed the plugin with
-    // (e.g. wired from a deployment env var). On a shared hosted deploy this
-    // is the same cross-tenant hazard as any deploy-level provider key:
-    // accepting it as the final fallback would silently bill every key-less
-    // user to the deployment's account. Honour it only when the generic
-    // deploy fallback policy allows it.
-    const effectiveApiKey = shouldBlockDeployCredentialFallback()
-      ? userApiKey
-      : (userApiKey ??
-        options.apiKey ??
-        readDeployCredentialEnv("ANTHROPIC_API_KEY"));
+    workerStep("engine_start");
+    const credentialIdentity = {
+      userEmail: ownerEmail,
+      orgId: getRequestOrgId(),
+    };
+    const engine = await resolveChatEngine({
+      engineOption,
+      ownerKey,
+      model: configuredModel,
+      appId: options.appId,
+      credentialIdentity,
+    });
+    workerStep("engine_done");
 
-    // Resolve engine — per-request engine override takes priority
-    let engine: AgentEngine;
+    workerStep("model_start");
+    const requestModelIsExplicit = isConcreteModelSelection(requestModel);
+    const configuredModelIsExplicit = isConcreteModelSelection(configuredModel);
+    const storedModel =
+      !requestModelIsExplicit && !configuredModelIsExplicit
+        ? await getStoredModelForEngine(engine, { appId: options.appId })
+        : undefined;
+    const modelSelection = await applyUncheckedDefaultModelReplacement(
+      engine,
+      resolveAgentModelSelection({
+        requestModel,
+        configuredModel,
+        storedModel,
+        defaultModel: engine.defaultModel,
+      }),
+    );
+    workerStep("model_done");
+    const model = normalizeModelForEngine(engine, modelSelection.model);
+    let effectiveModel = model;
+    let modelSelectionSource: AgentModelSelectionSource | "experiment" =
+      modelSelection.source;
+    const turnUsageLabel = normalizeUsageLabel(body.usageLabel);
+    let experimentAssignments: Array<{
+      experimentId: string;
+      variantId: string;
+    }> = [];
+
     try {
-      engine = await resolveEngine({
-        engineOption: requestEngine ?? options.engine,
-        apiKey: effectiveApiKey,
-        model: configuredModel,
-        appId: options.appId,
-      });
+      // A pinned request model suppresses the experiment's model override, so
+      // resolving would assign (and persist) a variant this turn never ran.
+      if (ownerEmail && !requestModelIsExplicit) {
+        const { resolveActiveExperimentConfig } =
+          await import("../observability/experiments.js");
+        const expConfig = await resolveActiveExperimentConfig(ownerEmail);
+        if (expConfig) {
+          const experimentSelection = resolveAgentExperimentSelection({
+            requestModel,
+            experimentModel:
+              typeof expConfig.configs.model === "string"
+                ? expConfig.configs.model
+                : undefined,
+            assignments: expConfig.assignments,
+          });
+          experimentAssignments = experimentSelection.assignments;
+          if (experimentSelection.model) {
+            effectiveModel = normalizeModelForEngine(
+              engine,
+              experimentSelection.model,
+            );
+            modelSelectionSource = "experiment";
+          }
+        }
+      }
     } catch {
-      engine = await resolveEngine({
-        apiKey: effectiveApiKey,
-        appId: options.appId,
-      });
+      // Experiments are best-effort. Model resolution must keep working if the
+      // observability tables are unavailable during startup or migration.
     }
 
-    // Honor the model the user picked in the settings UI (written via
-    // `manage-agent-engine` action="set"), but only when the caller hasn't overridden it for
-    // this request or at plugin construction time. Read per-request so a
-    // dropdown change in the UI takes effect without a server restart. Skip
-    // the DB read entirely when a higher-precedence value is set.
-    const modelCandidate =
-      requestModel ??
-      configuredModel ??
-      (await getStoredModelForEngine(engine, { appId: options.appId })) ??
-      engine.defaultModel;
-    const model = normalizeModelForEngine(engine, modelCandidate);
-    const reasoningEffort = normalizeReasoningEffortForModel(
-      model,
-      isReasoningEffort(requestEffort)
-        ? requestEffort
-        : options.reasoningEffort,
+    const reasoningEffort = resolveAgentRequestReasoningEffort({
+      model: effectiveModel,
+      requestEffort,
+      configuredEffort: options.reasoningEffort,
+    });
+    const modelSupportsVision = isAgentModelVisionCapable(
+      effectiveModel,
+      engine.capabilities.vision === true,
     );
 
-    options.onEngineResolved?.(engine, model);
+    options.onEngineResolved?.(engine, effectiveModel);
 
-    // One-line per-turn resolution log so it's obvious in dev which engine
-    // is actually handling the request. `requestEngine` is what the client
-    // sent from the model picker; `engine.name` is what resolveEngine picked.
-    // Divergence between them is the usual cause of "status says builder but
-    // no [builder-engine] log lines appear" confusion.
     console.log(
-      `[agent-chat] resolved engine=${engine.name} model=${model} requestEngine=${requestEngine ?? "(none)"}`,
+      `[agent-chat] resolved engine=${engine.name} model=${effectiveModel} requestModel=${requestModel ?? "(none)"} requestEngine=${requestEngine ?? "(none)"} modelSource=${modelSelectionSource} engineDefault=${engine.defaultModel} effort=${reasoningEffort ?? "unset"} turnId=${requestTurnId ?? "(none)"}`,
     );
 
-    // Check for API key before starting a run (only for anthropic engine)
-    if (engine.name === "anthropic" && !effectiveApiKey) {
+    if (
+      !(await isResolvedEngineUsableForRequest(engine, {
+        apiKey: effectiveApiKey,
+        credentialIdentity,
+      }))
+    ) {
       setResponseHeader(event, "Content-Type", "text/event-stream");
       setResponseHeader(event, "Cache-Control", "no-cache");
       setResponseHeader(event, "Connection", "keep-alive");
       const encoder = new TextEncoder();
+      const missingCredentialsEvent = await missingCredentialsChatError({
+        ownerEmail,
+        visitorFacing: isBuilderGatewayDeployConfigured(),
+      });
+      const unstartedTurnId =
+        typeof requestTurnId === "string" && requestTurnId.trim()
+          ? requestTurnId.trim()
+          : undefined;
+      if (
+        options.onRunNotStarted &&
+        threadId &&
+        unstartedTurnId &&
+        !internalContinuation &&
+        !isBackgroundWorker
+      ) {
+        await options.onRunNotStarted({
+          runId: unstartedTurnId,
+          turnId: unstartedTurnId,
+          threadId,
+          message:
+            typeof requestDisplayMessage === "string" &&
+            requestDisplayMessage.trim()
+              ? requestDisplayMessage
+              : requestMessage,
+          attachments: requestAttachments,
+          ...(typeof queuedMessageId === "string" && queuedMessageId.trim()
+            ? { queuedMessageId: queuedMessageId.trim() }
+            : {}),
+          ...(agentKitMessageId ? { agentKitMessageId } : {}),
+          retryContext: retryContextFromRequest(body, (dropped) =>
+            console.warn(
+              `[agent-chat] dropped ${dropped} invalid reference(s) from a refused turn's retry context`,
+            ),
+          ),
+          failure: {
+            code: missingCredentialsEvent.errorCode,
+            message: missingCredentialsEvent.error,
+          },
+        });
+      }
       return new ReadableStream({
         start(controller) {
           controller.enqueue(
             encoder.encode(
-              `data: ${JSON.stringify({
-                type: "error",
-                error: LLM_MISSING_CREDENTIALS_MESSAGE,
-                errorCode: LLM_MISSING_CREDENTIALS_ERROR_CODE,
-              })}\n\n`,
+              `data: ${JSON.stringify(missingCredentialsEvent)}\n\n`,
             ),
           );
           controller.close();
@@ -3840,301 +11712,646 @@ export function createProductionAgentHandler(
       });
     }
 
-    // Run all independent pre-send steps in parallel. Each of these hits
-    // the DB or invokes an action; running them sequentially was the
-    // single biggest contributor to pre-LLM latency.
-    const enrichedMessagePromise = enrichMessage(requestMessage, references);
-    const loopSettingsPromise = readAgentLoopSettings({
-      userEmail: ownerEmail ?? getRequestUserEmail() ?? null,
-      orgId: getRequestOrgId() ?? null,
-    }).catch(() => readAgentLoopSettings({}));
-
-    let systemPromptError: any = null;
-    const systemPromptPromise = (async (): Promise<string> => {
-      try {
-        return typeof options.systemPrompt === "function"
-          ? await options.systemPrompt(event)
-          : options.systemPrompt;
-      } catch (error) {
-        systemPromptError = error;
-        return "";
+    attachmentHydrationBudget ??= createOwnedAttachmentHydrationBudget();
+    const resolvedHistoryImages = await hydrateStructuredHistoryImageReferences(
+      requestStructuredHistory,
+      { vision: modelSupportsVision, budget: attachmentHydrationBudget },
+    );
+    const modelPreparedContext = await preparedRequest?.prepareAfterModel?.({
+      model: effectiveModel,
+      vision: modelSupportsVision,
+      hydrationBudget: attachmentHydrationBudget,
+      historyImageUrls: attemptedStructuredHistoryImageUrls(
+        requestStructuredHistory,
+        resolvedHistoryImages,
+        modelSupportsVision,
+      ),
+    });
+    if (modelPreparedContext) {
+      if (Array.isArray(modelPreparedContext.contextAttachments)) {
+        requestContextAttachments = [
+          ...requestContextAttachments,
+          ...modelPreparedContext.contextAttachments,
+        ];
       }
-    })();
+      if (typeof modelPreparedContext.contextNote === "string") {
+        requestContextNote = [
+          requestContextNote,
+          modelPreparedContext.contextNote,
+        ]
+          .filter(Boolean)
+          .join("\n");
+      }
+    }
 
-    const screenContextPromise = (async (): Promise<string> => {
-      try {
-        const viewScreenAction = resolvedActions["view-screen"];
-        if (viewScreenAction) {
-          const result = await viewScreenAction.run(
-            {},
-            {
-              userEmail: getRequestUserEmail(),
-              orgId: getRequestOrgId() ?? null,
-              caller: "tool",
-            },
-          );
-          if (result && result !== "(no output)") {
-            const screenText =
-              typeof result === "string"
-                ? result
-                : JSON.stringify(result, null, 2);
-            return `\n\n<current-screen>\n${capScreenContext(screenText)}\n</current-screen>`;
-          }
-        } else {
-          const navigation = await readAppStateForBrowserTab(
-            "navigation",
-            requestBrowserTabId,
-          );
-          if (navigation) {
-            return `\n\n<current-screen>\n${capScreenContext(JSON.stringify(navigation, null, 2))}\n</current-screen>`;
-          }
+    setupMark("prepDone");
+    workerStep("env_config");
+    const enrichedMessageThunk = () =>
+      enrichMessage(requestMessage, requestReferences);
+    const loopSettingsThunk = () =>
+      readAgentLoopSettings({
+        userEmail: ownerEmail ?? getRequestUserEmail() ?? null,
+        orgId: getRequestOrgId() ?? null,
+      }).catch(() => readAgentLoopSettings({}));
+
+    let systemPromptError: Error | null = null;
+    const systemPromptThunk = (): Promise<string> =>
+      (async (): Promise<string> => {
+        const sysPromptStart = Date.now();
+        try {
+          const built =
+            typeof options.systemPrompt === "function"
+              ? await options.systemPrompt(event)
+              : options.systemPrompt;
+          return built;
+        } catch (error) {
+          systemPromptError =
+            error instanceof Error
+              ? error
+              : new Error(
+                  typeof error === "string" && error.trim()
+                    ? error
+                    : "system prompt preparation failed",
+                );
+          return "";
+        } finally {
+          setupMarks.sysPromptMs = Date.now() - sysPromptStart;
         }
-      } catch {
-        // DB not ready or no navigation state — skip silently
-      }
-      return "";
-    })();
+      })();
 
-    const urlContextPromise = (async (): Promise<string> => {
-      try {
-        const url = (await readAppStateForBrowserTab(
-          "__url__",
-          requestBrowserTabId,
-        )) as {
-          pathname?: string;
-          search?: string;
-          hash?: string;
-          searchParams?: Record<string, string>;
-        } | null;
-        if (url && (url.pathname || url.search || url.hash)) {
-          const lines: string[] = [];
-          if (url.pathname) lines.push(`pathname: ${url.pathname}`);
-          const extensionId = url.pathname
-            ? extensionIdFromPathname(url.pathname)
-            : null;
-          if (extensionId) lines.push(`extensionId: ${extensionId}`);
-          if (url.search) lines.push(`search: ${url.search}`);
-          if (url.hash) lines.push(`hash: ${url.hash}`);
-          if (url.searchParams && Object.keys(url.searchParams).length > 0) {
-            lines.push("searchParams:");
-            for (const [k, v] of Object.entries(url.searchParams)) {
-              lines.push(`  ${k}: ${v}`);
+    const timeContextThunk = (): Promise<string> =>
+      (async (): Promise<string> => {
+        try {
+          const tzRaw = getHeader(event, "x-user-timezone");
+          const timezone =
+            typeof tzRaw === "string" &&
+            tzRaw.trim().length > 0 &&
+            tzRaw.trim().length < 64
+              ? tzRaw.trim()
+              : undefined;
+          return buildCurrentTimeUserContext({ timezone });
+        } catch {
+          return buildCurrentTimeUserContext();
+        }
+      })();
+
+    // `empty` (no navigation yet) stays silent; a timeout or a throw adds a
+    // note, because the model would otherwise read it as an app with no page.
+    const screenStatuses: Record<
+      "screen" | "url" | "selection",
+      ContextStatus
+    > = { screen: "empty", url: "empty", selection: "empty" };
+    // Once a cap fires the model has the fallback note, so a read that
+    // resolves late must not change what the trace says it saw.
+    const noteScreenStatus = (
+      source: keyof typeof screenStatuses,
+      status: ContextStatus,
+    ) => {
+      if (screenStatuses[source] !== "timed_out") {
+        screenStatuses[source] = status;
+      }
+    };
+    const screenUnavailableNote = screenContextUnavailableNote(
+      Boolean(surfacedRequestActions["view-screen"]),
+    );
+    const screenContextThunk = (): Promise<string> =>
+      (async (): Promise<string> => {
+        const screenStart = Date.now();
+        try {
+          const viewScreenAction = surfacedRequestActions["view-screen"];
+          if (viewScreenAction) {
+            const result = await viewScreenAction.run(
+              {},
+              {
+                userEmail: getRequestUserEmail(),
+                orgId: getRequestOrgId() ?? null,
+                caller: "tool",
+              },
+            );
+            if (result && result !== "(no output)") {
+              const screenText =
+                typeof result === "string"
+                  ? result
+                  : JSON.stringify(result, null, 2);
+              noteScreenStatus("screen", "ok");
+              return `\n\n<current-screen>\n${capScreenContext(screenText)}\n</current-screen>`;
+            }
+          } else {
+            const navigation = await readAppStateForBrowserTab(
+              "navigation",
+              requestBrowserTabId,
+            );
+            if (navigation) {
+              noteScreenStatus("screen", "ok");
+              return `\n\n<current-screen>\n${capScreenContext(JSON.stringify(navigation, null, 2))}\n</current-screen>`;
             }
           }
-          return `\n\n<current-url>\n${lines.join("\n")}\n</current-url>`;
-        }
-      } catch {
-        // DB not ready — skip silently
-      }
-      return "";
-    })();
-
-    // Selection context: written by the client when the user presses Cmd+I
-    // with text selected on the page. Treat anything older than 5 minutes
-    // as stale and ignore it.
-    const SELECTION_TTL_MS = 5 * 60 * 1000;
-    const selectionContextPromise = (async (): Promise<string> => {
-      try {
-        const sel = (await readAppState("pending-selection-context")) as {
-          text?: string;
-          capturedAt?: number;
-        } | null;
-        if (!sel?.text) return "";
-        const capturedAt =
-          typeof sel.capturedAt === "number" ? sel.capturedAt : 0;
-        if (Date.now() - capturedAt > SELECTION_TTL_MS) return "";
-        return (
-          `\n\nThe user has selected the following text and pressed Cmd+I to focus the agent. ` +
-          `Treat this as the immediate context to act on:\n` +
-          `<selection>\n${capSelectionContext(sel.text)}\n</selection>`
-        );
-      } catch {
-        // DB not ready — skip silently
-      }
-      return "";
-    })();
-
-    // On the first message of a conversation, inject workspace inventory
-    // so the agent knows what files, skills, jobs, and custom agents exist.
-    // Templates can opt out via `skipFilesContext: true` when the inventory
-    // is unrelated to the app's job (e.g. a voice-first macro tracker).
-    const filesContextPromise = (async (): Promise<string> => {
-      let filesContext = "";
-      if (options.skipFilesContext) return filesContext;
-      if (history.length === 0) {
-        try {
-          const {
-            resourceListAccessible,
-            SHARED_OWNER,
-            WORKSPACE_OWNER,
-            resourceGet,
-          } = await import("../resources/store.js");
-          const {
-            getResourceKind,
-            parseCustomAgentProfile,
-            parseRemoteAgentManifest,
-            parseSkillMetadata,
-          } = await import("../resources/metadata.js");
-          const ownerEmail = getRequestUserEmail();
-          const orgId = getRequestOrgId();
-          if (!ownerEmail) throw new Error("no authenticated user");
-          const allResources = await resourceListAccessible(
-            ownerEmail,
-            undefined,
-            { userEmail: ownerEmail, orgId },
+        } catch (error) {
+          if (!hasAppStateIdentity()) return "";
+          noteScreenStatus("screen", "failed");
+          console.warn(
+            "[agent-chat] current-screen context unavailable:",
+            error instanceof Error ? error.message : String(error),
           );
+          return screenUnavailableNote;
+        } finally {
+          setupMarks.screenMs = Date.now() - screenStart;
+        }
+        return "";
+      })();
 
-          if (allResources.length > 0) {
-            const fileLines: string[] = [];
-            const skillLines: string[] = [];
-            const agentLines: string[] = [];
-            const jobLines: string[] = [];
-            for (const r of allResources) {
-              const scope =
-                r.owner === WORKSPACE_OWNER
+    const urlContextThunk = (): Promise<string> =>
+      (async (): Promise<string> => {
+        try {
+          const url = (await readAppStateForBrowserTab(
+            "__url__",
+            requestBrowserTabId,
+          )) as {
+            pathname?: string;
+            search?: string;
+            hash?: string;
+            searchParams?: Record<string, string>;
+          } | null;
+          if (url && (url.pathname || url.search || url.hash)) {
+            const lines: string[] = [];
+            if (url.pathname) lines.push(`pathname: ${url.pathname}`);
+            const extensionId = url.pathname
+              ? extensionIdFromPathname(url.pathname)
+              : null;
+            if (extensionId) lines.push(`extensionId: ${extensionId}`);
+            if (url.search) lines.push(`search: ${url.search}`);
+            if (url.hash) lines.push(`hash: ${url.hash}`);
+            if (url.searchParams && Object.keys(url.searchParams).length > 0) {
+              lines.push("searchParams:");
+              for (const [k, v] of Object.entries(url.searchParams)) {
+                lines.push(`  ${k}: ${v}`);
+              }
+            }
+            // The Settings shell names the page it resolved, which a legacy
+            // or mounted pathname doesn't say directly.
+            if (url.pathname?.includes("/settings")) {
+              const settingsPage = describeSettingsViewForAgent(
+                await readAppStateForBrowserTab(
+                  SETTINGS_VIEW_STATE_KEY,
+                  requestBrowserTabId,
+                ),
+              );
+              if (settingsPage) lines.push(settingsPage);
+            }
+            noteScreenStatus("url", "ok");
+            return `\n\n<current-url>\n${lines.join("\n")}\n</current-url>`;
+          }
+        } catch (error) {
+          if (!hasAppStateIdentity()) return "";
+          noteScreenStatus("url", "failed");
+          console.warn(
+            "[agent-chat] current-url context unavailable:",
+            error instanceof Error ? error.message : String(error),
+          );
+          return screenUnavailableNote;
+        }
+        return "";
+      })();
+
+    const SELECTION_TTL_MS = 5 * 60 * 1000;
+    const selectionContextThunk = (): Promise<string> =>
+      (async (): Promise<string> => {
+        if (requestSkipPendingSelectionContext === true) return "";
+        try {
+          const sel = (await readAppState("pending-selection-context")) as {
+            text?: string;
+            capturedAt?: number;
+          } | null;
+          if (!sel?.text) return "";
+          const capturedAt =
+            typeof sel.capturedAt === "number" ? sel.capturedAt : 0;
+          if (Date.now() - capturedAt > SELECTION_TTL_MS) return "";
+          noteScreenStatus("selection", "ok");
+          return (
+            `\n\nThe user has selected the following text and pressed Cmd I to focus the agent. ` +
+            `Treat this as the immediate context to act on:\n` +
+            `<selection>\n${capSelectionContext(sel.text)}\n</selection>`
+          );
+        } catch (error) {
+          if (!hasAppStateIdentity()) return "";
+          noteScreenStatus("selection", "failed");
+          console.warn(
+            "[agent-chat] selection context unavailable:",
+            error instanceof Error ? error.message : String(error),
+          );
+          return SELECTION_CONTEXT_UNAVAILABLE_NOTE;
+        }
+        return "";
+      })();
+
+    const filesContextThunk = (): Promise<string> =>
+      (async (): Promise<string> => {
+        let filesContext = "";
+        if (options.skipFilesContext || requestedHostedHarness) {
+          return filesContext;
+        }
+        if (requestHistory.length === 0) {
+          try {
+            const {
+              resourceListAccessible,
+              SHARED_OWNER,
+              isWorkspaceResourceOwner,
+              resourceGet,
+            } = await import("../resources/store.js");
+            const {
+              getResourceKind,
+              parseCustomAgentProfile,
+              parseRemoteAgentManifest,
+              parseSkillMetadata,
+            } = await import("../resources/metadata.js");
+            const ownerEmail = getRequestUserEmail();
+            const orgId = getRequestOrgId();
+            if (!ownerEmail) throw new Error("no authenticated user");
+            const allResources = await resourceListAccessible(
+              ownerEmail,
+              undefined,
+              { userEmail: ownerEmail, orgId },
+            );
+
+            if (allResources.length > 0) {
+              const fileLines: string[] = [];
+              const skillLines: string[] = [];
+              const agentLines: string[] = [];
+              const jobLines: string[] = [];
+              for (const r of allResources) {
+                const scope = isWorkspaceResourceOwner(r.owner)
                   ? "workspace"
                   : r.owner === SHARED_OWNER
                     ? "shared"
                     : "personal";
-              const kind = getResourceKind(r.path);
-              if (kind === "file") {
-                fileLines.push(`  ${r.path} (${scope})`);
-                continue;
-              }
+                const kind = getResourceKind(r.path);
+                if (kind === "file") {
+                  fileLines.push(`  ${r.path} (${scope})`);
+                  continue;
+                }
 
-              if (kind === "job") {
-                jobLines.push(`  ${r.path} (${scope})`);
-                continue;
-              }
+                if (kind === "job") {
+                  jobLines.push(`  ${r.path} (${scope})`);
+                  continue;
+                }
 
-              if (
-                kind === "skill" ||
-                kind === "agent" ||
-                kind === "remote-agent"
-              ) {
-                const full = await resourceGet(r.id, {
-                  userEmail: ownerEmail,
-                  orgId,
-                });
-                if (!full) continue;
-                if (kind === "skill") {
-                  const skill = parseSkillMetadata(full.content, r.path);
-                  skillLines.push(
-                    `  ${skill?.name || r.path} — ${compactInventoryDescription(skill?.description || r.path)} (${scope}, ${r.path})`,
-                  );
-                } else if (kind === "agent") {
-                  const agent = parseCustomAgentProfile(full.content, r.path);
-                  agentLines.push(
-                    `  ${agent?.name || r.path} — ${compactInventoryDescription(agent?.description || "Custom workspace agent")} (${scope}, ${r.path}${agent?.model ? `, model: ${agent.model}` : ""})`,
-                  );
-                } else {
-                  const agent = parseRemoteAgentManifest(full.content, r.path);
-                  agentLines.push(
-                    `  ${agent?.name || r.path} — ${compactInventoryDescription(agent?.description || "Connected A2A agent")} (${scope}, remote via ${r.path})`,
-                  );
+                if (
+                  kind === "skill" ||
+                  kind === "agent" ||
+                  kind === "remote-agent"
+                ) {
+                  const full = await resourceGet(r.id, {
+                    userEmail: ownerEmail,
+                    orgId,
+                  });
+                  if (!full) continue;
+                  if (kind === "skill") {
+                    const skill = parseSkillMetadata(full.content, r.path);
+                    skillLines.push(
+                      `  ${skill?.name || r.path} — ${compactInventoryDescription(skill?.description || r.path)} (${scope}, ${r.path})`,
+                    );
+                  } else if (kind === "agent") {
+                    const agent = parseCustomAgentProfile(full.content, r.path);
+                    agentLines.push(
+                      `  ${agent?.name || r.path} — ${compactInventoryDescription(agent?.description || "Custom workspace agent")} (${scope}, ${r.path}${agent?.model ? `, model: ${agent.model}` : ""})`,
+                    );
+                  } else {
+                    const agent = parseRemoteAgentManifest(
+                      full.content,
+                      r.path,
+                    );
+                    agentLines.push(
+                      `  ${agent?.name || r.path} — ${compactInventoryDescription(agent?.description || "Connected A2A agent")} (${scope}, remote via ${r.path})`,
+                    );
+                  }
                 }
               }
+              const blocks: string[] = [];
+              if (fileLines.length > 0) {
+                const lines = limitInventoryLines(fileLines, "files");
+                blocks.push(
+                  `<available-files>\nFiles in the workspace:\n${lines.join("\n")}\n\nTo read a resource file's contents, use the resources tool with action "read" and the file path.\n</available-files>`,
+                );
+              }
+              if (skillLines.length > 0) {
+                const lines = limitInventoryLines(skillLines, "skills");
+                blocks.push(
+                  `<available-skills>\nSkills in the workspace:\n${lines.join("\n")}\n\nBefore using a matching workspace skill, read its path with the resources tool using action "read"; slash-selected skills are inlined automatically when available.\n</available-skills>`,
+                );
+              }
+              if (agentLines.length > 0) {
+                const lines = limitInventoryLines(agentLines, "agents");
+                blocks.push(
+                  `<available-agents>\nCustom and connected agents in the workspace:\n${lines.join("\n")}\n\nCustom agents under agents/*.md can be mentioned or used via agent-teams (action: "spawn") with the agent parameter.\n</available-agents>`,
+                );
+              }
+              if (jobLines.length > 0) {
+                const lines = limitInventoryLines(jobLines, "jobs");
+                blocks.push(
+                  `<available-jobs>\nScheduled tasks in the workspace:\n${lines.join("\n")}\n</available-jobs>`,
+                );
+              }
+              filesContext =
+                blocks.length > 0 ? `\n\n${blocks.join("\n\n")}` : "";
             }
-            const blocks: string[] = [];
-            if (fileLines.length > 0) {
-              const lines = limitInventoryLines(fileLines, "files");
-              blocks.push(
-                `<available-files>\nFiles in the workspace:\n${lines.join("\n")}\n\nTo read a resource file's contents, use the resources tool with action "read" and the file path.\n</available-files>`,
-              );
-            }
-            if (skillLines.length > 0) {
-              const lines = limitInventoryLines(skillLines, "skills");
-              blocks.push(
-                `<available-skills>\nSkills in the workspace:\n${lines.join("\n")}\n\nBefore using a matching workspace skill, read its path with the resources tool using action "read"; slash-selected skills are inlined automatically when available.\n</available-skills>`,
-              );
-            }
-            if (agentLines.length > 0) {
-              const lines = limitInventoryLines(agentLines, "agents");
-              blocks.push(
-                `<available-agents>\nCustom and connected agents in the workspace:\n${lines.join("\n")}\n\nCustom agents under agents/*.md can be mentioned or used via agent-teams (action: "spawn") with the agent parameter.\n</available-agents>`,
-              );
-            }
-            if (jobLines.length > 0) {
-              const lines = limitInventoryLines(jobLines, "jobs");
-              blocks.push(
-                `<available-jobs>\nScheduled tasks in the workspace:\n${lines.join("\n")}\n</available-jobs>`,
-              );
-            }
-            filesContext =
-              blocks.length > 0 ? `\n\n${blocks.join("\n\n")}` : "";
+          } catch {
+            // Resources not available — skip silently
           }
-        } catch {
-          // Resources not available — skip silently
         }
-      }
-      return filesContext;
-    })();
+        return filesContext;
+      })();
 
-    const [
+    const presendCap = <T>(
+      label: string,
+      thunk: () => Promise<T>,
+      fallback: T,
+      ms: number,
+      onTimeout?: () => void,
+    ): Promise<T> => {
+      return resolvePresendWithCap({
+        enabled: isBackgroundWorker,
+        thunk,
+        fallback,
+        timeoutMs: ms,
+        onTimeout: () => {
+          onTimeout?.();
+          workerStep(`presend_timeout:${label}`);
+        },
+      });
+    };
+    const fallbackLoopSettings: AgentLoopSettings = {
+      maxIterations: getDefaultMaxIterations(),
+      defaultMaxIterations: getDefaultMaxIterations(),
+      minMaxIterations: MIN_AGENT_MAX_ITERATIONS,
+      maxMaxIterations: MAX_AGENT_MAX_ITERATIONS,
+      maxRunInputTokens: getDefaultMaxRunInputTokens(),
+      defaultMaxRunInputTokens: getDefaultMaxRunInputTokens(),
+      scope: "default",
+      source: "default",
+    };
+    const systemPromptTimeoutError = new Error(
+      "system prompt preparation timed out before the agent could start",
+    );
+    let [
       systemPrompt,
+      timeBlock,
       screenBlock,
       urlBlock,
       selectionBlock,
       filesContext,
       loopSettings,
       enrichedMessage,
+      jevContextCredentials,
+      priorConnection,
     ] = await Promise.all([
-      systemPromptPromise,
-      screenContextPromise,
-      urlContextPromise,
-      selectionContextPromise,
-      filesContextPromise,
-      loopSettingsPromise,
-      enrichedMessagePromise,
+      presendCap("systemPrompt", systemPromptThunk, "", 13000, () => {
+        // An empty configured prompt is valid, but an empty timeout fallback
+        // is not: required app instructions must either finish or fail before
+        // the model is called. Set the error synchronously with the cap so a
+        // late rejection/success cannot race the check below.
+        systemPromptError ??= systemPromptTimeoutError;
+      }),
+      presendCap("time", timeContextThunk, "", 9000),
+      presendCap(
+        "screen",
+        screenContextThunk,
+        screenUnavailableNote,
+        9000,
+        () => {
+          screenStatuses.screen = "timed_out";
+        },
+      ),
+      presendCap("url", urlContextThunk, screenUnavailableNote, 9000, () => {
+        screenStatuses.url = "timed_out";
+      }),
+      presendCap(
+        "selection",
+        selectionContextThunk,
+        SELECTION_CONTEXT_UNAVAILABLE_NOTE,
+        9000,
+        () => {
+          screenStatuses.selection = "timed_out";
+        },
+      ),
+      presendCap("files", filesContextThunk, "", 12000),
+      presendCap("loopSettings", loopSettingsThunk, fallbackLoopSettings, 9000),
+      presendCap("enrichedMessage", enrichedMessageThunk, requestMessage, 9000),
+      presendCap(
+        "jevContextCredentials",
+        () => getJevContextCredentials(ownerEmail ?? getRequestUserEmail()),
+        { apiKey: undefined, personalApiKey: undefined, builderAuth: null },
+        9000,
+      ),
+      presendCap(
+        "priorConnection",
+        // The foreground of a dispatched run never prompts the model; the
+        // worker re-reads, so reading here would pay for it twice.
+        (): Promise<PriorConnectionNote> =>
+          threadId && !dispatchToBackground
+            ? resolvePriorConnectionNote({
+                threadId,
+                orgId: getRequestOrgId() ?? null,
+                appId: options.appId,
+                excludeRunId: backgroundRunMarker?.runId,
+              })
+            : Promise.resolve({ status: "none" }),
+        { status: "unreadable", error: "timed out" },
+        9000,
+      ),
     ]);
+    setupMark("ctxAll");
+    workerStep("context_all");
 
     if (systemPromptError) {
+      if (isBackgroundWorker) throw systemPromptError;
       setResponseHeader(event, "Content-Type", "text/event-stream");
       setResponseHeader(event, "Cache-Control", "no-cache");
       const encoder = new TextEncoder();
-      const err = systemPromptError;
+      const err = systemPromptError as Error;
       return new ReadableStream({
         start(controller) {
           controller.enqueue(
             encoder.encode(
-              `data: ${JSON.stringify({ type: "error", error: `Failed to load system prompt: ${err?.message ?? String(err)}` })}\n\n`,
+              `data: ${JSON.stringify({ type: "error", error: `Failed to load system prompt: ${err.message}` })}\n\n`,
             ),
           );
           controller.close();
         },
       });
     }
-    const screenContext = screenBlock + urlBlock + selectionBlock;
-    const requestActions =
+    // Screen and URL share one note; the same failure needn't be told twice.
+    if (urlBlock === screenBlock) urlBlock = "";
+    const screenContext = timeBlock + screenBlock + urlBlock + selectionBlock;
+    // Referenced agents don't share this run's tools, so a note telling the
+    // model to call view-screen would send them looking for a tool they lack.
+    const withoutUnavailableNote = (block: string) =>
+      block === screenUnavailableNote ||
+      block === SELECTION_CONTEXT_UNAVAILABLE_NOTE
+        ? ""
+        : block;
+    const referencedAgentContext =
+      timeBlock +
+      withoutUnavailableNote(screenBlock) +
+      withoutUnavailableNote(urlBlock) +
+      withoutUnavailableNote(selectionBlock);
+    const screenStatus = worstContextStatus(...Object.values(screenStatuses));
+    const surfacedActionRegistry =
       requestMode === "plan"
-        ? createPlanModeActionRegistry(resolvedActions)
-        : resolvedActions;
-    const availableRequestTools = getEngineTools(requestActions);
-    const requestTools = filterInitialEngineTools(
-      availableRequestTools,
-      options.initialToolNames,
+        ? createPlanModeActionRegistry(surfacedRequestActions)
+        : surfacedRequestActions;
+    const requestActions = await filterActionsForAgentDiscovery(
+      surfacedActionRegistry,
+      {
+        caller: "tool",
+        userEmail: ownerEmail ?? undefined,
+        orgId: getRequestOrgId() ?? null,
+        appId: options.appId,
+      },
     );
+    const availableRequestTools = getEngineTools(requestActions);
+    const initialRequestTools = shouldFilterInitialRequestTools
+      ? filterInitialEngineTools(
+          availableRequestTools,
+          options.initialToolNames,
+        )
+      : availableRequestTools;
+    const curatedRequestTools =
+      requestMode === "plan"
+        ? preloadPlanModeEngineTools({
+            request: requestMessage,
+            registry: requestActions,
+            initialTools: initialRequestTools,
+            availableTools: availableRequestTools,
+          })
+        : initialRequestTools;
+    const jevContextMaxChars = options.jevContextCompact
+      ? Math.max(
+          0,
+          COMPACT_PROMPT_RESOURCES_TOTAL_MAX_CHARS - systemPrompt.length - 2,
+        )
+      : undefined;
+    const [requestTools, jevPreload] = await Promise.all([
+      preloadJevTools({
+        request: jevRequestContext,
+        skip: Boolean(internalContinuation || dispatchToBackground),
+        deadlineAt: contextPrefetchDeadlineAt,
+        apiKey: jevContextCredentials.apiKey,
+        personalApiKey: jevContextCredentials.personalApiKey,
+        builderAuth: jevContextCredentials.builderAuth,
+        registry: requestActions,
+        initialTools: curatedRequestTools,
+        availableTools: availableRequestTools,
+        readOnlyOnly: requestMode === "plan",
+      }),
+      preloadJevContextWithStatus({
+        request: jevRequestContext,
+        appId: options.appId,
+        owner: ownerEmail ?? undefined,
+        orgId: getRequestOrgId() ?? null,
+        apiKey: jevContextCredentials.apiKey,
+        personalApiKey: jevContextCredentials.personalApiKey,
+        builderAuth: jevContextCredentials.builderAuth,
+        compact: options.jevContextCompact,
+        maxChars: jevContextMaxChars,
+        contextPrefetchDeadlineAt,
+        dispatchToBackground,
+        internalContinuation: Boolean(internalContinuation),
+        candidates: jevPromptCandidates,
+        fallbackCandidateIds: jevFallbackCandidateIds,
+      }),
+    ]);
+    const jevContext = jevPreload.context;
+    if (jevContext) systemPrompt = `${systemPrompt}\n\n${jevContext}`;
+    const prefetchStatus = worstContextStatus(
+      jevPreload.status,
+      preparedReferenceStatus,
+    );
+    if (runContext) {
+      runContext.contextStatus = {
+        prefetch: prefetchStatus,
+        screen: screenStatus,
+      };
+    }
+    // Per-turn, so the stable system prompt prefix keeps caching.
+    const prefetchNote =
+      prefetchStatus && isContextDegraded(prefetchStatus)
+        ? preloadedContextUnavailableNote(prefetchStatus, {
+            // The other source delivered, so only part of the context is missing.
+            partial:
+              jevPreload.status === "ok" || preparedReferenceStatus === "ok",
+          })
+        : "";
+    const contextXraySystemSections = [
+      ...readContextXraySystemSections(event),
+      ...(jevContext
+        ? await buildSystemManifestSections([
+            {
+              label: "Jev-prefetched context",
+              provenance: "runtime-context",
+              governance: "inherited",
+              content: jevContext,
+              sourceRef: { scope: "jev" },
+            },
+          ])
+        : []),
+      ...(requestTools.length > 0
+        ? await buildSystemManifestSections([
+            {
+              label: "Action and MCP tool schemas",
+              provenance: "tools",
+              governance: "required",
+              content: requestTools
+                .map((tool) =>
+                  JSON.stringify({
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.inputSchema,
+                  }),
+                )
+                .join("\n"),
+              sourceRef: { scope: "tools" },
+            },
+          ])
+        : []),
+    ];
+    setupMark("actions");
+    workerStep("action_tool_setup");
     const requestSystemPrompt =
       requestMode === "plan"
         ? `${systemPrompt}\n\n${PLAN_MODE_SYSTEM_PROMPT}`
         : systemPrompt;
 
-    // Pre-compute agent references for A2A resolution inside the run
-    const agentRefs = references.filter((r) => r.type === "agent");
-    const customAgentRefs = references.filter((r) => r.type === "custom-agent");
+    const agentRefs = requestReferences.filter((r) => r.type === "agent");
+    const customAgentRefs = requestReferences.filter(
+      (r) => r.type === "custom-agent",
+    );
     const planModeAgentNote =
       requestMode === "plan" && agentRefs.length > 0
         ? "\n\n<plan-mode-note>Connected external agent mentions were not called because Plan mode is read-only. Mention that they can be called after the user switches to Act mode if the plan needs them.</plan-mode-note>"
         : "";
 
     const userContent = buildUserContentWithAttachments({
-      text: enrichedMessage + screenContext + filesContext + planModeAgentNote,
-      attachments: requestAttachments,
+      text:
+        enrichedMessage +
+        screenContext +
+        prefetchNote +
+        priorConnectionContextNote(priorConnection) +
+        filesContext +
+        planModeAgentNote +
+        (requestContextAttachments.length > 0
+          ? "\n\n<prior-chat-image-context>Images attached in earlier turns of this chat are included after the current text, in chronological order. Use them as prior references when relevant.</prior-chat-image-context>"
+          : "") +
+        (requestContextNote ? `\n\n${requestContextNote}` : ""),
+      attachments: [...requestContextAttachments, ...requestAttachments],
+      vision: modelSupportsVision,
     });
 
     const historyMessages =
-      structuredHistoryToEngineMessages(structuredHistory) ??
-      history
+      structuredHistoryToEngineMessages(
+        requestStructuredHistory,
+        resolvedHistoryImages,
+      ) ??
+      requestHistory
         .filter((m) => m.content.trim())
         .map(
           (m): EngineMessage => ({
@@ -4147,42 +12364,546 @@ export function createProductionAgentHandler(
       ...historyMessages,
       { role: "user" as const, content: userContent },
     ];
-
-    // Atomically claim the run slot for this thread. The claim checks SQL for
-    // a live (non-stale) running row so two near-simultaneous POSTs on
-    // different serverless isolates both see the correct state — a plain
-    // read-then-act check races on multi-isolate deployments because both
-    // reads see no running row before either insert commits.
-    if (threadId) {
-      const slot = await tryClaimRunSlot(threadId);
-      if (!slot.claimed) {
-        setResponseStatus(event, 409);
+    // The durable approval row is the authorization boundary. Do not require
+    // the client to reproduce the original structured history exactly: the UI
+    // may truncate tool arguments and intentionally assigns fresh replay ids.
+    // The loop still consumes only a matching server-created grant for the
+    // current owner/org/thread/turn/tool/input tuple.
+    const firstRequestPayloadDetail = buildFirstRequestPayloadDetail({
+      isFirstRequest: requestHistory.length === 0,
+      systemPrompt: requestSystemPrompt,
+      messages,
+      tools: requestTools,
+      availableToolCount: availableRequestTools.length,
+    });
+    const isChainedBackgroundContinuation =
+      isBackgroundWorker && backgroundContinuationCount > 0;
+    const isReaperSuccessor =
+      isBackgroundWorker &&
+      typeof mutableBody[AGENT_CHAT_RECOVERY_OF_RUN_FIELD] === "string" &&
+      Boolean(mutableBody[AGENT_CHAT_RECOVERY_OF_RUN_FIELD]);
+    const isClientTurnContinuation =
+      !isBackgroundWorker &&
+      internalContinuation === true &&
+      !continueOf &&
+      !approvedToolCallsForExecution?.length &&
+      typeof message === "string" &&
+      message.startsWith(AGENT_INTERNAL_CONTINUE_PROMPT) &&
+      typeof threadId === "string" &&
+      threadId.trim().length > 0 &&
+      typeof requestTurnId === "string" &&
+      requestTurnId.trim().length > 0;
+    const runId = backgroundRunMarker?.runId ?? generateRunId();
+    const effectiveThreadId = threadId ?? runId;
+    const effectiveTurnId =
+      typeof backgroundRunMarker?.turnId === "string" &&
+      backgroundRunMarker.turnId.trim()
+        ? backgroundRunMarker.turnId.trim()
+        : (resolvedApprovalTurnId ??
+          (typeof requestTurnId === "string" && requestTurnId.trim()
+            ? requestTurnId.trim()
+            : runId));
+    let durableDispatchPayload: string | undefined;
+    if (dispatchToBackground) {
+      try {
+        durableDispatchPayload = serializeDurableDispatchPayload({
+          ...body,
+          ...(Array.isArray(attachments) || requestAttachments.length > 0
+            ? { attachments: requestAttachments }
+            : {}),
+        } as unknown as Record<string, unknown>);
+      } catch (error) {
+        if (!(error instanceof DurableAttachmentReferenceRequiredError)) {
+          throw error;
+        }
+        setResponseStatus(event, 503);
         return {
-          error: "Run already in progress for this thread",
-          activeRunId: slot.activeRunId,
+          error: error.message,
+          code: error.code,
+          retryable: false,
         };
       }
     }
+    const foregroundSelfChainEligible =
+      !isBackgroundWorker &&
+      !dispatchToBackground &&
+      typeof threadId === "string" &&
+      threadId.trim().length > 0 &&
+      isAgentChatForegroundSelfChainEnabled();
+    let foregroundRunRowInserted = false;
 
-    // Start agent loop in background via run-manager
-    const runId = generateRunId();
-    const effectiveThreadId = threadId ?? runId;
-    const effectiveTurnId =
-      typeof requestTurnId === "string" && requestTurnId.trim()
-        ? requestTurnId.trim()
-        : runId;
+    if (threadId && !isBackgroundWorker) {
+      if (
+        typeof requestTurnId === "string" &&
+        requestTurnId &&
+        (await isTurnAborted(threadId, requestTurnId))
+      ) {
+        return { ok: true, stopped: true };
+      }
+      const setupResumeOfRunId = setupResumeRefusedRunId(body);
+      const setupResumeClaim =
+        setupResumeOfRunId && ownerEmail
+          ? await claimSetupResume({
+              ownerEmail,
+              threadId,
+              refusedRunId: setupResumeOfRunId,
+              turnId: effectiveTurnId,
+            })
+          : undefined;
+      if (setupResumeOfRunId && ownerEmail && !setupResumeClaim) {
+        // Another tab already sent this refused prompt again.
+        return { ok: true, stopped: true, resumeAlreadySent: true };
+      }
+      let slot;
+      try {
+        slot = await tryClaimRunSlot(threadId, runId, undefined, {
+          turnId: effectiveTurnId,
+          ...(turnInitiator ? { turnInitiator } : {}),
+          replayCompletedTurn:
+            typeof requestTurnId === "string" &&
+            Boolean(requestTurnId.trim()) &&
+            !approvedToolCallsForExecution,
+          dispatchMode: dispatchToBackground
+            ? "background"
+            : foregroundSelfChainEligible
+              ? "foreground-self-chain"
+              : "foreground",
+          ...(dispatchToBackground
+            ? { dispatchPayload: durableDispatchPayload }
+            : {}),
+          ...(continueOf ? { continueOf } : {}),
+        });
+      } catch (error) {
+        await setupResumeClaim?.release();
+        if (
+          error instanceof AgentTurnInitiatorMismatchError ||
+          error instanceof AgentTurnInitiatorUnavailableError
+        ) {
+          setResponseStatus(event, 409);
+          return { error: "This agent turn cannot resume for this initiator" };
+        }
+        throw error;
+      }
+      if (slot.turnAborted) {
+        await setupResumeClaim?.release();
+        return { ok: true, stopped: true };
+      }
+      if (slot.continueRefused) {
+        await setupResumeClaim?.release();
+        setResponseStatus(event, 409);
+        return continueRefusal(slot.continueRefused);
+      }
+      if (slot.completedRunId) {
+        const stream = await replayCompletedTurn(threadId, effectiveTurnId);
+        if (!stream) {
+          setResponseStatus(event, 500);
+          return { error: "Failed to replay completed agent run" };
+        }
+        setResponseHeader(event, "Content-Type", "text/event-stream");
+        setResponseHeader(event, "Cache-Control", "no-cache");
+        setResponseHeader(event, "Connection", "keep-alive");
+        setResponseHeader(event, "X-Run-Id", slot.completedRunId);
+        setResponseHeader(event, "X-Dispatch-Mode", "replay");
+        return stream;
+      }
+      if (!slot.claimed) {
+        await setupResumeClaim?.release();
+        return runSlotBusy(event, slot.activeRunId);
+      }
+      foregroundRunRowInserted = true;
+    }
+
+    const approvalStoreBinding = (
+      binding: AgentApprovalBinding,
+    ): AgentToolApprovalBinding => {
+      if (!ownerEmail) {
+        throw new Error(
+          "Cannot create or consume an approval without an authenticated owner",
+        );
+      }
+      return {
+        ownerEmail,
+        orgId: getRequestOrgId() ?? null,
+        threadId: effectiveThreadId,
+        turnId: effectiveTurnId,
+        toolName: binding.toolName,
+        callId: binding.callId,
+        approvalKey: binding.approvalKey,
+        ...(binding.approvalId ? { approvalId: binding.approvalId } : {}),
+      };
+    };
+    const approvalHooks = {
+      onApprovalRequired: async (binding: AgentApprovalBinding) => {
+        return createAgentToolApproval(approvalStoreBinding(binding));
+      },
+      consumeApproval: async (binding: AgentApprovalBinding) => {
+        if (!ownerEmail) return false;
+        return consumeAgentToolApproval(approvalStoreBinding(binding));
+      },
+      isToolAlwaysAllowed: async (binding: AgentApprovalBinding) => {
+        if (!ownerEmail) return false;
+        return isAgentToolAlwaysAllowed({
+          ownerEmail,
+          orgId: getRequestOrgId() ?? null,
+          toolName: binding.toolName,
+        });
+      },
+    };
+    if (
+      isBackgroundWorker &&
+      (await isTurnAborted(effectiveThreadId, effectiveTurnId))
+    ) {
+      await markRunAborted(runId, "user").catch(() => {});
+      return { ok: true, stopped: true };
+    }
     const messageToPersist =
       typeof requestDisplayMessage === "string" &&
       requestDisplayMessage.trim().length > 0
         ? requestDisplayMessage
         : requestMessage;
-    if (options.onRunPrepared && !internalContinuation) {
-      await options.onRunPrepared({
+    const priorTurnInputTokensFromBody = Number(
+      (body as unknown as Record<string, unknown>)[
+        AGENT_CHAT_TURN_INPUT_TOKENS_FIELD
+      ],
+    );
+    let turnInputTokens = Number.isFinite(priorTurnInputTokensFromBody)
+      ? Math.max(0, priorTurnInputTokensFromBody)
+      : 0;
+
+    // A server successor and a continuation, automatic or chosen, resume the
+    // same turn the same way: the thread's tool calls and results, plus the turn's
+    // journal of finished steps, so nothing already done is sent again.
+    if (
+      (isChainedBackgroundContinuation ||
+        isReaperSuccessor ||
+        continueOf ||
+        isClientTurnContinuation) &&
+      effectiveThreadId
+    ) {
+      try {
+        const { getThread } = await import("../chat-threads/store.js");
+        const { latestPromptTurnId, resumeThreadHistoryForRequest } =
+          await import("./thread-data-builder.js");
+        const threadData =
+          isReaperSuccessor && !continueOf
+            ? undefined
+            : (await getThread(effectiveThreadId))?.threadData;
+        const { messages: resumed, foundTurnPrompt } =
+          isReaperSuccessor && !continueOf
+            ? { messages: [...messages], foundTurnPrompt: true }
+            : resumeThreadHistoryForRequest(threadData);
+        // A continuation always follows a stopped run, so a thread without
+        // that turn's prompt means its history was lost, not that there was
+        // none. A successor stays best-effort and resumes from what is there.
+        if ((continueOf || isClientTurnContinuation) && !foundTurnPrompt) {
+          throw new Error(`thread ${effectiveThreadId} has no turn prompt`);
+        }
+        // Resuming takes the thread's newest prompt, so a newer one, even one
+        // whose run never started, would run under this turn's journal.
+        const promptTurnId =
+          (continueOf || isClientTurnContinuation) && threadData
+            ? latestPromptTurnId(threadData)
+            : undefined;
+        if (promptTurnId && promptTurnId !== effectiveTurnId) {
+          if (await updateRunStatusIfRunning(runId, "errored")) {
+            await setRunTerminalReason(runId, CONTINUE_UNAVAILABLE_CODE);
+          }
+          setResponseStatus(event, 409);
+          return continueRefusal(CONTINUE_UNAVAILABLE_CODE);
+        }
+        if (resumed.length > 0) {
+          const actionPreparationTool =
+            typeof backgroundRunMarker?.actionPreparationTool === "string" &&
+            backgroundRunMarker.actionPreparationTool.trim()
+              ? backgroundRunMarker.actionPreparationTool.trim()
+              : undefined;
+          const continuationReason = isAgentLoopContinuationReason(
+            backgroundRunMarker?.continuationReason,
+          )
+            ? backgroundRunMarker.continuationReason
+            : isReaperSuccessor
+              ? "network_interrupted"
+              : isClientTurnContinuation
+                ? "stream_ended"
+                : "run_timeout";
+          const journalRead = await loadPriorTurnToolCallJournal(
+            effectiveThreadId,
+            effectiveTurnId,
+          );
+          if (
+            (continueOf || isReaperSuccessor || isClientTurnContinuation) &&
+            journalRead.status === "unreadable"
+          ) {
+            throw new Error(journalRead.error);
+          }
+          appendRequestAttachmentContextToResumedHistory(
+            resumed,
+            requestAttachments,
+            {
+              vision: isAgentModelVisionCapable(
+                effectiveModel,
+                engine.capabilities.vision === true,
+              ),
+            },
+          );
+          const context = buildTurnResumeContext({
+            messages: resumed,
+            journal:
+              journalRead.status === "read"
+                ? journalRead.toolCallJournal
+                : null,
+            ...(isReaperSuccessor && journalRead.status === "read"
+              ? { events: journalRead.events }
+              : {}),
+          });
+          appendAgentLoopContinuation(context.messages, continuationReason, {
+            ...(actionPreparationTool ? { actionPreparationTool } : {}),
+            ...(context.journalNote
+              ? { journalNote: context.journalNote }
+              : {}),
+          });
+          messages.length = 0;
+          messages.push(...context.messages);
+        }
+      } catch (error) {
+        if (continueOf || isReaperSuccessor || isClientTurnContinuation) {
+          // The browser's history lacks the stopped run's tool results, so
+          // continuing from it could repeat a step that already finished.
+          console.warn(
+            `[agent-chat] auto-continue history unreadable for thread ${effectiveThreadId}:`,
+            error,
+          );
+          const code = isReaperSuccessor
+            ? "recovery_history_unreadable"
+            : "auto_continue_history_unreadable";
+          if (await updateRunStatusIfRunning(runId, "errored")) {
+            await setRunTerminalReason(runId, code);
+          }
+          setResponseStatus(event, 503);
+          return {
+            error: "This turn's history could not be read to continue it.",
+            code,
+            retryable: true,
+          };
+        }
+        // Keep the body-derived messages — never drop the run.
+      }
+    }
+    if (
+      !isBackgroundWorker &&
+      !internalContinuation &&
+      threadId &&
+      historyMessages.length === 0
+    ) {
+      try {
+        const { getThread } = await import("../chat-threads/store.js");
+        const { recoverThreadHistoryForRequest } =
+          await import("./thread-data-builder.js");
+        const recovered = recoverThreadHistoryForRequest(
+          (await getThread(threadId))?.threadData,
+        );
+        if (recovered.length > 0) messages.unshift(...recovered);
+      } catch (err) {
+        console.warn(
+          `[agent-chat] history recovery failed for thread ${threadId}; continuing with no prior context:`,
+          err,
+        );
+      }
+    }
+    if (!internalContinuation && !isChainedBackgroundContinuation && threadId) {
+      try {
+        const { loadStoppedPreviousTurnNote } =
+          await import("./previous-turn-note.js");
+        const note = await loadStoppedPreviousTurnNote(
+          threadId,
+          effectiveTurnId,
+        );
+        const prompt = messages.at(-1);
+        if (note && prompt?.role === "user") {
+          prompt.content = [{ type: "text", text: note }, ...prompt.content];
+        }
+      } catch (err) {
+        captureError(err, {
+          tags: { source: "agent-chat", failureClass: "previous-turn-note" },
+          extra: { threadId, turnId: effectiveTurnId },
+        });
+      }
+    }
+    setupMark("depsThread");
+    workerStep("owner_thread");
+
+    if (options.onRunPrepared && !internalContinuation && !isBackgroundWorker) {
+      try {
+        await options.onRunPrepared({
+          runId,
+          turnId: effectiveTurnId,
+          threadId,
+          message: messageToPersist,
+          ...(agentKitMessageId ? { agentKitMessageId } : {}),
+          attachments: requestAttachments,
+          ...(typeof queuedMessageId === "string" && queuedMessageId.trim()
+            ? { queuedMessageId: queuedMessageId.trim() }
+            : {}),
+          ...(typeof queuedMessageClaimId === "string" &&
+          queuedMessageClaimId.trim()
+            ? { queuedMessageClaimId: queuedMessageClaimId.trim() }
+            : {}),
+        });
+      } catch (error) {
+        if (foregroundRunRowInserted) {
+          const terminalized = await updateRunStatusIfRunning(runId, "errored");
+          if (terminalized) {
+            await setRunTerminalReason(runId, "run_preparation_failed");
+            await setRunError(
+              runId,
+              "run_preparation_failed",
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+        }
+        throw error;
+      }
+    }
+
+    if (dispatchToBackground) {
+      let backgroundRowInserted = foregroundRunRowInserted;
+      if (!backgroundRowInserted) {
+        try {
+          await insertRun(runId, effectiveThreadId, effectiveTurnId, {
+            dispatchMode: "background",
+            dispatchPayload: durableDispatchPayload!,
+            ...(turnInitiator ? { turnInitiator } : {}),
+          });
+          backgroundRowInserted = true;
+        } catch (err) {
+          if (err instanceof ServicePrincipalRefusedError) throw err;
+          console.error(
+            "[agent-chat] background insertRun failed; falling back to inline:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+
+      if (
+        backgroundRowInserted &&
+        (await isTurnAborted(effectiveThreadId, effectiveTurnId))
+      ) {
+        await markRunAborted(runId, "user");
+        return { ok: true, stopped: true };
+      }
+
+      let dispatched = false;
+      const backgroundDispatchPath = resolveAgentChatProcessRunDispatchPath();
+      const expectsNetlifyBackgroundFunction =
+        dispatchPathTargetsNetlifyBackgroundFunction(backgroundDispatchPath);
+      try {
+        await fireInternalDispatch({
+          event,
+          // On hosted Netlify this resolves to the background function's DEFAULT
+          // url (/.netlify/functions/<name>, or per-app <app>-agent-background for
+          // workspaces) — the function declares NO custom config.path, so it keeps
+          // its default url, and `background: true` makes that url async (202,
+          // 15-min budget). The `server` /* catch-all already excludes /.netlify/*
+          // so it never shadows it. Off-Netlify this resolves to the framework
+          // `_process-run` route and the same in-process catch-all handles it
+          // inline. `fireInternalDispatch` strips the app base path for
+          // /.netlify/* targets so the request reaches the host-root function url;
+          // the Authorization Bearer HMAC is preserved either way.
+          path: backgroundDispatchPath,
+          taskId: runId,
+          ...(expectsNetlifyBackgroundFunction
+            ? { awaitResponse: true, responseTimeoutMs: 5_000 }
+            : {}),
+          body: backgroundRowInserted
+            ? {
+                [AGENT_CHAT_BACKGROUND_RUN_FIELD]: {
+                  runId,
+                  turnId: effectiveTurnId,
+                  backgroundFunctionRuntimeExpected:
+                    expectsNetlifyBackgroundFunction,
+                  payloadRef: true,
+                },
+              }
+            : {
+                ...body,
+                [AGENT_CHAT_BACKGROUND_RUN_FIELD]: {
+                  runId,
+                  turnId: effectiveTurnId,
+                  backgroundFunctionRuntimeExpected:
+                    expectsNetlifyBackgroundFunction,
+                },
+              },
+        });
+        dispatched = true;
+      } catch (err) {
+        console.error(
+          "[agent-chat] background dispatch failed; falling back to inline:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+
+      const backgroundOutcome = await resolveBackgroundDispatchOutcome({
+        dispatched,
+        backgroundRowInserted,
         runId,
-        threadId,
-        message: messageToPersist,
-        attachments: requestAttachments,
+        graceMs: BACKGROUND_CLAIM_GRACE_MS,
+        reaperGraceMs: UNCLAIMED_BACKGROUND_RUN_GRACE_MS,
+        pollIntervalMs: BACKGROUND_CLAIM_POLL_MS,
+        readClaim: readBackgroundRunClaim,
+        claim: claimBackgroundRun,
+        streamWhenWorkerAlive: true,
       });
+
+      if (
+        backgroundOutcome.action === "stream" ||
+        backgroundOutcome.action === "subscribe"
+      ) {
+        const stream = subscribeToRun(runId, 0);
+        if (stream) {
+          setResponseHeader(event, "Content-Type", "text/event-stream");
+          setResponseHeader(event, "Cache-Control", "no-cache");
+          setResponseHeader(event, "Connection", "keep-alive");
+          setResponseHeader(event, "X-Run-Id", runId);
+          setResponseHeader(event, "X-Dispatch-Mode", "background");
+          return stream;
+        }
+        const terminalReason =
+          backgroundOutcome.action === "stream"
+            ? "background_subscribe_failed"
+            : "background_dispatch_failed";
+        const statusUpdated = await updateRunStatusIfRunning(
+          runId,
+          "errored",
+        ).catch(() => false);
+        if (statusUpdated) {
+          await setRunTerminalReason(runId, terminalReason).catch(() => {});
+        }
+        setResponseStatus(event, 500);
+        return {
+          error:
+            backgroundOutcome.action === "stream"
+              ? "Failed to subscribe to background run"
+              : "Failed to dispatch background run",
+        };
+      }
+
+      if (backgroundOutcome.reason === "worker-never-claimed") {
+        const priorClaim = await readBackgroundRunClaim(runId).catch(
+          () => null,
+        );
+        const priorDiag = priorClaim?.diagStage ?? "none";
+        console.error(
+          "[agent-chat] background worker did not claim the 202-dispatched run " +
+            `within grace; recovering inline. bgFnPriorDiag=${priorDiag}`,
+          runId,
+        );
+        await recordRunDiagnostic(
+          runId,
+          RUN_DIAG_STAGE.foregroundInlineRecovery,
+          `202 dispatched but no worker claimed within grace; bgFnPriorDiag=${priorDiag}`,
+        ).catch(() => {});
+      }
+      // Fall through to the inline `startRun` path below.
     }
 
     const trackedProgressOwner =
@@ -4198,13 +12919,30 @@ export function createProductionAgentHandler(
           turnId: effectiveTurnId,
         }
       : null;
+    const noProgressRepeatForRun = (run: ActiveRun) =>
+      resolveBackgroundNoProgressRepeat({
+        run,
+        priorErrorCode: priorNoProgressErrorCode,
+        priorCount: priorNoProgressCount,
+      });
+    const willChainBackgroundContinuation = (run: ActiveRun) =>
+      shouldChainBackgroundContinuation({
+        isBackgroundWorker,
+        run,
+        continuationCount: backgroundContinuationCount,
+        foregroundSelfChainEligible,
+        dispatchedToBackground: dispatchToBackground,
+        priorNoProgressErrorCode,
+        priorNoProgressCount,
+        priorContinuationReason,
+      });
 
     const completeTrackedProgressRun = async (
       run: ActiveRun,
       completionError?: unknown,
     ) => {
       if (!trackedProgressRunId || !trackedProgressOwner) return;
-      if (!completionError && endsAtInternalContinuationBoundary(run)) {
+      if (!completionError && willChainBackgroundContinuation(run)) {
         return;
       }
       const terminalStatus =
@@ -4241,13 +12979,15 @@ export function createProductionAgentHandler(
       const now = Date.now();
       if (now - lastTrackedProgressUpdateAt < 15_000) return;
       lastTrackedProgressUpdateAt = now;
-      void updateRunProgress(trackedProgressRunId, trackedProgressOwner, {
-        step,
-        metadata: {
-          ...(trackedProgressMetadata ?? {}),
-          runId,
-        },
-      }).catch(() => {});
+      void retainRequestDbPoolScope(
+        updateRunProgress(trackedProgressRunId, trackedProgressOwner, {
+          step,
+          metadata: {
+            ...(trackedProgressMetadata ?? {}),
+            runId,
+          },
+        }).catch(() => {}),
+      );
     };
 
     if (trackedProgressRunId && trackedProgressOwner && !internalContinuation) {
@@ -4260,43 +13000,242 @@ export function createProductionAgentHandler(
       }).catch(() => {});
     }
 
-    const handleRunComplete =
+    const baseHandleRunComplete =
       options.onRunComplete || trackedProgressRunId
         ? async (run: ActiveRun) => {
             try {
-              await options.onRunComplete?.(run, threadId);
+              await runCompletionCallbackWithDatabaseRetry(() =>
+                options.onRunComplete?.(
+                  run,
+                  threadId,
+                  completionTrackingSource,
+                ),
+              );
             } catch (err) {
               await completeTrackedProgressRun(run, err);
               throw err;
+            } finally {
+              completionTrackingSource = undefined;
             }
             await completeTrackedProgressRun(run);
           }
         : undefined;
 
-    startRun(
+    const handleRunComplete =
+      isBackgroundWorker || foregroundSelfChainEligible || baseHandleRunComplete
+        ? async (run: ActiveRun) => {
+            if (
+              isBackgroundWorker &&
+              run.status === "errored" &&
+              !willChainBackgroundContinuation(run)
+            ) {
+              const errEvent = [...run.events]
+                .reverse()
+                .find((e) => e.event.type === "error")?.event as
+                | { error?: string; errorCode?: string }
+                | undefined;
+              await recordRunDiagnostic(
+                run.runId,
+                RUN_DIAG_STAGE.workerThrew,
+                errEvent?.errorCode || errEvent?.error
+                  ? `${errEvent.errorCode ?? ""} ${errEvent.error ?? ""}`.trim()
+                  : "run ended in errored state",
+              ).catch(() => {});
+            }
+            const noProgressRepeat = noProgressRepeatForRun(run);
+            if (rateLimitChainCapTripped({ run, priorContinuationReason })) {
+              installRateLimitChainCapTerminalEvent(run);
+            } else if (noProgressRepeat.tripped) {
+              installBackgroundNoProgressTerminalEvent(run, noProgressRepeat);
+            }
+
+            await baseHandleRunComplete?.(run);
+
+            if (noProgressRepeat.tripped) {
+              if (run.continuationTerminalEvent?.type === "error") {
+                console.error(
+                  `[agent-chat] stopping background chain: ${noProgressRepeat.errorCode} ` +
+                    `failed ${noProgressRepeat.count}x with no progress`,
+                  run.runId,
+                );
+                await recordRunDiagnostic(
+                  run.runId,
+                  RUN_DIAG_STAGE.workerThrew,
+                  `chain_stopped_no_progress code=${noProgressRepeat.errorCode} count=${noProgressRepeat.count}`,
+                ).catch(() => {});
+              }
+            } else if (
+              rateLimitChainCapTripped({ run, priorContinuationReason })
+            ) {
+              if (run.continuationTerminalEvent?.type === "error") {
+                console.error(
+                  `[agent-chat] stopping background chain: rate-limit cap reached ` +
+                    `(second consecutive rate-limited chunk)`,
+                  run.runId,
+                );
+                await recordRunDiagnostic(
+                  run.runId,
+                  RUN_DIAG_STAGE.workerThrew,
+                  `chain_stopped_rate_limited`,
+                ).catch(() => {});
+              }
+            } else if (willChainBackgroundContinuation(run)) {
+              await chainServerDrivenContinuation({
+                event,
+                run,
+                effectiveThreadId,
+                effectiveTurnId,
+                requestBody: {
+                  ...body,
+                  ...(Array.isArray(attachments) ||
+                  requestAttachments.length > 0
+                    ? { attachments: requestAttachments }
+                    : {}),
+                } as unknown as Record<string, unknown>,
+                backgroundContinuationCount,
+                noProgressRepeat,
+                turnInputTokens,
+                chainViaDurableBackground:
+                  isAgentChatDurableBackgroundEnabled({
+                    appOptIn: options.durableBackgroundRuns,
+                  }) && !runsInBackgroundFunction,
+                turnInitiator,
+                workerProvenInBackgroundFunction: runsInBackgroundFunction,
+              });
+            }
+          }
+        : undefined;
+
+    if (isBackgroundWorker) {
+      if (!backgroundRunClaimedEarly) {
+        await recordRunDiagnostic(
+          runId,
+          RUN_DIAG_STAGE.workerEntered,
+          [
+            `runsInBackgroundFunction=${runsInBackgroundFunction}`,
+            `continuationCount=${backgroundContinuationCount}`,
+            backgroundRuntimeDetail,
+          ]
+            .filter(Boolean)
+            .join(" "),
+        ).catch(() => {});
+        if (isChainedBackgroundContinuation) {
+          await insertRun(runId, effectiveThreadId, effectiveTurnId, {
+            dispatchMode: "background",
+            ...(turnInitiator ? { turnInitiator } : {}),
+          }).catch((error) => {
+            if (error instanceof ServicePrincipalRefusedError) throw error;
+          });
+        }
+        const won = await claimBackgroundRun(runId);
+        if (!won) {
+          await recordRunDiagnostic(
+            runId,
+            RUN_DIAG_STAGE.workerClaimLost,
+          ).catch(() => {});
+          return { ok: true, skipped: "already-claimed" };
+        }
+        await recordRunDiagnostic(runId, RUN_DIAG_STAGE.workerClaimed).catch(
+          () => {},
+        );
+        await updateRunHeartbeat(runId).catch(() => {});
+      }
+    }
+
+    setupMark("preStart");
+    workerStep("prestart");
+    const setupDetail =
+      Object.entries(setupMarks)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(" ") +
+      ` total=${Date.now() - setupT0}` +
+      (backgroundRuntimeDetail ? ` ${backgroundRuntimeDetail}` : "") +
+      firstRequestPayloadDetail;
+    // Only slow setups are logged: the reported delay is seconds, and the
+    // marks show which step owns it.
+    if (Date.now() - setupT0 >= 1_000) {
+      console.warn(`[agent-chat] slow run setup runId=${runId} ${setupDetail}`);
+    }
+
+    const isSynchronousSelfChainContinuation =
+      isBackgroundWorker &&
+      !runsInBackgroundFunction &&
+      !isAgentChatDurableBackgroundEnabled({
+        appOptIn: options.durableBackgroundRuns,
+      });
+    const selfChainBudget = isSynchronousSelfChainContinuation
+      ? resolveSelfChainContinuationBudget(
+          Date.now() - setupT0,
+          resolveRunSoftTimeoutMs(options.runSoftTimeoutMs, {
+            useHostedDefault: true,
+            backgroundFunction: false,
+          }),
+        )
+      : null;
+
+    const resolvedRunSoftTimeoutMs = resolveRunSoftTimeoutMs(
+      selfChainBudget && !selfChainBudget.skipToBoundary
+        ? selfChainBudget.softTimeoutMs
+        : options.runSoftTimeoutMs,
+      {
+        useHostedDefault: true,
+        backgroundFunction: runsInBackgroundFunction,
+      },
+    );
+
+    const startedRun = startRun(
       runId,
       effectiveThreadId,
-      async (rawSend, signal) => {
+      async (rawSend, signal, control) => {
         const send = (event: AgentChatEvent) => {
           rawSend(event);
           updateTrackedProgressFromEvent(event);
         };
 
-        send({ type: "activity", label: "Starting agent" });
-
-        // Notify listeners that a run has started (used by agent teams)
-        if (options.onRunStart) {
-          await options.onRunStart(send, threadId ?? runId);
+        if (selfChainBudget?.skipToBoundary) {
+          await recordRunDiagnostic(
+            runId,
+            RUN_DIAG_STAGE.workerSetupStep,
+            `self_chain_budget_exhausted elapsed=${Date.now() - setupT0}ms`,
+          ).catch(() => {});
+          send({ type: "auto_continue", reason: "run_timeout" });
+          return;
         }
 
-        // Resolve custom workspace agent mentions first.
+        send({
+          type: "activity",
+          id: `agentkit:internal:${runId}:starting-agent`,
+          label: "Starting agent",
+        });
+
+        if (isBackgroundWorker) {
+          await recordRunDiagnostic(
+            runId,
+            RUN_DIAG_STAGE.workerStarted,
+            setupDetail,
+          ).catch(() => {});
+        } else {
+          void retainRequestDbPoolScope(
+            recordRunDiagnostic(
+              runId,
+              RUN_DIAG_STAGE.setupTimings,
+              setupDetail,
+            ).catch(() => {}),
+          ).catch(() => {});
+        }
+
+        if (options.onRunStart) {
+          await options.onRunStart(send, threadId ?? runId, runId);
+        }
+
+        const unknownWriteToolNames = new Set<string>();
         if (customAgentRefs.length > 0) {
           const ownerEmail = getRequestUserEmail();
           if (!ownerEmail) throw new Error("no authenticated user");
           const { findAccessibleCustomAgent } =
             await import("../resources/agents.js");
           const customResults = await Promise.allSettled(
-            customAgentRefs.map(async (ref) => {
+            customAgentRefs.map(async (ref, index) => {
               send({
                 type: "agent_call",
                 agent: ref.name,
@@ -4314,7 +13253,11 @@ export function createProductionAgentHandler(
                 const profilePrompt =
                   `${requestSystemPrompt}\n\n<custom-agent-profile name="${profile.name}" path="${profile.path}">\n` +
                   (profile.description ? `${profile.description}\n\n` : "") +
-                  `${profile.instructions}\n</custom-agent-profile>`;
+                  `${profile.instructions}` +
+                  (profile.workspace?.resources.length
+                    ? `\n\nAgent pack resources (read these with the resources tools when relevant):\n${profile.workspace.resources.map((resource) => `- ${resource.path}${resource.name ? ` (${resource.name})` : ""}`).join("\n")}`
+                    : "") +
+                  `\n</custom-agent-profile>`;
 
                 let responseText = "";
                 const subUsage = await runAgentLoop({
@@ -4323,15 +13266,26 @@ export function createProductionAgentHandler(
                   systemPrompt: profilePrompt,
                   tools: requestTools,
                   availableTools: availableRequestTools,
-                  messages: [
-                    {
-                      role: "user",
-                      content: [
-                        { type: "text", text: enrichedMessage + screenContext },
+                  messages: internalContinuation
+                    ? structuredClone(messages)
+                    : [
+                        {
+                          role: "user",
+                          content: [
+                            {
+                              type: "text",
+                              text: enrichedMessage + referencedAgentContext,
+                            },
+                          ],
+                        },
                       ],
-                    },
-                  ],
                   actions: requestActions,
+                  runId,
+                  threadId: effectiveThreadId,
+                  turnId: effectiveTurnId,
+                  beforeWrite: control.flushEvents,
+                  unknownWriteToolNames,
+                  internalContinuation,
                   send: (event) => {
                     if (event.type === "text") {
                       responseText += event.text;
@@ -4340,6 +13294,22 @@ export function createProductionAgentHandler(
                         agent: ref.name,
                         text: event.text,
                       });
+                    } else if (
+                      event.type === "tool_start" ||
+                      event.type === "tool_done"
+                    ) {
+                      send({
+                        ...event,
+                        id:
+                          event.id === undefined
+                            ? undefined
+                            : `custom_${createHash("sha256")
+                                .update(
+                                  JSON.stringify([runId, index, event.id]),
+                                )
+                                .digest("hex")
+                                .slice(0, 32)}`,
+                      });
                     }
                   },
                   signal,
@@ -4347,16 +13317,17 @@ export function createProductionAgentHandler(
                   providerOptions: options.providerOptions,
                   executionMode: requestMode,
                   maxIterations: loopSettings.maxIterations,
+                  ...(resolvedRunSoftTimeoutMs > 0
+                    ? { runSoftTimeoutMs: resolvedRunSoftTimeoutMs }
+                    : {}),
                 });
+                await control.flushEvents();
 
-                // Attribute custom-agent sub-calls under their own label
-                // so the Usage panel separates them from the main chat.
                 try {
                   const ownerEmail = options.resolveOwnerEmail
                     ? await options.resolveOwnerEmail(event)
                     : getRequestUserEmail();
                   if (!ownerEmail) {
-                    // Skip usage recording for unauthenticated runs.
                     return;
                   }
                   const { recordUsage } = await import("../usage/store.js");
@@ -4366,8 +13337,13 @@ export function createProductionAgentHandler(
                     outputTokens: subUsage.outputTokens,
                     cacheReadTokens: subUsage.cacheReadTokens,
                     cacheWriteTokens: subUsage.cacheWriteTokens,
+                    builderCreditsUsed: subUsage.builderCreditsUsed,
+                    engineName: engine.name,
                     model: subUsage.model,
                     label: `custom-agent:${ref.name}`,
+                    runId,
+                    threadId: effectiveThreadId,
+                    taskId: effectiveTurnId,
                   });
                 } catch {}
 
@@ -4386,6 +13362,7 @@ export function createProductionAgentHandler(
                 const message =
                   userFacingLlmCredentialError(err, {
                     agentName: ref.name,
+                    visitorFacing: isBuilderGatewayDeployConfigured(),
                   }) ?? `Failed to run ${ref.name}: ${err?.message}`;
                 return `<agent-response name="${ref.name}" id="${ref.refId}" type="custom-agent" error="true">\n${message}\n</agent-response>`;
               }
@@ -4416,98 +13393,28 @@ export function createProductionAgentHandler(
           }
         }
 
-        // Resolve connected agent @-mentions via A2A calls.
         if (agentRefs.length > 0 && requestMode !== "plan") {
-          const [{ A2AClient, callAgent }, { resolveA2ACallerAuth }] =
-            await Promise.all([
-              import("../a2a/client.js"),
-              import("../a2a/caller-auth.js"),
-            ]);
+          const [{ callAgent }, { resolveA2ACallerAuth }] = await Promise.all([
+            import("../a2a/client.js"),
+            import("../a2a/caller-auth.js"),
+          ]);
           const results = await Promise.allSettled(
             agentRefs.map(async (ref) => {
-              send({
-                type: "agent_call",
-                agent: ref.name,
-                status: "start",
-              });
               try {
-                const callerAuth = await resolveA2ACallerAuth({
-                  includeGoogleToken: true,
-                });
-                const a2aClient = new A2AClient(ref.path, callerAuth.apiKey);
-                const a2aMetadata = callerAuth.metadata;
-
-                let responseText = "";
-                let lastSentLength = 0;
-
-                try {
-                  for await (const task of a2aClient.stream(
-                    {
-                      role: "user",
-                      parts: [
-                        {
-                          type: "text",
-                          text: enrichedMessage + screenContext,
-                        },
-                      ],
-                    },
-                    Object.keys(a2aMetadata).length > 0
-                      ? { metadata: a2aMetadata }
-                      : undefined,
-                  )) {
-                    const newText =
-                      task.status?.message?.parts
-                        ?.filter(
-                          (p): p is { type: "text"; text: string } =>
-                            p.type === "text",
-                        )
-                        ?.map((p) => p.text)
-                        ?.join("") ?? "";
-
-                    if (newText.length > lastSentLength) {
-                      send({
-                        type: "agent_call_text",
-                        agent: ref.name,
-                        text: newText.slice(lastSentLength),
-                      });
-                      lastSentLength = newText.length;
-                    }
-                    responseText = newText;
-                  }
-                } catch {
-                  if (!responseText) {
-                    responseText = await callAgent(
-                      ref.path,
-                      enrichedMessage + screenContext,
-                      {
-                        apiKey: callerAuth.apiKey,
-                        userEmail: callerAuth.userEmail,
-                        orgDomain: callerAuth.orgDomain,
-                        orgSecret: callerAuth.orgSecret,
-                      },
-                    );
-                  }
-                }
-                responseText =
-                  userFacingLlmCredentialError(responseText, {
-                    agentName: ref.name,
-                  }) ?? responseText;
-
-                send({
-                  type: "agent_call",
+                const responseText = await callConnectedAgentReference({
                   agent: ref.name,
-                  status: "done",
+                  path: ref.path,
+                  message: enrichedMessage + referencedAgentContext,
+                  send,
+                  callAgent,
+                  resolveCallerAuth: resolveA2ACallerAuth,
                 });
                 return `<agent-response name="${ref.name}" id="${ref.refId}">\n${responseText}\n</agent-response>`;
               } catch (err: any) {
-                send({
-                  type: "agent_call",
-                  agent: ref.name,
-                  status: "error",
-                });
                 const message =
                   userFacingLlmCredentialError(err, {
                     agentName: ref.name,
+                    visitorFacing: isBuilderGatewayDeployConfigured(),
                   }) ?? `Failed to reach ${ref.name}: ${err?.message}`;
                 return `<agent-response name="${ref.name}" id="${ref.refId}" error="true">\n${message}\n</agent-response>`;
               }
@@ -4538,137 +13445,280 @@ export function createProductionAgentHandler(
           }
         }
 
-        // Apply experiment variant overrides (A/B testing)
-        let effectiveModel = model;
-        try {
-          const { resolveActiveExperimentConfig } =
-            await import("../observability/experiments.js");
-          if (!ownerEmail) {
-            // Without an authenticated owner we can't resolve user-scoped experiments.
-            throw new Error("no authenticated user");
-          }
-          const expConfig = await resolveActiveExperimentConfig(ownerEmail);
-          if (expConfig) {
-            if (typeof expConfig.configs.model === "string") {
-              effectiveModel = expConfig.configs.model;
-            }
-          }
-        } catch {
-          // Experiments module unavailable — use default model
-        }
-
-        // TODO(processor-seam): thread `processors` from ProductionAgentOptions
-        // through to runAgentLoop here once the handler exposes a way to
-        // configure them (e.g. a `processors` field on ProductionAgentOptions
-        // or a per-request resolver). The loop-level seam (runAgentLoop's
-        // `processors` opt + ProcessorChain/TripWire) is the deliverable and is
-        // already callable directly by sub-agents, A2A, MCP, and tests; this is
-        // only the HTTP-handler convenience plumbing.
+        const userVisibleSentimentInput =
+          typeof displayMessage === "string" && displayMessage.trim().length > 0
+            ? displayMessage
+            : typeof message === "string" && message.trim().length > 0
+              ? message
+              : undefined;
+        const turnUsage: AgentLoopUsage = {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          engineName: engine.name,
+          model: effectiveModel,
+        };
         const agentLoopOpts = {
           engine,
           model: effectiveModel,
+          runId,
+          followUpSuggestions: true,
           systemPrompt: requestSystemPrompt,
           tools: requestTools,
           availableTools: availableRequestTools,
           messages,
+          ...(Array.isArray(requestStructuredHistory)
+            ? {
+                structuredHistoryImages: {
+                  history: requestStructuredHistory,
+                  resolutions: resolvedHistoryImages,
+                },
+              }
+            : {}),
+          systemSections: contextXraySystemSections,
           actions: requestActions,
+          beforeWrite: control.flushEvents,
+          unknownWriteToolNames,
+          internalContinuation,
           send,
           signal,
+          onUsage: (usage: AgentLoopUsage) => {
+            turnUsage.inputTokens += usage.inputTokens;
+            turnUsage.outputTokens += usage.outputTokens;
+            turnUsage.cacheReadTokens += usage.cacheReadTokens;
+            turnUsage.cacheWriteTokens += usage.cacheWriteTokens;
+            if (usage.builderCreditsUsed !== undefined) {
+              turnUsage.builderCreditsUsed =
+                (turnUsage.builderCreditsUsed ?? 0) + usage.builderCreditsUsed;
+            }
+            turnUsage.engineName = usage.engineName ?? turnUsage.engineName;
+            turnUsage.model = usage.model;
+          },
           ownerEmail,
           orgId: getRequestOrgId() ?? null,
+          ...(options.appId && getRequestOrgId()
+            ? { appAuthorization: getRequestRunContext()?.appAuthorization }
+            : {}),
           attachments: requestAttachments,
           reasoningEffort,
+          maxOutputTokens: resolveMainChatMaxOutputTokens(effectiveModel),
           providerOptions: options.providerOptions,
           executionMode: requestMode,
           maxIterations: loopSettings.maxIterations,
+          maxRunInputTokens: loopSettings.maxRunInputTokens,
+          priorTurnInputTokens: turnInputTokens,
+          loadedSkillSlugs: normalizeLoadedSkillSlugs(
+            requestedLoadedSkillSlugs,
+          ),
           finalResponseGuard: options.finalResponseGuard,
+          finalResponseGuardRequestText: messageToPersist,
+          ...(resolvedRunSoftTimeoutMs > 0
+            ? { runSoftTimeoutMs: resolvedRunSoftTimeoutMs }
+            : {}),
           ...(options.toolLimits ? { toolLimits: options.toolLimits } : {}),
           ...(threadId
             ? { threadId: effectiveThreadId, turnId: effectiveTurnId }
             : {}),
-          // Human-in-the-loop approval grants for this turn (sanitized — the
-          // request is untrusted; accept only a bounded list of string keys).
-          ...(Array.isArray(body.approvedToolCalls) &&
-          body.approvedToolCalls.length
+          ...(approvedToolCallsForExecution
+            ? { approvedToolCalls: approvedToolCallsForExecution }
+            : {}),
+          ...(requestedApprovedToolCallAskIds
             ? {
-                approvedToolCalls: body.approvedToolCalls
-                  .filter((k: unknown): k is string => typeof k === "string")
-                  .slice(0, 200),
+                approvedToolCallAskId: requestedApprovedToolCallAskIds[0],
+              }
+            : {}),
+          onApprovalRequired: approvalHooks.onApprovalRequired,
+          consumeApproval: approvalHooks.consumeApproval,
+          isToolAlwaysAllowed: approvalHooks.isToolAlwaysAllowed,
+          ...(runsInBackgroundFunction
+            ? {
+                resumeResumableErrorsInProcess: true,
+                maxContinuations: MAX_BACKGROUND_RUN_CONTINUATIONS,
               }
             : {}),
         };
 
-        send({ type: "activity", label: "Contacting model" });
+        send({
+          type: "activity",
+          id: `agentkit:internal:${runId}:contacting-model`,
+          label: "Contacting model",
+        });
 
-        // loopUsage is always assigned — either via instrumentAgentLoop or
-        // runAgentLoop before use below. The definite-assignment guard is
-        // conservative because the try/catch makes the control flow non-obvious.
-        let loopUsage: AgentLoopUsage = undefined!;
         let instrumented = false;
         try {
-          const { getObservabilityConfig, instrumentAgentLoop } =
-            await import("../observability/traces.js");
-          const obsConfig = await getObservabilityConfig();
-          if (obsConfig.enabled) {
-            instrumented = true;
-            loopUsage = await instrumentAgentLoop({
-              runAgentLoop,
-              loopOpts: agentLoopOpts,
-              runId,
-              threadId: threadId ?? null,
-              userId: ownerEmail,
-              config: obsConfig,
-            });
-          }
-        } catch (err) {
-          // If instrumentation setup failed, fall through to uninstrumented.
-          // If the agent loop itself failed (via instrumentAgentLoop), re-throw.
-          if (instrumented) throw err;
-        }
-        if (!instrumented) {
-          loopUsage = await runAgentLoop(agentLoopOpts);
-        }
-
-        // Record token usage for cost monitoring so the Usage panel in
-        // settings works in every mode, including local dev.
-        try {
-          const ownerEmail = options.resolveOwnerEmail
-            ? await options.resolveOwnerEmail(event)
-            : getRequestUserEmail();
           if (
-            ownerEmail &&
-            (loopUsage.inputTokens > 0 ||
-              loopUsage.outputTokens > 0 ||
-              loopUsage.cacheReadTokens > 0 ||
-              loopUsage.cacheWriteTokens > 0)
+            exactApprovedToolCall &&
+            approvedToolCallsForExecution &&
+            requestActions[exactApprovedToolCall.name]
           ) {
-            const { recordUsage } = await import("../usage/store.js");
-            await recordUsage({
-              ownerEmail,
-              inputTokens: loopUsage.inputTokens,
-              outputTokens: loopUsage.outputTokens,
-              cacheReadTokens: loopUsage.cacheReadTokens,
-              cacheWriteTokens: loopUsage.cacheWriteTokens,
-              model: loopUsage.model,
-              label: body.usageLabel || "chat",
+            send({
+              type: "activity",
+              label: `Running approved ${exactApprovedToolCall.name} action`,
+              tool: exactApprovedToolCall.name,
             });
+            await executeAgentToolCall({
+              actions: requestActions,
+              name: exactApprovedToolCall.name,
+              input: exactApprovedToolCall.input,
+              callId: exactApprovedToolCall.callId,
+              signal: agentLoopOpts.signal,
+              ownerEmail,
+              orgId: getRequestOrgId() ?? null,
+              appId: options.appId,
+              threadId: effectiveThreadId,
+              turnId: effectiveTurnId,
+              approvedToolCalls: approvedToolCallsForExecution,
+              ...(requestedApprovedToolCallAskIds
+                ? {
+                    approvedToolCallAskId: requestedApprovedToolCallAskIds[0],
+                  }
+                : {}),
+              onApprovalRequired: approvalHooks.onApprovalRequired,
+              consumeApproval: approvalHooks.consumeApproval,
+              isToolAlwaysAllowed: approvalHooks.isToolAlwaysAllowed,
+              send,
+            });
+            return;
           }
-        } catch {
-          // Usage recording failed — don't break the run
+          try {
+            const { getObservabilityConfig, instrumentAgentLoop } =
+              await import("../observability/traces.js");
+            const obsConfig = await getObservabilityConfig();
+            if (obsConfig.enabled) {
+              instrumented = true;
+              await instrumentAgentLoop({
+                runAgentLoop: runAgentLoopWithMainChatInternalContinuations,
+                loopOpts: agentLoopOpts,
+                runId,
+                threadId: threadId ?? null,
+                userId: ownerEmail,
+                config: obsConfig,
+                spanName:
+                  turnUsageLabel && turnUsageLabel !== "chat"
+                    ? `agent_run:${turnUsageLabel}`
+                    : undefined,
+                metadata: {
+                  modelSelectionSource,
+                  // What the request asked for; the loop may lower it on retry.
+                  reasoningEffortRequested: reasoningEffort ?? null,
+                  ...(prefetchStatus
+                    ? { contextPrefetchStatus: prefetchStatus }
+                    : {}),
+                  ...(screenStatus
+                    ? { screenContextStatus: screenStatus }
+                    : {}),
+                  ...(priorConnection.status !== "none"
+                    ? { priorConnectionRequest: priorConnection.status }
+                    : {}),
+                  ...(turnUsageLabel ? { label: turnUsageLabel } : {}),
+                  ...(experimentAssignments.length > 0
+                    ? { experimentAssignments }
+                    : {}),
+                },
+                experimentAssignments,
+                modelSelectionSource,
+                sentimentInput: shouldInferSentimentForTurn({
+                  internalContinuation: Boolean(internalContinuation),
+                  isBackgroundWorker,
+                  backgroundContinuationCount,
+                  hasUserText: Boolean(userVisibleSentimentInput),
+                })
+                  ? userVisibleSentimentInput
+                  : undefined,
+                classifyError: () => {
+                  if (
+                    agentLoopOpts.signal.aborted &&
+                    agentLoopOpts.signal.reason === "run_timeout"
+                  ) {
+                    return {
+                      status: "success",
+                      errorMessage: null,
+                      metadata: {
+                        terminalReason: "run_timeout",
+                        recoverableContinuation: true,
+                      },
+                    };
+                  }
+                  return null;
+                },
+              });
+            }
+          } catch (err) {
+            if (instrumented) throw err;
+          }
+          if (!instrumented) {
+            await runAgentLoopWithMainChatInternalContinuations(agentLoopOpts);
+          }
+        } finally {
+          turnInputTokens += turnUsage.inputTokens;
+          try {
+            const resolvedOwnerEmail = options.resolveOwnerEmail
+              ? await options.resolveOwnerEmail(event)
+              : getRequestUserEmail();
+            if (
+              resolvedOwnerEmail &&
+              (turnUsage.inputTokens > 0 ||
+                turnUsage.outputTokens > 0 ||
+                turnUsage.cacheReadTokens > 0 ||
+                turnUsage.cacheWriteTokens > 0 ||
+                turnUsage.builderCreditsUsed != null)
+            ) {
+              const { recordUsage } = await import("../usage/store.js");
+              await recordUsage({
+                ownerEmail: resolvedOwnerEmail,
+                inputTokens: turnUsage.inputTokens,
+                outputTokens: turnUsage.outputTokens,
+                cacheReadTokens: turnUsage.cacheReadTokens,
+                cacheWriteTokens: turnUsage.cacheWriteTokens,
+                builderCreditsUsed: turnUsage.builderCreditsUsed,
+                engineName: engine.name,
+                model: turnUsage.model,
+                label: turnUsageLabel || "chat",
+                runId,
+                threadId: effectiveThreadId,
+                taskId: effectiveTurnId,
+              });
+            }
+          } catch {
+            // Usage recording failed — don't break the run
+          }
         }
       },
       handleRunComplete,
       {
-        softTimeoutMs: options.runSoftTimeoutMs,
+        softTimeoutMs: resolvedRunSoftTimeoutMs,
         useHostedSoftTimeoutDefault: true,
-        // Fold continuation runs of one logical turn onto a single durable
-        // assistant message. Falls back to the runId (turn == run) when the
-        // client doesn't supply a turnId.
+        backgroundFunction: runsInBackgroundFunction,
+        noProgressTimeoutMs: options.runNoProgressTimeoutMs,
         turnId: effectiveTurnId,
+        agentKitApprovalContinuation:
+          internalContinuation &&
+          Boolean(approvedToolCallsForExecution?.length),
+        turnInitiator,
+        parentId: requestParentId,
+        waitUntil: getRequestRunContext()?.waitUntil,
+        dispatchMode: isBackgroundWorker
+          ? "background"
+          : foregroundSelfChainEligible
+            ? "foreground-self-chain"
+            : "foreground",
+        runRowAlreadyInserted: foregroundRunRowInserted,
+        // Resolved AFTER stored-model/experiment overrides — the same value
+        // actually sent to the engine, not the raw client-requested model.
+        // No userId here: `ownerEmail` is the only identity known at this
+        // scope and is PII (email), which the terminal event must not carry.
+        model: effectiveModel,
+        engineName: engine.name,
+        attemptCount: backgroundContinuationCount,
       },
     );
 
-    // Subscribe to the run and stream events to the client
+    if (isBackgroundWorker) {
+      await startedRun.finalized;
+      return { ok: true, runId };
+    }
+
     const stream = subscribeToRun(runId, 0);
     if (!stream) {
       setResponseStatus(event, 500);
@@ -4679,6 +13729,11 @@ export function createProductionAgentHandler(
     setResponseHeader(event, "Cache-Control", "no-cache");
     setResponseHeader(event, "Connection", "keep-alive");
     setResponseHeader(event, "X-Run-Id", runId);
+    setResponseHeader(
+      event,
+      "X-Dispatch-Mode",
+      foregroundSelfChainEligible ? "foreground-self-chain" : "foreground",
+    );
 
     return stream;
   });
@@ -4689,5 +13744,8 @@ export {
   getActiveRunForThreadAsync,
   getRun,
   abortRun,
+  abortRunDurably,
+  abortTurnByRefDurably,
+  abortTurnDurably,
   subscribeToRun,
 };

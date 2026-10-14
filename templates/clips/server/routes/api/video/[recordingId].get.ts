@@ -12,7 +12,8 @@
  *
  * Access rules (match `/api/public-recording.get.ts`):
  *   - public visibility: anyone can fetch, but a password (if set) must be
- *     supplied via `?password=<pw>` — otherwise 401.
+ *     supplied via `?password=<pw>`, `?t=<token>`, or the protected media
+ *     cookie renewed by this route — otherwise 401.
  *   - non-public: caller must have a share grant (owner / viewer / editor /
  *     admin) via `resolveAccess`. Password is still enforced on top.
  *   - expired recordings 410.
@@ -29,38 +30,61 @@
  * Route: GET /api/video/:recordingId
  */
 
-import {
-  defineEventHandler,
-  getRouterParam,
-  getRequestHeader,
-  getQuery,
-  setResponseHeader,
-  setResponseStatus,
-  type H3Event,
-} from "h3";
 import { readAppState } from "@agent-native/core/application-state";
 import {
   createSsrfSafeDispatcher,
   isBlockedExtensionUrlWithDns,
 } from "@agent-native/core/extensions/url-safety";
 import { getOrgContext } from "@agent-native/core/org";
-import { resolveAccess } from "@agent-native/core/sharing";
 import {
+  captureRouteError,
   getSession,
   runWithRequestContext,
+  signShortLivedToken,
   verifyShortLivedToken,
 } from "@agent-native/core/server";
+import { resolveAccess } from "@agent-native/core/sharing";
+import { eq } from "drizzle-orm";
+import {
+  defineEventHandler,
+  getCookie,
+  getRouterParam,
+  getRequestHeader,
+  getQuery,
+  setResponseHeader,
+  setResponseStatus,
+  setCookie,
+  type H3Event,
+} from "h3";
+
 import {
   LOOM_START_MS_QUERY_PARAM,
-  isLoomRecordingSource,
+  isLoomEmbedBackedRecording,
   loomEmbedUrlWithTimestamp,
   loomEmbedUrlForRecording,
 } from "../../../../shared/loom.js";
-import { verifySharePassword } from "../../../lib/share-password.js";
+import { getDb, schema } from "../../../db/index.js";
+import { allowsLegacyS3ObjectForPersistedMedia } from "../../../lib/media-storage-provenance.js";
+import {
+  isHeldForRedaction,
+  REDACTION_HOLD_MESSAGE,
+} from "../../../lib/pending-redactions.js";
+import { isRecordingExpiredForViewer } from "../../../lib/recording-page-access.js";
+import { getOrganizationRoleForEmail } from "../../../lib/recordings.js";
+import { fetchS3ObjectByUrl } from "../../../lib/s3-upload-provider.js";
+import {
+  getRecordingAccessTokenResourceId,
+  verifySharePassword,
+} from "../../../lib/share-password.js";
 
 interface RecordingRow {
+  editsJson?: string | null;
   expiresAt?: string | null;
+  organizationId?: string | null;
+  ownerEmail?: string | null;
   password?: string | null;
+  sharePasswordVersion?: string | null;
+  updatedAt?: string | null;
   sourceAppName?: string | null;
   sourceWindowTitle?: string | null;
   videoUrl?: string | null;
@@ -75,6 +99,63 @@ const PROXIED_HEADER_NAMES = [
   "etag",
   "last-modified",
 ] as const;
+const PROVIDER_MEDIA_FETCH_TIMEOUT_MS = 30_000;
+const PROTECTED_MEDIA_ACCESS_TTL_SECONDS = 6 * 60 * 60;
+const PROTECTED_MEDIA_COOKIE_PREFIX = "clips_media_";
+
+function appPath(path: string): string {
+  if (!path.startsWith("/")) return path;
+  const raw = process.env.VITE_APP_BASE_PATH || process.env.APP_BASE_PATH || "";
+  const base = raw.trim().replace(/^\/+/, "").replace(/\/+$/, "");
+  return base ? `/${base}${path}` : path;
+}
+
+function protectedMediaCookieName(recordingId: string): string {
+  return `${PROTECTED_MEDIA_COOKIE_PREFIX}${recordingId.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+}
+
+function protectedMediaCookiePath(recordingId: string): string {
+  return appPath(`/api/video/${encodeURIComponent(recordingId)}`);
+}
+
+function isHttpsRequest(event: H3Event): boolean {
+  try {
+    const xfProto = getRequestHeader(event, "x-forwarded-proto");
+    if (xfProto && String(xfProto).split(",")[0].trim() === "https") {
+      return true;
+    }
+    const appUrl = process.env.APP_URL || process.env.BETTER_AUTH_URL || "";
+    if (appUrl.startsWith("https://")) return true;
+  } catch {
+    // keep plain-http dev behavior if request metadata is unavailable
+  }
+  return false;
+}
+
+function setProtectedMediaAccessCookie(
+  event: H3Event,
+  recordingId: string,
+  password: string | null | undefined,
+  sharePasswordVersion: string | null | undefined,
+): void {
+  const token = signShortLivedToken({
+    resourceId: getRecordingAccessTokenResourceId(
+      recordingId,
+      password,
+      sharePasswordVersion,
+    ),
+    ttlSeconds: PROTECTED_MEDIA_ACCESS_TTL_SECONDS,
+  });
+  const secure = isHttpsRequest(event);
+  setCookie(event, protectedMediaCookieName(recordingId), token, {
+    httpOnly: true,
+    sameSite: secure ? "none" : "lax",
+    secure,
+    ...(secure ? { partitioned: true } : {}),
+    path: protectedMediaCookiePath(recordingId),
+    maxAge: PROTECTED_MEDIA_ACCESS_TTL_SECONDS,
+  });
+}
 
 function isRecursiveVideoRouteUrl(value: string, recordingId: string): boolean {
   try {
@@ -110,7 +191,20 @@ async function fetchProviderMedia(
     };
     if (dispatcher) fetchOptions.dispatcher = dispatcher;
 
-    const upstream = await fetch(currentUrl, fetchOptions);
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      PROVIDER_MEDIA_FETCH_TIMEOUT_MS,
+    );
+    let upstream: Response;
+    try {
+      upstream = await fetch(currentUrl, {
+        ...fetchOptions,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
     if (upstream.status < 300 || upstream.status >= 400) return upstream;
 
     const location = upstream.headers.get("location");
@@ -139,6 +233,22 @@ function providerResponse(upstream: Response): Response {
     statusText: upstream.statusText,
     headers,
   });
+}
+
+function statusCodeForProviderFetchError(err: unknown): number {
+  if (err instanceof Error && /^SSRF blocked:/i.test(err.message)) return 403;
+  if (err instanceof Error && /abort|timeout/i.test(err.name)) return 504;
+  return 502;
+}
+
+function messageForProviderFetchError(err: unknown): string {
+  if (err instanceof Error && /^SSRF blocked:/i.test(err.message)) {
+    return "Recording media URL is blocked by server safety policy.";
+  }
+  if (err instanceof Error && /abort|timeout/i.test(err.name)) {
+    return "Recording media fetch timed out.";
+  }
+  return "Recording media could not be fetched.";
 }
 
 function escapeHtmlAttribute(value: string): string {
@@ -183,8 +293,6 @@ function loomEmbedResponse(embedUrl: string): Response {
       "Cache-Control": "private, max-age=0, no-store",
       "Referrer-Policy": "no-referrer",
       "X-Content-Type-Options": "nosniff",
-      "Content-Security-Policy":
-        "default-src 'none'; frame-src https://www.loom.com; style-src 'unsafe-inline'",
     },
   });
 }
@@ -217,27 +325,66 @@ export default defineEventHandler(async (event: H3Event) => {
     { userEmail: session?.email, orgId },
     async () => {
       const access = await resolveAccess("recording", recordingId);
-      if (!access) {
-        setResponseStatus(event, 403);
-        return { error: "Forbidden" };
-      }
-      const rec = access.resource as RecordingRow;
+      let recRow: RecordingRow | null =
+        (access?.resource as RecordingRow | undefined) ?? null;
+      let role: string | null = access?.role ?? null;
 
-      if (rec.expiresAt) {
-        const expires = new Date(rec.expiresAt).getTime();
-        if (Number.isFinite(expires) && expires < Date.now()) {
-          setResponseStatus(event, 410);
-          return { error: "Recording has expired" };
+      if (!recRow) {
+        const db = getDb();
+        const [row] = await db
+          .select()
+          .from(schema.recordings)
+          .where(eq(schema.recordings.id, recordingId))
+          .limit(1);
+        if (!row) {
+          setResponseStatus(event, 404);
+          return { error: "Not found" };
         }
+        let viewerIsOrgMember = false;
+        if (session?.email && row.visibility === "org" && row.organizationId) {
+          try {
+            const orgRole = await getOrganizationRoleForEmail(
+              row.organizationId,
+              session.email,
+            );
+            viewerIsOrgMember = Boolean(orgRole);
+          } catch {
+            viewerIsOrgMember = false;
+          }
+        }
+        if (row.visibility !== "public" && !viewerIsOrgMember) {
+          setResponseStatus(event, 403);
+          return { error: "Forbidden" };
+        }
+        recRow = row as RecordingRow;
+        role = "viewer";
+      }
+
+      const rec = recRow;
+
+      if (
+        isRecordingExpiredForViewer({
+          expiresAt: rec.expiresAt,
+          viewerIsOwner: role === "owner",
+        })
+      ) {
+        setResponseStatus(event, 410);
+        return { error: "Recording has expired" };
+      }
+      if (isHeldForRedaction(rec.editsJson, role)) {
+        setResponseStatus(event, 409);
+        return { error: REDACTION_HOLD_MESSAGE, redactionPending: true };
       }
 
       // Password gate — owners skip it (they set it). Same behavior as
       // public-recording.get.ts so the two endpoints don't disagree.
       // Accepts either:
-      //   - `?t=<token>` — preferred. Short-lived HMAC token minted by
-      //     public-recording.get.ts after the password check passed; keeps
-      //     the plaintext password out of the video URL (and therefore out
-      //     of browser history / CDN logs / Referer headers).
+      //   - protected media cookie — preferred. It is httpOnly, scoped to this
+      //     recording's video route, and renewed while playback/range requests
+      //     continue.
+      //   - `?t=<token>` — fallback for contexts that cannot use the cookie
+      //     immediately. Minted by public-recording.get.ts after the password
+      //     check passes; keeps the plaintext password out of the video URL.
       //   - `?password=<pw>` — legacy fallback so existing share pages /
       //     bookmarks keep working during rollout.
       // (audit 11 F-07)
@@ -246,13 +393,24 @@ export default defineEventHandler(async (event: H3Event) => {
         password?: string;
         t?: string;
       };
-      if (rec.password && access.role !== "owner") {
+      if (rec.password && role !== "owner") {
         const token = typeof q.t === "string" ? q.t : "";
+        const cookieToken =
+          getCookie(event, protectedMediaCookieName(recordingId)) ?? "";
         const supplied = typeof q.password === "string" ? q.password : "";
 
         let allowed = false;
+        const scopedRecordingId = getRecordingAccessTokenResourceId(
+          recordingId,
+          rec.password,
+          rec.sharePasswordVersion,
+        );
         if (token) {
-          const result = verifyShortLivedToken(token, recordingId);
+          const result = verifyShortLivedToken(token, scopedRecordingId);
+          if (result.ok) allowed = true;
+        }
+        if (!allowed && cookieToken) {
+          const result = verifyShortLivedToken(cookieToken, scopedRecordingId);
           if (result.ok) allowed = true;
         }
         if (
@@ -266,9 +424,15 @@ export default defineEventHandler(async (event: H3Event) => {
           setResponseStatus(event, 401);
           return { error: "Password required", passwordRequired: true };
         }
+        setProtectedMediaAccessCookie(
+          event,
+          recordingId,
+          rec.password,
+          rec.sharePasswordVersion,
+        );
       }
 
-      if (isLoomRecordingSource(rec)) {
+      if (isLoomEmbedBackedRecording(rec)) {
         let embedUrl = loomEmbedUrlForRecording(rec);
         if (!embedUrl) {
           setResponseStatus(event, 404);
@@ -282,7 +446,9 @@ export default defineEventHandler(async (event: H3Event) => {
         return loomEmbedResponse(embedUrl);
       }
 
-      const blob = await readAppState(`recording-blob-${recordingId}`);
+      const blob = await readAppState(`recording-blob-${recordingId}`).catch(
+        () => null,
+      );
       const b64 = typeof blob?.data === "string" ? blob.data : null;
       const rangeHeader = getRequestHeader(event, "range");
 
@@ -300,12 +466,98 @@ export default defineEventHandler(async (event: H3Event) => {
           return { error: "Blob not found" };
         }
 
-        const upstream = await fetchProviderMedia(sourceUrl, rangeHeader);
+        let upstream: Response | { error: string; status: number };
+        try {
+          const db = getDb();
+          const [persistedMedia] = await db
+            .select({
+              videoUrl: schema.recordings.videoUrl,
+              editsJson: schema.recordings.editsJson,
+            })
+            .from(schema.recordings)
+            .where(eq(schema.recordings.id, recordingId))
+            .limit(1);
+          const allowLegacyObjectKey = allowsLegacyS3ObjectForPersistedMedia({
+            requestedUrl: sourceUrl,
+            persistedUrl: persistedMedia?.videoUrl,
+            editsJson: persistedMedia?.editsJson,
+          });
+          const signedS3Response = await runWithRequestContext(
+            {
+              userEmail: rec.ownerEmail ?? undefined,
+              orgId: rec.organizationId ?? undefined,
+            },
+            () =>
+              fetchS3ObjectByUrl(sourceUrl, {
+                range: rangeHeader?.startsWith("bytes=")
+                  ? rangeHeader
+                  : undefined,
+                timeoutMs: PROVIDER_MEDIA_FETCH_TIMEOUT_MS,
+                recordingId,
+                ...(allowLegacyObjectKey ? { allowLegacyObjectKey } : {}),
+              }),
+          );
+          if (
+            signedS3Response?.status === 200 ||
+            signedS3Response?.status === 206 ||
+            signedS3Response?.status === 416
+          ) {
+            upstream = signedS3Response;
+          } else {
+            await signedS3Response?.body?.cancel().catch(() => undefined);
+            upstream = await fetchProviderMedia(sourceUrl, rangeHeader);
+          }
+        } catch (err) {
+          setResponseStatus(event, statusCodeForProviderFetchError(err));
+          return { error: messageForProviderFetchError(err) };
+        }
         if (!(upstream instanceof Response)) {
           setResponseStatus(event, upstream.status);
           return { error: upstream.error };
         }
-        return providerResponse(upstream);
+        if (upstream.status >= 500) {
+          captureRouteError(
+            new Error(
+              `Storage provider returned ${upstream.status} for recording media`,
+            ),
+            {
+              route: "api/video",
+              tags: {
+                mediaPath: "provider-proxy",
+                upstreamStatus: String(upstream.status),
+              },
+              extra: { recordingId },
+            },
+          );
+          setResponseStatus(event, 502);
+          setResponseHeader(
+            event,
+            "Cache-Control",
+            "private, max-age=0, no-store",
+          );
+          return {
+            error: "The recording's media could not be loaded from storage.",
+            upstreamStatus: upstream.status,
+          };
+        }
+        try {
+          return providerResponse(upstream);
+        } catch (err) {
+          captureRouteError(err, {
+            route: "api/video",
+            tags: { mediaPath: "provider-proxy-response" },
+            extra: { recordingId, upstreamStatus: String(upstream.status) },
+          });
+          setResponseStatus(event, 502);
+          setResponseHeader(
+            event,
+            "Cache-Control",
+            "private, max-age=0, no-store",
+          );
+          return {
+            error: "The recording's media could not be loaded from storage.",
+          };
+        }
       }
       const mimeType =
         typeof blob?.mimeType === "string" ? blob.mimeType : "video/webm";
@@ -316,8 +568,6 @@ export default defineEventHandler(async (event: H3Event) => {
       setResponseHeader(event, "X-Content-Type-Options", "nosniff");
       setResponseHeader(event, "Accept-Ranges", "bytes");
       setResponseHeader(event, "Cache-Control", "private, max-age=0, no-store");
-      // Don't leak the URL (which carries a short-lived token) into the
-      // Referer of any outbound link rendered alongside the player.
       setResponseHeader(event, "Referrer-Policy", "no-referrer");
 
       if (rangeHeader && rangeHeader.startsWith("bytes=")) {
@@ -326,7 +576,6 @@ export default defineEventHandler(async (event: H3Event) => {
         let end: number;
 
         if (spec.startsWith("-")) {
-          // Suffix range: bytes=-N → last N bytes.
           const suffixLen = Number.parseInt(spec.slice(1), 10);
           if (!Number.isFinite(suffixLen) || suffixLen <= 0) {
             setResponseStatus(event, 416);
@@ -343,7 +592,6 @@ export default defineEventHandler(async (event: H3Event) => {
             setResponseHeader(event, "Content-Range", `bytes */${total}`);
             return "";
           }
-          // Clamp oversized `end` to total-1 (RFC 9110 §14.1.2) instead of 416'ing.
           if (endStr === "" || endStr === undefined) {
             end = total - 1;
           } else {

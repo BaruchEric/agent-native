@@ -1,8 +1,10 @@
-import { defineAction, embedApp } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { accessFilter, currentAccess } from "@agent-native/core/sharing";
-import { and, desc, eq, isNotNull, isNull, or } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, ne, or } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
+import { isEditionsLabEnabled } from "../server/lib/editions-lab.js";
 import { resolvePlanAccessContext } from "../server/lib/local-identity.js";
 import { planStatusSchema, summarizePlans } from "../server/plans.js";
 
@@ -35,20 +37,8 @@ export default defineAction({
   readOnly: true,
   mcpApp: {
     compactCatalog: true,
-    resource: embedApp({
-      title: "Plans",
-      description:
-        "Open the Agent-Native Plan index for existing plans and recaps.",
-      iframeTitle: "Agent-Native Plan",
-      openLabel: "Open Plans",
-      height: 860,
-    }),
   },
   run: async (args) => {
-    // Project only the columns the list/summary needs. A bare `.select()` pulls
-    // every column — including the large `html`, `markdown`, and `content`
-    // blobs — for every plan the user can access, which is pure waste for a
-    // list view and the main reason the plans-list skeleton lingered.
     const accessContext = resolvePlanAccessContext(currentAccess());
     const accessWhere = accessFilter(
       schema.plans,
@@ -56,6 +46,11 @@ export default defineAction({
       accessContext,
     );
     const clauses = [accessWhere];
+    // Editions are ordinary `plans` rows, so gating only the edition actions
+    // would still let an opted-out caller discover them through this list.
+    if (!(await isEditionsLabEnabled())) {
+      clauses.push(ne(schema.plans.kind, "edition"));
+    }
     if (args.status) clauses.push(eq(schema.plans.status, args.status));
     if (args.deleted === "active") clauses.push(isNull(schema.plans.deletedAt));
     if (args.deleted === "deleted") {
@@ -84,6 +79,8 @@ export default defineAction({
         hostedPlanId: schema.plans.hostedPlanId,
         hostedPlanUrl: schema.plans.hostedPlanUrl,
         sourceUrl: schema.plans.sourceUrl,
+        sourceAuthorName: schema.plans.sourceAuthorName,
+        sourceAuthorLogin: schema.plans.sourceAuthorLogin,
         createdAt: schema.plans.createdAt,
         updatedAt: schema.plans.updatedAt,
         approvedAt: schema.plans.approvedAt,

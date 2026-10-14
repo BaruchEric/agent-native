@@ -9,11 +9,11 @@
 
 ```bash
 git clone https://github.com/BuilderIO/agent-native.git
-cd agent-native/framework
+cd agent-native
 pnpm install
 ```
 
-The `postinstall` script automatically builds the workspace packages other packages depend on (`shared-app-config`, `core`, `code-agents-ui`, `migrate`, `pinpoint`, `scheduling`, `embedding`, `dispatch`).
+The `postinstall` script automatically builds the workspace packages other packages depend on (`shared-app-config`, `toolkit`, `core`, `code-agents-ui`, `migrate`, `pinpoint`, `scheduling`, `embedding`, `dispatch`).
 
 ## Development
 
@@ -66,7 +66,7 @@ This is a pnpm monorepo. Workspaces are defined in `pnpm-workspace.yaml`.
 
 Production-ready template apps that demonstrate the framework. Each template is a standalone app with its own `package.json`, Drizzle schema, actions, and UI.
 
-Templates: `analytics`, `assets`, `brain`, `calendar`, `chat`, `clips`, `content`, `design`, `dispatch`, `forms`, `macros`, `mail`, `plan`, `slides`, `videos`
+Templates: `analytics`, `assets`, `brain`, `calendar`, `chat`, `clips`, `content`, `design`, `dispatch`, `forms`, `mail`, `plan`, `slides`
 
 Each template uses the same scripts:
 
@@ -79,51 +79,85 @@ pnpm typecheck    # type-check
 
 ## Environment Variables
 
-Templates read from `.env` in their own directory. Key variables:
+Templates read from `.env` in their own directory, and workspace development
+loads the root `.env` before app-local values. The complete repository-wide
+index is [docs/environment-variables.md](docs/environment-variables.md). It
+covers framework, template, local/test, build/deploy, CI-only, and credential
+variables, and is checked by `pnpm run guard:env-documentation`.
 
-| Variable               | Purpose                                                          |
-| ---------------------- | ---------------------------------------------------------------- |
-| `DATABASE_URL`         | Database connection string (see below)                           |
-| `ANTHROPIC_API_KEY`    | API key for Claude (required for agent chat)                     |
-| `ACCESS_TOKEN`         | Static bearer fallback for MCP/connect clients; not browser auth |
-| `GOOGLE_CLIENT_ID`     | Google OAuth client ID (for Gmail, Calendar integrations)        |
-| `GOOGLE_CLIENT_SECRET` | Google OAuth client secret                                       |
+For the most common setup variables, start with `DATABASE_URL`,
+`BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `A2A_SECRET`, and the provider key
+needed by the selected agent engine. User-, organization-, and workspace-scoped
+credentials should be stored through the scoped secret/credential store rather
+than added to `.env`.
 
 ### Database options
 
-Set `DATABASE_URL` to connect to your database. When unset, defaults to a local SQLite file at `data/app.db`.
+Set `DATABASE_URL` to connect to a hosted PostgreSQL database. When unset, local development uses PGlite at `data/pglite`.
 
 | Provider         | Example `DATABASE_URL`                                     |
 | ---------------- | ---------------------------------------------------------- |
-| SQLite (default) | _(unset, or `file:./data/app.db`)_                         |
+| PGlite (default) | _(unset)_                                                  |
 | Neon Postgres    | `postgresql://user:pass@ep-xxx.us-east-2.aws.neon.tech/db` |
 | Supabase         | `postgresql://user:pass@db.xxx.supabase.co:5432/postgres`  |
-| Turso (libSQL)   | `libsql://your-db.turso.io?authToken=...`                  |
 | Plain Postgres   | `postgresql://user:pass@localhost:5432/mydb`               |
 
-All SQL must be dialect-agnostic -- never assume SQLite.
+All SQL must be PostgreSQL-compatible.
 
 ## Key Commands
 
 Run these from the repo root:
 
-| Command              | Description                                                      |
-| -------------------- | ---------------------------------------------------------------- |
-| `pnpm run prep`      | Format + typecheck + test + guards in parallel (run before push) |
-| `pnpm run fmt`       | Format all files with Prettier                                   |
-| `pnpm run fmt:check` | Check formatting without writing                                 |
-| `pnpm run typecheck` | Type-check all packages and templates                            |
-| `pnpm test`          | Run tests (core + migrate + docs + dispatch + brain evals)       |
-| `pnpm run guards`    | Run all security/consistency guard scripts (see Guards below)    |
-| `pnpm run lint`      | Format check + typecheck                                         |
+| Command              | Description                                                            |
+| -------------------- | ---------------------------------------------------------------------- |
+| `pnpm run prep`      | Format + typecheck + test + guards in parallel (run before push)       |
+| `pnpm run fmt`       | Format all files with Prettier                                         |
+| `pnpm run fmt:check` | Check formatting without writing                                       |
+| `pnpm run typecheck` | Type-check all packages and templates                                  |
+| `pnpm test`          | Run tests across every workspace package/template with a `test` script |
+| `pnpm run guards`    | Run all security/consistency guard scripts (see Guards below)          |
+| `pnpm run lint`      | Format check + typecheck                                               |
+
+## Concurrency
+
+Each runner sizes itself off the whole machine, which oversubscribes the CPU
+when several agent sessions or checkouts run checks at once. Every lid has an
+env override:
+
+| Variable                                                | Controls                            | Default                         |
+| ------------------------------------------------------- | ----------------------------------- | ------------------------------- |
+| `VITEST_CONCURRENCY`, `AGENT_NATIVE_VITEST_CONCURRENCY` | Workers per vitest suite            | `25%` of cores                  |
+| `GUARD_CONCURRENCY`, `AGENT_NATIVE_GUARD_CONCURRENCY`   | Guards running in parallel          | `cores / 2`, clamped to 2--6    |
+| `WORKSPACE_CONCURRENCY`, `PNPM_WORKSPACE_CONCURRENCY`   | Packages running a task in parallel | per-profile, derived from cores |
+
+`VITEST_CONCURRENCY` takes a percentage (`25%`) or a worker count (`2`). The
+base config every vitest config merges in ships from
+`@agent-native/core/vitest-config`; templates import it by package name, and
+`packages/*` go through the `vitest.shared.ts` re-export at the repo root so
+they need no dependency on core. A package that needs a different value
+sets `test.maxWorkers` in its own config; that wins the merge.
+
+Template configs must import the package path, never the root re-export.
+`agent-native create` extracts a template directory with `--strip-components=1`,
+so anything a template reaches for above its own directory resolves to nothing
+in the scaffolded app.
+
+Vitest's own `VITEST_MAX_WORKERS` still works for a one-off integer, but never
+give it a percentage: vitest applies it as `Number.parseInt`, so `25%` becomes
+25 workers rather than a quarter of the machine (vitest#9631). The config
+throws rather than let that through.
 
 ## Guards
 
-The `guards` script chains a suite of guard scripts under `scripts/guard-*.mjs`,
-each codifying a real past incident or invariant (cross-tenant data leaks,
-credential leaks, `drizzle-kit push` against prod, unscoped ownable queries,
-env-based credentials, the public template allow-list, etc.). Read the header
-comment of each `scripts/guard-*.mjs` for what it enforces.
+The `guards` script (`scripts/run-guards.ts`) runs the fixed list of checks
+registered there. Most are `scripts/guard-*` scripts (`.mjs` and `.ts`), but a
+few -- `guard:workspace-skills`, `guard:plan-skills`, `guard:plan-marketplace`
+-- run `scripts/sync-*.ts --check` and don't match the `guard-*` filename
+glob. `scripts/run-guards.ts` is the authoritative registry of what runs;
+each check codifies a real past incident or invariant (cross-tenant data
+leaks, credential leaks, `drizzle-kit push` against prod, unscoped ownable
+queries, env-based credentials, the public template allow-list, etc.). Read
+the header comment of each guard script for what it enforces.
 
 Enforcement:
 
@@ -133,6 +167,20 @@ Enforcement:
   the required-status-checks ruleset for `main`.
 - There is intentionally **no pre-commit hook** (see project conventions); run
   `pnpm run prep` before pushing.
+
+On Windows, the guards need a checkout with LF line endings and real symlinks
+(several read the symlinked skill folders in `.agents/skills/`):
+
+1. Turn on Windows Developer Mode, which lets Git create symlinks, and run
+   `git config core.symlinks true`.
+2. If the clone predates the `eol=lf` rule in `.gitattributes` or was made
+   without symlinks, commit or stash your changes, then rewrite the tracked
+   files once:
+
+   ```bash
+   git rm --cached -r -q .
+   git reset --hard
+   ```
 
 ## Building
 

@@ -1,18 +1,126 @@
-import { getSetting, putSetting, deleteSetting } from "../settings/store.js";
+import { getDbExec } from "../db/client.js";
+import { canManageOrg } from "../org/permissions.js";
 import {
   encryptSecretValue,
   decryptSecretValue,
   isEncryptedSecretValue,
 } from "../secrets/crypto.js";
+import {
+  deleteAppSecret,
+  readAppSecret,
+  type SecretRef,
+} from "../secrets/storage.js";
+import { assertCredentialStoreReadable } from "../server/credential-provider.js";
+import {
+  isPersonalCredentialScope,
+  readsOrgCredentialFirst,
+} from "../server/credential-read-order.js";
+import {
+  isPersonalProviderKeyUseRestricted,
+  isPersonalProviderPolicyKey,
+  readOrgMemberRole,
+} from "../server/personal-provider-key-policy.js";
+import { getSetting, putSetting, deleteSetting } from "../settings/store.js";
 
 const SETTING_PREFIX = "credential:";
 
 export interface CredentialContext {
   userEmail: string;
   orgId?: string | null;
+  /** Restricts lookup to shared credentials in the explicit org. */
+  credentialScope?: "org";
 }
 
 export type CredentialStorageScope = "user" | "org";
+
+export interface ResolvedCredential {
+  value: string;
+  scope: SecretRef["scope"];
+  scopeId: string;
+}
+
+export interface CredentialProvenance {
+  scope: SecretRef["scope"] | "deployment";
+  scopeId?: string;
+  source?: string;
+  connectionId?: string;
+}
+
+export interface CredentialEndpointOwner {
+  scope: string;
+  scopeId?: string;
+  source?: string;
+  connectionId?: string;
+}
+
+export class CredentialEndpointMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CredentialEndpointMismatchError";
+  }
+}
+
+export function assertCredentialCanReachEndpoint(
+  endpoint: CredentialEndpointOwner,
+  credential:
+    | Pick<
+        CredentialProvenance,
+        "scope" | "scopeId" | "source" | "connectionId"
+      >
+    | {
+        scope?: string;
+        scopeId?: string;
+        source?: string;
+        connectionId?: string;
+      }
+    | undefined,
+  key?: string,
+): void {
+  if (
+    endpoint.source === "workspace_connection" &&
+    (!endpoint.connectionId ||
+      credential?.connectionId !== endpoint.connectionId)
+  ) {
+    throw new CredentialEndpointMismatchError(
+      `Refusing to send ${key ? `\"${key}\"` : "a credential"} to a workspace connection unless it is bound to that exact connection.`,
+    );
+  }
+  if (endpoint.scope === "unknown") {
+    throw new CredentialEndpointMismatchError(
+      `Refusing to send ${key ? `\"${key}\"` : "a credential"} to an endpoint with unknown ownership.`,
+    );
+  }
+  const soloWorkspaceEndpoint =
+    endpoint.scope === "workspace" && endpoint.scopeId?.startsWith("solo:");
+  if (endpoint.scope === "user" || soloWorkspaceEndpoint) {
+    const endpointUserEmail = soloWorkspaceEndpoint
+      ? endpoint.scopeId?.slice("solo:".length)
+      : endpoint.scopeId;
+    const credentialBelongsToEndpointUser =
+      Boolean(endpointUserEmail) &&
+      ((credential?.scope === "user" &&
+        credential.scopeId === endpointUserEmail) ||
+        (credential?.scope === "workspace" &&
+          credential.scopeId === `solo:${endpointUserEmail}`));
+    if (credentialBelongsToEndpointUser) return;
+
+    throw new CredentialEndpointMismatchError(
+      `Refusing to send ${key ? `\"${key}\"` : "a credential"} to a user-controlled endpoint unless it is saved by the same user.`,
+    );
+  }
+
+  if (endpoint.scope === "org" || endpoint.scope === "workspace") {
+    const credentialBelongsToEndpointWorkspace =
+      Boolean(endpoint.scopeId) &&
+      (credential?.scope === "org" || credential?.scope === "workspace") &&
+      credential.scopeId === endpoint.scopeId;
+    if (credentialBelongsToEndpointWorkspace) return;
+
+    throw new CredentialEndpointMismatchError(
+      `Refusing to send ${key ? `\"${key}\"` : "a credential"} to a shared endpoint unless it is saved by the same organization or workspace.`,
+    );
+  }
+}
 
 function userCredentialSettingKey(email: string, key: string): string {
   return `u:${email.toLowerCase()}:${SETTING_PREFIX}${key}`;
@@ -28,15 +136,26 @@ async function readCredentialSetting(
   const setting = await getSetting(settingKey);
   if (!setting || typeof setting.value !== "string") return undefined;
   const stored = setting.value;
-  // Values written by saveCredential are AES-256-GCM encrypted at rest.
-  // Rows that predate encryption are plaintext — read them transparently
-  // (the migrate-encrypt-credentials script re-encrypts them in place).
   if (!isEncryptedSecretValue(stored)) return stored;
   try {
     return decryptSecretValue(stored);
   } catch {
     // Key rotated, corrupt, or tampered row — treat as not set rather than
     // surfacing ciphertext or throwing into every credential lookup.
+    return undefined;
+  }
+}
+
+async function readScopedAppSecret(
+  key: string,
+  scope: SecretRef["scope"],
+  scopeId: string,
+): Promise<string | undefined> {
+  try {
+    return (await readAppSecret({ key, scope, scopeId }))?.value;
+  } catch {
+    // Older databases may not have app_secrets yet. Keep the legacy
+    // credential store available while the table bootstraps.
     return undefined;
   }
 }
@@ -61,39 +180,250 @@ export async function resolveCredentialForScope(
 }
 
 /**
- * Resolve a credential, scoped to the caller's user (and falling back to
- * the active org's shared credential, if any).
+ * `ctx.orgId` when the caller supplied one, otherwise the org resolved from
+ * `ctx.userEmail`'s membership. Interactive requests always supply `orgId`
+ * (session/`getOrgContext` backfill it); CLI runs, cron jobs, and any other
+ * caller built straight from `getCredentialContext()` outside a request event
+ * do not, and previously fell through as "no active org" — invisibly skipping
+ * every org-scoped credential a signed-in session could see. Mirrors the
+ * fallback already proven in `resolveSecretDetailed`
+ * (server/credential-provider.ts).
+ */
+async function resolveEffectiveOrgId(
+  ctx: CredentialContext,
+): Promise<{ orgId: string | null; lookupFailed: boolean; cause?: unknown }> {
+  if (ctx.orgId) return { orgId: ctx.orgId, lookupFailed: false };
+  try {
+    const { resolveOrgIdForEmail } = await import("../org/context.js");
+    return {
+      orgId: await resolveOrgIdForEmail(ctx.userEmail),
+      lookupFailed: false,
+    };
+  } catch (cause) {
+    return { orgId: null, lookupFailed: true, cause };
+  }
+}
+
+/**
+ * Resolve a credential across the encrypted app_secrets store and the legacy
+ * settings-backed credential store. A member's own value wins, followed by the
+ * active org/workspace shared value.
  *
  * SECURITY: NEVER reads from process.env. Env vars are global to the
- * deployment and would leak across users in a multi-tenant app. The only
- * sources are per-user / per-org rows in the SQL `settings` table.
+ * deployment and would leak across users in a multi-tenant app.
  *
- * Storage keys (priority order):
- *   1. u:<email>:credential:<KEY>   — per-user override
- *   2. o:<orgId>:credential:<KEY>   — per-org shared credential (if orgId given)
+ * Read order:
+ *   1. user-scoped app_secrets
+ *   2. user-scoped legacy settings credential
+ *   3. org-scoped app_secrets
+ *   4. legacy workspace-scoped app_secrets for the org
+ *   5. org-scoped legacy settings credential
+ *   6. solo workspace-scoped app_secrets (`solo:<email>`)
+ *
+ * An owner or admin of the org reads 3-5 before 1-2 (`readsOrgCredentialFirst`).
+ *
+ * Steps 3-5 use `ctx.orgId` when given, else the org resolved from
+ * `ctx.userEmail` (see `resolveEffectiveOrgId`), and are skipped only when the
+ * caller truly has no org. A membership lookup that could not be read throws
+ * `CredentialStoreUnavailableError` instead of silently reporting the
+ * credential as unset — "the store didn't answer" and "nothing is saved" are
+ * different outcomes callers must not conflate.
  */
+export async function resolveCredentialDetailed(
+  key: string,
+  ctx: CredentialContext,
+): Promise<ResolvedCredential | undefined> {
+  if (!ctx?.userEmail) return undefined;
+
+  // Stored but unused while the org restricts a member's provider keys.
+  const personalRestricted =
+    ctx.credentialScope !== "org" &&
+    isPersonalProviderPolicyKey(key) &&
+    (await isPersonalProviderKeyUseRestricted(
+      ctx.orgId
+        ? { email: ctx.userEmail, orgId: ctx.orgId }
+        : { email: ctx.userEmail },
+    ));
+
+  let personal: ResolvedCredential | undefined;
+  if (ctx.credentialScope !== "org" && !personalRestricted) {
+    const value =
+      (await readScopedAppSecret(key, "user", ctx.userEmail)) ??
+      (await resolveCredentialForScope(key, { ...ctx, scope: "user" }));
+    if (value) personal = { value, scope: "user", scopeId: ctx.userEmail };
+  }
+
+  if (ctx.credentialScope === "org" && !ctx.orgId) return undefined;
+  const orgLookup = await resolveEffectiveOrgId(ctx);
+  // Before the personal answer: without the org, an owner's role is unknown.
+  assertCredentialStoreReadable(orgLookup);
+  const { orgId } = orgLookup;
+  // An owner or admin runs on the organization's credential ahead of their own.
+  if (personal && !(await readsOrgCredentialFirst(orgId, ctx.userEmail))) {
+    return personal;
+  }
+
+  if (orgId) {
+    const orgSecret = await readScopedAppSecret(key, "org", orgId);
+    if (orgSecret) return { value: orgSecret, scope: "org", scopeId: orgId };
+
+    const workspaceSecret = await readScopedAppSecret(key, "workspace", orgId);
+    if (workspaceSecret) {
+      return { value: workspaceSecret, scope: "workspace", scopeId: orgId };
+    }
+
+    const orgSetting = await resolveCredentialForScope(key, {
+      ...ctx,
+      orgId,
+      scope: "org",
+    });
+    if (orgSetting) {
+      return { value: orgSetting, scope: "org", scopeId: orgId };
+    }
+  }
+
+  if (ctx.credentialScope === "org") return undefined;
+  if (personal) return personal;
+
+  // Solo-workspace fallback: always checked, even when an org id was found
+  // above. A credential written before the user joined/created an org lives
+  // here, and must not become unreachable once that org exists. Last on
+  // purpose — a current org-scoped value always wins over a pre-org one.
+  if (personalRestricted) return undefined;
+  const soloWorkspaceSecret = await readScopedAppSecret(
+    key,
+    "workspace",
+    `solo:${ctx.userEmail}`,
+  );
+  return soloWorkspaceSecret
+    ? {
+        value: soloWorkspaceSecret,
+        scope: "workspace",
+        scopeId: `solo:${ctx.userEmail}`,
+      }
+    : undefined;
+}
+
 export async function resolveCredential(
   key: string,
   ctx: CredentialContext,
 ): Promise<string | undefined> {
-  if (!ctx?.userEmail) return undefined;
-
-  const userSetting = await resolveCredentialForScope(key, {
-    ...ctx,
-    scope: "user",
-  });
-  if (userSetting) return userSetting;
-
-  if (ctx.orgId) {
-    return resolveCredentialForScope(key, { ...ctx, scope: "org" });
-  }
-
-  return undefined;
+  return (await resolveCredentialDetailed(key, ctx))?.value;
 }
 
 /**
- * Check if a credential is available for the given context.
+ * Explain an empty credential lookup when a key of that name is saved in a
+ * scope the caller cannot read.
+ *
+ * Two distinct causes produce the same "the key is right there and it still
+ * says it's missing" report:
+ *
+ *  - Non-interactive runs — integration/webhook deliveries, scheduled jobs,
+ *    automations, and inbound A2A calls — resolve credentials as an owner
+ *    identity rather than as the person who triggered them, so a teammate's
+ *    Personal key is invisible to them even though the vault visibly holds it.
+ *  - The key is saved in a DIFFERENT organization the caller also belongs to.
+ *    Credentials are per-organization, so gaining a second organization (or
+ *    having `active-org-id` repointed at one) orphans every key synced under
+ *    the first. Without this, the only symptom is a missing-env-var error that
+ *    names the key rather than the org mismatch that actually caused it.
+ *
+ * SECURITY: both probes are bounded to organizations the caller is a member
+ * of, report only the scope kind (and, for the cross-org case, the name of an
+ * org the caller already belongs to), and never return the owning account, how
+ * many rows matched, or any part of the value. Without an active org there is
+ * no boundary to bound the probe to, so it declines to answer rather than
+ * revealing that some other tenant holds a key of the same name — this
+ * includes callers whose `ctx.orgId` is unset AND whose org could not be
+ * resolved from `ctx.userEmail` (see `resolveEffectiveOrgId`).
+ *
+ * Returns null when nothing safe and useful can be said.
  */
+export async function describeCredentialScopeGap(
+  keys: readonly string[],
+  ctx: CredentialContext,
+): Promise<string | null> {
+  if (!ctx?.userEmail) return null;
+  const orgLookup = await resolveEffectiveOrgId(ctx);
+  if (orgLookup.lookupFailed || !orgLookup.orgId) return null;
+  const scopedCtx: CredentialContext = { ...ctx, orgId: orgLookup.orgId };
+
+  for (const key of keys) {
+    if (await hasForeignPersonalCredentialInOrg(key, scopedCtx)) {
+      return (
+        `A "${key}" key is saved in this workspace with Personal scope. ` +
+        `Personal keys are readable only by their own owner's signed-in sessions, ` +
+        `and this run resolves credentials as the owner identity behind the ` +
+        `integration, job, or automation — so it needs "${key}" saved with ` +
+        `Workspace or Organization scope instead.`
+      );
+    }
+
+    const holder = await findMemberOrgHoldingCredential(key, scopedCtx);
+    if (holder) {
+      return (
+        `A "${key}" key is saved in the ${holder} organization, but this ` +
+        `request resolved to a different organization you also belong to. ` +
+        `Credentials are scoped per organization and are not shared between ` +
+        `them, so this is an organization mismatch rather than a missing key. ` +
+        `Either switch your active organization back to ${holder}, or save ` +
+        `"${key}" in the organization this request runs in.`
+      );
+    }
+  }
+  return null;
+}
+
+async function hasForeignPersonalCredentialInOrg(
+  key: string,
+  ctx: CredentialContext,
+): Promise<boolean> {
+  try {
+    const { rows } = await getDbExec().execute({
+      sql: `SELECT 1 FROM app_secrets s
+              JOIN org_members m ON LOWER(m.email) = LOWER(s.scope_id)
+                                AND m.federation_removal_pending_at IS NULL
+             WHERE s.key = ? AND s.scope = 'user'
+               AND m.org_id = ? AND LOWER(s.scope_id) <> ?
+             LIMIT 1`,
+      args: [key, ctx.orgId!, ctx.userEmail.toLowerCase()],
+    });
+    return rows.length > 0;
+  } catch {
+    // Missing app_secrets/org_members table, or any other read failure — a
+    // diagnostic must never replace the real "not configured" error.
+    return false;
+  }
+}
+
+async function findMemberOrgHoldingCredential(
+  key: string,
+  ctx: CredentialContext,
+): Promise<string | null> {
+  try {
+    const { rows } = await getDbExec().execute({
+      sql: `SELECT o.name AS org_name
+              FROM app_secrets s
+              JOIN org_members m ON m.org_id = s.scope_id
+                                AND LOWER(m.email) = ?
+                                AND m.federation_removal_pending_at IS NULL
+              LEFT JOIN organizations o ON o.id = s.scope_id
+             WHERE s.key = ?
+               AND s.scope IN ('org', 'workspace')
+               AND s.scope_id <> ?
+             LIMIT 1`,
+      args: [ctx.userEmail.toLowerCase(), key, ctx.orgId!],
+    });
+    if (rows.length === 0) return null;
+    const name = (rows[0] as { org_name?: unknown }).org_name;
+    return typeof name === "string" && name.trim()
+      ? `"${name.trim()}"`
+      : "another";
+  } catch {
+    return null;
+  }
+}
+
 export async function hasCredential(
   key: string,
   ctx: CredentialContext,
@@ -101,10 +431,6 @@ export async function hasCredential(
   return (await resolveCredential(key, ctx)) !== undefined;
 }
 
-/**
- * Save a credential. By default writes to the per-user store; pass
- * `scope: "org"` to write to the active org's shared credentials.
- */
 export async function saveCredential(
   key: string,
   value: string,
@@ -113,9 +439,6 @@ export async function saveCredential(
   if (!ctx?.userEmail) {
     throw new Error("saveCredential requires CredentialContext with userEmail");
   }
-  // Encrypt at rest (AES-256-GCM) so a leaked DB backup / pg_dump / read
-  // replica doesn't expose plaintext keys. resolveCredential decrypts
-  // transparently on read.
   const encrypted = encryptSecretValue(value);
   if (ctx.scope === "org") {
     if (!ctx.orgId) {
@@ -132,7 +455,11 @@ export async function saveCredential(
 }
 
 /**
- * Delete a credential from the per-user (default) or per-org store.
+ * Remove every row of `key` the named owner holds: the caller's own (user
+ * secret, legacy user setting, `solo:` workspace secret) or, with
+ * `scope: "org"`, the organization's (org secret, legacy workspace secret,
+ * legacy org setting). Callers check that the caller may change the
+ * organization's credentials; `deleteResolvedCredential` does it for them.
  */
 export async function deleteCredential(
   key: string,
@@ -147,8 +474,50 @@ export async function deleteCredential(
     if (!ctx.orgId) {
       throw new Error("deleteCredential scope='org' requires orgId");
     }
+    await deleteAppSecret({ key, scope: "org", scopeId: ctx.orgId });
+    await deleteAppSecret({ key, scope: "workspace", scopeId: ctx.orgId });
     await deleteSetting(orgCredentialSettingKey(ctx.orgId, key));
     return;
   }
+  await deleteAppSecret({ key, scope: "user", scopeId: ctx.userEmail });
   await deleteSetting(userCredentialSettingKey(ctx.userEmail, key));
+  await deleteAppSecret({
+    key,
+    scope: "workspace",
+    scopeId: `solo:${ctx.userEmail}`,
+  });
+}
+
+export class CredentialDeleteForbiddenError extends Error {
+  statusCode = 403;
+  constructor() {
+    super(
+      "Only organization owners and admins can remove the organization's credentials",
+    );
+    this.name = "CredentialDeleteForbiddenError";
+  }
+}
+
+/**
+ * Remove the credential `resolveCredentialDetailed` answers with, so a
+ * disconnect takes effect: every row of the owner that answers (see
+ * `deleteCredential`), since deleting just the answering row would let the
+ * next row of that owner answer instead. Only an owner or admin may remove
+ * the organization's. A save that clears a value knows its scope and calls
+ * `deleteCredential` with it instead, which never follows the read order.
+ */
+export async function deleteResolvedCredential(
+  key: string,
+  ctx: CredentialContext,
+): Promise<void> {
+  const held = await resolveCredentialDetailed(key, ctx);
+  if (!held) return;
+  if (isPersonalCredentialScope(held)) {
+    await deleteCredential(key, { ...ctx, scope: "user" });
+    return;
+  }
+  if (!canManageOrg(await readOrgMemberRole(held.scopeId, ctx.userEmail))) {
+    throw new CredentialDeleteForbiddenError();
+  }
+  await deleteCredential(key, { ...ctx, orgId: held.scopeId, scope: "org" });
 }

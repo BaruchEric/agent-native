@@ -1,11 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 
-const DISMISSED_KEY = "clips.desktop-promo.dismissed";
+import { useIsMobile } from "@/hooks/use-mobile";
 
 function detectDesktopApp(): boolean {
   if (typeof navigator === "undefined") return false;
   if (/Electron/i.test(navigator.userAgent)) return true;
-  // Tauri v2 exposes `__TAURI_INTERNALS__` on window; v1 used `__TAURI__`.
   if (typeof window !== "undefined") {
     const w = window as unknown as {
       __TAURI_INTERNALS__?: unknown;
@@ -17,31 +16,18 @@ function detectDesktopApp(): boolean {
 }
 
 export function useDesktopPromo() {
+  const isMobile = useIsMobile();
   const [isDesktopApp, setIsDesktopApp] = useState(false);
-  const [dismissed, setDismissed] = useState(false);
+  const [runtimeDetected, setRuntimeDetected] = useState(false);
 
   useEffect(() => {
     setIsDesktopApp(detectDesktopApp());
-    setDismissed(
-      typeof window !== "undefined" &&
-        window.localStorage?.getItem(DISMISSED_KEY) === "1",
-    );
-  }, []);
-
-  const dismiss = useCallback(() => {
-    setDismissed(true);
-    try {
-      window.localStorage?.setItem(DISMISSED_KEY, "1");
-    } catch {
-      // localStorage can throw in private browsing — ignore, dismissal
-      // still holds for the session via React state.
-    }
+    setRuntimeDetected(true);
   }, []);
 
   return {
     isDesktopApp,
-    shouldShowPromo: !isDesktopApp && !dismissed,
-    shouldShowSidebarLink: !isDesktopApp,
-    dismiss,
+    isMobile,
+    shouldShowSidebarLink: runtimeDetected && !isMobile && !isDesktopApp,
   };
 }

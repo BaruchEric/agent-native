@@ -1,12 +1,66 @@
-import DocsLayout from "../components/DocsLayout";
+import {
+  useLoaderData,
+  useLocation,
+  useParams,
+  type ClientLoaderFunctionArgs,
+  type LoaderFunctionArgs,
+} from "react-router";
+
+import {
+  gettingStartedIntro,
+  GettingStartedCloudContent,
+  gettingStartedTabFromSearch,
+  GettingStartedTabs,
+} from "../components/blocks/getting-started-paths";
 import DocContent from "../components/DocContent";
-import { getDoc } from "../components/docs-content";
-import { withDocsSocialImage } from "../seo";
+import DocDraftBanner from "../components/DocDraftBanner";
+import {
+  hasLocalizedDoc,
+  loadDocRespectingDraftVisibility,
+  preloadDocBlocksForDoc,
+  type DocEntry,
+} from "../components/docs-content";
+import {
+  DEFAULT_DOCS_LOCALE,
+  docsLocaleFromSegment,
+  docsPathForSlug,
+} from "../components/docs-locale";
+import { docsMarkdownPathForDoc } from "../components/docs-seo";
+import DocsLayout from "../components/DocsLayout";
+import DocTranslationBanner from "../components/DocTranslationBanner";
+import { withDefaultSocialImage, withDocsSocialImage } from "../seo";
 
-const doc = getDoc("getting-started")!;
+const GETTING_STARTED_SLUG = "getting-started";
 
-export const meta = () =>
-  withDocsSocialImage(
+function routeLocale(params: LoaderFunctionArgs["params"]) {
+  return docsLocaleFromSegment(params.locale) ?? DEFAULT_DOCS_LOCALE;
+}
+
+export async function loader({
+  params,
+}: LoaderFunctionArgs): Promise<DocEntry> {
+  const doc = await loadDocRespectingDraftVisibility(
+    GETTING_STARTED_SLUG,
+    routeLocale(params),
+  );
+  if (!doc) throw new Response("Not Found", { status: 404 });
+  return doc;
+}
+
+export async function clientLoader({ serverLoader }: ClientLoaderFunctionArgs) {
+  const doc = (await serverLoader()) as DocEntry;
+  return preloadDocBlocksForDoc(doc);
+}
+
+export const meta = ({
+  data,
+  loaderData,
+}: { data?: DocEntry; loaderData?: DocEntry } = {}) => {
+  const doc = data ?? loaderData;
+  if (!doc) {
+    return withDefaultSocialImage([{ title: "Not Found — Agent-Native" }]);
+  }
+  return withDocsSocialImage(
     [
       { title: `${doc.title} — Agent-Native` },
       { name: "description", content: doc.description },
@@ -16,17 +70,49 @@ export const meta = () =>
     ],
     doc.title,
   );
+};
 
 export default function DocsIndex() {
-  const toc = doc.headings.map((h) => ({
-    id: h.id,
-    label: h.label,
-    level: h.level,
-  }));
+  const currentDoc = useLoaderData<typeof loader>();
+  const location = useLocation();
+  const params = useParams();
+  const locale = routeLocale(params);
+  const isCloud = gettingStartedTabFromSearch(location.search) === "cloud";
+
+  const toc = isCloud
+    ? []
+    : currentDoc.headings.map((h) => ({
+        id: h.id,
+        label: h.label,
+        level: h.level,
+      }));
 
   return (
-    <DocsLayout toc={toc}>
-      <DocContent markdown={doc.body} />
+    <DocsLayout
+      toc={toc}
+      markdownUrl={docsMarkdownPathForDoc(currentDoc.slug, locale) ?? undefined}
+    >
+      {currentDoc.draft && <DocDraftBanner />}
+      {isCloud ? (
+        <>
+          <DocContent
+            markdown={gettingStartedIntro(currentDoc.body)}
+            locale={locale}
+          />
+          <div className="docs-block">
+            <GettingStartedTabs activeTab="cloud" />
+          </div>
+          <GettingStartedCloudContent />
+        </>
+      ) : (
+        <DocContent markdown={currentDoc.body} locale={locale} />
+      )}
+      {locale !== DEFAULT_DOCS_LOCALE &&
+        hasLocalizedDoc(locale, currentDoc.slug) && (
+          <DocTranslationBanner
+            originalHref={docsPathForSlug(currentDoc.slug, DEFAULT_DOCS_LOCALE)}
+          />
+        )}
     </DocsLayout>
   );
 }

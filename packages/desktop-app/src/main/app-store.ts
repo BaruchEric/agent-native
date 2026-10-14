@@ -1,13 +1,19 @@
-import { app, safeStorage } from "electron";
-import { randomUUID } from "node:crypto";
 import fs from "fs";
+import { randomUUID } from "node:crypto";
 import path from "path";
+
 import {
   DESKTOP_DEFAULT_APPS,
   TEMPLATE_APPS,
+  sortDesktopApps,
   type AppConfig,
-  type FrameSettings,
 } from "@shared/app-registry";
+import {
+  normalizeDesktopShortcutAccelerator,
+  type DesktopShortcutBehavior,
+  type DesktopShortcutBinding,
+  type DesktopShortcutUpsertRequest,
+} from "@shared/desktop-shortcuts";
 import type {
   CodeAgentProviderCredentialKey,
   CodeAgentProviderSettings,
@@ -15,18 +21,19 @@ import type {
   CodeAgentProviderStatus,
 } from "@shared/ipc-channels";
 import {
-  normalizeDesktopShortcutAccelerator,
-  type DesktopShortcutBehavior,
-  type DesktopShortcutBinding,
-  type DesktopShortcutUpsertRequest,
-} from "@shared/desktop-shortcuts";
+  normalizeQuickPromptPreferences,
+  type QuickPromptPreferences,
+} from "@shared/quick-prompt";
+import { app } from "electron";
 
 const STORE_FILE = "app-config.json";
-const FRAME_STORE_FILE = "frame-config.json";
 const REMOTE_CONNECTOR_STORE_FILE = "remote-connector-config.json";
 const CODE_AGENT_PROVIDER_STORE_FILE = "code-agent-providers.json";
 const SHORTCUT_STORE_FILE = "shortcut-config.json";
-const REMOVED_DESKTOP_APP_IDS = new Set(["starter"]);
+const QUICK_PROMPT_STORE_FILE = "quick-prompt-config.json";
+const DESKTOP_APP_PREFERENCES_STORE_FILE = "desktop-app-preferences.json";
+const REMOVED_DESKTOP_APP_IDS = new Set(["starter", "chat"]);
+const DESKTOP_APP_MODE_DEFAULTS_VERSION = 1;
 
 type StoredSecret =
   | { encoding: "local-file-v1"; value: string; updatedAt?: string }
@@ -77,14 +84,29 @@ const CODE_AGENT_PROVIDER_KEYS = CODE_AGENT_PROVIDER_DEFINITIONS.flatMap(
   (provider) => provider.keys,
 );
 
-const INITIAL_CODE_AGENT_PROVIDER_ENV = new Map(
-  CODE_AGENT_PROVIDER_KEYS.map((key) => [key, process.env[key]]),
-);
-
-export type { FrameSettings };
+type CodeAgentProviderCredentials = Partial<
+  Record<CodeAgentProviderCredentialKey, string>
+>;
 
 export interface RemoteConnectorSettings {
   enabled: boolean;
+}
+
+export type DesktopEnvironmentLanePreference = "auto" | "production" | "beta";
+
+export function isDesktopEnvironmentLanePreference(
+  value: unknown,
+): value is DesktopEnvironmentLanePreference {
+  return value === "auto" || value === "production" || value === "beta";
+}
+
+export interface DesktopAppPreferences {
+  appsRoot: string;
+  managedAppIds: string[];
+  appOrder: string[];
+  appModeDefaultsVersion?: number;
+  desktopSsoEnabled: boolean;
+  desktopEnvironmentLane: DesktopEnvironmentLanePreference;
 }
 
 interface ShortcutStore {
@@ -92,35 +114,26 @@ interface ShortcutStore {
   bindings: DesktopShortcutBinding[];
 }
 
-function defaultFrameSettings(): FrameSettings {
-  return {
-    enabled: true,
-    showCodeTab: false,
-    mode: app.isPackaged ? "prod" : "dev",
-  };
+interface QuickPromptStore extends QuickPromptPreferences {
+  version: 1;
 }
 
 function defaultRemoteConnectorSettings(): RemoteConnectorSettings {
   return {
-    enabled: true,
+    enabled: false,
   };
 }
 
 function defaultApps(): AppConfig[] {
   return DESKTOP_DEFAULT_APPS.map((def) => ({
     ...def,
-    mode:
-      app.isPackaged || def.id === "dispatch" ? (def.mode ?? "prod") : "dev",
+    mode: def.mode ?? "prod",
   }));
 }
 
 function canonicalizeDefaultApp(appConfig: AppConfig, def: AppConfig) {
   const shouldBackfillProdUrl = !appConfig.url?.trim() && Boolean(def.url);
 
-  // Preserve everything the user can edit in the settings dialog. Only
-  // structural fields the user can't edit (id, icon, isBuiltIn, placeholder)
-  // and template-canonical metadata (color) come from `def`. Without this,
-  // every restart wipes user-edited devUrl/url/name/etc. back to defaults.
   return {
     ...def,
     enabled: appConfig.enabled ?? def.enabled,
@@ -161,10 +174,6 @@ function canonicalizeTemplateApp(appConfig: AppConfig, def: AppConfig) {
   };
 }
 
-function getFrameStorePath(): string {
-  return path.join(app.getPath("userData"), FRAME_STORE_FILE);
-}
-
 function getRemoteConnectorStorePath(): string {
   return path.join(app.getPath("userData"), REMOTE_CONNECTOR_STORE_FILE);
 }
@@ -175,6 +184,14 @@ function getCodeAgentProviderStorePath(): string {
 
 function getShortcutStorePath(): string {
   return path.join(app.getPath("userData"), SHORTCUT_STORE_FILE);
+}
+
+function getQuickPromptStorePath(): string {
+  return path.join(app.getPath("userData"), QUICK_PROMPT_STORE_FILE);
+}
+
+function getDesktopAppPreferencesStorePath(): string {
+  return path.join(app.getPath("userData"), DESKTOP_APP_PREFERENCES_STORE_FILE);
 }
 
 function writeJsonFileAtomic(
@@ -240,6 +257,41 @@ function defaultShortcutStore(): ShortcutStore {
   return { version: 1, bindings: [] };
 }
 
+function defaultQuickPromptStore(): QuickPromptStore {
+  return { version: 1, enabled: false };
+}
+
+function loadQuickPromptStore(): QuickPromptStore {
+  try {
+    const raw = JSON.parse(fs.readFileSync(getQuickPromptStorePath(), "utf-8"));
+    return {
+      version: 1,
+      ...normalizeQuickPromptPreferences(raw),
+    };
+  } catch {
+    return defaultQuickPromptStore();
+  }
+}
+
+export function loadQuickPromptPreferences(): QuickPromptPreferences {
+  return loadQuickPromptStore();
+}
+
+export function saveQuickPromptPreferences(
+  settings: Partial<QuickPromptPreferences>,
+): QuickPromptPreferences {
+  const current = loadQuickPromptStore();
+  const updated: QuickPromptStore = {
+    version: 1,
+    enabled:
+      typeof settings.enabled === "boolean"
+        ? settings.enabled
+        : current.enabled,
+  };
+  writeJsonFileAtomic(getQuickPromptStorePath(), updated);
+  return updated;
+}
+
 function sanitizeShortcutBehavior(behavior: unknown): DesktopShortcutBehavior {
   return behavior === "show" ? "show" : "toggle";
 }
@@ -293,92 +345,33 @@ function saveShortcutStore(store: ShortcutStore): void {
   writeJsonFileAtomic(getShortcutStorePath(), store);
 }
 
-function canUseSafeStorage(): boolean {
-  try {
-    return safeStorage.isEncryptionAvailable();
-  } catch {
-    return false;
-  }
-}
-
 function encodeProviderSecret(value: string): StoredSecret {
-  if (canUseSafeStorage()) {
-    try {
-      return {
-        encoding: "safeStorage-v1",
-        value: safeStorage.encryptString(value).toString("base64"),
-        updatedAt: new Date().toISOString(),
-      };
-    } catch {
-      // Fall through to the plain fallback below.
-    }
-  }
-
   return {
-    encoding: "plain",
+    encoding: "local-file-v1",
     value,
     updatedAt: new Date().toISOString(),
   };
 }
 
-function decryptProviderSecret(
-  secret: StoredSecret | undefined,
-): string | null {
+function readProviderSecret(secret: StoredSecret | undefined): string | null {
   if (!secret?.value) return null;
   if (secret.encoding === "local-file-v1" || secret.encoding === "plain") {
     return secret.value;
   }
-  if (!canUseSafeStorage()) return null;
-  try {
-    return safeStorage.decryptString(Buffer.from(secret.value, "base64"));
-  } catch {
-    return null;
-  }
+  return null;
 }
 
-function migrateDecryptableProviderSecrets(
-  store: CodeAgentProviderStore,
-  credentials: Partial<Record<CodeAgentProviderCredentialKey, string>>,
-): void {
-  if (!canUseSafeStorage()) return;
-  let changed = false;
-  for (const key of CODE_AGENT_PROVIDER_KEYS) {
-    const secret = store.credentials[key];
-    const value = credentials[key];
-    if (!value || !secret || secret.encoding === "safeStorage-v1") continue;
-    store.credentials[key] = encodeProviderSecret(value);
-    changed = true;
-  }
-  if (changed) saveCodeAgentProviderStore(store);
+function hasUsableProviderSecret(secret: StoredSecret | undefined): boolean {
+  return readProviderSecret(secret) !== null;
 }
 
-function hasStoredProviderSecretBlob(
-  secret: StoredSecret | undefined,
-): boolean {
-  return Boolean(secret?.value);
-}
-
-function canReadStoredProviderSecret(
-  secret: StoredSecret | undefined,
-): boolean {
-  if (!secret?.value) return false;
-  if (secret.encoding === "local-file-v1" || secret.encoding === "plain") {
-    return true;
-  }
-  return Boolean(decryptProviderSecret(secret));
-}
-
-export function loadCodeAgentProviderCredentials(): Partial<
-  Record<CodeAgentProviderCredentialKey, string>
-> {
+export function loadCodeAgentProviderCredentials(): CodeAgentProviderCredentials {
   const store = loadCodeAgentProviderStore();
-  const credentials: Partial<Record<CodeAgentProviderCredentialKey, string>> =
-    {};
+  const credentials: CodeAgentProviderCredentials = {};
   for (const key of CODE_AGENT_PROVIDER_KEYS) {
-    const value = decryptProviderSecret(store.credentials[key]);
+    const value = readProviderSecret(store.credentials[key]);
     if (value) credentials[key] = value;
   }
-  migrateDecryptableProviderSecrets(store, credentials);
   return credentials;
 }
 
@@ -396,8 +389,17 @@ export function saveCodeAgentProviderCredentials(
     }
   }
   saveCodeAgentProviderStore(store);
-  applyCodeAgentProviderCredentialsToEnv();
   return getCodeAgentProviderSettingsStatus();
+}
+
+export function getCodeAgentProviderProcessEnv(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const credentials = loadCodeAgentProviderCredentials();
+  return {
+    ...baseEnv,
+    ...credentials,
+  };
 }
 
 export function applyCodeAgentProviderCredentialsToEnv(): CodeAgentProviderCredentialApplyResult {
@@ -406,15 +408,10 @@ export function applyCodeAgentProviderCredentialsToEnv(): CodeAgentProviderCrede
   const appliedKeys: CodeAgentProviderCredentialKey[] = [];
   const failedKeys: CodeAgentProviderCredentialKey[] = [];
   for (const key of CODE_AGENT_PROVIDER_KEYS) {
-    const value = credentials[key] ?? INITIAL_CODE_AGENT_PROVIDER_ENV.get(key);
-    if (value) {
-      process.env[key] = value;
-      if (credentials[key]) appliedKeys.push(key);
-    } else {
-      delete process.env[key];
-      if (hasStoredProviderSecretBlob(store.credentials[key])) {
-        failedKeys.push(key);
-      }
+    if (credentials[key]) {
+      appliedKeys.push(key);
+    } else if (hasUsableProviderSecret(store.credentials[key])) {
+      failedKeys.push(key);
     }
   }
   return {
@@ -433,7 +430,7 @@ export function getCodeAgentProviderSettingsStatus(): CodeAgentProviderSettings 
   const store = loadCodeAgentProviderStore();
   const providers = CODE_AGENT_PROVIDER_DEFINITIONS.map((provider) => {
     const savedKeys = provider.keys.filter((key) =>
-      canReadStoredProviderSecret(store.credentials[key]),
+      hasUsableProviderSecret(store.credentials[key]),
     );
     const envKeys = provider.keys.filter((key) => Boolean(process.env[key]));
     const configuredKeys = provider.keys.filter(
@@ -472,24 +469,6 @@ export function getCodeAgentProviderSettingsStatus(): CodeAgentProviderSettings 
   };
 }
 
-export function loadFrameSettings(): FrameSettings {
-  try {
-    const raw = fs.readFileSync(getFrameStorePath(), "utf-8");
-    return { ...defaultFrameSettings(), ...JSON.parse(raw) };
-  } catch {
-    return defaultFrameSettings();
-  }
-}
-
-export function saveFrameSettings(
-  settings: Partial<FrameSettings>,
-): FrameSettings {
-  const current = loadFrameSettings();
-  const updated = { ...current, ...settings };
-  writeJsonFileAtomic(getFrameStorePath(), updated);
-  return updated;
-}
-
 export function loadRemoteConnectorSettings(): RemoteConnectorSettings {
   try {
     const raw = fs.readFileSync(getRemoteConnectorStorePath(), "utf-8");
@@ -506,6 +485,125 @@ export function saveRemoteConnectorSettings(
   const updated = { ...current, ...settings };
   writeJsonFileAtomic(getRemoteConnectorStorePath(), updated);
   return updated;
+}
+
+export function getDefaultDesktopAppsRoot(): string {
+  return path.join(app.getPath("home"), ".agent-native", "workspaces");
+}
+
+export function loadDesktopAppPreferences(): DesktopAppPreferences {
+  const defaults: DesktopAppPreferences = {
+    appsRoot: getDefaultDesktopAppsRoot(),
+    managedAppIds: [],
+    appOrder: [],
+    desktopSsoEnabled: true,
+    desktopEnvironmentLane: "auto",
+  };
+  try {
+    const raw = JSON.parse(
+      fs.readFileSync(getDesktopAppPreferencesStorePath(), "utf-8"),
+    ) as Partial<DesktopAppPreferences>;
+    const appsRoot =
+      typeof raw.appsRoot === "string" && raw.appsRoot.trim()
+        ? path.resolve(raw.appsRoot.trim())
+        : defaults.appsRoot;
+    const managedAppIds = Array.isArray(raw.managedAppIds)
+      ? raw.managedAppIds.filter(
+          (id): id is string => typeof id === "string" && Boolean(id.trim()),
+        )
+      : [];
+    const appOrder = Array.isArray(raw.appOrder)
+      ? raw.appOrder.filter(
+          (id): id is string => typeof id === "string" && Boolean(id.trim()),
+        )
+      : [];
+    return {
+      appsRoot,
+      managedAppIds: [...new Set(managedAppIds)],
+      appOrder: [...new Set(appOrder)],
+      desktopSsoEnabled:
+        typeof raw.desktopSsoEnabled === "boolean"
+          ? raw.desktopSsoEnabled
+          : defaults.desktopSsoEnabled,
+      desktopEnvironmentLane: isDesktopEnvironmentLanePreference(
+        raw.desktopEnvironmentLane,
+      )
+        ? raw.desktopEnvironmentLane
+        : defaults.desktopEnvironmentLane,
+      ...(typeof raw.appModeDefaultsVersion === "number"
+        ? { appModeDefaultsVersion: raw.appModeDefaultsVersion }
+        : {}),
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+export function saveDesktopAppPreferences(
+  settings: Partial<DesktopAppPreferences>,
+): DesktopAppPreferences {
+  const current = loadDesktopAppPreferences();
+  const updated: DesktopAppPreferences = {
+    appsRoot:
+      typeof settings.appsRoot === "string" && settings.appsRoot.trim()
+        ? path.resolve(settings.appsRoot.trim())
+        : current.appsRoot,
+    managedAppIds: [
+      ...new Set(settings.managedAppIds ?? current.managedAppIds),
+    ],
+    appOrder: [...new Set(settings.appOrder ?? current.appOrder)],
+    desktopSsoEnabled:
+      typeof settings.desktopSsoEnabled === "boolean"
+        ? settings.desktopSsoEnabled
+        : current.desktopSsoEnabled,
+    desktopEnvironmentLane: isDesktopEnvironmentLanePreference(
+      settings.desktopEnvironmentLane,
+    )
+      ? settings.desktopEnvironmentLane
+      : current.desktopEnvironmentLane,
+    ...(settings.appModeDefaultsVersion !== undefined
+      ? { appModeDefaultsVersion: settings.appModeDefaultsVersion }
+      : current.appModeDefaultsVersion !== undefined
+        ? { appModeDefaultsVersion: current.appModeDefaultsVersion }
+        : {}),
+  };
+  writeJsonFileAtomic(getDesktopAppPreferencesStorePath(), updated);
+  return updated;
+}
+
+export function markDesktopManagedApp(
+  appId: string,
+  appsRoot?: string,
+): DesktopAppPreferences {
+  const current = loadDesktopAppPreferences();
+  return saveDesktopAppPreferences({
+    appsRoot: appsRoot ?? current.appsRoot,
+    managedAppIds: [...current.managedAppIds, appId],
+    appOrder: current.appOrder.includes(appId)
+      ? current.appOrder
+      : [...current.appOrder, appId],
+  });
+}
+
+export function isDesktopManagedApp(appId: string): boolean {
+  return loadDesktopAppPreferences().managedAppIds.includes(appId);
+}
+
+function orderAppsForDesktop(apps: AppConfig[]): AppConfig[] {
+  const customOrder = loadDesktopAppPreferences().appOrder;
+  if (customOrder.length === 0) return sortDesktopApps(apps);
+
+  const orderIndex = new Map(customOrder.map((id, index) => [id, index]));
+  const fallbackIndex = new Map(apps.map((item, index) => [item.id, index]));
+  return [...apps].sort((a, b) => {
+    const aIndex =
+      orderIndex.get(a.id) ??
+      customOrder.length + (fallbackIndex.get(a.id) ?? apps.length);
+    const bIndex =
+      orderIndex.get(b.id) ??
+      customOrder.length + (fallbackIndex.get(b.id) ?? apps.length);
+    return aIndex - bIndex;
+  });
 }
 
 export function loadDesktopShortcutBindings(): DesktopShortcutBinding[] {
@@ -573,22 +671,34 @@ function getStorePath(): string {
   return path.join(app.getPath("userData"), STORE_FILE);
 }
 
+function seedDefaultApps(): AppConfig[] {
+  const apps = defaultApps();
+  saveApps(apps);
+  saveDesktopAppPreferences({
+    appModeDefaultsVersion: DESKTOP_APP_MODE_DEFAULTS_VERSION,
+  });
+  return apps;
+}
+
 export function loadApps(): AppConfig[] {
+  let parsed: unknown;
   try {
-    const raw = fs.readFileSync(getStorePath(), "utf-8");
-    let apps = JSON.parse(raw) as AppConfig[];
-    // Migrations
+    parsed = JSON.parse(fs.readFileSync(getStorePath(), "utf-8"));
+  } catch {
+    return seedDefaultApps();
+  }
+  if (!Array.isArray(parsed)) return seedDefaultApps();
+
+  try {
+    let apps = parsed as AppConfig[];
     let migrated = false;
 
-    // Build a lookup of canonical built-in app defaults by id
     const defaults = defaultApps();
     const defaultsById = new Map(defaults.map((d) => [d.id, d]));
     const templateAppsById = new Map(TEMPLATE_APPS.map((d) => [d.id, d]));
+    const preferences = loadDesktopAppPreferences();
     const persistedIds = new Set(apps.map((a) => a.id));
 
-    // Remove stale desktop apps that should no longer appear, then preserve
-    // other first-party template ids so existing user configs can still be
-    // migrated instead of disappearing.
     const before = apps.length;
     apps = apps.filter(
       (a) =>
@@ -597,7 +707,6 @@ export function loadApps(): AppConfig[] {
     );
     if (apps.length !== before) migrated = true;
 
-    // Add new built-in apps that aren't in the persisted config
     for (const def of defaults) {
       if (!persistedIds.has(def.id)) {
         apps.push({ ...def });
@@ -618,9 +727,6 @@ export function loadApps(): AppConfig[] {
         migrated = true;
       }
 
-      // Sync any app whose id matches a default back to canonical built-in
-      // metadata. Older persisted configs could keep stale placeholder/URL
-      // fields and leave apps such as Dispatch non-rendering.
       const def = defaultsById.get(app.id);
       if (def) {
         const canonical = canonicalizeDefaultApp(app, def);
@@ -631,11 +737,6 @@ export function loadApps(): AppConfig[] {
         continue;
       }
 
-      // User-added or legacy entries that match a first-party template should
-      // still get canonical URL backfills. This covers old desktop configs
-      // where hidden-but-known templates existed with an empty production URL,
-      // which otherwise falls through to the local dev frame in packaged builds
-      // and renders a blank tab.
       const templateDef = templateAppsById.get(app.id);
       if (templateDef) {
         const canonical = canonicalizeTemplateApp(app, templateDef);
@@ -645,13 +746,33 @@ export function loadApps(): AppConfig[] {
         }
       }
     }
+
+    if (
+      preferences.appModeDefaultsVersion !== DESKTOP_APP_MODE_DEFAULTS_VERSION
+    ) {
+      // Record the migration only after legacy useCliHarness values have been
+      // normalized. An explicit persisted mode cannot be distinguished from
+      // the old implicit default, so changing every legacy dev app to prod
+      // would silently overwrite a user's local-development choice.
+      saveDesktopAppPreferences({
+        appModeDefaultsVersion: DESKTOP_APP_MODE_DEFAULTS_VERSION,
+      });
+    }
+
+    const orderedApps = orderAppsForDesktop(apps);
+    if (orderedApps.some((app, index) => app !== apps[index])) {
+      apps = orderedApps;
+      migrated = true;
+    }
+
     if (migrated) saveApps(apps);
     return apps;
-  } catch {
-    // First launch or corrupted — seed with defaults
-    const apps = defaultApps();
-    saveApps(apps);
-    return apps;
+  } catch (error) {
+    console.error(
+      "[app-store] keeping stored apps unmigrated after a load failure",
+      error,
+    );
+    return parsed as AppConfig[];
   }
 }
 
@@ -663,12 +784,39 @@ export function addApp(newApp: AppConfig): AppConfig[] {
   const apps = loadApps();
   apps.push(newApp);
   saveApps(apps);
+  const preferences = loadDesktopAppPreferences();
+  if (preferences.appOrder.length > 0) {
+    saveDesktopAppPreferences({
+      appOrder: [...preferences.appOrder, newApp.id],
+    });
+  }
   return apps;
 }
 
 export function removeApp(id: string): AppConfig[] {
   const apps = loadApps().filter((a) => a.id !== id);
   saveApps(apps);
+  const preferences = loadDesktopAppPreferences();
+  saveDesktopAppPreferences({
+    managedAppIds: preferences.managedAppIds.filter((appId) => appId !== id),
+    appOrder: preferences.appOrder.filter((appId) => appId !== id),
+  });
+  return apps;
+}
+
+export function reorderApp(id: string, direction: "up" | "down"): AppConfig[] {
+  const apps = loadApps();
+  const index = apps.findIndex((candidate) => candidate.id === id);
+  if (index === -1) return apps;
+  const nextIndex = direction === "up" ? index - 1 : index + 1;
+  if (nextIndex < 0 || nextIndex >= apps.length) return apps;
+
+  const [moved] = apps.splice(index, 1);
+  apps.splice(nextIndex, 0, moved);
+  saveApps(apps);
+  saveDesktopAppPreferences({
+    appOrder: apps.map((candidate) => candidate.id),
+  });
   return apps;
 }
 
@@ -688,5 +836,10 @@ export function updateApp(
 export function resetToDefaults(): AppConfig[] {
   const apps = defaultApps();
   saveApps(apps);
+  saveDesktopAppPreferences({
+    managedAppIds: [],
+    appOrder: [],
+    appModeDefaultsVersion: DESKTOP_APP_MODE_DEFAULTS_VERSION,
+  });
   return apps;
 }

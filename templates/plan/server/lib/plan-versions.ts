@@ -1,6 +1,6 @@
+import { getRequestRunContext } from "@agent-native/core/server";
 import { and, asc, desc, eq } from "drizzle-orm";
-import { getDb, schema } from "../db/index.js";
-import { parsePlanContent } from "../plan-content.js";
+
 import type {
   Plan,
   PlanAuthor,
@@ -8,17 +8,65 @@ import type {
   PlanVersionSnapshot,
   PlanVersionSummary,
 } from "../../shared/types.js";
+import { getDb, schema } from "../db/index.js";
+import { parsePlanContent } from "../plan-content.js";
 
 const SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
 
-/**
- * When `force: true` is set and the latest version for this plan carries the
- * exact same label and was created within this window, we coalesce rather than
- * append a new identical-label row.  The earliest snapshot of a burst already
- * captures the pre-burst state, which is the meaningful restore point.
- * A different label, or a gap longer than this window, always starts a new row.
- */
-const BURST_COALESCE_WINDOW_MS = 90 * 1000; // 90 seconds
+const BURST_COALESCE_WINDOW_MS = 90 * 1000;
+
+export interface PlanVersionChatContext {
+  threadId?: string;
+  runId?: string;
+  turnId?: string;
+}
+
+function planVersionChatContextFromFields(value: {
+  threadId?: unknown;
+  runId?: unknown;
+  turnId?: unknown;
+}): PlanVersionChatContext | undefined {
+  const context: PlanVersionChatContext = {};
+  for (const key of ["threadId", "runId", "turnId"] as const) {
+    if (typeof value[key] === "string" && value[key].trim()) {
+      context[key] = value[key];
+    }
+  }
+  return context.runId || context.turnId ? context : undefined;
+}
+
+function requestPlanVersionChatContext(): PlanVersionChatContext | undefined {
+  const run = getRequestRunContext();
+  return run ? planVersionChatContextFromFields(run) : undefined;
+}
+
+export function planVersionChatContextFromRun(run: {
+  threadId?: unknown;
+  runId?: unknown;
+  turnId?: unknown;
+}): PlanVersionChatContext | undefined {
+  return planVersionChatContextFromFields(run);
+}
+
+export function parsePlanVersionChatContext(
+  raw: string | null | undefined,
+): PlanVersionChatContext | undefined {
+  if (raw == null) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("Plan version chat metadata is not valid JSON.");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Plan version chat metadata is invalid.");
+  }
+  const context = planVersionChatContextFromFields(
+    value as Record<string, unknown>,
+  );
+  if (!context) throw new Error("Plan version chat metadata is invalid.");
+  return context;
+}
 
 function canCoalesceBurstLabel(label: string | undefined): label is string {
   return label !== undefined && !label.startsWith("Before ");
@@ -151,12 +199,73 @@ export function summarizePlanVersion(row: VersionRow): PlanVersionSummary {
   };
 }
 
+function summaryColumnsFromSnapshot(snapshot: PlanVersionSnapshot) {
+  return {
+    status: snapshot.plan.status,
+    source: snapshot.plan.source,
+    blockCount: blockCount(snapshot),
+    sectionCount: snapshot.sections.length,
+    hasCanvas: Boolean(snapshot.plan.content?.canvas),
+    hasPrototype: Boolean(snapshot.plan.content?.prototype),
+    previewText: snapshotPreview(snapshot),
+  };
+}
+
+type SummaryRow = Pick<
+  VersionRow,
+  | "id"
+  | "planId"
+  | "title"
+  | "changeLabel"
+  | "createdBy"
+  | "createdAt"
+  | "status"
+  | "source"
+  | "blockCount"
+  | "sectionCount"
+  | "hasCanvas"
+  | "hasPrototype"
+  | "previewText"
+> & { snapshotJson?: string | null };
+
+export function summarizePlanVersionRow(row: SummaryRow): PlanVersionSummary {
+  const base = {
+    id: row.id,
+    planId: row.planId,
+    title: row.title,
+    label: row.changeLabel,
+    createdBy: row.createdBy,
+    createdAt: row.createdAt,
+  };
+  if (row.blockCount == null) {
+    if (row.snapshotJson == null) {
+      throw new Error(
+        `Plan version ${row.id} has no summary columns and no snapshotJson to fall back to`,
+      );
+    }
+    const snapshot = parsePlanVersionSnapshot(row.snapshotJson);
+    const summary = summaryColumnsFromSnapshot(snapshot);
+    return { ...base, ...summary, preview: summary.previewText };
+  }
+  return {
+    ...base,
+    status: row.status ?? "draft",
+    source: row.source ?? "manual",
+    blockCount: row.blockCount,
+    sectionCount: row.sectionCount ?? 0,
+    hasCanvas: Boolean(row.hasCanvas),
+    hasPrototype: Boolean(row.hasPrototype),
+    preview: row.previewText ?? "",
+  };
+}
+
 export async function createPlanVersionSnapshot(
   planId: string,
   options: {
     force?: boolean;
     label?: string;
     createdBy?: PlanAuthor;
+    chatContext?: PlanVersionChatContext;
   } = {},
 ): Promise<{ created: boolean; id?: string; reason?: string }> {
   const db = getDb();
@@ -178,7 +287,9 @@ export async function createPlanVersionSnapshot(
       asc(schema.planSections.order),
       asc(schema.planSections.createdAt),
     );
-  const snapshotJson = JSON.stringify(snapshotFromRows(plan, sections));
+  const snapshot = snapshotFromRows(plan, sections);
+  const snapshotJson = JSON.stringify(snapshot);
+  const summaryColumns = summaryColumnsFromSnapshot(snapshot);
 
   const [latestVersion] = await db
     .select({
@@ -196,19 +307,10 @@ export async function createPlanVersionSnapshot(
     .orderBy(desc(schema.planVersions.createdAt))
     .limit(1);
 
-  // Identical-content dedupe: skip regardless of label.
   if (latestVersion?.snapshotJson === snapshotJson) {
     return { created: false, reason: "duplicate" };
   }
 
-  // Burst coalescing: when force is set (inline-edit path) and the latest
-  // snapshot for this plan already carries the same label and was written
-  // within BURST_COALESCE_WINDOW_MS, skip. The earliest snapshot of the burst
-  // already preserves the pre-burst state; appending more identical-label rows
-  // floods version history without adding restore value.
-  // Explicit safety snapshots ("Before restore", "Before source import", etc.)
-  // are never coalesced: they are created before destructive/import/restore
-  // operations and are the actual restore point.
   if (
     options.force &&
     canCoalesceBurstLabel(options.label) &&
@@ -235,6 +337,7 @@ export async function createPlanVersionSnapshot(
   }
 
   const id = newVersionId();
+  const chatContext = options.chatContext ?? requestPlanVersionChatContext();
   await db.insert(schema.planVersions).values({
     id,
     ownerEmail: plan.ownerEmail,
@@ -244,6 +347,14 @@ export async function createPlanVersionSnapshot(
     changeLabel: options.label,
     createdBy: options.createdBy ?? "agent",
     createdAt: new Date().toISOString(),
+    ...(chatContext ? { chatContext: JSON.stringify(chatContext) } : {}),
+    status: summaryColumns.status,
+    source: summaryColumns.source,
+    blockCount: summaryColumns.blockCount,
+    sectionCount: summaryColumns.sectionCount,
+    hasCanvas: summaryColumns.hasCanvas,
+    hasPrototype: summaryColumns.hasPrototype,
+    previewText: summaryColumns.previewText,
   });
 
   return { created: true, id };

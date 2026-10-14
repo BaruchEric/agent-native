@@ -1,12 +1,19 @@
 import { defineAction, embedApp } from "@agent-native/core";
 import { buildDeepLink } from "@agent-native/core/server";
+import { loadAgentDesignSystemContext } from "@agent-native/core/shared";
 import { resolveAccess } from "@agent-native/core/sharing";
 import { z } from "zod";
+
 import { schema } from "../server/db/index.js";
 import { buildDesignSnapshot } from "../server/lib/design-snapshot.js";
-import "../server/db/index.js"; // ensure registerShareableResource runs
+import {
+  parseDesignTemplateData,
+  readDesignTemplateSource,
+} from "../server/lib/design-template-data.js";
+import { lockedLayerSnapshots } from "../shared/locked-layers.js";
+import getDesignSystem from "./get-design-system.js";
+import "../server/db/index.js";
 
-/** Editor deep link so external agents can surface "Open design". */
 function designDeepLink(designId: string): string {
   return buildDeepLink({
     app: "design",
@@ -22,11 +29,26 @@ export default defineAction({
     "edited live, otherwise the stored content), the design's tweak " +
     "definitions, the user's applied tweak selections, and the resolved CSS " +
     "custom-property values so the agent sees the *tuned* design, not the " +
-    "original generated tokens. Read-only.",
+    "original generated tokens. Pass fileId or filename when continuing from " +
+    "one selected screen so large multi-file designs stay bounded. Includes " +
+    "linked `designSystem.agentContext` when readable. Read-only.",
   schema: z.object({
     designId: z.string().describe("Design project ID to snapshot"),
+    fileId: z
+      .string()
+      .optional()
+      .describe(
+        "Optional design file ID to return. Use this after a variant pick to snapshot only the kept screen.",
+      ),
+    filename: z
+      .string()
+      .optional()
+      .describe(
+        "Optional design filename to return when fileId is unavailable.",
+      ),
   }),
   readOnly: true,
+  capabilityScopes: ["visual-edit"],
   http: { method: "GET" },
   publicAgent: { expose: true, readOnly: true, requiresAuth: true },
   mcpApp: {
@@ -39,14 +61,53 @@ export default defineAction({
       height: 680,
     }),
   },
-  run: async ({ designId }) => {
+  mcpAnnotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    openWorldHint: false,
+  },
+  run: async ({ designId, fileId, filename }) => {
     const access = await resolveAccess("design", designId);
     if (!access) {
-      throw new Error("Design not found");
+      const err = new Error("Design not found") as Error & {
+        statusCode: number;
+      };
+      err.statusCode = 404;
+      throw err;
     }
     const design = access.resource as typeof schema.designs.$inferSelect;
+    const designSystem = await loadAgentDesignSystemContext(
+      design.designSystemId ?? null,
+      getDesignSystem,
+    );
 
     const snapshot = await buildDesignSnapshot(designId, design.data);
+    const templateSource = readDesignTemplateSource(
+      parseDesignTemplateData(design.data),
+    );
+    const requestedFileId = fileId?.trim();
+    const requestedFilename = filename?.trim();
+    const files = requestedFileId
+      ? snapshot.files.filter((file) => file.id === requestedFileId)
+      : requestedFilename
+        ? snapshot.files.filter((file) => file.filename === requestedFilename)
+        : snapshot.files;
+
+    if ((requestedFileId || requestedFilename) && files.length === 0) {
+      const err = new Error("Design file not found") as Error & {
+        statusCode: number;
+      };
+      err.statusCode = 404;
+      throw err;
+    }
+    if (!requestedFileId && requestedFilename && files.length > 1) {
+      const err = new Error(
+        "Multiple design files match filename; pass fileId instead",
+      ) as Error & { statusCode: number };
+      err.statusCode = 409;
+      throw err;
+    }
+    const boundedFile = requestedFileId || requestedFilename ? files[0] : null;
 
     return {
       designId,
@@ -54,18 +115,52 @@ export default defineAction({
       description: design.description ?? null,
       projectType: design.projectType,
       designSystemId: design.designSystemId ?? null,
+      designSystem,
       updatedAt: design.updatedAt,
-      files: snapshot.files.map((f) => ({
+      ...(templateSource
+        ? {
+            createdFromTemplate: {
+              templateId: templateSource.templateId,
+              title: templateSource.title,
+              note:
+                "These files are edited copies of the template, not the template itself. " +
+                `Call \`get-design-template --designId="${designId}"\` for the original canvas dimensions, typography, and locked layers, and preserve them in this edit.`,
+            },
+          }
+        : {}),
+      files: files.map((f) => ({
+        id: f.id,
         filename: f.filename,
         fileType: f.fileType,
         content: f.content,
         source: f.source,
       })),
-      fileCount: snapshot.files.length,
+      fileCount: files.length,
+      totalFileCount: snapshot.files.length,
       tweaks: snapshot.tweaks,
       appliedTweaks: snapshot.appliedTweaks,
       resolvedCssVars: snapshot.resolvedCssVars,
+      lockedLayers: files.flatMap((file) =>
+        lockedLayerSnapshots(file.content).map((layer) => ({
+          fileId: file.id,
+          filename: file.filename,
+          nodeId: layer.id,
+          layerName: layer.label,
+        })),
+      ),
       deepLink: designDeepLink(designId),
+      ...(boundedFile
+        ? {
+            editTarget: {
+              designId,
+              fileId: boundedFile.id,
+              filename: boundedFile.filename,
+            },
+            nextRequiredAction:
+              `Call edit-design exactly once with designId ${designId} and fileId ${boundedFile.id} (${boundedFile.filename}). ` +
+              "Do not call delete-file or get-design-snapshot again unless edit-design fails with a concrete missing context error.",
+          }
+        : {}),
     };
   },
   link: ({ result }) => {

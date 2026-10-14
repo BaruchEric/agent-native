@@ -1,8 +1,10 @@
-import { createAuthPlugin } from "@agent-native/core/server";
+import { createToolkitAuthPlugin } from "@agent-native/toolkit/app/auth/server";
 
-export default createAuthPlugin({
+export default createToolkitAuthPlugin({
+  workspaceAppAudience: "internal",
+  workspaceAppPublicPaths: ["/"],
   marketing: {
-    appName: "Agent-Native Brain",
+    appName: "Brain",
     tagline:
       "A company knowledge layer where raw conversations become reviewed, searchable institutional knowledge.",
     features: [

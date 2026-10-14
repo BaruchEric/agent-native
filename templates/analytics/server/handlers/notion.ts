@@ -1,4 +1,10 @@
-import { defineEventHandler, getRouterParam, setResponseStatus } from "h3";
+import {
+  defineEventHandler,
+  getQuery,
+  getRouterParam,
+  setResponseStatus,
+} from "h3";
+
 import {
   requireCredential,
   runApiHandlerWithContext,
@@ -9,13 +15,15 @@ import {
   getNotionPage,
 } from "../lib/notion";
 
-// GET /api/notion/content-calendar — returns all content calendar entries
 export const handleContentCalendar = defineEventHandler(async (event) => {
   return runApiHandlerWithContext(event, async () => {
     const missing = await requireCredential(event, "NOTION_API_KEY", "Notion");
     if (missing) return missing;
     try {
-      const entries = await getContentCalendar();
+      const { databaseId } = getQuery(event);
+      const entries = await getContentCalendar(
+        databaseId as string | undefined,
+      );
       return { entries, total: entries.length };
     } catch (err: any) {
       console.error("Notion content-calendar error:", err.message);
@@ -25,13 +33,15 @@ export const handleContentCalendar = defineEventHandler(async (event) => {
   });
 });
 
-// GET /api/notion/content-calendar/schema — returns the database schema
 export const handleContentCalendarSchema = defineEventHandler(async (event) => {
   return runApiHandlerWithContext(event, async () => {
     const missing = await requireCredential(event, "NOTION_API_KEY", "Notion");
     if (missing) return missing;
     try {
-      const schema = await getContentCalendarSchema();
+      const { databaseId } = getQuery(event);
+      const schema = await getContentCalendarSchema(
+        databaseId as string | undefined,
+      );
       return { schema };
     } catch (err: any) {
       console.error("Notion schema error:", err.message);
@@ -41,7 +51,6 @@ export const handleContentCalendarSchema = defineEventHandler(async (event) => {
   });
 });
 
-// GET /api/notion/page/:pageId — returns page title and blocks for rendering
 export const handleNotionPage = defineEventHandler(async (event) => {
   return runApiHandlerWithContext(event, async () => {
     const missing = await requireCredential(event, "NOTION_API_KEY", "Notion");

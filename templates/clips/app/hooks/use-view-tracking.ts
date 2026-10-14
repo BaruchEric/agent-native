@@ -1,55 +1,55 @@
+import { appBasePath } from "@agent-native/core/client/api-path";
 import { useEffect, useRef } from "react";
-import { appBasePath } from "@agent-native/core/client";
 
-const SESSION_KEY = "clips-view-session-id";
+import { getViewerSessionId } from "@/lib/viewer-session";
 
-function getSessionId(): string {
-  if (typeof window === "undefined") return "server";
-  try {
-    let id = localStorage.getItem(SESSION_KEY);
-    if (!id) {
-      id =
-        "s-" +
-        Date.now().toString(36) +
-        "-" +
-        Math.random().toString(36).slice(2, 8);
-      localStorage.setItem(SESSION_KEY, id);
-    }
-    return id;
-  } catch {
-    return "s-" + Math.random().toString(36).slice(2, 8);
-  }
+import { clampCompletionPct } from "../../shared/view-analytics";
+
+function createViewSessionId(recordingId: string): string {
+  return [
+    "v",
+    recordingId,
+    Date.now().toString(36),
+    Math.random().toString(36).slice(2, 8),
+  ].join("-");
 }
 
 export interface UseViewTrackingOpts {
   recordingId: string;
-  videoRef: React.RefObject<HTMLVideoElement | null>;
+  videoEl: HTMLVideoElement | null;
   durationMs: number;
-  /** Disable tracking entirely (e.g. for the recording's owner viewing their own clip). */
   disabled?: boolean;
-  /** Count an open as a view when playback is iframe-backed and there is no native video element. */
   trackOpenWithoutVideo?: boolean;
 }
 
-/**
- * Wires up the view-event tracker for a player instance. Fires a "view-start"
- * on mount, then throttled "watch-progress" every 5s while playing, plus
- * seek/pause/resume events and a final flush on unmount.
- */
 export function useViewTracking(opts: UseViewTrackingOpts) {
-  const { recordingId, videoRef, durationMs, disabled, trackOpenWithoutVideo } =
+  const { recordingId, videoEl, durationMs, disabled, trackOpenWithoutVideo } =
     opts;
+
   const watchMsRef = useRef(0);
   const lastTickRef = useRef<number | null>(null);
   const startedRef = useRef(false);
   const openTrackedRecordingRef = useRef<string | null>(null);
   const lastSentProgressRef = useRef(0);
   const maxPctRef = useRef(0);
+  const viewSessionRef = useRef<string | null>(null);
+  const durationMsRef = useRef(durationMs);
+  const recordingIdRef = useRef(recordingId);
+
+  durationMsRef.current = durationMs;
+  recordingIdRef.current = recordingId;
 
   useEffect(() => {
     if (disabled) return;
-    const video = videoRef.current;
-    if (!video) {
+
+    watchMsRef.current = 0;
+    lastTickRef.current = null;
+    startedRef.current = false;
+    lastSentProgressRef.current = 0;
+    maxPctRef.current = 0;
+    viewSessionRef.current = null;
+
+    if (!videoEl) {
       if (
         !trackOpenWithoutVideo ||
         !recordingId ||
@@ -58,6 +58,7 @@ export function useViewTracking(opts: UseViewTrackingOpts) {
         return;
       }
       openTrackedRecordingRef.current = recordingId;
+      viewSessionRef.current = createViewSessionId(recordingId);
       fetch(`${appBasePath()}/api/view-event`, {
         method: "POST",
         keepalive: true,
@@ -66,7 +67,8 @@ export function useViewTracking(opts: UseViewTrackingOpts) {
           recordingId,
           kind: "view-start",
           timestampMs: 0,
-          sessionId: getSessionId(),
+          sessionId: getViewerSessionId(),
+          viewSessionId: viewSessionRef.current,
           totalWatchMs: 0,
           completedPct: 0,
           scrubbedToEnd: false,
@@ -76,7 +78,9 @@ export function useViewTracking(opts: UseViewTrackingOpts) {
       return;
     }
 
-    const sessionId = getSessionId();
+    const video = videoEl;
+    const sessionId = getViewerSessionId();
+    viewSessionRef.current = createViewSessionId(recordingId);
     let progressTimer: ReturnType<typeof setInterval> | null = null;
 
     function post(
@@ -90,11 +94,13 @@ export function useViewTracking(opts: UseViewTrackingOpts) {
         | "reaction",
       extra?: Record<string, unknown>,
     ) {
-      const v = videoRef.current;
-      if (!v) return;
+      const durationMs = durationMsRef.current;
       const completedPct =
         durationMs > 0 ? (watchMsRef.current / durationMs) * 100 : 0;
-      maxPctRef.current = Math.max(maxPctRef.current, completedPct);
+      maxPctRef.current = Math.max(
+        maxPctRef.current,
+        clampCompletionPct(completedPct),
+      );
       fetch(`${appBasePath()}/api/view-event`, {
         method: "POST",
         keepalive: kind === "watch-progress" || kind === "pause",
@@ -102,11 +108,13 @@ export function useViewTracking(opts: UseViewTrackingOpts) {
         body: JSON.stringify({
           recordingId,
           kind,
-          timestampMs: Math.floor(v.currentTime * 1000),
+          timestampMs: Math.floor(video.currentTime * 1000),
           sessionId,
+          viewSessionId: viewSessionRef.current,
           totalWatchMs: Math.floor(watchMsRef.current),
           completedPct: Math.floor(maxPctRef.current),
-          scrubbedToEnd: v.duration > 0 && v.currentTime >= v.duration - 0.5,
+          scrubbedToEnd:
+            video.duration > 0 && video.currentTime >= video.duration - 0.5,
           payload: extra,
         }),
       }).catch(() => {});
@@ -120,7 +128,6 @@ export function useViewTracking(opts: UseViewTrackingOpts) {
         post("resume");
       }
       lastTickRef.current = performance.now();
-      // Heartbeat every 5s while playing.
       progressTimer = setInterval(() => {
         const now = performance.now();
         if (lastTickRef.current != null) {
@@ -128,7 +135,6 @@ export function useViewTracking(opts: UseViewTrackingOpts) {
           watchMsRef.current += delta;
           lastTickRef.current = now;
         }
-        // Throttle by sent delta so we don't overwhelm the server.
         if (watchMsRef.current - lastSentProgressRef.current >= 4000) {
           lastSentProgressRef.current = watchMsRef.current;
           post("watch-progress");
@@ -167,10 +173,11 @@ export function useViewTracking(opts: UseViewTrackingOpts) {
       video.removeEventListener("seeked", onSeek);
       video.removeEventListener("ended", onEnded);
       if (progressTimer) clearInterval(progressTimer);
-      // Flush final progress.
       if (startedRef.current) post("watch-progress");
     };
-  }, [recordingId, videoRef, durationMs, disabled, trackOpenWithoutVideo]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- durationMs is
+    // deliberately excluded; it's read live from durationMsRef inside post().
+  }, [recordingId, videoEl, trackOpenWithoutVideo, disabled]);
 
   return {
     reportCtaClick: () => {
@@ -179,9 +186,9 @@ export function useViewTracking(opts: UseViewTrackingOpts) {
         keepalive: true,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          recordingId,
+          recordingId: recordingIdRef.current,
           kind: "cta-click",
-          sessionId: getSessionId(),
+          sessionId: getViewerSessionId(),
         }),
       }).catch(() => {});
     },
@@ -191,9 +198,9 @@ export function useViewTracking(opts: UseViewTrackingOpts) {
         keepalive: true,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          recordingId,
+          recordingId: recordingIdRef.current,
           kind: "reaction",
-          sessionId: getSessionId(),
+          sessionId: getViewerSessionId(),
           payload: { emoji },
         }),
       }).catch(() => {});

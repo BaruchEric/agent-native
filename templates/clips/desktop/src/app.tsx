@@ -1,234 +1,500 @@
+import { useT } from "@agent-native/core/client/i18n";
+import { BuilderConnectPopover } from "@agent-native/toolkit/app/settings";
 import {
-  type RefObject,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
-import { open as openExternal } from "@tauri-apps/plugin-shell";
+  IconAdjustmentsHorizontal,
+  IconAlertTriangle,
+  IconArrowLeft,
+  IconCalendar,
+  IconCalendarEvent,
+  IconCircleCheck,
+  IconExternalLink,
+  IconFlask,
+  IconPencil,
+  IconInfoCircle,
+  IconHistory,
+  IconMicrophone,
+  IconMicrophone2,
+  IconPlayerPlay,
+  IconRefresh,
+  IconSearch,
+  IconShieldLock,
+  IconTool,
+  IconTrash,
+  IconUpload,
+  IconVideo,
+} from "@tabler/icons-react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { startBubbleFramePump } from "./lib/bubble-pump";
+import { open as openExternal } from "@tauri-apps/plugin-shell";
 import {
-  startBubbleWebrtc,
-  type BubbleWebrtcHandle,
-} from "./lib/bubble-webrtc";
+  type ReactNode,
+  type RefObject,
+  type KeyboardEvent as ReactKeyboardEvent,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+
 import {
-  discardBrowserRecordingBackup,
-  exportBrowserRecordingBackup,
-  listBrowserRecordingBackups,
-  retryBrowserRecordingBackup,
-  shouldUseNativeFullscreenRecording,
-  startRecording,
-  type LocalExportedFile,
-  type PendingBrowserRecordingUpload,
-  type RecorderHandle,
-  type RecorderStopResult,
-} from "./lib/recorder";
+  SettingsActionButton,
+  SettingsChoicePopover,
+  SettingsGroup,
+  SettingsKeycap,
+  SettingsPopover,
+  SettingsRow,
+  SettingsSelect,
+  SettingsValueTrigger,
+} from "@/components/settings/settings-ui";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
-  installDesktopVoiceDictation,
-  type VoiceMode,
-  type VoiceProvider,
-  type VoiceShortcutPreference,
-} from "./lib/voice-dictation";
-import { UpdateBanner } from "./components/UpdateBanner";
-import { FeedbackButton } from "./components/FeedbackButton";
-import { Tooltip, TooltipContent, TooltipTrigger } from "./components/Tooltip";
-import { SourceRow, type CaptureSource } from "./components/SourceRow";
-import { MediaDeviceRow } from "./components/MediaDeviceRow";
-import { Switch } from "./components/Switch";
-import { ReadinessPanel } from "./components/ReadinessPanel";
+  AlertDialog as UiAlertDialog,
+  AlertDialogAction as UiAlertDialogAction,
+  AlertDialogCancel as UiAlertDialogCancel,
+  AlertDialogContent as UiAlertDialogContent,
+  AlertDialogDescription as UiAlertDialogDescription,
+  AlertDialogFooter as UiAlertDialogFooter,
+  AlertDialogHeader as UiAlertDialogHeader,
+  AlertDialogTitle as UiAlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyTitle,
+} from "@/components/ui/empty";
+import { Input } from "@/components/ui/input";
+import { Switch as UiSwitch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
+
+import {
+  readFileUploadStatusProbe,
+  type FileUploadStatusProbe,
+} from "../../shared/file-upload-status";
+import {
+  CLIPS_LABS,
+  CLIPS_LOOKBACK_CONTEXT,
+  CLIPS_MEETINGS,
+  CLIPS_WISPRFLOW,
+  isLabEnabled,
+} from "../../shared/labs";
+import { rememberLookbackSeconds } from "../../shared/screen-history-context";
+import { BackToApp } from "./components/BackToApp";
 import {
   CamIcon,
-  ClockIcon,
-  CloseIcon,
   GoogleIcon,
   LibraryIcon,
   ScreenCamIcon,
   ScreenIcon,
   SettingsIcon,
 } from "./components/Icons";
-import { useFeatureConfig, type LocalRecordingMode } from "./shared/config";
-import { useMeetingTranscription } from "./hooks/useMeetingTranscription";
-import { normalizeServerUrl } from "./lib/url";
-import { isMacPlatform, isWindowsPlatform } from "./lib/platform";
+import { MediaDeviceRow } from "./components/MediaDeviceRow";
+import { MicOffConfirmation } from "./components/MicOffConfirmation";
 import {
-  IconAlertTriangle,
-  IconArrowLeft,
-  IconCircleCheck,
-  IconDownload,
-  IconFolderOpen,
-  IconPencil,
-  IconInfoCircle,
-  IconRefresh,
-  IconTrash,
-  IconUpload,
-} from "@tabler/icons-react";
+  RecordingRecovery,
+  RecordingRecoveryPage,
+  type RecordingRecoveryProps,
+} from "./components/RecordingRecovery";
+import { ShortcutKeycaps } from "./components/ShortcutKeycaps";
+import { SourceRow, type CaptureSource } from "./components/SourceRow";
+import { Switch } from "./components/Switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./components/Tooltip";
+import { UpdateBanner } from "./components/UpdateBanner";
+import { useMediaDevices } from "./hooks/useMediaDevices";
+import { useMeetingTranscription } from "./hooks/useMeetingTranscription";
+import { stopAllMicMeters } from "./hooks/useMicMeter";
+import { useSystemAccessRows } from "./hooks/useSystemAccessRows";
+import { useWhisperSettings } from "./hooks/useWhisperSettings";
+import {
+  desktopAuthCopy,
+  desktopRecoveryCopy,
+  desktopRecordingFailureCopy,
+} from "./i18n/en-US";
+import { createAudioCue } from "./lib/audio-cue";
+import { startBubbleFramePump } from "./lib/bubble-pump";
+import { shouldKeepBubbleSession } from "./lib/bubble-session";
+import {
+  startBubbleWebrtc,
+  type BubbleWebrtcHandle,
+} from "./lib/bubble-webrtc";
+import {
+  connectBuilderForVoiceCleanup,
+  isBuilderProvisioningAvailable,
+} from "./lib/builder-connection";
+import {
+  captureSetupForCamera,
+  captureSetupForMode,
+  normalizeCaptureSetup,
+} from "./lib/capture-mode";
+import { callClipsActionFor } from "./lib/clips-action";
+import {
+  authTokenStorageKey,
+  loadDesktopAuthToken,
+  originForServer,
+  originForUrl,
+} from "./lib/desktop-auth-token";
+import { clipsDeviceId } from "./lib/device-id";
+import {
+  getCameraStreamWithFallback,
+  isMediaConstraintFailure,
+} from "./lib/media-capture-constraints";
+import { sendNativeNotification } from "./lib/native-notification";
+import { openMeetingJoinUrl } from "./lib/open-meeting-join-url";
+import type { MacosPrivacyPane } from "./lib/permission-status";
+import {
+  DESKTOP_CAPTURE_PERMISSION_MESSAGE,
+  isHardCapturePermissionError,
+  MACOS_CAPTURE_PERMISSION_MESSAGE,
+  MACOS_SCREEN_PERMISSION_MESSAGE,
+  MACOS_SPEECH_PERMISSION_MESSAGE,
+  MACOS_UPDATE_RESTART_MESSAGE,
+} from "./lib/permissions";
+import { isMacPlatform, isWindowsPlatform } from "./lib/platform";
+import { getPopoverAutoSizeOptions } from "./lib/popover-sizing";
+import {
+  changeRecordFirstFiles,
+  effectiveLocalRecordingMode,
+  loadRecordFirstFiles,
+  RecordFirstFileMissingError,
+  recordFirstFilesKey,
+  recordFirstFilesToQueue,
+  recordFirstMediaFlags,
+  stagedIdAfterFailure,
+  transferRecordFirstFiles,
+  type RecordFirstFile,
+  type VideoStorageStatus,
+} from "./lib/record-first";
+import {
+  createPrivateAgentRewindRecording,
+  exportBrowserRecordingBackup,
+  getRewindClipOrigin,
+  listBrowserRecordingBackups,
+  queueRecordFirstUpload,
+  retryBrowserRecordingBackup,
+  scheduleNativeBackupCleanupAfterProcessing,
+  shouldUseNativeFullscreenRecording,
+  shouldUseNativeWindowRecording,
+  startRecording,
+  type LocalExportedFile,
+  type CaptureMode,
+  type RecorderHandle,
+  type RecorderStopResult,
+  type RestartHandoff,
+} from "./lib/recorder";
+import { RECORDER_DISCARD_EVENT } from "./lib/recorder-events";
+import { notifyRecordingFailure } from "./lib/recording-failure-notifications";
+import { clearResolvedFinalizationError } from "./lib/recording-finalization-state";
+import {
+  copyRecordingShareLink,
+  recordingShareUrl,
+} from "./lib/recording-link";
+import {
+  prepareNativeRecordingStart,
+  recoverRecordingStart,
+  RecordingStartAttempt,
+  ScreenRecordingPermissionError,
+} from "./lib/recording-preflight";
+import {
+  reconcileRecordingRecovery,
+  recordingRecoveryKey,
+  shouldShowRecordingRecoveryBanner,
+  type PendingDesktopUpload,
+  type PendingNativeUpload,
+  type RecoverySnapshot,
+} from "./lib/recording-recovery";
+import {
+  applyRecordingRecoveryResult,
+  isRecordingStartCancellation,
+  type RecordingRecoveryResult,
+} from "./lib/recording-recovery-failure";
+import {
+  shouldDismissDesktopPopover,
+  useRecordingRecoveryNavigation,
+} from "./lib/recording-recovery-navigation";
+import {
+  RECORDING_SERVER_UNAVAILABLE,
+  RECORDING_SESSION_EXPIRED,
+  isStorageSetupFailureMessage,
+} from "./lib/recording-request";
+import {
+  listenForRecordingShortcutStopAcks,
+  requestRecordingShortcutStop,
+} from "./lib/recording-shortcut-stop";
+import { boundedCleanup } from "./lib/recording-start-guard";
+import { REWIND_AGENT_PROMPT } from "./lib/rewind-agent-prompt";
+import { getRewindStatusPresentation } from "./lib/rewind-status";
+import {
+  initialDesktopSettingsTab,
+  type DesktopSettingsTab,
+} from "./lib/settings-navigation";
+import {
+  loadBool,
+  loadString,
+  loadStringAllowEmpty,
+  saveBool,
+  saveString,
+} from "./lib/storage";
+import {
+  canCheckForUpdates,
+  installAndRestart,
+  isUpdatePendingRestart,
+  retryUpdateCheck,
+  useUpdateStatus,
+} from "./lib/updater";
+import {
+  DEFAULT_SERVER_URL,
+  normalizeServerUrl,
+  SERVER_URL_STORAGE_KEY,
+} from "./lib/url";
+import { cn } from "./lib/utils";
+import {
+  installDesktopVoiceDictation,
+  type VoiceMode,
+  type VoiceProvider,
+  type VoiceShortcutPreference,
+} from "./lib/voice-dictation";
+import { whisperModelOptionLabel } from "./lib/whisper-model-picker";
+import {
+  getRecordingContextItem,
+  listPendingRecordingContext,
+  removeRecordingContext,
+  requestRecordingContext,
+  type RecordingContextItem,
+  updateRecordingContext,
+} from "./lookback/context-api";
+import {
+  effectiveLookbackSeconds,
+  loadLookbackSeconds,
+  loadRecentLookbackSeconds,
+  saveLookbackSeconds,
+  saveRecentLookbackSeconds,
+} from "./lookback/lookback-settings";
+import { LookbackRow } from "./lookback/LookbackRow";
+import { processRecordingContextItem } from "./lookback/worker";
+import { PillLogo } from "./overlays/pill-logo";
+import {
+  useFeatureConfig,
+  type FeatureConfig,
+  type RewindCaptureMode,
+  type LocalRecordingMode,
+  type ScreenMemoryStatus,
+} from "./shared/config";
 
-interface RecordingSummary {
+type AuthCheckResult =
+  | { state: "authenticated"; token?: string }
+  | { state: "anonymous" }
+  | { state: "unavailable" }
+  | { state: "stale" };
+
+type NativeUploadProgress = {
+  recordingId?: string;
+  message?: string;
+};
+
+type PopoverView = "recorder" | "memory" | "settings" | "meetings" | "recovery";
+
+type SettingsTabId = DesktopSettingsTab;
+
+declare const __CLIPS_DESKTOP_VERSION__: string;
+
+interface PopoverMeeting {
   id: string;
   title: string;
-  durationMs: number;
-  thumbnailUrl: string | null;
-  updatedAt: string;
+  scheduledStart: string | null;
+  scheduledEnd: string | null;
+  joinUrl: string | null;
+  platform: string | null;
+  transcriptStatus: string | null;
 }
 
-interface PendingNativeUpload {
-  kind: "native";
+interface RewindMeetingHistoryAvailability {
+  available: boolean;
+  reason?: string | null;
+  coveredFrom?: string | null;
+}
+
+interface RewindAgentHandoffRequest {
+  requestId: string;
+  status: "pending" | "processing" | "ready" | "declined" | "failed";
+  requestedAt: string;
+  startAt: string;
+  endAt: string;
+  durationMs: number;
+  reason: string;
+  includeMicrophone: boolean;
+  includeSystemAudio: boolean;
+  reviewRequired: boolean;
+  agentClipRetention: "forever" | "24-hours" | "7-days" | "30-days";
+  recordingId?: string;
+  agentUrl?: string;
+  contextUrl?: string;
+  expiresAt?: string;
+  error?: string;
+}
+
+interface NativeRewindUploadResult {
   recordingId: string;
-  serverUrl: string;
-  folderPath?: string;
   durationMs: number;
   width?: number | null;
   height?: number | null;
-  bytes: number;
-  hasAudio: boolean;
-  hasCamera: boolean;
-  savedAt: string;
-  lastAttemptAt?: string | null;
-  lastError?: string | null;
-  retryCount: number;
 }
 
-type PendingDesktopUpload = PendingNativeUpload | PendingBrowserRecordingUpload;
+interface DueRewindAgentHandoff {
+  requestId: string;
+  recordingId: string;
+}
 
 interface LocalRecordingNotice {
   folderPath?: string;
   files: LocalExportedFile[];
 }
 
+interface ShareLinkNotice {
+  recordingId: string;
+  origin: string;
+  url: string;
+}
+
+interface ScreenMemoryExportResult {
+  folderPath: string;
+  files: Array<{
+    path: string;
+    fileName: string;
+    bytes: number;
+    mimeType: string;
+  }>;
+}
+
+interface RewindEgressEvent {
+  requestId: string;
+  occurredAt: string;
+  state:
+    | "prepared"
+    | "completed"
+    | "failed"
+    | "local-evidence-read"
+    | "handoff-requested";
+  evidenceCount: number;
+  packetBytes: number;
+  error?: string | null;
+  operation?: string | null;
+  receipt?: {
+    evidence?: Array<{
+      id: string;
+      momentId: string;
+      sourceType: "app-context" | "transcript" | "ocr" | "chapter";
+      capturedAt?: string | null;
+    }>;
+    frames?: Array<{ timestamp: string; segmentId: string }>;
+    mediaInterval?: { startAt: string; endAt: string };
+    reviewRequired?: boolean;
+  } | null;
+}
+
+interface RewindLocalAskResult {
+  query: string;
+  answerSummary: string;
+  evidence: Array<{
+    id: string;
+    sourceType: "app-context" | "transcript" | "ocr";
+    capturedAt: string;
+    excerpt: string;
+    confidence?: number | null;
+    segmentId: string;
+    offsetMs: number;
+  }>;
+  coverage: {
+    segmentsConsidered: number;
+    transcriptIndexesReady: number;
+    ocrIndexesReady: number;
+    gaps: Array<{
+      kind: string;
+      source: string;
+      startedAt?: string | null;
+      endedAt?: string | null;
+      detail: string;
+    }>;
+  };
+  confidence: string;
+  truncated: boolean;
+}
+
+interface RewindExcludedApplication {
+  bundleId: string;
+  name: string;
+  path?: string | null;
+  installed: boolean;
+}
+
+interface RewindAgentConnectionStatus {
+  client: "codex" | "claude-code";
+  configured: boolean;
+  configPath: string;
+  storeDir: string;
+}
+
 type MeetingTranscriptionMode = "manual" | "ask" | "auto";
 
-type CaptureMode = "screen" | "screen-camera" | "camera";
+const STORAGE_SETUP_HELP_TEXT =
+  "Clips is 100% free and open source, so you need to hook up a way to store your clips. Connect storage with Builder.io for free-tier storage and AI, or use S3-compatible object storage and your own LLM keys.";
+const DEFAULT_SCREEN_MEMORY_CONFIG = {
+  enabled: false,
+  paused: false,
+  retentionHours: 8,
+  maxBytes: 5 * 1024 * 1024 * 1024,
+  segmentSeconds: 5 * 60,
+  sampleIntervalSeconds: 10,
+  captureMode: "visuals" as const,
+  reviewBeforeSending: true,
+  autoPreviewBeforeSending: true,
+  agentClipRetention: "forever" as const,
+  excludedBundleIds: [
+    "com.1password.1password",
+    "com.agilebits.onepassword7",
+    "com.bitwarden.desktop",
+    "com.dashlane.dashlane",
+    "com.lastpass.lastpass",
+  ],
+  excludePrivateWindows: false,
+};
 
-const STORAGE_KEY = "clips:server-url";
+const STORAGE_KEY = SERVER_URL_STORAGE_KEY;
 const MODE_KEY = "clips:last-mode";
 const VOICE_SHORTCUT_KEY = "clips:voice-shortcut";
 const VOICE_SHORTCUT_CONFIGURED_KEY = "clips:voice-shortcut-configured";
+const DEFAULT_VOICE_SHORTCUT: VoiceShortcutPreference = "fn";
 const VOICE_CUSTOM_SHORTCUT_KEY = "clips:voice-custom-shortcut";
 const POPOVER_CUSTOM_SHORTCUT_KEY = "clips:popover-custom-shortcut";
+const RECORD_CUSTOM_SHORTCUT_KEY = "clips:record-custom-shortcut";
+const RECORD_CANCEL_SHORTCUT_KEY = "clips:record-cancel-shortcut";
+const RECORD_PAUSE_SHORTCUT_KEY = "clips:record-pause-shortcut";
 const VOICE_MODE_KEY = "clips:voice-mode";
 const VOICE_PROVIDER_KEY = "clips:voice-provider";
 const VOICE_INSTRUCTIONS_KEY = "clips:voice-instructions";
-const AUTH_TOKEN_KEY = "clips:auth-token";
 const SOURCE_KEY = "clips:last-source";
-const CAM_KEY = "clips:last-camera-id";
-const MIC_KEY = "clips:last-mic-id";
-const CAM_LABEL_KEY = "clips:last-camera-label";
-const MIC_LABEL_KEY = "clips:last-mic-label";
 const CAM_ON_KEY = "clips:camera-on";
 const MIC_ON_KEY = "clips:mic-on";
 const SYSTEM_AUDIO_KEY = "clips:system-audio";
-const READINESS_REVIEWED_KEY = "clips:readiness-reviewed";
+const VIDEO_STORAGE_CONFIGURED_KEY = "clips:video-storage-configured";
+const REWIND_DOCS_URL =
+  "https://www.agent-native.com/docs/template-clips-capture-everywhere#rewind";
 
-// Sensible defaults so the user never has to type a URL on first launch.
-// Dev builds point at the local dev server; production builds point at the
-// hosted Clips instance. The user can still override from Settings.
-// Dev points at the Clips dev server (shared-app-config says 8094).
-// Prod points at the hosted Clips instance. User can override from Settings.
-const DEFAULT_URL = import.meta.env.DEV
-  ? "http://localhost:8094"
-  : "https://clips.agent-native.com";
-
-const MACOS_CAPTURE_PERMISSION_MESSAGE =
-  "Grant the required macOS permissions below, then try again. If you just changed access, restart Clips before retrying.";
-const MACOS_SPEECH_PERMISSION_MESSAGE =
-  "Grant Speech Recognition and Microphone access, then try again. If you just changed access, restart Clips before retrying.";
-
-function normalizedMediaDeviceId(value: string | null | undefined): string {
-  return value?.trim() ?? "";
-}
-
-function isPseudoMediaDeviceId(value: string | null | undefined): boolean {
-  const id = normalizedMediaDeviceId(value).toLowerCase();
-  return id === "default" || id === "communications";
-}
-
-function concreteMediaDeviceId(value: string | null | undefined): string {
-  const id = normalizedMediaDeviceId(value);
-  return id && !isPseudoMediaDeviceId(id) ? id : "";
-}
-
-// Prefer this page's own enumeration; fall back to the bubble-relayed list
-// when the popover can't see labels itself (local-camera path).
-function preferEnumerated(
-  own: MediaDeviceInfo[],
-  relayed: MediaDeviceInfo[],
-): MediaDeviceInfo[] {
-  return own.length > 0 ? own : relayed;
-}
-
-function isSelectableMediaDevice(device: MediaDeviceInfo): boolean {
-  return !!concreteMediaDeviceId(device.deviceId);
-}
-
-function isBuiltInMicDevice(device: MediaDeviceInfo): boolean {
-  const label = device.label.toLowerCase();
-  return (
-    label.includes("macbook") ||
-    label.includes("built-in") ||
-    label.includes("built in") ||
-    label.includes("internal microphone")
-  );
-}
-
-function isHardCapturePermissionError(message: string): boolean {
-  return /permission denied by system|blocked by system|system settings|screen recording|privacy|sandbox/i.test(
-    message,
-  );
-}
-
-function resolveDesktopThumbnailUrl(
-  rawUrl: string | null | undefined,
-  serverUrl: string,
-): string | null {
-  if (!rawUrl) return null;
-  if (
-    rawUrl.startsWith("http://") ||
-    rawUrl.startsWith("https://") ||
-    rawUrl.startsWith("data:") ||
-    rawUrl.startsWith("blob:")
-  ) {
-    return rawUrl;
-  }
-  if (rawUrl.startsWith("/")) {
-    return `${serverUrl.replace(/\/+$/, "")}${rawUrl}`;
-  }
-  return rawUrl;
-}
-
-function loadString(key: string, fallback: string): string {
-  try {
-    const v = localStorage.getItem(key);
-    if (v && v.trim()) return v;
-  } catch {
-    // ignore
-  }
-  return fallback;
-}
-
-function loadStringAllowEmpty(key: string, fallback: string): string {
-  try {
-    const v = localStorage.getItem(key);
-    if (v !== null) return v;
-  } catch {
-    // ignore
-  }
-  return fallback;
-}
-
-function saveString(key: string, value: string): void {
-  try {
-    localStorage.setItem(key, value);
-  } catch {
-    // non-fatal
-  }
-}
+const DEFAULT_URL = DEFAULT_SERVER_URL;
 
 function normalizeCaptureSource(value: string): CaptureSource {
+  if (value === "region" && isMacPlatform()) return "region";
   return value === "window" ? "window" : "full-screen";
+}
+
+function stopRestartHandoff(handoff: RestartHandoff): void {
+  [handoff.displayStream, handoff.audioStream].forEach((stream) =>
+    stream?.getTracks().forEach((track) => track.stop()),
+  );
+  void handoff.transcriptionTornDown?.catch(() => {});
 }
 
 type FetchInput = Parameters<typeof fetch>[0];
@@ -238,18 +504,6 @@ let authFetchInstalled = false;
 let currentServerOrigin = "";
 let currentAuthToken = "";
 
-function originForUrl(value: string, base?: string): string | null {
-  try {
-    return new URL(value, base).origin;
-  } catch {
-    return null;
-  }
-}
-
-function originForServer(serverUrl: string): string {
-  return originForUrl(serverUrl) ?? serverUrl.trim().replace(/\/+$/, "");
-}
-
 function serverUrlForPendingUpload(
   upload: PendingDesktopUpload,
   currentServerUrl: string,
@@ -258,13 +512,58 @@ function serverUrlForPendingUpload(
   return normalizedCurrent || normalizeServerUrl(upload.serverUrl || "");
 }
 
-function authTokenStorageKey(serverUrl: string): string {
-  return `${AUTH_TOKEN_KEY}:${originForServer(serverUrl)}`;
+const VIDEO_STORAGE_PROBE_TIMEOUT_MS = Math.max(10_000, 5000 * 4);
+
+async function fetchWithAbortTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-function loadDesktopAuthToken(serverUrl: string): string {
-  return loadString(authTokenStorageKey(serverUrl), "");
+async function hasConfiguredVideoStorage(
+  serverUrl: string,
+  account: string | null,
+): Promise<FileUploadStatusProbe> {
+  const base = serverUrl.replace(/\/+$/, "");
+
+  const probeEndpoint = async (
+    path: string,
+  ): Promise<FileUploadStatusProbe> => {
+    try {
+      const res = await fetchWithAbortTimeout(
+        `${base}${path}`,
+        {
+          credentials: "include",
+          cache: "no-store",
+        },
+        VIDEO_STORAGE_PROBE_TIMEOUT_MS,
+      );
+      return await readFileUploadStatusProbe(res);
+    } catch {
+      return "unavailable";
+    }
+  };
+
+  const probe = await probeEndpoint("/_agent-native/file-upload/status");
+  if (probe === "configured" && account) {
+    saveBool(videoStorageConfiguredKey(serverUrl, account), true);
+  }
+  return probe;
 }
+
+function videoStorageConfiguredKey(serverUrl: string, account: string): string {
+  return `${VIDEO_STORAGE_CONFIGURED_KEY}:${originForServer(serverUrl)}:${account}`;
+}
+
+export { loadDesktopAuthToken };
 
 function setDesktopAuthContext(serverUrl: string, token: string): void {
   currentServerOrigin = originForServer(serverUrl);
@@ -294,9 +593,28 @@ function urlForFetchInput(input: FetchInput): string | null {
   return null;
 }
 
-function installAuthFetchInterceptor(): void {
+function isDevOriginWebview(): boolean {
+  return (
+    import.meta.env.DEV &&
+    typeof window !== "undefined" &&
+    window.location.protocol.startsWith("http") &&
+    window.location.hostname === "localhost"
+  );
+}
+
+function seedDesktopAuthContextFromStorage(): void {
+  if (currentServerOrigin || typeof window === "undefined") return;
+  const storedServerUrl = loadString(STORAGE_KEY, DEFAULT_URL).replace(
+    /\/+$/,
+    "",
+  );
+  setDesktopAuthContext(storedServerUrl, loadDesktopAuthToken(storedServerUrl));
+}
+
+export function installAuthFetchInterceptor(): void {
   if (authFetchInstalled || typeof window === "undefined") return;
   authFetchInstalled = true;
+  seedDesktopAuthContextFromStorage();
   const nativeFetch = window.fetch.bind(window);
 
   window.fetch = (input: FetchInput, init?: FetchInit) => {
@@ -319,55 +637,43 @@ function installAuthFetchInterceptor(): void {
     if (currentAuthToken && !headers.has("Authorization")) {
       headers.set("Authorization", `Bearer ${currentAuthToken}`);
     }
-    return nativeFetch(input, { ...init, headers });
+    // Cookies are only an option from the packaged app. `tauri dev` serves the
+    // webview from http://localhost:1420, and the framework deliberately keeps
+    // localhost off credentialed CORS ("only the configured browser allowlist
+    // and the framework's exact native app origins may receive cookies" —
+    // shouldAllowMcpEmbedCredentials). Since we always add X-Request-Source,
+    // the preflight is credentialed, so asking for cookies there fails the
+    // whole request rather than degrading. The bearer token above is the
+    // supported credential for this origin, and the server returns it in the
+    // login body precisely because localhost:1420 is on its token allowlist.
+    const credentials: RequestCredentials | undefined = isDevOriginWebview()
+      ? "omit"
+      : init?.credentials;
+    return nativeFetch(input, { ...init, headers, credentials });
   };
 }
 
-function loadBool(key: string, fallback: boolean): boolean {
-  try {
-    const v = localStorage.getItem(key);
-    if (v === "0" || v === "false") return false;
-    if (v === "1" || v === "true") return true;
-  } catch {
-    // ignore
-  }
-  return fallback;
-}
-
-function saveBool(key: string, value: boolean): void {
-  saveString(key, value ? "1" : "0");
-}
-
 type ByokVoiceProvider = Extract<VoiceProvider, "gemini" | "groq">;
-type VoiceProviderMode = "native" | "builder" | "byok";
-type MacosPrivacyPane =
-  | "camera"
-  | "microphone"
-  | "screen"
-  | "speech"
-  | "accessibility"
-  | "input-monitoring";
+type VoiceProviderMode = "native" | "whisper" | "builder" | "byok";
 
 const MACOS_PRIVACY_URLS: Record<MacosPrivacyPane, string> = {
   camera:
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Camera",
   microphone:
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone",
   screen:
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture",
   speech:
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition",
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_SpeechRecognition",
   accessibility:
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
   "input-monitoring":
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ListenEvent",
 };
 
 const WINDOWS_PRIVACY_URLS: Partial<Record<MacosPrivacyPane, string>> = {
   camera: "ms-settings:privacy-webcam",
   microphone: "ms-settings:privacy-microphone",
-  // No dedicated screen-capture privacy page that works on all Windows
-  // versions, so open the top-level Privacy settings page.
   screen: "ms-settings:privacy",
   speech: "ms-settings:privacy-speechtyping",
   accessibility: "ms-settings:easeofaccess",
@@ -412,6 +718,7 @@ function isByokVoiceProvider(value: VoiceProvider): value is ByokVoiceProvider {
 function voiceProviderMode(value: VoiceProvider): VoiceProviderMode {
   if (isByokVoiceProvider(value)) return "byok";
   if (value === "builder" || value === "builder-gemini") return "builder";
+  if (value === "whisper") return "whisper";
   return "native";
 }
 
@@ -420,8 +727,10 @@ function normalizeVoiceProvider(value: string): VoiceProvider {
   if (value === "auto") return native;
   if (value === "builder") return "builder-gemini";
   if (value === "macos-native" && !isMacPlatform()) return "browser";
+  if (value === "browser" && isMacPlatform()) return "macos-native";
   return value === "browser" ||
     value === "macos-native" ||
+    value === "whisper" ||
     value === "builder-gemini" ||
     value === "gemini" ||
     value === "groq"
@@ -429,23 +738,122 @@ function normalizeVoiceProvider(value: string): VoiceProvider {
     : native;
 }
 
-function formatAgo(iso: string): string {
-  try {
-    const delta = (Date.now() - new Date(iso).getTime()) / 1000;
-    if (delta < 60) return "just now";
-    if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
-    if (delta < 86400) return `${Math.floor(delta / 3600)}h ago`;
-    return `${Math.floor(delta / 86400)}d ago`;
-  } catch {
-    return "";
+function formatMeetingWhen(meeting: PopoverMeeting): string {
+  const startMs = Date.parse(meeting.scheduledStart ?? "");
+  if (Number.isNaN(startMs)) return "Upcoming";
+
+  const endMs = Date.parse(meeting.scheduledEnd ?? "");
+  const now = Date.now();
+  if (startMs <= now && (Number.isNaN(endMs) || endMs >= now)) {
+    return "Now";
+  }
+
+  if (startMs > now && startMs - now < 60 * 60 * 1000) {
+    return `in ${Math.max(1, Math.round((startMs - now) / 60000))}m`;
+  }
+
+  const start = new Date(startMs);
+  const time = start.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  const today = new Date(now);
+  const tomorrow = new Date(now + 24 * 60 * 60 * 1000);
+  if (start.toDateString() === today.toDateString()) return `Today ${time}`;
+  if (start.toDateString() === tomorrow.toDateString()) {
+    return `Tomorrow ${time}`;
+  }
+
+  return `${start.toLocaleDateString([], {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  })} ${time}`;
+}
+
+const MEETING_IMMINENT_WINDOW_MS = 10 * 60 * 1000;
+
+function meetingCanStartNotes(meeting: PopoverMeeting): boolean {
+  const startMs = Date.parse(meeting.scheduledStart ?? "");
+  if (Number.isNaN(startMs)) return false;
+  const endMs = Date.parse(meeting.scheduledEnd ?? "");
+  const now = Date.now();
+  return (
+    startMs <= now + MEETING_IMMINENT_WINDOW_MS &&
+    (Number.isNaN(endMs) || endMs >= now)
+  );
+}
+
+const MAC_MODIFIER_GLYPHS: Record<string, string> = {
+  Cmd: "⌘",
+  Ctrl: "⌃",
+  Alt: "⌥",
+  Shift: "⇧",
+};
+
+function compactShortcutLabel(shortcut: string): string {
+  const tokens = shortcut
+    .split("+")
+    .map((token) => token.trim())
+    .filter(Boolean);
+  if (!isMacPlatform()) return tokens.join(" ");
+  return tokens.map((token) => MAC_MODIFIER_GLYPHS[token] ?? token).join("");
+}
+
+function compactVoiceShortcutLabel(
+  shortcut: VoiceShortcutPreference,
+  customShortcut: string,
+): string {
+  switch (shortcut) {
+    case "fn":
+      return "Fn";
+    case "cmd-shift-space":
+      return compactShortcutLabel("Cmd+Shift+Space");
+    case "ctrl-shift-space":
+      return compactShortcutLabel("Ctrl+Shift+Space");
+    case "custom":
+      return customShortcut ? compactShortcutLabel(customShortcut) : "Custom";
+    case "both":
+      return `Fn / ${compactShortcutLabel("Cmd+Shift+Space")}`;
   }
 }
+
+function SettingsSwitch({
+  checked,
+  onCheckedChange,
+  label,
+  disabled = false,
+}: {
+  checked: boolean;
+  onCheckedChange: (value: boolean) => void;
+  label: string;
+  disabled?: boolean;
+}) {
+  return (
+    <UiSwitch
+      checked={checked}
+      onCheckedChange={onCheckedChange}
+      disabled={disabled}
+      aria-label={label}
+    />
+  );
+}
+
+const VOICE_SHORTCUT_CHOICES: Array<{ value: string; label: string }> = [
+  { value: "fn", label: "Fn (globe)" },
+  { value: "cmd-shift-space", label: "Cmd Shift Space" },
+  { value: "ctrl-shift-space", label: "Ctrl Shift Space" },
+  { value: "custom", label: "Custom shortcut" },
+  { value: "both", label: "Any of them" },
+];
 
 function formatFileSize(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "";
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
 }
+
+const POPOVER_RESIZE_OVERLAY_SELECTOR = '[data-popover-resize-overlay="true"]';
 
 function measurePopoverHeight(el: HTMLElement): number {
   const rect = el.getBoundingClientRect();
@@ -456,26 +864,63 @@ function measurePopoverHeight(el: HTMLElement): number {
 
   const candidates = [rect.height, el.scrollHeight + borderY];
 
-  // ResizeObserver on `.app` alone misses scroll-only and absolutely
-  // positioned growth. Measure descendant bounds so menus, banners, and
-  // settings sections can grow the native window even when `.app` is capped
-  // by the current viewport height.
+  const directChildOverflow = Array.from(el.children).reduce((total, child) => {
+    if (!(child instanceof HTMLElement)) return total;
+    return total + Math.max(0, child.scrollHeight - child.clientHeight);
+  }, 0);
+  candidates.push(el.scrollHeight + borderY + directChildOverflow);
+
   let lowestBottom = rect.bottom;
   for (const child of Array.from(el.querySelectorAll<HTMLElement>("*"))) {
+    if (child.closest('[data-popover-overlay="true"]')) continue;
+    const scrollRegion = child.closest<HTMLElement>(
+      "[data-popover-scroll-region]",
+    );
+    if (scrollRegion) {
+      if (scrollRegion !== child) continue;
+      const regionRect = child.getBoundingClientRect();
+      lowestBottom = Math.max(lowestBottom, regionRect.bottom);
+      continue;
+    }
     const childStyle = window.getComputedStyle(child);
     if (childStyle.display === "none") continue;
     const childRect = child.getBoundingClientRect();
     if (childRect.width === 0 && childRect.height === 0) continue;
     lowestBottom = Math.max(lowestBottom, childRect.bottom);
+
+    const childBorderY =
+      Number.parseFloat(childStyle.borderTopWidth || "0") +
+      Number.parseFloat(childStyle.borderBottomWidth || "0");
+    candidates.push(
+      childRect.top - rect.top + child.scrollHeight + childBorderY,
+    );
   }
   candidates.push(lowestBottom - rect.top);
+
+  for (const overlay of Array.from(
+    document.querySelectorAll<HTMLElement>(POPOVER_RESIZE_OVERLAY_SELECTOR),
+  )) {
+    const overlayRect = overlay.getBoundingClientRect();
+    const overlayStyle = window.getComputedStyle(overlay);
+    const overlayBorderY =
+      Number.parseFloat(overlayStyle.borderTopWidth || "0") +
+      Number.parseFloat(overlayStyle.borderBottomWidth || "0");
+    const overlayHeight = Math.max(
+      overlayRect.height,
+      overlay.scrollHeight + overlayBorderY,
+    );
+    candidates.push(overlayRect.top - rect.top + overlayHeight + 8);
+  }
 
   return Math.ceil(Math.max(...candidates));
 }
 
 function usePopoverAutoSize(
   ref: RefObject<HTMLElement | null>,
-  options: { disabled: boolean; width: number },
+  options: {
+    disabled: boolean;
+    width: number;
+  },
 ): void {
   const { disabled, width } = options;
 
@@ -516,6 +961,11 @@ function usePopoverAutoSize(
       for (const child of Array.from(el.querySelectorAll<HTMLElement>("*"))) {
         resizeObserver.observe(child);
       }
+      for (const overlay of Array.from(
+        document.querySelectorAll<HTMLElement>(POPOVER_RESIZE_OVERLAY_SELECTOR),
+      )) {
+        resizeObserver.observe(overlay);
+      }
     };
 
     const mutationObserver = new MutationObserver(() => {
@@ -530,6 +980,14 @@ function usePopoverAutoSize(
       childList: true,
       subtree: true,
     });
+    const portalObserver = new MutationObserver(() => {
+      observeTree();
+      schedule();
+    });
+    portalObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
     schedule();
 
     if (document.fonts) {
@@ -540,63 +998,54 @@ function usePopoverAutoSize(
       if (animationFrame) window.cancelAnimationFrame(animationFrame);
       window.clearTimeout(settleTimer);
       mutationObserver.disconnect();
+      portalObserver.disconnect();
       resizeObserver.disconnect();
     };
   }, [disabled, ref, width]);
 }
 
-export function App() {
+export function App({
+  initialView,
+  initialSettingsTab: initialSettingsTabProp,
+}: {
+  initialView?: PopoverView;
+  initialSettingsTab?: DesktopSettingsTab;
+} = {}) {
   const featureConfig = useFeatureConfig();
   const [serverUrl, setServerUrl] = useState<string>(() =>
     loadString(STORAGE_KEY, DEFAULT_URL).replace(/\/+$/, ""),
   );
-  const [mode, setMode] = useState<CaptureMode>(
-    () => loadString(MODE_KEY, "screen-camera") as CaptureMode,
+  const [initialCaptureSetup] = useState(() =>
+    normalizeCaptureSetup(
+      loadString(MODE_KEY, "screen-camera"),
+      loadBool(CAM_ON_KEY, true),
+    ),
   );
+  const [mode, setMode] = useState<CaptureMode>(initialCaptureSetup.mode);
   const [source, setSource] = useState<CaptureSource>(() =>
     normalizeCaptureSource(loadString(SOURCE_KEY, "full-screen")),
   );
-  const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
-  const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
-  // Device lists relayed from the bubble page when IT owns the camera grant
-  // (full-screen / local-camera path). The popover page can't enumerate device
-  // labels itself there without muting the live bubble, so we use these lists
-  // when our own enumeration comes back empty.
-  const [bubbleCameras, setBubbleCameras] = useState<MediaDeviceInfo[]>([]);
-  const [bubbleMics, setBubbleMics] = useState<MediaDeviceInfo[]>([]);
-  const [cameraId, setCameraId] = useState<string>(() =>
-    loadString(CAM_KEY, ""),
-  );
-  const [micId, setMicId] = useState<string>(() => loadString(MIC_KEY, ""));
-  // Remembered human labels for the saved ids, so a cold launch (device list
-  // still locked behind a getUserMedia grant) can show the device by name
-  // instead of "Selected camera unavailable".
-  const [cameraLabel, setCameraLabel] = useState<string>(() =>
-    loadString(CAM_LABEL_KEY, ""),
-  );
-  const [micLabel, setMicLabel] = useState<string>(() =>
-    loadString(MIC_LABEL_KEY, ""),
-  );
-  const [cameraOn, setCameraOn] = useState<boolean>(() =>
-    loadBool(CAM_ON_KEY, false),
+  const [cameraOn, setCameraOn] = useState<boolean>(
+    initialCaptureSetup.cameraOn,
   );
   const [micOn, setMicOn] = useState<boolean>(() => loadBool(MIC_ON_KEY, true));
+  const [micOffConfirmOpen, setMicOffConfirmOpen] = useState(false);
   const [systemAudioOn, setSystemAudioOn] = useState<boolean>(() =>
     loadBool(SYSTEM_AUDIO_KEY, true),
   );
   const [voiceShortcut, setVoiceShortcut] = useState<VoiceShortcutPreference>(
     () => {
       if (!loadBool(VOICE_SHORTCUT_CONFIGURED_KEY, false)) {
-        return "cmd-shift-space";
+        return DEFAULT_VOICE_SHORTCUT;
       }
-      const saved = loadString(VOICE_SHORTCUT_KEY, "cmd-shift-space");
+      const saved = loadString(VOICE_SHORTCUT_KEY, DEFAULT_VOICE_SHORTCUT);
       return saved === "fn" ||
         saved === "cmd-shift-space" ||
         saved === "ctrl-shift-space" ||
         saved === "custom" ||
         saved === "both"
         ? saved
-        : "cmd-shift-space";
+        : DEFAULT_VOICE_SHORTCUT;
     },
   );
   const [voiceCustomShortcut, setVoiceCustomShortcut] = useState<string>(() =>
@@ -604,6 +1053,15 @@ export function App() {
   );
   const [popoverCustomShortcut, setPopoverCustomShortcut] = useState<string>(
     () => loadStringAllowEmpty(POPOVER_CUSTOM_SHORTCUT_KEY, ""),
+  );
+  const [recordCustomShortcut, setRecordCustomShortcut] = useState<string>(() =>
+    loadStringAllowEmpty(RECORD_CUSTOM_SHORTCUT_KEY, ""),
+  );
+  const [recordCancelShortcut, setRecordCancelShortcut] = useState<string>(() =>
+    loadStringAllowEmpty(RECORD_CANCEL_SHORTCUT_KEY, ""),
+  );
+  const [recordPauseShortcut, setRecordPauseShortcut] = useState<string>(() =>
+    loadStringAllowEmpty(RECORD_PAUSE_SHORTCUT_KEY, ""),
   );
   const [voiceMode, setVoiceMode] = useState<VoiceMode>(() => {
     const saved = loadString(VOICE_MODE_KEY, "push-to-talk");
@@ -619,68 +1077,212 @@ export function App() {
   );
   const localRecordingMode: LocalRecordingMode =
     featureConfig?.localRecordingMode ?? "off";
+  const voiceCleanupEnabled = featureConfig?.voiceCleanupEnabled !== false;
 
-  const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
-  const [pendingUploads, setPendingUploads] = useState<PendingDesktopUpload[]>(
-    [],
-  );
+  const [recoverySnapshot, setRecoverySnapshot] = useState<RecoverySnapshot>({
+    uploads: [],
+    errors: [],
+  });
+  const pendingUploads = recoverySnapshot.uploads;
+  const [recoveryActionErrors, setRecoveryActionErrors] = useState<
+    Record<string, string>
+  >({});
+  const [recoveryRefreshing, setRecoveryRefreshing] = useState(false);
+  const recoveryLookupSequence = useRef(0);
+  const recoveryFailureAttempts = useRef(new Map<string, string>());
+  const recoverySessionId = useRef(crypto.randomUUID());
   const [retryingUploadId, setRetryingUploadId] = useState<string | null>(null);
-  const [exportingUploadId, setExportingUploadId] = useState<string | null>(
+  const [retryingUploadStatus, setRetryingUploadStatus] = useState<
+    string | null
+  >(null);
+  const retryUploadAbortRef = useRef<AbortController | null>(null);
+  const retryUploadRecordingIdRef = useRef<string | null>(null);
+  const retryingUploadKindRef = useRef<PendingDesktopUpload["kind"] | null>(
     null,
   );
-  const [discardingUploadId, setDiscardingUploadId] = useState<string | null>(
+  useEffect(() => {
+    if (!retryingUploadId) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void listen<NativeUploadProgress>(
+      "clips:native-upload-progress",
+      (event) => {
+        if (
+          !event.payload.recordingId ||
+          retryingUploadId !== `native:${event.payload.recordingId}`
+        )
+          return;
+        const message = event.payload?.message?.trim();
+        if (message) setRetryingUploadStatus(message);
+      },
+    ).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [retryingUploadId]);
+  const [exportingUploadId, setExportingUploadId] = useState<string | null>(
     null,
   );
   const [localRecordingNotice, setLocalRecordingNotice] =
     useState<LocalRecordingNotice | null>(null);
-  const [showRecent, setShowRecent] = useState(false);
-  const [readinessOpen, setReadinessOpen] = useState<boolean>(
-    () => !loadBool(READINESS_REVIEWED_KEY, false),
+  const [shareLinkNotice, setShareLinkNotice] =
+    useState<ShareLinkNotice | null>(null);
+  const [popoverView, setPopoverView] = useState<PopoverView>(
+    initialView ?? "recorder",
   );
-  const [showSettings, setShowSettings] = useState(false);
+  const [initialSettingsTab, setInitialSettingsTab] = useState<SettingsTabId>(
+    initialSettingsTabProp ?? "general",
+  );
+  function openSettings(tab: SettingsTabId = "general") {
+    setInitialSettingsTab(tab);
+    setPopoverView("settings");
+  }
+
+  function selectCaptureMode(nextMode: CaptureMode) {
+    const nextSetup = captureSetupForMode(nextMode);
+    setMode(nextSetup.mode);
+    setCameraOn(nextSetup.cameraOn);
+  }
+
+  function toggleCamera(nextOn: boolean) {
+    const nextSetup = captureSetupForCamera(mode, nextOn);
+    setMode(nextSetup.mode);
+    setCameraOn(nextSetup.cameraOn);
+  }
+
+  const [rewindAgentPromptCopied, setRewindAgentPromptCopied] = useState(false);
+  const [agentHandoff, setAgentHandoff] =
+    useState<RewindAgentHandoffRequest | null>(null);
+  const agentHandoffProcessingRef = useRef<string | null>(null);
+  const agentHandoffPreviewedRef = useRef<Set<string>>(new Set());
+  const [agentHandoffPreviewBusy, setAgentHandoffPreviewBusy] = useState(false);
+  const [agentHandoffPreviewError, setAgentHandoffPreviewError] = useState<
+    string | null
+  >(null);
+  const [meetings, setMeetings] = useState<PopoverMeeting[]>([]);
+  const [meetingsLoading, setMeetingsLoading] = useState(false);
+  const [meetingsError, setMeetingsError] = useState<string | null>(null);
+  const [meetingsCalendarNeedsReauth, setMeetingsCalendarNeedsReauth] =
+    useState(false);
+  const [meetingStartMessage, setMeetingStartMessage] = useState<string | null>(
+    null,
+  );
+  const [
+    rewindMeetingHistoryAvailability,
+    setRewindMeetingHistoryAvailability,
+  ] = useState<Record<string, RewindMeetingHistoryAvailability>>({});
+  const [activeMeetingId, setActiveMeetingId] = useState<string | null>(null);
   const [recorder, setRecorder] = useState<RecorderHandle | null>(null);
+  const recordingStartAttemptRef = useRef<RecordingStartAttempt | null>(null);
+  const captureStartedDuringStartRef = useRef(false);
+  const [recordingStartPending, setRecordingStartPending] = useState(false);
   const [recError, setRecError] = useState<string | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [shortcutRegistrationError, setShortcutRegistrationError] = useState<
     string | null
   >(null);
-  // Latched true the moment the user clicks Start Recording and cleared
-  // when the recorder fully stops/cancels. We use this to suppress the
-  // popover auto-hide during the macOS screen-picker focus dance.
   const [recordingFlowActive, setRecordingFlowActive] = useState(false);
-  const [lastRecordingId, setLastRecordingId] = useState<string | null>(null);
-  const [authStatus, setAuthStatus] = useState<"unknown" | "authed" | "anon">(
-    "unknown",
+  const [recordingStopFinalizing, setRecordingStopFinalizing] = useState(false);
+  const [, setLastRecordingId] = useState<string | null>(null);
+  const [authStatus, setAuthStatus] = useState<
+    "unknown" | "authed" | "anon" | "unavailable"
+  >("unknown");
+  const [labValues, setLabValues] = useState<Record<string, unknown>>({});
+  const [labError, setLabError] = useState<string | null>(null);
+  const t = useT();
+  const [lookbackSeconds, setLookbackSeconds] = useState(loadLookbackSeconds);
+  const [recentLookbackSeconds, setRecentLookbackSeconds] = useState(
+    loadRecentLookbackSeconds,
   );
+  const [lookbackNotice, setLookbackNotice] = useState<string | null>(null);
+  const [rewindConsentPending, setRewindConsentPending] = useState(false);
+  // The context request for the current recording. It keeps its own target so
+  // a later cancel removes the item from the server that created it.
+  const lookbackContextRef = useRef<{
+    target: { serverUrl: string; authToken: string };
+    item: Promise<RecordingContextItem | null>;
+  } | null>(null);
+  const processingLookbackIdsRef = useRef<Set<string>>(new Set());
+  // Pending items whose footage was captured on another device. Session-scoped,
+  // so a restart checks them against local origins again.
+  const skippedLookbackIdsRef = useRef<Set<string>>(new Set());
+  const [serverReachable, setServerReachable] = useState(true);
+  const serverHostForSignIn = serverUrl
+    .replace(/^https?:\/\//, "")
+    .replace(/\/+$/, "");
+  const [videoStorageStatus, setVideoStorageStatus] =
+    useState<VideoStorageStatus>("checking");
   const [signedInAs, setSignedInAs] = useState<string | null>(null);
-  const [signInPending, setSignInPending] = useState(false);
+  const [signInPending, setSignInPending] = useState<
+    "google" | "magic-link" | null
+  >(null);
+  const [magicLinkEmail, setMagicLinkEmail] = useState<string | null>(null);
   const [signInError, setSignInError] = useState<string | null>(null);
-  // Ref-based lock so two fast clicks cannot both enter signInExternal()
-  // (state updates are async; refs are synchronous).
   const signInInflightRef = useRef(false);
-  // Stored so Cancel can stop the polling loop.
+  const authCheckGenerationRef = useRef(0);
+  const authServerUrlRef = useRef(serverUrl);
+  authServerUrlRef.current = serverUrl;
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const signInVisibilityRef = useRef<(() => void) | null>(null);
   const isRecording = recorder !== null;
-  const selectedMicId = useMemo(() => concreteMediaDeviceId(micId), [micId]);
-  const cameraDevices = useMemo(
-    () => preferEnumerated(cameras, bubbleCameras),
-    [cameras, bubbleCameras],
-  );
-  const micDevices = useMemo(
-    () => preferEnumerated(mics, bubbleMics),
-    [mics, bubbleMics],
-  );
-  const selectedMicLabel = useMemo(
-    () =>
-      selectedMicId
-        ? (mics.find((mic) => mic.deviceId === selectedMicId)?.label ?? "")
-        : "",
-    [selectedMicId, mics],
-  );
-  const voiceDictationEnabled = featureConfig?.voiceEnabled !== false;
+  const [popoverVisible, setPopoverVisible] = useState(false);
+  const recordingErrorVisibleRef = useRef({
+    visible: popoverVisible,
+    view: popoverView,
+  });
+  recordingErrorVisibleRef.current = {
+    visible: popoverVisible,
+    view: popoverView,
+  };
+  const recordShortcutHandlerRef = useRef<() => void>(() => {});
+  const handleStartRecordingRef = useRef<
+    (options?: {
+      resumeCapture?: RestartHandoff;
+    }) => Promise<RecorderHandle | null>
+  >(async () => null);
+  const bubbleActiveRef = useRef(false);
+  const {
+    cameraId,
+    setCameraId,
+    setMicId,
+    cameraLabel,
+    setCameraLabel,
+    micLabel,
+    setMicLabel,
+    selectedMicId,
+    selectedMicLabel,
+    cameraDevices,
+    micDevices,
+    loadDevices,
+    requestDeviceAccess,
+  } = useMediaDevices({
+    microphoneEnabled: micOn,
+    popoverVisible,
+    setCameraError,
+    setRecError,
+  });
+  const meetingsLabEnabled =
+    authStatus === "authed" && isLabEnabled(labValues, CLIPS_MEETINGS);
+  const wisprFlowLabEnabled =
+    authStatus === "authed" && isLabEnabled(labValues, CLIPS_WISPRFLOW);
+  const lookbackLabEnabled =
+    authStatus === "authed" && isLabEnabled(labValues, CLIPS_LOOKBACK_CONTEXT);
+  const rewindOn = featureConfig?.screenMemory?.enabled === true;
+  const voiceDictationEnabled =
+    wisprFlowLabEnabled && featureConfig?.voiceEnabled !== false;
   const fnShortcutEnabled =
     voiceDictationEnabled &&
     (voiceShortcut === "fn" || voiceShortcut === "both");
+
+  useEffect(() => {
+    if (!meetingsLabEnabled && popoverView === "meetings") {
+      setPopoverView("recorder");
+    }
+  }, [meetingsLabEnabled, popoverView]);
   const updateVoiceShortcut = useCallback((value: VoiceShortcutPreference) => {
     saveBool(VOICE_SHORTCUT_CONFIGURED_KEY, true);
     setVoiceShortcut(value);
@@ -690,6 +1292,80 @@ export function App() {
     installAuthFetchInterceptor();
     setDesktopAuthContext(serverUrl, loadDesktopAuthToken(serverUrl));
   }, [serverUrl]);
+
+  const videoStorageIdentity = `${originForServer(serverUrl)}|${signedInAs ?? ""}`;
+  const videoStorageIdentityRef = useRef(videoStorageIdentity);
+  useEffect(() => {
+    videoStorageIdentityRef.current = videoStorageIdentity;
+    setVideoStorageStatus(
+      signedInAs &&
+        loadBool(videoStorageConfiguredKey(serverUrl, signedInAs), false)
+        ? "configured"
+        : "checking",
+    );
+  }, [videoStorageIdentity, serverUrl, signedInAs]);
+
+  const refreshVideoStorageStatus = useCallback(async () => {
+    if (authStatus !== "authed" || localRecordingMode !== "off") {
+      setVideoStorageStatus("configured");
+      return true;
+    }
+
+    const probedIdentity = videoStorageIdentity;
+    const probe = await hasConfiguredVideoStorage(serverUrl, signedInAs);
+    if (videoStorageIdentityRef.current !== probedIdentity) return false;
+    if (probe === "unavailable") {
+      setVideoStorageStatus("unavailable");
+      return false;
+    }
+    setVideoStorageStatus(probe);
+    return probe === "configured";
+  }, [
+    authStatus,
+    localRecordingMode,
+    serverUrl,
+    signedInAs,
+    videoStorageIdentity,
+  ]);
+
+  useEffect(() => {
+    void refreshVideoStorageStatus();
+  }, [refreshVideoStorageStatus]);
+
+  useEffect(() => {
+    if (
+      authStatus !== "authed" ||
+      localRecordingMode !== "off" ||
+      (videoStorageStatus !== "missing" &&
+        videoStorageStatus !== "checking" &&
+        videoStorageStatus !== "unavailable")
+    ) {
+      return;
+    }
+
+    let inFlight = false;
+    const tick = () => {
+      if (document.hidden || inFlight) return;
+      inFlight = true;
+      void refreshVideoStorageStatus().finally(() => {
+        inFlight = false;
+      });
+    };
+    const interval = window.setInterval(tick, 5000);
+    const onVisibilityChange = () => {
+      if (!document.hidden) tick();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [
+    authStatus,
+    localRecordingMode,
+    refreshVideoStorageStatus,
+    videoStorageStatus,
+  ]);
 
   useEffect(() => {
     return installDesktopVoiceDictation({
@@ -726,6 +1402,9 @@ export function App() {
     invoke("set_custom_shortcuts", {
       voice: voiceShortcut === "custom" ? voiceCustomShortcut : null,
       popover: popoverCustomShortcut.trim() ? popoverCustomShortcut : null,
+      record: recordCustomShortcut.trim() ? recordCustomShortcut : null,
+      recordCancel: recordCancelShortcut.trim() ? recordCancelShortcut : null,
+      recordPause: recordPauseShortcut.trim() ? recordPauseShortcut : null,
     })
       .then(() => {
         if (!cancelled) setShortcutRegistrationError(null);
@@ -741,25 +1420,45 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [popoverCustomShortcut, voiceCustomShortcut, voiceShortcut]);
+  }, [
+    popoverCustomShortcut,
+    recordCancelShortcut,
+    recordCustomShortcut,
+    recordPauseShortcut,
+    voiceCustomShortcut,
+    voiceShortcut,
+  ]);
 
-  // ---- auth status --------------------------------------------------------
-  // The Tauri WebView has its own cookie jar (separate from the user's
-  // browser). Before anything else, check whether we have a session cookie
-  // for the Clips server; if not, surface a Sign in button.
-  const checkAuth = useCallback(async () => {
+  const checkAuth = useCallback(async (): Promise<AuthCheckResult> => {
+    const requestServerUrl = serverUrl;
+    const requestId = ++authCheckGenerationRef.current;
+    const isCurrentRequest = () =>
+      requestId === authCheckGenerationRef.current &&
+      authServerUrlRef.current === requestServerUrl;
     try {
       const res = await fetch(
-        `${serverUrl.replace(/\/+$/, "")}/_agent-native/auth/session`,
-        { credentials: "include" },
+        `${requestServerUrl.replace(/\/+$/, "")}/_agent-native/auth/session`,
+        { credentials: "include", cache: "no-store" },
       );
+      if (!isCurrentRequest()) return { state: "stale" };
+      setServerReachable(true);
       if (!res.ok) {
         if (res.status === 401 || res.status === 403) {
-          clearDesktopAuthToken(serverUrl);
+          clearDesktopAuthToken(requestServerUrl);
+          setAuthStatus("anon");
+          setSignedInAs(null);
+          return { state: "anonymous" };
+        }
+        if (res.status >= 500) {
+          setServerReachable(false);
+          setAuthStatus((current) =>
+            current === "authed" ? current : "unavailable",
+          );
+          return { state: "unavailable" };
         }
         setAuthStatus("anon");
         setSignedInAs(null);
-        return false;
+        return { state: "anonymous" };
       }
       const json = (await res.json().catch(() => null)) as {
         email?: string;
@@ -767,60 +1466,69 @@ export function App() {
         error?: string;
       } | null;
       if (json?.email) {
-        if (json.token) saveDesktopAuthToken(serverUrl, json.token);
+        if (!isCurrentRequest()) return { state: "stale" };
+        const token = json.token?.trim() || undefined;
+        if (token) saveDesktopAuthToken(requestServerUrl, token);
         setAuthStatus("authed");
         setSignedInAs(json.email);
-        return true;
+        return { state: "authenticated", ...(token ? { token } : {}) };
       }
+      if (!isCurrentRequest()) return { state: "stale" };
       setAuthStatus("anon");
       setSignedInAs(null);
-      clearDesktopAuthToken(serverUrl);
-      return false;
+      clearDesktopAuthToken(requestServerUrl);
+      return { state: "anonymous" };
     } catch {
-      setAuthStatus("anon");
-      setSignedInAs(null);
-      return false;
+      if (!isCurrentRequest()) return { state: "stale" };
+      setServerReachable(false);
+      setAuthStatus((current) =>
+        current === "authed" ? current : "unavailable",
+      );
+      return { state: "unavailable" };
     }
   }, [serverUrl]);
 
+  const pushMeetingsSession = useCallback(async () => {
+    const cookie = typeof document !== "undefined" ? document.cookie || "" : "";
+    const authToken = loadDesktopAuthToken(serverUrl);
+    try {
+      await invoke("meetings_watcher_set_session", { cookie, authToken });
+    } catch {
+      // coercion-ok: older Clips builds do not expose the optional watcher command.
+    }
+  }, [serverUrl]);
+
+  const resumePolling = useCallback(async () => {
+    if (document.hidden) return;
+    const authResult = await checkAuth();
+    if (authResult.state !== "authenticated") return;
+    await pushMeetingsSession();
+    await invoke("meetings_watcher_resume_polling").catch(() => {
+      // Older builds may not expose this command yet — best-effort.
+    });
+  }, [checkAuth, pushMeetingsSession]);
+
   useEffect(() => {
-    checkAuth();
+    void checkAuth();
   }, [checkAuth]);
 
-  // Push the current server URL to the Rust meetings watcher so it can
-  // poll the backend for upcoming events. The watcher no-ops until this
-  // fires — we re-push on every server-url change so a settings tweak
-  // flows through immediately.
   useEffect(() => {
     invoke("meetings_watcher_set_server_url", { serverUrl }).catch(() => {
       // Command may be missing on older builds — best-effort.
     });
   }, [serverUrl]);
 
-  // The Rust-side meetings watcher fetches the backend with `reqwest`, which
-  // does NOT inherit the popover WebView's cookie jar or fetch interceptor.
-  // We forward both the legacy cookie string and the desktop bearer token.
-  // Re-push on:
-  //   - boot
-  //   - sign-in / sign-out (signedInAs change)
-  //   - the watcher emitting `meetings:auth-needed` (401) — usually means
-  //     the cookie expired and we need to send a fresh one.
   useEffect(() => {
-    function pushSession() {
-      const cookie =
-        typeof document !== "undefined" ? document.cookie || "" : "";
-      const authToken = loadDesktopAuthToken(serverUrl);
-      invoke("meetings_watcher_set_session", { cookie, authToken }).catch(
-        () => {
-          // Older builds may not expose this command yet — best-effort.
-        },
-      );
-    }
-    pushSession();
+    void pushMeetingsSession();
     let unlisten: (() => void) | null = null;
-    listen("meetings:auth-needed", () => {
+    listen("meetings:auth-needed", async () => {
       console.warn("[clips-popover] meetings:auth-needed — re-pushing session");
-      pushSession();
+      // Never resume the pollers here: every rejection fires this event, so a
+      // session check that passes while actions still 401/403 would reset the
+      // rejection budget each time and poll forever. A refreshed token changes
+      // the credentials, which the pollers already retry on their own.
+      const authResult = await checkAuth();
+      if (authResult.state === "authenticated") await pushMeetingsSession();
     })
       .then((u) => {
         unlisten = u;
@@ -835,12 +1543,17 @@ export function App() {
         }
       }
     };
-  }, [signedInAs, serverUrl]);
+  }, [signedInAs, serverUrl, checkAuth, pushMeetingsSession]);
 
-  // Tray "Upcoming Meetings" submenu click → open that meeting's notes page in
-  // the browser. The rich meeting UI (transcript + AI notes) lives in the web
-  // app, not this popover, so we deep-link to it. Without this listener the
-  // tray click emitted `meetings:open` into the void and nothing happened.
+  useEffect(() => {
+    if (authStatus !== "authed") return;
+    void resumePolling();
+    document.addEventListener("visibilitychange", resumePolling);
+    return () => {
+      document.removeEventListener("visibilitychange", resumePolling);
+    };
+  }, [authStatus, resumePolling]);
+
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     listen<{ meetingId?: string }>("meetings:open", (ev) => {
@@ -869,19 +1582,14 @@ export function App() {
     };
   }, [serverUrl]);
 
-  // Open meeting join URLs (Zoom / Meet / Teams) when the meeting
-  // notification banner asks. Centralized here so any future surface that
-  // emits `meetings:open-join-url` works the same way.
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     listen<{ joinUrl?: string | null }>("meetings:open-join-url", (ev) => {
       const url = ev.payload?.joinUrl;
       if (!url) return;
-      import("@tauri-apps/plugin-shell")
-        .then(({ open }) => open(url))
-        .catch((err) => {
-          console.error("[clips-popover] open join url failed:", err);
-        });
+      openMeetingJoinUrl(url).catch((err) => {
+        console.error("[clips-popover] open join url failed:", err);
+      });
     })
       .then((u) => {
         unlisten = u;
@@ -899,174 +1607,1003 @@ export function App() {
   }, []);
 
   const callClipsAction = useCallback(
-    async <T,>(
+    <T,>(
       name: string,
       body: Record<string, unknown>,
       opts?: { method?: "GET" | "POST"; signal?: AbortSignal },
-    ): Promise<T> => {
-      const base = serverUrl.replace(/\/+$/, "");
-      const method = opts?.method ?? "POST";
-      const headers = new Headers();
-      const authToken = loadDesktopAuthToken(serverUrl);
-      if (authToken) headers.set("Authorization", `Bearer ${authToken}`);
-      // GET actions read their args from the query string; POST actions send a
-      // JSON body.
-      let url = `${base}/_agent-native/actions/${name}`;
-      let requestBody: string | undefined;
-      if (method === "GET") {
-        const params = new URLSearchParams();
-        for (const [key, value] of Object.entries(body)) {
-          if (value != null) params.set(key, String(value));
-        }
-        const qs = params.toString();
-        if (qs) url += `?${qs}`;
-      } else {
-        headers.set("Content-Type", "application/json");
-        requestBody = JSON.stringify(body);
-      }
-      const response = await fetch(url, {
-        method,
-        credentials: "include",
-        headers,
-        body: requestBody,
-        signal: opts?.signal,
-      });
-      const text = await response.text().catch(() => "");
-      let json: any = null;
-      try {
-        json = text ? JSON.parse(text) : null;
-      } catch {
-        // Keep text fallback below.
-      }
-      if (!response.ok) {
-        const message =
-          json?.error ||
-          json?.message ||
-          (response.status === 401
-            ? "Sign in to transcribe meetings."
-            : text.slice(0, 180) || `Request failed (${response.status})`);
-        throw new Error(message);
-      }
-      return (json?.result ?? json) as T;
-    },
+    ): Promise<T> =>
+      callClipsActionFor<T>(
+        { serverUrl, authToken: loadDesktopAuthToken(serverUrl) },
+        name,
+        body,
+        opts,
+      ),
     [serverUrl],
   );
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshLabs = async () => {
+      if (authStatus !== "authed") {
+        setLabValues({});
+        emit("clips:labs-updated", { values: {} }).catch(() => {});
+        return;
+      }
+
+      try {
+        const values = await callClipsAction<Record<string, unknown>>(
+          "get-lab-states",
+          {},
+          { method: "GET" },
+        );
+        if (!cancelled) {
+          setLabValues(values);
+          emit("clips:labs-updated", { values }).catch(() => {});
+        }
+      } catch (error) {
+        console.warn("[clips-tray] lab refresh failed:", error);
+      }
+    };
+
+    void refreshLabs();
+    if (authStatus !== "authed") {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const refreshInterval = window.setInterval(() => {
+      void refreshLabs();
+    }, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(refreshInterval);
+    };
+  }, [authStatus, callClipsAction]);
+
+  // Writes through the same set-lab action the web app uses, so a change here
+  // also reaches Clips on the web and the record popover. The switch moves at
+  // once and is reverted if the save fails.
+  async function setLabEnabled(
+    lab: { key: string; displayName?: string },
+    enabled: boolean,
+  ) {
+    const previous = labValues;
+    setLabError(null);
+    const optimistic = { ...labValues, [lab.key]: enabled };
+    setLabValues(optimistic);
+    emit("clips:labs-updated", { values: optimistic }).catch(() => {});
+    try {
+      const saved = await callClipsAction<{ values: Record<string, unknown> }>(
+        "set-lab",
+        { key: lab.key, enabled },
+        { method: "POST" },
+      );
+      setLabValues(saved.values);
+      emit("clips:labs-updated", { values: saved.values }).catch(() => {});
+    } catch (error) {
+      console.warn("[clips-tray] lab update failed:", error);
+      setLabValues(previous);
+      emit("clips:labs-updated", { values: previous }).catch(() => {});
+      setLabError(`Could not change ${lab.displayName ?? lab.key}. Try again.`);
+    }
+  }
+
+  useEffect(() => {
+    invoke("meetings_watcher_set_lab_enabled", {
+      enabled: authStatus === "authed" && meetingsLabEnabled,
+    }).catch((error) => {
+      console.warn("[clips-tray] meetings lab sync failed:", error);
+    });
+  }, [authStatus, meetingsLabEnabled]);
+
+  useEffect(() => {
+    if (meetingsLabEnabled) return;
+    setActiveMeetingId(null);
+    setMeetingStartMessage(null);
+  }, [meetingsLabEnabled]);
+
+  const updateAgentHandoff = useCallback(
+    async (
+      requestId: string,
+      status: RewindAgentHandoffRequest["status"],
+      result?: Record<string, unknown>,
+      error?: string,
+    ) => {
+      await invoke("screen_memory_update_agent_handoff", {
+        requestId,
+        status,
+        result: result ?? null,
+        error: error ?? null,
+      });
+    },
+    [],
+  );
+
+  const previewAgentHandoff = useCallback(
+    async (request: RewindAgentHandoffRequest) => {
+      setAgentHandoffPreviewBusy(true);
+      setAgentHandoffPreviewError(null);
+      try {
+        await invoke("rewind_agent_handoff_preview", {
+          requestId: request.requestId,
+          startedAt: request.startAt,
+          endedAt: request.endAt,
+          includeMic: request.includeMicrophone,
+          includeSystemAudio: request.includeSystemAudio,
+        });
+      } catch (error) {
+        setAgentHandoffPreviewError(
+          error instanceof Error ? error.message : String(error),
+        );
+      } finally {
+        setAgentHandoffPreviewBusy(false);
+      }
+    },
+    [],
+  );
+
+  const processAgentHandoff = useCallback(
+    async (request: RewindAgentHandoffRequest) => {
+      if (agentHandoffProcessingRef.current === request.requestId) return;
+      agentHandoffProcessingRef.current = request.requestId;
+      const processing = { ...request, status: "processing" as const };
+      setAgentHandoff(processing);
+      let recordingId: string | null = null;
+      try {
+        await updateAgentHandoff(request.requestId, "processing");
+        const hasAudio =
+          request.includeMicrophone || request.includeSystemAudio;
+        const recording = await createPrivateAgentRewindRecording(
+          serverUrl,
+          hasAudio,
+          request.startAt,
+          loadDesktopAuthToken(serverUrl),
+        );
+        recordingId = recording.id;
+        await invoke("rewind_agent_handoff_upload", {
+          requestId: request.requestId,
+          startedAt: request.startAt,
+          endedAt: request.endAt,
+          serverUrl,
+          recordingId,
+          authToken: loadDesktopAuthToken(serverUrl),
+          cookie: typeof document !== "undefined" ? document.cookie || "" : "",
+          uploadMode: recording.uploadMode,
+          includeMic: request.includeMicrophone,
+          includeSystemAudio: request.includeSystemAudio,
+        });
+
+        const retentionHours = {
+          forever: null,
+          "24-hours": 24,
+          "7-days": 7 * 24,
+          "30-days": 30 * 24,
+        }[request.agentClipRetention];
+        const autoDeleteAt = retentionHours
+          ? new Date(
+              Date.now() + retentionHours * 60 * 60 * 1_000,
+            ).toISOString()
+          : null;
+        await callClipsAction("update-recording", {
+          id: recordingId,
+          ...(autoDeleteAt ? { expiresAt: autoDeleteAt } : {}),
+        });
+        const link = await callClipsAction<{
+          recordingId: string;
+          url: string;
+          contextUrl: string;
+          expiresAt: string;
+        }>("create-recording-agent-link", { recordingId });
+        const ready: RewindAgentHandoffRequest = {
+          ...processing,
+          status: "ready",
+          recordingId,
+          agentUrl: link.url,
+          contextUrl: link.contextUrl,
+          expiresAt: link.expiresAt,
+        };
+        await updateAgentHandoff(request.requestId, "ready", {
+          recordingId,
+          agentUrl: link.url,
+          contextUrl: link.contextUrl,
+          expiresAt: link.expiresAt,
+          ...(autoDeleteAt ? { autoDeleteAt } : {}),
+        });
+        setAgentHandoff(ready);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (recordingId) {
+          await callClipsAction("trash-recording", {
+            id: recordingId,
+            skipIfReady: true,
+          }).catch(() => {});
+        }
+        await updateAgentHandoff(
+          request.requestId,
+          "failed",
+          undefined,
+          message,
+        ).catch(() => {});
+        setAgentHandoff({ ...processing, status: "failed", error: message });
+      } finally {
+        agentHandoffProcessingRef.current = null;
+      }
+    },
+    [callClipsAction, serverUrl, updateAgentHandoff],
+  );
+
+  function chooseLookbackSeconds(seconds: number) {
+    setLookbackSeconds(seconds);
+    saveLookbackSeconds(seconds);
+    const nextRecent = rememberLookbackSeconds(recentLookbackSeconds, seconds);
+    setRecentLookbackSeconds(nextRecent);
+    saveRecentLookbackSeconds(nextRecent);
+  }
+
+  // The consent dialog mounts only on the settings surface, so the Rewind
+  // button here opens that surface on the Rewind tab with the dialog already open.
+  function openRewindConsent() {
+    setInitialSettingsTab("rewind");
+    setRewindConsentPending(true);
+    setPopoverView("settings");
+  }
+
+  function lookbackTarget() {
+    return { serverUrl, authToken: loadDesktopAuthToken(serverUrl) };
+  }
+
+  // Runs beside the recording, never ahead of it: a failed request only raises
+  // the notice, and the recording continues.
+  function requestLookbackForRecording(seconds: number) {
+    lookbackContextRef.current = null;
+    if (seconds <= 0) return;
+    const recordingId = sessionRecordingIdRef.current;
+    const origin = recordingId ? getRewindClipOrigin(recordingId) : null;
+    if (!recordingId || !origin) {
+      setLookbackNotice(t("lookbackContext.localOnlyUnavailable"));
+      return;
+    }
+    const target = lookbackTarget();
+    const item = requestRecordingContext(target, {
+      recordingId,
+      seconds,
+      endedAt: origin.startedAt,
+      deviceId: clipsDeviceId(),
+    }).catch((error: unknown) => {
+      console.error(
+        "[clips-popover] earlier screen time request failed:",
+        error,
+      );
+      setLookbackNotice(t("lookbackContext.requestFailed"));
+      return null;
+    });
+    lookbackContextRef.current = { target, item };
+  }
+
+  // A discarded recording must not keep an item that the worker would export.
+  function removeLookbackContext() {
+    const pending = lookbackContextRef.current;
+    lookbackContextRef.current = null;
+    if (!pending) return;
+    void pending.item
+      .then((item) =>
+        item ? removeRecordingContext(pending.target, item.id) : null,
+      )
+      .catch((error: unknown) => {
+        console.error(
+          "[clips-popover] removing earlier screen time failed:",
+          error,
+        );
+        setLookbackNotice(t("lookbackContext.removeFailed"));
+      });
+  }
+
+  const processLookbackItem = useCallback(
+    (item: RecordingContextItem) => {
+      const target = { serverUrl, authToken: loadDesktopAuthToken(serverUrl) };
+      return processRecordingContextItem(item, {
+        originFor: (recordingId) => {
+          const origin = getRewindClipOrigin(recordingId);
+          return origin
+            ? {
+                includeMicrophone: origin.includeMicrophone,
+                includeSystemAudio: origin.includeSystemAudio,
+              }
+            : null;
+        },
+        update: (input) => updateRecordingContext(target, input),
+        currentItem: (recordingId, itemId) =>
+          getRecordingContextItem(target, recordingId, itemId),
+        createRecording: ({ hasAudio, startedAt }) =>
+          createPrivateAgentRewindRecording(
+            serverUrl,
+            hasAudio,
+            startedAt,
+            target.authToken,
+          ),
+        uploadWindow: (input) =>
+          invoke<NativeRewindUploadResult>("rewind_agent_handoff_upload", {
+            requestId: input.requestId,
+            startedAt: input.startedAt,
+            endedAt: input.endedAt,
+            serverUrl,
+            recordingId: input.recordingId,
+            authToken: target.authToken,
+            cookie:
+              typeof document !== "undefined" ? document.cookie || "" : "",
+            uploadMode: input.uploadMode,
+            includeMic: input.includeMic,
+            includeSystemAudio: input.includeSystemAudio,
+          }),
+        trashRecording: (id) => callClipsAction("trash-recording", { id }),
+      });
+    },
+    [callClipsAction, serverUrl],
+  );
+
+  useEffect(() => {
+    if (authStatus !== "authed" || !lookbackLabEnabled || !rewindOn) return;
+    let cancelled = false;
+    let inFlight = false;
+    const poll = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const items = await listPendingRecordingContext(
+          { serverUrl, authToken: loadDesktopAuthToken(serverUrl) },
+          {
+            deviceId: clipsDeviceId(),
+            // The server accepts at most 100 excludeIds; any beyond that stay
+            // in the oldest-first batch.
+            excludeIds: [...skippedLookbackIdsRef.current].slice(0, 100),
+          },
+        );
+        if (cancelled) return;
+        for (const item of items) {
+          if (processingLookbackIdsRef.current.has(item.id)) continue;
+          if (!getRewindClipOrigin(item.recordingId)) {
+            // Not this device's footage. Excluding it keeps the batch from
+            // refilling with items this device will never export.
+            skippedLookbackIdsRef.current.add(item.id);
+            continue;
+          }
+          processingLookbackIdsRef.current.add(item.id);
+          void processLookbackItem(item)
+            .catch((error: unknown) => {
+              console.error(
+                "[clips-popover] earlier screen time export failed:",
+                error,
+              );
+            })
+            .finally(() => {
+              processingLookbackIdsRef.current.delete(item.id);
+            });
+        }
+      } catch (error) {
+        // Nothing starts on a failed read; the next tick reads again.
+        console.warn(
+          "[clips-popover] pending earlier screen time read failed:",
+          error,
+        );
+      } finally {
+        inFlight = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 3_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    authStatus,
+    lookbackLabEnabled,
+    processLookbackItem,
+    rewindOn,
+    serverUrl,
+  ]);
+
+  useEffect(() => {
+    if (featureConfig?.screenMemory?.enabled !== true || agentHandoff) return;
+    let cancelled = false;
+    const poll = () => {
+      invoke<RewindAgentHandoffRequest | null>(
+        "screen_memory_next_agent_handoff",
+      )
+        .then((request) => {
+          if (cancelled || !request) return;
+          setAgentHandoff(request);
+          getCurrentWindow()
+            .show()
+            .catch(() => {});
+          getCurrentWindow()
+            .setFocus()
+            .catch(() => {});
+          if (!request.reviewRequired) {
+            void processAgentHandoff(request);
+          } else if (
+            featureConfig?.screenMemory?.autoPreviewBeforeSending !== false &&
+            !agentHandoffPreviewedRef.current.has(request.requestId)
+          ) {
+            agentHandoffPreviewedRef.current.add(request.requestId);
+            void previewAgentHandoff(request);
+          }
+        })
+        .catch(() => {});
+    };
+    poll();
+    const timer = window.setInterval(poll, 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    agentHandoff,
+    featureConfig?.screenMemory?.autoPreviewBeforeSending,
+    featureConfig?.screenMemory?.enabled,
+    previewAgentHandoff,
+    processAgentHandoff,
+  ]);
+
+  useEffect(() => {
+    if (featureConfig?.screenMemory?.enabled !== true) return;
+    let cancelled = false;
+    let inFlight = false;
+    const sweep = async () => {
+      if (document.hidden || inFlight) return;
+      inFlight = true;
+      try {
+        const due = await invoke<DueRewindAgentHandoff[]>(
+          "screen_memory_due_agent_handoffs",
+        )
+          // coercion-ok: handoffs stay due in the local store, so an empty
+          // sweep and a failed one both retry on the next tick.
+          .catch(() => []);
+        if (cancelled) return;
+        for (const item of due) {
+          try {
+            const controller = new AbortController();
+            const abortTimer = setTimeout(
+              () => controller.abort(),
+              Math.max(10_000, 60_000 * 4),
+            );
+            const cleanup = await callClipsAction<{
+              deleted: boolean;
+              reason: string;
+            }>(
+              "delete-agent-recording-if-unpromoted",
+              { id: item.recordingId },
+              { signal: controller.signal },
+            ).finally(() => clearTimeout(abortTimer));
+            if (cleanup.deleted) {
+              await invoke("screen_memory_mark_agent_handoff_deleted", {
+                requestId: item.requestId,
+              });
+            } else if (cleanup.reason === "promoted") {
+              await invoke("screen_memory_cancel_agent_handoff_cleanup", {
+                requestId: item.requestId,
+              });
+            }
+          } catch (error) {
+            console.warn(
+              "[clips-tray] agent-created Clip cleanup failed:",
+              error,
+            );
+          }
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+    void sweep();
+    const timer = window.setInterval(() => void sweep(), 60_000);
+    const onVisibilityChange = () => {
+      if (!document.hidden) void sweep();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [callClipsAction, featureConfig?.screenMemory?.enabled]);
+
+  const fetchUpcomingMeetings = useCallback(async () => {
+    if (authStatus !== "authed" || !meetingsLabEnabled) {
+      setMeetings([]);
+      setMeetingsError(null);
+      setMeetingsCalendarNeedsReauth(false);
+      return;
+    }
+
+    setMeetingsLoading(true);
+    setMeetingsError(null);
+    try {
+      const result = await callClipsAction<{
+        meetings?: unknown[];
+        calendarErrors?: Array<{ needsReauth?: boolean }>;
+      }>(
+        "list-meetings",
+        {
+          view: "upcoming",
+          limit: 3,
+          upcomingWithinMin: 24 * 60,
+        },
+        { method: "GET" },
+      );
+      setMeetingsCalendarNeedsReauth(
+        result.calendarErrors?.some((error) => error.needsReauth === true) ===
+          true,
+      );
+      const list = Array.isArray(result.meetings) ? result.meetings : [];
+      setMeetings(
+        list.slice(0, 3).map((raw) => {
+          const meeting = raw as Partial<PopoverMeeting>;
+          return {
+            id: String(meeting.id ?? ""),
+            title: meeting.title || "Untitled meeting",
+            scheduledStart: meeting.scheduledStart ?? null,
+            scheduledEnd: meeting.scheduledEnd ?? null,
+            joinUrl: meeting.joinUrl ?? null,
+            platform: meeting.platform ?? null,
+            transcriptStatus: meeting.transcriptStatus ?? null,
+          };
+        }),
+      );
+    } catch (err) {
+      setMeetings([]);
+      setMeetingsCalendarNeedsReauth(false);
+      setMeetingsError(
+        err instanceof Error ? err.message : "Could not load meetings.",
+      );
+    } finally {
+      setMeetingsLoading(false);
+    }
+  }, [authStatus, callClipsAction, meetingsLabEnabled]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (
+      !meetingsLabEnabled ||
+      popoverView !== "meetings" ||
+      meetings.length === 0
+    ) {
+      setRewindMeetingHistoryAvailability({});
+      return () => {
+        cancelled = true;
+      };
+    }
+    void Promise.all(
+      meetings.map(async (meeting) => {
+        if (!meeting.scheduledStart)
+          return [meeting.id, { available: false }] as const;
+        try {
+          const availability = await invoke<RewindMeetingHistoryAvailability>(
+            "rewind_meeting_history_status",
+            { scheduledStart: meeting.scheduledStart },
+          );
+          return [meeting.id, availability] as const;
+        } catch (error) {
+          return [
+            meeting.id,
+            {
+              available: false,
+              reason:
+                error instanceof Error
+                  ? error.message
+                  : "Earlier local meeting audio is unavailable.",
+            },
+          ] as const;
+        }
+      }),
+    ).then((entries) => {
+      if (!cancelled)
+        setRewindMeetingHistoryAvailability(Object.fromEntries(entries));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [meetings, meetingsLabEnabled, popoverView]);
+
+  const startMeetingNotes = useCallback(
+    (meeting: PopoverMeeting, includeFromMeetingStart = false) => {
+      if (!meetingsLabEnabled) return;
+      setActiveMeetingId(meeting.id);
+      setMeetingStartMessage(
+        includeFromMeetingStart
+          ? `Including earlier local audio for ${meeting.title}…`
+          : `Starting notes for ${meeting.title}…`,
+      );
+      emit("meetings:start-transcription", {
+        meetingId: meeting.id,
+        joinUrl: meeting.joinUrl,
+        reason: "user",
+        scheduledStart: meeting.scheduledStart,
+        includeFromMeetingStart,
+      }).catch((err) => {
+        console.error("[clips-popover] start meeting notes failed:", err);
+        setActiveMeetingId(null);
+        setMeetingStartMessage(
+          "Could not start notes. Try again from Meetings.",
+        );
+      });
+    },
+    [meetingsLabEnabled],
+  );
+
+  const startMeetingNotesAndJoin = useCallback(
+    (meeting: PopoverMeeting, includeFromMeetingStart = false) => {
+      if (!meetingsLabEnabled) return;
+      if (meeting.joinUrl) {
+        openMeetingJoinUrl(meeting.joinUrl).catch((err) => {
+          console.error("[clips-popover] open meeting join url failed:", err);
+        });
+      }
+      startMeetingNotes(meeting, includeFromMeetingStart);
+      hidePopover();
+    },
+    [startMeetingNotes],
+  );
+
+  const showActiveMeetingPill = useCallback((meetingId: string) => {
+    invoke("recording_pill_show", { meetingId, mode: "meeting" }).catch(
+      (err) => {
+        console.error("[clips-popover] show meeting pill failed:", err);
+      },
+    );
+    emit("clips:pill-context", { meetingId, mode: "meeting" }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!meetingsLabEnabled) return;
+    invoke<string | null>("get_active_meeting_id")
+      .then((meetingId) => {
+        if (meetingId) setActiveMeetingId((current) => current ?? meetingId);
+      })
+      .catch(() => {});
+
+    let stopped = false;
+    const unlistens: Array<() => void> = [];
+    const track = (promise: Promise<() => void>) => {
+      promise
+        .then((unlisten) => {
+          if (stopped) {
+            unlisten();
+            return;
+          }
+          unlistens.push(unlisten);
+        })
+        .catch(() => {});
+    };
+    track(
+      listen<{ meetingId?: string | null }>(
+        "meetings:transcription-started",
+        (event) => {
+          if (event.payload?.meetingId) {
+            setActiveMeetingId(event.payload.meetingId);
+            setMeetingStartMessage("Meeting notes are live and staying local.");
+          }
+        },
+      ),
+    );
+    track(
+      listen<{ meetingId?: string | null }>(
+        "meetings:transcription-stopped",
+        (event) => {
+          setActiveMeetingId((current) =>
+            !event.payload?.meetingId || event.payload.meetingId === current
+              ? null
+              : current,
+          );
+          setMeetingStartMessage(null);
+        },
+      ),
+    );
+    track(
+      listen<{ meetingId?: string | null; error?: string }>(
+        "meetings:transcription-error",
+        (event) => {
+          setActiveMeetingId((current) =>
+            !event.payload?.meetingId || event.payload.meetingId === current
+              ? null
+              : current,
+          );
+          setMeetingStartMessage(
+            event.payload?.error || "Could not start meeting notes.",
+          );
+        },
+      ),
+    );
+    track(
+      listen<{ meetingId?: string | null; error?: string }>(
+        "meetings:history-error",
+        (event) => {
+          setMeetingStartMessage(
+            event.payload?.error ||
+              "Meeting notes are live, but the earlier local audio could not be included.",
+          );
+        },
+      ),
+    );
+    return () => {
+      stopped = true;
+      unlistens.forEach((unlisten) => unlisten());
+      unlistens.length = 0;
+    };
+  }, [meetingsLabEnabled]);
+
+  useEffect(() => {
+    if (!meetingsLabEnabled || !popoverVisible || !activeMeetingId) {
+      return;
+    }
+    showActiveMeetingPill(activeMeetingId);
+  }, [
+    activeMeetingId,
+    meetingsLabEnabled,
+    popoverVisible,
+    showActiveMeetingPill,
+  ]);
 
   useMeetingTranscription({
     callClipsAction,
     serverUrl,
     selectedMicId,
     selectedMicLabel,
+    enabled: meetingsLabEnabled,
   });
 
-  // OAuth (Google) opens in the system browser — the popover WebView can't
-  // share a cookie jar with a separate Tauri WebviewWindow, and the old
-  // approach of opening a WebView at the server root produced a blank window.
-  // Instead: fetch the Google auth URL, open it externally, then poll a
-  // server-side exchange endpoint for the session token.
+  type DesktopAuthKind = "google" | "magic-link";
+
+  function stopDesktopAuthPolling() {
+    if (pollIntervalRef.current !== null) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    if (signInVisibilityRef.current) {
+      document.removeEventListener(
+        "visibilitychange",
+        signInVisibilityRef.current,
+      );
+      signInVisibilityRef.current = null;
+    }
+  }
+
+  function finishDesktopAuthWithError(kind: DesktopAuthKind, message: string) {
+    stopDesktopAuthPolling();
+    signInInflightRef.current = false;
+    setSignInPending(null);
+    if (kind === "magic-link") setMagicLinkEmail(null);
+    setSignInError(message);
+  }
+
+  function startDesktopAuthExchange(
+    flowId: string,
+    kind: DesktopAuthKind,
+    verifier?: string,
+  ) {
+    let tickInFlight = false;
+    const base = serverUrl.replace(/\/+$/, "");
+    const start = Date.now();
+    const TIMEOUT_MS = 5 * 60 * 1000;
+    const POLL_ABORT_MS = Math.max(10_000, 1500 * 4);
+    const timeoutMessage =
+      kind === "magic-link"
+        ? "That sign-in link expired. Request a new one."
+        : "Google sign-in timed out. Try again.";
+    const exchangeErrorMessage =
+      kind === "magic-link"
+        ? "That link didn't sign you in. Request a new one."
+        : "Google sign-in didn't go through. Try again.";
+
+    const tick = async () => {
+      if (document.hidden || tickInFlight) return;
+      tickInFlight = true;
+      const controller = new AbortController();
+      const abortTimer = setTimeout(() => controller.abort(), POLL_ABORT_MS);
+      try {
+        const xr = await fetch(
+          `${base}/_agent-native/auth/desktop-exchange?flow_id=${encodeURIComponent(flowId)}`,
+          {
+            credentials: "include",
+            ...(verifier
+              ? {
+                  headers: {
+                    "X-Agent-Native-Desktop-Verifier": verifier,
+                  },
+                }
+              : {}),
+            signal: controller.signal,
+          },
+        );
+        if (!xr.ok) {
+          if (Date.now() - start > TIMEOUT_MS) {
+            finishDesktopAuthWithError(kind, timeoutMessage);
+          }
+          return;
+        }
+        const xd = (await xr.json()) as {
+          error?: string;
+          message?: string;
+          token?: string;
+        } | null;
+        if (xd?.error) {
+          finishDesktopAuthWithError(
+            kind,
+            typeof xd.message === "string"
+              ? xd.message
+              : typeof xd.error === "string"
+                ? xd.error
+                : exchangeErrorMessage,
+          );
+          return;
+        }
+        if (xd?.token) {
+          stopDesktopAuthPolling();
+          saveDesktopAuthToken(base, String(xd.token));
+          signInInflightRef.current = false;
+          setSignInPending(null);
+          setMagicLinkEmail(null);
+          const authResult = await checkAuth();
+          if (authResult.state === "anonymous") {
+            setSignInError(
+              kind === "magic-link"
+                ? "Signed in, but Clips couldn't keep the session. Try again."
+                : "Signed in with Google, but Clips couldn't keep the session. Try again.",
+            );
+          } else if (authResult.state === "unavailable") {
+            setSignInError(
+              "Signed in, but Clips couldn't reach the server to verify it. Try again.",
+            );
+          }
+        } else if (Date.now() - start > TIMEOUT_MS) {
+          finishDesktopAuthWithError(kind, timeoutMessage);
+        }
+      } catch {
+        if (Date.now() - start > TIMEOUT_MS) {
+          finishDesktopAuthWithError(kind, timeoutMessage);
+        }
+      } finally {
+        clearTimeout(abortTimer);
+        tickInFlight = false;
+      }
+    };
+
+    stopDesktopAuthPolling();
+    pollIntervalRef.current = setInterval(() => void tick(), 1500);
+    const onVisibilityChange = () => {
+      if (!document.hidden) void tick();
+    };
+    signInVisibilityRef.current = onVisibilityChange;
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    void tick();
+  }
+
   async function signInExternal() {
-    // Synchronous ref guard — prevents a double-click from opening two OAuth
-    // tabs. State updates are async so `signInPending` alone isn't sufficient.
     if (signInInflightRef.current) return;
     signInInflightRef.current = true;
 
-    function stopPolling() {
-      if (pollIntervalRef.current !== null) {
-        clearInterval(pollIntervalRef.current);
-        pollIntervalRef.current = null;
-      }
-    }
-
-    function finishWithError(message: string) {
-      stopPolling();
-      signInInflightRef.current = false;
-      setSignInPending(false);
-      setSignInError(message);
-    }
-
     try {
       setSignInError(null);
-      const flowId =
-        crypto.randomUUID?.() ||
-        Math.random().toString(36).slice(2) + Date.now().toString(36);
+      const flowId = crypto.randomUUID?.call(crypto) ?? null;
+      const verifier = (() => {
+        const randomUuid = crypto.randomUUID?.bind(crypto);
+        if (randomUuid) {
+          return `${randomUuid()}${randomUuid()}`;
+        }
+        if (typeof crypto.getRandomValues === "function") {
+          const bytes = new Uint8Array(32);
+          crypto.getRandomValues(bytes);
+          let binary = "";
+          for (const byte of bytes) binary += String.fromCharCode(byte);
+          return btoa(binary)
+            .replace(/\+/g, "-")
+            .replace(/\//g, "_")
+            .replace(/=+$/, "");
+        }
+        return null;
+      })();
+      if (!flowId || !verifier) {
+        throw new Error("Secure OAuth flow generation is unavailable.");
+      }
       const base = serverUrl.replace(/\/+$/, "");
 
-      // Open directly in the system browser — the server redirects (302)
-      // to Google's OAuth page, avoiding any cross-origin fetch from
-      // the Tauri WebView.
-      await openExternal(
-        `${base}/_agent-native/google/auth-url?desktop=1&flow_id=${flowId}&redirect=1`,
+      const authParams = new URLSearchParams({
+        desktop: "1",
+        flow_id: flowId,
+      });
+      const authResponse = await fetch(
+        `${base}/_agent-native/google/auth-url?${authParams.toString()}`,
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json",
+            "X-Agent-Native-Desktop-Verifier": verifier,
+          },
+        },
       );
-
-      setSignInPending(true);
-
-      // Poll the exchange endpoint for the session token.
-      const start = Date.now();
-      const TIMEOUT_MS = 180_000; // 3 minutes
-      pollIntervalRef.current = setInterval(async () => {
-        try {
-          const xr = await fetch(
-            `${base}/_agent-native/auth/desktop-exchange?flow_id=${flowId}`,
-            { credentials: "include" },
-          );
-          if (!xr.ok) {
-            if (Date.now() - start > TIMEOUT_MS) {
-              stopPolling();
-              signInInflightRef.current = false;
-              setSignInPending(false);
-            }
-            return;
-          }
-          const xd = await xr.json();
-          if (xd?.error) {
-            finishWithError(
-              typeof xd.error === "string"
-                ? xd.error
-                : "Google sign-in failed. Please try again.",
-            );
-            return;
-          }
-          if (xd?.token) {
-            stopPolling();
-            saveDesktopAuthToken(base, String(xd.token));
-            // Establish the session cookie when the WebView accepts it; the
-            // bearer token above is the reliable desktop auth path.
-            await fetch(
-              `${base}/_agent-native/auth/session?_session=${xd.token}`,
-              { credentials: "include" },
-            );
-            signInInflightRef.current = false;
-            setSignInPending(false);
-            const ok = await checkAuth();
-            if (!ok) {
-              setSignInError(
-                "Google sign-in completed, but Clips could not save the session. Please try again.",
-              );
-            }
-          } else if (Date.now() - start > TIMEOUT_MS) {
-            finishWithError("Google sign-in timed out. Please try again.");
-          }
-        } catch {
-          if (Date.now() - start > TIMEOUT_MS) {
-            finishWithError("Google sign-in timed out. Please try again.");
-          }
-        }
-      }, 1500);
+      let authPayload: {
+        url?: unknown;
+        error?: unknown;
+        message?: unknown;
+      };
+      try {
+        authPayload = (await authResponse.json()) as typeof authPayload;
+      } catch {
+        throw new Error("Could not start Google sign-in.");
+      }
+      if (!authResponse.ok || typeof authPayload?.url !== "string") {
+        const message =
+          typeof authPayload.message === "string"
+            ? authPayload.message
+            : typeof authPayload.error === "string"
+              ? authPayload.error
+              : "Could not start Google sign-in.";
+        throw new Error(message);
+      }
+      await openExternal(authPayload.url);
+      setSignInPending("google");
+      startDesktopAuthExchange(flowId, "google", verifier);
     } catch (err) {
       console.error("[clips-tray] signInExternal failed:", err);
       signInInflightRef.current = false;
-      setSignInPending(false);
+      setSignInPending(null);
       setSignInError(
         err instanceof Error
           ? err.message
-          : "Could not open Google sign-in. Please try again.",
+          : "Couldn't open Google sign-in. Try again.",
       );
     }
   }
 
-  // Sign out via the framework's logout endpoint. The cookie clears in the
-  // same webview that will re-check `/auth/session`, so the popover flips
-  // back to the inline sign-in form without a reload.
+  async function requestMagicLink(email: string) {
+    if (signInInflightRef.current) return;
+    signInInflightRef.current = true;
+    const base = serverUrl.replace(/\/+$/, "");
+    try {
+      setSignInError(null);
+      const res = await fetch(`${base}/_agent-native/auth/magic-link`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: email.trim(),
+          callbackURL: "/_agent-native/auth/magic-link/desktop-callback",
+        }),
+        credentials: "include",
+      });
+      const json = (await res.json()) as {
+        error?: string;
+        flowId?: string;
+        verifier?: string;
+      } | null;
+      if (!res.ok) {
+        throw new Error(
+          json?.error ||
+            "Couldn't send the link. Check the email address and try again.",
+        );
+      }
+      if (!json?.flowId || !json.verifier) {
+        throw new Error("That link is no longer active. Request a new one.");
+      }
+      setMagicLinkEmail(email.trim());
+      setSignInPending("magic-link");
+      startDesktopAuthExchange(json.flowId, "magic-link", json.verifier);
+    } catch (err) {
+      signInInflightRef.current = false;
+      setSignInPending(null);
+      setMagicLinkEmail(null);
+      throw err;
+    }
+  }
+
+  function cancelSignIn() {
+    stopDesktopAuthPolling();
+    signInInflightRef.current = false;
+    setSignInPending(null);
+    setMagicLinkEmail(null);
+    setSignInError(null);
+  }
+
   async function signOut() {
     try {
       await fetch(
@@ -1078,134 +2615,15 @@ export function App() {
     }
     clearDesktopAuthToken(serverUrl);
     await checkAuth();
-    setShowSettings(false);
+    setPopoverView("recorder");
   }
 
-  // ---- device enumeration -------------------------------------------------
-  // WebKit only returns full device labels after getUserMedia() has granted
-  // access once. Enumerating itself is safe; the unlock helper below is careful
-  // to never touch the OS default input just to populate labels.
-  const loadDevices = useCallback(async () => {
-    try {
-      if (!navigator.mediaDevices?.enumerateDevices) return;
-      const list = await navigator.mediaDevices.enumerateDevices();
-      setCameras(
-        list.filter(
-          (d) => d.kind === "videoinput" && isSelectableMediaDevice(d),
-        ),
-      );
-      setMics(
-        list.filter(
-          (d) => d.kind === "audioinput" && isSelectableMediaDevice(d),
-        ),
-      );
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!navigator.mediaDevices?.addEventListener) return;
-    navigator.mediaDevices.addEventListener("devicechange", loadDevices);
-    return () => {
-      navigator.mediaDevices.removeEventListener("devicechange", loadDevices);
-    };
-  }, [loadDevices]);
-
-  const unlockDeviceLabels = useCallback(async () => {
-    // Audio-only probe to unlock mic labels. We INTENTIONALLY skip video —
-    // the on-screen camera bubble window owns the camera, and probing
-    // video here would race for the hardware and knock the bubble's
-    // stream offline (macOS can't reliably share a camera across two
-    // WebViews in the same process). Camera-label text is low-value
-    // anyway; most machines have one.
-    //
-    // Do not probe `audio: true` or WebKit's pseudo `default` device here.
-    // On macOS that opens the system default input, which can shove
-    // Bluetooth headphones into hands-free mode just from opening the Clips
-    // popover. If the user has picked a concrete mic, use that exact device;
-    // otherwise leave labels locked until a real user action needs access.
-    try {
-      // While the bubble owns the camera, even this audio-only probe trips
-      // WebKit's single-page capture-exclusion and blacks the bubble. Don't
-      // probe — leave mic labels locked until the bubble is gone.
-      if (bubbleActiveRef.current || !selectedMicId) {
-        await loadDevices();
-        return;
-      }
-      const s = await navigator.mediaDevices.getUserMedia({
-        audio: { deviceId: { exact: selectedMicId } },
-        video: false,
-      });
-      s.getTracks().forEach((t) => t.stop());
-    } catch {
-      // permission denied — labels stay empty until the user grants
-    }
-    await loadDevices();
-  }, [loadDevices, selectedMicId]);
-
-  const requestDeviceAccess = useCallback(
-    async (kind: "camera" | "mic") => {
-      try {
-        if (!navigator.mediaDevices?.getUserMedia) {
-          throw new Error("Device selection is not available in this WebView.");
-        }
-        // When the camera bubble is live, ANY getUserMedia in this page —
-        // camera OR mic — hits WebKit's single-page capture-exclusion (one
-        // process, one webview): the bubble page's camera stream gets muted
-        // and goes black with no reliable unmute. The exclusion is not
-        // per-kind, so an audio-only probe blacks the bubble just the same.
-        // So we never probe here while the bubble owns the camera. Instead the
-        // bubble page — the only page that can capture without muting its own
-        // camera — does the probe and relays the device list back to us.
-        if (bubbleActiveRef.current) {
-          if (kind === "mic") {
-            // Ask the bubble to probe + relay the mic list (it has no mic
-            // grant of its own, so it must open a transient mic stream).
-            emit("clips:refresh-mics", {
-              micId: selectedMicId || null,
-            }).catch(() => {});
-          }
-          // Cameras are already relayed when the bubble's local camera starts.
-          await loadDevices();
-          return;
-        }
-        const stream = await navigator.mediaDevices.getUserMedia(
-          kind === "camera"
-            ? { video: true, audio: false }
-            : { audio: true, video: false },
-        );
-        stream.getTracks().forEach((track) => track.stop());
-        await loadDevices();
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (kind === "camera") {
-          setCameraError(
-            isHardCapturePermissionError(message) ||
-              /notallowed|permission|denied/i.test(message)
-              ? MACOS_CAPTURE_PERMISSION_MESSAGE
-              : `Camera unavailable: ${message}`,
-          );
-        } else {
-          setRecError(
-            isHardCapturePermissionError(message) ||
-              /notallowed|permission|denied/i.test(message)
-              ? "Microphone access is blocked. Open System Settings → Privacy & Security → Microphone, allow Clips, then try again."
-              : `Microphone unavailable: ${message}`,
-          );
-        }
-        await loadDevices();
-      }
-    },
-    [loadDevices, selectedMicId],
-  );
-
-  // ---- Esc closes the popover --------------------------------------------
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape") {
-        // Don't close mid-recording — user would lose the recorder handle.
         if (isRecording) return;
+        if (!shouldDismissDesktopPopover(e)) return;
+        setPopoverView("recorder");
         hidePopover();
       }
     }
@@ -1213,13 +2631,6 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [isRecording]);
 
-  // ---- popover visibility tracking ----------------------------------------
-  // ONLY source of truth: explicit `clips:popover-visible` events from Rust,
-  // which fire on every show/hide (including the blur-auto-hide path).
-  // Focus events are NOT reliable here — opening devtools steals focus,
-  // clicking inside the popover re-gains it, etc., which caused an
-  // infinite show_bubble/hide flap when we listened to onFocusChanged.
-  const [popoverVisible, setPopoverVisible] = useState(false);
   useEffect(() => {
     // Race-safe listen tracking. `listen()` is async — the unlisten fn
     // only exists AFTER the IPC round-trip resolves. If React cleanup
@@ -1249,42 +2660,30 @@ export function App() {
     track(
       listen<boolean>("clips:popover-visible", (ev) => {
         console.log("[clips-popover] popover-visible =", ev.payload);
-        setPopoverVisible(!!ev.payload);
+        const visible = !!ev.payload;
+        setPopoverVisible(visible);
+        recordingErrorVisibleRef.current.visible = visible;
+        if (!visible) setPopoverView("recorder");
       }),
     );
-    // The bubble window emits `clips:bubble-closed` when the user clicks
-    // the X on the hover controls. Treat that as "camera off" — the
-    // bubble-session effect then tears down the stream + pump.
     track(
       listen("clips:bubble-closed", () => {
         console.log(
-          "[clips-popover] bubble-closed received — clearing cameraOn",
+          "[clips-popover] bubble-closed received — stopping camera + clearing cameraOn",
         );
-        setCameraOn(false);
+        bubbleStreamRef.current?.getTracks().forEach((t) => t.stop());
+        const nextSetup = captureSetupForMode("screen");
+        setMode(nextSetup.mode);
+        setCameraOn(nextSetup.cameraOn);
       }),
     );
-    // The bubble relays its device lists (it holds the grant in the
-    // local-camera path). Used by the picker when our own enumeration is empty.
-    const trackRelay = (
-      event: string,
-      set: (devices: MediaDeviceInfo[]) => void,
-    ) =>
-      track(
-        listen<{ devices?: Array<{ deviceId: string; label: string }> }>(
-          event,
-          (ev) => set((ev.payload?.devices ?? []) as MediaDeviceInfo[]),
-        ),
-      );
-    trackRelay("clips:camera-devices", setBubbleCameras);
-    trackRelay("clips:mic-devices", setBubbleMics);
-    // Query the CURRENT visibility on mount in case the event already
-    // fired before React subscribed.
     getCurrentWindow()
       .isVisible()
       .then((v) => {
         if (cancelled) return;
         console.log("[clips-popover] initial isVisible =", v);
         setPopoverVisible(!!v);
+        recordingErrorVisibleRef.current.visible = !!v;
       })
       .catch(() => {});
     return () => {
@@ -1300,140 +2699,77 @@ export function App() {
     };
   }, []);
 
-  // Defer device-label unlocking until the popover is first shown. Even the
-  // selected-device probe can trigger a macOS permission dialog, so keep it
-  // attached to visible UI instead of firing on hidden webview mount.
-  const deviceLabelsUnlocked = useRef(false);
-  const speechPermissionChecked = useRef(false);
-  useEffect(() => {
-    loadDevices();
-    if (popoverVisible && !deviceLabelsUnlocked.current) {
-      deviceLabelsUnlocked.current = true;
-      unlockDeviceLabels();
-    }
-  }, [loadDevices, unlockDeviceLabels, popoverVisible]);
-
-  useEffect(() => {
-    if (!isPseudoMediaDeviceId(micId) || mics.length === 0) return;
-    const builtIn = mics.find(isBuiltInMicDevice);
-    setMicId(builtIn?.deviceId ?? "");
-  }, [micId, mics]);
-
-  useEffect(() => {
-    if (!popoverVisible || !micOn || speechPermissionChecked.current) return;
-    speechPermissionChecked.current = true;
-    invoke<boolean>("native_speech_request_permission").catch((err) => {
-      const message = err instanceof Error ? err.message : String(err);
-      console.warn("[clips-popover] speech permission preflight failed:", err);
-      setRecError(
-        /speech recognition|speech/i.test(message)
-          ? MACOS_SPEECH_PERMISSION_MESSAGE
-          : `Speech recognition unavailable: ${message}`,
-      );
-    });
-  }, [micOn, popoverVisible]);
-
-  // ---- camera bubble session ---------------------------------------------
-  // The bubble overlay (small circular PiP in the bottom-left of the screen
-  // showing the user's face) uses two paths. Browser capture keeps the camera
-  // in this popover for the entire session because WebKit can mute capture
-  // tracks across same-process webviews. Native full-screen capture uses a
-  // local bubble camera because the native screen recorder captures that
-  // overlay directly.
-  //
-  // Lifecycle:
-  //   - Popover visible + camera mode + cameraOn → acquire camera, call
-  //     show_bubble, then either start the WebRTC/canvas relay (browser
-  //     capture) or tell the bubble to start its local camera (native
-  //     full-screen capture). User sees their face in the bottom-left corner.
-  //   - User clicks Start Recording → popover hides, recording begins.
-  //     `isRecording` becomes true, so this effect's deps still say
-  //     "active" — the stream + bubble + pump keep running. The recorder
-  //     reuses the camera stream for the saved video composite (see
-  //     `preAcquiredCameraStream` in recorder.ts). Explicit native full-screen
-  //     mode leaves the bubble's local camera stream alone.
-  //   - Recording stops → `isRecording` flips back to false, popover
-  //     usually hides too, so the effect cleans up: stop tracks, hide
-  //     overlays (which closes the bubble window).
-  //   - User switches camera / turns camera off / closes popover (not
-  //     recording) → cleanup fires, bubble disappears.
   const bubbleStreamRef = useRef<MediaStream | null>(null);
-  // Set to true the instant handleStartRecording hands `bubbleStreamRef.current`
-  // to `startRecording` as `preAcquiredCameraStream`. The recorder
-  // then owns the track lifecycle — this effect's cleanup MUST NOT stop
-  // the tracks or the MediaRecorder ends up with `readyState: "ended"`
-  // tracks (which causes the laggy / black / silently-failing recording
-  // symptoms). Reset to false once the recording is fully torn down.
   const bubbleStreamTransferredToRecorder = useRef(false);
+  const [bubbleSessionEpoch, setBubbleSessionEpoch] = useState(0);
+  const [recordingChromeEpoch, setRecordingChromeEpoch] = useState(0);
   const wantsCamera = mode !== "screen" && cameraOn;
   const nativeFullscreenRecordingActive =
     mode !== "camera" && shouldUseNativeFullscreenRecording(source);
-  const bubbleUsesLocalCamera =
-    nativeFullscreenRecordingActive && localRecordingMode !== "separate";
-  // Ref mirror of `isRecording || recordingFlowActive` so cleanup (which
-  // captures the dep-snapshot value) can still see the CURRENT flow state
-  // at the moment it actually runs. Without this, if `recordingFlowActive`
-  // briefly flips false on a re-render mid-flow (e.g. finally-block
-  // recovery path), the cleanup function snapshots `bubbleActive=false`
-  // from THAT render and stops the camera stream even though recording is
-  // still in flight.
+  const nativeWindowRecordingActive =
+    mode !== "camera" && shouldUseNativeWindowRecording(source);
+  const nativeCaptureRecordingActive =
+    nativeFullscreenRecordingActive || nativeWindowRecordingActive;
   const recordingFlowGateRef = useRef(false);
-  useEffect(() => {
-    recordingFlowGateRef.current = isRecording || recordingFlowActive;
-  }, [isRecording, recordingFlowActive]);
-  const bubbleActive =
-    wantsCamera &&
-    (popoverVisible ||
-      isRecording ||
-      recordingFlowActive ||
-      recordingFlowGateRef.current);
+  const recordingStopFinalizingRef = useRef(false);
+  const restartInFlightRef = useRef(false);
+  const restartCancelledRef = useRef(false);
+  const recordingCancelInFlightRef = useRef(false);
+  const sessionRecordingIdRef = useRef<string | null>(null);
+  const recordedWithoutStorageRef = useRef(false);
+  // The record-first list a capture belongs to, fixed when capture starts.
+  const recordFirstKeyAtStartRef = useRef<string | null>(null);
+  const finishRecordingStopRef = useRef<
+    (handle: RecorderHandle, recordingId?: string | null) => Promise<void>
+  >(async () => {});
+  const recordingInFlight =
+    isRecording || recordingFlowActive || recordingStartPending;
+  useLayoutEffect(() => {
+    recordingFlowGateRef.current =
+      recordingInFlight || recordingStartAttemptRef.current !== null;
+  }, [recordingInFlight]);
+  const bubbleActive = shouldKeepBubbleSession({
+    wantsCamera,
+    popoverVisible,
+    recordingInFlight,
+  });
 
-  const bubbleActiveRef = useRef(false);
   bubbleActiveRef.current = bubbleActive;
-  // The toolbar is recording chrome, not pre-record chrome. Showing it while
-  // the popover is merely open leaves a disabled 0:00 Stop/Pause pill on the
-  // desktop, which reads as a stuck recorder and can trap accessibility clicks.
   const toolbarActive = isRecording || recordingFlowActive;
 
   useEffect(() => {
     if (!toolbarActive) return;
     let cancelled = false;
-    (async () => {
+    void (async () => {
       try {
         await invoke("show_toolbar");
         if (cancelled) return;
-        // Seed disabled — previous recordings may have latched it on in
-        // the toolbar's React state (the window is destroyed on
-        // `hide_overlays`, so this is mostly defensive, but free).
-        emit("clips:toolbar-enabled", false).catch(() => {});
       } catch (err) {
         console.error("[clips-popover] show_toolbar failed:", err);
       }
     })();
+    emit("clips:toolbar-enabled", false).catch(() => {});
+    emit("clips:toolbar-preparing").catch(() => {});
     return () => {
       cancelled = true;
-      // In screen-only mode the bubble effect never runs, so its
-      // cleanup (which normally hides overlays) never fires either.
-      // Hide them from here instead. Guard on !recordingInFlight so
-      // we don't rip the toolbar out from under an active recording.
       if (!recordingFlowGateRef.current) {
-        invoke("hide_overlays").catch(() => {});
+        invoke("hide_overlays", {
+          preserveFinalizing: recordingStopFinalizingRef.current,
+        }).catch(() => {});
       }
     };
-  }, [toolbarActive]);
+  }, [toolbarActive, recordingChromeEpoch]);
 
   useEffect(() => {
     if (!bubbleActive) return;
     setCameraError(null);
 
     let cancelled = false;
-    // Dual-transport bookkeeping. We try WebRTC first; if it fails or
-    // times out, we fall back to the canvas pump. Only one should be
-    // active at a time — the ref below guarantees we never double-start.
     let webrtcHandle: BubbleWebrtcHandle | null = null;
     let stopPump: (() => void) | null = null;
     let fellBackToPump = false;
     let stream: MediaStream | null = null;
+    let unlistenUnrendered: (() => void) | null = null;
 
     const startPump = (reason: string) => {
       if (cancelled || stopPump || !stream) return;
@@ -1446,122 +2782,36 @@ export function App() {
       "[clips-popover] bubble session start — acquiring camera + showing bubble",
     );
 
-    if (bubbleUsesLocalCamera) {
-      const localStartTimers: Array<ReturnType<typeof setTimeout>> = [];
-      let localReadyUnlisten: (() => void) | null = null;
-      const emitLocalCameraStart = (reason: string) => {
-        if (cancelled) return;
-        console.log(
-          "[clips-popover] starting local bubble camera — %s",
-          reason,
-        );
-        emit("clips:bubble-start-local-camera", {
-          cameraId: cameraId || null,
-        }).catch((err) => {
-          if (!cancelled) {
-            console.warn(
-              "[clips-popover] emit local bubble camera start failed:",
-              err,
-            );
-          }
-        });
-      };
-
-      listen("clips:bubble-ready", () => emitLocalCameraStart("ready"))
-        .then((u) => {
-          if (cancelled) {
-            try {
-              u();
-            } catch {
-              // ignore
-            }
-          } else {
-            localReadyUnlisten = u;
-          }
-        })
-        .catch(() => {});
-
-      invoke("show_bubble")
-        .then(() => {
-          // The bubble's React listener may mount just after the Rust window
-          // reports as shown. Send a few idempotent starts; the bubble ignores
-          // repeats for the same camera but this avoids a first-show race.
-          for (const delay of [100, 500, 1000]) {
-            localStartTimers.push(
-              setTimeout(
-                () => emitLocalCameraStart(`show-bubble+${delay}ms`),
-                delay,
-              ),
-            );
-          }
-        })
-        .catch((err) => {
-          if (!cancelled) {
-            console.error("[clips-popover] local bubble start failed:", err);
-            setCameraError(`Camera unavailable: ${err?.message ?? err}`);
-          }
-        });
-
-      return () => {
-        cancelled = true;
-        for (const timer of localStartTimers) clearTimeout(timer);
-        try {
-          localReadyUnlisten?.();
-        } catch {
-          // ignore
-        }
-        emit("clips:bubble-stop-local-camera", {}).catch(() => {});
-        const recordingInFlight = recordingFlowGateRef.current;
-        console.log(
-          "[clips-popover] local bubble session end — recordingInFlight=%o stillActive=%o",
-          recordingInFlight,
-          bubbleActiveRef.current,
-        );
-        // Skip teardown when the bubble is still wanted (only the capture
-        // source changed). Hiding here would race the re-run's show_bubble.
-        if (!recordingInFlight && !bubbleActiveRef.current) {
-          invoke("hide_overlays").catch(() => {});
-        }
-      };
-    }
-
-    navigator.mediaDevices
-      .getUserMedia({
-        video: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          ...(cameraId ? { deviceId: { exact: cameraId } } : {}),
-        },
-        audio: false,
-      })
+    getCameraStreamWithFallback(cameraId, {
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+    })
       .then(async (s) => {
         if (cancelled) {
-          // Effect re-ran before we resolved — throw this stream away.
           s.getTracks().forEach((t) => t.stop());
           return;
         }
         await loadDevices();
+        if (cancelled) {
+          s.getTracks().forEach((t) => t.stop());
+          return;
+        }
         stream = s;
         bubbleStreamRef.current = s;
-        // Open the bubble window. It's a pure renderer — the bubble
-        // itself creates an RTCPeerConnection receiver and emits
-        // `clips:bubble-ready` once it's listening. We also keep the
-        // legacy canvas-frame sink around so a WebRTC failure can
-        // fall back to JPEG frames without a bubble reload.
         try {
           await invoke("show_bubble");
         } catch (err) {
           console.error("[clips-popover] show_bubble failed:", err);
         }
         if (cancelled) {
+          if (!recordingFlowGateRef.current && !bubbleActiveRef.current) {
+            await invoke("close_bubble").catch((err) =>
+              console.error("[clips-popover] late bubble cleanup failed:", err),
+            );
+          }
           s.getTracks().forEach((t) => t.stop());
           return;
         }
-        // Preferred path: WebRTC. Starts listening for bubble-ready,
-        // then kicks off an offer/answer/ICE dance. If ICE doesn't
-        // connect within the timeout (or fails later) we start the
-        // canvas pump in its place. The pump is our safety net —
-        // proven to work, just slower.
         const startCanvasFallback = (reason: string) => {
           if (cancelled || fellBackToPump) return;
           fellBackToPump = true;
@@ -1573,11 +2823,24 @@ export function App() {
           webrtcHandle = null;
           startPump(reason);
         };
+        listen("clips:bubble-webrtc-unrendered", (ev) => {
+          startCanvasFallback(
+            `bubble reported no rendered frames ${JSON.stringify(ev.payload)}`,
+          );
+        })
+          .then((u) => {
+            if (cancelled) {
+              u();
+              return;
+            }
+            unlistenUnrendered = u;
+          })
+          .catch(() => {});
         webrtcHandle = startBubbleWebrtc({
           stream: s,
           onConnected: () => {
             console.log(
-              "[clips-popover] bubble WebRTC connected — video is live",
+              "[clips-popover] bubble WebRTC transport connected — waiting for the bubble to confirm playback",
             );
           },
           onFailure: startCanvasFallback,
@@ -1592,7 +2855,15 @@ export function App() {
           msg.includes("sandbox") ||
           err?.name === "NotAllowedError"
         ) {
-          setCameraError(MACOS_CAPTURE_PERMISSION_MESSAGE);
+          setCameraError(
+            isMacPlatform()
+              ? MACOS_CAPTURE_PERMISSION_MESSAGE
+              : DESKTOP_CAPTURE_PERMISSION_MESSAGE,
+          );
+        } else if (isMediaConstraintFailure(err)) {
+          setCameraError(
+            "No camera found. Connect a camera, or pick one from the camera menu.",
+          );
         } else {
           setCameraError(`Camera unavailable: ${msg}`);
         }
@@ -1611,6 +2882,10 @@ export function App() {
         !!webrtcHandle,
         !!stopPump,
       );
+      if (unlistenUnrendered) {
+        unlistenUnrendered();
+        unlistenUnrendered = null;
+      }
       if (webrtcHandle) {
         webrtcHandle.stop();
         webrtcHandle = null;
@@ -1619,105 +2894,299 @@ export function App() {
         stopPump();
         stopPump = null;
       }
-      // Critical: if the recorder borrowed this stream, it now owns the
-      // track lifecycle. Stopping tracks here would end them out from
-      // under `MediaRecorder`, producing the laggy-bubble / dead-track
-      // bug. The recorder will stop them on `stop()` / `cancel()`.
       if (stream && !transferred) {
         stream.getTracks().forEach((t) => t.stop());
-        // Drop the local closure reference so nothing else pins the
-        // (now-stopped) MediaStream. WebKit's MediaStream is backed by a
-        // native track buffer that GC doesn't reclaim aggressively — any
-        // dangling reference keeps it resident.
         stream = null;
       }
-      // If the recorder owns the stream, keep `bubbleStreamRef` pointed
-      // at it so the next re-entry of this effect (if any) doesn't try
-      // to re-acquire while the recorder is still using it.
       if (!transferred) {
         bubbleStreamRef.current = null;
       }
-      // Don't tear down overlays if a recording is still in flight (the
-      // recorder's stop flow calls `hide_recording_chrome` which handles
-      // the bubble correctly). Hiding here mid-flow would kill the
-      // on-screen bubble window the user sees during the recording.
-      // Also skip when the bubble is still wanted and only the capture
-      // source changed (window ↔ full-screen flips `bubbleUsesLocalCamera`,
-      // re-running this effect): hiding would race the re-run's show_bubble
-      // and close the window out from under it.
       if (!recordingInFlight && !bubbleActiveRef.current) {
-        invoke("hide_overlays").catch(() => {});
+        invoke("hide_overlays", {
+          preserveFinalizing: recordingStopFinalizingRef.current,
+        }).catch(() => {});
       }
     };
-  }, [bubbleActive, bubbleUsesLocalCamera, cameraId]);
+  }, [bubbleActive, cameraId, bubbleSessionEpoch]);
 
-  // ---- auto-size popover to content --------------------------------------
-  // The Tauri window is fixed-size via tauri.conf.json, but our content
-  // height varies (more rows when a camera is on, Recent list toggle, etc.).
-  // A descendant-aware observer tells Rust what the current content height is
-  // and we call `resize_popover` to match.
-  const appRef = useRef<HTMLDivElement | null>(null);
-  usePopoverAutoSize(appRef, {
-    disabled: !popoverVisible || isRecording || recordingFlowActive,
-    width: showSettings ? 440 : 360,
-  });
-
-  // ---- recent list --------------------------------------------------------
-
-  const fetchRecent = useCallback(async () => {
-    if (authStatus !== "authed") return; // don't bother; would just 401
-    try {
-      const url = `${serverUrl.replace(/\/+$/, "")}/_agent-native/actions/list-recordings?limit=3&sort=recent`;
-      const res = await fetch(url, { credentials: "include" });
-      if (!res.ok) return;
-      const json = await res.json();
-      const list = Array.isArray(json?.recordings) ? json.recordings : [];
-      setRecordings(
-        list.slice(0, 3).map((r: any) => ({
-          id: r.id,
-          title: r.title ?? "Untitled",
-          durationMs: r.durationMs ?? 0,
-          thumbnailUrl: r.thumbnailUrl ?? null,
-          updatedAt: r.updatedAt ?? r.createdAt,
-        })),
-      );
-    } catch {
-      // ignore — server may be unreachable, we still render the chrome
-    }
-  }, [serverUrl, authStatus]);
-
-  const loadPendingUploads = useCallback(async () => {
-    try {
-      const nativeList = await invoke<Omit<PendingNativeUpload, "kind">[]>(
-        "native_fullscreen_pending_uploads",
-      );
-      const browserList = await listBrowserRecordingBackups();
-      const nativeUploads = Array.isArray(nativeList)
-        ? nativeList.map((upload) => ({
-            ...upload,
-            kind: "native" as const,
-          }))
-        : [];
-      setPendingUploads(
-        [...nativeUploads, ...browserList].sort((a, b) =>
-          b.savedAt.localeCompare(a.savedAt),
-        ),
-      );
-    } catch (err) {
-      console.warn("[clips-tray] pending upload lookup failed:", err);
-      setPendingUploads([]);
-    }
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    listen("clips:release-camera", () => {
+      console.log(`[popover] releasing camera`);
+      bubbleStreamTransferredToRecorder.current = false;
+      bubbleStreamRef.current?.getTracks().forEach((t) => t.stop());
+      bubbleStreamRef.current = null;
+      if (!recordingFlowGateRef.current) {
+        setBubbleSessionEpoch((epoch) => epoch + 1);
+      }
+    })
+      .then((u) => {
+        if (cancelled) u();
+        else unlisten = u;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, []);
 
   useEffect(() => {
-    fetchRecent();
-  }, [fetchRecent]);
+    if (!popoverVisible || !wantsCamera) return;
+    if (recordingFlowGateRef.current || recordingFlowActive) return;
+    const tracks = bubbleStreamRef.current?.getTracks() ?? [];
+    const needsFreshBubble =
+      tracks.length === 0 ||
+      tracks.every((track) => track.readyState === "ended");
+    if (!needsFreshBubble) return;
+    bubbleStreamTransferredToRecorder.current = false;
+    bubbleStreamRef.current = null;
+    setBubbleSessionEpoch((epoch) => epoch + 1);
+  }, [popoverVisible, wantsCamera, recordingFlowActive]);
+
+  const appRef = useRef<HTMLDivElement | null>(null);
+  const recoveryNavigation = useRecordingRecoveryNavigation(
+    popoverView,
+    setPopoverView,
+    appRef,
+  );
+  const popoverLayoutView =
+    popoverView === "settings"
+      ? "settings"
+      : popoverView === "memory"
+        ? "memory"
+        : "recorder";
+  const popoverAutoSizeOptions = getPopoverAutoSizeOptions(
+    popoverLayoutView,
+    popoverVisible,
+    recordingStartPending,
+  );
+  usePopoverAutoSize(appRef, popoverAutoSizeOptions);
+
+  const loadPendingUploads = useCallback(async () => {
+    const sequence = ++recoveryLookupSequence.current;
+    setRecoveryRefreshing(true);
+    const [nativeResult, browserResult] = await Promise.allSettled([
+      invoke<Omit<PendingNativeUpload, "kind">[]>(
+        "native_fullscreen_pending_uploads",
+      ),
+      listBrowserRecordingBackups(),
+    ]);
+    if (nativeResult.status === "rejected") {
+      console.warn(
+        "[clips-tray] native pending upload lookup failed:",
+        nativeResult.reason,
+      );
+    }
+    if (browserResult.status === "rejected") {
+      console.warn(
+        "[clips-tray] browser pending upload lookup failed:",
+        browserResult.reason,
+      );
+    }
+    if (sequence !== recoveryLookupSequence.current) return;
+    setRecoverySnapshot((previous) =>
+      reconcileRecordingRecovery(previous.uploads, nativeResult, browserResult),
+    );
+    setRecoveryRefreshing(false);
+  }, []);
 
   useEffect(() => {
-    loadPendingUploads();
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    listen("clips:pending-uploads-changed", () => {
+      void loadPendingUploads();
+    })
+      .then((stop) => {
+        if (cancelled) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [loadPendingUploads]);
+
+  const reportRecordingFailure = useCallback(
+    (result: RecordingRecoveryResult, localOnly = false) => {
+      const recordingId = result.recordingId || recoverySessionId.current;
+      setRecoveryActionErrors((errors) =>
+        applyRecordingRecoveryResult(
+          errors,
+          result,
+          recoverySessionId.current,
+          desktopRecoveryCopy.actionFailed,
+        ),
+      );
+      if (result.ok) return;
+      const id =
+        recoveryFailureAttempts.current.get(recordingId) ||
+        `recording:${recordingId}`;
+      void notifyRecordingFailure({
+        kind: localOnly ? "save" : "upload",
+        id,
+        localCopyVerified: false,
+        title: localOnly
+          ? desktopRecordingFailureCopy.saveTitle
+          : desktopRecordingFailureCopy.uploadTitle,
+        body: localOnly
+          ? desktopRecordingFailureCopy.saveBody
+          : desktopRecordingFailureCopy.uploadBody,
+      });
+    },
+    [],
+  );
+
+  // Recordings saved to Movies/Clips because storage was not connected. They
+  // are kept per server and account, so a file only uploads to the account
+  // that recorded it, and leave this list only once queued for upload.
+  const recordFirstKey = signedInAs
+    ? recordFirstFilesKey(originForServer(serverUrl), signedInAs)
+    : null;
+  const unclaimedRecordFirstKey = recordFirstFilesKey(
+    originForServer(serverUrl),
+    null,
+  );
+  const [recordFirstFiles, setRecordFirstFiles] = useState<RecordFirstFile[]>(
+    [],
+  );
+  const [unclaimedRecordFirstFiles, setUnclaimedRecordFirstFiles] = useState<
+    RecordFirstFile[]
+  >([]);
+  const [recordFirstError, setRecordFirstError] = useState<string | null>(null);
+  const [recordFirstFileErrors, setRecordFirstFileErrors] = useState<
+    Record<string, { message: string; missing: boolean }>
+  >({});
+  const [recordFirstUploading, setRecordFirstUploading] = useState(false);
+  useEffect(() => {
+    // Never keep another account's list in state: an unreadable list shows
+    // an error and an empty queue, so "Upload now" cannot send A's files
+    // with B's token.
+    setRecordFirstFileErrors({});
+    try {
+      setUnclaimedRecordFirstFiles(
+        loadRecordFirstFiles(localStorage, unclaimedRecordFirstKey),
+      );
+      setRecordFirstFiles(
+        recordFirstKey
+          ? loadRecordFirstFiles(localStorage, recordFirstKey)
+          : [],
+      );
+      setRecordFirstError(null);
+    } catch (err) {
+      setRecordFirstFiles([]);
+      setUnclaimedRecordFirstFiles([]);
+      setRecordFirstError(
+        `${RECORD_FIRST_LIST_UNREADABLE} ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }, [recordFirstKey, unclaimedRecordFirstKey]);
+  // Every change is written to storage first; state only mirrors it, so a
+  // crash or quit right after a change neither loses nor repeats an entry.
+  const changeQueuedFiles = useCallback(
+    (key: string, change: (files: RecordFirstFile[]) => RecordFirstFile[]) => {
+      const next = changeRecordFirstFiles(localStorage, key, change);
+      if (key === recordFirstKey) setRecordFirstFiles(next);
+      else if (key === unclaimedRecordFirstKey) {
+        setUnclaimedRecordFirstFiles(next);
+      }
+      return next;
+    },
+    [recordFirstKey, unclaimedRecordFirstKey],
+  );
+  const rememberRecordFirstFile = useCallback(
+    (file: RecordFirstFile, key: string) => {
+      // `key` is the account signed in when capture started, never whoever
+      // is signed in at Stop, so a switch mid-recording cannot reassign it.
+      changeQueuedFiles(key, (files) => [
+        ...files.filter((f) => f.path !== file.path),
+        file,
+      ]);
+    },
+    [changeQueuedFiles],
+  );
+  const forgetRecordFirstFile = useCallback(
+    (path: string) => {
+      // Removes the list entry only; the file on disk is never touched.
+      for (const key of [recordFirstKey, unclaimedRecordFirstKey]) {
+        if (key)
+          changeQueuedFiles(key, (files) =>
+            files.filter((f) => f.path !== path),
+          );
+      }
+      setRecordFirstFileErrors(({ [path]: _forgotten, ...rest }) => rest);
+    },
+    [changeQueuedFiles, recordFirstKey, unclaimedRecordFirstKey],
+  );
+  const uploadRecordFirstFilesRef = useRef<
+    (options?: { includeUnclaimed?: boolean }) => Promise<void>
+  >(async () => {});
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<RecordingRecoveryResult>(
+      "clips:native-upload-finished",
+      (event) => {
+        const retryWasCancelled =
+          (retryUploadAbortRef.current?.signal.aborted &&
+            retryUploadRecordingIdRef.current === event.payload.recordingId) ||
+          event.payload.error === "native recording upload retry cancelled";
+        if (!event.payload.ok && retryWasCancelled) return;
+        reportRecordingFailure(event.payload);
+        void loadPendingUploads();
+      },
+    )
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch((error) => {
+        console.error("[clips-tray] upload recovery listener failed:", error);
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [loadPendingUploads, reportRecordingFailure]);
+
+  useEffect(() => {
+    if (
+      popoverVisible &&
+      (popoverView === "meetings" || popoverView === "recorder")
+    ) {
+      void fetchUpcomingMeetings();
+    }
+  }, [fetchUpcomingMeetings, popoverView, popoverVisible]);
+
+  useEffect(() => {
+    void loadPendingUploads();
   }, [loadPendingUploads, popoverVisible]);
 
-  // ---- persist selections -------------------------------------------------
+  useEffect(() => {
+    let cancelled = false;
+    void invoke<{ recovered: number }>(
+      "native_fullscreen_recover_orphaned_uploads",
+      { serverUrl },
+    )
+      .then((result) => {
+        if (!cancelled && result.recovered > 0) {
+          return loadPendingUploads();
+        }
+        return undefined;
+      })
+      .catch((error) => {
+        console.warn(
+          "[clips-tray] orphaned recording recovery lookup failed:",
+          error,
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [loadPendingUploads, serverUrl]);
 
   useEffect(() => saveString(MODE_KEY, mode), [mode]);
   useEffect(
@@ -1732,6 +3201,18 @@ export function App() {
     () => saveString(POPOVER_CUSTOM_SHORTCUT_KEY, popoverCustomShortcut),
     [popoverCustomShortcut],
   );
+  useEffect(
+    () => saveString(RECORD_CUSTOM_SHORTCUT_KEY, recordCustomShortcut),
+    [recordCustomShortcut],
+  );
+  useEffect(
+    () => saveString(RECORD_CANCEL_SHORTCUT_KEY, recordCancelShortcut),
+    [recordCancelShortcut],
+  );
+  useEffect(
+    () => saveString(RECORD_PAUSE_SHORTCUT_KEY, recordPauseShortcut),
+    [recordPauseShortcut],
+  );
   useEffect(() => saveString(VOICE_MODE_KEY, voiceMode), [voiceMode]);
   useEffect(
     () => saveString(VOICE_PROVIDER_KEY, voiceProvider),
@@ -1742,28 +3223,9 @@ export function App() {
     [voiceInstructions],
   );
   useEffect(() => saveString(SOURCE_KEY, source), [source]);
-  useEffect(() => saveString(CAM_KEY, cameraId), [cameraId]);
-  useEffect(() => saveString(MIC_KEY, micId), [micId]);
-  useEffect(() => saveString(CAM_LABEL_KEY, cameraLabel), [cameraLabel]);
-  useEffect(() => saveString(MIC_LABEL_KEY, micLabel), [micLabel]);
   useEffect(() => saveBool(CAM_ON_KEY, cameraOn), [cameraOn]);
   useEffect(() => saveBool(MIC_ON_KEY, micOn), [micOn]);
   useEffect(() => saveBool(SYSTEM_AUDIO_KEY, systemAudioOn), [systemAudioOn]);
-
-  // Once the device list unlocks (after a grant), refresh the remembered
-  // label for the saved id so the persisted name stays current.
-  useEffect(() => {
-    if (!cameraId) return;
-    const match = cameraDevices.find((d) => d.deviceId === cameraId);
-    if (match?.label) setCameraLabel(match.label);
-  }, [cameraDevices, cameraId]);
-  useEffect(() => {
-    if (!micId) return;
-    const match = micDevices.find((d) => d.deviceId === micId);
-    if (match?.label) setMicLabel(match.label);
-  }, [micDevices, micId]);
-
-  // ---- actions -----------------------------------------------------------
 
   function openInBrowser(path: string) {
     const href = `${serverUrl.replace(/\/+$/, "")}${path}`;
@@ -1772,29 +3234,305 @@ export function App() {
     });
   }
 
-  async function retryPendingUpload(upload: PendingDesktopUpload) {
-    if (retryingUploadId || exportingUploadId || discardingUploadId) return;
-    const targetServerUrl = serverUrlForPendingUpload(upload, serverUrl);
-    setRecError(null);
-    setRetryingUploadId(upload.recordingId);
+  function openRewindDocs() {
+    openExternal(REWIND_DOCS_URL).catch((err) => {
+      console.error("[clips-tray] open Rewind docs failed:", err);
+    });
+  }
+
+  async function copyShareLink(
+    recordingId: string,
+    origin = serverUrl,
+    { notify = true }: { notify?: boolean } = {},
+  ) {
     try {
-      const authToken = loadDesktopAuthToken(targetServerUrl);
-      if (upload.kind === "native") {
-        await invoke("native_fullscreen_recording_retry_upload", {
-          serverUrl: targetServerUrl,
-          recordingId: upload.recordingId,
-          authToken,
-          cookie: typeof document !== "undefined" ? document.cookie || "" : "",
+      const url = recordingShareUrl(recordingId, origin);
+      const copied = await copyRecordingShareLink(recordingId, origin);
+      if (copied) {
+        setShareLinkNotice(null);
+        if (notify) {
+          await sendNativeNotification({
+            title: "Link copied",
+            body: "Your clip link is ready to paste.",
+          });
+        }
+      } else {
+        setShareLinkNotice({ recordingId, origin, url });
+      }
+      return copied;
+    } catch (err) {
+      console.error("[clips-tray] copy share link failed:", err);
+      return false;
+    }
+  }
+
+  finishRecordingStopRef.current = async (handle, stoppingRecordingId) => {
+    recordingStopFinalizingRef.current = true;
+    setRecordingStopFinalizing(true);
+    bubbleStreamTransferredToRecorder.current = false;
+    bubbleStreamRef.current = null;
+    recordingFlowGateRef.current = false;
+    (window as unknown as { clipsForceAlive?: boolean }).clipsForceAlive =
+      false;
+    setRecordingFlowActive(false);
+    setRecorder(null);
+    setBubbleSessionEpoch((epoch) => epoch + 1);
+
+    let stopFailed = false;
+    let stopResult: RecorderStopResult | null = null;
+    try {
+      stopResult = await handle.stop();
+      if (stopResult.localOnly) {
+        setLocalRecordingNotice({
+          folderPath: stopResult.localFolder,
+          files: stopResult.localFiles ?? [],
         });
+        const queueKey = recordFirstKeyAtStartRef.current;
+        if (recordedWithoutStorageRef.current && queueKey) {
+          for (const file of recordFirstFilesToQueue(
+            stopResult.localFiles ?? [],
+          )) {
+            rememberRecordFirstFile(
+              {
+                ...file,
+                ...recordFirstMediaFlags(file.role, {
+                  hasAudio: micOn || systemAudioOn,
+                  hasCamera: mode !== "screen",
+                }),
+                savedAt: new Date().toISOString(),
+              },
+              queueKey,
+            );
+          }
+        }
+        emit("clips:native-upload-finished", {
+          recordingId: stopResult.recordingId,
+          ok: true,
+          localFilePath: stopResult.localFiles?.[0]?.path ?? null,
+        }).catch(() => {});
+      } else {
+        setLastRecordingId(stopResult.recordingId);
+        await copyShareLink(stopResult.recordingId, serverUrl, {
+          notify: false,
+        });
+      }
+    } catch (err) {
+      stopFailed = true;
+      setRecError(err instanceof Error ? err.message : String(err));
+      if (!stopResult) {
+        reportRecordingFailure(
+          {
+            recordingId: stoppingRecordingId ?? undefined,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          },
+          localRecordingMode !== "off" || recordedWithoutStorageRef.current,
+        );
+        emit("clips:native-upload-finished", {
+          recordingId: stoppingRecordingId ?? undefined,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        }).catch(() => {});
+      }
+      await loadPendingUploads();
+    } finally {
+      recordingStopFinalizingRef.current = false;
+      setRecordingStopFinalizing(false);
+      setRecError((message) => clearResolvedFinalizationError(message, false));
+      invoke("set_recording_state", { active: false }).catch(() => {});
+      if (stopFailed || stopResult?.localOnly) {
+        invoke("show_popover").catch(() => {});
+      } else {
+        getCurrentWindow()
+          .hide()
+          .catch(() => {});
+        emit("clips:popover-visible", false).catch(() => {});
+      }
+    }
+  };
+
+  uploadRecordFirstFilesRef.current = async (
+    options: { includeUnclaimed?: boolean } = {},
+  ) => {
+    if (recordFirstUploading || !recordFirstKey || !signedInAs) return;
+    if (videoStorageStatus !== "configured") {
+      openVideoStorageSetup();
+      return;
+    }
+    // Unclaimed files (saved while signed out) join this account only when
+    // the user clicks Upload now, never automatically.
+    let files = changeQueuedFiles(recordFirstKey, (own) => own);
+    if (options.includeUnclaimed && unclaimedRecordFirstFiles.length > 0) {
+      try {
+        files = transferRecordFirstFiles(
+          localStorage,
+          unclaimedRecordFirstKey,
+          recordFirstKey,
+        );
+      } catch (err) {
+        // Every file is still in at least one list; show both as stored.
+        setRecordFirstError(err instanceof Error ? err.message : String(err));
+        files = [];
+      }
+      for (const [key, setFiles] of [
+        [recordFirstKey, setRecordFirstFiles],
+        [unclaimedRecordFirstKey, setUnclaimedRecordFirstFiles],
+      ] as const) {
+        try {
+          setFiles(loadRecordFirstFiles(localStorage, key));
+        } catch {
+          // coercion-ok: an unreadable list keeps its last state; the transfer error is shown above.
+        }
+      }
+      if (files.length === 0) return;
+    }
+    setRecordFirstUploading(true);
+    setRecordFirstError(null);
+    try {
+      for (const queued of files) {
+        const authToken = loadDesktopAuthToken(serverUrl);
+        // The row's id is saved with the entry before the row exists, so a
+        // crash mid-handoff resumes it instead of creating a second clip.
+        const file = queued.stagedRecordingId
+          ? queued
+          : { ...queued, stagedRecordingId: crypto.randomUUID() };
+        const setEntry = (entry: RecordFirstFile | null) =>
+          changeQueuedFiles(recordFirstKey, (current) =>
+            current.flatMap((f) =>
+              f.path !== file.path ? [f] : entry ? [entry] : [],
+            ),
+          );
+        setEntry(file);
+        let upload: PendingDesktopUpload | null;
+        try {
+          upload = await queueRecordFirstUpload({
+            serverUrl,
+            authToken,
+            ownerEmail: signedInAs,
+            file,
+          });
+        } catch (err) {
+          // One bad file never blocks the rest of the queue. The staged id is
+          // kept unless its row was cleaned up: after an ambiguous failure
+          // (a create cut off mid-flight) the retry must reuse that row.
+          setEntry({
+            ...file,
+            stagedRecordingId: stagedIdAfterFailure(
+              file.stagedRecordingId,
+              err,
+            ),
+          });
+          const message = err instanceof Error ? err.message : String(err);
+          setRecordFirstFileErrors((errors) => ({
+            ...errors,
+            [file.path]: {
+              message,
+              missing: err instanceof RecordFirstFileMissingError,
+            },
+          }));
+          continue;
+        }
+        setRecordFirstFileErrors(({ [file.path]: _done, ...rest }) => rest);
+        setEntry(null);
+        await loadPendingUploads();
+        // The queued copy now lives in the recovery list: a failed upload
+        // stays there with Retry, and the file on disk is untouched.
+        if (upload) await retryPendingUpload(upload);
+      }
+    } finally {
+      setRecordFirstUploading(false);
+    }
+  };
+
+  async function retryPendingUpload(upload: PendingDesktopUpload) {
+    if (
+      retryingUploadId ||
+      exportingUploadId ||
+      recordingStopFinalizingRef.current
+    )
+      return;
+    const key = recordingRecoveryKey(upload);
+    if (authStatus !== "authed") {
+      setRecoveryActionErrors((errors) => ({
+        ...errors,
+        [key]: desktopRecoveryCopy.signInToRetry,
+      }));
+      return;
+    }
+    const targetServerUrl = serverUrlForPendingUpload(upload, serverUrl);
+    setRecoveryActionErrors((errors) => {
+      const next = { ...errors };
+      delete next[key];
+      delete next[`failure:${upload.recordingId}`];
+      return next;
+    });
+    setRetryingUploadId(key);
+    recoveryFailureAttempts.current.set(
+      upload.recordingId,
+      `retry:${upload.recordingId}:${crypto.randomUUID()}`,
+    );
+    const abortController = new AbortController();
+    retryUploadAbortRef.current = abortController;
+    retryUploadRecordingIdRef.current = upload.recordingId;
+    retryingUploadKindRef.current = upload.kind;
+    let uploadCompleted = false;
+    try {
+      let authToken = loadDesktopAuthToken(targetServerUrl);
+      if (originForServer(targetServerUrl) === originForServer(serverUrl)) {
+        const authResult = await checkAuth();
+        if (authResult.state === "anonymous") {
+          throw new Error(desktopRecoveryCopy.signInToRetry);
+        }
+        if (authResult.state === "authenticated" && authResult.token) {
+          authToken = authResult.token;
+        }
+      }
+      if (upload.kind === "native") {
+        const result = await invoke<{ verificationPending?: boolean }>(
+          "native_fullscreen_recording_retry_upload",
+          {
+            serverUrl: targetServerUrl,
+            recordingId: upload.recordingId,
+            authToken,
+            cookie:
+              typeof document !== "undefined" ? document.cookie || "" : "",
+          },
+        );
+        if (result.verificationPending) {
+          scheduleNativeBackupCleanupAfterProcessing({
+            serverUrl: targetServerUrl,
+            recordingId: upload.recordingId,
+            authToken,
+          });
+        }
       } else {
         await retryBrowserRecordingBackup({
           recordingId: upload.recordingId,
           serverUrl: targetServerUrl,
           authToken,
+          signal: abortController.signal,
+          onRecoveryDecision: ({ action, progress }) => {
+            setRetryingUploadStatus(
+              action === "resume"
+                ? desktopRecoveryCopy.resumeProgress.replace(
+                    "{percent}",
+                    String(Math.round(progress * 100)),
+                  )
+                : action === "wait"
+                  ? desktopRecoveryCopy.waiting
+                  : action === "restart"
+                    ? desktopRecoveryCopy.restarting
+                    : desktopRecoveryCopy.retrying,
+            );
+          },
         });
       }
+      uploadCompleted = true;
       await loadPendingUploads();
-      await fetchRecent();
+      reportRecordingFailure({ recordingId: upload.recordingId, ok: true });
+      await copyShareLink(upload.recordingId, targetServerUrl, {
+        notify: false,
+      });
       await openExternal(`${targetServerUrl}/r/${upload.recordingId}`);
       getCurrentWindow()
         .hide()
@@ -1802,24 +3540,68 @@ export function App() {
       emit("clips:popover-visible", false).catch(() => {});
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (
+        abortController.signal.aborted ||
+        (err instanceof DOMException && err.name === "AbortError") ||
+        message === "native recording upload retry cancelled"
+      ) {
+        await loadPendingUploads();
+        return;
+      }
       console.error("[clips-tray] retry saved upload failed:", err);
-      setRecError(message);
+      setRecoveryActionErrors((errors) => ({ ...errors, [key]: message }));
+      if (!uploadCompleted)
+        reportRecordingFailure({
+          recordingId: upload.recordingId,
+          ok: false,
+          error: message,
+        });
       await loadPendingUploads();
     } finally {
+      if (retryUploadAbortRef.current === abortController) {
+        retryUploadAbortRef.current = null;
+        retryUploadRecordingIdRef.current = null;
+        retryingUploadKindRef.current = null;
+      }
       setRetryingUploadId(null);
+      setRetryingUploadStatus(null);
     }
   }
 
+  function cancelPendingUploadRetry(upload: PendingDesktopUpload) {
+    if (retryingUploadId !== recordingRecoveryKey(upload)) return;
+    retryUploadAbortRef.current?.abort();
+    if (retryingUploadKindRef.current === "native") {
+      invoke("native_fullscreen_recording_cancel_retry", {
+        recordingId: upload.recordingId,
+      }).catch((err) => {
+        console.error("[clips-tray] cancel saved upload retry failed:", err);
+        setRecoveryActionErrors((errors) => ({
+          ...errors,
+          [recordingRecoveryKey(upload)]:
+            err instanceof Error ? err.message : String(err),
+        }));
+        setRetryingUploadStatus(desktopRecoveryCopy.retrying);
+      });
+    }
+    setRetryingUploadStatus(desktopRecoveryCopy.cancelling);
+  }
+
   async function exportPendingUpload(upload: PendingDesktopUpload) {
-    if (retryingUploadId || exportingUploadId || discardingUploadId) return;
-    setRecError(null);
+    if (retryingUploadId || exportingUploadId) return;
+    const key = recordingRecoveryKey(upload);
+    setRecoveryActionErrors((errors) => {
+      const next = { ...errors };
+      delete next[key];
+      return next;
+    });
 
     if (upload.kind === "native") {
       openPendingUploadFolder(upload);
       return;
     }
 
-    setExportingUploadId(upload.recordingId);
+    setExportingUploadId(key);
     try {
       const exportResult = await exportBrowserRecordingBackup(
         upload.recordingId,
@@ -1834,41 +3616,24 @@ export function App() {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error("[clips-tray] export saved upload failed:", err);
-      setRecError(message);
+      setRecoveryActionErrors((errors) => ({ ...errors, [key]: message }));
     } finally {
       setExportingUploadId(null);
     }
   }
 
-  async function discardPendingUpload(upload: PendingDesktopUpload) {
-    if (retryingUploadId || exportingUploadId || discardingUploadId) return;
-    setRecError(null);
-    setDiscardingUploadId(upload.recordingId);
-    setPendingUploads((uploads) =>
-      uploads.filter((item) => item.recordingId !== upload.recordingId),
-    );
-    try {
-      if (upload.kind === "native") {
-        await invoke("native_fullscreen_recording_discard_upload", {
-          recordingId: upload.recordingId,
-        });
-      } else {
-        await discardBrowserRecordingBackup(upload.recordingId);
-      }
-      await loadPendingUploads();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error("[clips-tray] discard saved upload failed:", err);
-      setRecError(message);
-      await loadPendingUploads();
-    } finally {
-      setDiscardingUploadId(null);
-    }
-  }
-
   function openPendingUploadFolder(upload: PendingDesktopUpload) {
+    const key = recordingRecoveryKey(upload);
+    setRecoveryActionErrors((errors) => {
+      const next = { ...errors };
+      delete next[key];
+      return next;
+    });
     if (upload.kind !== "native" || !upload.folderPath) {
-      setRecError("This saved upload is stored in the browser backup cache.");
+      setRecoveryActionErrors((errors) => ({
+        ...errors,
+        [key]: desktopRecoveryCopy.completeCopyUnconfirmed,
+      }));
       return;
     }
     invoke("open_local_recording_folder", {
@@ -1876,16 +3641,79 @@ export function App() {
     }).catch((err) => {
       const message = err instanceof Error ? err.message : String(err);
       console.error("[clips-tray] open pending upload folder failed:", err);
-      setRecError(message);
+      setRecoveryActionErrors((errors) => ({ ...errors, [key]: message }));
     });
   }
 
+  const openVideoStorageSetup = useCallback(
+    (targetServerUrl?: string) => {
+      const base = (targetServerUrl?.trim() || serverUrl).replace(/\/+$/, "");
+      setRecError(STORAGE_SETUP_HELP_TEXT);
+      void openExternal(`${base}/record?connectStorage=1`).catch((err) => {
+        setRecError(
+          err instanceof Error
+            ? err.message
+            : "Could not open Clips storage setup.",
+        );
+      });
+      void refreshVideoStorageStatus();
+    },
+    [refreshVideoStorageStatus, serverUrl],
+  );
+
   async function handleStartRecording(options?: {
-    ignoreActiveRecorder?: boolean;
-  }) {
-    if (recorder && !options?.ignoreActiveRecorder) return;
+    resumeCapture?: RestartHandoff;
+  }): Promise<RecorderHandle | null> {
+    const recordingClickAt = performance.now();
+    if (recordingStopFinalizingRef.current) {
+      console.warn(
+        "[clips-popover] handleStartRecording ignored — previous recording still finalizing",
+      );
+      return null;
+    }
+    if (
+      recordingStartAttemptRef.current ||
+      (!options?.resumeCapture &&
+        (recorder ||
+          recordingFlowGateRef.current ||
+          restartInFlightRef.current ||
+          recordingCancelInFlightRef.current))
+    ) {
+      console.warn(
+        "[clips-popover] handleStartRecording ignored — recorder already active",
+      );
+      return null;
+    }
+    if (localRecordingMode === "off" && authStatus !== "authed") {
+      return null;
+    }
+    const bubbleTracks = bubbleStreamRef.current?.getTracks() ?? [];
+    const bubbleStreamDead =
+      bubbleTracks.length > 0 &&
+      bubbleTracks.every((track) => track.readyState === "ended");
+    if (bubbleStreamDead) {
+      console.warn("[clips-popover] clearing ended bubble stream before start");
+      bubbleStreamTransferredToRecorder.current = false;
+      bubbleStreamRef.current = null;
+      setBubbleSessionEpoch((epoch) => epoch + 1);
+    }
+    // Recording never waits on storage: until storage reads as connected the
+    // clip is written to Movies/Clips as it records, then uploads once
+    // storage connects.
+    const recordingLocalMode = effectiveLocalRecordingMode(
+      localRecordingMode,
+      videoStorageStatus,
+    );
+    const recordLocallyUntilStorage = recordingLocalMode !== localRecordingMode;
+    recordedWithoutStorageRef.current = recordLocallyUntilStorage;
+    recordFirstKeyAtStartRef.current = recordFirstFilesKey(
+      originForServer(serverUrl),
+      signedInAs,
+    );
     setRecError(null);
     setLocalRecordingNotice(null);
+    setShareLinkNotice(null);
+    setLookbackNotice(null);
     console.log("[clips-popover] handleStartRecording clicked", {
       serverUrl,
       mode,
@@ -1895,205 +3723,360 @@ export function App() {
       micOn,
     });
 
-    if (mode !== "camera" && nativeFullscreenRecordingActive) {
-      try {
-        const granted = await invoke<boolean>(
-          "request_macos_screen_recording_access",
-        );
-        if (!granted) {
-          setReadinessOpen(true);
-          setRecError(MACOS_CAPTURE_PERMISSION_MESSAGE);
-          openPrivacySettings("screen");
-          return;
-        }
-      } catch (err) {
-        setReadinessOpen(true);
-        setRecError(err instanceof Error ? err.message : String(err));
-        return;
-      }
-    }
-
-    // Latch BEFORE the async work so the popover stays in "recording
-    // flow" during the macOS screen-picker focus dance. The bubble
-    // session effect also keys off this flag (via `bubbleActive`) so
-    // the bubble + camera stream stay alive while the picker is up.
+    const audioCue = createAudioCue();
+    let audioCueTransferred = false;
+    const attempt = new RecordingStartAttempt();
+    const startAttemptId = crypto.randomUUID();
+    recoverySessionId.current = startAttemptId;
+    recordingStartAttemptRef.current = attempt;
+    captureStartedDuringStartRef.current = false;
     recordingFlowGateRef.current = true;
-    setRecordingFlowActive(true);
-    // Tell Rust we're entering the recording flow NOW, not after the
-    // handle arrives. The macOS screen-picker dialog steals focus from
-    // the popover, which would otherwise trigger the blur-auto-hide
-    // mid-setup — so the countdown and toolbar render behind a hidden
-    // popover and the user sees nothing happen.
-    invoke("set_recording_state", { active: true }).catch(() => {});
-
-    // Hand the live camera stream to the recorder so it doesn't
-    // re-acquire the camera (which would trigger WebKit's
-    // capture-exclusion mute bug — see `preAcquiredCameraStream` in
-    // recorder.ts). The popover KEEPS ownership: the bubble session
-    // effect's deps still include `isRecording`, so the stream + bubble
-    // + pump stay alive for the entire recording.
-    const preAcquiredCameraStream =
-      mode !== "screen" && cameraOn && !bubbleUsesLocalCamera
-        ? bubbleStreamRef.current
-        : null;
-    // Flip the ownership flag BEFORE kicking off the recorder. Any
-    // bubble-session cleanup that fires after this point must leave the
-    // tracks alone — the recorder now owns them. Cleared in the stop /
-    // cancel / failure paths below.
-    if (preAcquiredCameraStream) {
-      bubbleStreamTransferredToRecorder.current = true;
-    }
-
+    setRecordingStartPending(true);
     let handle: RecorderHandle | null = null;
+    let stoppedDuringStart = false;
+    let stopRequestedDuringStart = false;
+    let captureStartRequestedDuringStart = false;
+    let unlistenStartupStop: (() => void) | null = null;
     let startError: unknown = null;
+    let parkPopoverTimer: number | null = null;
     try {
-      // Per Steve: "when we hit Start Recording the popover should disappear
-      // BEFORE the screen picker shows up — otherwise you might accidentally
-      // pick the popover itself." NSWindowSharingNone keeps the popover out
-      // of the final recording, but on modern macOS the picker STILL lists
-      // NSWindowSharingNone windows — only the actual capture is blocked.
-      // So we have to visually hide it early.
-      //
-      // We can't hide() the popover — that suspends its JS and the bubble
-      // frame pump dies. Instead we park it as a 2×2 pinhole on the primary
-      // screen (AppKit sees the window as on-screen, no occlusion
-      // throttling, pump keeps ticking). The pinhole is too small to show
-      // up prominently in the picker and since NSWindowSharingNone is also
-      // set the picker's thumbnail is empty anyway.
-      //
-      // USER ACTIVATION: WebKit requires `getDisplayMedia` to be called
-      // from within a user gesture handler. The first `await` in a click
-      // handler consumes user activation. `startRecording` kicks off
-      // `getDisplayMedia` SYNCHRONOUSLY before its first `await`, so we
-      // start the recording promise FIRST (capturing the gesture), then
-      // park the popover in parallel via a fire-and-forget `invoke`.
-      // `invoke` itself is async — but because `getDisplayMedia` was
-      // already dispatched at that point, user activation has already been
-      // consumed for the purpose that needs it.
-      //
-      // Set `clipsForceAlive` before parking so the bubble frame pump's
-      // `document.hidden` early-out is bypassed even if WebKit flips
-      // visibility=hidden on a pinhole-sized window.
+      sessionRecordingIdRef.current = null;
+      unlistenStartupStop = await listen("clips:recorder-stop", () => {
+        stopRequestedDuringStart = true;
+        if (!captureStartRequestedDuringStart) {
+          attempt.cancel();
+          emit("clips:countdown-cancel").catch(() => {});
+        }
+      });
+      stopAllMicMeters();
+      (window as unknown as { clipsForceAlive?: boolean }).clipsForceAlive =
+        true;
+      if (nativeCaptureRecordingActive) {
+        await prepareNativeRecordingStart(attempt, {
+          windowCapture: nativeWindowRecordingActive,
+          resumeCapture: Boolean(options?.resumeCapture),
+          microphone: micOn,
+        });
+      }
+      attempt.ensureActive();
+
+      recordingFlowGateRef.current = true;
+      setRecordingFlowActive(true);
+      if (!nativeCaptureRecordingActive) {
+        void boundedCleanup(invoke("set_recording_state", { active: true }));
+      }
+
+      const preAcquiredCameraStream =
+        mode !== "screen" && cameraOn ? bubbleStreamRef.current : null;
+      if (preAcquiredCameraStream) {
+        bubbleStreamTransferredToRecorder.current = true;
+      }
+
       (window as unknown as { clipsForceAlive?: boolean }).clipsForceAlive =
         true;
 
-      const recordingPromise = startRecording({
-        serverUrl,
-        mode,
-        source,
-        cameraId,
-        micId: selectedMicId || undefined,
-        micLabel: selectedMicLabel || undefined,
-        authToken: loadDesktopAuthToken(serverUrl),
-        cookie: typeof document !== "undefined" ? document.cookie || "" : "",
-        cameraOn,
-        micOn,
-        systemAudioOn,
-        localRecordingMode,
-        preAcquiredCameraStream,
-      });
-      // macOS: park the popover to its 2×2 pinhole IMMEDIATELY so it
-      // doesn't appear in the screen picker window list. The native
-      // Rust recorder used for full-screen doesn't need getDisplayMedia
-      // at all, so parking is always safe on macOS.
-      //
-      // Windows: do NOT park before getDisplayMedia resolves. On Windows,
-      // the WebView2 screen picker UI renders within the popover webview —
-      // shrinking the window to 2×2 makes the picker invisible and the
-      // user can never select a screen. The recorder.ts code parks the
-      // popover itself (line ~2165) AFTER the streams are acquired, which
-      // is the correct time on Windows.
-      if (isMacPlatform()) {
-        invoke("park_popover_offscreen").catch(() => {});
-        emit("clips:popover-visible", false).catch(() => {});
+      const recordingPromise = startRecording(
+        {
+          serverUrl,
+          mode,
+          source,
+          cameraId,
+          micId: selectedMicId || undefined,
+          micLabel: selectedMicLabel || micLabel || undefined,
+          authToken: loadDesktopAuthToken(serverUrl),
+          cookie: typeof document !== "undefined" ? document.cookie || "" : "",
+          cameraOn,
+          micOn,
+          systemAudioOn,
+          voiceCleanupEnabled,
+          localRecordingMode: recordingLocalMode,
+          preAcquiredCameraStream,
+          preAcquiredDisplayStream:
+            options?.resumeCapture?.displayStream ?? null,
+          preAcquiredAudioStream: options?.resumeCapture?.audioStream ?? null,
+          preAcquiredCaptureSuspension: attempt.captureSuspension,
+          pendingTranscriptionTeardown:
+            options?.resumeCapture?.transcriptionTornDown ?? null,
+          signal: attempt.signal,
+          onCaptureStartRequested: (recordingId) => {
+            console.log(
+              `[recording-start-latency] click to capture request ${Math.round(performance.now() - recordingClickAt)}ms`,
+            );
+            captureStartRequestedDuringStart = true;
+            if (recordingStartAttemptRef.current === attempt) {
+              captureStartedDuringStartRef.current = true;
+            }
+            sessionRecordingIdRef.current = recordingId;
+          },
+        },
+        audioCue,
+      );
+      audioCueTransferred = true;
+      if (isMacPlatform() && !nativeCaptureRecordingActive) {
+        parkPopoverTimer = window.setTimeout(() => {
+          if (
+            !attempt.signal.aborted &&
+            recordingStartAttemptRef.current === attempt
+          ) {
+            invoke("park_popover_offscreen").catch(() => {});
+            emit("clips:popover-visible", false).catch(() => {});
+          }
+        }, 250);
       }
-
-      // No watchdog — the macOS screen picker can stay open indefinitely
-      // (a user deciding which window to capture may take 20, 60, 180
-      // seconds). A false-positive timeout here fires recovery mid-setup,
-      // which flips `recordingFlowActive` back to false → the bubble
-      // session effect's cleanup runs and stops the popover-owned camera
-      // stream → the recorder ends up with a dead track when the screen
-      // picker finally resolves. If the user actually wants to abort,
-      // canceling the picker throws NotAllowedError and we recover through
-      // the normal error path.
-      handle = await recordingPromise;
-      console.log("[clips-popover] recorder handle received");
+      const started = await recordingPromise;
+      if (attempt.signal.aborted && !captureStartRequestedDuringStart) {
+        await boundedCleanup(started.cancel());
+        attempt.ensureActive();
+      }
+      attempt.captureSuspension = null;
+      // Capture already began: an abandoned start stops and keeps the take.
+      if (
+        (stopRequestedDuringStart || attempt.signal.aborted) &&
+        captureStartRequestedDuringStart
+      ) {
+        stoppedDuringStart = true;
+        await finishRecordingStopRef.current(
+          started,
+          sessionRecordingIdRef.current,
+        );
+      } else {
+        handle = started;
+        console.log("[clips-popover] recorder handle received");
+      }
     } catch (err) {
       startError = err;
+      if (!isRecordingStartCancellation(err)) {
+        void notifyRecordingFailure({
+          kind: "start",
+          id: `start:${startAttemptId}`,
+          localCopyVerified: false,
+          title: desktopRecordingFailureCopy.startTitle,
+          body: desktopRecordingFailureCopy.startBody,
+          visible:
+            recordingErrorVisibleRef.current.visible &&
+            recordingErrorVisibleRef.current.view === "recorder",
+        });
+      }
     } finally {
-      // If the recorder handle was NEVER set, ALWAYS run recovery here —
-      // even if downstream code throws before reaching the failure
-      // branch. This makes the tray-dead symptom impossible: regardless
-      // of WHICH step failed (stream acquisition, countdown, createRecording,
-      // MediaRecorder.start, watchdog, unexpected throw), is_recording_active
-      // is flipped back to false and the popover is re-shown.
-      if (!handle) {
+      if (!audioCueTransferred) audioCue.cleanup();
+      if (parkPopoverTimer !== null) {
+        window.clearTimeout(parkPopoverTimer);
+        parkPopoverTimer = null;
+      }
+      unlistenStartupStop?.();
+      if (
+        !handle &&
+        !stoppedDuringStart &&
+        recordingStartAttemptRef.current === attempt
+      ) {
+        attempt.cancel();
         console.warn(
           "[clips-popover] handleStartRecording finally: no handle — running recovery",
         );
-        // Clear the force-alive flag if it was latched before the failure.
         (window as unknown as { clipsForceAlive?: boolean }).clipsForceAlive =
           false;
-        // Hand the stream back to the popover session. The recorder
-        // never got far enough to take ownership of the tracks, so the
-        // bubble-session effect must be allowed to stop them again on
-        // its next cleanup (e.g. if the user closes the popover).
         bubbleStreamTransferredToRecorder.current = false;
+        await recoverRecordingStart(attempt, nativeWindowRecordingActive);
         recordingFlowGateRef.current = false;
         setRecordingFlowActive(false);
-        try {
-          await invoke("set_recording_state", { active: false });
-        } catch {
-          // ignore — best-effort
-        }
-        try {
-          await invoke("show_popover");
-        } catch {
-          // ignore — best-effort
-        }
+      }
+      if (recordingStartAttemptRef.current === attempt) {
+        recordingStartAttemptRef.current = null;
+        captureStartedDuringStartRef.current = false;
+        setRecordingStartPending(false);
       }
     }
 
     if (handle) {
       setRecorder(handle);
-      return;
+      requestLookbackForRecording(
+        effectiveLookbackSeconds({
+          labEnabled: lookbackLabEnabled,
+          rewindOn,
+          seconds: lookbackSeconds,
+        }),
+      );
+      return handle;
     }
+    if (stoppedDuringStart) return null;
 
-    // Failure path — the recorder never came up. Side-effects (recording
-    // flag + popover visibility) were already restored in the finally
-    // block above. Now surface any non-cancel error to the UI.
     console.error("[clips-popover] handleStartRecording failed:", startError);
 
-    // User cancelled the macOS screen-picker (or denied permission). WebKit
-    // often reports both as NotAllowedError; only show the big permissions
-    // banner when the message carries a hard macOS/privacy failure signal.
-    const errName =
-      startError instanceof DOMException || startError instanceof Error
-        ? startError.name
-        : "";
+    if (startError instanceof ScreenRecordingPermissionError) {
+      setRecError(MACOS_SCREEN_PERMISSION_MESSAGE);
+      openPrivacySettings("screen");
+      return null;
+    }
+
     const message =
       startError instanceof Error ? startError.message : String(startError);
-    if (errName === "AbortError" || /was cancelled|dismissed/i.test(message)) {
+    if (isRecordingStartCancellation(startError)) {
+      return null;
+    }
+    if (isHardCapturePermissionError(message)) {
+      setRecError(
+        isUpdatePendingRestart()
+          ? MACOS_UPDATE_RESTART_MESSAGE
+          : isMacPlatform()
+            ? MACOS_CAPTURE_PERMISSION_MESSAGE
+            : DESKTOP_CAPTURE_PERMISSION_MESSAGE,
+      );
+      return null;
+    }
+    if (isStorageSetupFailureMessage(message)) {
+      setRecError(STORAGE_SETUP_HELP_TEXT);
+      openVideoStorageSetup();
+      return null;
+    }
+    if (
+      message === RECORDING_SESSION_EXPIRED ||
+      message === RECORDING_SERVER_UNAVAILABLE
+    ) {
+      setRecError(message);
+      return null;
+    }
+    setRecError(message);
+    return null;
+  }
+
+  async function reconnectSession() {
+    const authResult = await checkAuth();
+    if (authResult.state === "unavailable") {
+      setRecError(RECORDING_SERVER_UNAVAILABLE);
       return;
     }
     if (
-      errName === "NotAllowedError" &&
-      !isHardCapturePermissionError(message)
+      authResult.state === "authenticated" ||
+      authResult.state === "anonymous"
     ) {
-      return;
+      setRecError(null);
     }
-    if (isHardCapturePermissionError(message)) {
-      setRecError(MACOS_CAPTURE_PERMISSION_MESSAGE);
-      return;
-    }
-    setRecError(message);
   }
 
-  function updateReadinessOpen(next: boolean) {
-    setReadinessOpen(next);
-    if (!next) saveBool(READINESS_REVIEWED_KEY, true);
+  handleStartRecordingRef.current = handleStartRecording;
+
+  useEffect(() => {
+    let cancelled = false;
+    const unlisteners: Array<() => void> = [];
+    const cancelStart = () => {
+      // Once capture has begun only the pill's confirmed discard deletes it.
+      if (captureStartedDuringStartRef.current) return;
+      if (restartInFlightRef.current) restartCancelledRef.current = true;
+      recordingStartAttemptRef.current?.cancel();
+    };
+    for (const event of ["clips:recorder-cancel", "clips:countdown-cancel"]) {
+      listen(event, cancelStart)
+        .then((nextUnlisten) => {
+          if (cancelled) {
+            nextUnlisten();
+            return;
+          }
+          unlisteners.push(nextUnlisten);
+        })
+        .catch(() => {});
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") cancelStart();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelled = true;
+      recordingStartAttemptRef.current?.cancel();
+      unlisteners.forEach((unlisten) => unlisten());
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+
+  function beginRecording(
+    options?: Parameters<typeof handleStartRecording>[0],
+    beginOptions?: { revealPopoverIfMicOff?: boolean },
+  ) {
+    if (!micOn) {
+      if (beginOptions?.revealPopoverIfMicOff) {
+        invoke("show_popover").catch(() => {});
+      }
+      setMicOffConfirmOpen(true);
+      return;
+    }
+    void handleStartRecording(options);
   }
+
+  function closeMicOffConfirmation() {
+    setMicOffConfirmOpen(false);
+  }
+
+  recordShortcutHandlerRef.current = () => {
+    if (recordingStartAttemptRef.current || restartInFlightRef.current) {
+      if (restartInFlightRef.current) restartCancelledRef.current = true;
+      recordingStartAttemptRef.current?.cancel();
+      emit("clips:countdown-cancel").catch(() => {});
+      return;
+    }
+    if (recorder) {
+      void requestRecordingShortcutStop().catch((error) => {
+        console.error("[clips] Recording shortcut stop failed:", error);
+      });
+      return;
+    }
+    if (recordingFlowGateRef.current || recordingFlowActive) {
+      emit("clips:countdown-cancel").catch(() => {});
+      return;
+    }
+    if (recordingStopFinalizingRef.current) {
+      invoke("show_popover").catch(() => {});
+      return;
+    }
+
+    setPopoverView("recorder");
+    if (authStatus !== "authed" && localRecordingMode === "off") {
+      if (authStatus === "anon") {
+        setRecError("Sign in to Clips before using the recording shortcut.");
+      }
+      invoke("show_popover").catch(() => {});
+      return;
+    }
+
+    const canStartFromGlobalShortcut =
+      mode === "camera" || nativeCaptureRecordingActive;
+    if (!canStartFromGlobalShortcut) {
+      setRecError(
+        "Open Clips and click Start recording to use the selected source.",
+      );
+      invoke("show_popover").catch(() => {});
+      return;
+    }
+
+    beginRecording(undefined, { revealPopoverIfMicOff: true });
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenAcks: (() => void) | undefined;
+    let unlistenShortcut: (() => void) | undefined;
+    void listenForRecordingShortcutStopAcks()
+      .then((unlisten) => {
+        if (cancelled) unlisten();
+        else unlistenAcks = unlisten;
+      })
+      .catch((error) => {
+        console.error("[clips] stop acknowledgement listener failed:", error);
+      });
+    void listen("clips:record-shortcut", () => {
+      recordShortcutHandlerRef.current();
+    })
+      .then((unlisten) => {
+        if (cancelled) unlisten();
+        else unlistenShortcut = unlisten;
+      })
+      .catch((error) => {
+        console.error("[clips] record shortcut listener failed:", error);
+      });
+    return () => {
+      cancelled = true;
+      unlistenShortcut?.();
+      unlistenAcks?.();
+    };
+  }, []);
 
   function retryCameraPreview() {
     setCameraError(null);
@@ -2105,18 +4088,9 @@ export function App() {
     window.setTimeout(() => setCameraOn(true), 0);
   }
 
-  // When the toolbar or countdown triggers stop/cancel the popover auto-
-  // rehydrates into a "last recording" state so the user has a single-click
-  // path to the playback page + knows the upload landed.
   useEffect(() => {
     if (!recorder) return;
     let cancelled = false;
-    // Each Promise<UnlistenFn> is still pending when this effect might
-    // already be tearing down (a fast stop→cancel toggle, or the effect
-    // re-running due to a new recorder). If the unlisten arrives after
-    // cleanup ran, call it immediately — otherwise Tauri keeps the
-    // listener registered for the lifetime of the webview, and each
-    // orphaned closure pins `recorder` + its MediaStream graph.
     const unlisteners: Array<() => void> = [];
     const track = (p: Promise<() => void>) => {
       p.then((u) => {
@@ -2134,64 +4108,56 @@ export function App() {
       });
     };
     track(
+      listen<{ recordingId?: string | null }>(
+        "clips:recorder-session",
+        (event) => {
+          sessionRecordingIdRef.current = event.payload?.recordingId ?? null;
+        },
+      ),
+    );
+    track(
       listen("clips:recorder-stop", async () => {
-        let stopFailed = false;
-        let stopResult: RecorderStopResult | null = null;
-        try {
-          stopResult = await recorder.stop();
-          if (cancelled) return;
-          if (stopResult.localOnly) {
-            setLocalRecordingNotice({
-              folderPath: stopResult.localFolder,
-              files: stopResult.localFiles ?? [],
-            });
-          } else {
-            setLastRecordingId(stopResult.recordingId);
-          }
-        } catch (err) {
-          stopFailed = true;
-          if (!cancelled) {
-            setRecError(err instanceof Error ? err.message : String(err));
-            await loadPendingUploads();
-          }
-        } finally {
-          if (!cancelled) {
-            // Clear the force-alive flag — recording is done, the pump
-            // can honor document.hidden normally again.
-            (
-              window as unknown as { clipsForceAlive?: boolean }
-            ).clipsForceAlive = false;
-            // Recorder has stopped its tracks; next popover session can
-            // acquire the camera cleanly again.
-            bubbleStreamTransferredToRecorder.current = false;
-            bubbleStreamRef.current = null;
-            recordingFlowGateRef.current = false;
-            setRecorder(null);
-            setRecordingFlowActive(false);
-            invoke("set_recording_state", { active: false }).catch(() => {});
-            if (stopFailed || stopResult?.localOnly) {
-              invoke("show_popover").catch(() => {});
-            } else {
-              // Close the popover — recorder.stop() already opened the
-              // recording's page in the default browser. The popover doesn't
-              // need to hang around.
-              getCurrentWindow()
-                .hide()
-                .catch(() => {});
-              emit("clips:popover-visible", false).catch(() => {});
-            }
-            if (!stopResult?.localOnly) {
-              fetchRecent();
-            }
-          }
-        }
+        if (
+          cancelled ||
+          restartInFlightRef.current ||
+          recordingStopFinalizingRef.current ||
+          recordingCancelInFlightRef.current
+        )
+          return;
+        void finishRecordingStopRef.current(
+          recorder,
+          sessionRecordingIdRef.current,
+        );
       }),
     );
     track(
-      listen("clips:recorder-cancel", async () => {
+      listen(RECORDER_DISCARD_EVENT, async () => {
+        if (
+          cancelled ||
+          restartInFlightRef.current ||
+          recordingStopFinalizingRef.current ||
+          recordingCancelInFlightRef.current
+        )
+          return;
+        recordingCancelInFlightRef.current = true;
+        removeLookbackContext();
+        const cancelDone = recorder.cancel();
+        // Optimistic feedback: bring the popover back and clear the tray's
+        // recording state the moment the cancel is dispatched — the recorder
+        // teardown can take seconds and neither call depends on it. The flow
+        // gate below must NOT be released here: it stays latched until
+        // cancel() resolves so a fast Start can't race the tearing-down
+        // session.
+        if (!cancelled) {
+          invoke("set_recording_state", { active: false }).catch(() => {});
+          invoke("show_popover").catch(() => {});
+        }
         try {
-          await recorder.cancel();
+          await cancelDone;
+        } catch (err) {
+          setRecError(err instanceof Error ? err.message : String(err));
         } finally {
+          recordingCancelInFlightRef.current = false;
           if (!cancelled) {
             (
               window as unknown as { clipsForceAlive?: boolean }
@@ -2201,33 +4167,53 @@ export function App() {
             recordingFlowGateRef.current = false;
             setRecorder(null);
             setRecordingFlowActive(false);
-            invoke("set_recording_state", { active: false }).catch(() => {});
-            invoke("show_popover").catch(() => {});
+            setBubbleSessionEpoch((epoch) => epoch + 1);
           }
         }
       }),
     );
     track(
       listen("clips:recorder-restart", async () => {
+        if (
+          cancelled ||
+          recordingStopFinalizingRef.current ||
+          recordingCancelInFlightRef.current
+        )
+          return;
+        if (restartInFlightRef.current) return;
+        restartInFlightRef.current = true;
+        restartCancelledRef.current = false;
+        let handoff: RestartHandoff | null = null;
         try {
-          await recorder.cancel();
-        } finally {
-          if (!cancelled) {
+          handoff = await recorder.discardForRestart();
+          removeLookbackContext();
+          if (cancelled) return;
+          if (restartCancelledRef.current) {
+            await recorder.cancel();
+            recordingFlowGateRef.current = false;
             (
               window as unknown as { clipsForceAlive?: boolean }
             ).clipsForceAlive = false;
             bubbleStreamTransferredToRecorder.current = false;
             bubbleStreamRef.current = null;
-            recordingFlowGateRef.current = false;
             setRecorder(null);
             setRecordingFlowActive(false);
-            invoke("set_recording_state", { active: false }).catch(() => {});
-            // Starting a new browser capture must come from a fresh click in
-            // this webview. The toolbar click arrives here through async Tauri
-            // IPC, so reopen the popover and let the next Start click provide
-            // the required user activation.
-            invoke("show_popover").catch(() => {});
+            setBubbleSessionEpoch((epoch) => epoch + 1);
+            void boundedCleanup(invoke("show_popover"));
+            return;
           }
+          setRecordingChromeEpoch((epoch) => epoch + 1);
+          setRecorder(null);
+          const restarted = await handleStartRecordingRef.current({
+            resumeCapture: handoff,
+          });
+          if (restarted) handoff = null;
+        } catch (err) {
+          console.error("[clips-popover] restart failed:", err);
+          setRecError(err instanceof Error ? err.message : String(err));
+        } finally {
+          if (handoff) stopRestartHandoff(handoff);
+          restartInFlightRef.current = false;
         }
       }),
     );
@@ -2242,30 +4228,304 @@ export function App() {
       });
       unlisteners.length = 0;
     };
-  }, [recorder, fetchRecent, loadPendingUploads]);
+  }, [
+    recorder,
+    loadPendingUploads,
+    reportRecordingFailure,
+    localRecordingMode,
+    serverUrl,
+  ]);
 
-  // Auto-hide on blur is handled on the Rust side (tauri::WindowEvent::Focused).
+  const recordFirstPending = recordFirstFiles.length;
+  useEffect(() => {
+    if (
+      recordFirstPending > 0 &&
+      authStatus === "authed" &&
+      videoStorageStatus === "configured" &&
+      !recorder
+    ) {
+      void uploadRecordFirstFilesRef.current();
+    }
+  }, [authStatus, recorder, recordFirstPending, videoStorageStatus]);
 
-  const showCameraRow = mode !== "screen"; // screen-only has no camera
-  const showSourceRow = mode !== "camera"; // camera-only has no screen source
+  const showSourceRow = mode !== "camera";
+  const imminentMeeting = meetings.find(meetingCanStartNotes) ?? null;
+  const recordingReadinessPending =
+    localRecordingMode === "off" && authStatus !== "authed";
+  const startButtonLoading =
+    (recordingReadinessPending || recordingStartPending) &&
+    !recordingStopFinalizing;
+  const startButtonLabel = recordingStopFinalizing
+    ? desktopRecoveryCopy.finishing
+    : mode === "camera"
+      ? "Start camera recording"
+      : localRecordingMode === "off"
+        ? "Start recording"
+        : "Start local recording";
 
-  // During recording the popover is normally hidden — the tray click and the
-  // global shortcut both emit `clips:recorder-stop` directly, and the
-  // floating left-edge toolbar has the canonical Stop button. If the popover
-  // does somehow end up visible (dock reopen, global-shortcut race, etc.),
-  // we just render the normal pre-record panel so the user at least knows
-  // where they are. No recording-only UI lives here.
+  const recoveryProps: RecordingRecoveryProps = {
+    uploads: pendingUploads,
+    lookupErrors: recoverySnapshot.errors,
+    actionErrors: recoveryActionErrors,
+    refreshing: recoveryRefreshing,
+    authenticated: authStatus === "authed",
+    finalizing: recordingStopFinalizing,
+    finalizingRecordingId: sessionRecordingIdRef.current,
+    activeRecordingId:
+      isRecording || recordingStartPending
+        ? sessionRecordingIdRef.current
+        : null,
+    showFinalizing: popoverView !== "recorder" || authStatus !== "authed",
+    retryingUploadId,
+    retryingUploadStatus,
+    exportingUploadId,
+    needsStorage: isStorageSetupFailureMessage,
+    onRefresh: () => void loadPendingUploads(),
+    onExport: exportPendingUpload,
+    onRetry: retryPendingUpload,
+    onCancelRetry: cancelPendingUploadRetry,
+    onOpenFolder: openPendingUploadFolder,
+    onReviewFiles: (key) => {
+      void invoke("native_fullscreen_open_drafts_folder").catch((error) => {
+        setRecoveryActionErrors((errors) => ({
+          ...errors,
+          [key]: error instanceof Error ? error.message : String(error),
+        }));
+      });
+    },
+    onOpenLogs: (key) => {
+      void invoke("open_logs").catch((error) => {
+        setRecoveryActionErrors((errors) => ({
+          ...errors,
+          [key]: error instanceof Error ? error.message : String(error),
+        }));
+      });
+    },
+    onConnectStorage: (upload) => {
+      const key = recordingRecoveryKey(upload);
+      const targetServerUrl = serverUrlForPendingUpload(upload, serverUrl);
+      setRecoveryActionErrors((errors) => {
+        const next = { ...errors };
+        delete next[key];
+        return next;
+      });
+      void openExternal(`${targetServerUrl}/record`).catch((error) => {
+        setRecoveryActionErrors((errors) => ({
+          ...errors,
+          [key]: error instanceof Error ? error.message : String(error),
+        }));
+      });
+    },
+  };
+  const pendingUploadBanner = shouldShowRecordingRecoveryBanner(
+    popoverView,
+    authStatus === "authed",
+  ) ? (
+    <RecordingRecovery
+      {...recoveryProps}
+      onOpen={recoveryNavigation.openRecovery}
+      triggerRef={recoveryNavigation.triggerRef}
+    />
+  ) : null;
 
-  if (showSettings) {
+  async function copyRewindAgentPrompt() {
+    try {
+      await navigator.clipboard.writeText(REWIND_AGENT_PROMPT);
+      setRewindAgentPromptCopied(true);
+      window.setTimeout(() => setRewindAgentPromptCopied(false), 1_500);
+    } catch (err) {
+      console.error("[clips-tray] copy Rewind agent prompt failed:", err);
+    }
+  }
+
+  if (agentHandoff) {
+    const durationSeconds = Math.max(
+      1,
+      Math.round(
+        (new Date(agentHandoff.endAt).getTime() -
+          new Date(agentHandoff.startAt).getTime()) /
+          1_000,
+      ),
+    );
     return (
       <div className="app app-settings" ref={appRef}>
+        <div className="setup popover-view rewind-settings-surface">
+          <div className="setup-header">
+            <h2>
+              {agentHandoff.status === "pending"
+                ? "Review before sending"
+                : agentHandoff.status === "processing"
+                  ? "Making a private Clip"
+                  : agentHandoff.status === "ready"
+                    ? "Clip sent to your agent"
+                    : "Couldn't send this Clip"}
+            </h2>
+          </div>
+          <div className="rewind-agent-guide">
+            <div className="rewind-agent-guide-icon">
+              <IconHistory size={17} stroke={1.8} />
+            </div>
+            <div>
+              <strong>{agentHandoff.reason}</strong>
+              <p>
+                {new Date(agentHandoff.startAt).toLocaleString()} –{" "}
+                {new Date(agentHandoff.endAt).toLocaleTimeString()} ·{" "}
+                {durationSeconds} seconds
+              </p>
+            </div>
+          </div>
+          <div className="rewind-local-promise">
+            <IconShieldLock size={17} stroke={1.8} />
+            <p>
+              <strong>Only this range becomes a private Clip.</strong> The
+              rolling Rewind archive stays on this device.
+              {agentHandoff.agentClipRetention === "forever"
+                ? " This Clip will be kept in your Library."
+                : ` It follows your ${agentHandoff.agentClipRetention.replace("-", " ")} retention setting.`}
+            </p>
+          </div>
+          {agentHandoff.status === "pending" ? (
+            <>
+              <div className="setup-grid">
+                <div className="setup-mini-field">
+                  <span>Microphone</span>
+                  <Switch
+                    checked={agentHandoff.includeMicrophone}
+                    onCheckedChange={(includeMicrophone) =>
+                      setAgentHandoff({ ...agentHandoff, includeMicrophone })
+                    }
+                    label="Include microphone audio"
+                  />
+                </div>
+                <div className="setup-mini-field">
+                  <span>System audio</span>
+                  <Switch
+                    checked={agentHandoff.includeSystemAudio}
+                    onCheckedChange={(includeSystemAudio) =>
+                      setAgentHandoff({ ...agentHandoff, includeSystemAudio })
+                    }
+                    label="Include system audio"
+                  />
+                </div>
+              </div>
+              <button
+                type="button"
+                className="secondary"
+                disabled={agentHandoffPreviewBusy}
+                onClick={() => void previewAgentHandoff(agentHandoff)}
+              >
+                {agentHandoffPreviewBusy
+                  ? "Preparing preview…"
+                  : "Preview range"}
+              </button>
+              {agentHandoffPreviewError ? (
+                <p className="setup-error" role="alert">
+                  {agentHandoffPreviewError}
+                </p>
+              ) : null}
+              <button
+                type="button"
+                className="primary rewind-consent-primary"
+                onClick={() => void processAgentHandoff(agentHandoff)}
+              >
+                Send to agent
+              </button>
+              <button
+                type="button"
+                className="rewind-quiet-button"
+                onClick={async () => {
+                  await updateAgentHandoff(agentHandoff.requestId, "declined");
+                  setAgentHandoff(null);
+                }}
+              >
+                Don’t send
+              </button>
+            </>
+          ) : agentHandoff.status === "processing" ? (
+            <p className="setup-hint" role="status">
+              Making a private Clip of this range and preparing transcript and
+              frame access for your agent…
+            </p>
+          ) : agentHandoff.status === "ready" ? (
+            <>
+              <p className="setup-hint" role="status">
+                Your agent received a temporary link. The private Clip stays in
+                your Library under your retention setting.
+              </p>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => {
+                  if (!agentHandoff.agentUrl) return;
+                  import("@tauri-apps/plugin-shell")
+                    .then(({ open }) => open(agentHandoff.agentUrl!))
+                    .catch(() => {});
+                }}
+              >
+                Open Clip
+              </button>
+              <button
+                type="button"
+                className="primary rewind-consent-primary"
+                onClick={() => setAgentHandoff(null)}
+              >
+                Done
+              </button>
+            </>
+          ) : (
+            <>
+              <p className="setup-error" role="alert">
+                {agentHandoff.error || "This Clip couldn't be sent. Try again."}
+              </p>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setAgentHandoff(null)}
+              >
+                Close
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (popoverView === "recovery") {
+    return (
+      <div className="app app-popover-view" ref={appRef}>
+        <RecordingRecoveryPage
+          {...recoveryProps}
+          onBack={recoveryNavigation.closeRecovery}
+        />
+      </div>
+    );
+  }
+
+  if (popoverView === "memory") {
+    return (
+      <div className="app app-settings" ref={appRef}>
+        {isRecording ? <ActiveRecordingBanner /> : null}
         <Setup
+          surface="memory"
+          meetingsLabEnabled={meetingsLabEnabled}
+          wisprFlowLabEnabled={wisprFlowLabEnabled}
+          labValues={labValues}
+          labError={labError}
+          labsSignedIn={authStatus === "authed"}
+          onLabEnabledChange={(lab, enabled) =>
+            void setLabEnabled(lab, enabled)
+          }
+          recordingActive={isRecording || recordingFlowActive}
           initial={serverUrl}
           serverUrl={serverUrl}
           signedInAs={signedInAs}
           voiceShortcut={voiceShortcut}
           voiceCustomShortcut={voiceCustomShortcut}
           popoverCustomShortcut={popoverCustomShortcut}
+          recordCustomShortcut={recordCustomShortcut}
+          recordCancelShortcut={recordCancelShortcut}
+          recordPauseShortcut={recordPauseShortcut}
           voiceMode={voiceMode}
           voiceProvider={voiceProvider}
           voiceInstructions={voiceInstructions}
@@ -2273,6 +4533,9 @@ export function App() {
           onVoiceShortcutChange={updateVoiceShortcut}
           onVoiceCustomShortcutChange={setVoiceCustomShortcut}
           onPopoverCustomShortcutChange={setPopoverCustomShortcut}
+          onRecordCustomShortcutChange={setRecordCustomShortcut}
+          onRecordCancelShortcutChange={setRecordCancelShortcut}
+          onRecordPauseShortcutChange={setRecordPauseShortcut}
           onVoiceModeChange={setVoiceMode}
           onVoiceProviderChange={setVoiceProvider}
           onVoiceInstructionsChange={setVoiceInstructions}
@@ -2280,48 +4543,129 @@ export function App() {
           onConnect={(url) => {
             saveString(STORAGE_KEY, url.replace(/\/+$/, ""));
             setServerUrl(url.replace(/\/+$/, ""));
-            setShowSettings(false);
+            setPopoverView("recorder");
           }}
-          onCancel={() => setShowSettings(false)}
+          rewindAgentPromptCopied={rewindAgentPromptCopied}
+          onCopyRewindAgentPrompt={copyRewindAgentPrompt}
+          onOpenRewindDocs={openRewindDocs}
+          onCancel={() => openSettings("rewind")}
         />
       </div>
     );
   }
 
-  // When unauthenticated, render the sign-in form INLINE in the popover
-  // (not a separate Tauri window). This avoids Tauri 2's separate-WebKit-
-  // data-store-per-WebviewWindow cookie-jar issue — the cookie is set in
-  // the same webview that reads it on the next /auth/session poll.
-  // OAuth (Google / Apple) still needs a browser, so we offer that as a
-  // secondary link via signInExternal().
-  if (authStatus === "anon") {
+  if (popoverView === "settings") {
+    return (
+      <div className="app app-settings" ref={appRef}>
+        {isRecording ? <ActiveRecordingBanner /> : null}
+        <Setup
+          initialSettingsTab={initialSettingsTab}
+          onSettingsTabChange={setInitialSettingsTab}
+          meetingsLabEnabled={meetingsLabEnabled}
+          wisprFlowLabEnabled={wisprFlowLabEnabled}
+          labValues={labValues}
+          labError={labError}
+          labsSignedIn={authStatus === "authed"}
+          onLabEnabledChange={(lab, enabled) =>
+            void setLabEnabled(lab, enabled)
+          }
+          recordingActive={isRecording || recordingFlowActive}
+          initial={serverUrl}
+          serverUrl={serverUrl}
+          signedInAs={signedInAs}
+          voiceShortcut={voiceShortcut}
+          voiceCustomShortcut={voiceCustomShortcut}
+          popoverCustomShortcut={popoverCustomShortcut}
+          recordCustomShortcut={recordCustomShortcut}
+          recordCancelShortcut={recordCancelShortcut}
+          recordPauseShortcut={recordPauseShortcut}
+          voiceMode={voiceMode}
+          voiceProvider={voiceProvider}
+          voiceInstructions={voiceInstructions}
+          shortcutRegistrationError={shortcutRegistrationError}
+          onVoiceShortcutChange={updateVoiceShortcut}
+          onVoiceCustomShortcutChange={setVoiceCustomShortcut}
+          onPopoverCustomShortcutChange={setPopoverCustomShortcut}
+          onRecordCustomShortcutChange={setRecordCustomShortcut}
+          onRecordCancelShortcutChange={setRecordCancelShortcut}
+          onRecordPauseShortcutChange={setRecordPauseShortcut}
+          onVoiceModeChange={setVoiceMode}
+          onVoiceProviderChange={setVoiceProvider}
+          onVoiceInstructionsChange={setVoiceInstructions}
+          onSignOut={signOut}
+          onConnect={(url) => {
+            saveString(STORAGE_KEY, url.replace(/\/+$/, ""));
+            setServerUrl(url.replace(/\/+$/, ""));
+            setPopoverView("recorder");
+          }}
+          rewindAgentPromptCopied={rewindAgentPromptCopied}
+          onCopyRewindAgentPrompt={copyRewindAgentPrompt}
+          onOpenRewindDocs={openRewindDocs}
+          onOpenMemory={() => setPopoverView("memory")}
+          rewindConsentPending={rewindConsentPending}
+          onRewindConsentHandled={() => setRewindConsentPending(false)}
+          onCancel={() => setPopoverView("recorder")}
+        />
+      </div>
+    );
+  }
+
+  if (popoverView === "meetings" && meetingsLabEnabled) {
+    return (
+      <div className="app app-popover-view" ref={appRef}>
+        {isRecording ? <ActiveRecordingBanner /> : null}
+        <MeetingsPopoverView
+          meetings={meetings}
+          loading={meetingsLoading}
+          error={meetingsError}
+          startMessage={meetingStartMessage}
+          activeMeetingId={activeMeetingId}
+          meetingsEnabled={featureConfig?.meetingsEnabled !== false}
+          rewindHistoryAvailability={rewindMeetingHistoryAvailability}
+          onBack={() => setPopoverView("recorder")}
+          onRefresh={fetchUpcomingMeetings}
+          onOpenMeetings={() => openInBrowser("/meetings")}
+          onOpenMeeting={(meetingId) =>
+            openInBrowser(`/meetings/${encodeURIComponent(meetingId)}`)
+          }
+          onOpenSettings={() => openSettings()}
+          onStartNotes={startMeetingNotes}
+          onStartNotesAndJoin={startMeetingNotesAndJoin}
+          onShowActiveMeeting={showActiveMeetingPill}
+          calendarNeedsReauth={meetingsCalendarNeedsReauth}
+        />
+      </div>
+    );
+  }
+
+  if (authStatus === "anon" || authStatus === "unavailable") {
     return (
       <div className="app" ref={appRef}>
-        <Header
-          mode={mode}
-          onModeChange={setMode}
-          submitterEmail={signedInAs}
-        />
-        <UpdateBanner />
-        {signInPending ? (
-          <div className="signin-pending">
-            <div className="signin-pending-spinner" />
-            <p className="signin-pending-text">Waiting for browser sign-in…</p>
-            <button
-              type="button"
-              className="signin-pending-cancel"
-              onClick={() => {
-                if (pollIntervalRef.current !== null) {
-                  clearInterval(pollIntervalRef.current);
-                  pollIntervalRef.current = null;
-                }
-                signInInflightRef.current = false;
-                setSignInPending(false);
-                setSignInError(null);
-              }}
-            >
-              Cancel
-            </button>
+        {/* Signed out, the only job on this screen is signing in. Capture
+            modes, Feedback, and Settings all act on an account that does not
+            exist yet, so they appear after auth rather than competing with it.
+            The menubar toggle remains the single way to dismiss the popover. */}
+        {signInPending === "google" ? (
+          <div data-tw-surface>
+            <Empty className="w-full border-none">
+              <EmptyHeader>
+                <EmptyTitle>Sign in from your browser</EmptyTitle>
+                <EmptyDescription>
+                  We opened a tab for {serverHostForSignIn}. Approve access
+                  there and Clips picks it up from here.
+                </EmptyDescription>
+              </EmptyHeader>
+              <EmptyContent>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 rounded-md px-3 text-sm"
+                  onClick={cancelSignIn}
+                >
+                  Cancel
+                </Button>
+              </EmptyContent>
+            </Empty>
           </div>
         ) : (
           <>
@@ -2332,64 +4676,117 @@ export function App() {
               serverUrl={serverUrl}
               onSignedIn={async () => {
                 setSignInError(null);
-                await checkAuth();
+                const authResult = await checkAuth();
+                if (authResult.state === "unavailable") {
+                  setSignInError(
+                    "Signed in, but Clips couldn't reach the server to verify it. Try again.",
+                  );
+                }
               }}
               onUseBrowser={signInExternal}
+              onMagicLink={requestMagicLink}
+              magicLinkSentEmail={
+                signInPending === "magic-link" ? magicLinkEmail : null
+              }
+              onMagicLinkBack={cancelSignIn}
             />
+            {/* The escape hatches. An unreachable server names itself; a
+                reachable-but-WRONG server (packaged default when the user
+                wants self-hosted, dev build on the wrong port) answers 401
+                forever, and without this link the only way into Settings ›
+                Advanced is signing in to a server the user never wanted. */}
+            <div className="footer">
+              <span>
+                {serverReachable
+                  ? serverHostForSignIn
+                  : `Can’t reach ${serverHostForSignIn}`}
+              </span>
+              <a
+                className="footer-link"
+                onClick={() => openSettings("advanced")}
+              >
+                Change server
+              </a>
+            </div>
           </>
         )}
-        <div className="footer">
-          <a className="footer-link" onClick={() => setShowSettings(true)}>
-            Settings
-          </a>
-        </div>
       </div>
     );
   }
 
   return (
-    <div className="app" ref={appRef}>
-      <Header mode={mode} onModeChange={setMode} submitterEmail={signedInAs} />
-      <UpdateBanner />
-
-      {pendingUploads.length > 0 ? (
-        <PendingUploadBanner
-          uploads={pendingUploads}
-          retryingUploadId={retryingUploadId}
-          exportingUploadId={exportingUploadId}
-          discardingUploadId={discardingUploadId}
-          onExport={exportPendingUpload}
-          onRetry={retryPendingUpload}
-          onDiscard={discardPendingUpload}
-          onOpenFolder={openPendingUploadFolder}
-        />
-      ) : null}
-
-      {localRecordingMode !== "off" ? (
-        <LocalRecordingModeBanner mode={localRecordingMode} />
-      ) : null}
-
-      {localRecordingNotice ? (
-        <LocalRecordingSavedBanner
-          notice={localRecordingNotice}
-          onDismiss={() => setLocalRecordingNotice(null)}
-          onOpenFolder={() => {
-            if (!localRecordingNotice.folderPath) return;
-            invoke("open_local_recording_folder", {
-              path: localRecordingNotice.folderPath,
-            }).catch((err) => {
-              console.error("[clips-tray] open local folder failed:", err);
-            });
+    <div className="app app-recorder" ref={appRef}>
+      {micOffConfirmOpen ? (
+        <MicOffConfirmation
+          onBack={closeMicOffConfirmation}
+          onContinue={() => {
+            setMicOffConfirmOpen(false);
+            void handleStartRecording();
           }}
         />
       ) : null}
 
-      <div className="panel">
-        {showSourceRow ? (
-          <SourceRow value={source} onChange={setSource} />
+      <div className="recorder-home-content">
+        <Header mode={mode} onModeChange={selectCaptureMode} />
+        <UpdateBanner />
+
+        {meetingsLabEnabled && imminentMeeting ? (
+          <ImminentMeetingRow
+            meeting={imminentMeeting}
+            onStartNotes={() => startMeetingNotes(imminentMeeting)}
+          />
         ) : null}
 
-        {showCameraRow ? (
+        {isRecording ? <ActiveRecordingBanner /> : null}
+
+        {localRecordingMode !== "off" ? (
+          <LocalRecordingModeBanner mode={localRecordingMode} />
+        ) : null}
+
+        {lookbackNotice ? (
+          <p role="status" className="setup-warning">
+            {lookbackNotice}
+          </p>
+        ) : null}
+
+        {localRecordingNotice ? (
+          <LocalRecordingSavedBanner
+            notice={localRecordingNotice}
+            onDismiss={() => setLocalRecordingNotice(null)}
+            onOpenFolder={() => {
+              if (!localRecordingNotice.folderPath) return;
+              invoke("open_local_recording_folder", {
+                path: localRecordingNotice.folderPath,
+              }).catch((err) => {
+                console.error("[clips-tray] open local folder failed:", err);
+              });
+            }}
+          />
+        ) : null}
+
+        {shareLinkNotice ? (
+          <ShareLinkBanner
+            notice={shareLinkNotice}
+            onCopy={() => {
+              void copyShareLink(
+                shareLinkNotice.recordingId,
+                shareLinkNotice.origin,
+                { notify: false },
+              );
+            }}
+            onDismiss={() => setShareLinkNotice(null)}
+          />
+        ) : null}
+
+        <div className="panel" inert={recordingStartPending}>
+          {showSourceRow ? (
+            <SourceRow
+              value={source}
+              onChange={setSource}
+              includeRegion={isMacPlatform()}
+            />
+          ) : null}
+
           <MediaDeviceRow
             kind="camera"
             devices={cameraDevices}
@@ -2401,135 +4798,176 @@ export function App() {
             }}
             onRefresh={() => requestDeviceAccess("camera")}
             on={cameraOn}
-            onToggle={setCameraOn}
+            onToggle={toggleCamera}
           />
+
+          <MediaDeviceRow
+            kind="mic"
+            devices={micDevices}
+            selectedId={selectedMicId}
+            selectedLabel={micLabel}
+            onSelect={(id, label) => {
+              setMicId(id);
+              setMicLabel(label);
+            }}
+            onRefresh={() => requestDeviceAccess("mic")}
+            on={micOn}
+            onToggle={setMicOn}
+            systemAudio={systemAudioOn}
+            onSystemAudioToggle={setSystemAudioOn}
+            meterActive={popoverVisible && !recordingInFlight}
+          />
+          {lookbackLabEnabled ? (
+            <LookbackRow
+              seconds={lookbackSeconds}
+              recentSeconds={recentLookbackSeconds}
+              rewindOn={rewindOn}
+              disabled={isRecording || recordingStartPending}
+              onSecondsChange={chooseLookbackSeconds}
+              onTurnOnRewind={openRewindConsent}
+            />
+          ) : null}
+        </div>
+
+        {!isRecording ? (
+          <button
+            data-recovery-focus-fallback
+            className={cn(
+              "primary start",
+              startButtonLoading && "start-loading",
+            )}
+            disabled={
+              recordingReadinessPending ||
+              recordingStopFinalizing ||
+              recordingStartPending
+            }
+            aria-busy={
+              recordingReadinessPending ||
+              recordingStopFinalizing ||
+              recordingStartPending
+            }
+            aria-label={
+              recordingStopFinalizing || recordingReadinessPending
+                ? startButtonLabel
+                : undefined
+            }
+            onClick={() => beginRecording()}
+          >
+            <span className="rec-dot" aria-hidden="true" />
+            <span className="start-label">{startButtonLabel}</span>
+            {startButtonLoading ? (
+              <span
+                aria-hidden="true"
+                className="start-loading-shimmer skeleton-shimmer"
+              />
+            ) : null}
+          </button>
         ) : null}
 
-        <MediaDeviceRow
-          kind="mic"
-          devices={micDevices}
-          selectedId={selectedMicId}
-          selectedLabel={micLabel}
-          onSelect={(id, label) => {
-            setMicId(id);
-            setMicLabel(label);
-          }}
-          onRefresh={() => requestDeviceAccess("mic")}
-          on={micOn}
-          onToggle={setMicOn}
-          systemAudio={systemAudioOn}
-          onSystemAudioToggle={setSystemAudioOn}
-        />
+        {recordFirstFiles.length + unclaimedRecordFirstFiles.length > 0 ||
+        recordFirstError ? (
+          <RecordFirstUploadsBanner
+            count={recordFirstFiles.length + unclaimedRecordFirstFiles.length}
+            storageStatus={videoStorageStatus}
+            signedIn={!!signedInAs}
+            uploading={recordFirstUploading}
+            error={recordFirstError}
+            failedFiles={[
+              ...recordFirstFiles,
+              ...unclaimedRecordFirstFiles,
+            ].flatMap((file) =>
+              recordFirstFileErrors[file.path]
+                ? [{ file, ...recordFirstFileErrors[file.path]! }]
+                : [],
+            )}
+            onUpload={() =>
+              void uploadRecordFirstFilesRef.current({
+                includeUnclaimed: true,
+              })
+            }
+            onCheckStorage={() => void refreshVideoStorageStatus()}
+            onForget={forgetRecordFirstFile}
+          />
+        ) : null}
+        {recError ? (
+          recError === MACOS_UPDATE_RESTART_MESSAGE ? (
+            <UpdateRestartBanner message={recError} />
+          ) : recError === MACOS_CAPTURE_PERMISSION_MESSAGE ||
+            recError === MACOS_SCREEN_PERMISSION_MESSAGE ||
+            recError === DESKTOP_CAPTURE_PERMISSION_MESSAGE ? (
+            <PermissionRecoveryBanner
+              kind="recording"
+              message={recError}
+              panes={
+                recError === MACOS_SCREEN_PERMISSION_MESSAGE
+                  ? ["screen"]
+                  : permissionPanesForRecording(mode, cameraOn, micOn)
+              }
+              onRetry={() => beginRecording()}
+            />
+          ) : recError === MACOS_SPEECH_PERMISSION_MESSAGE ? (
+            <PermissionRecoveryBanner
+              kind="speech"
+              message={recError}
+              panes={["speech", "microphone"]}
+              onRetry={() => beginRecording()}
+            />
+          ) : isStorageSetupFailureMessage(recError) ? (
+            <StorageConnectionBanner
+              onConnect={() => openVideoStorageSetup()}
+            />
+          ) : recError === RECORDING_SESSION_EXPIRED ? (
+            <SessionExpiredBanner onReconnect={() => void reconnectSession()} />
+          ) : recError === RECORDING_SERVER_UNAVAILABLE ? (
+            <ServerUnavailableBanner onRetry={() => beginRecording()} />
+          ) : (
+            <div className="error-banner">{recError}</div>
+          )
+        ) : null}
+        {cameraError && !recError ? (
+          cameraError === MACOS_CAPTURE_PERMISSION_MESSAGE ||
+          cameraError === DESKTOP_CAPTURE_PERMISSION_MESSAGE ? (
+            <PermissionRecoveryBanner
+              kind="camera"
+              message={cameraError}
+              panes={["camera"]}
+              onRetry={retryCameraPreview}
+            />
+          ) : (
+            <div className="error-banner">{cameraError}</div>
+          )
+        ) : null}
       </div>
 
-      <ReadinessPanel
-        mode={mode}
-        cameraOn={cameraOn}
-        micOn={micOn}
-        includeVoicePaste={voiceDictationEnabled}
-        includeFnMonitoring={fnShortcutEnabled}
-        open={readinessOpen}
-        onOpenChange={updateReadinessOpen}
-        onOpenPermission={openPrivacySettings}
-      />
-
-      <button
-        className="primary start"
-        onClick={() => {
-          void handleStartRecording();
-        }}
-      >
-        {localRecordingMode === "off"
-          ? "Start recording"
-          : "Start local recording"}
-      </button>
-      {recError ? (
-        recError === MACOS_CAPTURE_PERMISSION_MESSAGE ? (
-          <PermissionRecoveryBanner
-            kind="recording"
-            message={recError}
-            panes={permissionPanesForRecording(mode, cameraOn, micOn)}
-            onRetry={handleStartRecording}
-          />
-        ) : recError === MACOS_SPEECH_PERMISSION_MESSAGE ? (
-          <PermissionRecoveryBanner
-            kind="speech"
-            message={recError}
-            panes={["speech", "microphone"]}
-            onRetry={handleStartRecording}
-          />
-        ) : (
-          <div className="error-banner">{recError}</div>
-        )
-      ) : null}
-      {cameraError && !recError ? (
-        cameraError === MACOS_CAPTURE_PERMISSION_MESSAGE ? (
-          <PermissionRecoveryBanner
-            kind="camera"
-            message={cameraError}
-            panes={["camera"]}
-            onRetry={retryCameraPreview}
-          />
-        ) : (
-          <div className="error-banner">{cameraError}</div>
-        )
-      ) : null}
+      {pendingUploadBanner}
 
       <div className="bottom-row">
+        {voiceDictationEnabled ? (
+          <BottomHint
+            label="Dictate"
+            shortcut={compactVoiceShortcutLabel(
+              voiceShortcut,
+              voiceCustomShortcut,
+            )}
+          />
+        ) : null}
         <BottomButton
           icon="library"
           label="Library"
+          external
           onClick={() => openInBrowser("/")}
         />
         <BottomButton
           icon="settings"
           label="Settings"
-          onClick={() => setShowSettings(true)}
-        />
-        <BottomButton
-          icon="recent"
-          label="Recent"
-          badge={undefined}
-          onClick={() => setShowRecent((v) => !v)}
+          onClick={() => openSettings()}
         />
       </div>
-
-      {showRecent && recordings.length > 0 ? (
-        <div className="recent-list">
-          {recordings.map((r) => (
-            <button
-              key={r.id}
-              className="recent-item"
-              onClick={() => openInBrowser(`/r/${r.id}`)}
-            >
-              {r.thumbnailUrl ? (
-                <img
-                  className="thumb"
-                  src={
-                    resolveDesktopThumbnailUrl(r.thumbnailUrl, serverUrl) ?? ""
-                  }
-                  alt=""
-                />
-              ) : (
-                <div className="thumb thumb-placeholder" />
-              )}
-              <div className="recent-meta">
-                <div className="recent-title">{r.title}</div>
-                <div className="recent-sub">{formatAgo(r.updatedAt)}</div>
-              </div>
-            </button>
-          ))}
-        </div>
-      ) : null}
     </div>
   );
 }
 
-// ---------------------------------------------------------------------------
-
 function hidePopover() {
-  // Hide the Tauri window + tell Rust so it can broadcast the
-  // popover-visible=false event (which in turn tears down the bubble).
   getCurrentWindow()
     .hide()
     .catch(() => {});
@@ -2577,129 +5015,247 @@ function PermissionRecoveryBanner({
         ? "Camera setup blocked"
         : "Recording setup blocked";
   const uniquePanes = Array.from(new Set(panes));
+  const canOpenPrivacySettings = isMacPlatform() || isWindowsPlatform();
 
   return (
-    <div className="error-banner permission-banner">
-      <div className="permission-copy">
-        <div className="permission-title">{title}</div>
-        <div>{message}</div>
+    <Alert variant="destructive" className="recovery-alert p-2 text-xs">
+      <span className="recovery-alert-icon" aria-hidden>
+        <IconAlertTriangle size={16} stroke={1.8} />
+      </span>
+      <div className="recovery-alert-copy">
+        <AlertTitle className="mb-0">{title}</AlertTitle>
+        <AlertDescription className="recovery-alert-description text-[11px] leading-tight">
+          {message}
+        </AlertDescription>
+        <div className="permission-actions" aria-label="Permission recovery">
+          {canOpenPrivacySettings
+            ? uniquePanes.map((pane) => (
+                <Button
+                  type="button"
+                  key={pane}
+                  variant="outline"
+                  size="sm"
+                  className="permission-action h-7 px-2 text-xs"
+                  onClick={() => openPrivacySettings(pane)}
+                >
+                  {permissionPaneLabel(pane)}
+                </Button>
+              ))
+            : null}
+          <Button
+            type="button"
+            variant="destructive"
+            size="sm"
+            className="permission-action permission-retry h-7 px-2 text-xs"
+            onClick={onRetry}
+          >
+            Try again
+          </Button>
+        </div>
       </div>
-      <div className="permission-actions" aria-label="Open privacy settings">
-        {uniquePanes.map((pane) => (
+    </Alert>
+  );
+}
+
+function UpdateRestartBanner({ message }: { message: string }) {
+  return (
+    <Alert variant="destructive" className="recovery-alert p-2 text-xs">
+      <span className="recovery-alert-icon" aria-hidden>
+        <IconAlertTriangle size={16} stroke={1.8} />
+      </span>
+      <div className="recovery-alert-copy">
+        <AlertTitle className="mb-0">Restart to finish updating</AlertTitle>
+        <AlertDescription className="recovery-alert-description text-[11px] leading-tight">
+          {message}
+        </AlertDescription>
+        <div className="permission-actions">
+          <Button
+            type="button"
+            variant="destructive"
+            size="sm"
+            className="permission-action permission-retry h-7 px-2 text-xs"
+            onClick={() => {
+              installAndRestart().catch((err) => {
+                console.error("[clips-updater] relaunch failed:", err);
+              });
+            }}
+          >
+            Restart Clips
+          </Button>
+        </div>
+      </div>
+    </Alert>
+  );
+}
+
+const RECORD_FIRST_LIST_UNREADABLE =
+  "Clips couldn't read its list of recordings waiting to upload. They are still in Movies/Clips.";
+
+function RecordFirstUploadsBanner({
+  count,
+  storageStatus,
+  signedIn,
+  uploading,
+  error,
+  failedFiles,
+  onUpload,
+  onCheckStorage,
+  onForget,
+}: {
+  count: number;
+  storageStatus: VideoStorageStatus;
+  signedIn: boolean;
+  uploading: boolean;
+  error: string | null;
+  failedFiles: Array<{
+    file: RecordFirstFile;
+    message: string;
+    missing: boolean;
+  }>;
+  onUpload: () => void;
+  onCheckStorage: () => void;
+  onForget: (path: string) => void;
+}) {
+  const recordings = count === 1 ? "1 recording" : `${count} recordings`;
+  const storageCopy =
+    storageStatus === "configured"
+      ? "Saved in Movies/Clips. Upload them to get share links."
+      : storageStatus === "missing"
+        ? "Saved in Movies/Clips. Connect storage and they upload."
+        : storageStatus === "unavailable"
+          ? "Storage authorization could not be checked. Retry to check again; recordings remain in Movies/Clips."
+          : "Checking whether storage can upload clips.";
+  const checkingStorage =
+    storageStatus === "checking" || storageStatus === "unavailable";
+  return (
+    <>
+      <div className="storage-flow-banner" role="status">
+        <div className="storage-flow-icon" aria-hidden>
+          <IconUpload size={17} stroke={1.8} />
+        </div>
+        <div className="storage-flow-copy">
+          <div className="storage-flow-title">
+            {uploading
+              ? `Uploading ${recordings}…`
+              : `${recordings} saved on this Mac, not uploaded`}
+          </div>
+          <div className="storage-flow-sub">
+            {error ? <div>{error}</div> : null}
+            <div>{storageCopy}</div>
+          </div>
+        </div>
+        {count > 0 ? (
           <button
             type="button"
-            key={pane}
-            onClick={() => openPrivacySettings(pane)}
+            className="storage-flow-connect"
+            disabled={uploading || !signedIn}
+            title={signedIn ? undefined : "Sign in to upload"}
+            onClick={checkingStorage ? onCheckStorage : onUpload}
           >
-            {permissionPaneLabel(pane)}
+            <IconUpload size={14} stroke={2} />
+            {storageStatus === "configured"
+              ? "Upload now"
+              : storageStatus === "missing"
+                ? "Connect"
+                : storageStatus === "unavailable"
+                  ? "Retry"
+                  : "Check storage"}
           </button>
-        ))}
-        <button type="button" className="permission-retry" onClick={onRetry}>
-          Try again
-        </button>
+        ) : null}
       </div>
+      {failedFiles.map(({ file, message, missing }) => (
+        <div key={file.path} className="error-banner" role="alert">
+          {file.fileName}: {message}
+          {missing ? (
+            <button
+              type="button"
+              className="storage-flow-connect"
+              onClick={() => onForget(file.path)}
+            >
+              Remove from list
+            </button>
+          ) : null}
+        </div>
+      ))}
+    </>
+  );
+}
+
+function StorageConnectionBanner({ onConnect }: { onConnect: () => void }) {
+  return (
+    <div className="storage-flow-banner">
+      <div className="storage-flow-icon" aria-hidden>
+        <IconUpload size={17} stroke={1.8} />
+      </div>
+      <div className="storage-flow-copy">
+        <div className="storage-flow-title">
+          Connect storage to upload your clips
+        </div>
+        <div className="storage-flow-sub">{STORAGE_SETUP_HELP_TEXT}</div>
+      </div>
+      <button
+        type="button"
+        className="storage-flow-connect"
+        onClick={onConnect}
+      >
+        <IconExternalLink size={14} stroke={2} />
+        Connect
+      </button>
     </div>
   );
 }
 
-function PendingUploadBanner({
-  uploads,
-  retryingUploadId,
-  exportingUploadId,
-  discardingUploadId,
-  onExport,
-  onRetry,
-  onDiscard,
-  onOpenFolder,
-}: {
-  uploads: PendingDesktopUpload[];
-  retryingUploadId: string | null;
-  exportingUploadId: string | null;
-  discardingUploadId: string | null;
-  onExport: (upload: PendingDesktopUpload) => void;
-  onRetry: (upload: PendingDesktopUpload) => void;
-  onDiscard: (upload: PendingDesktopUpload) => void;
-  onOpenFolder: (upload: PendingDesktopUpload) => void;
-}) {
-  const latest = uploads[0];
-  if (!latest) return null;
-
-  const retrying = retryingUploadId === latest.recordingId;
-  const exporting = exportingUploadId === latest.recordingId;
-  const canOpenFolder = latest.kind === "native" && !!latest.folderPath;
-  const canExport = latest.kind === "browser";
-  const actionsDisabled =
-    !!retryingUploadId || !!exportingUploadId || !!discardingUploadId;
-  const savedLabel =
-    uploads.length === 1
-      ? "1 Clip saved locally"
-      : `${uploads.length} Clips saved locally`;
-  const details = [
-    latest.savedAt ? `saved ${formatAgo(latest.savedAt)}` : null,
-    formatFileSize(latest.bytes),
-  ].filter(Boolean);
-  const errorText = latest.lastError
-    ? latest.lastError.replace(/\s+/g, " ").slice(0, 140)
-    : null;
-
+function SessionExpiredBanner({ onReconnect }: { onReconnect: () => void }) {
   return (
-    <div className="pending-upload-banner">
-      <div className="pending-upload-icon" aria-hidden>
-        <IconUpload size={17} stroke={1.8} />
-      </div>
-      <div className="pending-upload-copy">
-        <div className="pending-upload-title">{savedLabel}</div>
-        <div className="pending-upload-sub">
-          {details.join(" · ")}
-          {errorText ? ` · ${errorText}` : ""}
+    <Alert variant="destructive" className="recovery-alert p-2 text-xs">
+      <span className="recovery-alert-icon" aria-hidden>
+        <IconAlertTriangle size={16} stroke={1.8} />
+      </span>
+      <div className="recovery-alert-copy">
+        <AlertTitle className="mb-0">Session expired</AlertTitle>
+        <AlertDescription className="recovery-alert-description text-[11px] leading-tight">
+          Sign in again to start recording.
+        </AlertDescription>
+        <div className="permission-actions" aria-label="Session recovery">
+          <Button
+            type="button"
+            variant="destructive"
+            size="sm"
+            className="permission-action permission-retry h-7 px-2 text-xs"
+            onClick={onReconnect}
+          >
+            Sign in again
+          </Button>
         </div>
       </div>
-      <div className="pending-upload-actions">
-        {canOpenFolder ? (
-          <button
+    </Alert>
+  );
+}
+
+function ServerUnavailableBanner({ onRetry }: { onRetry: () => void }) {
+  return (
+    <Alert variant="destructive" className="recovery-alert p-2 text-xs">
+      <span className="recovery-alert-icon" aria-hidden>
+        <IconAlertTriangle size={16} stroke={1.8} />
+      </span>
+      <div className="recovery-alert-copy">
+        <AlertTitle className="mb-0">Clips server unavailable</AlertTitle>
+        <AlertDescription className="recovery-alert-description text-[11px] leading-tight">
+          Check your connection, then try starting the recording again.
+        </AlertDescription>
+        <div className="permission-actions" aria-label="Server recovery">
+          <Button
             type="button"
-            className="pending-upload-folder"
-            disabled={actionsDisabled}
-            onClick={() => onOpenFolder(latest)}
-            aria-label="Open saved local clip folder"
-            title="Open saved local clip folder"
+            variant="destructive"
+            size="sm"
+            className="permission-action permission-retry h-7 px-2 text-xs"
+            onClick={onRetry}
           >
-            <IconFolderOpen size={14} stroke={2} />
-          </button>
-        ) : null}
-        {canExport ? (
-          <button
-            type="button"
-            className="pending-upload-folder"
-            disabled={actionsDisabled}
-            onClick={() => onExport(latest)}
-            aria-label="Download saved local clip"
-            title="Download saved local clip"
-          >
-            <IconDownload size={14} stroke={2} />
-          </button>
-        ) : null}
-        <button
-          type="button"
-          className="pending-upload-retry"
-          disabled={actionsDisabled}
-          onClick={() => onRetry(latest)}
-        >
-          <IconRefresh size={14} stroke={2} />
-          {retrying ? "Retrying" : "Retry"}
-        </button>
-        <button
-          type="button"
-          className="pending-upload-discard"
-          disabled={actionsDisabled}
-          onClick={() => onDiscard(latest)}
-          aria-label="Discard saved local clip"
-          title="Discard saved local clip"
-        >
-          <IconTrash size={14} stroke={2} />
-        </button>
+            Try again
+          </Button>
+        </div>
       </div>
-    </div>
+    </Alert>
   );
 }
 
@@ -2770,187 +5326,364 @@ function LocalRecordingSavedBanner({
   );
 }
 
-function Header({
-  mode,
-  onModeChange,
-  submitterEmail,
+function ShareLinkBanner({
+  notice,
+  onCopy,
+  onDismiss,
 }: {
-  mode: CaptureMode;
-  onModeChange: (m: CaptureMode) => void;
-  submitterEmail?: string | null;
+  notice: ShareLinkNotice;
+  onCopy: () => void;
+  onDismiss: () => void;
 }) {
-  const [tooltipMode, setTooltipMode] = useState<CaptureMode | null>(null);
-  const tooltipReadyAtRef = useRef(Date.now() + 600);
-  const tooltipTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(
-    null,
-  );
-  const suppressTooltipRef = useRef(false);
-
-  const clearModeTooltip = useCallback(() => {
-    if (tooltipTimerRef.current) {
-      window.clearTimeout(tooltipTimerRef.current);
-      tooltipTimerRef.current = null;
-    }
-    setTooltipMode(null);
-  }, []);
-
-  const queueModeTooltip = useCallback(
-    (nextMode: CaptureMode) => {
-      if (
-        suppressTooltipRef.current ||
-        Date.now() < tooltipReadyAtRef.current ||
-        tooltipMode === nextMode ||
-        tooltipTimerRef.current
-      ) {
-        return;
-      }
-      tooltipTimerRef.current = window.setTimeout(() => {
-        tooltipTimerRef.current = null;
-        if (!suppressTooltipRef.current) {
-          setTooltipMode(nextMode);
-        }
-      }, 350);
-    },
-    [tooltipMode],
-  );
-
-  const leaveModeButton = useCallback(() => {
-    suppressTooltipRef.current = false;
-    clearModeTooltip();
-  }, [clearModeTooltip]);
-
-  const pressModeButton = useCallback(() => {
-    suppressTooltipRef.current = true;
-    clearModeTooltip();
-  }, [clearModeTooltip]);
-
-  useEffect(
-    () => () => {
-      if (tooltipTimerRef.current) {
-        window.clearTimeout(tooltipTimerRef.current);
-        tooltipTimerRef.current = null;
-      }
-    },
-    [],
-  );
-
-  // Mode-toggle is absolutely centered (visual center of the popover) and the
-  // close button lives top-right as an absolute-positioned sibling, so the
-  // tabs aren't offset by the close button's width.
   return (
-    <div className="header header-centered">
-      <FeedbackButton submitterEmail={submitterEmail} />
-      <div
-        className="mode-toggle"
-        role="radiogroup"
-        aria-label="Recording mode"
-      >
-        <button
-          className={mode === "screen" ? "active" : ""}
-          onPointerEnter={() => {
-            suppressTooltipRef.current = false;
-          }}
-          onPointerMove={() => queueModeTooltip("screen")}
-          onPointerLeave={leaveModeButton}
-          onPointerDown={pressModeButton}
-          onClick={(event) => {
-            suppressTooltipRef.current = true;
-            clearModeTooltip();
-            event.currentTarget.blur();
-            onModeChange("screen");
-          }}
-          aria-label="Screen only"
-        >
-          <ScreenIcon />
-          {tooltipMode === "screen" ? (
-            <span className="mode-tooltip" role="tooltip">
-              Screen
-            </span>
-          ) : null}
-        </button>
-        <button
-          className={mode === "screen-camera" ? "active" : ""}
-          onPointerEnter={() => {
-            suppressTooltipRef.current = false;
-          }}
-          onPointerMove={() => queueModeTooltip("screen-camera")}
-          onPointerLeave={leaveModeButton}
-          onPointerDown={pressModeButton}
-          onClick={(event) => {
-            suppressTooltipRef.current = true;
-            clearModeTooltip();
-            event.currentTarget.blur();
-            onModeChange("screen-camera");
-          }}
-          aria-label="Screen + Camera"
-        >
-          <ScreenCamIcon />
-          {tooltipMode === "screen-camera" ? (
-            <span className="mode-tooltip" role="tooltip">
-              Screen + cam
-            </span>
-          ) : null}
-        </button>
-        <button
-          className={mode === "camera" ? "active" : ""}
-          onPointerEnter={() => {
-            suppressTooltipRef.current = false;
-          }}
-          onPointerMove={() => queueModeTooltip("camera")}
-          onPointerLeave={leaveModeButton}
-          onPointerDown={pressModeButton}
-          onClick={(event) => {
-            suppressTooltipRef.current = true;
-            clearModeTooltip();
-            event.currentTarget.blur();
-            onModeChange("camera");
-          }}
-          aria-label="Camera only"
-        >
-          <CamIcon />
-          {tooltipMode === "camera" ? (
-            <span className="mode-tooltip" role="tooltip">
-              Camera
-            </span>
-          ) : null}
-        </button>
+    <div className="share-link-banner">
+      <div className="local-save-copy">
+        <div className="local-save-title">Share link ready</div>
+        <div className="local-save-sub">{notice.url}</div>
       </div>
-      <button
-        className="icon-button header-close"
-        onClick={hidePopover}
-        aria-label="Close"
-        title="Close"
-      >
-        <CloseIcon />
+      <button type="button" onClick={onCopy}>
+        Copy
+      </button>
+      <button type="button" className="local-save-dismiss" onClick={onDismiss}>
+        Dismiss
       </button>
     </div>
   );
 }
 
-function SignInForm({
+function ImminentMeetingRow({
+  meeting,
+  onStartNotes,
+}: {
+  meeting: PopoverMeeting;
+  onStartNotes: () => void;
+}) {
+  const startMs = Date.parse(meeting.scheduledStart ?? "");
+  const endMs = Date.parse(meeting.scheduledEnd ?? "");
+  const durationMinutes =
+    !Number.isNaN(startMs) && !Number.isNaN(endMs) && endMs > startMs
+      ? Math.max(1, Math.round((endMs - startMs) / 60000))
+      : null;
+
+  return (
+    <section className="imminent-meeting" aria-label="Upcoming meeting">
+      <IconCalendarEvent size={20} stroke={1.8} aria-hidden />
+      <div className="imminent-meeting-copy">
+        <strong>
+          {meeting.title}
+          {durationMinutes ? ` · ${durationMinutes} min` : ""}
+        </strong>
+        <span>
+          {meeting.platform || "Calendar"} · {formatMeetingWhen(meeting)}
+        </span>
+      </div>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="imminent-meeting-action"
+        onClick={onStartNotes}
+      >
+        Start notes
+      </Button>
+    </section>
+  );
+}
+
+function Header({
+  mode,
+  onModeChange,
+}: {
+  mode: CaptureMode;
+  onModeChange: (m: CaptureMode) => void;
+}) {
+  const modeOrder: CaptureMode[] = ["screen", "screen-camera", "camera"];
+  const modeButtonRefs = useRef<
+    Partial<Record<CaptureMode, HTMLButtonElement | null>>
+  >({});
+
+  function moveMode(
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    currentMode: CaptureMode,
+  ) {
+    const currentIndex = modeOrder.indexOf(currentMode);
+    let nextIndex = currentIndex;
+
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      nextIndex = (currentIndex + 1) % modeOrder.length;
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      nextIndex = (currentIndex - 1 + modeOrder.length) % modeOrder.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = modeOrder.length - 1;
+    } else {
+      return;
+    }
+
+    event.preventDefault();
+    const nextMode = modeOrder[nextIndex];
+    onModeChange(nextMode);
+    requestAnimationFrame(() => modeButtonRefs.current[nextMode]?.focus());
+  }
+
+  return (
+    <div className="header header-centered">
+      <div
+        className="mode-toggle"
+        role="radiogroup"
+        aria-label="Recording mode"
+      >
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              className={mode === "screen" ? "active" : ""}
+              role="radio"
+              aria-checked={mode === "screen"}
+              tabIndex={mode === "screen" ? 0 : -1}
+              aria-label="Screen"
+              ref={(button) => {
+                modeButtonRefs.current.screen = button;
+              }}
+              onKeyDown={(event) => moveMode(event, "screen")}
+              onClick={() => onModeChange("screen")}
+            >
+              <ScreenIcon />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Screen</TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              className={mode === "screen-camera" ? "active" : ""}
+              role="radio"
+              aria-checked={mode === "screen-camera"}
+              tabIndex={mode === "screen-camera" ? 0 : -1}
+              aria-label="Screen and camera"
+              ref={(button) => {
+                modeButtonRefs.current["screen-camera"] = button;
+              }}
+              onKeyDown={(event) => moveMode(event, "screen-camera")}
+              onClick={() => onModeChange("screen-camera")}
+            >
+              <ScreenCamIcon />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Screen and camera</TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              className={mode === "camera" ? "active" : ""}
+              role="radio"
+              aria-checked={mode === "camera"}
+              tabIndex={mode === "camera" ? 0 : -1}
+              aria-label="Camera"
+              ref={(button) => {
+                modeButtonRefs.current.camera = button;
+              }}
+              onKeyDown={(event) => moveMode(event, "camera")}
+              onClick={() => onModeChange("camera")}
+            >
+              <CamIcon />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Camera</TooltipContent>
+        </Tooltip>
+      </div>
+    </div>
+  );
+}
+
+export function SignInForm({
   serverUrl,
   onSignedIn,
   onUseBrowser,
+  onMagicLink,
+  magicLinkSentEmail,
+  onMagicLinkBack,
 }: {
   serverUrl: string;
   onSignedIn: () => Promise<void> | void;
-  onUseBrowser: () => void;
+  onUseBrowser: () => void | Promise<void>;
+  onMagicLink: (email: string) => Promise<void>;
+  magicLinkSentEmail: string | null;
+  onMagicLinkBack: () => void;
 }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [authMode, setAuthMode] = useState<"magic-link" | "password">(
+    "magic-link",
+  );
+  const [twoFactorPending, setTwoFactorPending] = useState(false);
+  const [twoFactorCode, setTwoFactorCode] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const emailRef = useRef<HTMLInputElement | null>(null);
+  const passwordRef = useRef<HTMLInputElement | null>(null);
+  const twoFactorCodeRef = useRef<HTMLInputElement | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<{
+    email?: string;
+    password?: string;
+  }>({});
   useEffect(() => {
-    emailRef.current?.focus();
-  }, []);
+    if (!magicLinkSentEmail) emailRef.current?.focus();
+  }, [magicLinkSentEmail]);
+  useEffect(() => {
+    if (twoFactorPending) twoFactorCodeRef.current?.focus();
+  }, [twoFactorPending]);
 
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
+  const [devSignInAvailable, setDevSignInAvailable] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${serverUrl.replace(/\/+$/, "")}/_agent-native/auth/local-dev`, {
+      credentials: "include",
+    })
+      .then(async (res) => {
+        const raw = res.ok ? await res.text() : "";
+        let available: boolean | null = null;
+        let parseError: string | null = null;
+        if (raw) {
+          try {
+            available =
+              (JSON.parse(raw) as { available?: boolean }).available === true;
+          } catch (err) {
+            // coercion-ok: recorded and logged below as its own outcome, so an
+            // unreadable body never passes for "not available".
+            parseError = err instanceof Error ? err.message : String(err);
+          }
+        }
+        if (cancelled) return;
+        setDevSignInAvailable(available === true);
+        console.info("[clips-tray] local-dev sign-in probe", {
+          server: serverUrl,
+          status: res.status,
+          available,
+          parseError,
+        });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setDevSignInAvailable(false);
+        console.warn("[clips-tray] local-dev sign-in probe failed:", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [serverUrl]);
+
+  async function signInAsLocalDev() {
     if (submitting) return;
     setError(null);
     setSubmitting(true);
     try {
+      const res = await fetch(
+        `${serverUrl.replace(/\/+$/, "")}/_agent-native/auth/local-dev`,
+        { method: "POST", credentials: "include" },
+      );
+      const raw = await res.text();
+      let json: { error?: string; token?: string } | null = null;
+      try {
+        json = raw
+          ? (JSON.parse(raw) as { error?: string; token?: string })
+          : null;
+      } catch {
+        // coercion-ok: the unparsed body is still reported in the error below,
+        // so a non-JSON response surfaces instead of reading as an empty one.
+      }
+      if (!res.ok) {
+        throw new Error(
+          json?.error ||
+            raw.slice(0, 200) ||
+            `Dev sign-in didn't work (${res.status})`,
+        );
+      }
+      if (json?.token) saveDesktopAuthToken(serverUrl, json.token);
+      await onSignedIn();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (submitting) return;
+    const trimmedEmail = email.trim();
+    const nextFieldErrors: { email?: string; password?: string } = {};
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+      nextFieldErrors.email = "Enter an email like you@example.com";
+    }
+    if (authMode === "password" && !twoFactorPending && !password) {
+      nextFieldErrors.password = "Enter a password";
+    }
+    setFieldErrors(nextFieldErrors);
+    if (nextFieldErrors.email || nextFieldErrors.password) {
+      (nextFieldErrors.email ? emailRef : passwordRef).current?.focus();
+      return;
+    }
+    if (twoFactorPending && !/^\d{6,8}$/.test(twoFactorCode)) {
+      setError(desktopAuthCopy.codeRequired);
+      twoFactorCodeRef.current?.focus();
+      return;
+    }
+    setError(null);
+    setSubmitting(true);
+    try {
+      if (authMode === "magic-link") {
+        await onMagicLink(email.trim());
+        return;
+      }
+      if (twoFactorPending) {
+        const res = await fetch(
+          `${serverUrl.replace(/\/+$/, "")}/_agent-native/auth/two-factor/verify`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              email: trimmedEmail,
+              password,
+              code: twoFactorCode,
+            }),
+            credentials: "include",
+          },
+        );
+        const raw = await res.text();
+        let json: { error?: string; ok?: boolean; token?: string } | null =
+          null;
+        try {
+          json = raw
+            ? (JSON.parse(raw) as {
+                error?: string;
+                ok?: boolean;
+                token?: string;
+              })
+            : null;
+        } catch {
+          if (res.ok) throw new Error(desktopAuthCopy.verificationFailed);
+        }
+        if (!res.ok) {
+          throw new Error(
+            json?.error ||
+              raw.slice(0, 200) ||
+              `Couldn't verify the code (${res.status})`,
+          );
+        }
+        if (json?.ok !== true || typeof json.token !== "string") {
+          throw new Error(desktopAuthCopy.verificationFailed);
+        }
+        saveDesktopAuthToken(serverUrl, json.token);
+        setPassword("");
+        setTwoFactorCode("");
+        setTwoFactorPending(false);
+        await onSignedIn();
+        return;
+      }
       // Post to the framework's Better Auth-backed email/password endpoint.
       // Production Tauri builds cannot rely on cross-origin cookies sticking,
       // so the desktop fetch interceptor stores the returned session token and
@@ -2966,10 +5699,18 @@ function SignInForm({
       );
       const json = (await res.json().catch(() => null)) as {
         error?: string;
+        twoFactorRedirect?: boolean;
         token?: string;
       } | null;
       if (!res.ok) {
-        throw new Error(json?.error || `Sign in failed (${res.status})`);
+        throw new Error(
+          json?.error || "Couldn't sign you in. Check your email and password.",
+        );
+      }
+      if (json?.twoFactorRedirect === true) {
+        setTwoFactorPending(true);
+        setTwoFactorCode("");
+        return;
       }
       if (json?.token) saveDesktopAuthToken(serverUrl, json.token);
       await onSignedIn();
@@ -2980,87 +5721,482 @@ function SignInForm({
     }
   }
 
+  if (magicLinkSentEmail) {
+    return (
+      <div className="signin signin-success" aria-live="polite">
+        <div className="signin-title">Check your email</div>
+        <p className="signin-success-copy">
+          {"We sent a sign-in link to "}
+          <strong>{magicLinkSentEmail}</strong>
+          {"."}
+        </p>
+        <button
+          type="button"
+          className="signin-alt signin-mode-link"
+          onClick={onMagicLinkBack}
+        >
+          Back
+        </button>
+      </div>
+    );
+  }
+
   return (
-    <form className="signin" onSubmit={onSubmit}>
-      <div className="signin-title">Sign in to Clips</div>
-      <input
-        ref={emailRef}
-        type="email"
-        autoComplete="email"
-        placeholder="Email"
-        value={email}
-        onChange={(e) => setEmail(e.target.value)}
-        required
-      />
-      <input
-        type="password"
-        autoComplete="current-password"
-        placeholder="Password"
-        value={password}
-        onChange={(e) => setPassword(e.target.value)}
-        required
-      />
+    <form className="signin" onSubmit={onSubmit} noValidate>
+      <PillLogo className="signin-mark" />
+      <div className="signin-title">
+        {twoFactorPending
+          ? desktopAuthCopy.verificationTitle
+          : "Welcome to Clips"}
+      </div>
+      {!twoFactorPending ? (
+        <>
+          <div className="signin-subtitle">
+            Record your screen, camera, and mic. Share a link the moment you
+            stop.
+          </div>
+          <button
+            type="button"
+            className="signin-google"
+            onClick={onUseBrowser}
+            title="Comes back to Clips to finish sign-in"
+          >
+            <GoogleIcon />
+            Sign in with Google
+          </button>
+          <div className="signin-divider">
+            <span>or</span>
+          </div>
+        </>
+      ) : null}
+      <div data-tw-surface className="grid w-full gap-2">
+        {twoFactorPending ? (
+          <Input
+            ref={twoFactorCodeRef}
+            type="text"
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            aria-label={desktopAuthCopy.codePlaceholder}
+            placeholder={desktopAuthCopy.codePlaceholder}
+            className="h-9 text-sm"
+            value={twoFactorCode}
+            onChange={(e) => {
+              setTwoFactorCode(e.target.value.replace(/\D/g, "").slice(0, 8));
+              setError(null);
+            }}
+          />
+        ) : (
+          <>
+            <Input
+              ref={emailRef}
+              type="email"
+              autoComplete="email"
+              placeholder="you@example.com"
+              className="h-9 text-sm"
+              value={email}
+              aria-invalid={fieldErrors.email ? true : undefined}
+              onChange={(e) => {
+                setEmail(e.target.value);
+                setError(null);
+                setFieldErrors((current) => ({
+                  ...current,
+                  email: undefined,
+                }));
+              }}
+            />
+            {fieldErrors.email ? (
+              <p className="text-xs text-destructive">{fieldErrors.email}</p>
+            ) : null}
+            {authMode === "password" ? (
+              <>
+                <Input
+                  ref={passwordRef}
+                  type="password"
+                  autoComplete="current-password"
+                  placeholder="Password"
+                  className="h-9 text-sm"
+                  value={password}
+                  aria-invalid={fieldErrors.password ? true : undefined}
+                  onChange={(e) => {
+                    setPassword(e.target.value);
+                    setError(null);
+                    setFieldErrors((current) => ({
+                      ...current,
+                      password: undefined,
+                    }));
+                  }}
+                />
+                {fieldErrors.password ? (
+                  <p className="text-xs text-destructive">
+                    {fieldErrors.password}
+                  </p>
+                ) : null}
+              </>
+            ) : null}
+          </>
+        )}
+      </div>
       {error ? <div className="error-banner">{error}</div> : null}
       <button
         type="submit"
         className="primary start"
-        disabled={submitting || !email || !password}
+        disabled={
+          submitting ||
+          !email ||
+          (authMode === "password" && !password) ||
+          (twoFactorPending && !twoFactorCode)
+        }
       >
-        {submitting ? "Signing in…" : "Sign in"}
+        {submitting
+          ? twoFactorPending
+            ? desktopAuthCopy.verifyingCode
+            : authMode === "magic-link"
+              ? "Sending…"
+              : "Signing in…"
+          : twoFactorPending
+            ? desktopAuthCopy.verifyCode
+            : authMode === "magic-link"
+              ? "Continue"
+              : "Sign in"}
       </button>
-      <div className="signin-divider">
-        <span>or</span>
-      </div>
+      {twoFactorPending ? (
+        <button
+          type="button"
+          className="signin-alt signin-mode-link"
+          onClick={() => {
+            setError(null);
+            setTwoFactorPending(false);
+            setTwoFactorCode("");
+            setPassword("");
+          }}
+        >
+          {desktopAuthCopy.backToSignIn}
+        </button>
+      ) : null}
+      {!twoFactorPending ? (
+        <>
+          <button
+            type="button"
+            className="signin-alt signin-mode-link"
+            onClick={() => {
+              setError(null);
+              setAuthMode((current) =>
+                current === "magic-link" ? "password" : "magic-link",
+              );
+            }}
+          >
+            {authMode === "magic-link"
+              ? "Use a password instead"
+              : "Use a sign-in link instead"}
+          </button>
+          {devSignInAvailable ? (
+            <button
+              type="button"
+              className="signin-alt signin-mode-link"
+              onClick={signInAsLocalDev}
+              disabled={submitting}
+            >
+              Continue as the dev account
+            </button>
+          ) : null}
+        </>
+      ) : null}
+    </form>
+  );
+}
+
+function PopoverSubViewHeader({
+  title,
+  onBack,
+  action,
+}: {
+  title: string;
+  onBack: () => void;
+  action?: ReactNode;
+}) {
+  return (
+    <div className="setup-header popover-view-header">
       <button
         type="button"
-        className="signin-google"
-        onClick={onUseBrowser}
-        title="Opens your default browser to complete Google sign-in"
+        className="setup-back"
+        onClick={onBack}
+        aria-label="Back"
       >
-        <GoogleIcon />
-        Continue with Google
+        <IconArrowLeft size={18} stroke={1.75} />
       </button>
-    </form>
+      <h2>{title}</h2>
+      <div className="popover-view-header-spacer" />
+      {action}
+    </div>
+  );
+}
+
+function MeetingsPopoverView({
+  meetings,
+  loading,
+  error,
+  startMessage,
+  activeMeetingId,
+  meetingsEnabled,
+  rewindHistoryAvailability,
+  onBack,
+  onRefresh,
+  onOpenMeetings,
+  onOpenMeeting,
+  onOpenSettings,
+  onStartNotes,
+  onStartNotesAndJoin,
+  onShowActiveMeeting,
+  calendarNeedsReauth,
+}: {
+  meetings: PopoverMeeting[];
+  loading: boolean;
+  error: string | null;
+  startMessage: string | null;
+  activeMeetingId: string | null;
+  meetingsEnabled: boolean;
+  rewindHistoryAvailability: Record<string, RewindMeetingHistoryAvailability>;
+  onBack: () => void;
+  onRefresh: () => void;
+  onOpenMeetings: () => void;
+  onOpenMeeting: (meetingId: string) => void;
+  onOpenSettings: () => void;
+  onStartNotes: (
+    meeting: PopoverMeeting,
+    includeFromMeetingStart?: boolean,
+  ) => void;
+  onStartNotesAndJoin: (
+    meeting: PopoverMeeting,
+    includeFromMeetingStart?: boolean,
+  ) => void;
+  onShowActiveMeeting: (meetingId: string) => void;
+  calendarNeedsReauth: boolean;
+}) {
+  return (
+    <div className="setup popover-view">
+      <PopoverSubViewHeader
+        title="Meetings"
+        onBack={onBack}
+        action={
+          <button
+            type="button"
+            className="link-button popover-view-link"
+            onClick={onOpenMeetings}
+          >
+            Open web
+          </button>
+        }
+      />
+
+      <div className="setup-section">
+        <p className="setup-hint">
+          Start live notes from calendar meetings without hunting through
+          Settings.
+        </p>
+      </div>
+
+      {!meetingsEnabled ? (
+        <div className="popover-empty-card">
+          <strong>Meeting notes are off</strong>
+          <p>Turn them on to show reminders and start live transcription.</p>
+          <button type="button" className="secondary" onClick={onOpenSettings}>
+            Open meeting settings
+          </button>
+        </div>
+      ) : error ? (
+        <div className="popover-empty-card">
+          <strong>Could not load meetings</strong>
+          <p>{error}</p>
+          {calendarNeedsReauth ? (
+            <p>Reconnect your calendar from the Meetings page.</p>
+          ) : null}
+          <button type="button" className="secondary" onClick={onRefresh}>
+            Try again
+          </button>
+          {calendarNeedsReauth ? (
+            <button
+              type="button"
+              className="secondary"
+              onClick={onOpenMeetings}
+            >
+              Open Meetings
+            </button>
+          ) : null}
+        </div>
+      ) : loading ? (
+        <div className="popover-empty-card">
+          <strong>Loading meetings…</strong>
+          <p>Checking your connected calendar.</p>
+        </div>
+      ) : meetings.length === 0 ? (
+        <div className="popover-empty-card">
+          <strong>
+            {calendarNeedsReauth
+              ? "Reconnect your calendar"
+              : "No meetings ready"}
+          </strong>
+          <p>
+            {calendarNeedsReauth
+              ? "Your calendar connection needs attention before Clips can match meeting titles."
+              : "Connect Google Calendar or open the Meetings page to see setup."}
+          </p>
+          <button type="button" className="secondary" onClick={onOpenMeetings}>
+            Open Meetings
+          </button>
+        </div>
+      ) : (
+        <div className="popover-list">
+          {meetings.map((meeting) => {
+            const canStart = meetingCanStartNotes(meeting);
+            const hasJoin = Boolean(meeting.joinUrl);
+            const isActive = activeMeetingId === meeting.id;
+            const rewindHistory = rewindHistoryAvailability[meeting.id];
+            return (
+              <div className="popover-list-item" key={meeting.id}>
+                <div className="popover-list-icon">
+                  <IconCalendarEvent size={17} stroke={1.75} />
+                </div>
+                <div className="popover-list-main">
+                  <div className="popover-list-title">{meeting.title}</div>
+                  <div className="popover-list-sub">
+                    {formatMeetingWhen(meeting)}
+                    {meeting.platform ? ` · ${meeting.platform}` : ""}
+                  </div>
+                </div>
+                {isActive ? (
+                  <button
+                    type="button"
+                    className="popover-list-action popover-list-action-active"
+                    onClick={() => onShowActiveMeeting(meeting.id)}
+                    title="Meeting notes are recording"
+                  >
+                    <span className="popover-list-action-dot" aria-hidden />
+                    Recording
+                  </button>
+                ) : canStart ? (
+                  <button
+                    type="button"
+                    className="popover-list-action popover-list-action-primary"
+                    onClick={() =>
+                      hasJoin
+                        ? onStartNotesAndJoin(
+                            meeting,
+                            rewindHistory?.available === true,
+                          )
+                        : onStartNotes(
+                            meeting,
+                            rewindHistory?.available === true,
+                          )
+                    }
+                    title={
+                      hasJoin
+                        ? "Start notes and join the meeting"
+                        : "Start meeting notes"
+                    }
+                  >
+                    {hasJoin ? "Start + join" : "Start notes"}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="popover-list-action"
+                    onClick={() => onOpenMeeting(meeting.id)}
+                  >
+                    Open
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {startMessage ? <p className="setup-success">{startMessage}</p> : null}
+    </div>
   );
 }
 
 function BottomButton({
   icon,
   label,
-  badge,
+  shortcut,
+  external = false,
   onClick,
 }: {
-  icon: "library" | "settings" | "recent";
+  icon: "library" | "settings";
   label: string;
-  badge?: string;
+  shortcut?: string;
+  external?: boolean;
   onClick: () => void;
 }) {
+  const tooltipLabel = icon === "library" ? "Open library" : "Open settings";
+
   return (
-    <button className="bottom-btn" onClick={onClick}>
-      <span className="bottom-icon">
-        {icon === "library" ? (
-          <LibraryIcon />
-        ) : icon === "settings" ? (
-          <SettingsIcon />
-        ) : (
-          <ClockIcon />
-        )}
-        {badge ? <span className="badge">{badge}</span> : null}
-      </span>
-      <span className="bottom-label">{label}</span>
-    </button>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button type="button" className="bottom-btn" onClick={onClick}>
+          <span className="bottom-icon" aria-hidden="true">
+            {icon === "library" ? <LibraryIcon /> : <SettingsIcon />}
+          </span>
+          <span className="bottom-label">{label}</span>
+          {shortcut ? <ShortcutKeycaps shortcut={shortcut} /> : null}
+          {external ? (
+            <IconExternalLink
+              className="bottom-external"
+              size={16}
+              stroke={1.75}
+              aria-hidden
+            />
+          ) : null}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="left">{tooltipLabel}</TooltipContent>
+    </Tooltip>
   );
 }
 
-// ---- inline icons (Tabler-style, monochrome, stroke=1.75) -----------------
+function BottomHint({ label, shortcut }: { label: string; shortcut: string }) {
+  return (
+    <div
+      className="bottom-btn bottom-btn-hint"
+      role="note"
+      aria-label={`Press ${shortcut} to dictate`}
+    >
+      <span className="bottom-icon" aria-hidden="true">
+        <IconMicrophone2 size={18} stroke={1.75} />
+      </span>
+      <span className="bottom-label">{label}</span>
+      <ShortcutKeycaps shortcut={shortcut} />
+    </div>
+  );
+}
 
-// ---------------------------------------------------------------------------
+function ActiveRecordingBanner() {
+  return (
+    <section
+      className="active-recording-card active-recording-card-compact"
+      aria-live="polite"
+    >
+      <span className="active-recording-live" aria-label="Live recording">
+        <span className="active-recording-live-dot" aria-hidden="true" />
+        REC
+      </span>
+      <div className="active-recording-copy">
+        <strong>Recording in progress</strong>
+      </div>
+      <button
+        type="button"
+        className="primary rec-active active-recording-stop"
+        onClick={() => emit("clips:recorder-stop").catch(() => {})}
+      >
+        Stop
+      </button>
+    </section>
+  );
+}
 
 type VoiceProviderStatus = {
   browser: true;
-  // Apple's SFSpeechRecognizer + AVAudioEngine driven from Rust. The
-  // server reports `true` whenever it's available; the desktop client
-  // additionally has it gated to macOS at the Tauri-command layer.
   "macos-native": boolean;
   builder: boolean;
   gemini: boolean;
@@ -3069,7 +6205,7 @@ type VoiceProviderStatus = {
 
 function keyForByokProvider(provider: ByokVoiceProvider): string {
   return {
-    gemini: "GEMINI_API_KEY",
+    gemini: "GOOGLE_GENERATIVE_AI_API_KEY",
     groq: "GROQ_API_KEY",
   }[provider];
 }
@@ -3081,13 +6217,34 @@ function labelForByokProvider(provider: ByokVoiceProvider): string {
   }[provider];
 }
 
+function formatStorageBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 MB";
+  const gb = bytes / (1024 * 1024 * 1024);
+  if (gb >= 1) return `${gb.toFixed(gb >= 10 ? 0 : 1)} GB`;
+  const mb = bytes / (1024 * 1024);
+  return `${Math.max(1, Math.round(mb))} MB`;
+}
+
 function Setup({
+  surface = "settings",
+  initialSettingsTab,
+  onSettingsTabChange,
+  meetingsLabEnabled,
+  wisprFlowLabEnabled,
+  labValues,
+  labError,
+  labsSignedIn,
+  onLabEnabledChange,
+  recordingActive = false,
   initial,
   serverUrl,
   signedInAs,
   voiceShortcut,
   voiceCustomShortcut,
   popoverCustomShortcut,
+  recordCustomShortcut,
+  recordCancelShortcut,
+  recordPauseShortcut,
   voiceMode,
   voiceProvider,
   voiceInstructions,
@@ -3095,19 +6252,44 @@ function Setup({
   onVoiceShortcutChange,
   onVoiceCustomShortcutChange,
   onPopoverCustomShortcutChange,
+  onRecordCustomShortcutChange,
+  onRecordCancelShortcutChange,
+  onRecordPauseShortcutChange,
   onVoiceModeChange,
   onVoiceProviderChange,
   onVoiceInstructionsChange,
   onConnect,
+  rewindAgentPromptCopied,
+  onCopyRewindAgentPrompt,
+  onOpenRewindDocs,
+  onOpenMemory,
+  rewindConsentPending = false,
+  onRewindConsentHandled,
   onCancel,
   onSignOut,
 }: {
+  surface?: "settings" | "memory";
+  initialSettingsTab?: SettingsTabId;
+  onSettingsTabChange?: (tab: SettingsTabId) => void;
+  meetingsLabEnabled: boolean;
+  wisprFlowLabEnabled: boolean;
+  labValues: Record<string, unknown>;
+  labError: string | null;
+  labsSignedIn: boolean;
+  onLabEnabledChange: (
+    lab: { key: string; displayName?: string },
+    enabled: boolean,
+  ) => void;
+  recordingActive?: boolean;
   initial?: string | null;
   serverUrl?: string;
   signedInAs?: string | null;
   voiceShortcut: VoiceShortcutPreference;
   voiceCustomShortcut: string;
   popoverCustomShortcut: string;
+  recordCustomShortcut: string;
+  recordCancelShortcut: string;
+  recordPauseShortcut: string;
   voiceMode: VoiceMode;
   voiceProvider: VoiceProvider;
   voiceInstructions: string;
@@ -3115,23 +6297,68 @@ function Setup({
   onVoiceShortcutChange: (value: VoiceShortcutPreference) => void;
   onVoiceCustomShortcutChange: (value: string) => void;
   onPopoverCustomShortcutChange: (value: string) => void;
+  onRecordCustomShortcutChange: (value: string) => void;
+  onRecordCancelShortcutChange: (value: string) => void;
+  onRecordPauseShortcutChange: (value: string) => void;
   onVoiceModeChange: (value: VoiceMode) => void;
   onVoiceProviderChange: (value: VoiceProvider) => void;
   onVoiceInstructionsChange: (value: string) => void;
   onConnect: (url: string) => void;
+  rewindAgentPromptCopied: boolean;
+  onCopyRewindAgentPrompt: () => void;
+  onOpenRewindDocs: () => void;
+  onOpenMemory?: () => void;
+  // Set when the popover's Turn on Rewind button opened this surface. Setup
+  // opens the Rewind consent dialog once and then reports it handled.
+  rewindConsentPending?: boolean;
+  onRewindConsentHandled?: () => void;
   onCancel?: () => void;
   onSignOut?: () => void;
 }) {
   const [url, setUrl] = useState(initial ?? DEFAULT_URL);
-  const [readinessOpen, setReadinessOpen] = useState(false);
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const [settingsTab, setSettingsTab] = useState<SettingsTabId>(() =>
+    initialDesktopSettingsTab(initialSettingsTab),
+  );
+  const [serverUrlOpen, setServerUrlOpen] = useState(false);
+
+  useEffect(() => {
+    if (surface !== "settings") return;
+    setSettingsTab(initialDesktopSettingsTab(initialSettingsTab));
+  }, [initialSettingsTab, surface]);
+
   const featureConfig = useFeatureConfig();
+  const updateStatus = useUpdateStatus();
   const voiceEnabled = featureConfig?.voiceEnabled !== false;
+  const voiceCleanupEnabled = featureConfig?.voiceCleanupEnabled !== false;
   const meetingsEnabled = featureConfig?.meetingsEnabled !== false;
+  const showMeetingWidgetEnabled =
+    featureConfig?.showMeetingWidgetEnabled !== false;
   const launchAtLoginEnabled = featureConfig?.launchAtLoginEnabled !== false;
   const autoHidePopoverEnabled = featureConfig?.autoHidePopoverEnabled === true;
   const showInScreenCapture = featureConfig?.showInScreenCapture === true;
   const localRecordingMode = featureConfig?.localRecordingMode ?? "off";
+  const observedScreenMemory =
+    featureConfig?.screenMemory ?? DEFAULT_SCREEN_MEMORY_CONFIG;
+  const [screenMemory, setScreenMemory] = useState(observedScreenMemory);
+  const [rewindConsentOpen, setRewindConsentOpen] = useState(false);
+
+  useEffect(() => {
+    if (!rewindConsentPending) return;
+    setSettingsTab("rewind");
+    setRewindConsentOpen(true);
+    onRewindConsentHandled?.();
+  }, [rewindConsentPending]);
+  const screenMemoryRef = useRef(observedScreenMemory);
+  const screenMemoryMutationRef = useRef(0);
+  const screenMemoryMutationVersionRef = useRef(0);
+  const screenMemoryMutationTailRef = useRef<Promise<void>>(Promise.resolve());
+  const [screenMemoryConfigBusy, setScreenMemoryConfigBusy] = useState(false);
+
+  useEffect(() => {
+    if (screenMemoryMutationRef.current > 0) return;
+    screenMemoryRef.current = observedScreenMemory;
+    setScreenMemory(observedScreenMemory);
+  }, [observedScreenMemory]);
   const regionGuides = featureConfig?.regionGuides ?? {
     enabled: false,
     rects: [],
@@ -3142,23 +6369,105 @@ function Setup({
   const regionGuidesAlwaysVisible = regionGuides.alwaysVisible === true;
   const meetingTranscriptionMode: MeetingTranscriptionMode =
     featureConfig?.meetingTranscriptionMode ?? "ask";
-  const showMeetingWidgetEnabled =
-    featureConfig?.showMeetingWidgetEnabled !== false;
-  const whisperModelEnabled = featureConfig?.whisperModelEnabled !== false;
-  type WhisperModelState = "disabled" | "missing" | "downloading" | "ready";
-  interface WhisperModelStatus {
-    state: WhisperModelState;
-    path: string;
-    downloadedMb: number;
-    totalMb: number;
-  }
-  const [whisperStatus, setWhisperStatus] = useState<WhisperModelStatus | null>(
-    null,
+  const whisper = useWhisperSettings(
+    featureConfig,
+    voiceProvider,
+    onVoiceProviderChange,
+    nativeVoiceProvider,
   );
+  const {
+    catalog: whisperModels,
+    status: whisperStatus,
+    enabled: whisperModelEnabled,
+    modelId: whisperModelId,
+    deletableModels,
+  } = whisper;
+  const [screenMemoryStatus, setScreenMemoryStatus] =
+    useState<ScreenMemoryStatus | null>(null);
+  const screenMemoryStatusRefreshVersionRef = useRef(0);
+  const [screenMemoryMessage, setScreenMemoryMessage] = useState<{
+    kind: "ok" | "error";
+    text: string;
+  } | null>(null);
+  const [clipDraftsError, setClipDraftsError] = useState<string | null>(null);
+  const [screenMemoryBusy, setScreenMemoryBusy] = useState(false);
+  const [rewindLocalQuery, setRewindLocalQuery] = useState("");
+  const [rewindLocalResult, setRewindLocalResult] =
+    useState<RewindLocalAskResult | null>(null);
+  const [rewindLocalBusy, setRewindLocalBusy] = useState(false);
+  const [rewindLocalError, setRewindLocalError] = useState<string | null>(null);
+  const [rewindReplayId, setRewindReplayId] = useState<string | null>(null);
+  const [rewindEgressEvents, setRewindEgressEvents] = useState<
+    RewindEgressEvent[]
+  >([]);
+  const [excludedApps, setExcludedApps] = useState<RewindExcludedApplication[]>(
+    [],
+  );
+  const [excludedAppsBusy, setExcludedAppsBusy] = useState(false);
+  const [agentConnectionBusy, setAgentConnectionBusy] = useState<
+    "codex" | "claude-code" | null
+  >(null);
+  const [agentConnectionMessage, setAgentConnectionMessage] = useState<{
+    kind: "ok" | "error";
+    text: string;
+  } | null>(null);
+  const screenMemorySegments = screenMemoryStatus?.recentSegments ?? [];
+  const screenMemoryTotalBytes = screenMemorySegments.reduce(
+    (sum, segment) => sum + segment.bytes,
+    0,
+  );
+  const rewindStatusPresentation = getRewindStatusPresentation({
+    status: screenMemoryStatus,
+    config: screenMemory,
+    clipRecordingActive: recordingActive,
+  });
+  const captureControlsLocked = recordingActive;
+
+  useEffect(() => {
+    invoke<RewindExcludedApplication[]>("resolve_rewind_excluded_apps", {
+      bundleIds: screenMemory.excludedBundleIds ?? [],
+    })
+      .then(setExcludedApps)
+      .catch(() => {
+        setExcludedApps(
+          (screenMemory.excludedBundleIds ?? []).map((bundleId) => ({
+            bundleId,
+            name: bundleId.split(".").pop() || "Application",
+            installed: false,
+          })),
+        );
+      });
+  }, [screenMemory.excludedBundleIds]);
+
+  const excludedAppGroups = excludedApps.reduce<
+    Array<RewindExcludedApplication & { bundleIds: string[] }>
+  >((groups, app) => {
+    const existing = groups.find(
+      (candidate) => candidate.name.toLowerCase() === app.name.toLowerCase(),
+    );
+    if (existing) {
+      existing.bundleIds.push(app.bundleId);
+      existing.installed ||= app.installed;
+      existing.path ||= app.path;
+    } else {
+      groups.push({ ...app, bundleIds: [app.bundleId] });
+    }
+    return groups;
+  }, []);
 
   const [providerStatus, setProviderStatus] =
     useState<VoiceProviderStatus | null>(null);
   const [providerStatusLoading, setProviderStatusLoading] = useState(true);
+  const [providerStatusRefreshVersion, setProviderStatusRefreshVersion] =
+    useState(0);
+  const [builderConnecting, setBuilderConnecting] = useState(false);
+  const [canProvisionBuilderAccount, setCanProvisionBuilderAccount] =
+    useState(false);
+  const [builderAccountExists, setBuilderAccountExists] = useState(false);
+  const [builderConnectMessage, setBuilderConnectMessage] = useState<{
+    kind: "ok" | "error";
+    text: string;
+  } | null>(null);
   const [apiKeyValue, setApiKeyValue] = useState("");
   const [apiKeySaving, setApiKeySaving] = useState(false);
   const [apiKeyMessage, setApiKeyMessage] = useState<{
@@ -3166,10 +6475,35 @@ function Setup({
     text: string;
   } | null>(null);
 
+  useEffect(() => {
+    let active = true;
+    const base = (serverUrl ?? initial ?? DEFAULT_URL).replace(/\/+$/, "");
+    setCanProvisionBuilderAccount(false);
+    void isBuilderProvisioningAvailable(base)
+      .then((available) => {
+        if (active) setCanProvisionBuilderAccount(available);
+      })
+      .catch(() => {
+        if (active) setCanProvisionBuilderAccount(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [initial, serverUrl]);
+
   function setVoiceEnabled(enabled: boolean) {
     if (!featureConfig) return;
     invoke("set_feature_config", {
       config: { ...featureConfig, voiceEnabled: enabled },
+    }).catch((err) =>
+      console.error("[settings] set_feature_config failed", err),
+    );
+  }
+
+  function setVoiceCleanupEnabled(enabled: boolean) {
+    if (!featureConfig) return;
+    invoke("set_feature_config", {
+      config: { ...featureConfig, voiceCleanupEnabled: enabled },
     }).catch((err) =>
       console.error("[settings] set_feature_config failed", err),
     );
@@ -3184,18 +6518,13 @@ function Setup({
     );
   }
 
-  function triggerWhisperDownload() {
-    invoke("whisper_model_download").catch(() => {});
-  }
-
-  function setWhisperModelEnabled(enabled: boolean) {
+  function setShowMeetingWidgetEnabled(enabled: boolean) {
     if (!featureConfig) return;
     invoke("set_feature_config", {
-      config: { ...featureConfig, whisperModelEnabled: enabled },
+      config: { ...featureConfig, showMeetingWidgetEnabled: enabled },
     }).catch((err) =>
       console.error("[settings] set_feature_config failed", err),
     );
-    if (enabled) triggerWhisperDownload();
   }
 
   function setLaunchAtLoginEnabled(enabled: boolean) {
@@ -3223,6 +6552,257 @@ function Setup({
     }).catch((err) =>
       console.error("[settings] set_feature_config failed", err),
     );
+  }
+
+  async function setScreenMemoryConfig(
+    patch: Partial<ScreenMemoryStatus["config"]>,
+  ) {
+    if (!featureConfig) return;
+    setScreenMemoryMessage(null);
+    const previous = screenMemoryRef.current;
+    const optimistic = {
+      ...DEFAULT_SCREEN_MEMORY_CONFIG,
+      ...previous,
+      ...patch,
+    };
+    const version = ++screenMemoryMutationVersionRef.current;
+    screenMemoryMutationRef.current += 1;
+    screenMemoryRef.current = optimistic;
+    setScreenMemory(optimistic);
+    setScreenMemoryConfigBusy(true);
+    let operation!: Promise<void>;
+    operation = screenMemoryMutationTailRef.current
+      .catch(() => {})
+      .then(async () => {
+        const current = await invoke<FeatureConfig>("get_feature_config");
+        const next = {
+          ...DEFAULT_SCREEN_MEMORY_CONFIG,
+          ...current.screenMemory,
+          ...patch,
+        };
+        await invoke("set_feature_config", {
+          config: { ...current, screenMemory: next },
+        });
+        const committed = await invoke<FeatureConfig>("get_feature_config");
+        if (version === screenMemoryMutationVersionRef.current) {
+          screenMemoryRef.current = committed.screenMemory;
+          setScreenMemory(committed.screenMemory);
+        }
+      });
+    screenMemoryMutationTailRef.current = operation;
+    try {
+      await operation;
+    } catch (err) {
+      console.error("[settings] set_feature_config failed", err);
+      if (version === screenMemoryMutationVersionRef.current) {
+        const committed = await invoke<FeatureConfig>(
+          "get_feature_config",
+        ).catch(() => null);
+        const restored = committed ? committed.screenMemory : previous;
+        screenMemoryRef.current = restored;
+        setScreenMemory(restored);
+      }
+      setScreenMemoryMessage({
+        kind: "error",
+        text: (err as Error)?.message ?? "Couldn't update Rewind. Try again.",
+      });
+    } finally {
+      screenMemoryMutationRef.current = Math.max(
+        0,
+        screenMemoryMutationRef.current - 1,
+      );
+      if (screenMemoryMutationRef.current === 0) {
+        setScreenMemoryConfigBusy(false);
+      }
+    }
+  }
+
+  async function installRewindAgentConnection(client: "codex" | "claude-code") {
+    setAgentConnectionBusy(client);
+    setAgentConnectionMessage(null);
+    try {
+      const status = await invoke<RewindAgentConnectionStatus>(
+        "screen_memory_install_agent_connection",
+        { client },
+      );
+      setAgentConnectionMessage({
+        kind: "ok",
+        text: `${client === "codex" ? "Codex" : "Claude Code"} is connected. Restart it once to load Rewind.`,
+      });
+      console.info(
+        `[clips-tray] configured ${status.client} Screen Memory MCP at ${status.configPath}`,
+      );
+    } catch (err) {
+      setAgentConnectionMessage({
+        kind: "error",
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setAgentConnectionBusy(null);
+    }
+  }
+
+  const refreshScreenMemoryStatus = useCallback(() => {
+    const version = ++screenMemoryStatusRefreshVersionRef.current;
+    invoke<ScreenMemoryStatus>("screen_memory_status")
+      .then((status) => {
+        if (version === screenMemoryStatusRefreshVersionRef.current) {
+          setScreenMemoryStatus(status);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  async function askRewindLocally() {
+    const query = rewindLocalQuery.trim();
+    if (!query) return;
+    setRewindLocalBusy(true);
+    setRewindLocalError(null);
+    try {
+      const result = await invoke<RewindLocalAskResult>("rewind_local_ask", {
+        query,
+        limit: 12,
+      });
+      setRewindLocalResult(result);
+    } catch (err) {
+      setRewindLocalError(
+        (err as Error)?.message ??
+          "Couldn't search this device's memory. Try again.",
+      );
+    } finally {
+      setRewindLocalBusy(false);
+    }
+  }
+
+  async function replayRewindMoment(
+    evidence: RewindLocalAskResult["evidence"][number],
+  ) {
+    setRewindReplayId(evidence.id);
+    setRewindLocalError(null);
+    try {
+      await invoke("rewind_replay_moment", {
+        segmentId: evidence.segmentId,
+        offsetMs: evidence.offsetMs,
+      });
+    } catch (err) {
+      setRewindLocalError(
+        (err as Error)?.message ??
+          "Couldn't replay this moment. Try another result.",
+      );
+    } finally {
+      setRewindReplayId(null);
+    }
+  }
+
+  async function exportScreenMemoryRecent() {
+    setScreenMemoryBusy(true);
+    setScreenMemoryMessage(null);
+    try {
+      const result = await invoke<ScreenMemoryExportResult>(
+        "screen_memory_export_recent",
+        { minutes: 5 },
+      );
+      setScreenMemoryMessage({
+        kind: "ok",
+        text: `Saved ${result.files.length === 1 ? "a video" : `${result.files.length} videos`} to ${result.folderPath}`,
+      });
+    } catch (err) {
+      setScreenMemoryMessage({
+        kind: "error",
+        text:
+          (err as Error)?.message ??
+          "Couldn't save the last 5 minutes. Try again.",
+      });
+    } finally {
+      setScreenMemoryBusy(false);
+      refreshScreenMemoryStatus();
+    }
+  }
+
+  function refreshRewindEgressLog() {
+    invoke<RewindEgressEvent[]>("rewind_list_evidence_egress", { limit: 20 })
+      .then(setRewindEgressEvents)
+      .catch((err) => {
+        setScreenMemoryMessage({
+          kind: "error",
+          text:
+            (err as Error)?.message ??
+            "Couldn't read the access log. Try again.",
+        });
+      });
+  }
+
+  async function clearScreenMemory() {
+    setScreenMemoryBusy(true);
+    setScreenMemoryMessage(null);
+    try {
+      const status = await invoke<ScreenMemoryStatus>(
+        "screen_memory_delete_all",
+      );
+      screenMemoryStatusRefreshVersionRef.current += 1;
+      setScreenMemoryStatus(status);
+      setScreenMemoryMessage({ kind: "ok", text: "Rewind cleared" });
+    } catch (err) {
+      setScreenMemoryMessage({
+        kind: "error",
+        text: (err as Error)?.message ?? "Couldn't clear Rewind. Try again.",
+      });
+    } finally {
+      setScreenMemoryBusy(false);
+    }
+  }
+
+  function openScreenMemoryFolder() {
+    invoke("screen_memory_open_folder").catch((err) => {
+      setScreenMemoryMessage({
+        kind: "error",
+        text: (err as Error)?.message ?? "Couldn't open the Rewind folder.",
+      });
+    });
+  }
+
+  async function chooseExcludedApplications() {
+    setExcludedAppsBusy(true);
+    setScreenMemoryMessage(null);
+    try {
+      const chosen = await invoke<RewindExcludedApplication[]>(
+        "choose_rewind_excluded_apps",
+      );
+      if (chosen.length === 0) return;
+      const bundleIds = [
+        ...new Set([
+          ...(screenMemory.excludedBundleIds ?? []),
+          ...chosen.map((app) => app.bundleId),
+        ]),
+      ];
+      await setScreenMemoryConfig({ excludedBundleIds: bundleIds });
+    } catch (err) {
+      setScreenMemoryMessage({
+        kind: "error",
+        text:
+          (err as Error)?.message ?? "Couldn't open the app picker. Try again.",
+      });
+    } finally {
+      setExcludedAppsBusy(false);
+    }
+  }
+
+  function removeExcludedApplications(bundleIds: string[]) {
+    const removed = new Set(bundleIds);
+    void setScreenMemoryConfig({
+      excludedBundleIds: (screenMemory.excludedBundleIds ?? []).filter(
+        (candidate) => !removed.has(candidate),
+      ),
+    });
+  }
+
+  function openClipDraftsFolder() {
+    setClipDraftsError(null);
+    invoke("native_fullscreen_open_drafts_folder").catch((err) => {
+      setClipDraftsError(
+        (err as Error)?.message ?? "Couldn't open the drafts folder.",
+      );
+    });
   }
 
   function openRegionGuideEditor() {
@@ -3316,30 +6896,13 @@ function Setup({
     );
   }
 
-  function setShowMeetingWidgetEnabled(enabled: boolean) {
-    if (!featureConfig) return;
-    invoke("set_feature_config", {
-      config: { ...featureConfig, showMeetingWidgetEnabled: enabled },
-    }).catch((err) =>
-      console.error("[settings] set_feature_config failed", err),
-    );
-  }
-
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
-
-  // Load model status on mount and keep it current via events.
   useEffect(() => {
     let cancelled = false;
     const refresh = () => {
-      invoke<WhisperModelStatus>("whisper_model_status")
-        .then((s) => {
-          if (!cancelled) setWhisperStatus(s);
-        })
-        .catch(() => {});
+      if (!cancelled) refreshScreenMemoryStatus();
     };
     refresh();
+    const timer = window.setInterval(refresh, 5_000);
     const unlistens: Array<() => void> = [];
     const track = (p: Promise<() => void>) => {
       p.then((u) => {
@@ -3354,12 +6917,11 @@ function Setup({
         unlistens.push(u);
       }).catch(() => {});
     };
-    track(listen("whisper:model-progress", () => refresh()));
-    track(listen("whisper:model-ready", () => refresh()));
-    track(listen("whisper:model-error", () => refresh()));
-    track(listen("whisper:model-enabled-changed", () => refresh()));
+    track(listen("clips:screen-memory-changed", refresh));
     return () => {
       cancelled = true;
+      screenMemoryStatusRefreshVersionRef.current += 1;
+      window.clearInterval(timer);
       unlistens.forEach((u) => {
         try {
           u();
@@ -3368,13 +6930,19 @@ function Setup({
         }
       });
     };
-  }, []);
+  }, [refreshScreenMemoryStatus]);
+
+  useEffect(() => {
+    if (surface !== "settings" || settingsTab !== "rewind") return;
+    if (screenMemory.enabled !== true) return;
+    refreshRewindEgressLog();
+  }, [surface, settingsTab, screenMemory.enabled]);
 
   useEffect(() => {
     const base = (serverUrl ?? initial ?? DEFAULT_URL).replace(/\/+$/, "");
     let cancelled = false;
     setProviderStatusLoading(true);
-    (async () => {
+    void (async () => {
       try {
         const res = await fetch(
           `${base}/_agent-native/voice-providers/status`,
@@ -3387,9 +6955,6 @@ function Setup({
           }
           return;
         }
-        // Server emits `native` (no namespace); the client uses
-        // `"macos-native"` as the provider key throughout — remap on the
-        // way in.
         const json = (await res.json().catch(() => null)) as
           | (Partial<Omit<VoiceProviderStatus, "browser" | "macos-native">> & {
               native?: boolean;
@@ -3414,12 +6979,35 @@ function Setup({
     return () => {
       cancelled = true;
     };
-  }, [serverUrl, initial]);
+  }, [providerStatusRefreshVersion, serverUrl, initial]);
 
-  function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
+  useEffect(() => {
+    const refreshOnFocus = () =>
+      setProviderStatusRefreshVersion((version) => version + 1);
+    window.addEventListener("focus", refreshOnFocus);
+    return () => window.removeEventListener("focus", refreshOnFocus);
+  }, []);
+
+  const [serverUrlError, setServerUrlError] = useState<string | null>(null);
+
+  function handleConnect() {
     const trimmed = url.trim();
-    if (!trimmed) return;
+    let parsed: URL | null = null;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      // coercion-ok: null is the typed "not a URL" outcome the next branch
+      // reports to the user as an inline field error.
+      parsed = null;
+    }
+    if (
+      !parsed ||
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    ) {
+      setServerUrlError("Enter a URL like http://localhost:8080");
+      return;
+    }
+    setServerUrlError(null);
     onConnect(trimmed);
   }
 
@@ -3427,32 +7015,25 @@ function Setup({
   const byokProvider: ByokVoiceProvider = isByokVoiceProvider(voiceProvider)
     ? voiceProvider
     : "gemini";
-  const providerHint: Record<VoiceProviderMode, string> = {
-    native: isMacPlatform()
-      ? "Uses macOS on-device speech recognition for the fastest free dictation."
-      : "Uses the browser's built-in speech recognition when available.",
-    builder:
-      "Uses Builder.io for fast cleanup. No separate provider key needed.",
-    byok: "Use your own provider key for cleanup.",
-  };
-  const shortcutHint: Record<VoiceShortcutPreference, string> = {
-    fn: "Press the Fn / globe key to dictate. macOS requires Input Monitoring for this one shortcut.",
-    "cmd-shift-space":
-      "Press Cmd+Shift+Space to dictate. This does not need Input Monitoring.",
-    "ctrl-shift-space": "Press Ctrl+Shift+Space to dictate.",
-    custom: `Press ${voiceCustomShortcut || "your recorded shortcut"} to dictate.`,
-    both: "Any of Fn, Cmd+Shift+Space, or Ctrl+Shift+Space. Includes Fn, so macOS may ask for Input Monitoring.",
-  };
   const fnShortcutSelected = voiceShortcut === "fn" || voiceShortcut === "both";
-  const modeHint: Record<VoiceMode, string> = {
-    "push-to-talk": "Hold the shortcut while speaking. Release to stop.",
-    toggle: "Press once to start, again to stop.",
-  };
+  const canOpenPrivacySettings = isMacPlatform() || isWindowsPlatform();
+  const systemAccessRows = useSystemAccessRows({
+    includeVoicePaste: voiceEnabled,
+    includeFnMonitoring: fnShortcutSelected,
+    onOpenSettings: openPrivacySettings,
+  });
+  const serverHostLabel = (serverUrl ?? initial ?? DEFAULT_URL)
+    .replace(/^https?:\/\//, "")
+    .replace(/\/+$/, "");
 
   function selectProviderMode(mode: VoiceProviderMode) {
     setApiKeyMessage(null);
+    setBuilderConnectMessage(null);
     if (mode === "native") {
       onVoiceProviderChange(nativeVoiceProvider());
+    } else if (mode === "whisper") {
+      onVoiceProviderChange("whisper");
+      if (!whisperModelEnabled) whisper.setEnabled(true);
     } else if (mode === "builder") {
       onVoiceProviderChange("builder-gemini");
     } else {
@@ -3478,8 +7059,6 @@ function Setup({
         },
       );
 
-      // Some apps may not register every BYOK provider. Fall back to the
-      // ad-hoc secret store so the tray can still wire user-scoped keys.
       if (res.status === 404) {
         res = await fetch(`${base}/_agent-native/secrets/adhoc`, {
           method: "POST",
@@ -3498,7 +7077,9 @@ function Setup({
         const body = (await res.json().catch(() => null)) as {
           error?: string;
         } | null;
-        throw new Error(body?.error || `Save failed (${res.status})`);
+        throw new Error(
+          body?.error || `Couldn't save the key (${res.status}). Try again.`,
+        );
       }
 
       setProviderStatus((prev) =>
@@ -3515,45 +7096,142 @@ function Setup({
       setApiKeyValue("");
       setApiKeyMessage({
         kind: "ok",
-        text: `${labelForByokProvider(byokProvider)} key saved.`,
+        text: `${labelForByokProvider(byokProvider)} key saved`,
       });
     } catch (err) {
       setApiKeyMessage({
         kind: "error",
-        text: (err as Error)?.message ?? "Could not save key.",
+        text: (err as Error)?.message ?? "Couldn't save the key. Try again.",
       });
     } finally {
       setApiKeySaving(false);
     }
   }
 
-  function connectBuilder() {
+  async function connectBuilder(provisionAccount: boolean) {
+    if (builderConnecting) return;
     const base = (serverUrl ?? initial ?? DEFAULT_URL).replace(/\/+$/, "");
-    openExternal(`${base}/_agent-native/builder/connect`).catch((err) => {
-      setApiKeyMessage({
+    setBuilderConnecting(true);
+    setBuilderConnectMessage(null);
+    if (!provisionAccount) setBuilderAccountExists(false);
+    try {
+      const result = await connectBuilderForVoiceCleanup(
+        base,
+        {
+          openExternal,
+        },
+        { provisionAccount },
+      );
+      if (result === "activated") {
+        setProviderStatus((previous) =>
+          previous
+            ? { ...previous, builder: true }
+            : {
+                browser: true,
+                "macos-native": false,
+                builder: true,
+                gemini: false,
+                groq: false,
+              },
+        );
+        setBuilderConnectMessage({
+          kind: "ok",
+          text: "Builder.io is ready for voice cleanup.",
+        });
+      } else if (result === "account-exists") {
+        setBuilderAccountExists(true);
+      } else {
+        setBuilderConnectMessage({
+          kind: "ok",
+          text: "Continue in your browser to use your Builder.io account.",
+        });
+      }
+    } catch (err) {
+      setBuilderConnectMessage({
         kind: "error",
-        text: (err as Error)?.message ?? "Could not open Builder.io connect.",
+        text:
+          err instanceof Error
+            ? err.message
+            : "Couldn't use Builder.io. Try again.",
       });
-    });
+    } finally {
+      setBuilderConnecting(false);
+    }
   }
 
-  // Only warn when the selected provider has no key/connection on the server.
+  const builderConnectFlow = {
+    connecting: builderConnecting,
+    accountExists: builderAccountExists,
+    start: (options?: { provisionAccount?: boolean }) => {
+      void connectBuilder(options?.provisionAccount === true);
+    },
+  };
+
   const providerWarning: string | null = (() => {
     if (providerStatusLoading || !providerStatus) return null;
     if (selectedMode === "native") return null;
+    if (selectedMode === "whisper") return null;
     if (selectedMode === "builder") {
       return providerStatus.builder
         ? null
-        : "Builder.io is not connected — cleanup will fail until connected.";
+        : "Use Builder.io to turn on cleanup.";
     }
     if (providerStatus[byokProvider]) return null;
-    return `${keyForByokProvider(byokProvider)} is not set — cleanup will fail until configured.`;
+    return `Cleanup is off until you add ${keyForByokProvider(byokProvider)}.`;
   })();
+  const updateChecksSupported = canCheckForUpdates();
+  const updateBusy =
+    updateStatus.state === "checking" ||
+    updateStatus.state === "available" ||
+    updateStatus.state === "downloading";
+  const updateReady = updateStatus.state === "downloaded";
+  const updateRowLabel = !updateChecksSupported
+    ? `Version ${__CLIPS_DESKTOP_VERSION__ || "0.0.0"}`
+    : updateStatus.state === "downloaded"
+      ? `Version ${updateStatus.version} ready`
+      : updateStatus.state === "downloading"
+        ? `Downloading ${updateStatus.version} · ${updateStatus.percent}%`
+        : updateStatus.state === "available"
+          ? `Version ${updateStatus.version} found`
+          : updateStatus.state === "checking"
+            ? "Checking for updates"
+            : updateStatus.state === "error"
+              ? "Couldn't check for updates"
+              : `Version ${__CLIPS_DESKTOP_VERSION__ || "0.0.0"}`;
+  const updateRowDescription = !updateChecksSupported
+    ? undefined
+    : updateStatus.state === "downloaded"
+      ? "Restart when you like. Nothing in progress is lost."
+      : updateStatus.state === "downloading" ||
+          updateStatus.state === "available"
+        ? "Downloading in the background, so keep recording"
+        : updateStatus.state === "error"
+          ? "Clips retries after launch and every hour"
+          : "Checks after launch, every hour, and when you come back";
 
-  return (
-    <form className="setup" onSubmit={handleSubmit}>
-      <div className="setup-header">
-        {onCancel ? (
+  function checkForDesktopUpdate() {
+    retryUpdateCheck().catch((err) => {
+      console.error("[clips-updater] manual check failed:", err);
+    });
+  }
+
+  const settingsTabIsAvailable =
+    settingsTab === "general" ||
+    settingsTab === "recording" ||
+    settingsTab === "rewind" ||
+    settingsTab === "advanced" ||
+    (settingsTab === "meetings" && meetingsLabEnabled) ||
+    (settingsTab === "dictation" && wisprFlowLabEnabled);
+
+  useEffect(() => {
+    if (surface !== "settings" || settingsTabIsAvailable) return;
+    setSettingsTab("general");
+  }, [settingsTabIsAvailable, surface]);
+
+  if (surface === "memory") {
+    return (
+      <div className="setup popover-view rewind-memory-surface">
+        <div className="setup-header">
           <button
             type="button"
             className="setup-back"
@@ -3562,524 +7240,1417 @@ function Setup({
           >
             <IconArrowLeft size={18} stroke={1.75} />
           </button>
-        ) : null}
-        <h2>Settings</h2>
-      </div>
-
-      <div className="setup-section">
-        <SettingLabel
-          label="Clips server URL"
-          hint="The URL of the Clips backend this tray app connects to."
-          htmlFor="clips-url"
-        />
-        <input
-          id="clips-url"
-          ref={inputRef}
-          type="url"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          placeholder="http://localhost:8080"
-        />
-        <button className="primary" type="submit">
-          Connect
-        </button>
-      </div>
-
-      <div className="setup-section">
-        <div className="setup-toggle-row">
-          <SettingLabel
-            label="Open at login"
-            hint="Start Clips automatically when you sign in so recording, meetings, and dictation shortcuts are ready."
-          />
-          <Switch
-            on={launchAtLoginEnabled}
-            onChange={setLaunchAtLoginEnabled}
-            label="Open Clips at login"
-          />
+          <h2>Search memory</h2>
         </div>
-      </div>
-
-      <div className="setup-section">
-        <div className="setup-toggle-row">
-          <SettingLabel
-            label="Hide when inactive"
-            hint="When off, the Clips window stays open until you close it."
-          />
-          <Switch
-            on={autoHidePopoverEnabled}
-            onChange={setAutoHidePopoverEnabled}
-            label="Hide Clips when focus leaves"
-          />
-        </div>
-      </div>
-
-      <div className="setup-section">
-        <div className="setup-toggle-row">
-          <SettingLabel
-            label="Show Clips in screen captures"
-            hint="By default the Clips window and recording overlays are hidden from screenshots and screen recordings so they never leak into your captured video. Turn on for debugging or demos."
-          />
-          <Switch
-            on={showInScreenCapture}
-            onChange={setShowInScreenCapture}
-            label="Show Clips in screen captures"
-          />
-        </div>
-      </div>
-
-      <details className="setup-advanced">
-        <summary className="setup-advanced-summary">Advanced recording</summary>
-        <div className="setup-advanced-body">
-          <div className="setup-section">
-            <SettingLabel
-              label="Save recordings locally"
-              hint="Advanced local-only mode. Local recordings save to Movies/Clips and do not upload or create a Clip."
-              htmlFor="local-recording-mode"
-            />
-            <select
-              id="local-recording-mode"
-              className="setup-select"
-              value={localRecordingMode}
-              onChange={(event) =>
-                setLocalRecordingMode(event.target.value as LocalRecordingMode)
-              }
-            >
-              <option value="off">Cloud Clips (default)</option>
-              <option value="composed">One local composed video</option>
-              <option value="separate">
-                Two local files: desktop + camera
-              </option>
-            </select>
-            <p className="setup-hint">
-              Two-file mode records desktop with audio and a raw rectangular
-              camera video with no audio.
+        {screenMemory.enabled ? (
+          <>
+            <p className="rewind-surface-lede">
+              Search what Rewind remembers on this device. For everyday recall,
+              ask your connected agent.
             </p>
-          </div>
-
-          <div className="setup-section">
-            <div className="setup-toggle-row">
-              <SettingLabel
-                label="Screen region guides"
-                hint="Show private rectangle guides over your screen while recording. They stay out of the saved Clip."
+            <form
+              className="rewind-search-row"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void askRewindLocally();
+              }}
+            >
+              <IconSearch size={17} stroke={1.8} />
+              <input
+                autoFocus
+                value={rewindLocalQuery}
+                onChange={(event) => setRewindLocalQuery(event.target.value)}
+                placeholder="Search words you saw or heard…"
+                aria-label="Search memory"
+                maxLength={500}
               />
-              <Switch
-                on={regionGuides.enabled}
-                onChange={setRegionGuidesEnabled}
-                label="Show screen region guides while recording"
-              />
-            </div>
-            {regionGuides.enabled && (
-              <div className="setup-toggle-row">
-                <SettingLabel
-                  label="Keep guides on screen even when not recording"
-                  hint="Stays visible at all times so you can frame recordings made with other tools like OBS or QuickTime. Still excluded from every screen recording."
-                />
-                <Switch
-                  on={regionGuidesAlwaysVisible}
-                  onChange={setRegionGuidesAlwaysVisible}
-                  label="Keep region guides on screen even when not recording"
-                />
+              <button
+                type="submit"
+                disabled={rewindLocalBusy || !rewindLocalQuery.trim()}
+              >
+                {rewindLocalBusy ? "Searching…" : "Search"}
+              </button>
+            </form>
+            {rewindLocalError ? (
+              <p className="setup-warning">{rewindLocalError}</p>
+            ) : null}
+            {rewindLocalResult ? (
+              <div className="rewind-search-results" aria-live="polite">
+                <div className="rewind-result-summary">
+                  <strong>
+                    {rewindLocalResult.evidence.length} moment
+                    {rewindLocalResult.evidence.length === 1 ? "" : "s"} found
+                  </strong>
+                  <span>
+                    {rewindLocalResult.coverage.segmentsConsidered} local
+                    segments searched
+                  </span>
+                </div>
+                {rewindLocalResult.evidence.length === 0 ? (
+                  <div className="popover-empty-card">
+                    <strong>No matching moments</strong>
+                    <p>
+                      Try an app name, a phrase you heard, or text that appeared
+                      on screen.
+                    </p>
+                  </div>
+                ) : (
+                  rewindLocalResult.evidence.map((evidence) => (
+                    <article className="rewind-evidence-card" key={evidence.id}>
+                      <div className="rewind-evidence-meta">
+                        {new Date(evidence.capturedAt).toLocaleString()} ·{" "}
+                        {evidence.sourceType === "ocr"
+                          ? "On-screen text"
+                          : evidence.sourceType === "transcript"
+                            ? "Audio"
+                            : "App context"}
+                      </div>
+                      <p>{evidence.excerpt}</p>
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={() => void replayRewindMoment(evidence)}
+                        disabled={rewindReplayId === evidence.id}
+                      >
+                        <IconPlayerPlay size={14} stroke={1.9} />
+                        {rewindReplayId === evidence.id
+                          ? "Preparing replay…"
+                          : "Replay this moment"}
+                      </button>
+                    </article>
+                  ))
+                )}
+                <details className="setup-advanced rewind-coverage-details">
+                  <summary className="setup-advanced-summary">
+                    Coverage and gaps
+                  </summary>
+                  <div className="setup-advanced-body">
+                    <p className="setup-hint">
+                      {rewindLocalResult.coverage.transcriptIndexesReady} audio
+                      and {rewindLocalResult.coverage.ocrIndexesReady} visual
+                      indexes were ready. Confidence:{" "}
+                      {rewindLocalResult.confidence}.
+                    </p>
+                    {rewindLocalResult.coverage.gaps.length === 0 ? (
+                      <p className="setup-hint">
+                        No known capture or index gaps.
+                      </p>
+                    ) : (
+                      rewindLocalResult.coverage.gaps.map((gap, index) => (
+                        <p
+                          className="setup-hint"
+                          key={`${gap.kind}-${gap.source}-${gap.startedAt ?? index}`}
+                        >
+                          <strong>{gap.source}</strong> · {gap.detail}
+                        </p>
+                      ))
+                    )}
+                  </div>
+                </details>
+              </div>
+            ) : (
+              <div className="popover-empty-card rewind-memory-empty">
+                <IconSearch size={19} stroke={1.7} />
+                <strong>Find the source moment</strong>
+                <p>
+                  Every result comes from what's stored on this device and links
+                  back to a replay.
+                </p>
               </div>
             )}
-            <div className="setup-button-row">
-              <button
-                type="button"
-                className="secondary"
-                onClick={openRegionGuideEditor}
-              >
-                <IconPencil size={15} stroke={1.9} />
-                Edit preset
-              </button>
-              <button
-                type="button"
-                className="secondary"
-                onClick={clearRegionGuidePreset}
-                disabled={regionGuideCount === 0}
-              >
-                <IconTrash size={15} stroke={1.9} />
-                Clear
-              </button>
-            </div>
-            <p className="setup-hint">
-              {regionGuideCount === 0
-                ? "No guide preset saved yet."
-                : `${regionGuideCount} ${regionGuideCount === 1 ? "rectangle" : "rectangles"} saved.`}
-            </p>
+          </>
+        ) : (
+          <div className="popover-empty-card rewind-memory-empty">
+            <IconHistory size={20} stroke={1.7} />
+            <strong>Rewind is off</strong>
+            <p>Turn on Rewind to start keeping moments you can search.</p>
+            {/* The consent dialog renders only on the settings surface, so
+                the switch (and its consent) live there — this button walks
+                the user to it rather than toggling a dialog that cannot
+                mount here. */}
+            <button type="button" className="secondary" onClick={onCancel}>
+              Open Rewind settings
+            </button>
           </div>
-        </div>
-      </details>
-
-      <div className="setup-section">
-        <div className="setup-toggle-row">
-          <SettingLabel
-            label="Voice dictation"
-            hint="Speak to type anywhere on your Mac. Turn off to disable globally and remove the keyboard shortcuts."
-          />
-          <Switch
-            on={voiceEnabled}
-            onChange={setVoiceEnabled}
-            label="Enable voice dictation"
-          />
-        </div>
+        )}
       </div>
+    );
+  }
 
-      <div className="setup-section">
-        <div className="setup-toggle-row">
-          <SettingLabel
-            label="Meeting notes"
-            hint="Use calendar meetings to show a notes widget and start live transcription."
+  function renderGeneralSettings() {
+    return (
+      <div className="mx-auto grid w-full max-w-[620px] gap-7 pb-4">
+        <SettingsGroup label="App">
+          <SettingsRow
+            label="Open at login"
+            description="Open Clips automatically on login"
+            control={
+              <SettingsSwitch
+                checked={launchAtLoginEnabled}
+                onCheckedChange={setLaunchAtLoginEnabled}
+                label="Open at login"
+              />
+            }
           />
-          <Switch
-            on={meetingsEnabled}
-            onChange={setMeetingsEnabled}
-            label="Enable meeting notes"
+          <SettingsRow
+            label="Hide when inactive"
+            description="Close the Clips window when switching to another application"
+            control={
+              <SettingsSwitch
+                checked={autoHidePopoverEnabled}
+                onCheckedChange={setAutoHidePopoverEnabled}
+                label="Hide when inactive"
+              />
+            }
           />
-        </div>
-      </div>
+        </SettingsGroup>
 
-      {meetingsEnabled ? (
-        <>
-          <div className="setup-section">
-            <SettingLabel
-              label="Meeting transcription"
-              hint="Choose whether Clips asks first, starts automatically, or waits for manual start."
-              htmlFor="meeting-transcription-mode"
-            />
-            <select
-              id="meeting-transcription-mode"
-              className="setup-select"
-              value={meetingTranscriptionMode}
-              onChange={(event) =>
-                setMeetingTranscriptionMode(
-                  event.target.value as MeetingTranscriptionMode,
+        <SettingsGroup label="System access">
+          {systemAccessRows.map((row) => (
+            <SettingsRow
+              key={row.key}
+              label={row.label}
+              description={row.description}
+              control={
+                row.granted === true ? (
+                  <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                    <IconCircleCheck
+                      className="size-4"
+                      stroke={1.8}
+                      aria-hidden="true"
+                    />
+                    Granted
+                  </span>
+                ) : canOpenPrivacySettings ? (
+                  <SettingsActionButton onClick={row.onGrant}>
+                    {row.granted === false ? "Grant" : "Open settings"}
+                  </SettingsActionButton>
+                ) : (
+                  <span className="text-sm text-muted-foreground">
+                    System prompt
+                  </span>
                 )
               }
-            >
-              <option value="ask">Ask at meeting time</option>
-              <option value="auto">Auto-start during meeting times</option>
-              <option value="manual">Manual only</option>
-            </select>
-            <p className="setup-hint">
-              Auto-start still shows the notes pill while transcription is
-              active.
-            </p>
-          </div>
-
-          <div className="setup-section">
-            <div className="setup-toggle-row">
-              <SettingLabel
-                label="Whisper model"
-                hint="Local AI model for offline meeting transcription. Captures both your mic and other speakers — no API key required."
-              />
-              <Switch
-                on={whisperModelEnabled}
-                onChange={setWhisperModelEnabled}
-                label="Enable Whisper model"
-              />
-            </div>
-            <WhisperModelStatusRow
-              status={whisperStatus}
-              enabled={whisperModelEnabled}
-              onDownload={triggerWhisperDownload}
             />
-          </div>
+          ))}
+        </SettingsGroup>
 
-          <div className="setup-section">
-            <div className="setup-toggle-row">
-              <SettingLabel
-                label="Meeting widget"
-                hint="Show the on-screen meeting widget near calendar start times, even when macOS notifications are hidden."
-              />
-              <Switch
-                on={showMeetingWidgetEnabled}
-                onChange={setShowMeetingWidgetEnabled}
-                label="Show meeting widget"
-              />
-            </div>
-          </div>
-        </>
-      ) : null}
-
-      <div className="setup-section">
-        <SettingLabel
-          label="Open Clips shortcut"
-          hint="Optional extra global shortcut for opening the tray popover. Cmd+Shift+L remains available."
-        />
-        <ShortcutRecorder
-          value={popoverCustomShortcut}
-          placeholder="Record shortcut"
-          onChange={onPopoverCustomShortcutChange}
-        />
-        <p className="setup-hint">
-          Use a modifier combination like Cmd+Shift+K. Leave empty to use only
-          Cmd+Shift+L.
-        </p>
-        {shortcutRegistrationError ? (
-          <p className="setup-warning">{shortcutRegistrationError}</p>
-        ) : null}
+        <SettingsGroup label="Updates">
+          <SettingsRow
+            label={updateRowLabel}
+            description={updateRowDescription}
+            control={renderUpdateControl()}
+          >
+            {updateStatus.state === "error" ? (
+              <p className="text-xs text-destructive">{updateStatus.message}</p>
+            ) : null}
+          </SettingsRow>
+        </SettingsGroup>
       </div>
+    );
+  }
 
-      <div className="setup-section">
-        <SettingLabel
-          label="Privacy permissions"
-          hint="Open the exact Privacy & Security pane for each permission Clips can need."
-        />
-        <ReadinessPanel
-          mode="screen-camera"
-          cameraOn={true}
-          micOn={true}
-          includeVoicePaste={voiceEnabled}
-          includeFnMonitoring={fnShortcutSelected}
-          open={readinessOpen}
-          onOpenChange={setReadinessOpen}
-          onOpenPermission={openPrivacySettings}
-        />
-      </div>
-
-      {voiceEnabled ? (
-        <>
-          <div className="setup-section">
-            <SettingLabel
-              label="Provider"
-              hint="Choose free on-device dictation, Builder.io cleanup, or a provider key you own."
-              htmlFor="voice-provider"
-            />
-            <select
-              id="voice-provider"
-              className="setup-select"
-              value={selectedMode}
-              onChange={(event) =>
-                selectProviderMode(event.target.value as VoiceProviderMode)
-              }
-            >
-              <option value="native">On-device (free, fast)</option>
-              <option value="builder">Builder.io</option>
-              <option value="byok">Add your own key</option>
-            </select>
-            <p className="setup-hint">{providerHint[selectedMode]}</p>
-            {providerWarning ? (
-              <p className="setup-warning">{providerWarning}</p>
-            ) : null}
-            {selectedMode === "builder" && !providerStatus?.builder ? (
-              <button
-                type="button"
-                className="secondary"
-                onClick={connectBuilder}
-              >
-                Connect Builder.io
-              </button>
-            ) : null}
-          </div>
-
-          {selectedMode === "byok" ? (
-            <div className="setup-section">
-              <SettingLabel
-                label="Key provider"
-                hint="Choose which provider key to use for cleanup."
-                htmlFor="voice-byok-provider"
-              />
-              <select
-                id="voice-byok-provider"
-                className="setup-select"
-                value={byokProvider}
-                onChange={(event) => {
-                  setApiKeyMessage(null);
-                  onVoiceProviderChange(
-                    event.target.value as ByokVoiceProvider,
-                  );
-                }}
-              >
-                <option value="gemini">Google Gemini (recommended)</option>
-                <option value="groq">Groq</option>
-              </select>
-              <div className="setup-key-row">
-                <input
-                  type="password"
-                  value={apiKeyValue}
-                  onChange={(event) => setApiKeyValue(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      saveApiKey();
-                    }
-                  }}
-                  placeholder={
-                    providerStatus?.[byokProvider]
-                      ? "Paste a new key to rotate"
-                      : `Paste ${keyForByokProvider(byokProvider)}`
-                  }
-                />
-                <button
-                  type="button"
-                  className="secondary setup-key-save"
-                  onClick={saveApiKey}
-                  disabled={!apiKeyValue.trim() || apiKeySaving}
-                >
-                  {apiKeySaving
-                    ? "Saving..."
-                    : providerStatus?.[byokProvider]
-                      ? "Rotate"
-                      : "Save"}
-                </button>
-              </div>
-              {providerStatus?.[byokProvider] ? (
-                <p className="setup-hint">
-                  {labelForByokProvider(byokProvider)} key is set.
-                </p>
-              ) : null}
-              {apiKeyMessage ? (
-                <p
-                  className={
-                    apiKeyMessage.kind === "ok"
-                      ? "setup-success"
-                      : "setup-warning"
-                  }
-                >
-                  {apiKeyMessage.text}
-                </p>
-              ) : null}
-            </div>
-          ) : null}
-
-          {selectedMode !== "native" ? (
-            <div className="setup-section">
-              <SettingLabel
-                label="Custom instructions"
-                hint="Included with LLM cleanup/transcription. Use this for casing, names, punctuation, tone, or terms of art."
-                htmlFor="voice-instructions"
-              />
-              <textarea
-                id="voice-instructions"
-                className="setup-textarea"
-                rows={4}
-                value={voiceInstructions}
-                onChange={(event) =>
-                  onVoiceInstructionsChange(event.target.value)
-                }
-                placeholder="Example: keep it casual, spell Builder.io with a dot, and preserve technical terms exactly."
-              />
-              <p className="setup-hint">
-                These instructions are sent only when an LLM-based provider is
-                selected.
-              </p>
-            </div>
-          ) : null}
-
-          <div className="setup-section">
-            <SettingLabel
-              label="Shortcut"
-              hint="The key combination that triggers voice dictation."
-              htmlFor="voice-shortcut"
-            />
-            <select
-              id="voice-shortcut"
-              className="setup-select"
-              value={voiceShortcut}
-              onChange={(event) =>
-                onVoiceShortcutChange(
-                  event.target.value as VoiceShortcutPreference,
-                )
-              }
-            >
-              <option value="cmd-shift-space">Cmd+Shift+Space</option>
-              <option value="ctrl-shift-space">Ctrl+Shift+Space</option>
-              <option value="custom">Custom shortcut</option>
-              <option value="fn">Fn (globe, needs Input Monitoring)</option>
-              <option value="both">All shortcuts (includes Fn)</option>
-            </select>
-            {voiceShortcut === "custom" ? (
-              <ShortcutRecorder
-                value={voiceCustomShortcut}
-                placeholder="Record voice shortcut"
-                onChange={onVoiceCustomShortcutChange}
-              />
-            ) : null}
-            <p className="setup-hint">{shortcutHint[voiceShortcut]}</p>
-            {isMacPlatform() && fnShortcutSelected ? (
-              <button
-                type="button"
-                className="secondary"
-                onClick={() => openPrivacySettings("input-monitoring")}
-              >
-                Open Input Monitoring
-              </button>
-            ) : null}
-          </div>
-
-          <div className="setup-section">
-            <SettingLabel
-              label="Mode"
-              hint="Whether you hold the shortcut while speaking or toggle it on and off."
-              htmlFor="voice-mode"
-            />
-            <select
-              id="voice-mode"
-              className="setup-select"
-              value={voiceMode}
-              onChange={(event) =>
-                onVoiceModeChange(event.target.value as VoiceMode)
-              }
-            >
-              <option value="push-to-talk">Hold to dictate</option>
-              <option value="toggle">Press to start, press to stop</option>
-            </select>
-            <p className="setup-hint">{modeHint[voiceMode]}</p>
-          </div>
-        </>
-      ) : null}
-      <div className="setup-account">
-        <button
-          type="button"
-          className="link-button"
+  function renderUpdateControl() {
+    if (!updateChecksSupported) {
+      return null;
+    }
+    if (updateReady) {
+      return (
+        <SettingsActionButton
+          emphasis="primary"
           onClick={() => {
-            invoke("open_logs").catch((err) => {
-              console.error("[clips-tray] open logs failed:", err);
+            installAndRestart().catch((err) => {
+              console.error("[clips-updater] relaunch failed:", err);
             });
           }}
-          style={{ display: "flex", alignItems: "center", gap: 6 }}
         >
-          <IconFolderOpen size={14} />
-          Open logs
-        </button>
-      </div>
-      {signedInAs && onSignOut ? (
-        <div className="setup-account">
-          <span className="setup-account-email">{signedInAs}</span>
-          <button
-            type="button"
-            className="link-button"
-            onClick={onSignOut}
-            style={{ background: "transparent", border: "none" }}
-          >
-            Sign out
-          </button>
-        </div>
-      ) : null}
-    </form>
-  );
-}
+          Restart to install
+        </SettingsActionButton>
+      );
+    }
+    if (updateBusy) {
+      return (
+        <IconRefresh
+          size={15}
+          stroke={1.9}
+          className="update-spinner text-muted-foreground"
+          aria-hidden="true"
+        />
+      );
+    }
+    return (
+      <SettingsActionButton onClick={checkForDesktopUpdate}>
+        Check now
+      </SettingsActionButton>
+    );
+  }
 
-function SettingLabel({
-  label,
-  hint,
-  htmlFor,
-}: {
-  label: string;
-  hint: string;
-  htmlFor?: string;
-}) {
+  function renderRecordingSettings() {
+    return (
+      <div className="mx-auto grid w-full max-w-[620px] gap-7 pb-4">
+        <SettingsGroup>
+          <SettingsRow
+            label="Voice cleanup"
+            description="Reduces background noise and echo from your microphone"
+            control={
+              <SettingsSwitch
+                checked={voiceCleanupEnabled}
+                onCheckedChange={setVoiceCleanupEnabled}
+                disabled={captureControlsLocked}
+                label="Voice cleanup"
+              />
+            }
+          />
+          <SettingsRow
+            label="Start / stop recording"
+            description="Start and stop a recording from any app"
+            control={
+              <ShortcutRecorder
+                value={recordCustomShortcut}
+                placeholder={compactShortcutLabel(
+                  isMacPlatform() ? "Cmd+Shift+L" : "Ctrl+Shift+L",
+                )}
+                onChange={onRecordCustomShortcutChange}
+              />
+            }
+          />
+          <SettingsRow
+            label="Cancel recording"
+            description="Cancel a recording without saving it"
+            control={
+              <ShortcutRecorder
+                value={recordCancelShortcut}
+                placeholder={compactShortcutLabel("Alt+Shift+C")}
+                onChange={onRecordCancelShortcutChange}
+              />
+            }
+          />
+          <SettingsRow
+            label="Pause / resume recording"
+            description="Pause and resume an active recording"
+            control={
+              <ShortcutRecorder
+                value={recordPauseShortcut}
+                placeholder={
+                  isMacPlatform()
+                    ? compactShortcutLabel("Alt+Shift+P")
+                    : "Alt Shift P / S"
+                }
+                onChange={onRecordPauseShortcutChange}
+              />
+            }
+          />
+          <SettingsRow
+            label="Save to"
+            description="Uploads recordings to your cloud library, or saves locally on device"
+            control={
+              <SettingsSelect
+                ariaLabel="Save recordings to"
+                value={localRecordingMode}
+                onValueChange={(value) =>
+                  setLocalRecordingMode(value as LocalRecordingMode)
+                }
+                options={[
+                  { value: "off", label: "Cloud Clips" },
+                  { value: "composed", label: "This device, one video" },
+                  { value: "separate", label: "This device, screen + camera" },
+                ]}
+              />
+            }
+          />
+        </SettingsGroup>
+      </div>
+    );
+  }
+
+  function renderRewindSettings() {
+    const rewindOn = screenMemory.enabled === true;
+    return (
+      <div className="mx-auto grid w-full max-w-[620px] gap-7 pb-4">
+        <SettingsGroup>
+          {/* A confirmation, so a dialog rather than a takeover: the user is
+              answering one question about the screen behind it, not moving to
+              a new place. What it remembers is chosen afterwards, in the row
+              below — asking before they have agreed puts the options in front
+              of the decision.
+
+              The copy names what is captured and what can leave, and nothing
+              else. Two claims are tempting and both are false: this buffer
+              holds screen *video* (hence the GB disk limit below), not app
+              and window notes; and it cannot promise "never leaves this Mac"
+              because the agent-handoff path uploads an approved range. A
+              consent screen is the one place a comforting simplification is
+              indistinguishable from a lie. */}
+          <UiAlertDialog
+            open={rewindConsentOpen}
+            onOpenChange={setRewindConsentOpen}
+          >
+            <UiAlertDialogContent className="max-w-md">
+              <UiAlertDialogHeader>
+                <UiAlertDialogTitle>Turn on Rewind?</UiAlertDialogTitle>
+                <UiAlertDialogDescription>
+                  Clips will continuously record your screen and keep it on this
+                  device. Agents get text excerpts, and video is shared only
+                  when you approve it.
+                </UiAlertDialogDescription>
+              </UiAlertDialogHeader>
+              <UiAlertDialogFooter>
+                <UiAlertDialogCancel>Not now</UiAlertDialogCancel>
+                <UiAlertDialogAction
+                  disabled={screenMemoryConfigBusy || !featureConfig}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    void setScreenMemoryConfig({
+                      enabled: true,
+                      paused: false,
+                    }).finally(() => setRewindConsentOpen(false));
+                  }}
+                >
+                  {screenMemoryConfigBusy ? "Turning on…" : "Turn on Rewind"}
+                </UiAlertDialogAction>
+              </UiAlertDialogFooter>
+            </UiAlertDialogContent>
+          </UiAlertDialog>
+          <SettingsRow
+            label="Rewind"
+            description="Keeps a rolling record of your recent screen on this device"
+            control={
+              <SettingsSwitch
+                checked={rewindOn}
+                onCheckedChange={(next) => {
+                  if (next) {
+                    setRewindConsentOpen(true);
+                    return;
+                  }
+                  void setScreenMemoryConfig({ enabled: false });
+                }}
+                disabled={screenMemoryConfigBusy || captureControlsLocked}
+                label="Rewind"
+              />
+            }
+          >
+            {screenMemoryMessage ? (
+              <p
+                className={
+                  screenMemoryMessage.kind === "ok"
+                    ? "text-xs text-success"
+                    : "text-xs text-destructive"
+                }
+              >
+                {screenMemoryMessage.text}
+              </p>
+            ) : rewindOn && rewindStatusPresentation.hasError ? (
+              <p className="text-xs text-destructive">
+                {rewindStatusPresentation.detail}
+              </p>
+            ) : null}
+          </SettingsRow>
+          {rewindOn ? (
+            <>
+              <SettingsRow
+                label="Remember"
+                description="Choose what Rewind captures"
+                control={
+                  <SettingsSelect
+                    ariaLabel="What Rewind remembers"
+                    value={screenMemory.captureMode ?? "visuals"}
+                    onValueChange={(value) => {
+                      void setScreenMemoryConfig({
+                        captureMode: value as RewindCaptureMode,
+                      });
+                    }}
+                    disabled={screenMemoryConfigBusy || captureControlsLocked}
+                    options={[
+                      { value: "visuals", label: "Screen only" },
+                      { value: "visuals-audio", label: "Screen + audio" },
+                    ]}
+                  />
+                }
+              />
+              <SettingsRow
+                label="Time limit"
+                description="Choose how long Rewind keeps your screen history"
+                control={
+                  <SettingsSelect
+                    ariaLabel="Rewind time limit"
+                    placeholder={`${screenMemory.retentionHours} hours`}
+                    value={String(screenMemory.retentionHours)}
+                    onValueChange={(value) => {
+                      void setScreenMemoryConfig({
+                        retentionHours: Number(value),
+                      });
+                    }}
+                    disabled={screenMemoryConfigBusy}
+                    options={[
+                      { value: "8", label: "8 hours" },
+                      { value: "24", label: "24 hours" },
+                    ]}
+                  />
+                }
+              />
+              <SettingsRow
+                label="Storage limit"
+                description="Choose how much space Rewind can use on this device"
+                control={
+                  <SettingsSelect
+                    ariaLabel="Rewind storage limit"
+                    placeholder={formatStorageBytes(screenMemory.maxBytes)}
+                    value={String(screenMemory.maxBytes)}
+                    onValueChange={(value) => {
+                      void setScreenMemoryConfig({ maxBytes: Number(value) });
+                    }}
+                    disabled={screenMemoryConfigBusy}
+                    options={[
+                      { value: String(5 * 1024 * 1024 * 1024), label: "5 GB" },
+                      {
+                        value: String(20 * 1024 * 1024 * 1024),
+                        label: "20 GB",
+                      },
+                      {
+                        value: String(50 * 1024 * 1024 * 1024),
+                        label: "50 GB",
+                      },
+                    ]}
+                  />
+                }
+              />
+            </>
+          ) : null}
+        </SettingsGroup>
+
+        {rewindOn ? (
+          <>
+            <SettingsGroup label="Privacy">
+              <SettingsRow
+                label="Excluded apps"
+                description={"Apps Rewind never captures"}
+                control={
+                  <SettingsActionButton
+                    onClick={() => void chooseExcludedApplications()}
+                    disabled={excludedAppsBusy}
+                  >
+                    Choose apps
+                  </SettingsActionButton>
+                }
+              >
+                {excludedAppGroups.length > 0 ? (
+                  <div className="grid gap-1">
+                    {excludedAppGroups.map((app) => (
+                      <div
+                        key={app.bundleIds.join(",")}
+                        className="flex items-center justify-between gap-2"
+                      >
+                        <span className="truncate">{app.name}</span>
+                        <SettingsActionButton
+                          emphasis="quiet"
+                          onClick={() =>
+                            removeExcludedApplications(app.bundleIds)
+                          }
+                        >
+                          Remove
+                        </SettingsActionButton>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </SettingsRow>
+              <SettingsRow
+                label="Review before sending"
+                description="Approve each visual or audio range before an agent receives it"
+                control={
+                  <SettingsSwitch
+                    checked={screenMemory.reviewBeforeSending !== false}
+                    onCheckedChange={(next) => {
+                      void setScreenMemoryConfig({
+                        reviewBeforeSending: next,
+                      });
+                    }}
+                    disabled={screenMemoryConfigBusy}
+                    label="Review before sending"
+                  />
+                }
+              />
+              <SettingsRow
+                label="Preview before sending"
+                description="Open the range locally so you see exactly what is sent"
+                control={
+                  <SettingsSwitch
+                    checked={screenMemory.autoPreviewBeforeSending === true}
+                    onCheckedChange={(next) => {
+                      void setScreenMemoryConfig({
+                        autoPreviewBeforeSending: next,
+                      });
+                    }}
+                    disabled={screenMemoryConfigBusy}
+                    label="Preview before sending"
+                  />
+                }
+              />
+              <SettingsRow
+                label="Keep agent Clips"
+                description="Choose how long Clips made for agents stay in your library"
+                control={
+                  <SettingsSelect
+                    ariaLabel="How long agent-created Clips are kept"
+                    value={screenMemory.agentClipRetention}
+                    onValueChange={(value) => {
+                      void setScreenMemoryConfig({
+                        agentClipRetention:
+                          value as ScreenMemoryStatus["config"]["agentClipRetention"],
+                      });
+                    }}
+                    disabled={screenMemoryConfigBusy}
+                    options={[
+                      { value: "forever", label: "Forever" },
+                      { value: "24-hours", label: "24 hours" },
+                      { value: "7-days", label: "7 days" },
+                      { value: "30-days", label: "30 days" },
+                    ]}
+                  />
+                }
+              />
+              <SettingsRow
+                label="Agent activity"
+                description="Each time an agent searched this device's memory, newest first"
+              >
+                {rewindEgressEvents.length === 0 ? (
+                  <p>No agent has searched it yet.</p>
+                ) : (
+                  <div className="grid gap-1">
+                    {rewindEgressEvents.slice(0, 10).map((event) => (
+                      <div
+                        key={`${event.requestId}-${event.state}`}
+                        className="flex items-center justify-between gap-2"
+                      >
+                        <span className="truncate">
+                          {new Date(event.occurredAt).toLocaleString()}
+                        </span>
+                        <span className="shrink-0">
+                          {event.state} ·{" "}
+                          {`${event.evidenceCount} item${event.evidenceCount === 1 ? "" : "s"}`}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </SettingsRow>
+            </SettingsGroup>
+
+            <SettingsGroup label="Agents">
+              <SettingsRow
+                label="Setup prompt"
+                description="Paste it into an agent once to install Rewind's instructions"
+                control={
+                  <>
+                    <SettingsActionButton
+                      emphasis="quiet"
+                      onClick={onOpenRewindDocs}
+                    >
+                      Learn more
+                    </SettingsActionButton>
+                    <SettingsActionButton onClick={onCopyRewindAgentPrompt}>
+                      {rewindAgentPromptCopied ? "Copied" : "Copy"}
+                    </SettingsActionButton>
+                  </>
+                }
+              />
+              <SettingsRow
+                label="Connect an agent"
+                description="Gives a local agent access to this device's Rewind memory"
+                control={
+                  <>
+                    <SettingsActionButton
+                      onClick={() => void installRewindAgentConnection("codex")}
+                      disabled={agentConnectionBusy !== null}
+                    >
+                      Codex
+                    </SettingsActionButton>
+                    <SettingsActionButton
+                      onClick={() =>
+                        void installRewindAgentConnection("claude-code")
+                      }
+                      disabled={agentConnectionBusy !== null}
+                    >
+                      Claude Code
+                    </SettingsActionButton>
+                  </>
+                }
+              >
+                {agentConnectionMessage ? (
+                  <p
+                    className={
+                      agentConnectionMessage.kind === "ok"
+                        ? "text-xs text-success"
+                        : "text-xs text-destructive"
+                    }
+                  >
+                    {agentConnectionMessage.text}
+                  </p>
+                ) : null}
+              </SettingsRow>
+            </SettingsGroup>
+
+            <SettingsGroup label="Storage">
+              <SettingsRow
+                label="Search memory"
+                description="Find and replay a recent moment yourself"
+                control={
+                  <SettingsActionButton onClick={onOpenMemory}>
+                    Search
+                  </SettingsActionButton>
+                }
+              />
+              <SettingsRow
+                label="Save last 5 minutes"
+                description="Exports recent memory as video files on this device. Nothing is uploaded."
+                control={
+                  <SettingsActionButton
+                    onClick={() => void exportScreenMemoryRecent()}
+                    disabled={screenMemoryBusy}
+                  >
+                    Save
+                  </SettingsActionButton>
+                }
+              />
+              <SettingsRow
+                label="On this device"
+                description={`${screenMemorySegments.length} ${screenMemorySegments.length === 1 ? "segment" : "segments"} · ${formatStorageBytes(screenMemoryTotalBytes)}`}
+                control={
+                  <>
+                    <SettingsActionButton onClick={openScreenMemoryFolder}>
+                      Open folder
+                    </SettingsActionButton>
+                    <SettingsActionButton
+                      emphasis="destructive"
+                      onClick={() => void clearScreenMemory()}
+                      disabled={screenMemoryBusy}
+                    >
+                      Delete all
+                    </SettingsActionButton>
+                  </>
+                }
+              />
+            </SettingsGroup>
+          </>
+        ) : null}
+      </div>
+    );
+  }
+
+  function renderLabsSettings() {
+    const signedIn = labsSignedIn;
+    return (
+      <div className="mx-auto grid w-full max-w-[620px] gap-7 pb-4">
+        <SettingsGroup label="Labs">
+          {CLIPS_LABS.map((lab) => (
+            <SettingsRow
+              key={lab.key}
+              label={lab.displayName ?? lab.key}
+              description={lab.description}
+              control={
+                <UiSwitch
+                  checked={isLabEnabled(labValues, lab)}
+                  onCheckedChange={(enabled) =>
+                    onLabEnabledChange(lab, enabled)
+                  }
+                  disabled={!signedIn}
+                  aria-label={lab.displayName ?? lab.key}
+                />
+              }
+            />
+          ))}
+        </SettingsGroup>
+        {signedIn ? null : (
+          <p className="text-xs text-muted-foreground">
+            Sign in to change labs.
+          </p>
+        )}
+        {labError ? (
+          <p role="alert" className="text-xs text-destructive">
+            {labError}
+          </p>
+        ) : null}
+      </div>
+    );
+  }
+
+  function renderAdvancedSettings() {
+    return (
+      <div className="mx-auto grid w-full max-w-[620px] gap-7 pb-4">
+        <SettingsGroup label="Connection">
+          <SettingsRow
+            label="Clips server URL"
+            description="The server Clips signs in and uploads to"
+            control={
+              <SettingsPopover
+                title="Clips server URL"
+                open={serverUrlOpen}
+                onOpenChange={setServerUrlOpen}
+                trigger={<SettingsValueTrigger mono value={serverHostLabel} />}
+              >
+                <div className="grid gap-1.5">
+                  <div className="flex items-center gap-2">
+                    <Input
+                      id="clips-url"
+                      type="url"
+                      value={url}
+                      aria-invalid={serverUrlError ? true : undefined}
+                      onChange={(event) => {
+                        setUrl(event.target.value);
+                        setServerUrlError(null);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          handleConnect();
+                        }
+                      }}
+                      placeholder="http://localhost:8080"
+                      className="h-8 text-sm"
+                    />
+                    <SettingsActionButton
+                      className="shrink-0"
+                      onClick={handleConnect}
+                      disabled={!url.trim()}
+                    >
+                      Connect
+                    </SettingsActionButton>
+                  </div>
+                  {serverUrlError ? (
+                    <p className="text-xs text-destructive">{serverUrlError}</p>
+                  ) : null}
+                </div>
+              </SettingsPopover>
+            }
+          />
+        </SettingsGroup>
+
+        <SettingsGroup label="Transcription">
+          <SettingsRow
+            label="Transcription engine"
+            description="Choose what transcribes dictation and meetings"
+            control={
+              <SettingsSelect
+                ariaLabel="Transcription engine"
+                value={selectedMode}
+                onValueChange={(value) =>
+                  selectProviderMode(value as VoiceProviderMode)
+                }
+                options={[
+                  {
+                    value: "native",
+                    label: isMacPlatform()
+                      ? "macOS on-device"
+                      : "Browser built-in",
+                  },
+                  { value: "whisper", label: "Local Whisper" },
+                  { value: "builder", label: "Builder.io" },
+                  { value: "byok", label: "Your own key" },
+                ]}
+              />
+            }
+          >
+            {providerWarning ||
+            (selectedMode === "builder" && !providerStatus?.builder) ||
+            builderConnectMessage ? (
+              <>
+                {providerWarning ? (
+                  <p className="text-xs text-destructive">{providerWarning}</p>
+                ) : null}
+                {builderConnectMessage ? (
+                  <p
+                    className={
+                      builderConnectMessage.kind === "ok"
+                        ? "text-xs text-success"
+                        : "text-xs text-destructive"
+                    }
+                  >
+                    {builderConnectMessage.text}
+                  </p>
+                ) : null}
+                {selectedMode === "builder" && !providerStatus?.builder ? (
+                  <BuilderConnectPopover
+                    flow={builderConnectFlow}
+                    canProvisionAccount={canProvisionBuilderAccount}
+                  >
+                    <SettingsActionButton
+                      className="w-fit"
+                      disabled={builderConnecting}
+                    >
+                      {builderConnecting ? "Setting up…" : "Use Builder.io"}
+                    </SettingsActionButton>
+                  </BuilderConnectPopover>
+                ) : null}
+              </>
+            ) : null}
+          </SettingsRow>
+
+          {selectedMode === "byok" ? (
+            <>
+              <SettingsRow
+                label="Key provider"
+                description="Choose whose model cleans up dictated text"
+                control={
+                  <SettingsSelect
+                    ariaLabel="Key provider"
+                    value={byokProvider}
+                    onValueChange={(value) => {
+                      setApiKeyMessage(null);
+                      onVoiceProviderChange(value as ByokVoiceProvider);
+                    }}
+                    options={[
+                      { value: "gemini", label: "Google Gemini" },
+                      { value: "groq", label: "Groq" },
+                    ]}
+                  />
+                }
+              />
+              <SettingsRow
+                label={
+                  providerStatus?.[byokProvider]
+                    ? `${labelForByokProvider(byokProvider)} key (set)`
+                    : `${labelForByokProvider(byokProvider)} key`
+                }
+                description="Saved to your Clips account"
+                stacked
+                control={
+                  <div className="flex w-full items-center gap-2">
+                    <Input
+                      type="password"
+                      value={apiKeyValue}
+                      onChange={(event) => setApiKeyValue(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          void saveApiKey();
+                        }
+                      }}
+                      placeholder={
+                        providerStatus?.[byokProvider]
+                          ? "Paste to rotate"
+                          : `Paste ${keyForByokProvider(byokProvider)}`
+                      }
+                      className="h-8 text-sm"
+                    />
+                    <SettingsActionButton
+                      className="shrink-0"
+                      onClick={saveApiKey}
+                      disabled={!apiKeyValue.trim() || apiKeySaving}
+                    >
+                      {apiKeySaving
+                        ? "Saving…"
+                        : providerStatus?.[byokProvider]
+                          ? "Rotate"
+                          : "Save"}
+                    </SettingsActionButton>
+                  </div>
+                }
+              >
+                {apiKeyMessage ? (
+                  <p
+                    className={
+                      apiKeyMessage.kind === "ok"
+                        ? "text-xs text-success"
+                        : "text-xs text-destructive"
+                    }
+                  >
+                    {apiKeyMessage.text}
+                  </p>
+                ) : null}
+              </SettingsRow>
+            </>
+          ) : null}
+
+          {selectedMode !== "native" && selectedMode !== "whisper" ? (
+            <SettingsRow
+              label="Cleanup instructions"
+              description="Names, jargon, and casing to keep exactly as you say them"
+              stacked
+              control={
+                <Textarea
+                  id="voice-instructions"
+                  rows={3}
+                  value={voiceInstructions}
+                  onChange={(event) =>
+                    onVoiceInstructionsChange(event.target.value)
+                  }
+                  placeholder="Example: keep it casual and preserve technical terms exactly."
+                  className="min-h-16 text-sm"
+                />
+              }
+            />
+          ) : null}
+
+          <SettingsRow
+            label="Local Whisper model"
+            description="Transcribes everyone else in a meeting, offline on this device"
+            control={
+              <SettingsSwitch
+                checked={whisperModelEnabled}
+                onCheckedChange={whisper.setEnabled}
+                label="Local Whisper model"
+              />
+            }
+          >
+            {whisperModelEnabled ? null : (
+              <WhisperModelStatusRow
+                status={whisperStatus}
+                enabled={false}
+                onDownload={whisper.triggerDownload}
+              />
+            )}
+          </SettingsRow>
+          {whisperModelEnabled ? (
+            <SettingsRow
+              label="Model"
+              description="Choose the model used for offline transcription"
+              control={
+                <SettingsSelect
+                  ariaLabel="Whisper model"
+                  value={whisperModelId}
+                  onValueChange={whisper.setModelId}
+                  placeholder={
+                    whisperModels.length === 0
+                      ? "No models available"
+                      : "Choose a model"
+                  }
+                  options={whisperModels.map((model) => ({
+                    value: model.id,
+                    label: whisperModelOptionLabel(model),
+                  }))}
+                  disabled={
+                    whisperModels.length === 0 ||
+                    whisperStatus?.state === "downloading"
+                  }
+                />
+              }
+            >
+              {/* `ready` renders nothing (the picker already says which model),
+                  so gating on `whisperStatus` alone left an empty children row
+                  adding phantom space under the select. Gate on what will
+                  actually render. */}
+              {(whisperStatus && whisperStatus.state !== "ready") ||
+              deletableModels.length > 0 ? (
+                <>
+                  <WhisperModelStatusRow
+                    status={whisperStatus}
+                    enabled={whisperModelEnabled}
+                    onDownload={whisper.triggerDownload}
+                  />
+                  {deletableModels.length > 0 ? (
+                    <div className="grid gap-1">
+                      {deletableModels.map((model) => (
+                        <div
+                          key={model.id}
+                          className="flex items-center justify-between gap-2"
+                        >
+                          <span className="truncate">
+                            {model.title} &middot; {model.sizeMb} MB
+                          </span>
+                          <SettingsActionButton
+                            emphasis="quiet"
+                            onClick={() => whisper.deleteModel(model.id)}
+                          >
+                            <IconTrash className="size-3.5" stroke={1.9} />
+                            Delete
+                          </SettingsActionButton>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </>
+              ) : null}
+            </SettingsRow>
+          ) : null}
+        </SettingsGroup>
+
+        <SettingsGroup label="Capture">
+          <SettingsRow
+            label="Screen region guides"
+            description={
+              "Outlines to frame a shot that never appear in the Clip"
+            }
+            control={
+              <>
+                <SettingsSwitch
+                  checked={regionGuides.enabled}
+                  onCheckedChange={setRegionGuidesEnabled}
+                  label="Show screen region guides while recording"
+                />
+                <SettingsActionButton onClick={openRegionGuideEditor}>
+                  <IconPencil className="size-3.5" stroke={1.9} />
+                  Edit
+                </SettingsActionButton>
+              </>
+            }
+          >
+            {regionGuides.enabled ? (
+              <div className="flex flex-wrap items-center gap-2.5">
+                <span className="flex-1">
+                  Keep guides visible when not recording
+                </span>
+                <SettingsSwitch
+                  checked={regionGuidesAlwaysVisible}
+                  onCheckedChange={setRegionGuidesAlwaysVisible}
+                  label="Keep region guides on screen even when not recording"
+                />
+                {regionGuideCount > 0 ? (
+                  <SettingsActionButton
+                    emphasis="quiet"
+                    onClick={clearRegionGuidePreset}
+                  >
+                    Clear preset
+                  </SettingsActionButton>
+                ) : null}
+              </div>
+            ) : null}
+          </SettingsRow>
+        </SettingsGroup>
+
+        <SettingsGroup label="Window">
+          <SettingsRow
+            label="Show Clips in screen captures"
+            description="The Clips window will appear in your recordings"
+            control={
+              <SettingsSwitch
+                checked={showInScreenCapture}
+                onCheckedChange={setShowInScreenCapture}
+                label="Show Clips in screen captures"
+              />
+            }
+          />
+          <SettingsRow
+            label="Open Clips shortcut"
+            description="Shortcut to open Clips from any app"
+            control={
+              <ShortcutRecorder
+                value={popoverCustomShortcut}
+                placeholder="Set"
+                onChange={onPopoverCustomShortcutChange}
+              />
+            }
+          >
+            {shortcutRegistrationError ? (
+              <p className="text-xs text-destructive">
+                {shortcutRegistrationError}
+              </p>
+            ) : null}
+          </SettingsRow>
+        </SettingsGroup>
+
+        <SettingsGroup label="Troubleshooting">
+          <SettingsRow
+            label="Clip drafts"
+            description="Local copies kept when an upload doesn't finish"
+            control={
+              <SettingsActionButton onClick={openClipDraftsFolder}>
+                Open folder
+              </SettingsActionButton>
+            }
+          >
+            {clipDraftsError ? (
+              <p className="text-xs text-destructive">{clipDraftsError}</p>
+            ) : null}
+          </SettingsRow>
+          <SettingsRow
+            label="Diagnostic logs"
+            description="Attach these when you report a problem"
+            control={
+              <SettingsActionButton
+                onClick={() => {
+                  invoke("open_logs").catch((err) => {
+                    console.error("[clips-tray] open logs failed:", err);
+                  });
+                }}
+              >
+                Open folder
+              </SettingsActionButton>
+            }
+          />
+        </SettingsGroup>
+
+        {signedInAs && onSignOut ? (
+          <SettingsGroup label="Account">
+            <SettingsRow
+              label={`Signed in as ${signedInAs}`}
+              description="Recordings from this device land in this library"
+              control={
+                <SettingsActionButton onClick={onSignOut}>
+                  Sign out
+                </SettingsActionButton>
+              }
+            />
+          </SettingsGroup>
+        ) : null}
+      </div>
+    );
+  }
+
+  function renderMeetingSettings() {
+    return (
+      <div className="mx-auto grid w-full max-w-[620px] gap-7 pb-4">
+        <SettingsGroup>
+          <SettingsRow
+            label="Meeting notes"
+            description="Transcribes and summarizes meetings from your calendar"
+            control={
+              <SettingsSwitch
+                checked={meetingsEnabled}
+                onCheckedChange={setMeetingsEnabled}
+                label="Meeting notes"
+              />
+            }
+          />
+          {meetingsEnabled ? (
+            <>
+              <SettingsRow
+                label="When a meeting starts"
+                description="Choose how note taking begins"
+                control={
+                  <SettingsSelect
+                    ariaLabel="When a meeting starts"
+                    value={meetingTranscriptionMode}
+                    onValueChange={(value) =>
+                      setMeetingTranscriptionMode(
+                        value as MeetingTranscriptionMode,
+                      )
+                    }
+                    options={[
+                      { value: "ask", label: "Ask first" },
+                      { value: "auto", label: "Start notes" },
+                      { value: "manual", label: "Do nothing" },
+                    ]}
+                  />
+                }
+              />
+              <SettingsRow
+                label="Meeting notifications"
+                description="Show a notification before scheduled meetings and when a call is detected"
+                control={
+                  <SettingsSwitch
+                    checked={showMeetingWidgetEnabled}
+                    onCheckedChange={setShowMeetingWidgetEnabled}
+                    label="Meeting notifications"
+                  />
+                }
+              />
+            </>
+          ) : null}
+        </SettingsGroup>
+      </div>
+    );
+  }
+
+  function renderDictationSettings() {
+    return (
+      <div className="mx-auto grid w-full max-w-[620px] gap-7 pb-4">
+        <SettingsGroup>
+          <SettingsRow
+            label="Voice dictation"
+            description="Turns speech into polished text in any app"
+            control={
+              <SettingsSwitch
+                checked={voiceEnabled}
+                onCheckedChange={setVoiceEnabled}
+                label="Voice dictation"
+              />
+            }
+          />
+          {voiceEnabled ? (
+            <>
+              <SettingsRow
+                label="Shortcut"
+                description="Shortcut to start dictation"
+                control={
+                  <SettingsChoicePopover
+                    title="Dictation shortcut"
+                    trigger={
+                      <SettingsKeycap aria-haspopup="listbox">
+                        {compactVoiceShortcutLabel(
+                          voiceShortcut,
+                          voiceCustomShortcut,
+                        )}
+                      </SettingsKeycap>
+                    }
+                    value={voiceShortcut}
+                    options={VOICE_SHORTCUT_CHOICES}
+                    keepOpenValues={["custom", "fn", "both"]}
+                    onChange={(next) =>
+                      onVoiceShortcutChange(next as VoiceShortcutPreference)
+                    }
+                  >
+                    {voiceShortcut === "custom" ? (
+                      <ShortcutRecorder
+                        value={voiceCustomShortcut}
+                        placeholder="Record shortcut"
+                        onChange={onVoiceCustomShortcutChange}
+                      />
+                    ) : null}
+                    {isMacPlatform() && fnShortcutSelected ? (
+                      <SettingsActionButton
+                        className="w-full"
+                        onClick={() => openPrivacySettings("input-monitoring")}
+                      >
+                        Grant Input Monitoring
+                      </SettingsActionButton>
+                    ) : null}
+                    {shortcutRegistrationError ? (
+                      <p className="text-xs text-destructive">
+                        {shortcutRegistrationError}
+                      </p>
+                    ) : null}
+                  </SettingsChoicePopover>
+                }
+              />
+              <SettingsRow
+                label="Mode"
+                description="Choose how the shortcut starts and stops dictation"
+                control={
+                  <SettingsSelect
+                    ariaLabel="Dictation mode"
+                    value={voiceMode}
+                    onValueChange={(value) =>
+                      onVoiceModeChange(value as VoiceMode)
+                    }
+                    options={[
+                      { value: "push-to-talk", label: "Hold to dictate" },
+                      { value: "toggle", label: "Press to start and stop" },
+                    ]}
+                  />
+                }
+              />
+            </>
+          ) : null}
+        </SettingsGroup>
+      </div>
+    );
+  }
+
+  const settingsTabs: Array<{
+    id: SettingsTabId;
+    label: string;
+    icon: ReactNode;
+  }> = [
+    {
+      id: "general",
+      label: "General",
+      icon: (
+        <IconAdjustmentsHorizontal size={16} stroke={1.7} aria-hidden="true" />
+      ),
+    },
+    {
+      id: "recording",
+      label: "Recording",
+      icon: <IconVideo size={16} stroke={1.7} aria-hidden="true" />,
+    },
+    {
+      id: "rewind",
+      label: "Rewind",
+      icon: <IconHistory size={16} stroke={1.7} aria-hidden="true" />,
+    },
+    ...(meetingsLabEnabled
+      ? [
+          {
+            id: "meetings" as const,
+            label: "Meetings",
+            icon: <IconCalendar size={16} stroke={1.7} aria-hidden="true" />,
+          },
+        ]
+      : []),
+    ...(wisprFlowLabEnabled
+      ? [
+          {
+            id: "dictation" as const,
+            label: "Dictation",
+            icon: <IconMicrophone size={16} stroke={1.7} aria-hidden="true" />,
+          },
+        ]
+      : []),
+    {
+      id: "labs",
+      label: "Labs",
+      icon: <IconFlask size={16} stroke={1.7} aria-hidden="true" />,
+    },
+    {
+      id: "advanced",
+      label: "Advanced",
+      icon: <IconTool size={16} stroke={1.7} aria-hidden="true" />,
+    },
+  ];
+  const activeSettingsTab =
+    settingsTabs.find((tab) => tab.id === settingsTab) ?? settingsTabs[0];
+
+  function renderSettingsTab() {
+    switch (activeSettingsTab?.id) {
+      case "recording":
+        return renderRecordingSettings();
+      case "meetings":
+        return renderMeetingSettings();
+      case "dictation":
+        return renderDictationSettings();
+      case "rewind":
+        return renderRewindSettings();
+      case "labs":
+        return renderLabsSettings();
+      case "advanced":
+        return renderAdvancedSettings();
+      case "general":
+      default:
+        return renderGeneralSettings();
+    }
+  }
+
   return (
-    <label className="setup-label" htmlFor={htmlFor}>
-      <span>{label}</span>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button type="button" className="setup-help" aria-label={hint}>
-            <IconInfoCircle size={14} stroke={1.75} />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent>{hint}</TooltipContent>
-      </Tooltip>
-    </label>
+    <div
+      data-tw-surface
+      className="flex h-[560px] w-full flex-col overflow-hidden rounded-[14px] bg-background text-foreground"
+    >
+      <div className="grid min-h-0 flex-1 grid-cols-[176px_minmax(0,1fr)]">
+        <nav
+          className="flex min-w-0 flex-col gap-0.5 overflow-y-auto border-r border-border bg-muted/50 p-2.5 pt-3"
+          aria-label="Settings sections"
+        >
+          <div className="flex items-center pb-2">
+            {onCancel ? <BackToApp onClick={onCancel} /> : null}
+          </div>
+          {settingsTabs.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              className={cn(
+                "flex min-h-8 w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-base font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                settingsTab === tab.id
+                  ? "bg-accent text-foreground"
+                  : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
+              )}
+              aria-current={settingsTab === tab.id ? "page" : undefined}
+              onClick={() => {
+                setSettingsTab(tab.id);
+                onSettingsTabChange?.(tab.id);
+              }}
+            >
+              {tab.icon}
+              <span className="flex-1 truncate">{tab.label}</span>
+            </button>
+          ))}
+        </nav>
+        <main
+          data-popover-scroll-region
+          className="min-h-0 min-w-0 overflow-y-auto overscroll-contain px-5 pb-6 pt-5"
+          tabIndex={-1}
+        >
+          {/* Title only, and the title deliberately repeats the nav item —
+              normally the first thing the default-chrome rule deletes. This
+              surface is a macOS System Settings idiom (owner-approved
+              mockups), where the pane restating the selected sidebar item is
+              the platform convention; a subtitle under it is still banned. */}
+          <h3 className="mx-auto mb-6 max-w-[620px] text-2xl font-semibold tracking-[-0.02em]">
+            {activeSettingsTab.label}
+          </h3>
+          {renderSettingsTab()}
+        </main>
+      </div>
+    </div>
   );
 }
 
@@ -4099,28 +8670,19 @@ function WhisperModelStatusRow({
 }) {
   if (!enabled) {
     return (
-      <div className="whisper-status whisper-status-disabled">
-        <IconAlertTriangle size={13} className="whisper-status-icon" />
-        <span>
-          Without the Whisper model, only your microphone is transcribed — other
-          speakers are not captured.
-        </span>
-      </div>
+      <p className="flex items-start gap-1.5">
+        <IconAlertTriangle
+          className="mt-px size-3.5 shrink-0 text-muted-foreground"
+          stroke={1.9}
+          aria-hidden="true"
+        />
+        <span>Without it, only your mic is transcribed</span>
+      </p>
     );
   }
   if (!status) return null;
 
-  if (status.state === "ready") {
-    return (
-      <div className="whisper-status whisper-status-ready">
-        <IconCircleCheck size={13} className="whisper-status-icon" />
-        <span>
-          Ready · {status.totalMb} MB
-          <span className="whisper-status-path">{status.path}</span>
-        </span>
-      </div>
-    );
-  }
+  if (status.state === "ready") return null;
 
   if (status.state === "downloading") {
     const pct =
@@ -4128,29 +8690,40 @@ function WhisperModelStatusRow({
         ? Math.round((status.downloadedMb / status.totalMb) * 100)
         : 0;
     return (
-      <div className="whisper-status whisper-status-downloading">
-        <span className="whisper-progress-label">
+      <div className="grid gap-1.5">
+        <span>
           Downloading… {status.downloadedMb} / {status.totalMb} MB ({pct}%)
         </span>
-        <div className="whisper-progress-bar">
-          <div className="whisper-progress-fill" style={{ width: `${pct}%` }} />
+        <div
+          className="h-1 overflow-hidden rounded-full bg-muted"
+          role="progressbar"
+          aria-valuenow={pct}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-label={`Whisper model download ${pct}% complete`}
+        >
+          <div
+            className="h-full rounded-full bg-foreground transition-[width] duration-200"
+            style={{ width: `${pct}%` }}
+          />
         </div>
       </div>
     );
   }
 
-  // "missing" state
   return (
-    <div className="whisper-status whisper-status-missing">
-      <IconAlertTriangle size={13} className="whisper-status-icon" />
-      <span>Model not downloaded.</span>
-      <button
-        type="button"
-        className="whisper-download-btn"
-        onClick={onDownload}
-      >
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="flex items-center gap-1.5">
+        <IconAlertTriangle
+          className="size-3.5 shrink-0 text-muted-foreground"
+          stroke={1.9}
+          aria-hidden="true"
+        />
+        Not downloaded yet
+      </span>
+      <SettingsActionButton onClick={onDownload}>
         Download now
-      </button>
+      </SettingsActionButton>
     </div>
   );
 }
@@ -4218,11 +8791,10 @@ function ShortcutRecorder({
   }
 
   return (
-    <div className="setup-shortcut-row">
-      <button
+    <div className="flex flex-wrap items-center justify-end gap-1.5">
+      <SettingsKeycap
         ref={buttonRef}
-        type="button"
-        className={`setup-shortcut-recorder ${recording ? "recording" : ""}`}
+        active={recording}
         onClick={(event) => {
           if (recording) {
             event.preventDefault();
@@ -4254,7 +8826,7 @@ function ShortcutRecorder({
           if (!next) {
             setError(
               event.key === " " && !hasShortcutModifier(event)
-                ? "Space needs Cmd, Ctrl, Option, or Shift so it does not hijack typing."
+                ? "Space needs Cmd, Ctrl, Option, or Shift so it doesn't hijack typing."
                 : "Use at least one modifier plus a key.",
             );
             return;
@@ -4270,12 +8842,15 @@ function ShortcutRecorder({
           event.stopPropagation();
         }}
       >
-        {recording ? "Press shortcut..." : value || placeholder}
-      </button>
+        {recording
+          ? "Press shortcut…"
+          : value
+            ? compactShortcutLabel(value)
+            : placeholder}
+      </SettingsKeycap>
       {value ? (
-        <button
-          type="button"
-          className="setup-shortcut-clear"
+        <SettingsActionButton
+          emphasis="quiet"
           onClick={() => {
             onChange("");
             setError(null);
@@ -4283,11 +8858,16 @@ function ShortcutRecorder({
           }}
         >
           Clear
-        </button>
+        </SettingsActionButton>
       ) : null}
-      {error ? <p className="setup-warning">{error}</p> : null}
+      {error ? (
+        <p className="w-full text-right text-xs text-destructive">{error}</p>
+      ) : null}
       {saved && !error ? (
-        <p className="setup-success" aria-live="polite">
+        <p
+          className="w-full text-right text-xs text-success"
+          aria-live="polite"
+        >
           Saved
         </p>
       ) : null}

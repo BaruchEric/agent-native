@@ -1,9 +1,17 @@
 import { defineAction, embedApp } from "@agent-native/core";
 import { buildDeepLink } from "@agent-native/core/server";
-import { and, eq, sql } from "drizzle-orm";
+import { getRequestUserEmail } from "@agent-native/core/server/request-context";
+import { and, eq, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
-import { accessFilter } from "@agent-native/core/sharing";
+import {
+  agentRecordingAccessFilter,
+  isAgentRecordingCaller,
+} from "../server/lib/agent-recording-access.js";
+import { listingThumbnailUrl } from "../server/lib/player-thumbnail-url.js";
+import { ownerEmailMatches } from "../server/lib/recordings.js";
+import { buildCaseInsensitiveSearchPattern } from "./search-recordings-utils.js";
 
 const SNIPPET_RADIUS = 80;
 
@@ -39,10 +47,6 @@ function recordingDeepLink(
     },
     to: playerPath(recordingId, options),
   });
-}
-
-function escapeLike(s: string): string {
-  return s.replace(/([\\%_])/g, "\\$1");
 }
 
 function buildSnippet(fullText: string, query: string): string | null {
@@ -94,7 +98,7 @@ function transcriptMatch(
 
 export default defineAction({
   description:
-    "Search recordings by title, description, transcript text, or comments. Transcript and comment matches include timestamps for jumping to the matching moment.",
+    "Search recordings by title, description, transcript text, or comments, including recordings in the caller's Trash. Transcript and comment matches include timestamps for jumping to the matching moment. Public/unlisted recordings are searchable only when owned by or previously viewed by the current user.",
   schema: z.object({
     query: z.string().min(1).describe("Search text"),
     limit: z.coerce.number().int().min(1).max(100).default(30),
@@ -110,17 +114,30 @@ export default defineAction({
     }),
   },
   http: { method: "GET" },
-  run: async (args) => {
+  run: async (args, ctx) => {
     const db = getDb();
-    const pattern = `%${escapeLike(args.query)}%`;
+    const pattern = buildCaseInsensitiveSearchPattern(args.query);
+    const recordingAccess = {
+      agentOnly: isAgentRecordingCaller(ctx?.caller),
+      userEmail: ctx?.userEmail,
+    };
+    const userEmail = ctx?.userEmail ?? getRequestUserEmail();
+    const lifecycleFilter = userEmail
+      ? or(
+          isNull(schema.recordings.trashedAt),
+          ownerEmailMatches(schema.recordings.ownerEmail, userEmail),
+        )
+      : isNull(schema.recordings.trashedAt);
 
-    // Title/description matches on the recordings table
     const recMatches = await db
       .select({
         id: schema.recordings.id,
         title: schema.recordings.title,
         description: schema.recordings.description,
         thumbnailUrl: schema.recordings.thumbnailUrl,
+        kind: schema.recordings.kind,
+        mediaUpdatedAt: schema.recordings.mediaUpdatedAt,
+        trashedAt: schema.recordings.trashedAt,
         durationMs: schema.recordings.durationMs,
         ownerEmail: schema.recordings.ownerEmail,
         visibility: schema.recordings.visibility,
@@ -130,14 +147,18 @@ export default defineAction({
       .from(schema.recordings)
       .where(
         and(
-          accessFilter(schema.recordings, schema.recordingShares),
-          sql`(${schema.recordings.title} LIKE ${pattern} ESCAPE '\\' OR ${schema.recordings.description} LIKE ${pattern} ESCAPE '\\')`,
+          agentRecordingAccessFilter(
+            schema.recordings,
+            schema.recordingShares,
+            schema.recordingViewers,
+            recordingAccess,
+          ),
+          lifecycleFilter,
+          sql`(lower(${schema.recordings.title}) LIKE ${pattern} ESCAPE '\\' OR lower(${schema.recordings.description}) LIKE ${pattern} ESCAPE '\\')`,
         ),
       )
       .limit(args.limit);
 
-    // Transcript matches — join recordings so accessFilter is applied upfront,
-    // preventing cross-user transcript ID leakage via timing side-channels.
     const transcriptRows = await db
       .select({
         recordingId: schema.recordingTranscripts.recordingId,
@@ -147,6 +168,9 @@ export default defineAction({
         title: schema.recordings.title,
         description: schema.recordings.description,
         thumbnailUrl: schema.recordings.thumbnailUrl,
+        kind: schema.recordings.kind,
+        mediaUpdatedAt: schema.recordings.mediaUpdatedAt,
+        trashedAt: schema.recordings.trashedAt,
         durationMs: schema.recordings.durationMs,
         ownerEmail: schema.recordings.ownerEmail,
         visibility: schema.recordings.visibility,
@@ -160,8 +184,14 @@ export default defineAction({
       )
       .where(
         and(
-          accessFilter(schema.recordings, schema.recordingShares),
-          sql`${schema.recordingTranscripts.fullText} LIKE ${pattern} ESCAPE '\\'`,
+          agentRecordingAccessFilter(
+            schema.recordings,
+            schema.recordingShares,
+            schema.recordingViewers,
+            recordingAccess,
+          ),
+          lifecycleFilter,
+          sql`lower(${schema.recordingTranscripts.fullText}) LIKE ${pattern} ESCAPE '\\'`,
         ),
       )
       .limit(args.limit);
@@ -175,6 +205,9 @@ export default defineAction({
         title: schema.recordings.title,
         description: schema.recordings.description,
         thumbnailUrl: schema.recordings.thumbnailUrl,
+        kind: schema.recordings.kind,
+        mediaUpdatedAt: schema.recordings.mediaUpdatedAt,
+        trashedAt: schema.recordings.trashedAt,
         durationMs: schema.recordings.durationMs,
         ownerEmail: schema.recordings.ownerEmail,
         visibility: schema.recordings.visibility,
@@ -188,8 +221,14 @@ export default defineAction({
       )
       .where(
         and(
-          accessFilter(schema.recordings, schema.recordingShares),
-          sql`${schema.recordingComments.content} LIKE ${pattern} ESCAPE '\\'`,
+          agentRecordingAccessFilter(
+            schema.recordings,
+            schema.recordingShares,
+            schema.recordingViewers,
+            recordingAccess,
+          ),
+          lifecycleFilter,
+          sql`lower(${schema.recordingComments.content}) LIKE ${pattern} ESCAPE '\\'`,
         ),
       )
       .limit(args.limit);
@@ -202,7 +241,8 @@ export default defineAction({
       id: r.id,
       title: r.title,
       description: r.description,
-      thumbnailUrl: r.thumbnailUrl,
+      thumbnailUrl: listingThumbnailUrl(r),
+      trashedAt: r.trashedAt,
       durationMs: r.durationMs,
       ownerEmail: r.ownerEmail,
       visibility: r.visibility,
@@ -213,7 +253,8 @@ export default defineAction({
       id: r.id,
       title: r.title,
       description: r.description,
-      thumbnailUrl: r.thumbnailUrl,
+      thumbnailUrl: listingThumbnailUrl(r),
+      trashedAt: r.trashedAt,
       durationMs: r.durationMs,
       ownerEmail: r.ownerEmail,
       visibility: r.visibility,
@@ -223,7 +264,6 @@ export default defineAction({
       matchMs: Math.max(0, Math.floor(r.videoTimestampMs ?? 0)),
     }));
 
-    // Merge matches by id. Prefer transcript snippet if present.
     const transcriptById = new Map<
       string,
       { snippet: string | null; matchMs: number | null }
@@ -241,6 +281,7 @@ export default defineAction({
     for (const r of recMatches) {
       merged.set(r.id, {
         ...r,
+        thumbnailUrl: listingThumbnailUrl(r),
         matchType: "title-description",
         snippet: buildSnippet(r.description, args.query),
         matchMs: null,
@@ -288,7 +329,6 @@ export default defineAction({
     }
 
     const results = Array.from(merged.values()).sort((a, b) => {
-      // Metadata matches first, then timed transcript/comment content.
       const order = {
         "title-description": 0,
         "title-transcript": 1,

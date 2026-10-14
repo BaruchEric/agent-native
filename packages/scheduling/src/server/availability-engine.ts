@@ -1,28 +1,63 @@
-/**
- * Availability engine — combines an event type, schedule, and calendar busy
- * intervals into the slot list shown to the Booker.
- *
- * This is where the pure `computeAvailableSlots` gets plugged into the real
- * world: it fetches the schedule, merges busy times from the selected
- * calendars + existing bookings, and applies booking limits.
- */
-import { eq, gte, lt, and } from "drizzle-orm";
+import { eq, gte, lt, and, inArray } from "drizzle-orm";
+
+import { expandSlotForConflictCheck } from "../core/buffers.js";
+import { hasConflict } from "../core/conflicts.js";
+import type { BookingCounts } from "../core/limits.js";
+import { bucketKeysForSlot } from "../core/limits.js";
+import { computeAvailableSlots } from "../core/slots.js";
 import type {
   EventType,
   Schedule,
   BusyInterval,
   Slot,
 } from "../shared/index.js";
-import type { BookingCounts } from "../core/limits.js";
-import { computeAvailableSlots } from "../core/slots.js";
-import { bucketKeysForSlot } from "../core/limits.js";
-import { getScheduleById } from "./schedules-repo.js";
 import { getSchedulingContext } from "./context.js";
 import { getCalendarProvider } from "./providers/registry.js";
+import { getScheduleById } from "./schedules-repo.js";
+
+const MAX_CALENDAR_BUSY_CONCURRENCY = 4;
+
+export class SlotConflictError extends Error {
+  statusCode = 409;
+  constructor(message = "This time slot is no longer available") {
+    super(message);
+    this.name = "SlotConflictError";
+  }
+}
+
+export interface AssertSlotAvailableInput {
+  hostEmail: string;
+  startTime: string;
+  endTime: string;
+  beforeEventBuffer?: number;
+  afterEventBuffer?: number;
+  excludeBookingUid?: string;
+}
+
+export async function assertSlotAvailable(
+  input: AssertSlotAvailableInput,
+): Promise<void> {
+  const expanded = expandSlotForConflictCheck(
+    new Date(input.startTime),
+    new Date(input.endTime),
+    input.beforeEventBuffer ?? 0,
+    input.afterEventBuffer ?? 0,
+  );
+  const busy = await aggregateBusy({
+    userEmail: input.hostEmail,
+    rangeStart: expanded.start,
+    rangeEnd: expanded.end,
+  });
+  const relevantBusy = input.excludeBookingUid
+    ? busy.filter((b) => b.source !== `booking:${input.excludeBookingUid}`)
+    : busy;
+  if (hasConflict(expanded, relevantBusy)) {
+    throw new SlotConflictError();
+  }
+}
 
 export interface GetSlotsInput {
   eventType: EventType;
-  /** The user we're finding availability for — their schedule + calendars. */
   forUserEmail: string;
   rangeStart: Date;
   rangeEnd: Date;
@@ -90,10 +125,6 @@ async function resolveDefaultSchedule(
   return getScheduleById(rows[0].id);
 }
 
-/**
- * Merge busy intervals from: (a) existing bookings for the user, (b) selected
- * external calendars (via providers), (c) the calendar cache.
- */
 export async function aggregateBusy(input: {
   userEmail: string;
   rangeStart: Date;
@@ -103,7 +134,6 @@ export async function aggregateBusy(input: {
   const db = getDb();
   const busy: BusyInterval[] = [];
 
-  // Existing bookings where this user is the host
   const bookings = await db
     .select()
     .from(schema.bookings)
@@ -123,7 +153,6 @@ export async function aggregateBusy(input: {
     });
   }
 
-  // External calendars via registered providers
   const creds = await db
     .select()
     .from(schema.schedulingCredentials)
@@ -133,29 +162,57 @@ export async function aggregateBusy(input: {
         eq(schema.schedulingCredentials.invalid, false),
       ),
     );
-  for (const cred of creds) {
-    const selected = await db
-      .select()
-      .from(schema.selectedCalendars)
-      .where(eq(schema.selectedCalendars.credentialId, cred.id));
-    if (selected.length === 0) continue;
-    const provider = getCalendarProvider(cred.type);
-    if (!provider) continue;
-    try {
-      const result = await provider.getBusy({
-        credentialId: cred.id,
-        calendarExternalIds: selected.map(
-          (s: { externalId: string }) => s.externalId,
-        ),
-        start: input.rangeStart,
-        end: input.rangeEnd,
-      });
-      busy.push(...result);
-    } catch {
-      // Silently degrade — booking UI shows "couldn't verify availability" banner
-      // Consumer logs via their own error handler
+  if (creds.length === 0) return busy;
+
+  const selected = await db
+    .select({
+      credentialId: schema.selectedCalendars.credentialId,
+      externalId: schema.selectedCalendars.externalId,
+    })
+    .from(schema.selectedCalendars)
+    .where(
+      inArray(
+        schema.selectedCalendars.credentialId,
+        creds.map((cred: { id: string }) => cred.id),
+      ),
+    );
+  const externalIdsByCredential = new Map<string, string[]>();
+  for (const calendar of selected) {
+    const externalIds =
+      externalIdsByCredential.get(calendar.credentialId) ?? [];
+    externalIds.push(calendar.externalId);
+    externalIdsByCredential.set(calendar.credentialId, externalIds);
+  }
+
+  const providerBusy: BusyInterval[][] = Array.from(
+    { length: creds.length },
+    () => [],
+  );
+  let nextCredentialIndex = 0;
+  async function worker(): Promise<void> {
+    while (nextCredentialIndex < creds.length) {
+      const credentialIndex = nextCredentialIndex++;
+      const cred = creds[credentialIndex];
+      const externalIds = externalIdsByCredential.get(cred.id);
+      if (!externalIds?.length) continue;
+      const provider = getCalendarProvider(cred.type);
+      if (!provider) continue;
+      try {
+        providerBusy[credentialIndex] = await provider.getBusy({
+          credentialId: cred.id,
+          calendarExternalIds: externalIds,
+          start: input.rangeStart,
+          end: input.rangeEnd,
+        });
+      } catch {
+        // Silently degrade — booking UI shows "couldn't verify availability" banner
+        // Consumer logs via their own error handler
+      }
     }
   }
+  const workerCount = Math.min(MAX_CALENDAR_BUSY_CONCURRENCY, creds.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  busy.push(...providerBusy.flat());
 
   return busy;
 }

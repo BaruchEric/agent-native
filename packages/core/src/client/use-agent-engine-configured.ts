@@ -1,79 +1,115 @@
-import { useEffect, useState } from "react";
-import { agentNativePath } from "./api-path.js";
-import { PROVIDER_ENV_VARS } from "../agent/engine/provider-env-vars.js";
+import { useEffect, useReducer } from "react";
 
-const PROVIDER_ENV_VAR_SET = new Set(PROVIDER_ENV_VARS);
+import {
+  ensureAgentEngineReadiness,
+  getAgentEngineReadiness,
+  subscribeAgentEngineReadiness,
+  type AgentEngineConfiguredState,
+  type AgentEngineReadinessSource,
+} from "./agent-engine-readiness.js";
+import { useSessionPreloading } from "./use-session.js";
 
-/** `unknown` until the first check resolves, so callers don't flash the gate. */
-export type AgentEngineConfiguredState = "unknown" | "configured" | "missing";
+export {
+  fetchAgentEngineConfiguredState,
+  type AgentEngineConfiguredState,
+  type FetchAgentEngineConfiguredStateOptions,
+} from "./agent-engine-readiness.js";
 
 export interface UseAgentEngineConfiguredResult {
-  /** True once we know nothing can run the agent (no key / Builder / BYOK). */
+  /** True only when the authoritative status confirms chat-eligible AI. */
+  canChat: boolean;
+  /** True only when the authoritative status says interactive chat is ineligible. */
   missing: boolean;
   state: AgentEngineConfiguredState;
 }
 
+export interface UseAgentEngineConfiguredOptions {
+  tabId?: string | null;
+  threadId?: string | null;
+  source?: AgentEngineReadinessSource;
+}
+
+const RETRY_BASE_MS = 2000;
+const RETRY_MAX_MS = 30000;
+
 /**
- * Shared "can the agent run?" gate — the single source of truth for the sidebar
- * composer and app prompt boxes. Checks the env-key / Builder / BYOK status
- * endpoints on mount, re-checks on `agent-engine:configured-changed`, and folds
- * in the adapter's `agent-chat:missing-api-key` signal. Pass `enabled = false`
- * to short-circuit to configured; flaky requests stay `unknown`.
+ * Readiness is shared by every composer and dispatch path in this client
+ * bundle. The initial probe starts on mount, and cached answers make sends
+ * instant until the short readiness window expires.
  */
 export function useAgentEngineConfigured(
   enabled = true,
+  options?: UseAgentEngineConfiguredOptions,
 ): UseAgentEngineConfiguredResult {
-  const [state, setState] = useState<AgentEngineConfiguredState>("unknown");
-
-  // Mid-run adapter signal that no key is usable — honored even when disabled.
-  useEffect(() => {
-    const onMissing = () => setState("missing");
-    window.addEventListener("agent-chat:missing-api-key", onMissing);
-    return () =>
-      window.removeEventListener("agent-chat:missing-api-key", onMissing);
-  }, []);
+  const [, forceRender] = useReducer((revision: number) => revision + 1, 0);
+  // A hinted load mounts the app before the session is known, and the status
+  // probe answers for one account. It waits for the session as onboarding does.
+  const preloading = useSessionPreloading();
 
   useEffect(() => {
-    if (!enabled) {
-      setState("configured");
-      return;
-    }
+    if (preloading) return;
     let cancelled = false;
-    const check = async () => {
-      const [envKeys, builderStatus, engineStatus] = await Promise.all([
-        fetch(agentNativePath("/_agent-native/env-status"))
-          .then((r) => (r.ok ? r.json() : null))
-          .catch(() => null),
-        fetch(agentNativePath("/_agent-native/builder/status"))
-          .then((r) => (r.ok ? r.json() : null))
-          .catch(() => null),
-        fetch(agentNativePath("/_agent-native/agent-engine/status"))
-          .then((r) => (r.ok ? r.json() : null))
-          .catch(() => null),
-      ]);
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let retryAttempt = 0;
+    let lastAppliedState: AgentEngineConfiguredState | undefined;
+
+    const applyState = (nextState: AgentEngineConfiguredState) => {
       if (cancelled) return;
-      // All three failed — likely a flaky network; keep the current state.
-      if (envKeys == null && builderStatus == null && engineStatus == null) {
+      if (lastAppliedState === nextState && retryTimer !== undefined) return;
+      lastAppliedState = nextState;
+      forceRender();
+      if (nextState === "configured" || nextState === "missing") {
+        retryAttempt = 0;
+        if (retryTimer !== undefined) clearTimeout(retryTimer);
+        retryTimer = undefined;
         return;
       }
-      const keys = (envKeys ?? []) as Array<{
-        key: string;
-        configured: boolean;
-      }>;
-      const llmKeys = keys.filter((k) => PROVIDER_ENV_VAR_SET.has(k.key));
-      const anyConfigured =
-        llmKeys.some((k) => k.configured) ||
-        builderStatus?.configured === true ||
-        engineStatus?.configured === true;
-      setState(anyConfigured ? "configured" : "missing");
+      const delay = Math.min(RETRY_BASE_MS * 2 ** retryAttempt, RETRY_MAX_MS);
+      retryAttempt += 1;
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined;
+        void check();
+      }, delay);
     };
+
+    const check = async () => {
+      const nextState = enabled
+        ? await ensureAgentEngineReadiness({ source: options?.source })
+        : "configured";
+      applyState(nextState);
+    };
+
+    const unsubscribe = subscribeAgentEngineReadiness(
+      () => {
+        applyState(getAgentEngineReadiness(options?.source));
+      },
+      { enabled, ...options },
+    );
+    const onVisibilityChange = () => {
+      if (!document.hidden && retryTimer !== undefined) {
+        clearTimeout(retryTimer);
+        retryTimer = undefined;
+        void check();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
     void check();
-    window.addEventListener("agent-engine:configured-changed", check);
+
     return () => {
       cancelled = true;
-      window.removeEventListener("agent-engine:configured-changed", check);
+      unsubscribe();
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [enabled]);
+  }, [enabled, preloading, options?.source, options?.tabId, options?.threadId]);
 
-  return { missing: state === "missing", state };
+  const effectiveState = enabled
+    ? getAgentEngineReadiness(options?.source)
+    : "configured";
+  return {
+    canChat: enabled && effectiveState === "configured",
+    missing: enabled && effectiveState === "missing",
+    state: effectiveState,
+  };
 }

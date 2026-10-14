@@ -6,6 +6,7 @@ export interface ContentSourceDocument {
   parentId: string | null;
   title: string;
   content: string;
+  description?: string;
   icon: string | null;
   position: number;
   isFavorite: boolean;
@@ -31,10 +32,12 @@ export interface ParsedContentSourceFile {
   parentId?: string | null;
   title: string;
   content: string;
+  description?: string;
   icon?: string | null;
   position?: number;
   isFavorite?: boolean;
   hideFromSearch?: boolean;
+  visibility?: "private" | "org" | "public";
   errors?: string[];
 }
 
@@ -107,7 +110,7 @@ function frontmatterLine(key: string, value: unknown): string {
   if (typeof value === "boolean" || typeof value === "number") {
     return `${key}: ${String(value)}`;
   }
-  return `${key}: ${JSON.stringify(String(value))}`;
+  return `${key}: ${JSON.stringify(typeof value === "string" ? value : (JSON.stringify(value) ?? ""))}`;
 }
 
 function normalizeSourcePath(filePath: string): string | null {
@@ -125,9 +128,15 @@ function normalizeSourcePath(filePath: string): string | null {
 export function isContentSourcePath(filePath: string): boolean {
   const normalized = normalizeSourcePath(filePath);
   if (!normalized) return false;
+  if (isBuilderMdxSourcePath(normalized)) return false;
   return CONTENT_SOURCE_EXTENSIONS.some((ext) =>
     normalized.toLowerCase().endsWith(ext),
   );
+}
+
+export function isBuilderMdxSourcePath(filePath: string): boolean {
+  const normalized = normalizeSourcePath(filePath);
+  return !!normalized && normalized.toLowerCase().endsWith(".builder.mdx");
 }
 
 export function isValidContentSourceId(id: string | null | undefined): boolean {
@@ -146,6 +155,7 @@ export function serializeContentSourceDocument(
   const frontmatter = [
     frontmatterLine("id", doc.id),
     frontmatterLine("title", doc.title || "Untitled"),
+    frontmatterLine("description", doc.description),
     frontmatterLine("parentId", doc.parentId),
     frontmatterLine("icon", doc.icon),
     frontmatterLine("position", doc.position),
@@ -183,6 +193,18 @@ export function parseContentSourceFile(
   const rawTitle = typeof metadata.title === "string" ? metadata.title : "";
   const title = rawTitle.trim() || titleFromPath(filePath) || "Untitled";
   const rawPosition = metadata.position;
+  let visibility: "private" | "org" | "public" | undefined;
+  if (hasOwn(metadata, "visibility")) {
+    if (
+      metadata.visibility === "private" ||
+      metadata.visibility === "org" ||
+      metadata.visibility === "public"
+    ) {
+      visibility = metadata.visibility;
+    } else {
+      errors.push("Invalid visibility frontmatter.");
+    }
+  }
 
   return {
     path: filePath,
@@ -190,6 +212,10 @@ export function parseContentSourceFile(
     parentId,
     title,
     content,
+    description:
+      typeof metadata.description === "string"
+        ? metadata.description
+        : undefined,
     icon: hasOwn(metadata, "icon")
       ? typeof metadata.icon === "string"
         ? metadata.icon
@@ -207,6 +233,7 @@ export function parseContentSourceFile(
       typeof metadata.hideFromSearch === "boolean"
         ? metadata.hideFromSearch
         : undefined,
+    visibility,
     errors: errors.length > 0 ? errors : undefined,
   };
 }

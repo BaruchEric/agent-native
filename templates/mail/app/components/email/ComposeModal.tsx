@@ -1,5 +1,10 @@
-import { useState, useEffect, useRef, useMemo } from "react";
-import type { CSSProperties } from "react";
+import { useAgentChatGenerating } from "@agent-native/core/client/agent-chat";
+import { useFormatters, useT } from "@agent-native/core/client/i18n";
+import {
+  appendSignatureToBody,
+  splitAppendedSignature,
+} from "@shared/signature";
+import type { ComposeState } from "@shared/types";
 import {
   IconX,
   IconMinus,
@@ -15,8 +20,10 @@ import {
   IconTrash,
   IconPlus,
 } from "@tabler/icons-react";
-import { cn } from "@/lib/utils";
-import { useIsMobile } from "@/hooks/use-mobile";
+import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import type { CSSProperties, ReactNode } from "react";
+import { toast } from "sonner";
+
 import { Button } from "@/components/ui/button";
 import {
   Popover,
@@ -24,58 +31,111 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useSendEmail, useAddOptimisticReply } from "@/hooks/use-emails";
-import { useSettings } from "@/hooks/use-emails";
-import { useAliases } from "@/hooks/use-aliases";
-import { useUpdateQueuedDraft } from "@/hooks/use-draft-queue";
-import { useScheduleEmail } from "@/hooks/use-scheduled-jobs";
-import { SendLaterButton } from "./SendLaterButton";
-import { expandAliasTokens } from "@/lib/alias-utils";
-import { useAgentChatGenerating } from "@agent-native/core/client";
-import { toast } from "sonner";
-import type { ComposeState } from "@shared/types";
 import {
-  appendSignatureToBody,
-  splitAppendedSignature,
-} from "@shared/signature";
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useAccountFilter } from "@/hooks/use-account-filter";
+import { useAliases } from "@/hooks/use-aliases";
+import { FOCUS_COMPOSE_DRAFT_EVENT } from "@/hooks/use-compose-state";
+import { useUpdateQueuedDraft } from "@/hooks/use-draft-queue";
+import {
+  useSendEmail,
+  useAddOptimisticReply,
+  useArchiveEmail,
+} from "@/hooks/use-emails";
+import { useSettings } from "@/hooks/use-emails";
+import { useIsMobile } from "@/hooks/use-mobile";
+import { useScheduleEmail } from "@/hooks/use-scheduled-jobs";
+import { canUseAgentGenerate } from "@/lib/agent-generate";
+import { expandAliasTokens } from "@/lib/alias-utils";
+import { openFilePicker, uploadFile, uploadFiles } from "@/lib/upload";
+import { cn } from "@/lib/utils";
+
+import { AttachmentStrip } from "./AttachmentStrip";
 import {
   getCurrentDraftBodyFromEditor,
+  isSameScheduledDraft,
   splitQuotedContent,
 } from "./compose-draft-context";
+import { handleComposeSendLaterShortcut } from "./compose-shortcuts";
+import { ComposeEditor, type ComposeEditorHandle } from "./ComposeEditor";
+import { shouldMarkReplyDoneAfterSend } from "./mail-send-policy";
 import {
   RecipientInput,
   computeRecipientMove,
   type RecipientField,
 } from "./RecipientInput";
-import { ComposeEditor, type ComposeEditorHandle } from "./ComposeEditor";
-import { openFilePicker, uploadFiles } from "@/lib/upload";
-import { useAccountFilter } from "@/hooks/use-account-filter";
-import { canUseAgentGenerate } from "@/lib/agent-generate";
-import { AttachmentStrip } from "./AttachmentStrip";
+import { SendLaterButton } from "./SendLaterButton";
 
+const SEND_UNDO_WINDOW_MS = 10_000;
 const LAST_SEND_ACCOUNT_KEY = "mail:lastSendAccount";
+
+type ComposeAccount = { email: string; displayName?: string };
+
+export interface ComposePaletteCommands {
+  send: () => void;
+  sendLater: () => void;
+  sendAndMarkDone: () => void;
+}
+
+function ComposeFieldRow({
+  label,
+  children,
+  trailing,
+}: {
+  label: string;
+  children: ReactNode;
+  trailing?: ReactNode;
+}) {
+  return (
+    <div className="flex min-h-10 items-center gap-2 border-b border-border px-4">
+      <span className="w-8 shrink-0 text-xs font-medium text-muted-foreground">
+        {label}
+      </span>
+      {children}
+      {trailing}
+    </div>
+  );
+}
+
+function accountDisplayName(account: ComposeAccount) {
+  return account.displayName?.trim() || account.email;
+}
+
+function AccountChip({ account }: { account: ComposeAccount }) {
+  const displayName = accountDisplayName(account);
+
+  return (
+    <span className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-md bg-accent px-2 py-0.5 text-xs text-accent-foreground">
+      <span className="truncate font-medium">{displayName}</span>
+      {displayName !== account.email && (
+        <span className="truncate text-muted-foreground/70">
+          {account.email}
+        </span>
+      )}
+    </span>
+  );
+}
 
 function FromAccountSelector({
   accounts,
   value,
   onChange,
+  label,
 }: {
-  accounts: Array<{ email: string; displayName?: string }>;
+  accounts: ComposeAccount[];
   value: string | undefined;
   onChange: (email: string) => void;
+  label: string;
 }) {
-  // On mount, if no account is set, apply the sticky default
   const resolvedValue =
     value ||
     (accounts.some(
@@ -84,8 +144,10 @@ function FromAccountSelector({
       ? localStorage.getItem(LAST_SEND_ACCOUNT_KEY)!
       : accounts[0]?.email) ||
     "";
+  const selectedAccount =
+    accounts.find((account) => account.email === resolvedValue) ??
+    (resolvedValue ? { email: resolvedValue } : accounts[0]);
 
-  // Sync the sticky default into the draft if it wasn't set
   useEffect(() => {
     if (!value && resolvedValue) {
       onChange(resolvedValue);
@@ -93,10 +155,7 @@ function FromAccountSelector({
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <div className="flex items-center border-b border-border px-4">
-      <span className="w-8 shrink-0 text-xs font-medium text-muted-foreground">
-        From
-      </span>
+    <ComposeFieldRow label={label}>
       <Select
         value={resolvedValue}
         onValueChange={(email) => {
@@ -104,20 +163,30 @@ function FromAccountSelector({
           onChange(email);
         }}
       >
-        <SelectTrigger className="flex-1 border-0 bg-transparent py-2 text-sm shadow-none focus:ring-0 h-auto px-0 cursor-pointer">
-          <SelectValue />
+        <SelectTrigger
+          data-an-block
+          className="h-10 min-w-0 flex-1 cursor-pointer border-0 bg-transparent p-0 text-sm shadow-none focus:ring-0"
+        >
+          <SelectValue className="min-w-0 flex-1">
+            {selectedAccount && <AccountChip account={selectedAccount} />}
+          </SelectValue>
         </SelectTrigger>
         <SelectContent>
           {accounts.map((acct) => (
-            <SelectItem key={acct.email} value={acct.email}>
-              {acct.displayName
-                ? `${acct.displayName} <${acct.email}>`
-                : acct.email}
+            <SelectItem key={acct.email} value={acct.email} data-an-block>
+              <span className="flex min-w-0 flex-col">
+                <span className="truncate">{accountDisplayName(acct)}</span>
+                {accountDisplayName(acct) !== acct.email && (
+                  <span className="truncate text-xs text-muted-foreground">
+                    {acct.email}
+                  </span>
+                )}
+              </span>
             </SelectItem>
           ))}
         </SelectContent>
       </Select>
-    </div>
+    </ComposeFieldRow>
   );
 }
 
@@ -131,10 +200,16 @@ interface ComposeModalProps {
   onClose: (id: string) => void;
   onCloseAll: () => void;
   onDiscard: (id: string) => void;
+  onStageForSend: (id: string) => void;
+  onRestoreAfterSend: (id: string) => void;
   onNewDraft: () => void;
   onFlush: (id: string) => Promise<unknown> | undefined;
-  onReopen: (state: Omit<ComposeState, "id">) => void;
+  onRegisterComposeCommands?: (commands: ComposePaletteCommands | null) => void;
   onInitialExpandedConsumed?: () => void;
+}
+
+function shouldStartComposeExpanded(initialExpanded: boolean) {
+  return initialExpanded;
 }
 
 export function ComposeModal({
@@ -147,31 +222,59 @@ export function ComposeModal({
   onClose,
   onCloseAll,
   onDiscard,
+  onStageForSend,
+  onRestoreAfterSend,
   onNewDraft,
   onFlush,
-  onReopen,
+  onRegisterComposeCommands,
   onInitialExpandedConsumed,
 }: ComposeModalProps) {
+  const t = useT();
+  const formatters = useFormatters();
   const isMobile = useIsMobile();
   const [minimized, setMinimized] = useState(false);
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [isExpanded, setIsExpanded] = useState(
+    shouldStartComposeExpanded(initialExpanded),
+  );
   const [generateOpen, setGenerateOpen] = useState(false);
   const [generatePrompt, setGeneratePrompt] = useState("");
+  const [scheduleOpen, setScheduleOpen] = useState(false);
   const [showCcBcc, setShowCcBcc] = useState(false);
   const [showQuoted, setShowQuoted] = useState(false);
+  const composeRef = useRef<HTMLDivElement>(null);
+  const composePaletteCommandsRef = useRef<ComposePaletteCommands>({
+    send: () => {},
+    sendLater: () => {},
+    sendAndMarkDone: () => {},
+  });
+  const knownDraftIdsRef = useRef(
+    new Set(
+      drafts
+        .filter((draft) => {
+          const isInitialNewCompose =
+            draft.id === activeDraft?.id &&
+            draft.mode === "compose" &&
+            !draft.savedDraftId &&
+            !draft.queuedDraftId;
+          return !isInitialNewCompose;
+        })
+        .map((draft) => draft.id),
+    ),
+  );
+  const pendingNewDraftIdsRef = useRef(new Set<string>());
+  const focusNewDraftIdRef = useRef<string | null>(null);
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
 
-  // Observe agent sidebar width so compose window stays to its left
-  const [sidebarRight, setSidebarRight] = useState(16); // default 16px (right-4)
+  const [sidebarRight, setSidebarRight] = useState(16);
   useEffect(() => {
     function measure() {
       const panel = document.querySelector(".agent-sidebar-panel");
-      // Also account for the resize handle (6px)
       const panelWidth = panel ? panel.getBoundingClientRect().width + 6 : 0;
       setSidebarRight(panelWidth > 0 ? panelWidth + 16 : 16);
     }
     measure();
     const observer = new MutationObserver(measure);
-    // Watch for sidebar appearing/disappearing and style changes (resize)
     observer.observe(document.body, {
       childList: true,
       subtree: true,
@@ -188,6 +291,7 @@ export function ComposeModal({
   const [isGenerating, sendToAgent] = useAgentChatGenerating();
   const sendEmail = useSendEmail();
   const addOptimisticReply = useAddOptimisticReply();
+  const archiveEmail = useArchiveEmail();
   const updateQueuedDraft = useUpdateQueuedDraft();
   const scheduleEmail = useScheduleEmail();
   const { data: aliases = [] } = useAliases();
@@ -196,14 +300,83 @@ export function ComposeModal({
   const editorRef = useRef<ComposeEditorHandle>(null);
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const sendingIdsRef = useRef<Set<string>>(new Set());
+  const schedulingRef = useRef(false);
+  const draftsRef = useRef(drafts);
+  draftsRef.current = drafts;
 
-  // Reset CC/BCC visibility and quote expansion when switching tabs
+  useEffect(() => {
+    const handleFocusDraft = (event: Event) => {
+      const id = (event as CustomEvent<{ id?: unknown }>).detail?.id;
+      if (
+        typeof id === "string" &&
+        draftsRef.current.some((draft) => draft.id === id)
+      ) {
+        setMinimized(false);
+      }
+    };
+
+    window.addEventListener(FOCUS_COMPOSE_DRAFT_EVENT, handleFocusDraft);
+    return () =>
+      window.removeEventListener(FOCUS_COMPOSE_DRAFT_EVENT, handleFocusDraft);
+  }, []);
+
+  useEffect(() => {
+    const [account] = allAccounts;
+    if (
+      allAccounts.length !== 1 ||
+      !activeDraft ||
+      activeDraft.mode !== "compose" ||
+      activeDraft.savedDraftId ||
+      activeDraft.queuedDraftId ||
+      activeDraft.accountEmail
+    ) {
+      return;
+    }
+    onUpdate(activeDraft.id, { accountEmail: account.email });
+  }, [activeDraft, allAccounts, onUpdate]);
+
   useEffect(() => {
     setShowCcBcc(false);
     setShowQuoted(false);
   }, [activeId]);
 
-  // Focus editor when reply/forward opens
+  useEffect(() => {
+    const currentDraftIds = new Set(drafts.map((draft) => draft.id));
+    for (const draft of drafts) {
+      const isNewCompose =
+        draft.mode === "compose" && !draft.savedDraftId && !draft.queuedDraftId;
+      if (isNewCompose && !knownDraftIdsRef.current.has(draft.id)) {
+        pendingNewDraftIdsRef.current.add(draft.id);
+      }
+    }
+    for (const id of pendingNewDraftIdsRef.current) {
+      if (!currentDraftIds.has(id)) pendingNewDraftIdsRef.current.delete(id);
+    }
+    knownDraftIdsRef.current = currentDraftIds;
+    if (!activeDraft || !pendingNewDraftIdsRef.current.delete(activeDraft.id)) {
+      return;
+    }
+    setMinimized(false);
+    focusNewDraftIdRef.current = activeDraft.id;
+  }, [activeDraft?.id, drafts]);
+
+  useEffect(() => {
+    const draftId = focusNewDraftIdRef.current;
+    if (!draftId || draftId !== activeDraft?.id || minimized) return;
+    focusNewDraftIdRef.current = null;
+
+    const focusTimer = setTimeout(() => {
+      if (activeIdRef.current !== draftId) return;
+      composeRef.current
+        ?.querySelector<HTMLInputElement>(
+          '[data-mail-recipient-input][data-recipient-field="to"]',
+        )
+        ?.focus();
+    }, 0);
+
+    return () => clearTimeout(focusTimer);
+  }, [activeDraft?.id, minimized]);
+
   useEffect(() => {
     if (activeDraft?.mode && activeDraft.mode !== "compose") {
       setTimeout(() => editorRef.current?.getEditor()?.commands.focus(), 100);
@@ -217,23 +390,40 @@ export function ComposeModal({
     onInitialExpandedConsumed?.();
   }, [activeDraft?.id, initialExpanded, onInitialExpandedConsumed]);
 
-  const handleSend = async () => {
-    if (!activeDraft || !activeId) return;
+  useEffect(() => {
+    setScheduleOpen(false);
+  }, [activeId]);
+
+  const hasUncommittedRecipientText = () =>
+    Array.from(
+      composeRef.current?.querySelectorAll<HTMLInputElement>(
+        "[data-mail-recipient-input]",
+      ) ?? [],
+    ).some((input) => input.value.trim().length > 0);
+
+  const handleSend = async (explicitlyMarkDone = false) => {
+    if (!activeDraft || !activeId || schedulingRef.current) return;
     if (sendingIdsRef.current.has(activeId)) return;
+    if (hasUncommittedRecipientText()) {
+      toast.error(t("mail.toasts.finishRecipientInput"));
+      return;
+    }
     if (!activeDraft.to.trim()) {
-      toast.error("Please add at least one recipient");
+      toast.error(t("mail.toasts.pleaseAddRecipient"));
       return;
     }
     sendingIdsRef.current.add(activeId);
     const sendingId = activeId;
 
-    // Snapshot draft data for potential undo
     const draftSnapshot = { ...activeDraft };
+    const markDoneAfterSend = shouldMarkReplyDoneAfterSend(
+      draftSnapshot,
+      settings?.sendAndArchive === true,
+      explicitlyMarkDone,
+    );
 
-    // Close composer immediately
-    onDiscard(activeId);
+    onStageForSend(activeId);
 
-    // Show optimistic reply in the thread immediately (for replies)
     const undoOptimistic = draftSnapshot.replyToId
       ? addOptimisticReply({
           to: expandAliasTokens(draftSnapshot.to, aliases),
@@ -248,43 +438,33 @@ export function ComposeModal({
       : undefined;
 
     let cancelled = false;
+    let dispatchStarted = false;
 
     const handleUndo = () => {
-      if (cancelled) return;
+      if (cancelled || dispatchStarted) return;
       cancelled = true;
       sendingIdsRef.current.delete(sendingId);
       clearTimeout(sendTimer);
-      clearTimeout(transitionTimer);
       toast.dismiss(toastId);
       undoOptimistic?.();
-      // Reopen composer with the saved draft
-      const { id: _id, ...reopenData } = draftSnapshot;
-      onReopen(reopenData);
+      onRestoreAfterSend(sendingId);
     };
 
-    // Show "Sending..." toast with undo
-    const toastId = toast("Sending...", {
-      action: { label: "UNDO", onClick: handleUndo },
+    const toastId = toast(t("mail.compose.sending"), {
+      action: { label: t("mail.actions.undo"), onClick: handleUndo },
       duration: Infinity,
     });
 
-    // After 1.5s, transition to "Message sent."
-    const transitionTimer = setTimeout(() => {
-      if (cancelled) return;
-      toast("Message sent.", {
-        id: toastId,
-        action: { label: "UNDO", onClick: handleUndo },
-        duration: Infinity,
-      });
-    }, 1500);
-
-    // After 5s, actually send the email
     const sendTimer = setTimeout(() => {
       if (cancelled) return;
+      dispatchStarted = true;
       sendingIdsRef.current.delete(sendingId);
       toast.dismiss(toastId);
-      sendEmail.mutate(
-        {
+      const sendingToastId = toast(t("mail.compose.sending"), {
+        duration: Infinity,
+      });
+      void sendEmail
+        .mutateAsync({
           to: expandAliasTokens(draftSnapshot.to, aliases),
           cc: expandAliasTokens(draftSnapshot.cc ?? "", aliases) || undefined,
           bcc: expandAliasTokens(draftSnapshot.bcc ?? "", aliases) || undefined,
@@ -294,77 +474,215 @@ export function ComposeModal({
           replyToThreadId: draftSnapshot.replyToThreadId,
           accountEmail: draftSnapshot.accountEmail,
           attachments: draftSnapshot.attachments,
-        },
-        {
-          onSuccess: (result) => {
-            if (draftSnapshot.queuedDraftId) {
-              updateQueuedDraft.mutate({
-                id: draftSnapshot.queuedDraftId,
-                status: "sent",
-                sentMessageId: result?.id,
-              });
-            }
-          },
-          onError: () => {
-            toast.error("Failed to send email");
-            // Reopen composer on failure
-            const { id: _id, ...reopenData } = draftSnapshot;
-            onReopen(reopenData);
-          },
-        },
-      );
-    }, 5000);
+        })
+        .then((result) => {
+          toast(t("mail.toasts.messageSent"), {
+            id: sendingToastId,
+            duration: 3_000,
+          });
+          onDiscard(sendingId);
+          if (draftSnapshot.queuedDraftId) {
+            updateQueuedDraft.mutate({
+              id: draftSnapshot.queuedDraftId,
+              status: "sent",
+              sentMessageId: result?.id,
+            });
+          }
+          if (markDoneAfterSend && draftSnapshot.replyToId) {
+            archiveEmail.mutate({
+              id: draftSnapshot.replyToId,
+              accountEmail: draftSnapshot.accountEmail,
+              threadId: draftSnapshot.replyToThreadId,
+            });
+          }
+        })
+        .catch(() => {
+          toast.dismiss(sendingToastId);
+          toast.error(t("mail.toasts.failedToSendEmail"));
+          onRestoreAfterSend(sendingId);
+        });
+    }, SEND_UNDO_WINDOW_MS);
   };
 
+  composePaletteCommandsRef.current = {
+    send: () => {
+      void handleSend();
+    },
+    sendLater: () => setScheduleOpen(true),
+    sendAndMarkDone: () => {
+      void handleSend(true);
+    },
+  };
+  const hasActiveDraft = Boolean(activeId && activeDraft);
+  useEffect(() => {
+    if (!onRegisterComposeCommands) return;
+    if (!hasActiveDraft || minimized) {
+      onRegisterComposeCommands(null);
+      return;
+    }
+    onRegisterComposeCommands({
+      send: () => composePaletteCommandsRef.current.send(),
+      sendLater: () => composePaletteCommandsRef.current.sendLater(),
+      sendAndMarkDone: () =>
+        composePaletteCommandsRef.current.sendAndMarkDone(),
+    });
+    return () => onRegisterComposeCommands(null);
+  }, [hasActiveDraft, minimized, onRegisterComposeCommands]);
+
   const handleSendLater = async (runAt: number) => {
-    if (!activeDraft || !activeId) return;
+    if (!activeDraft || !activeId || schedulingRef.current) return;
+    if (hasUncommittedRecipientText()) {
+      toast.error(t("mail.toasts.finishRecipientInput"));
+      return;
+    }
     if (!activeDraft.to.trim()) {
-      toast.error("Please add at least one recipient");
+      toast.error(t("mail.toasts.pleaseAddRecipient"));
       return;
     }
 
+    schedulingRef.current = true;
+    const schedulingId = activeId;
     const draftSnapshot = { ...activeDraft };
 
     try {
       await scheduleEmail.mutateAsync({
-        to: expandAliasTokens(draftSnapshot.to, aliases),
-        cc: expandAliasTokens(draftSnapshot.cc ?? "", aliases) || undefined,
-        bcc: expandAliasTokens(draftSnapshot.bcc ?? "", aliases) || undefined,
-        subject: draftSnapshot.subject,
-        body: draftSnapshot.body,
-        replyToId: draftSnapshot.replyToId,
         threadId: draftSnapshot.replyToThreadId,
         accountEmail: draftSnapshot.accountEmail,
-        attachments: draftSnapshot.attachments,
         runAt,
+        payload: {
+          to: expandAliasTokens(draftSnapshot.to, aliases),
+          cc: expandAliasTokens(draftSnapshot.cc ?? "", aliases) || undefined,
+          bcc: expandAliasTokens(draftSnapshot.bcc ?? "", aliases) || undefined,
+          subject: draftSnapshot.subject,
+          body: draftSnapshot.body,
+          replyToId: draftSnapshot.replyToId,
+          threadId: draftSnapshot.replyToThreadId,
+          accountEmail: draftSnapshot.accountEmail,
+          attachments: draftSnapshot.attachments,
+        },
       });
 
-      // Job created successfully — now discard the draft
-      onDiscard(activeId);
+      const currentDraft = draftsRef.current.find(
+        (draft) => draft.id === schedulingId,
+      );
+      if (currentDraft && isSameScheduledDraft(currentDraft, draftSnapshot)) {
+        onDiscard(schedulingId);
+      }
 
-      const scheduledDate = new Date(runAt).toLocaleString("en-US", {
+      const scheduledDate = formatters.formatDate(new Date(runAt), {
         weekday: "short",
         month: "short",
         day: "numeric",
         hour: "numeric",
         minute: "2-digit",
       });
-      toast(`Scheduled for ${scheduledDate}`);
+      toast(t("mail.sendLater.scheduledFor", { date: scheduledDate }));
     } catch {
-      toast.error("Failed to schedule email — draft kept open");
+      toast.error(t("mail.toasts.failedToScheduleEmailDraftKeptOpen"));
+    } finally {
+      schedulingRef.current = false;
     }
   };
 
-  const composeRef = useRef<HTMLDivElement>(null);
+  const composeAnimationRef = useRef<Animation | null>(null);
+  const focusBccAfterExpandRef = useRef(false);
+
+  useEffect(() => {
+    if (!showCcBcc || !focusBccAfterExpandRef.current) return;
+    focusBccAfterExpandRef.current = false;
+    composeRef.current
+      ?.querySelector<HTMLInputElement>('[data-recipient-field="bcc"]')
+      ?.focus();
+  }, [showCcBcc]);
+
+  const revealCcBcc = () => {
+    if (!activeId || !activeDraft) return;
+    setShowCcBcc(true);
+    const missingFields: Partial<ComposeState> = {};
+    if (activeDraft.cc === undefined) missingFields.cc = "";
+    if (activeDraft.bcc === undefined) missingFields.bcc = "";
+    if (Object.keys(missingFields).length > 0) {
+      onUpdate(activeId, missingFields);
+    }
+  };
+
+  const animateComposeLayout = useCallback((updateLayout: () => void) => {
+    const compose = composeRef.current;
+    const before = compose?.getBoundingClientRect();
+
+    updateLayout();
+
+    if (
+      !compose ||
+      !before ||
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ) {
+      return;
+    }
+
+    requestAnimationFrame(() => {
+      const after = compose.getBoundingClientRect();
+      if (after.width === 0 || after.height === 0) return;
+
+      const translateX = before.left - after.left;
+      const translateY = before.top - after.top;
+      const scaleX = before.width / after.width;
+      const scaleY = before.height / after.height;
+
+      composeAnimationRef.current?.cancel();
+      composeAnimationRef.current = compose.animate(
+        [
+          {
+            transform: `translate(${translateX}px, ${translateY}px) scale(${scaleX}, ${scaleY})`,
+            transformOrigin: "top left",
+          },
+          { transform: "none", transformOrigin: "top left" },
+        ],
+        {
+          duration: 200,
+          easing: "cubic-bezier(0.23, 1, 0.32, 1)",
+        },
+      );
+    });
+  }, []);
+
+  useEffect(
+    () => () => {
+      composeAnimationRef.current?.cancel();
+    },
+    [],
+  );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Only handle shortcuts for events originating within the compose window
-    // (prevents agent chat Cmd+Enter from triggering email send)
     if (!composeRef.current?.contains(e.target as Node)) return;
+
+    if (
+      (e.metaKey || e.ctrlKey) &&
+      !e.altKey &&
+      e.shiftKey &&
+      e.key.toLowerCase() === "b" &&
+      activeId &&
+      activeDraft
+    ) {
+      e.preventDefault();
+      if (showCcBcc) {
+        composeRef.current
+          ?.querySelector<HTMLInputElement>('[data-recipient-field="bcc"]')
+          ?.focus();
+      } else {
+        focusBccAfterExpandRef.current = true;
+        revealCcBcc();
+      }
+      return;
+    }
+
+    if (handleComposeSendLaterShortcut(e, () => setScheduleOpen(true))) {
+      return;
+    }
 
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
-      handleSend();
+      void handleSend(e.shiftKey);
     }
     if (e.key === "Escape") {
       e.preventDefault();
@@ -375,9 +693,7 @@ export function ComposeModal({
   const handleGenerate = async () => {
     if (!generatePrompt.trim() || !activeId || !activeDraft) return;
     if (!(await canUseAgentGenerate())) {
-      toast.error(
-        "Connect Builder or another AI engine before using Generate.",
-      );
+      toast.error(t("mail.toasts.aiEngineRequired"));
       window.dispatchEvent(new CustomEvent("agent-panel:open"));
       return;
     }
@@ -417,9 +733,6 @@ export function ComposeModal({
     setGenerateOpen(false);
   };
 
-  // Move a recipient chip between To/Cc/Bcc (drag-and-drop). The compose draft
-  // owns all three fields, so it can remove from the source and add to the
-  // target atomically.
   const moveRecipient = (
     value: string,
     from: RecipientField,
@@ -443,8 +756,22 @@ export function ComposeModal({
       const attachments = await uploadFiles(files);
       const existing = activeDraft.attachments ?? [];
       onUpdate(activeId, { attachments: [...existing, ...attachments] });
-    } catch {
-      toast.error("Failed to attach file");
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t("mail.toasts.failedToAttachFile"),
+      );
+    }
+  };
+
+  const handleUploadImage = async (file: File) => {
+    try {
+      const result = await uploadFile(file);
+      return result.url;
+    } catch (err) {
+      toast.error(t("mail.toasts.failedToUploadImage"));
+      throw err;
     }
   };
 
@@ -464,6 +791,14 @@ export function ComposeModal({
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
     const files = Array.from(e.dataTransfer.files ?? []);
     if (files.length === 0) return;
+    const target = e.target as HTMLElement;
+    const droppedOnEditor = target.closest(".compose-editor") != null;
+    if (
+      droppedOnEditor &&
+      files.every((file) => file.type.startsWith("image/"))
+    ) {
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     void handleAttachFiles(files);
@@ -479,13 +814,13 @@ export function ComposeModal({
 
   const title = activeDraft
     ? activeDraft.queuedDraftId
-      ? "Queued draft"
+      ? t("mail.compose.queuedDraft")
       : activeDraft.mode === "reply"
-        ? "Reply"
+        ? t("mail.compose.reply")
         : activeDraft.mode === "forward"
-          ? "Forward"
-          : "New message"
-    : "New message";
+          ? t("mail.compose.forward")
+          : t("mail.compose.newMessage")
+    : t("mail.compose.newMessage");
 
   const composeStyle = {
     right: isMobile ? 0 : sidebarRight,
@@ -496,13 +831,14 @@ export function ComposeModal({
     <div
       ref={composeRef}
       className={cn(
-        "compose-window fixed z-50 flex w-full flex-col bg-card transition-[width,height,top,bottom] duration-150 sm:rounded-t-xl",
+        "compose-window fixed z-50 flex w-full flex-col bg-card sm:rounded-t-xl",
         minimized
           ? "bottom-0 h-11 rounded-t-xl sm:w-[540px]"
           : isExpanded
             ? "top-0 bottom-0 h-auto rounded-none sm:top-4 sm:bottom-4 sm:w-[min(960px,calc(100vw-var(--compose-right)-1rem))] sm:rounded-xl"
-            : "bottom-0 h-[100dvh] sm:h-[520px] sm:w-[540px]",
+            : "bottom-0 h-[100dvh] sm:h-[min(540px,_calc(100dvh_-_2rem))] md:w-[min(490px,_calc(100vw_-_var(--compose-right)_-_1rem))] sm:rounded-xl",
       )}
+      data-mail-compose
       style={composeStyle}
       onKeyDown={handleKeyDown}
       onDragOverCapture={handleDragOver}
@@ -513,23 +849,24 @@ export function ComposeModal({
         {/* Left side: tabs (or single title) */}
         <div className="flex flex-1 items-center min-w-0 overflow-x-auto hide-scrollbar gap-0.5">
           {drafts.length <= 1 ? (
-            /* Single draft: just show the title */
-            <span className="text-sm font-semibold text-foreground px-2 truncate">
+            <span
+              data-an-mask
+              className="text-sm font-semibold text-foreground px-2 truncate"
+            >
               {title}
             </span>
           ) : (
-            /* Multiple drafts: show tabs */
             drafts.map((draft) => {
               const isActive = draft.id === activeId;
               const label =
                 draft.subject?.trim() ||
                 (draft.queuedDraftId
-                  ? "Queued draft"
+                  ? t("mail.compose.queuedDraft")
                   : draft.mode === "reply"
-                    ? "Reply"
+                    ? t("mail.compose.reply")
                     : draft.mode === "forward"
-                      ? "Forward"
-                      : "New message");
+                      ? t("mail.compose.forward")
+                      : t("mail.compose.newMessage"));
               return (
                 <button
                   key={draft.id}
@@ -541,7 +878,9 @@ export function ComposeModal({
                       : "text-muted-foreground hover:text-foreground hover:bg-accent/30",
                   )}
                 >
-                  <span className="truncate">{label}</span>
+                  <span data-an-mask className="truncate">
+                    {label}
+                  </span>
                   <span
                     onClick={(e) => {
                       e.stopPropagation();
@@ -564,13 +903,15 @@ export function ComposeModal({
           <Tooltip>
             <TooltipTrigger asChild>
               <button
+                type="button"
+                aria-label={t("mail.compose.newDraft")}
                 onClick={onNewDraft}
                 className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground/50 hover:text-foreground hover:bg-accent/30 transition-colors"
               >
                 <IconPlus className="h-3 w-3" />
               </button>
             </TooltipTrigger>
-            <TooltipContent>New draft</TooltipContent>
+            <TooltipContent>{t("mail.compose.newDraft")}</TooltipContent>
           </Tooltip>
         </div>
 
@@ -581,18 +922,27 @@ export function ComposeModal({
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-7 w-7"
-                aria-label={minimized ? "Restore compose" : "Minimize compose"}
+                className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                aria-label={
+                  minimized
+                    ? t("mail.compose.restoreCompose")
+                    : t("mail.compose.minimizeCompose")
+                }
                 onClick={() => {
-                  setIsExpanded(false);
-                  setMinimized(!minimized);
+                  animateComposeLayout(() => {
+                    setIsExpanded(false);
+                    if (!minimized) setScheduleOpen(false);
+                    setMinimized(!minimized);
+                  });
                 }}
               >
                 <IconMinus className="h-3.5 w-3.5" />
               </Button>
             </TooltipTrigger>
             <TooltipContent>
-              {minimized ? "Restore" : "Minimize"}
+              {minimized
+                ? t("mail.compose.restore")
+                : t("mail.compose.minimize")}
             </TooltipContent>
           </Tooltip>
           {!minimized && (
@@ -601,14 +951,18 @@ export function ComposeModal({
                 <Button
                   variant="ghost"
                   size="icon"
-                  className="h-7 w-7"
+                  className="h-7 w-7 text-muted-foreground hover:text-foreground"
                   aria-label={
-                    isExpanded ? "Restore compose size" : "Full screen compose"
+                    isExpanded
+                      ? t("mail.compose.restoreComposeSize")
+                      : t("mail.compose.fullScreenCompose")
                   }
                   aria-pressed={isExpanded}
                   onClick={() => {
-                    setMinimized(false);
-                    setIsExpanded((value) => !value);
+                    animateComposeLayout(() => {
+                      setMinimized(false);
+                      setIsExpanded((value) => !value);
+                    });
                   }}
                 >
                   {isExpanded ? (
@@ -619,15 +973,19 @@ export function ComposeModal({
                 </Button>
               </TooltipTrigger>
               <TooltipContent>
-                {isExpanded ? "Restore size" : "Full screen"}
+                {isExpanded
+                  ? t("mail.compose.restoreSize")
+                  : t("mail.compose.fullScreen")}
               </TooltipContent>
             </Tooltip>
           )}
           <Button
             variant="ghost"
             size="icon"
-            className="h-7 w-7"
+            type="button"
+            className="h-7 w-7 text-muted-foreground hover:text-foreground"
             onClick={onCloseAll}
+            aria-label={t("mail.compose.closeAllDrafts")}
           >
             <IconX className="h-3.5 w-3.5" />
           </Button>
@@ -642,68 +1000,68 @@ export function ComposeModal({
               <FromAccountSelector
                 accounts={allAccounts}
                 value={activeDraft.accountEmail}
+                label={t("mail.compose.from")}
                 onChange={(email) =>
                   onUpdate(activeId!, { accountEmail: email })
                 }
               />
             )}
-            <div className="flex items-center border-b border-border px-4">
-              <span className="w-8 shrink-0 text-xs font-medium text-muted-foreground">
-                To
-              </span>
+            <ComposeFieldRow
+              label={t("mail.compose.to")}
+              trailing={
+                <button
+                  type="button"
+                  aria-label={`${t("mail.draftQueue.cc")} / ${t("mail.draftQueue.bcc")}`}
+                  aria-expanded={showCcBcc}
+                  onClick={() => {
+                    const next = !showCcBcc;
+                    if (next) {
+                      revealCcBcc();
+                    } else {
+                      setShowCcBcc(false);
+                    }
+                  }}
+                  className="flex size-4 shrink-0 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  <IconChevronDown
+                    className={cn(
+                      "size-4 transition-transform",
+                      showCcBcc && "rotate-180",
+                    )}
+                  />
+                </button>
+              }
+            >
               <RecipientInput
                 value={activeDraft.to}
                 onChange={(val) => onUpdate(activeId!, { to: val })}
                 autoFocus={activeDraft.mode === "compose"}
+                ariaLabel={t("mail.compose.toRecipients")}
                 field="to"
                 onMoveRecipient={moveRecipient}
               />
-              <button
-                onClick={() => {
-                  const next = !showCcBcc;
-                  setShowCcBcc(next);
-                  if (next) {
-                    if (activeDraft.cc === undefined)
-                      onUpdate(activeId!, { cc: "" });
-                    if (activeDraft.bcc === undefined)
-                      onUpdate(activeId!, { bcc: "" });
-                  }
-                }}
-                className="text-muted-foreground hover:text-foreground transition-colors p-1"
-              >
-                <IconChevronDown
-                  className={cn(
-                    "h-4 w-4 transition-transform",
-                    showCcBcc && "rotate-180",
-                  )}
-                />
-              </button>
-            </div>
+            </ComposeFieldRow>
 
             {showCcBcc && (
               <>
-                <div className="flex items-center border-b border-border px-4">
-                  <span className="w-8 shrink-0 text-xs font-medium text-muted-foreground">
-                    Cc
-                  </span>
+                <ComposeFieldRow label={t("mail.compose.cc")}>
                   <RecipientInput
                     value={activeDraft.cc ?? ""}
                     onChange={(val) => onUpdate(activeId!, { cc: val })}
+                    ariaLabel={t("mail.compose.ccRecipients")}
                     field="cc"
                     onMoveRecipient={moveRecipient}
                   />
-                </div>
-                <div className="flex items-center border-b border-border px-4">
-                  <span className="w-8 shrink-0 text-xs font-medium text-muted-foreground">
-                    Bcc
-                  </span>
+                </ComposeFieldRow>
+                <ComposeFieldRow label={t("mail.compose.bcc")}>
                   <RecipientInput
                     value={activeDraft.bcc ?? ""}
                     onChange={(val) => onUpdate(activeId!, { bcc: val })}
+                    ariaLabel={t("mail.compose.bccRecipients")}
                     field="bcc"
                     onMoveRecipient={moveRecipient}
                   />
-                </div>
+                </ComposeFieldRow>
               </>
             )}
 
@@ -714,7 +1072,7 @@ export function ComposeModal({
                 onChange={(e) =>
                   onUpdate(activeId!, { subject: e.target.value })
                 }
-                placeholder="Subject"
+                placeholder={t("mail.compose.subject")}
                 className="flex-1 bg-transparent py-2 text-sm outline-none placeholder:text-muted-foreground"
               />
             </div>
@@ -735,6 +1093,8 @@ export function ComposeModal({
             showQuoted={showQuoted}
             setShowQuoted={setShowQuoted}
             signature={settings?.signature}
+            autocompleteEnabled={settings?.autocompleteEnabled ?? false}
+            onUploadImage={handleUploadImage}
           />
 
           {/* Attachments */}
@@ -753,52 +1113,60 @@ export function ComposeModal({
                   <Button
                     variant="ghost"
                     size="icon"
-                    className="h-7 w-7"
+                    type="button"
+                    aria-label={t("mail.compose.bold")}
+                    className="h-7 w-7 text-muted-foreground hover:text-foreground"
                     onClick={() => editorRef.current?.toggleBold()}
                   >
                     <IconBold className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent>Bold</TooltipContent>
+                <TooltipContent>{t("mail.compose.bold")}</TooltipContent>
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
                     variant="ghost"
                     size="icon"
-                    className="h-7 w-7"
+                    type="button"
+                    aria-label={t("mail.compose.italic")}
+                    className="h-7 w-7 text-muted-foreground hover:text-foreground"
                     onClick={() => editorRef.current?.toggleItalic()}
                   >
                     <IconItalic className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent>Italic</TooltipContent>
+                <TooltipContent>{t("mail.compose.italic")}</TooltipContent>
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
                     variant="ghost"
                     size="icon"
-                    className="h-7 w-7"
+                    type="button"
+                    aria-label={t("mail.compose.insertLink")}
+                    className="h-7 w-7 text-muted-foreground hover:text-foreground"
                     onClick={() => editorRef.current?.setLink()}
                   >
                     <IconLink className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent>Insert link</TooltipContent>
+                <TooltipContent>{t("mail.compose.insertLink")}</TooltipContent>
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
                     variant="ghost"
                     size="icon"
-                    className="h-7 w-7"
+                    type="button"
+                    aria-label={t("mail.compose.attachFile")}
+                    className="h-7 w-7 text-muted-foreground hover:text-foreground"
                     onClick={() => void handleAttach()}
                   >
                     <IconPaperclip className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent>Attach file</TooltipContent>
+                <TooltipContent>{t("mail.compose.attachFile")}</TooltipContent>
               </Tooltip>
 
               <div className="mx-1 h-4 w-px bg-border" />
@@ -806,7 +1174,7 @@ export function ComposeModal({
               {isGenerating ? (
                 <div className="flex items-center gap-1.5 px-2 text-xs text-muted-foreground">
                   <IconLoader2 className="h-3.5 w-3.5 animate-spin" />
-                  <span>Generating…</span>
+                  <span>{t("mail.compose.generating")}</span>
                 </div>
               ) : (
                 <Popover open={generateOpen} onOpenChange={setGenerateOpen}>
@@ -816,13 +1184,13 @@ export function ComposeModal({
                       size="sm"
                       className="h-7 gap-1.5 px-2 text-xs"
                     >
-                      Generate
+                      {t("mail.compose.generate")}
                     </Button>
                   </PopoverTrigger>
                   <PopoverContent side="top" align="start" className="w-80 p-3">
                     <div className="flex flex-col gap-2">
                       <label className="text-xs font-medium text-muted-foreground">
-                        What should the agent write?
+                        {t("mail.compose.agentPromptLabel")}
                       </label>
                       <textarea
                         ref={promptRef}
@@ -831,20 +1199,21 @@ export function ComposeModal({
                         onKeyDown={(e) => {
                           if (e.key === "Enter" && !e.shiftKey) {
                             e.preventDefault();
-                            handleGenerate();
+                            void handleGenerate();
                           }
                           if (e.key === "Escape") {
                             e.stopPropagation();
                             setGenerateOpen(false);
                           }
                         }}
-                        placeholder="e.g. Write a polite follow-up..."
+                        placeholder={t("mail.compose.agentPromptPlaceholder")}
                         className="min-h-[60px] w-full resize-none rounded-md border bg-transparent px-3 py-2 text-sm outline-none placeholder:text-muted-foreground focus:ring-1 focus:ring-ring"
                         autoFocus
                       />
                       <div className="flex items-center justify-between">
                         <span className="text-[10px] text-muted-foreground">
-                          <kbd className="kbd-hint">↵</kbd> to submit
+                          <kbd className="kbd-hint">↵</kbd>{" "}
+                          {t("mail.compose.toSubmit")}
                         </span>
                         <Button
                           size="sm"
@@ -852,7 +1221,7 @@ export function ComposeModal({
                           disabled={!generatePrompt.trim()}
                           className="h-7 gap-1.5 px-3 text-xs"
                         >
-                          Generate
+                          {t("mail.compose.generate")}
                         </Button>
                       </div>
                     </div>
@@ -865,19 +1234,23 @@ export function ComposeModal({
               <Tooltip>
                 <TooltipTrigger asChild>
                   <button
+                    type="button"
+                    aria-label={t("mail.compose.deleteDraft")}
                     onClick={() => activeId && onDiscard(activeId)}
                     className="flex h-8 w-8 items-center justify-center rounded text-muted-foreground/40 hover:text-red-400 hover:bg-red-400/10 transition-colors"
                   >
                     <IconTrash className="h-4 w-4" />
                   </button>
                 </TooltipTrigger>
-                <TooltipContent>Delete draft</TooltipContent>
+                <TooltipContent>{t("mail.compose.deleteDraft")}</TooltipContent>
               </Tooltip>
               <SendLaterButton
                 onSend={handleSend}
                 onSendLater={handleSendLater}
-                disabled={!activeDraft.to.trim()}
+                open={scheduleOpen}
+                onOpenChange={setScheduleOpen}
                 isSending={sendEmail.isPending}
+                isScheduling={scheduleEmail.isPending}
               />
             </div>
           </div>
@@ -887,10 +1260,6 @@ export function ComposeModal({
   );
 }
 
-/**
- * Compose body area — splits quoted history from editable content.
- * Shows "..." toggle for quoted content in reply/forward mode.
- */
 function ComposeBody({
   activeDraft,
   activeId,
@@ -905,6 +1274,8 @@ function ComposeBody({
   showQuoted,
   setShowQuoted,
   signature,
+  autocompleteEnabled,
+  onUploadImage,
 }: {
   activeDraft: ComposeState;
   activeId: string;
@@ -912,7 +1283,7 @@ function ComposeBody({
   onUpdate: (id: string, partial: Partial<ComposeState>) => void;
   onFlush: (id: string) => Promise<unknown> | undefined;
   onClose: (id: string) => void;
-  onSend: () => void;
+  onSend: (markDone?: boolean) => void;
   isGenerating: boolean;
   sendToAgent: (opts: {
     message: string;
@@ -923,7 +1294,10 @@ function ComposeBody({
   showQuoted: boolean;
   setShowQuoted: (show: boolean) => void;
   signature?: string;
+  autocompleteEnabled: boolean;
+  onUploadImage: (file: File) => Promise<string>;
 }) {
+  const t = useT();
   const [editableContent, quotedContent] = useMemo(
     () => splitQuotedContent(activeDraft.body),
     [activeDraft.body],
@@ -936,7 +1310,6 @@ function ComposeBody({
     [activeDraft.mode, editableContent, signature],
   );
 
-  // Store quoted content in a ref so the onChange handler always has the latest
   const quotedRef = useRef(quotedContent);
   quotedRef.current = quotedContent;
   const appendedSignatureRef = useRef(appendedSignature);
@@ -980,6 +1353,7 @@ function ComposeBody({
         onClose={() => onClose(activeId)}
         onFlush={() => onFlush(activeId)}
         isGenerating={isGenerating}
+        autocompleteEnabled={autocompleteEnabled}
         draftId={activeId}
         getCurrentDraftBody={(editor) =>
           getCurrentDraftBodyFromEditor({
@@ -989,19 +1363,27 @@ function ComposeBody({
           })
         }
         sendToAgent={sendToAgent}
+        onUploadImage={onUploadImage}
       />
       {hasQuote && (
         <>
           <button
             type="button"
-            aria-label={showQuoted ? "Hide quoted text" : "Show quoted text"}
+            aria-label={
+              showQuoted
+                ? t("mail.thread.hideQuotedText")
+                : t("mail.thread.showQuotedText")
+            }
             onClick={() => setShowQuoted(!showQuoted)}
             className="mt-1 inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground/50 transition-colors hover:bg-accent hover:text-muted-foreground"
           >
             <IconDots className="h-4 w-4" />
           </button>
           {showQuoted && (
-            <pre className="mt-2 whitespace-pre-wrap text-[13px] text-muted-foreground/60 font-sans leading-relaxed">
+            <pre
+              data-an-block
+              className="mt-2 whitespace-pre-wrap text-[13px] text-muted-foreground/60 font-sans leading-relaxed"
+            >
               {quotedContent.trim()}
             </pre>
           )}

@@ -1,30 +1,34 @@
 export interface CalendarEvent {
   id: string;
   title: string;
+  titleIsGenerated?: boolean;
   description: string;
-  start: string; // ISO 8601
-  end: string; // ISO 8601
-  /** IANA timezone for timed starts, e.g. America/New_York. */
+  start: string;
+  end: string;
   startTimeZone?: string;
-  /** IANA timezone for timed ends, e.g. America/New_York. */
   endTimeZone?: string;
   location: string;
   allDay: boolean;
   source: "local" | "google" | "ical";
+  sourceId?: string;
   googleEventId?: string;
-  /** Absolute Google Calendar web URL for Google events */
   htmlLink?: string;
   accountEmail?: string;
-  /** Set when this event belongs to an overlaid person's calendar */
+  calendarSourceKey?: string;
+  canonicalKey?: string;
+  calendarId?: string;
+  calendarName?: string;
+  calendarColor?: string;
+  calendarAccessRole?: GoogleCalendarSource["accessRole"];
+  calendarPrimary?: boolean;
+  calendarReadOnly?: boolean;
   overlayEmail?: string;
+  ownerColor?: string;
+  ownerName?: string;
   color?: string;
-  /** Google Calendar event color id (1-11). */
   colorId?: string;
-  /** User's RSVP status from Google Calendar */
   responseStatus?: "accepted" | "declined" | "tentative" | "needsAction";
-  /** Google Calendar free/busy visibility; transparent means the event is free */
   transparency?: "opaque" | "transparent";
-  /** Native Google Calendar event type. Non-default types cannot be changed after creation. */
   eventType?:
     | "default"
     | "birthday"
@@ -36,20 +40,22 @@ export interface CalendarEvent {
     email: string;
     displayName?: string;
     photoUrl?: string;
-    /** Google Calendar RSVP note/comment from the attendee */
     comment?: string;
     responseStatus?: "accepted" | "declined" | "tentative" | "needsAction";
     organizer?: boolean;
     self?: boolean;
+    optional?: boolean;
+    additionalGuests?: number;
+    timeZone?: string;
   }>;
   reminders?: Array<{ method: "popup" | "email"; minutes: number }>;
-  /** Whether this event uses the calendar's default reminder policy. */
   remindersUseDefault?: boolean;
-  recurrence?: string[]; // RRULE strings from Google Calendar
+  recurrence?: string[];
   recurringEventId?: string;
-  hangoutLink?: string; // Google Meet link
-  /** Meeting URL stored in location/description for non-Google providers such as Zoom */
+  hangoutLink?: string;
   meetingLink?: string;
+  meetingLinkPending?: boolean;
+  videoConferenceError?: "zoom";
   conferenceData?: {
     entryPoints?: Array<{
       entryPointType: string;
@@ -60,12 +66,6 @@ export interface CalendarEvent {
     }>;
     conferenceSolution?: { name: string; iconUri?: string };
   };
-  /**
-   * Client-only hint set on a draft event when the user has chosen to add a
-   * video conference that will be provisioned when the event is created. Lets
-   * the UI show the conferencing row as already attached instead of a
-   * "will be added later" placeholder. Never sent to or returned by the server.
-   */
   pendingConferenceProvider?: "meet" | "zoom";
   attachments?: Array<{
     fileUrl: string;
@@ -108,8 +108,51 @@ export interface CalendarEvent {
   organizer?: { email: string; displayName?: string; self?: boolean };
   createdAt: string;
   updatedAt: string;
-  /** Client-only: temp id preserved across optimistic→real swap to keep React keys stable */
   _tempId?: string;
+  _replacedId?: string;
+}
+
+type CalendarAttendee = NonNullable<CalendarEvent["attendees"]>[number];
+
+function additionalGuestCount(attendee: CalendarAttendee): number {
+  return typeof attendee.additionalGuests === "number" &&
+    Number.isFinite(attendee.additionalGuests) &&
+    attendee.additionalGuests > 0
+    ? Math.floor(attendee.additionalGuests)
+    : 0;
+}
+
+export function getCalendarAttendeeCount(
+  attendees: CalendarEvent["attendees"],
+): number {
+  return (attendees ?? []).reduce(
+    (count, attendee) => count + 1 + additionalGuestCount(attendee),
+    0,
+  );
+}
+
+export function getCalendarGuestCount(
+  attendees: CalendarEvent["attendees"],
+): number {
+  return (attendees ?? []).reduce(
+    (count, attendee) =>
+      count + (attendee.self ? 0 : 1) + additionalGuestCount(attendee),
+    0,
+  );
+}
+
+export function getCalendarAttendeeStatusCounts(
+  attendees: CalendarEvent["attendees"],
+): Record<string, number> {
+  return (attendees ?? []).reduce<Record<string, number>>(
+    (counts, attendee) => {
+      const status = attendee.responseStatus ?? "unknown";
+      counts[status] =
+        (counts[status] ?? 0) + 1 + additionalGuestCount(attendee);
+      return counts;
+    },
+    {},
+  );
 }
 
 export interface CalendarEventDraft {
@@ -122,12 +165,15 @@ export interface CalendarEventDraft {
   endTimeZone?: string;
   location?: string;
   allDay?: boolean;
+  fullDay?: boolean;
   eventType?: "default" | "outOfOffice" | "focusTime" | "workingLocation";
+  outOfOfficeProperties?: CalendarEvent["outOfOfficeProperties"];
   transparency?: "opaque" | "transparent";
   visibility?: "default" | "public" | "private" | "confidential";
   colorId?: string;
   reminders?: CalendarEvent["reminders"];
   remindersUseDefault?: boolean;
+  recurrence?: CalendarEvent["recurrence"];
   attachments?: CalendarEvent["attachments"];
   attendees?: CalendarEvent["attendees"];
   addGoogleMeet?: boolean;
@@ -185,7 +231,6 @@ export interface DeleteEventOptions {
   scope?: DeleteEventScope;
   sendUpdates?: "all" | "none";
   notificationMessage?: string;
-  /** When true and user is not the organizer, decline instead of deleting */
   removeOnly?: boolean;
 }
 
@@ -196,8 +241,8 @@ export interface OverlayPerson {
 }
 
 export interface TimeSlot {
-  start: string; // HH:mm
-  end: string; // HH:mm
+  start: string;
+  end: string;
 }
 
 export interface DaySchedule {
@@ -221,7 +266,6 @@ export interface AvailabilityConfig {
   maxAdvanceDays: number;
   slotDurationMinutes: number;
   bookingPageSlug: string;
-  /** Unique username for booking URLs, e.g. calendar.agent-native.com/book/{username}/{slug} */
   bookingUsername?: string;
 }
 
@@ -231,17 +275,13 @@ export interface CustomField {
   type: "text" | "email" | "url" | "tel" | "textarea" | "select" | "checkbox";
   required: boolean;
   placeholder?: string;
-  /** Regex pattern for validation (e.g. LinkedIn URL pattern) */
   pattern?: string;
-  /** Custom error message when pattern doesn't match */
   patternError?: string;
-  /** Options for select type fields */
   options?: string[];
 }
 
 export interface ConferencingConfig {
   type: "none" | "google_meet" | "zoom" | "custom";
-  /** Meeting URL for zoom/custom types */
   url?: string;
 }
 
@@ -250,23 +290,51 @@ export interface BookingHost {
   displayName?: string;
 }
 
+export interface HostOverlayStatusResult {
+  email: string;
+  reciprocal: boolean;
+  hasWorkingHours: boolean;
+  timezone?: string;
+  displayName?: string;
+  requestSentAt?: string;
+}
+
+export interface OverlayReciprocityResult {
+  email: string;
+  reciprocal: boolean;
+  displayName?: string;
+}
+
+export interface SendOverlayRequestResult {
+  email: string;
+  requestSentAt: string | null;
+  emailSent: boolean;
+  skippedReason?: "email-not-configured" | "send-in-progress";
+}
+
+export interface PublicBookingHost {
+  id: string;
+  label: string;
+  timezone?: string;
+}
+
 export interface Booking {
   id: string;
   name: string;
   email: string;
+  additionalGuestEmails?: string[];
   eventTitle: string;
-  start: string; // ISO 8601
-  end: string; // ISO 8601
+  start: string;
+  end: string;
   slug: string;
   notes?: string;
-  /** Responses to custom fields, keyed by field ID */
   fieldResponses?: Record<string, string | boolean>;
-  /** Meeting link (Zoom, Google Meet, or custom) */
   meetingLink?: string;
-  /** Google Calendar event created for this booking, if any */
+  meetingLinkPending?: boolean;
   googleEventId?: string;
-  /** Token for cancel/reschedule link (only returned to the booker) */
   cancelToken?: string;
+  zoomNeedsReview?: boolean;
+  zoomCancellationNeedsReview?: boolean;
   status: "confirmed" | "cancelled";
   createdAt: string;
 }
@@ -277,25 +345,49 @@ export interface BookingLink {
   title: string;
   description?: string;
   duration: number;
-  /** Additional duration options the booker can choose from */
   durations?: number[];
-  /** Required co-hosts in addition to the booking link owner */
   hosts?: BookingHost[];
-  /** Custom fields shown on the booking form */
+  publicHosts?: PublicBookingHost[];
   customFields?: CustomField[];
-  /** Video conferencing configuration */
   conferencing?: ConferencingConfig;
   color?: string;
   isActive: boolean;
-  /** Sharing visibility: private (default), org, or public */
   visibility?: "private" | "org" | "public";
+  ownerTimezone?: string;
+  ownerName?: string;
+  accessRole?: "owner" | "admin" | "editor" | "commenter" | "viewer";
   createdAt: string;
   updatedAt: string;
 }
 
 export interface GoogleAuthStatus {
+  configured?: boolean;
   connected: boolean;
-  accounts: Array<{ email: string; expiresAt?: string; photoUrl?: string }>;
+  accounts: Array<{
+    email: string;
+    expiresAt?: string;
+    photoUrl?: string;
+    shared?: boolean;
+  }>;
+}
+
+export interface GoogleCalendarSource {
+  sourceKey: string;
+  canonicalKey: string;
+  accountEmail: string;
+  calendarId: string;
+  name: string;
+  color?: string;
+  selected: boolean;
+  primary: boolean;
+  accessRole: "freeBusyReader" | "reader" | "writer" | "owner";
+  readOnly: boolean;
+  sourcePaths?: Array<{
+    sourceKey: string;
+    accountEmail: string;
+    accessRole: "freeBusyReader" | "reader" | "writer" | "owner";
+    primary: boolean;
+  }>;
 }
 
 export interface ExternalCalendar {
@@ -309,7 +401,21 @@ export interface Settings {
   timezone: string;
   bookingPageTitle: string;
   bookingPageDescription: string;
-  defaultEventDuration: number; // minutes
+  defaultEventDuration: number;
+  weekStart: import("./calendar-week.js").CalendarWeekStart;
+  eventRules?: { accept?: string; decline?: string; hide?: string };
+  hiddenEventKeys?: string[];
+  eventRuleActivity?: CalendarEventRuleActivity[];
+}
+
+export interface CalendarEventRuleActivity {
+  id: string;
+  eventId: string;
+  accountEmail: string;
+  title: string;
+  action: "accepted" | "declined" | "hidden";
+  occurredAt: string;
+  hiddenEventKey?: string;
 }
 
 export type ApolloPersonResult = {

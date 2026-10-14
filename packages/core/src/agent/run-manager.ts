@@ -1,111 +1,351 @@
-import type { AgentChatEvent, RunEvent, RunStatus } from "./types.js";
-import { EngineError } from "./engine/types.js";
+import { getAppConfig } from "../app-config/index.js";
+import {
+  BACKGROUND_AUTOMATION_SOFT_TIMEOUT_HEADROOM_MS,
+  BACKGROUND_SOFT_TIMEOUT_CEILING_MS,
+  RUN_NO_PROGRESS_HARD_TIMEOUT_MS,
+} from "../app-config/run-lifecycle-invariants.js";
+import {
+  getCurrentRequestDbPoolScope,
+  retainRequestDbPoolScope,
+} from "../db/request-pool-context.js";
+import { recordAgentRun } from "../observability/metrics.js";
+import { parseServiceIdentityEmail } from "../org/service-identity.js";
+import { ServicePrincipalRefusedError } from "../org/service-principal-guard.js";
 import { captureError } from "../server/capture-error.js";
 import {
+  isLlmCredentialError,
+  LLM_MISSING_CREDENTIALS_ERROR_CODE,
+  LLM_MISSING_CREDENTIALS_MESSAGE,
+} from "./engine/credential-errors.js";
+import {
+  classifyTerminalErrorCode,
+  describeErrorWithCauses,
+  isProviderConnectionError,
+} from "./engine/error-detail.js";
+import { runErrorTelemetryProperties } from "./engine/error-telemetry.js";
+import { getAgentEngineEntry } from "./engine/registry.js";
+import { EngineError } from "./engine/types.js";
+import type { EngineRequestShape } from "./engine/types.js";
+import {
+  type AgentTurnInitiator,
   insertRun,
   insertRunEvent,
+  insertRunEvents,
   updateRunStatusIfRunning,
   markRunAborted,
   getRunAbortState,
   getRunStatus,
   getRunEventsSince,
+  getCurrentTurnRunEventsForThread,
   getRunById,
   getRunByThread,
+  getRunTurnRef,
+  markTurnAborted,
   cleanupOldRuns,
   updateRunHeartbeat,
   bumpRunProgress,
+  setRunInFlightMarker,
   reapIfStale,
+  reapUnclaimedBackgroundRun,
+  shouldRedispatchUnclaimedBackgroundRun,
+  reconcileTerminalRunFromEvents,
   ensureTerminalRunEvent,
+  getLastTerminalRunEvent,
+  resolveErroredRunTerminalEvent,
   setRunError,
-  STALE_RUN_ERROR_EVENT,
+  setRunTerminalReason,
+  persistRunCheckpointEvent,
+  recordRunDiagnostic,
+  RUN_DIAG_STAGE,
+  terminalEventForAbortReason,
+  RUN_RECORD_MISSING_ERROR_EVENT,
+  RUN_RECORD_MISSING_GRACE_MS,
+  RUN_TERMINAL_LOOKUP_FAILED_ERROR_EVENT,
+  UNKNOWN_RUN_STATUS_ERROR_EVENT,
 } from "./run-store.js";
+import { isContinuationTerminalReason } from "./types.js";
+import type { AgentChatEvent, RunEvent, RunStatus } from "./types.js";
 
 export interface ActiveRun {
   runId: string;
   threadId: string;
-  /** Logical-turn identity (see StartRunOptions.turnId). Defaults to runId. */
+  parentId?: string | null;
   turnId: string;
+  agentKitApprovalContinuation?: boolean;
   events: RunEvent[];
   status: RunStatus;
   subscribers: Set<(event: RunEvent) => void>;
   abort: AbortController;
   abortReason?: string;
+  continuationTerminalEvent?: Extract<
+    AgentChatEvent,
+    { type: "auto_continue" } | { type: "error" }
+  >;
   startedAt: number;
+}
+
+export interface StartedRun extends ActiveRun {
+  finalized: Promise<void>;
 }
 
 const activeRuns = new Map<string, ActiveRun>();
 const threadToRun = new Map<string, string>();
 
-/** How long to keep completed runs in memory before cleanup (5 min) */
 const CLEANUP_DELAY_MS = 5 * 60 * 1000;
 
-/**
- * Default run chunk budget for hosted/serverless deploys.
- *
- * This MUST fire before the two upstream hard walls that otherwise kill a run
- * mid-turn with no chance to hand off:
- *   1. The Builder model gateway hard-caps a single model call at 45s
- *      (builder-engine.ts MAX_BUILDER_GATEWAY_TIMEOUT_MS) — not raisable.
- *   2. Serverless functions are hard-killed around 60-65s (the heartbeat then
- *      reaps the row as a stale_run).
- * Production data showed every cutoff landing in the 44-70s window with ZERO
- * auto_continue events ever emitted — i.e. the old 45s default raced the 45s
- * gateway and lost, and per-template overrides (e.g. 240_000) pushed it past
- * BOTH walls so it could never fire. 40s leaves ~5s of headroom under the
- * gateway wall to abort, persist the partial turn, write the terminal event,
- * and emit a clean auto_continue so the client resumes seamlessly.
- */
 export const DEFAULT_HOSTED_RUN_SOFT_TIMEOUT_MS = 40_000;
 
-/**
- * Hard ceiling for the hosted soft timeout. On a hosted runtime the
- * auto_continue soft timeout can never usefully exceed this — the gateway
- * (45s) / function (~60s) walls kill the run first, so a larger configured or
- * env value just guarantees the cutoff is a hard error instead of a graceful
- * hand-off. Any resolved value above this is clamped down when hosted. Local
- * dev (non-hosted) is left alone so long-running local turns aren't chunked.
- */
 export const HOSTED_SOFT_TIMEOUT_CEILING_MS = 40_000;
 
-/** Default SQL retention for completed run event logs (24 hours). */
+export const DEFAULT_BACKGROUND_NO_PROGRESS_TIMEOUT_MS =
+  RUN_NO_PROGRESS_HARD_TIMEOUT_MS;
+
+const FOREGROUND_NO_PROGRESS_SOFT_TIMEOUT_FRACTION = 0.75;
+
+const RUN_TOOL_TIMEOUT_HEADROOM_MS = 5_000;
+
+export function resolveRunToolTimeoutCeilingMs(softTimeoutMs: number): number {
+  if (!(softTimeoutMs > 0)) return 0;
+  return Math.max(1_000, softTimeoutMs - RUN_TOOL_TIMEOUT_HEADROOM_MS);
+}
+
+export function resolveRunNoProgressTimeoutMs(params: {
+  softTimeoutMs: number;
+  backgroundFunction?: boolean;
+  overrideMs?: number;
+  backgroundOverrideMs?: number;
+}): number {
+  const { softTimeoutMs, backgroundFunction } = params;
+  const explicit = (value: number | undefined) =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0
+      ? value
+      : undefined;
+
+  const configured = getAppConfig().agent;
+
+  const budgetCeilingMs = Math.floor(
+    softTimeoutMs * FOREGROUND_NO_PROGRESS_SOFT_TIMEOUT_FRACTION,
+  );
+
+  if (backgroundFunction === true) {
+    const override =
+      explicit(params.backgroundOverrideMs) ?? explicit(params.overrideMs);
+    if (!(softTimeoutMs > 0)) return override ?? 0;
+    if (override !== undefined) {
+      return override === 0 ? 0 : Math.min(override, budgetCeilingMs);
+    }
+    return Math.min(configured.backgroundNoProgressTimeoutMs, budgetCeilingMs);
+  }
+
+  const override = explicit(params.overrideMs);
+  if (!(softTimeoutMs > 0)) return override ?? 0;
+
+  const ceiling = Math.min(RUN_NO_PROGRESS_HARD_TIMEOUT_MS, budgetCeilingMs);
+  if (override === undefined) return ceiling;
+  return override === 0 ? 0 : Math.min(override, ceiling);
+}
+
+function inFlightWorkDelta(event: AgentChatEvent): -1 | 0 | 1 {
+  switch (event.type) {
+    case "tool_start":
+      return 1;
+    case "tool_done":
+      return -1;
+    case "agent_call":
+    case "model_stream":
+      return event.status === "start" ? 1 : -1;
+    default:
+      return 0;
+  }
+}
+
 export const DEFAULT_COMPLETED_RUN_RETENTION_MS = 24 * 60 * 60 * 1000;
 
-/**
- * Default SQL retention for errored/aborted run event logs (7 days). Kept
- * longer than completed runs so cut-off / failed chats survive for pattern
- * analysis (listErroredRuns) — these are rare and small, and they are exactly
- * the runs we need to study to keep hardening reliability.
- */
 export const DEFAULT_ERRORED_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
-/**
- * How recently a terminal run must have started for `/runs/active` to surface
- * it. Reconnect after this window won't replay the run — typical real-world
- * disconnects resolve in seconds, so 10 minutes is generous while keeping us
- * from resurrecting ancient turns when the user reopens an old thread.
- */
-export const TERMINAL_RUN_RECONNECT_WINDOW_MS = 10 * 60 * 1000;
+export const TERMINAL_RUN_RECONNECT_WINDOW_MS = 20 * 60 * 1000;
+
+export const SQL_SUBSCRIPTION_ACTIVE_POLL_MS = 125;
+
+export const SQL_SUBSCRIPTION_IDLE_POLL_MS = 500;
+
+export const SQL_SUBSCRIPTION_ACTIVE_GRACE_MS = 2_000;
+
+export const SQL_SUBSCRIPTION_STATUS_POLL_MS = 500;
+
+export const SQL_SUBSCRIPTION_IDLE_DECAY_AFTER_POLLS = 4;
+
+export const SQL_SUBSCRIPTION_IDLE_MAX_POLL_MS = 2_000;
+
+export const SQL_SUBSCRIPTION_REAP_POLL_MS = 5_000;
+
+export const SQL_SUBSCRIPTION_RETRY_BASE_MS = 250;
+
+export const IN_MEMORY_TERMINAL_SETTLE_MS = 5_000;
+
+export const SQL_SUBSCRIPTION_MAX_CONSECUTIVE_FAILURES = 4;
+
+export const SQL_SUBSCRIPTION_RETRY_MAX_MS = 2_000;
+
+export function resolveSqlSubscriptionPollMs(
+  now: number,
+  activePollUntil: number,
+  consecutiveEmptyPolls = 0,
+): number {
+  if (now < activePollUntil) return SQL_SUBSCRIPTION_ACTIVE_POLL_MS;
+  const steps = Math.min(
+    16,
+    Math.max(
+      0,
+      Math.floor(consecutiveEmptyPolls) -
+        SQL_SUBSCRIPTION_IDLE_DECAY_AFTER_POLLS,
+    ),
+  );
+  return Math.min(
+    SQL_SUBSCRIPTION_IDLE_MAX_POLL_MS,
+    SQL_SUBSCRIPTION_IDLE_POLL_MS * 2 ** steps,
+  );
+}
+
+export function nextSqlSubscriptionEmptyPolls(
+  current: number,
+  hadEvents: boolean,
+  now: number,
+  activePollUntil: number,
+): number {
+  if (hadEvents) return 0;
+  if (now < activePollUntil) return current;
+  return current + 1;
+}
+
+export function resolveSqlSubscriptionRetryMs(
+  consecutiveFailures: number,
+): number {
+  const retryIndex = Math.max(0, Math.floor(consecutiveFailures) - 1);
+  return Math.min(
+    SQL_SUBSCRIPTION_RETRY_MAX_MS,
+    SQL_SUBSCRIPTION_RETRY_BASE_MS * 2 ** retryIndex,
+  );
+}
+
+const PROVIDER_RATE_LIMITED_ERROR_CODE = "provider_rate_limited";
+const PROVIDER_NETWORK_ERROR_CODE = "provider_network_error";
+
+function isPreparingActionActivityEvent(event: AgentChatEvent): boolean {
+  if (event.type !== "activity") return false;
+  const label = event.label.trim().toLowerCase();
+  return label.startsWith("preparing ") && label.includes(" action");
+}
+
+function getRunErrorMessage(err: unknown): string {
+  if (
+    typeof err === "object" &&
+    err !== null &&
+    "message" in err &&
+    typeof err.message === "string" &&
+    err.message.trim().length > 0
+  ) {
+    return err.message;
+  }
+  return "Unknown error";
+}
+
+function getRunErrorCode(err: unknown): string | undefined {
+  if (err instanceof EngineError) {
+    if (err.errorCode) return err.errorCode;
+    if (err.statusCode === 429) return PROVIDER_RATE_LIMITED_ERROR_CODE;
+  }
+  if (isProviderConnectionError(err)) return PROVIDER_NETWORK_ERROR_CODE;
+  return classifyTerminalErrorCode(describeErrorWithCauses(err));
+}
+
+export function engineRequestShapeTags(
+  shape: EngineRequestShape | undefined,
+): Record<string, string> {
+  if (!shape) return {};
+  return {
+    engineModel: shape.model,
+    enginePayloadBytes: String(shape.payloadBytes),
+    engineToolCount: String(shape.toolCount),
+    engineMessageCount: String(shape.messageCount),
+  };
+}
+
+function getEngineRunErrorDetails(err: EngineError): string | undefined {
+  if (err.statusCode === 429) return err.message;
+  return undefined;
+}
+
+function shouldCaptureRunError(err: unknown): boolean {
+  const errorCode = getRunErrorCode(err);
+  if (isLlmCredentialError(err, errorCode)) return false;
+  if (
+    err instanceof EngineError &&
+    (err.statusCode === 401 || err.statusCode === 403)
+  ) {
+    return false;
+  }
+  if (!(err instanceof Error)) return true;
+  if (/^40[13] status code\b/i.test(err.message)) return false;
+  if (isProviderConnectionError(err)) return false;
+  if (!errorCode) return true;
+  const normalizedCode = errorCode.toLowerCase();
+  return (
+    !normalizedCode.startsWith("credits-limit") &&
+    normalizedCode !== "builder_gateway_network_error" &&
+    normalizedCode !== "builder_gateway_stream_ended" &&
+    normalizedCode !== PROVIDER_NETWORK_ERROR_CODE &&
+    normalizedCode !== "provider_rate_limited" &&
+    normalizedCode !== "rate_limit_exceeded"
+  );
+}
 
 export interface StartRunOptions {
-  /** Optional internal run chunk budget. When reached, the framework emits an
-   * auto-continuation signal instead of a user-facing timeout. Leave unset for
-   * no framework-imposed run timeout. */
+  waitUntil?: (promise: Promise<unknown>) => void;
   softTimeoutMs?: number;
-  /** Opt into the hosted/serverless default chunk budget. Only callers with
-   * automatic continuation support should enable this. */
   useHostedSoftTimeoutDefault?: boolean;
-  /** Stable identity for the logical assistant turn this run belongs to. A
-   * turn may span several continuation runs (each chunk is its own run); they
-   * share one `turnId` so the durable assistant message can be folded across
-   * them instead of dropped per-run. Defaults to the runId (turn == run). */
   turnId?: string;
+  agentKitApprovalContinuation?: boolean;
+  parentId?: string | null;
+  backgroundFunction?: boolean;
+  noProgressTimeoutMs?: number;
+  backgroundNoProgressTimeoutMs?: number;
+  dispatchMode?: "foreground" | "foreground-self-chain" | "background";
+  turnInitiator?: AgentTurnInitiator;
+  runRowAlreadyInserted?: boolean;
+  model?: string;
+  engineName?: string;
+  userId?: string;
+  attemptCount?: number;
+  recoverChunkBoundaries?: boolean;
+  persistEvent?: (
+    write: () => Promise<void>,
+    metadata: {
+      terminal: boolean;
+      runId: string;
+      seq: number;
+      eventData: string;
+    },
+  ) => Promise<void>;
+}
+
+export interface RunChunkControl {
+  readonly turnSignal: AbortSignal;
+  readonly chunkSignal: AbortSignal;
+  chunkBoundaryReason(): string | null;
+  beginChunk(): AbortSignal;
+  flushEvents(): Promise<void>;
 }
 
 export interface ResolveRunSoftTimeoutOptions {
   useHostedDefault?: boolean;
+  backgroundFunction?: boolean;
 }
 
-function isHostedRuntime(): boolean {
+export function isHostedRuntime(): boolean {
+  if (process.env.NETLIFY_LOCAL === "true") return false;
+  if (process.env.NETLIFY === "false") return false;
+  if (process.env.SITE_ID) return true; // guard:allow-env-credential -- Netlify's read-only public site identifier is a runtime host marker, not a user credential.
   if (
     process.env.NETLIFY &&
     process.env.NETLIFY !== "false" &&
@@ -134,23 +374,20 @@ export function resolveRunSoftTimeoutMs(
   options?: ResolveRunSoftTimeoutOptions,
 ): number {
   const hosted = isHostedRuntime();
-  // A configured/env soft timeout that exceeds the upstream walls can never
-  // actually fire (the gateway/function kills the run first), so clamp it down
-  // on hosted runtimes. This is what makes auto_continue reach the client
-  // instead of the run dying as builder_gateway_timeout / stale_run. `0` means
-  // "disabled" and is never clamped up.
+  const background = options?.backgroundFunction === true;
+  const ceiling = background
+    ? BACKGROUND_SOFT_TIMEOUT_CEILING_MS
+    : HOSTED_SOFT_TIMEOUT_CEILING_MS;
   const clampHosted = (ms: number): number =>
-    hosted && ms > HOSTED_SOFT_TIMEOUT_CEILING_MS
-      ? HOSTED_SOFT_TIMEOUT_CEILING_MS
-      : ms;
+    hosted && ms > ceiling ? ceiling : ms;
 
   if (typeof overrideMs === "number" && Number.isFinite(overrideMs)) {
     return clampHosted(Math.max(0, overrideMs));
   }
-  const envValue = process.env.AGENT_RUN_SOFT_TIMEOUT_MS;
-  if (envValue !== undefined) {
-    const raw = Number(envValue);
-    if (Number.isFinite(raw) && raw >= 0) return clampHosted(raw);
+  const configured = getAppConfig().agent.runSoftTimeoutMs;
+  if (configured !== undefined) return clampHosted(configured);
+  if (background) {
+    return hosted ? BACKGROUND_SOFT_TIMEOUT_CEILING_MS : 0;
   }
   return options?.useHostedDefault && hosted
     ? DEFAULT_HOSTED_RUN_SOFT_TIMEOUT_MS
@@ -158,21 +395,36 @@ export function resolveRunSoftTimeoutMs(
 }
 
 export function resolveCompletedRunRetentionMs(): number {
-  const envValue = process.env.AGENT_RUN_RETENTION_MS;
-  if (envValue !== undefined) {
-    const raw = Number(envValue);
-    if (Number.isFinite(raw) && raw >= 0) return raw;
-  }
-  return DEFAULT_COMPLETED_RUN_RETENTION_MS;
+  return (
+    getAppConfig().agent.completedRunRetentionMs ??
+    DEFAULT_COMPLETED_RUN_RETENTION_MS
+  );
 }
 
 export function resolveErroredRunRetentionMs(): number {
-  const envValue = process.env.AGENT_ERRORED_RUN_RETENTION_MS;
-  if (envValue !== undefined) {
-    const raw = Number(envValue);
-    if (Number.isFinite(raw) && raw >= 0) return raw;
-  }
-  return DEFAULT_ERRORED_RUN_RETENTION_MS;
+  return (
+    getAppConfig().agent.erroredRunRetentionMs ??
+    DEFAULT_ERRORED_RUN_RETENTION_MS
+  );
+}
+
+export function resolveBackgroundRunHardTimeoutMs(): number {
+  return getAppConfig().agent.backgroundRunHardTimeoutMs;
+}
+
+export function resolveBackgroundAutomationSoftTimeoutMs(
+  overrideMs?: number,
+): number {
+  const budget = Math.max(
+    1_000,
+    resolveBackgroundRunHardTimeoutMs() -
+      BACKGROUND_AUTOMATION_SOFT_TIMEOUT_HEADROOM_MS,
+  );
+  const resolved = resolveRunSoftTimeoutMs(overrideMs, {
+    useHostedDefault: true,
+    backgroundFunction: true,
+  });
+  return resolved > 0 ? Math.min(resolved, budget) : 0;
 }
 
 function isTerminalRunEvent(event: AgentChatEvent): boolean {
@@ -185,6 +437,236 @@ function isTerminalRunEvent(event: AgentChatEvent): boolean {
   );
 }
 
+interface RunEventBatch {
+  events: Array<{ seq: number; eventAt: number; eventData: string }>;
+  write: Promise<void>;
+}
+
+function isBatchableRunEvent(event: AgentChatEvent): boolean {
+  return (
+    event.type !== "tool_start" &&
+    event.type !== "tool_done" &&
+    !isTerminalRunEvent(event)
+  );
+}
+
+/**
+ * A tool result with no later assistant text is an unfinished turn, not a
+ * successful terminal response. Keep this predicate beside the run-manager's
+ * terminal synthesis so the run-manager and production continuation paths use
+ * the same boundary evidence.
+ *
+ * A FAILED tool result counts too. Skipping it made the verdict depend on
+ * whether some earlier call in the same turn happened to succeed: a turn ending
+ * on `resources` ok then `web_request` failed continued, while the same turn
+ * with both failing terminated as a plain `done`. The client can only render
+ * "stopped after these actions ... without sending a final message" for that,
+ * so the tool's real error — an expired handoff URL, a missing credential —
+ * never reached the user, and typing "continue" by hand was the only way to see
+ * it. The model has not read the error yet at this point, which makes a failed
+ * tail strictly more unfinished than a successful one.
+ */
+export function endsAfterToolResultWithoutAssistantFinal(
+  run: ActiveRun,
+): boolean {
+  let toolResultAfterLastAssistantText = false;
+  for (const { event } of run.events) {
+    if (event.type === "text" && event.text.trim().length > 0) {
+      toolResultAfterLastAssistantText = false;
+      continue;
+    }
+    if (event.type === "tool_done") {
+      if (event.approvalPause === true) return false;
+      toolResultAfterLastAssistantText =
+        event.isError === true ||
+        (event.chatUI === undefined && event.mcpApp === undefined);
+      continue;
+    }
+    if (
+      event.type === "clear" ||
+      event.type === "error" ||
+      event.type === "missing_api_key" ||
+      event.type === "connection_required" ||
+      event.type === "auto_continue" ||
+      event.type === "loop_limit"
+    ) {
+      toolResultAfterLastAssistantText = false;
+    }
+  }
+  return toolResultAfterLastAssistantText;
+}
+
+export function endsDuringActionPreparation(run: ActiveRun): boolean {
+  let preparingAction = false;
+  for (const { event } of run.events) {
+    if (
+      isPreparingActionActivityEvent(event) ||
+      event.type === "tool_input_start" ||
+      event.type === "tool_input_delta"
+    ) {
+      preparingAction = true;
+      continue;
+    }
+    if (
+      (event.type === "text" && event.text.trim().length > 0) ||
+      event.type === "tool_start" ||
+      event.type === "tool_done" ||
+      event.type === "approval_required" ||
+      event.type === "connection_required" ||
+      event.type === "clear" ||
+      event.type === "error" ||
+      event.type === "missing_api_key" ||
+      event.type === "auto_continue" ||
+      event.type === "loop_limit"
+    ) {
+      preparingAction = false;
+    }
+  }
+  return preparingAction;
+}
+
+function terminalEventForcesErroredStatus(event: AgentChatEvent | null) {
+  return event?.type === "error" || event?.type === "missing_api_key";
+}
+
+function terminalReasonForRun(
+  finalStatus: "completed" | "errored" | "aborted",
+  terminalEvent: AgentChatEvent | null,
+  abortReason: string | undefined,
+  completionError: unknown,
+): string {
+  if (
+    finalStatus !== "aborted" &&
+    completionError &&
+    terminalEvent?.type === "auto_continue"
+  ) {
+    return "completion_error";
+  }
+  if (terminalEvent?.type === "auto_continue") {
+    return terminalEvent.reason || "auto_continue";
+  }
+  if (terminalEvent?.type === "loop_limit") return "loop_limit";
+  if (terminalEvent?.type === "missing_api_key") return "missing_api_key";
+  if (terminalEvent?.type === "error") {
+    return `error:${terminalEvent.errorCode || "unknown"}`;
+  }
+  if (finalStatus === "aborted") return `aborted:${abortReason ?? "user"}`;
+  if (completionError) return "completion_error";
+  if (finalStatus === "errored") return "error:unknown";
+  return "done";
+}
+
+function emitRunBoundaryTrackingEvent(args: {
+  runId: string;
+  threadId: string;
+  reason: string;
+  recovered: boolean;
+  boundaryIndex: number;
+  dispatchMode?: string;
+  model?: string;
+  engineName?: string;
+  userId?: string;
+}): void {
+  const properties: Record<string, unknown> = {
+    source: "agent_run_manager",
+    run_id: args.runId,
+    thread_id: args.threadId,
+    reason: args.reason,
+    recovered: args.recovered,
+    boundary_index: args.boundaryIndex,
+    dispatch_mode: args.dispatchMode,
+    model: args.model,
+    engine: args.engineName,
+  };
+  for (const key of Object.keys(properties)) {
+    if (properties[key] === undefined) delete properties[key];
+  }
+  try {
+    void Promise.all([
+      import("../tracking/registry.js"),
+      import("../observability/tracking-identity.js"),
+    ])
+      .then(([{ track }, { trackingIdentityProperties }]) => {
+        track(
+          "agent_run_boundary",
+          { ...properties, ...trackingIdentityProperties() },
+          { userId: args.userId },
+        );
+      })
+      .catch(() => {});
+    // coercion-ok: a boundary counter must never affect the run it counts.
+  } catch {
+    // Tracking must never affect the agent run or its persisted status.
+  }
+}
+
+function emitRunTerminalTrackingEvent(args: {
+  runId: string;
+  threadId: string;
+  turnId: string;
+  status: "completed" | "errored" | "aborted" | "truncated";
+  terminalReason: string;
+  errorCode?: string;
+  dispatchMode?: string;
+  abortReason?: string;
+  durationMs: number;
+  model?: string;
+  engineName?: string;
+  userId?: string;
+  attemptCount?: number;
+}): void {
+  try {
+    recordAgentRun({
+      status: args.status,
+      terminalReason: args.terminalReason,
+      requestModel: args.model,
+      providerName: args.engineName,
+      supportedModels: args.engineName
+        ? getAgentEngineEntry(args.engineName)?.supportedModels
+        : undefined,
+    });
+    // coercion-ok: metrics must never affect the agent run or its status.
+  } catch {
+    // Metrics must never affect the agent run or its persisted status.
+  }
+  const properties: Record<string, unknown> = {
+    source: "agent_run_manager",
+    run_id: args.runId,
+    thread_id: args.threadId,
+    turn_id: args.turnId,
+    status: args.status,
+    terminal_reason: args.terminalReason,
+    error_code: args.errorCode,
+    ...(args.errorCode ? runErrorTelemetryProperties(args.errorCode) : {}),
+    dispatch_mode: args.dispatchMode,
+    abort_reason: args.abortReason,
+    duration_ms: args.durationMs,
+    model: args.model,
+    engine: args.engineName,
+    attempt_count: args.attemptCount,
+  };
+  for (const key of Object.keys(properties)) {
+    if (properties[key] === undefined) delete properties[key];
+  }
+
+  try {
+    void Promise.all([
+      import("../tracking/registry.js"),
+      import("../observability/tracking-identity.js"),
+    ])
+      .then(([{ track }, { trackingIdentityProperties }]) => {
+        track(
+          "agent_run_terminal",
+          { ...properties, ...trackingIdentityProperties() },
+          { userId: args.userId },
+        );
+      })
+      .catch(() => {});
+  } catch {
+    // Tracking must never affect the agent run or its persisted status.
+  }
+}
+
 function abortInMemoryRun(run: ActiveRun, reason: string = "user") {
   run.abortReason = reason;
   run.status = "aborted";
@@ -192,9 +674,19 @@ function abortInMemoryRun(run: ActiveRun, reason: string = "user") {
     threadToRun.delete(run.threadId);
   }
   run.abort.abort(reason);
+  const existingTerminalEvent = [...run.events]
+    .reverse()
+    .find((event) => isTerminalRunEvent(event.event));
+  const terminalRunEvent = existingTerminalEvent ?? {
+    seq: run.events.length,
+    event: terminalEventForAbortReason(reason),
+  };
+  if (!existingTerminalEvent) {
+    run.events.push(terminalRunEvent);
+  }
   for (const subscriber of run.subscribers) {
     try {
-      subscriber({ seq: run.events.length, event: { type: "done" } });
+      subscriber(terminalRunEvent);
     } catch {
       // ignore — subscriber is being removed below
     }
@@ -202,76 +694,554 @@ function abortInMemoryRun(run: ActiveRun, reason: string = "user") {
   run.subscribers.clear();
 }
 
-/**
- * Start a new agent run in the background.
- * `runFn` receives a `send` callback and an `AbortSignal`.
- * The run continues even if all SSE subscribers disconnect.
- *
- * Events are persisted to SQL for cross-isolate access (Cloudflare Workers).
- */
 export function startRun(
   runId: string,
   threadId: string,
   runFn: (
     send: (event: AgentChatEvent) => void,
     signal: AbortSignal,
+    control: RunChunkControl,
   ) => Promise<void>,
   onComplete?: (run: ActiveRun) => void | Promise<void>,
   options?: StartRunOptions,
-): ActiveRun {
-  // If there's already a run for this thread, abort it
+): StartedRun {
   const existingRunId = threadToRun.get(threadId);
   if (existingRunId) {
     abortRun(existingRunId);
   }
 
   const abort = new AbortController();
+  const recoverChunkBoundaries = options?.recoverChunkBoundaries === true;
+  let chunkAbort: AbortController | null = recoverChunkBoundaries
+    ? new AbortController()
+    : null;
+  let chunkBoundaryReason: string | null = null;
+  let chunkSoftTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  let armChunkSoftTimeout: () => void = () => {};
+  let recoverableRunDeadlineAt: number | null = null;
+  let recoveredChunkBoundaries = 0;
+  let pendingBoundary: {
+    reason: "no_progress" | "run_timeout";
+    diagnostic: { silentForMs?: number; lastEventType?: string };
+    index: number;
+  } | null = null;
+  const settleBoundary = (recovered: boolean) => {
+    const boundary = pendingBoundary;
+    if (!boundary) return;
+    pendingBoundary = null;
+    recordRunBoundaryDiagnostic(
+      boundary.reason,
+      boundary.diagnostic,
+      recovered ? "recovered" : "terminal",
+    );
+    emitRunBoundaryTrackingEvent({
+      runId,
+      threadId,
+      reason: boundary.reason,
+      recovered,
+      boundaryIndex: boundary.index,
+      dispatchMode: options?.dispatchMode,
+      model: options?.model,
+      engineName: options?.engineName,
+      userId: options?.userId,
+    });
+  };
+  if (chunkAbort) {
+    abort.signal.addEventListener("abort", () => {
+      chunkAbort?.abort(abort.signal.reason);
+    });
+  }
+  const runControl: RunChunkControl = {
+    flushEvents: () => persistenceChain,
+    get turnSignal() {
+      return abort.signal;
+    },
+    get chunkSignal() {
+      return chunkAbort?.signal ?? abort.signal;
+    },
+    chunkBoundaryReason: () => chunkBoundaryReason,
+    beginChunk: () => {
+      if (abort.signal.aborted || !chunkAbort) return abort.signal;
+      settleBoundary(true);
+      chunkBoundaryReason = null;
+      if (chunkSoftTimeoutTimer) clearTimeout(chunkSoftTimeoutTimer);
+      chunkAbort = new AbortController();
+      armChunkSoftTimeout();
+      lastRealProgressAt = Date.now();
+      return chunkAbort.signal;
+    },
+  };
   let softTimedOut = false;
-  const run: ActiveRun = {
+  let resolveFinalized: () => void = () => {};
+  let rejectFinalized: (reason?: unknown) => void = () => {};
+  const finalized = new Promise<void>((resolve, reject) => {
+    resolveFinalized = resolve;
+    rejectFinalized = reject;
+  });
+  void finalized.catch(() => {});
+  const run: StartedRun = {
     runId,
     threadId,
+    ...(options?.parentId !== undefined ? { parentId: options.parentId } : {}),
     turnId: options?.turnId ?? runId,
+    ...(options?.agentKitApprovalContinuation
+      ? { agentKitApprovalContinuation: true }
+      : {}),
     events: [],
     status: "running",
     subscribers: new Set(),
     abort,
     startedAt: Date.now(),
+    finalized,
   };
 
   activeRuns.set(runId, run);
   threadToRun.set(threadId, runId);
 
+  const captureRunPersistenceError = (
+    error: unknown,
+    phase: "insert-run" | "insert-event",
+    extra: Record<string, unknown> = {},
+  ) => {
+    captureError(error, {
+      route: "/_agent-native/agent-chat",
+      aiTraceId: runId,
+      tags: {
+        source: "agent-run-manager",
+        phase,
+        runStatus: run.status,
+      },
+      extra: {
+        runId,
+        threadId,
+        eventCount: run.events.length,
+        startedAt: run.startedAt,
+        ...extra,
+      },
+      contexts: {
+        agentRun: {
+          runId,
+          threadId,
+          status: run.status,
+          phase,
+          eventCount: run.events.length,
+          startedAt: run.startedAt,
+        },
+      },
+    });
+  };
+
   // Persist run to SQL without blocking the response. Keep the promise so
   // final status cannot race ahead of a slow initial INSERT and then get
   // overwritten by a late row stuck at status='running'.
-  const insertRunPromise = insertRun(runId, threadId, options?.turnId).catch(
-    () => {},
+  const insertOptions =
+    options?.dispatchMode || options?.turnInitiator
+      ? {
+          ...(options?.dispatchMode
+            ? { dispatchMode: options.dispatchMode }
+            : {}),
+          ...(options?.turnInitiator
+            ? { turnInitiator: options.turnInitiator }
+            : {}),
+        }
+      : undefined;
+  const servicePrincipalRunStart = Boolean(
+    options?.turnInitiator &&
+    parseServiceIdentityEmail(options.turnInitiator.email),
   );
+  const insertRunPromise = (
+    options?.runRowAlreadyInserted && !servicePrincipalRunStart
+      ? Promise.resolve()
+      : insertOptions
+        ? insertRun(runId, threadId, options?.turnId, insertOptions)
+        : insertRun(runId, threadId, options?.turnId)
+  ).catch((error) => {
+    captureRunPersistenceError(error, "insert-run");
+    if (error instanceof ServicePrincipalRefusedError) throw error;
+  });
 
-  // Per-run event persistence chain: events are chained so SQL inserts commit
-  // in seq order. Without this, a fast seq=5 commit before a slow seq=4 means
-  // the SQL poller advances its cursor past seq=4 (lastSeq = 5+1 = 6) and
-  // reconnecting clients permanently miss that event (silent gap). Chaining
-  // per run ensures order without blocking the fast in-memory SSE path.
   let persistenceChain: Promise<void> = Promise.resolve();
+  // Streamed deltas arrive hundreds per tool call, and a write tool waits for
+  // every queued event to persist first; one round trip per event put tens of
+  // seconds between the model finishing and the tool starting.
+  let openEventBatch = null as RunEventBatch | null;
 
-  // Throttle the durable progress timestamp to at most once per second so
-  // a chatty token-by-token stream doesn't translate into one DB write per
-  // chunk. The stuck-detector threshold is on the order of tens of seconds,
-  // so 1s resolution is plenty.
+  const PROGRESS_BUMP_INTERVAL_MS = 1_000;
   let lastProgressBumpAt = 0;
+  let progressWriteInFlight: Promise<void> | null = null;
+  let progressWriteTimer: ReturnType<typeof setTimeout> | null = null;
+  let progressWritePending = false;
+  let progressWriteAttempts = 0;
+  let progressWriteFailures = 0;
+  let consecutiveProgressWriteFailures = 0;
+  const preparingActivityBytes = new Map<string, number>();
+  const preparingActivityTools = new Map<string, string>();
+  const preparingActivityRestartHighWater = new Map<string, number>();
+  let eventPersistenceErrorCaptured = false;
+  const recordProgressWriteFailure = (error: unknown, kind: string) => {
+    progressWriteFailures += 1;
+    consecutiveProgressWriteFailures += 1;
+    if (progressWriteFailures === 1 || progressWriteFailures % 10 === 0) {
+      const capturedError =
+        error instanceof Error ? error : new Error(String(error));
+      console.error(
+        `[run-manager] durable progress write ${kind} failed`,
+        runId,
+        {
+          attempts: progressWriteAttempts,
+          failures: progressWriteFailures,
+          consecutiveFailures: consecutiveProgressWriteFailures,
+          eventCount: run.events.length,
+        },
+        capturedError,
+      );
+      captureError(capturedError, {
+        route: "/_agent-native/agent-chat",
+        tags: {
+          source: "agent-run-manager",
+          phase: "progress",
+          kind,
+          consecutiveFailures: String(consecutiveProgressWriteFailures),
+        },
+        aiTraceId: runId,
+        extra: {
+          runId,
+          threadId,
+          attempts: progressWriteAttempts,
+          failures: progressWriteFailures,
+          eventCount: run.events.length,
+        },
+      });
+    }
+  };
+  const writeProgress = async (): Promise<void> => {
+    let updated = await bumpRunProgress(runId);
+    if (updated === false) {
+      await insertRunPromise;
+      updated = await bumpRunProgress(runId);
+    }
+    if (updated === false) {
+      if (run.status !== "running") return;
+      const persistedStatus = await getRunStatus(runId);
+      if (run.status !== "running") return;
+      if (persistedStatus !== null && persistedStatus !== "running") {
+        abortInMemoryRun(run, "displaced");
+        return;
+      }
+      recordProgressWriteFailure(
+        new Error("Durable progress update affected no running run row"),
+        "no-row",
+      );
+      progressWritePending = true;
+      return;
+    }
+    consecutiveProgressWriteFailures = 0;
+  };
+  function startProgressWrite(): void {
+    if (
+      !progressWritePending ||
+      progressWriteInFlight ||
+      run.status !== "running"
+    ) {
+      return;
+    }
+    progressWritePending = false;
+    lastProgressBumpAt = Date.now();
+    progressWriteAttempts += 1;
+    const write = writeProgress()
+      .catch((error: unknown) => {
+        recordProgressWriteFailure(error, "error");
+        progressWritePending = true;
+      })
+      .finally(() => {
+        progressWriteInFlight = null;
+        scheduleProgressWrite();
+      });
+    progressWriteInFlight = write;
+  }
+  function scheduleProgressWrite(): void {
+    if (
+      !progressWritePending ||
+      progressWriteInFlight ||
+      progressWriteTimer ||
+      run.status !== "running"
+    ) {
+      return;
+    }
+    const delayMs = Math.max(
+      0,
+      lastProgressBumpAt + PROGRESS_BUMP_INTERVAL_MS - Date.now(),
+    );
+    if (delayMs === 0) {
+      startProgressWrite();
+      return;
+    }
+    progressWriteTimer = setTimeout(() => {
+      progressWriteTimer = null;
+      startProgressWrite();
+    }, delayMs);
+  }
   const bumpProgressIfDue = () => {
-    const now = Date.now();
-    if (now - lastProgressBumpAt < 1000) return;
-    lastProgressBumpAt = now;
-    bumpRunProgress(runId).catch(() => {});
+    progressWritePending = true;
+    scheduleProgressWrite();
+  };
+  const shouldBumpProgressForEvent = (event: AgentChatEvent): boolean => {
+    if (event.type === "stream_keepalive") return false;
+    if (event.type === "clear") {
+      for (const [key, bytes] of preparingActivityBytes) {
+        const toolKey = preparingActivityTools.get(key) ?? key;
+        preparingActivityRestartHighWater.set(
+          toolKey,
+          Math.max(preparingActivityRestartHighWater.get(toolKey) ?? 0, bytes),
+        );
+      }
+      preparingActivityBytes.clear();
+      preparingActivityTools.clear();
+      return false;
+    }
+    if (event.type === "activity" && isPreparingActionActivityEvent(event)) {
+      const toolKey = event.tool?.trim() || event.label.trim();
+      const activityKey = `${toolKey}:${event.id?.trim() || "no-id"}`;
+      const progressBytes =
+        typeof event.progressBytes === "number" &&
+        Number.isFinite(event.progressBytes) &&
+        event.progressBytes >= 0
+          ? Math.floor(event.progressBytes)
+          : undefined;
+      if (progressBytes === undefined) return false;
+      const restartHighWater =
+        preparingActivityRestartHighWater.get(toolKey) ?? 0;
+      if (!event.id?.trim()) {
+        if (progressBytes <= restartHighWater) return false;
+        preparingActivityTools.set(activityKey, toolKey);
+        preparingActivityBytes.set(
+          activityKey,
+          Math.max(preparingActivityBytes.get(activityKey) ?? 0, progressBytes),
+        );
+        if (preparingActivityRestartHighWater.has(toolKey)) {
+          preparingActivityRestartHighWater.set(
+            toolKey,
+            Math.max(restartHighWater, progressBytes),
+          );
+        }
+        return progressBytes > 0;
+      }
+      const previousBytes = Math.max(
+        preparingActivityBytes.get(activityKey) ?? 0,
+        restartHighWater,
+      );
+      if (
+        !preparingActivityBytes.has(activityKey) &&
+        progressBytes === 0 &&
+        !preparingActivityRestartHighWater.has(toolKey)
+      ) {
+        preparingActivityTools.set(activityKey, toolKey);
+        preparingActivityBytes.set(activityKey, 0);
+        preparingActivityRestartHighWater.set(toolKey, 0);
+        return true;
+      }
+      if (progressBytes <= previousBytes) {
+        preparingActivityTools.set(activityKey, toolKey);
+        preparingActivityBytes.set(
+          activityKey,
+          Math.max(previousBytes, progressBytes),
+        );
+        return false;
+      }
+      preparingActivityTools.set(activityKey, toolKey);
+      preparingActivityBytes.set(activityKey, progressBytes);
+      if (preparingActivityRestartHighWater.has(toolKey)) {
+        preparingActivityRestartHighWater.set(
+          toolKey,
+          Math.max(
+            preparingActivityRestartHighWater.get(toolKey) ?? 0,
+            progressBytes,
+          ),
+        );
+      }
+      return true;
+    }
+    if (event.type === "tool_start" || event.type === "tool_done") {
+      preparingActivityBytes.clear();
+      preparingActivityTools.clear();
+      preparingActivityRestartHighWater.clear();
+    }
+    if (event.type === "done" || event.type === "error") {
+      preparingActivityBytes.clear();
+      preparingActivityTools.clear();
+      preparingActivityRestartHighWater.clear();
+    }
+    return true;
   };
 
-  // Periodic SQL abort check interval (for cross-isolate abort on Workers).
-  // Also self-aborts when our row is no longer status='running' — catches the
-  // false-stale-reap zombie scenario where the reaper flipped the row while
-  // this isolate was briefly unable to heartbeat (DB latency / GC pause).
+  let lastRealProgressAt = Date.now();
+  let inFlightWorkCount = 0;
+  let inFlightMarkerSince: number | null = null;
+  let inFlightMarkerWrite = Promise.resolve();
+  const mirrorInFlightMarker = (inFlight: boolean) => {
+    const markerSince = inFlight ? Date.now() : inFlightMarkerSince;
+    if (inFlight) {
+      inFlightMarkerSince = markerSince;
+    } else {
+      inFlightMarkerSince = null;
+    }
+    inFlightMarkerWrite = inFlightMarkerWrite
+      .catch(() => undefined)
+      .then(() =>
+        setRunInFlightMarker(runId, inFlight, markerSince ?? undefined),
+      )
+      .catch((error: unknown) => {
+        console.error(
+          `[run-manager] failed to mirror in-flight marker (${inFlight ? "set" : "clear"})`,
+          runId,
+          error instanceof Error ? error.message : error,
+        );
+      });
+  };
+  const trackInFlightWork = (event: AgentChatEvent) => {
+    const delta = inFlightWorkDelta(event);
+    if (delta === 0) return;
+    const wasIdle = inFlightWorkCount === 0;
+    inFlightWorkCount = Math.max(0, inFlightWorkCount + delta);
+    if (wasIdle && inFlightWorkCount > 0) {
+      mirrorInFlightMarker(true);
+    } else if (!wasIdle && inFlightWorkCount === 0) {
+      mirrorInFlightMarker(false);
+    }
+  };
+  let checkpointAbortInFlight = false;
+  const checkpointRunBoundary = async (
+    event: AgentChatEvent,
+    terminalReason: string,
+  ): Promise<void> => {
+    if (
+      checkpointAbortInFlight ||
+      run.status !== "running" ||
+      abort.signal.aborted
+    )
+      return;
+    checkpointAbortInFlight = true;
+    try {
+      await persistRunCheckpointEvent(runId, event, terminalReason);
+    } catch {
+      // The abort still has to happen if the checkpoint write is rejected; the
+      // caller has already reached a server-owned chunk boundary.
+    } finally {
+      abort.abort(terminalReason);
+      checkpointAbortInFlight = false;
+    }
+  };
+
+  const recordRunBoundaryDiagnostic = (
+    reason: string,
+    diagnostic: { silentForMs?: number; lastEventType?: string },
+    disposition: "recovered" | "terminal",
+  ) => {
+    if (getCurrentRequestDbPoolScope()?.closing) return;
+    void retainRequestDbPoolScope(
+      recordRunDiagnostic(
+        runId,
+        RUN_DIAG_STAGE.runBoundaryReached,
+        JSON.stringify({
+          reason,
+          disposition,
+          silentForMs: diagnostic.silentForMs,
+          lastEventType: diagnostic.lastEventType,
+          inFlightWorkCount,
+          eventCount: run.events.length,
+          elapsedMs: Date.now() - run.startedAt,
+        }),
+        // coercion-ok: recordRunDiagnostic already swallows its own failures;
+        // this guards only against an unhandled rejection.
+      ).catch(() => {}),
+    ).catch(() => {});
+  };
+
+  const reachRunBoundary = (
+    reason: "no_progress" | "run_timeout",
+    diagnostic: { silentForMs?: number; lastEventType?: string } = {},
+  ) => {
+    if (run.status !== "running" || abort.signal.aborted) return;
+    const activeChunkAbort = chunkAbort;
+    const canRecoverChunk =
+      activeChunkAbort !== null &&
+      (recoverableRunDeadlineAt === null ||
+        Date.now() < recoverableRunDeadlineAt);
+    if (canRecoverChunk) {
+      if (activeChunkAbort.signal.aborted) return;
+      recoveredChunkBoundaries += 1;
+      console.warn(
+        `[run-manager] chunk boundary (${reason}) — recovering in-invocation`,
+        runId,
+        diagnostic,
+      );
+      pendingBoundary = { reason, diagnostic, index: recoveredChunkBoundaries };
+      chunkBoundaryReason = reason;
+      activeChunkAbort.abort(reason);
+      return;
+    }
+    if (chunkAbort) chunkBoundaryReason = reason;
+    softTimedOut = true;
+    recordRunBoundaryDiagnostic(reason, diagnostic, "terminal");
+    emitRunBoundaryTrackingEvent({
+      runId,
+      threadId,
+      reason,
+      recovered: false,
+      boundaryIndex: recoveredChunkBoundaries + 1,
+      dispatchMode: options?.dispatchMode,
+      model: options?.model,
+      engineName: options?.engineName,
+      userId: options?.userId,
+    });
+    const event: AgentChatEvent = { type: "auto_continue", reason };
+    send(event);
+    void checkpointRunBoundary(event, reason);
+  };
+
+  const checkNoProgressBackstop = () => {
+    if (noProgressTimeoutMs <= 0) return;
+    if (run.status !== "running" || abort.signal.aborted) return;
+    if (inFlightWorkCount > 0) return;
+    const silentForMs = Date.now() - lastRealProgressAt;
+    if (silentForMs < noProgressTimeoutMs) return;
+    const lastEventType = run.events.at(-1)?.event.type;
+    if (!chunkAbort) {
+      console.error(
+        `[run-manager] no real progress for ${noProgressTimeoutMs}ms with no tool ` +
+          `or model stream in flight — ` +
+          `checkpointing run for continuation`,
+        runId,
+      );
+      captureError(
+        new Error(
+          `Agent run checkpointed after ${silentForMs}ms of silence (no_progress)`,
+        ),
+        {
+          route: "/_agent-native/agent-chat",
+          aiTraceId: runId,
+          tags: {
+            source: "agent-run-manager",
+            phase: "no-progress-backstop",
+            terminalReason: "no_progress",
+            lastEventType,
+          },
+          extra: {
+            runId,
+            threadId,
+            silentForMs,
+            noProgressTimeoutMs,
+            lastEventType,
+            eventCount: run.events.length,
+          },
+        },
+      );
+    }
+    reachRunBoundary("no_progress", { silentForMs, lastEventType });
+  };
+
   let lastAbortCheck = Date.now() - 3000;
+  let consecutiveAbortCheckFailures = 0;
   const checkSqlAbort = () => {
     const now = Date.now();
     if (now - lastAbortCheck < 3000) return;
@@ -282,9 +1252,6 @@ export function startRun(
           abortInMemoryRun(run, state.reason ?? "user");
           return;
         }
-        // If the row is no longer 'running' (reaped / replaced) and we're
-        // still executing, self-abort so we stop executing and don't overwrite
-        // the newer state with our terminal write.
         if (!abort.signal.aborted) {
           const status = await getRunStatus(runId);
           if (status !== null && status !== "running") {
@@ -292,44 +1259,122 @@ export function startRun(
           }
         }
       })
-      .catch(() => {});
+      .then(() => {
+        consecutiveAbortCheckFailures = 0;
+      })
+      .catch((error) => {
+        consecutiveAbortCheckFailures += 1;
+        if (
+          consecutiveAbortCheckFailures === 3 ||
+          consecutiveAbortCheckFailures % 20 === 0
+        ) {
+          captureError(error, {
+            route: "/_agent-native/agent-chat",
+            tags: {
+              source: "agent-run-manager",
+              phase: "abort-check",
+              consecutiveFailures: String(consecutiveAbortCheckFailures),
+            },
+            aiTraceId: runId,
+            extra: {
+              runId,
+              threadId,
+              unreadableForMs: consecutiveAbortCheckFailures * 3000,
+            },
+          });
+        }
+      });
   };
 
-  // Heartbeat: bump heartbeat_at every 1.5s so watchers can detect a dead
-  // producer (process crash, HMR restart, isolate eviction) quickly and
-  // reap the row. Paired with RUN_STALE_MS (6s) — 4x the interval to
-  // tolerate transient DB slowness without false positives.
+  let consecutiveHeartbeatFailures = 0;
+  let heartbeatInFlight = false;
   const heartbeatTimer: ReturnType<typeof setInterval> = setInterval(() => {
-    updateRunHeartbeat(runId).catch(() => {});
+    if (!heartbeatInFlight) {
+      heartbeatInFlight = true;
+      updateRunHeartbeat(runId)
+        .then(() => {
+          consecutiveHeartbeatFailures = 0;
+        })
+        .catch((error) => {
+          consecutiveHeartbeatFailures += 1;
+          if (consecutiveHeartbeatFailures >= 3) {
+            captureError(error, {
+              route: "/_agent-native/agent-chat",
+              tags: {
+                source: "agent-run-manager",
+                phase: "heartbeat",
+                consecutiveFailures: String(consecutiveHeartbeatFailures),
+              },
+              aiTraceId: runId,
+              extra: { runId, threadId },
+            });
+          }
+        })
+        .finally(() => {
+          heartbeatInFlight = false;
+        });
+    }
     checkSqlAbort();
+    checkNoProgressBackstop();
   }, 1500);
   const softTimeoutMs = resolveRunSoftTimeoutMs(options?.softTimeoutMs, {
     useHostedDefault: options?.useHostedSoftTimeoutDefault === true,
+    backgroundFunction: options?.backgroundFunction === true,
+  });
+  const noProgressTimeoutMs = resolveRunNoProgressTimeoutMs({
+    softTimeoutMs,
+    backgroundFunction: options?.backgroundFunction === true,
+    overrideMs: options?.noProgressTimeoutMs,
+    backgroundOverrideMs: options?.backgroundNoProgressTimeoutMs,
   });
   const softTimeoutTimer =
-    softTimeoutMs > 0
+    softTimeoutMs > 0 && !recoverChunkBoundaries
       ? setTimeout(() => {
-          if (run.status !== "running" || abort.signal.aborted) return;
-          softTimedOut = true;
-          send({
-            type: "auto_continue",
-            reason: "run_timeout",
+          reachRunBoundary("run_timeout", {
+            lastEventType: run.events.at(-1)?.event.type,
           });
-          abort.abort();
         }, softTimeoutMs)
       : null;
+  if (recoverChunkBoundaries && softTimeoutMs > 0) {
+    const runDeadlineAt = Date.now() + softTimeoutMs;
+    recoverableRunDeadlineAt = runDeadlineAt;
+    armChunkSoftTimeout = () => {
+      if (chunkSoftTimeoutTimer) clearTimeout(chunkSoftTimeoutTimer);
+      if (abort.signal.aborted || run.status !== "running") return;
+      chunkSoftTimeoutTimer = setTimeout(
+        () => {
+          chunkSoftTimeoutTimer = null;
+          reachRunBoundary("run_timeout", {
+            lastEventType: run.events.at(-1)?.event.type,
+          });
+        },
+        Math.max(0, runDeadlineAt - Date.now()),
+      );
+    };
+    armChunkSoftTimeout();
+  }
   let pendingTerminalEvent: RunEvent | null = null;
 
   const captureRunError = (error: unknown, phase: "run" | "completion") => {
+    const errorCode = getRunErrorCode(error);
+    const engineError = error instanceof EngineError ? error : null;
     captureError(error, {
       route: "/_agent-native/agent-chat",
+      aiTraceId: runId,
+      errorMessagePolicy: "omit",
       tags: {
         source: "agent-run-manager",
         phase,
         runStatus: run.status,
         softTimedOut: softTimedOut ? "true" : "false",
         abortReason: run.abortReason,
-        errorCode: error instanceof EngineError ? error.errorCode : undefined,
+        errorCode,
+        gatewayRequestId: engineError?.requestId,
+        statusCode:
+          engineError?.statusCode != null
+            ? String(engineError.statusCode)
+            : undefined,
+        ...engineRequestShapeTags(engineError?.requestShape),
       },
       extra: {
         runId,
@@ -354,13 +1399,42 @@ export function startRun(
     });
   };
 
+  const persistEventHook = options?.persistEvent;
+  const persistRunEvent = async (
+    runEvent: RunEvent,
+    eventData: string,
+    eventAt: number,
+  ): Promise<void> => {
+    if (runEvent.event.type === "tool_start") await insertRunPromise;
+    const write = () =>
+      runEvent.event.type === "tool_start" ||
+      runEvent.event.type === "tool_done"
+        ? insertRunEvent(runId, runEvent.seq, eventData, {
+            eventAt,
+            toolInputSource: "execution",
+            ...(runEvent.event.type === "tool_start"
+              ? { requireInserted: true }
+              : {}),
+          })
+        : insertRunEvent(runId, runEvent.seq, eventData, { eventAt });
+    return options?.persistEvent
+      ? options.persistEvent(write, {
+          terminal: isTerminalRunEvent(runEvent.event),
+          runId,
+          seq: runEvent.seq,
+          eventData,
+        })
+      : write();
+  };
+
   const emitRunEvent = (
     runEvent: RunEvent,
     options?: { surfacePersistenceError?: boolean },
   ): Promise<void> => {
+    const eventData = JSON.stringify(runEvent.event);
+    const eventAt = Date.now();
     run.events.push(runEvent);
 
-    // Notify in-memory subscribers (same isolate, fast path)
     for (const subscriber of run.subscribers) {
       try {
         subscriber(runEvent);
@@ -369,22 +1443,53 @@ export function startRun(
       }
     }
 
-    // Bump the durable progress timestamp. Distinct from the heartbeat:
-    // heartbeat = "process is up", progress = "real work is happening." The
-    // gap between them is what the client-side stuck-detector reads to tell
-    // a hung run from a healthy one.
-    bumpProgressIfDue();
+    trackInFlightWork(runEvent.event);
+    if (shouldBumpProgressForEvent(runEvent.event)) {
+      lastRealProgressAt = Date.now();
+      bumpProgressIfDue();
+    }
 
-    // Persist event to SQL. Events are chained through persistenceChain so
-    // inserts commit in seq order — an out-of-order commit would advance the
-    // SQL poller's cursor past the slow row, permanently dropping it for
-    // reconnecting clients. Terminal events surface persistence errors so the
-    // caller can decide how to handle a failed final write.
-    const thisInsert = persistenceChain.then(() =>
-      insertRunEvent(runId, runEvent.seq, JSON.stringify(runEvent.event)),
-    );
-    persistenceChain = thisInsert.catch(() => {});
-    const persistence = thisInsert;
+    const retryOnce = async (write: () => Promise<void>) => {
+      try {
+        await write();
+      } catch (error) {
+        if (!eventPersistenceErrorCaptured) {
+          eventPersistenceErrorCaptured = true;
+          captureRunPersistenceError(error, "insert-event", {
+            seq: runEvent.seq,
+            eventType: runEvent.event.type,
+          });
+        }
+        await write();
+      }
+    };
+    let persistence: Promise<void>;
+    if (isBatchableRunEvent(runEvent.event) && !persistEventHook) {
+      if (!openEventBatch) {
+        const batch: RunEventBatch = {
+          events: [],
+          write: persistenceChain.then(() => {
+            if (openEventBatch === batch) openEventBatch = null;
+            return retryOnce(() => insertRunEvents(runId, batch.events));
+          }),
+        };
+        openEventBatch = batch;
+        persistenceChain = batch.write;
+      }
+      openEventBatch.events.push({
+        seq: runEvent.seq,
+        eventAt,
+        eventData,
+      });
+      persistence = openEventBatch.write;
+    } else {
+      // Anything emitted after this event must not persist before it.
+      openEventBatch = null;
+      persistence = persistenceChain.then(() =>
+        retryOnce(() => persistRunEvent(runEvent, eventData, eventAt)),
+      );
+      persistenceChain = persistence;
+    }
     if (!options?.surfacePersistenceError) {
       persistence.catch(() => {});
     }
@@ -396,18 +1501,34 @@ export function startRun(
   const send = (event: AgentChatEvent) => {
     if (run.status === "aborted" && abort.signal.aborted) return;
 
-    const runEvent: RunEvent = { seq: run.events.length, event };
+    // Explicit false distinguishes current completions from legacy pauses.
+    const normalizedEvent =
+      event.type === "tool_done" && event.approvalPause === undefined
+        ? { ...event, approvalPause: false }
+        : event;
+    const runEvent: RunEvent = {
+      seq: run.events.length,
+      event: normalizedEvent,
+    };
     if (isTerminalRunEvent(event)) {
       pendingTerminalEvent = runEvent;
       return;
     }
 
-    emitRunEvent(runEvent);
+    void emitRunEvent(runEvent);
   };
 
-  // Run in background — intentionally detached from any HTTP connection
-  const runPromise = runFn(send, abort.signal)
+  const runPromise = (
+    servicePrincipalRunStart
+      ? insertRunPromise.then(() => {
+          if (!abort.signal.aborted) {
+            return runFn(send, runControl.chunkSignal, runControl);
+          }
+        })
+      : runFn(send, runControl.chunkSignal, runControl)
+  )
     .then(() => {
+      settleBoundary(false);
       if (abort.signal.aborted) {
         run.status = softTimedOut ? "completed" : "aborted";
         return;
@@ -415,46 +1536,90 @@ export function startRun(
       run.status = "completed";
     })
     .catch((err) => {
-      // Don't surface abort errors — the run was intentionally stopped
+      settleBoundary(false);
       if (abort.signal.aborted) {
         run.status = softTimedOut ? "completed" : "aborted";
         return;
       }
       run.status = "errored";
-      captureRunError(err, "run");
+      if (shouldCaptureRunError(err)) {
+        captureRunError(err, "run");
+      }
+      const errorMessage = getRunErrorMessage(err);
+      const errorCode = getRunErrorCode(err);
+      const details =
+        err instanceof EngineError ? getEngineRunErrorDetails(err) : undefined;
       send({
         type: "error",
-        error: err?.message ?? "Unknown error",
-        ...(err instanceof EngineError && err.errorCode
-          ? { errorCode: err.errorCode }
-          : {}),
+        error: errorMessage,
+        ...(errorCode ? { errorCode } : {}),
+        ...(details ? { details } : {}),
         ...(err instanceof EngineError && err.upgradeUrl
           ? { upgradeUrl: err.upgradeUrl }
+          : {}),
+        ...(err instanceof EngineError && err.providerRetryable !== undefined
+          ? { providerRetryable: err.providerRetryable }
+          : {}),
+        ...(err instanceof EngineError && err.contextOverflow === true
+          ? { contextOverflow: true }
           : {}),
       });
     })
     .finally(async () => {
-      // Ordering matters here — this is the atomic-complete boundary.
-      // Invariant: once agent_runs.status flips to "completed"/"errored"
-      // in SQL, thread_data for this turn is already durable. This lets
-      // reconnecting clients trust the simple rule "status != running →
-      // fetch thread_data" without polling/retrying for a race window
-      // where onComplete was still pending.
-
-      // 1. Await the completion callback (thread_data save). Heartbeat is
-      //    still ticking so the run doesn't look stale to any concurrent
-      //    /runs/active check while we wait for SQL writes to land.
       let completionError: unknown = null;
       let terminalPersistenceError: unknown = null;
-      if (
-        onComplete &&
-        !(run.status === "aborted" && run.abortReason === "no_progress")
-      ) {
+      let eventPersistenceError: unknown = null;
+      let runTerminalErrorCode: string | undefined;
+      let terminalPersistenceEstablished = false;
+      try {
+        await persistenceChain;
+      } catch (error) {
+        eventPersistenceError = error;
+        if (run.status !== "aborted") {
+          run.status = "errored";
+          pendingTerminalEvent = {
+            seq: run.events.length,
+            event: {
+              type: "error",
+              error: "Agent run ended unexpectedly",
+              errorCode: "run_event_persistence_failed",
+            },
+          };
+        }
+      }
+      const resolveTerminalEventForCompletion = () => {
+        if (run.status === "aborted") return null;
+        if (eventPersistenceError) return pendingTerminalEvent;
+        const continuationTerminalEvent = run.continuationTerminalEvent
+          ? {
+              seq: run.events.length,
+              event: run.continuationTerminalEvent,
+            }
+          : null;
+        return continuationTerminalEvent ?? pendingTerminalEvent;
+      };
+      let terminalEventForCompletion = resolveTerminalEventForCompletion();
+      let terminalEvent = terminalEventForCompletion?.event ?? null;
+      if (onComplete) {
         try {
-          const completionRun: ActiveRun = pendingTerminalEvent
-            ? { ...run, events: [...run.events, pendingTerminalEvent] }
-            : run;
+          const completionStatus =
+            run.status !== "aborted" &&
+            terminalEventForcesErroredStatus(terminalEvent)
+              ? "errored"
+              : run.status;
+          const completionRun: ActiveRun =
+            terminalEventForCompletion || completionStatus !== run.status
+              ? {
+                  ...run,
+                  status: completionStatus,
+                  events: terminalEventForCompletion
+                    ? [...run.events, terminalEventForCompletion]
+                    : run.events,
+                }
+              : run;
           await onComplete(completionRun);
+          run.continuationTerminalEvent ??=
+            completionRun.continuationTerminalEvent;
         } catch (err) {
           completionError = err;
           captureRunError(err, "completion");
@@ -465,45 +1630,66 @@ export function startRun(
         }
       }
 
-      // 2. Compute final status. If the completion callback threw, we'd
-      //    rather mark the run errored than claim success with incomplete
-      //    thread_data.
+      terminalEventForCompletion = resolveTerminalEventForCompletion();
+      terminalEvent = terminalEventForCompletion?.event ?? null;
+
       const finalStatus =
         run.status === "aborted"
           ? "aborted"
-          : run.status === "errored" || completionError
+          : run.status === "errored" ||
+              completionError ||
+              terminalEventForcesErroredStatus(terminalEvent)
             ? "errored"
             : "completed";
+      run.status = finalStatus;
+      const shouldAutoContinueAfterUnfinishedTurn =
+        finalStatus === "completed" &&
+        (endsAfterToolResultWithoutAssistantFinal(run) ||
+          endsDuringActionPreparation(run)) &&
+        (!terminalEventForCompletion ||
+          (terminalEventForCompletion.event.type === "done" &&
+            terminalEventForCompletion.event.reason !== "user"));
+      const unfinishedTurnContinuationEvent =
+        shouldAutoContinueAfterUnfinishedTurn
+          ? ({
+              type: "auto_continue" as const,
+              reason: "stream_ended" as const,
+            } satisfies Extract<AgentChatEvent, { type: "auto_continue" }>)
+          : null;
+      if (unfinishedTurnContinuationEvent) {
+        terminalEvent = unfinishedTurnContinuationEvent;
+      }
+      const terminalReason =
+        eventPersistenceError && finalStatus !== "aborted"
+          ? "error:run_event_persistence_failed"
+          : terminalReasonForRun(
+              finalStatus,
+              terminalEvent,
+              run.abortReason,
+              completionError,
+            );
+      const persistedStatus =
+        finalStatus === "completed" &&
+        isContinuationTerminalReason(terminalReason)
+          ? "truncated"
+          : finalStatus;
 
-      // 3. Emit the terminal event only after thread_data is durable. Live
-      //    SSE clients close on this event and usually fetch thread_data
-      //    immediately, so emitting it earlier recreates the final-message
-      //    race this manager is meant to avoid.
       if (finalStatus === "completed" || finalStatus === "errored") {
-        // Choose the terminal event payload (done / the stashed terminal /
-        // a synthesized error). NOTE: the `seq` carried by
-        // `pendingTerminalEvent` was captured by `send()` at stash time as
-        // `run.events.length` and is NOT authoritative — if the runFn emitted
-        // any more events before it actually stopped on the abort signal,
-        // those events were pushed and reused that same seq. Persisting the
-        // terminal event with the stale seq would collide with an
-        // already-persisted streaming event and get silently dropped by
-        // insertRunEvent's `ON CONFLICT (run_id, seq) DO NOTHING`, so the
-        // client would never see the terminal/continuation signal. We always
-        // re-stamp the seq at emit time (max-seq+1) just below.
-        const terminalEvent: AgentChatEvent =
-          finalStatus === "completed"
-            ? (pendingTerminalEvent?.event ?? { type: "done" })
-            : pendingTerminalEvent?.event.type === "error"
-              ? pendingTerminalEvent.event
-              : pendingTerminalEvent?.event.type === "auto_continue"
-                ? // The run was checkpointed at a soft-timeout/loop boundary and
-                  // is recoverable: the partial turn is in agent_run_events and
-                  // the continuation run will re-attempt the thread_data save.
-                  // Even though the completion save failed (finalStatus stays
-                  // "errored" for SQL/diagnostics), re-emit the auto_continue so
-                  // the client resumes instead of seeing a dead chat.
-                  pendingTerminalEvent.event
+        const terminalEventToEmit: AgentChatEvent = eventPersistenceError
+          ? {
+              type: "error",
+              error: "Agent run ended unexpectedly",
+              errorCode: "run_event_persistence_failed",
+            }
+          : finalStatus === "completed"
+            ? (unfinishedTurnContinuationEvent ??
+              terminalEventForCompletion?.event ?? { type: "done" })
+            : terminalEventForCompletion?.event.type === "error" ||
+                terminalEventForCompletion?.event.type === "missing_api_key"
+              ? terminalEventForCompletion.event
+              : terminalEventForCompletion?.event.type === "auto_continue" &&
+                  run.continuationTerminalEvent
+                ? terminalEventForCompletion.event
                 : {
                     type: "error",
                     error: completionError
@@ -512,13 +1698,9 @@ export function startRun(
                   };
         const last = run.events[run.events.length - 1];
         if (!last || !isTerminalRunEvent(last.event)) {
-          // Assign the seq at EMIT time, not at stash time. `run.events` is a
-          // contiguous 0-based log, so `run.events.length` is the next free
-          // seq and can never collide with an event that was pushed after the
-          // terminal event was stashed.
           const terminal: RunEvent = {
             seq: run.events.length,
-            event: terminalEvent,
+            event: terminalEventToEmit,
           };
           try {
             await emitRunEvent(terminal, { surfacePersistenceError: true });
@@ -529,6 +1711,23 @@ export function startRun(
               "[run-manager] terminal event persistence error:",
               err instanceof Error ? err.message : err,
             );
+            if (!eventPersistenceError) {
+              try {
+                await persistRunEvent(
+                  terminal,
+                  JSON.stringify(terminal.event),
+                  Date.now(),
+                );
+                terminalPersistenceError = null;
+              } catch (retryError) {
+                terminalPersistenceError = retryError;
+                captureRunError(retryError, "completion");
+                console.error(
+                  "[run-manager] terminal event retry persistence error:",
+                  retryError instanceof Error ? retryError.message : retryError,
+                );
+              }
+            }
           }
         }
       }
@@ -536,39 +1735,54 @@ export function startRun(
         run.subscribers.delete(subscriber);
       }
 
-      // 4. Stop the heartbeat — all liveness writes are done.
-      clearInterval(heartbeatTimer);
-      if (softTimeoutTimer) clearTimeout(softTimeoutTimer);
+      if (inFlightWorkCount > 0 || inFlightMarkerSince !== null) {
+        inFlightWorkCount = 0;
+        mirrorInFlightMarker(false);
+      }
 
-      // 5. Persist final status to SQL. Use the conditional write so a zombie
-      //    run (reaped or displaced while executing) cannot clobber the newer
-      //    status written by the reaper or a replacement run.
       try {
         await insertRunPromise;
-        if (!terminalPersistenceError) {
-          await updateRunStatusIfRunning(runId, finalStatus);
+        if (!terminalPersistenceError || eventPersistenceError) {
+          let statusUpdated = false;
+          try {
+            statusUpdated = await updateRunStatusIfRunning(
+              runId,
+              persistedStatus,
+            );
+          } catch {
+            statusUpdated = false;
+          }
+          if (statusUpdated) {
+            terminalPersistenceEstablished = !terminalPersistenceError;
+            await setRunTerminalReason(runId, terminalReason);
+          } else {
+            terminalPersistenceEstablished =
+              await reconcileTerminalRunFromEvents(runId).catch(() => false);
+          }
         }
       } catch {
         // Best-effort — reapIfStale will eventually clean this up via
         // the heartbeat-stale path.
       }
 
-      // 5b. Record terminal failure classification for errored runs so
-      //     cut-off / failed chats are queryable for pattern analysis. Read
-      //     the actual error event the run emitted (errorCode + message) so
-      //     diagnostics reflect the real cause (builder_gateway_timeout,
-      //     stale_run, context_length_exceeded, completion_error, …).
       if (finalStatus === "errored") {
         let errorCode: string | undefined;
         let errorDetail: string | undefined;
-        for (let i = run.events.length - 1; i >= 0; i--) {
-          const ev = run.events[i].event as {
+        const diagnosticEvents = pendingTerminalEvent
+          ? [...run.events, pendingTerminalEvent]
+          : run.events;
+        for (let i = diagnosticEvents.length - 1; i >= 0; i--) {
+          const ev = diagnosticEvents[i].event as {
             type: string;
             error?: string;
             errorCode?: string;
             details?: string;
           };
-          if (ev.type === "error") {
+          if (ev.type === "missing_api_key") {
+            errorCode = LLM_MISSING_CREDENTIALS_ERROR_CODE;
+            errorDetail = LLM_MISSING_CREDENTIALS_MESSAGE;
+            break;
+          } else if (ev.type === "error") {
             errorCode = ev.errorCode;
             errorDetail = ev.error ?? ev.details;
             break;
@@ -582,10 +1796,52 @@ export function startRun(
               ? completionError.message
               : String(completionError));
         }
+        errorCode ??= classifyTerminalErrorCode(errorDetail);
+        runTerminalErrorCode = errorCode ?? "unknown";
         await setRunError(runId, errorCode ?? "unknown", errorDetail);
       }
 
-      // 6. Schedule in-memory cleanup + opportunistic old-run pruning.
+      if (terminalPersistenceError) {
+        const reconciled = eventPersistenceError
+          ? false
+          : await reconcileTerminalRunFromEvents(runId);
+        if (!reconciled) throw terminalPersistenceError;
+        terminalPersistenceEstablished = true;
+      }
+
+      // 5c. Emit a terminal-outcome analytics event, reusing the same
+      // best-effort tracking seam as $ai_generation (dynamic import + a
+      // swallowed catch so a broken/absent provider can never affect the
+      // run). Fired AFTER the atomic-complete SQL writes above so it never
+      // races the thread_data-before-status invariant those steps exist to
+      // protect. `persistedStatus` (not `finalStatus`) is used so a
+      // continuation boundary reports as "truncated" rather than a false
+      // "completed" — that distinction is the whole point of this event.
+      if (terminalPersistenceEstablished) {
+        emitRunTerminalTrackingEvent({
+          runId,
+          threadId,
+          turnId: run.turnId,
+          status: persistedStatus,
+          terminalReason,
+          errorCode: runTerminalErrorCode,
+          dispatchMode: options?.dispatchMode,
+          abortReason: run.abortReason,
+          durationMs: Date.now() - run.startedAt,
+          model: options?.model,
+          engineName: options?.engineName,
+          userId: options?.userId,
+          attemptCount: options?.attemptCount,
+        });
+      }
+    })
+    .finally(() => {
+      clearInterval(heartbeatTimer);
+      if (softTimeoutTimer) clearTimeout(softTimeoutTimer);
+      if (chunkSoftTimeoutTimer) clearTimeout(chunkSoftTimeoutTimer);
+      if (progressWriteTimer) clearTimeout(progressWriteTimer);
+      progressWriteTimer = null;
+      progressWritePending = false;
       setTimeout(() => {
         activeRuns.delete(runId);
         if (threadToRun.get(threadId) === runId) {
@@ -597,28 +1853,13 @@ export function startRun(
         resolveErroredRunRetentionMs(),
       ).catch(() => {});
     });
+  runPromise.then(resolveFinalized, rejectFinalized);
 
-  // On Cloudflare Workers, keep the isolate alive for this run
-  try {
-    const cfCtx = globalThis.__cf_ctx;
-    if (cfCtx?.waitUntil) {
-      cfCtx.waitUntil(runPromise);
-    }
-  } catch {
-    // Not on Workers — ignore
-  }
+  options?.waitUntil?.(runPromise);
 
   return run;
 }
 
-/**
- * Subscribe to a run's events starting from `fromSeq`.
- * Returns a ReadableStream that replays buffered events then live-tails.
- * Cancelling the stream only unsubscribes — does NOT abort the agent.
- *
- * Falls back to SQL polling when the run is not in local memory
- * (cross-isolate reconnection on Workers).
- */
 export function subscribeToRun(
   runId: string,
   fromSeq: number,
@@ -627,11 +1868,73 @@ export function subscribeToRun(
   if (run) {
     return subscribeInMemory(run, fromSeq);
   }
-  // Not in local memory — try SQL (cross-isolate path)
   return subscribeFromSQL(runId, fromSeq);
 }
 
-/** In-memory subscription (same isolate, fast path) */
+export async function replayCompletedTurn(
+  threadId: string,
+  turnId: string,
+): Promise<ReadableStream<Uint8Array> | null> {
+  const persisted = await getCurrentTurnRunEventsForThread(threadId, turnId);
+  if (persisted.length === 0) return null;
+  const events = persisted.filter(
+    ({ event }) => event.type !== "auto_continue",
+  );
+  const hasTerminalEvent = events.some(({ event }) =>
+    isTerminalRunEvent(event),
+  );
+  if (!hasTerminalEvent) {
+    const last = events.at(-1);
+    events.push({
+      runId: last?.runId ?? `turn-replay-${turnId}`,
+      seq: (last?.seq ?? -1) + 1,
+      event: { type: "done" },
+    });
+  }
+  const encoder = new TextEncoder();
+  return new ReadableStream({
+    start(controller) {
+      events.forEach(({ event, runId, seq }, replaySeq) => {
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              ...event,
+              seq: replaySeq,
+              eventId: runEventIdentity(runId, seq),
+            })}\n\n`,
+          ),
+        );
+      });
+      controller.close();
+    },
+  });
+}
+
+function runEventIdentity(runId: string, seq: number): string {
+  return `${runId}:${seq}`;
+}
+
+function streamRunEvent(
+  runId: string,
+  runEvent: RunEvent,
+): Record<string, unknown> {
+  return {
+    ...runEvent.event,
+    seq: runEvent.seq,
+    eventId: runEventIdentity(runId, runEvent.seq),
+  };
+}
+
+function streamEventWithIdentity(
+  runId: string,
+  event: AgentChatEvent | Record<string, unknown>,
+  seq?: number,
+): Record<string, unknown> {
+  return seq === undefined
+    ? { ...event }
+    : { ...event, seq, eventId: runEventIdentity(runId, seq) };
+}
+
 function subscribeInMemory(
   run: ActiveRun,
   fromSeq: number,
@@ -639,6 +1942,7 @@ function subscribeInMemory(
   const encoder = new TextEncoder();
   let subscriberRef: ((event: RunEvent) => void) | null = null;
   let pingTimer: ReturnType<typeof setInterval> | null = null;
+  let terminalSettleTimer: ReturnType<typeof setTimeout> | null = null;
 
   return new ReadableStream({
     start(controller) {
@@ -648,17 +1952,17 @@ function subscribeInMemory(
         } catch {
           if (subscriberRef) run.subscribers.delete(subscriberRef);
           if (pingTimer) clearInterval(pingTimer);
+          if (terminalSettleTimer) clearTimeout(terminalSettleTimer);
         }
       };
       ping();
       pingTimer = setInterval(ping, 10_000);
 
-      // Replay buffered events from fromSeq
       for (let i = fromSeq; i < run.events.length; i++) {
         try {
           controller.enqueue(
             encoder.encode(
-              `data: ${JSON.stringify({ ...run.events[i].event, seq: run.events[i].seq })}\n\n`,
+              `data: ${JSON.stringify(streamRunEvent(run.runId, run.events[i]!))}\n\n`,
             ),
           );
         } catch {
@@ -666,25 +1970,83 @@ function subscribeInMemory(
         }
       }
 
-      // If run is already done, close immediately
       if (run.status !== "running") {
-        if (pingTimer) clearInterval(pingTimer);
-        controller.close();
-        return;
+        let bufferedTerminalIndex = -1;
+        for (let index = run.events.length - 1; index >= 0; index -= 1) {
+          const buffered = run.events[index];
+          if (buffered && isTerminalRunEvent(buffered.event)) {
+            bufferedTerminalIndex = index;
+            break;
+          }
+        }
+        if (bufferedTerminalIndex >= 0) {
+          if (bufferedTerminalIndex < fromSeq) {
+            const buffered = run.events[bufferedTerminalIndex]!;
+            try {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify(streamRunEvent(run.runId, buffered))}\n\n`,
+                ),
+              );
+            } catch {
+              if (pingTimer) clearInterval(pingTimer);
+              return;
+            }
+          }
+          if (pingTimer) clearInterval(pingTimer);
+          controller.close();
+          return;
+        }
+        terminalSettleTimer = setTimeout(() => {
+          captureError(
+            new Error(
+              `Agent run ${run.runId} reached status ${run.status} without emitting a terminal event`,
+            ),
+            {
+              route: "/_agent-native/agent-chat/runs/:id/events",
+              aiTraceId: run.runId,
+              tags: {
+                source: "agent-run-manager",
+                phase: "memory-subscription-terminal",
+                runStatus: run.status,
+              },
+              extra: { runId: run.runId, threadId: run.threadId, fromSeq },
+            },
+          );
+          try {
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify(
+                  streamEventWithIdentity(
+                    run.runId,
+                    UNKNOWN_RUN_STATUS_ERROR_EVENT,
+                    run.events.length,
+                  ),
+                )}\n\n`,
+              ),
+            );
+            // coercion-ok: enqueue throws only once the reader is gone; the lost terminal event is already reported by captureError above.
+          } catch {}
+          if (subscriberRef) run.subscribers.delete(subscriberRef);
+          if (pingTimer) clearInterval(pingTimer);
+          try {
+            controller.close();
+            // coercion-ok: closing an already-closed controller is this cleanup's success case, not a failure to report.
+          } catch {}
+        }, IN_MEMORY_TERMINAL_SETTLE_MS);
       }
 
-      // Subscribe to live events
       subscriberRef = (event: RunEvent) => {
         try {
           controller.enqueue(
             encoder.encode(
-              `data: ${JSON.stringify({ ...event.event, seq: event.seq })}\n\n`,
+              `data: ${JSON.stringify(streamRunEvent(run.runId, event))}\n\n`,
             ),
           );
-          // Close stream after terminal events
           if (isTerminalRunEvent(event.event)) {
             run.subscribers.delete(subscriberRef!);
             if (pingTimer) clearInterval(pingTimer);
+            if (terminalSettleTimer) clearTimeout(terminalSettleTimer);
             controller.close();
           }
         } catch {
@@ -695,14 +2057,13 @@ function subscribeInMemory(
       run.subscribers.add(subscriberRef);
     },
     cancel() {
-      // Only unsubscribe — do NOT abort the agent run
       if (subscriberRef) run.subscribers.delete(subscriberRef);
       if (pingTimer) clearInterval(pingTimer);
+      if (terminalSettleTimer) clearTimeout(terminalSettleTimer);
     },
   });
 }
 
-/** SQL-based subscription (cross-isolate, polling) */
 function subscribeFromSQL(
   runId: string,
   fromSeq: number,
@@ -715,6 +2076,12 @@ function subscribeFromSQL(
   return new ReadableStream({
     async start(controller) {
       let lastSeq = fromSeq;
+      const subscriptionStartedAt = Date.now();
+      let activePollUntil = 0;
+      let lastStatusCheckAt = 0;
+      let lastReapCheckAt = 0;
+      let consecutivePollFailures = 0;
+      let consecutiveEmptyPolls = 0;
       const ping = () => {
         try {
           controller.enqueue(encoder.encode(`: ping ${Date.now()}\n\n`));
@@ -726,16 +2093,64 @@ function subscribeFromSQL(
       ping();
       pingTimer = setInterval(ping, 10_000);
 
+      const closeStream = () => {
+        cancelled = true;
+        if (pollTimer) clearTimeout(pollTimer);
+        if (pingTimer) clearInterval(pingTimer);
+        try {
+          controller.close();
+        } catch {}
+      };
+
+      const failSubscription = (error: unknown) => {
+        const event: AgentChatEvent = {
+          type: "error",
+          error:
+            "The live agent connection could not load persisted run progress.",
+          errorCode: "run_subscription_poll_failed",
+          details:
+            "The agent may still be running. Reconnect to resume from the last persisted event.",
+          recoverable: true,
+        };
+        captureError(error, {
+          route: "/_agent-native/agent-chat/runs/:id/events",
+          aiTraceId: runId,
+          tags: {
+            source: "agent-run-manager",
+            phase: "sql-subscription-poll",
+            consecutiveFailures: String(consecutivePollFailures),
+          },
+          extra: {
+            runId,
+            fromSeq,
+            lastSeq,
+            error: getRunErrorMessage(error),
+          },
+        });
+        try {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify(streamEventWithIdentity(runId, event))}\n\n`,
+            ),
+          );
+        } catch {}
+        closeStream();
+      };
+
       const poll = async () => {
         if (cancelled) return;
         try {
-          // Read new events from SQL
           const events = await getRunEventsSince(runId, lastSeq);
+          consecutiveEmptyPolls = nextSqlSubscriptionEmptyPolls(
+            consecutiveEmptyPolls,
+            events.length > 0,
+            Date.now(),
+            activePollUntil,
+          );
+          if (events.length > 0) {
+            activePollUntil = Date.now() + SQL_SUBSCRIPTION_ACTIVE_GRACE_MS;
+          }
           for (const { seq, eventData } of events) {
-            // Advance the cursor first, before any parse/enqueue branch can
-            // `continue`/`return`. Otherwise a single corrupt (unparseable)
-            // event row is re-fetched on every poll tick forever, wedging the
-            // SSE stream open and never delivering a terminal event.
             lastSeq = seq + 1;
             let parsed: any;
             try {
@@ -746,7 +2161,7 @@ function subscribeFromSQL(
             try {
               controller.enqueue(
                 encoder.encode(
-                  `data: ${JSON.stringify({ ...parsed, seq })}\n\n`,
+                  `data: ${JSON.stringify(streamEventWithIdentity(runId, parsed, seq))}\n\n`,
                 ),
               );
             } catch {
@@ -754,7 +2169,6 @@ function subscribeFromSQL(
               return;
             }
 
-            // Close on terminal events
             if (isTerminalRunEvent(parsed)) {
               if (pingTimer) clearInterval(pingTimer);
               controller.close();
@@ -762,18 +2176,46 @@ function subscribeFromSQL(
             }
           }
 
-          // Check if run completed (no terminal event but status changed)
           if (events.length === 0) {
-            // Opportunistically reap a stale producer before trusting SQL's
-            // "running" status — otherwise a crashed server leaves us polling
-            // forever.
-            await reapIfStale(runId).catch(() => {});
+            const now = Date.now();
+            if (now - lastStatusCheckAt < SQL_SUBSCRIPTION_STATUS_POLL_MS) {
+              if (!cancelled) {
+                consecutivePollFailures = 0;
+                const pollMs = resolveSqlSubscriptionPollMs(
+                  now,
+                  activePollUntil,
+                  consecutiveEmptyPolls,
+                );
+                pollTimer = setTimeout(poll, pollMs);
+              }
+              return;
+            }
+            lastStatusCheckAt = now;
+            if (now - lastReapCheckAt >= SQL_SUBSCRIPTION_REAP_POLL_MS) {
+              lastReapCheckAt = now;
+              await reapIfStale(runId).catch(() => {});
+            }
             const run = await getRunById(runId);
+            if (
+              !run &&
+              now - subscriptionStartedAt < RUN_RECORD_MISSING_GRACE_MS
+            ) {
+              if (!cancelled) {
+                consecutivePollFailures = 0;
+                pollTimer = setTimeout(
+                  poll,
+                  resolveSqlSubscriptionPollMs(
+                    now,
+                    activePollUntil,
+                    consecutiveEmptyPolls,
+                  ),
+                );
+              }
+              return;
+            }
             if (!run || run.status !== "running") {
-              // Run ended — do one final event read, then close
               const finalEvents = await getRunEventsSince(runId, lastSeq);
               for (const { seq, eventData } of finalEvents) {
-                // Advance first — see the main poll loop above for why.
                 lastSeq = seq + 1;
                 let parsed: any;
                 try {
@@ -784,7 +2226,7 @@ function subscribeFromSQL(
                 try {
                   controller.enqueue(
                     encoder.encode(
-                      `data: ${JSON.stringify({ ...parsed, seq })}\n\n`,
+                      `data: ${JSON.stringify(streamEventWithIdentity(runId, parsed, seq))}\n\n`,
                     ),
                   );
                 } catch {
@@ -798,21 +2240,66 @@ function subscribeFromSQL(
                 }
               }
               if (run?.status === "aborted") {
+                const existing = await getLastTerminalRunEvent(runId).catch(
+                  () => null,
+                );
+                const abortReason = run.terminalReason?.startsWith("aborted:")
+                  ? run.terminalReason.slice("aborted:".length)
+                  : undefined;
+                const terminalEvent = existing
+                  ? existing.event
+                  : terminalEventForAbortReason(abortReason);
                 try {
                   controller.enqueue(
                     encoder.encode(
-                      `data: ${JSON.stringify({ type: "done", seq: lastSeq })}\n\n`,
+                      `data: ${JSON.stringify(
+                        streamEventWithIdentity(
+                          runId,
+                          terminalEvent,
+                          existing?.seq ?? lastSeq,
+                        ),
+                      )}\n\n`,
                     ),
                   );
                 } catch {
                   cancelled = true;
                   return;
                 }
-              } else if (run?.status === "completed") {
+              } else if (
+                run?.status === "completed" ||
+                run?.status === "truncated"
+              ) {
+                // A chunk boundary is status "truncated" (with a continuation
+                // terminal_reason, and a chained successor run already carrying
+                // the turn). Synthesizing `done` here told the client the agent
+                // stopped while it was still working, which surfaced as a
+                // premature "stopped without sending a final message". Prefer
+                // the run's REAL terminal event, then the terminal_reason,
+                // before falling back to `done`. "completed" is still checked
+                // for chunk-boundary rows written before the truncated status
+                // existed, which linger for one retention window. A truncated
+                // row always hands its turn on, whatever its reason (a deferred
+                // handoff is truncated before its auto_continue is saved).
+                const existing = await getLastTerminalRunEvent(runId).catch(
+                  () => null,
+                );
+                const terminalEvent = existing
+                  ? existing.event
+                  : isContinuationTerminalReason(run.terminalReason)
+                    ? { type: "auto_continue", reason: run.terminalReason }
+                    : run.status === "truncated"
+                      ? { type: "auto_continue", reason: "stream_ended" }
+                      : { type: "done" };
                 try {
                   controller.enqueue(
                     encoder.encode(
-                      `data: ${JSON.stringify({ type: "done", seq: lastSeq })}\n\n`,
+                      `data: ${JSON.stringify(
+                        streamEventWithIdentity(
+                          runId,
+                          terminalEvent,
+                          existing?.seq ?? lastSeq,
+                        ),
+                      )}\n\n`,
                     ),
                   );
                 } catch {
@@ -820,25 +2307,78 @@ function subscribeFromSQL(
                   return;
                 }
               } else if (run?.status === "errored") {
-                // The run row was flipped to `errored` but no terminal event
-                // was ever persisted — almost always means a reaper's silent
-                // `appendTerminalRunEvent(...).catch(() => {})` swallowed a
-                // transient DB error, so the user-facing situation is the
-                // same as a stale-run reap. Send the friendly event AND try
-                // to persist it so future reconnects replay it from SQL
-                // rather than regenerating it (the user used to see a bare
-                // "run_terminal_event_missing" debug string here).
-                await ensureTerminalRunEvent(
-                  runId,
-                  STALE_RUN_ERROR_EVENT,
-                ).catch(() => {});
+                const existing = await getLastTerminalRunEvent(runId).catch(
+                  () => null,
+                );
+                const resolved = existing
+                  ? { event: existing.event, shouldPersist: false }
+                  : resolveErroredRunTerminalEvent(run);
+                if (resolved.shouldPersist) {
+                  await ensureTerminalRunEvent(runId, resolved.event).catch(
+                    () => {},
+                  );
+                }
                 try {
                   controller.enqueue(
                     encoder.encode(
-                      `data: ${JSON.stringify({
-                        ...STALE_RUN_ERROR_EVENT,
-                        seq: lastSeq,
-                      })}\n\n`,
+                      `data: ${JSON.stringify(
+                        streamEventWithIdentity(
+                          runId,
+                          resolved.event,
+                          existing?.seq ?? lastSeq,
+                        ),
+                      )}\n\n`,
+                    ),
+                  );
+                } catch {
+                  cancelled = true;
+                  return;
+                }
+              } else {
+                const lookup = await getLastTerminalRunEvent(runId).then(
+                  (event) => ({ read: true as const, event }),
+                  () => ({ read: false as const, event: null }),
+                );
+                const existing = lookup.event;
+                const terminalEvent = existing
+                  ? existing.event
+                  : !lookup.read
+                    ? { ...RUN_TERMINAL_LOOKUP_FAILED_ERROR_EVENT }
+                    : run
+                      ? { ...UNKNOWN_RUN_STATUS_ERROR_EVENT }
+                      : { ...RUN_RECORD_MISSING_ERROR_EVENT };
+                if (!existing) {
+                  captureError(
+                    new Error(
+                      !lookup.read
+                        ? `Agent run ${runId} terminal-event lookup failed; outcome unknown`
+                        : run
+                          ? `Agent run ${runId} left 'running' with unrecognized status ${run.status}`
+                          : `Agent run ${runId} has no agent_runs row and no terminal event`,
+                    ),
+                    {
+                      route: "/_agent-native/agent-chat/runs/:id/events",
+                      aiTraceId: runId,
+                      tags: {
+                        source: "agent-run-manager",
+                        phase: "sql-subscription-terminal",
+                        runStatus: run?.status ?? "missing",
+                        terminalLookup: lookup.read ? "read" : "failed",
+                      },
+                      extra: { runId, fromSeq, lastSeq },
+                    },
+                  );
+                }
+                try {
+                  controller.enqueue(
+                    encoder.encode(
+                      `data: ${JSON.stringify(
+                        streamEventWithIdentity(
+                          runId,
+                          terminalEvent,
+                          existing?.seq ?? lastSeq,
+                        ),
+                      )}\n\n`,
                     ),
                   );
                 } catch {
@@ -852,31 +2392,29 @@ function subscribeFromSQL(
             }
           }
 
-          // Schedule next poll
           if (!cancelled) {
-            pollTimer = setTimeout(poll, 500);
+            consecutivePollFailures = 0;
+            const pollMs = resolveSqlSubscriptionPollMs(
+              Date.now(),
+              activePollUntil,
+              consecutiveEmptyPolls,
+            );
+            pollTimer = setTimeout(poll, pollMs);
           }
-        } catch {
-          // SQL error — close stream
-          try {
-            if (pingTimer) clearInterval(pingTimer);
-            controller.close();
-          } catch {}
+        } catch (error) {
+          consecutivePollFailures += 1;
+          if (
+            consecutivePollFailures >= SQL_SUBSCRIPTION_MAX_CONSECUTIVE_FAILURES
+          ) {
+            failSubscription(error);
+            return;
+          }
+          pollTimer = setTimeout(
+            poll,
+            resolveSqlSubscriptionRetryMs(consecutivePollFailures),
+          );
         }
       };
-
-      // Verify run exists before starting poll
-      try {
-        const run = await getRunById(runId);
-        if (!run) {
-          if (pingTimer) clearInterval(pingTimer);
-          controller.close();
-          return;
-        }
-      } catch {
-        controller.close();
-        return;
-      }
 
       await poll();
     },
@@ -888,7 +2426,6 @@ function subscribeFromSQL(
   });
 }
 
-/** Get the active run for a thread (if any) — checks memory then SQL */
 export function getActiveRunForThread(threadId: string): ActiveRun | null {
   const runId = threadToRun.get(threadId);
   if (runId) {
@@ -898,59 +2435,146 @@ export function getActiveRunForThread(threadId: string): ActiveRun | null {
   return null;
 }
 
-/**
- * Async version that also checks SQL — for cross-isolate access.
- * Used by the /runs/active endpoint.
- *
- * Returns `heartbeatAt` so the client can independently decide a run is
- * dead even before the server-side stale reap has fired. Returns
- * `lastProgressAt` so the client-side stuck-detector can show a
- * user-visible "this chat looks stuck" affordance when a run is alive
- * (heartbeating) but not actually emitting events.
- */
+function legacyWireRunStatus(status: string): string {
+  return status === "truncated" ? "completed" : status;
+}
+
 export async function getActiveRunForThreadAsync(threadId: string): Promise<{
   runId: string;
   threadId: string;
   turnId: string;
   status: string;
+  /**
+   * The one answer to "is a run in flight on this thread". A terminal run is
+   * still returned inside `TERMINAL_RUN_RECONNECT_WINDOW_MS` so a reconnecting
+   * client can replay it, which is why `status` alone being present means
+   * nothing; `/runs/active` reports this as its `active` flag.
+   */
+  inFlight: boolean;
   heartbeatAt: number;
   lastProgressAt: number | null;
+  dispatchMode?: string | null;
+  terminalReason?: string | null;
+  diagStage?: string | null;
+  /**
+   * True exactly when this run is a `chainServerDrivenContinuation` deferral
+   * (dispatch_mode === 'background', never claimed) still inside
+   * `UNCLAIMED_BACKGROUND_RUN_REDISPATCH_BOUND_MS` — the same condition this
+   * function already uses below to skip its own `reapUnclaimedBackgroundRun`.
+   * Surfaced on `/runs/active` (agent-chat-plugin.ts) so
+   * `agent-chat-adapter.ts`'s follow loop can tell "silently deferred,
+   * server-side recovery in progress" apart from "dead" and stop counting the
+   * quiet gap against its idle timeout — see the THREE-SITE INVARIANT comment
+   * below and in agent-chat-plugin.ts / production-agent.ts. Always false for
+   * an in-memory run (that isolate IS the live producer) and for any run that
+   * isn't an unclaimed background dispatch.
+   */
+  awaitingRedispatch: boolean;
+  hasInFlightWork: boolean;
 } | null> {
-  // Check memory first — return both running AND recently-completed runs
-  // that still have events in memory. This allows sub-agent tabs to replay
-  // the full conversation from completed runs via SSE.
   const memRun = getActiveRunForThread(threadId);
   if (memRun && (memRun.status === "running" || memRun.events.length > 0)) {
+    const sqlSnapshot = await fetchRunThreadSnapshot(memRun.runId, threadId);
+
+    if (
+      memRun.status !== "running" &&
+      (!sqlSnapshot || sqlSnapshot.status === "running")
+    ) {
+      const successor = await fetchNewerNonTerminalRunForSameTurn(
+        threadId,
+        memRun,
+      );
+      if (successor) {
+        return {
+          runId: successor.id,
+          threadId: successor.threadId,
+          turnId: successor.turnId ?? successor.id,
+          status: successor.status,
+          inFlight: true,
+          heartbeatAt: successor.heartbeatAt ?? successor.startedAt,
+          lastProgressAt: successor.lastProgressAt,
+          dispatchMode: successor.dispatchMode,
+          terminalReason: successor.terminalReason,
+          diagStage: successor.diagStage,
+          awaitingRedispatch: false,
+          hasInFlightWork: successor.inFlightSince != null,
+        };
+      }
+    }
+
+    const sqlStatus =
+      sqlSnapshot?.status === "running" && memRun.status !== "running"
+        ? memRun.status
+        : (sqlSnapshot?.status ?? memRun.status);
+    const status = legacyWireRunStatus(sqlStatus);
+    const heartbeatAt =
+      status === "running"
+        ? Date.now()
+        : (sqlSnapshot?.heartbeatAt ?? memRun.startedAt);
     return {
       runId: memRun.runId,
       threadId: memRun.threadId,
       turnId: memRun.turnId,
-      status: memRun.status,
-      // In-memory means this isolate is the producer. By definition, the
-      // heartbeat is fresh as of "now" — the client can trust this.
-      heartbeatAt: Date.now(),
-      // For an in-memory run we don't have a separate "last event emit"
-      // timestamp tracked in JS — the SQL bump is throttled per-second.
-      // Read it back from SQL on demand. For the common case the SQL row
-      // is well under 1s old; if it isn't, the stuck-detector will pick
-      // it up on the next poll cycle.
-      lastProgressAt: await fetchLastProgressAt(memRun.runId),
+      status,
+      inFlight: status === "running",
+      heartbeatAt,
+      lastProgressAt: sqlSnapshot?.lastProgressAt ?? null,
+      dispatchMode: sqlSnapshot?.dispatchMode ?? null,
+      terminalReason: sqlSnapshot?.terminalReason ?? null,
+      diagStage: sqlSnapshot?.diagStage ?? null,
+      awaitingRedispatch: false,
+      hasInFlightWork: sqlSnapshot?.inFlightSince != null,
     };
   }
-  // Fall back to SQL — also surface recently terminated runs so the client
-  // can reconnect and replay synthesized done/error events instead of
-  // retrying the original POST. Without this, a POST that fails after the
-  // server already accepted (and finished) the run would re-execute the
-  // turn and double-apply mutations: the in-memory branch above already
-  // returns terminal runs whose events are still buffered, but the SQL
-  // path is the only authority once memory has been evicted.
   try {
     const sqlRun = await getRunByThread(threadId, { includeTerminal: true });
     if (!sqlRun) return null;
     if (sqlRun.status === "running") {
-      // If the producer is dead (no recent heartbeat), reap before the
-      // client can see a stale "running" status and enter a reconnect
-      // loop it can never exit.
+      // FALLBACK HARDENING: a background-dispatched run that is still UNCLAIMED
+      // (dispatch_mode === 'background', never flipped to 'background-processing')
+      // past the tight grace means the bg-fn worker never started — a silent
+      // async-worker death that the 202-ack inline fallback can't catch. Reap it
+      // early and recoverably (background_worker_never_started) so the run no
+      // longer hangs for the full 90s window. Only fires when there is provably
+      // no live worker; a claimed/heartbeating run is left alone by the
+      // conditional SQL.
+      //
+      // REDISPATCH-BOUND GUARD (must be kept in lockstep with the "Unclaimed
+      // background-run sweep" in agent-chat-plugin.ts and with
+      // chainServerDrivenContinuation's deferral in production-agent.ts — do NOT
+      // remove this guard without reading those two sites):
+      // `chainServerDrivenContinuation` now DEFERS a dispatch-failed successor
+      // instead of erroring it — it leaves the row status='running',
+      // dispatch_mode='background' with its dispatch_payload intact so the sweep
+      // can silently redispatch it. This client poll runs every ~1s while a
+      // client is connected, so without this guard it would reap that deferred
+      // successor at the 25s unclaimed grace — long before the ~2-min sweep —
+      // converting the intended SILENT server-side recovery into a user-visible
+      // `background_worker_never_started` manual-retry error (that terminal
+      // reason does NOT auto-continue in the client follow loop; only `stale_run`
+      // does). While the successor is still inside its redispatch bound we skip
+      // this reap and leave it for the sweep. The outer backstops still bound it:
+      // `reapIfStale` below reaps a heartbeat-stale background row at 90s
+      // (BACKGROUND_RUN_STALE_MS) to the recoverable `stale_run` — which the
+      // follow loop AUTO-continues — and once the redispatch bound is exceeded
+      // this reap fires loudly as before. So recovery stays automatic in the
+      // common case and loud failure is only moved later, never removed.
+      //
+      // `isUnclaimedBackgroundDispatch` also becomes the `awaitingRedispatch`
+      // wire field below once the still-inside-the-bound check passes — see
+      // this function's doc comment and the THREE-SITE INVARIANT comment in
+      // agent-chat-plugin.ts / production-agent.ts.
+      const isUnclaimedBackgroundDispatch =
+        sqlRun.dispatchMode === "background";
+      const stillInsideRedispatchBound = shouldRedispatchUnclaimedBackgroundRun(
+        { startedAt: sqlRun.startedAt },
+      );
+      if (isUnclaimedBackgroundDispatch && !stillInsideRedispatchBound) {
+        const recovered = await reapUnclaimedBackgroundRun(sqlRun.id).catch(
+          () => false,
+        );
+        if (recovered) return null;
+      }
       const reaped = await reapIfStale(sqlRun.id).catch(() => false);
       if (reaped) return null;
       return {
@@ -958,22 +2582,22 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
         threadId: sqlRun.threadId,
         turnId: sqlRun.turnId ?? sqlRun.id,
         status: sqlRun.status,
+        inFlight: true,
         heartbeatAt: sqlRun.heartbeatAt ?? sqlRun.startedAt,
         lastProgressAt: sqlRun.lastProgressAt,
+        dispatchMode: sqlRun.dispatchMode,
+        terminalReason: sqlRun.terminalReason,
+        diagStage: sqlRun.diagStage,
+        awaitingRedispatch:
+          isUnclaimedBackgroundDispatch && stillInsideRedispatchBound,
+        hasInFlightWork: sqlRun.inFlightSince != null,
       };
     }
-    if (sqlRun.status === "completed" || sqlRun.status === "errored") {
-      // Cap how far back we'll surface terminal runs as "active". The goal
-      // is to catch the recently-completed-but-reconnecting case, not to
-      // resurrect ancient turns when the user reopens an old thread.
-      //
-      // Measure age from the run's terminal timestamp, not its start. A
-      // long-running task that ran 11 minutes and completed five seconds
-      // ago should still be reachable — the client's disconnect happened
-      // around completion, so completion time is what matters for the
-      // "is the user still here waiting?" question. Fall back to the last
-      // heartbeat (older deployments may have unset completed_at) and
-      // finally to startedAt for ancient rows.
+    if (
+      sqlRun.status === "completed" ||
+      sqlRun.status === "truncated" ||
+      sqlRun.status === "errored"
+    ) {
       const referenceAt =
         sqlRun.completedAt ?? sqlRun.heartbeatAt ?? sqlRun.startedAt;
       const terminalAge = Date.now() - referenceAt;
@@ -982,9 +2606,15 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
         runId: sqlRun.id,
         threadId: sqlRun.threadId,
         turnId: sqlRun.turnId ?? sqlRun.id,
-        status: sqlRun.status,
+        status: legacyWireRunStatus(sqlRun.status),
+        inFlight: false,
         heartbeatAt: sqlRun.heartbeatAt ?? sqlRun.startedAt,
         lastProgressAt: sqlRun.lastProgressAt,
+        dispatchMode: sqlRun.dispatchMode,
+        terminalReason: sqlRun.terminalReason,
+        diagStage: sqlRun.diagStage,
+        awaitingRedispatch: false,
+        hasInFlightWork: false,
       };
     }
   } catch {
@@ -993,37 +2623,125 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
   return null;
 }
 
-async function fetchLastProgressAt(runId: string): Promise<number | null> {
+async function fetchRunThreadSnapshot(runId: string, threadId: string) {
   try {
-    const run = await getRunById(runId);
-    if (!run) return null;
-    // `getRunById` returns a narrow projection today; ask for the row via
-    // the thread lookup which carries last_progress_at.
-    const byThread = await getRunByThread(run.threadId, {
+    const byThread = await getRunByThread(threadId, {
       includeTerminal: true,
     });
-    if (byThread && byThread.id === runId) return byThread.lastProgressAt;
+    if (byThread && byThread.id === runId) return byThread;
     return null;
   } catch {
     return null;
   }
 }
 
-/** Get a run by ID */
+async function fetchNewerNonTerminalRunForSameTurn(
+  threadId: string,
+  memRun: ActiveRun,
+): Promise<Awaited<ReturnType<typeof getRunByThread>> | null> {
+  try {
+    const latest = await getRunByThread(threadId, { includeTerminal: true });
+    if (
+      latest &&
+      latest.id !== memRun.runId &&
+      latest.status === "running" &&
+      latest.startedAt > memRun.startedAt &&
+      (latest.turnId ?? latest.id) === memRun.turnId
+    ) {
+      return latest;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function getRun(runId: string): ActiveRun | null {
   return activeRuns.get(runId) ?? null;
 }
 
-/** Explicitly abort a run (e.g. Stop button) */
-export function abortRun(runId: string, reason: string = "user"): boolean {
+function abortRunInMemory(runId: string, reason: string): boolean {
   const run = activeRuns.get(runId);
   if (run) {
     abortInMemoryRun(run, reason);
   }
-  // Also mark as aborted in SQL (for cross-isolate abort on Workers)
-  markRunAborted(runId, reason).catch(() => {});
   return !!run;
 }
 
-// Re-export so callers can avoid importing from run-store directly.
-export { tryClaimRunSlot } from "./run-store.js";
+export function abortRun(runId: string, reason: string = "user"): boolean {
+  const abortedInMemory = abortRunInMemory(runId, reason);
+  markRunAborted(runId, reason).catch(() => {});
+  return abortedInMemory;
+}
+
+/**
+ * Abort a run and wait until the cross-isolate SQL state and terminal event
+ * are durable. Request handlers that start recovery immediately after aborting
+ * must use this path; otherwise the recovery POST can race the old row while
+ * it is still marked running.
+ */
+export async function abortRunDurably(
+  runId: string,
+  reason: string = "user",
+): Promise<boolean> {
+  const abortedInMemory = abortRunInMemory(runId, reason);
+  try {
+    await markRunAborted(runId, reason);
+  } catch (error) {
+    captureError(error, {
+      route: "/_agent-native/agent-chat/runs/:id/abort",
+      aiTraceId: runId,
+      tags: {
+        source: "agent-run-manager",
+        phase: "abort-run",
+      },
+      extra: {
+        runId,
+        threadId: activeRuns.get(runId)?.threadId,
+        reason,
+        abortedInMemory,
+      },
+    });
+    console.error(
+      "[run-manager] durable abort persistence failed:",
+      error instanceof Error ? error.message : error,
+    );
+  }
+  return abortedInMemory;
+}
+
+export async function abortTurnByRefDurably(
+  threadId: string,
+  turnId: string,
+  reason: string = "user",
+): Promise<"aborted" | "already_terminal"> {
+  for (const run of activeRuns.values()) {
+    if (run.threadId === threadId && run.turnId === turnId) {
+      abortInMemoryRun(run, reason);
+    }
+  }
+  return markTurnAborted(threadId, turnId, reason);
+}
+
+export async function abortTurnDurably(
+  runId: string,
+  reason: string = "user",
+): Promise<void> {
+  const memRun = activeRuns.get(runId);
+  const ref = memRun
+    ? { threadId: memRun.threadId, turnId: memRun.turnId }
+    : await getRunTurnRef(runId).catch(() => null);
+  if (!ref) return;
+  try {
+    await abortTurnByRefDurably(ref.threadId, ref.turnId, reason);
+  } catch (error) {
+    captureError(error, {
+      route: "/_agent-native/agent-chat/runs/:id/abort",
+      aiTraceId: runId,
+      tags: { source: "agent-run-manager", phase: "abort-turn" },
+      extra: { runId, reason, ...ref },
+    });
+  }
+}
+
+export { getSlotHoldingRunId, tryClaimRunSlot } from "./run-store.js";

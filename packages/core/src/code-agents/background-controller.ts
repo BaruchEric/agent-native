@@ -1,8 +1,8 @@
 import {
+  executeDenyCodeAgentApproval,
   executeExistingCodeAgentRun,
   executePendingCodeAgentApproval,
 } from "../cli/code-agent-executor.js";
-import type { AgentPromptAttachment } from "./prompt-attachments.js";
 import {
   appendCodeAgentTranscriptEvent,
   getCodeAgentRunRecord,
@@ -12,6 +12,7 @@ import {
   type CodeAgentFollowUpMode,
   type CodeAgentPermissionMode,
 } from "../cli/code-agent-runs.js";
+import type { ReasoningEffort } from "../shared/reasoning-effort.js";
 import {
   getBackgroundAgentRun,
   listBackgroundAgentRuns,
@@ -21,10 +22,11 @@ import {
   type BackgroundAgentTranscriptEvent,
   type ListBackgroundAgentRunsOptions,
 } from "./background-run.js";
-import type { ReasoningEffort } from "../shared/reasoning-effort.js";
+import type { AgentPromptAttachment } from "./prompt-attachments.js";
 
 export type BackgroundAgentControlCommand =
   | "approve"
+  | "deny"
   | "resume"
   | "retry"
   | "stop";
@@ -246,13 +248,24 @@ async function controlLocalCodeBackgroundAgentRun(
         error: approved ? undefined : `Run not found: ${run.id}`,
       };
     }
+    case "deny": {
+      const denied = await executeDenyCodeAgentApproval(run.id, {
+        stdout: input.stdout,
+      });
+      return {
+        ok: Boolean(denied),
+        runId: run.id,
+        run: denied
+          ? toBackgroundAgentRun(denied)
+          : currentBackgroundRun(run.id),
+        message: denied
+          ? "Pending approval denied for the Agent-Native Code run."
+          : undefined,
+        error: denied ? undefined : `Run not found: ${run.id}`,
+      };
+    }
     case "resume":
     case "retry": {
-      // A control action must return immediately — awaiting
-      // executeExistingCodeAgentRun() runs the entire code session
-      // (potentially minutes), which times out the HTTP/IPC caller.
-      // Kick the run off in the background; progress is surfaced via the
-      // transcript/poll, exactly like the initial run start.
       void executeExistingCodeAgentRun(run.id, {
         stdout: input.stdout,
       }).catch((err) => {

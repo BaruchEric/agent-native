@@ -5,7 +5,7 @@
 > clarity** on (a) exactly what is commented on — which text, which part of an
 > image / wireframe / canvas, with a focused marked screenshot for visual
 > comments, (b) the diff of edits, (c) whether each comment is for a **human** or
-> the **agent** to resolve — plus Figma-grade `@mention` tagging.
+> the **agent** to resolve — plus collaboration-grade `@mention` tagging.
 >
 > This plan is written to be merged into an already-in-progress implementation.
 > It is framed as **what already ships → the real holes → the fixes**, with
@@ -18,7 +18,7 @@
 | Question                                                                     | Today                                                                                                                                                                                                                                                                                                                        | Verdict                                                                  |
 | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
 | Is it clear when a comment should be resolved by a **human vs the agent**?   | A `resolutionTarget` (`'agent' \| 'human'`) toggle exists in the draft UI (`PlansPage.tsx:4587`) and is surfaced to the agent as an `Expected resolver:` line (`comment-context.ts:198`) — but it lives **only inside the anchor JSON blob**, is not a DB column, and the handoff doesn't partition the agent's queue by it. | **Partly. Make it queryable + partition the handoff.**                   |
-| Can you `@tag` org members with Figma-style autocomplete + inline chips?     | Yes — `CommentMentionEditor` (`:4320`) + `useOrgMemberMentionSearch` → `/_agent-native/org/members` (`:433/:451`) + `@[label](mailto:email)` token grammar (`comment-context.ts:55`).                                                                                                                                        | **Yes, already built. Harden, don't rebuild.**                           |
+| Can you `@tag` org members with design-editor autocomplete + inline chips?   | Yes — `CommentMentionEditor` (`:4320`) + `useOrgMemberMentionSearch` → `/_agent-native/org/members` (`:433/:451`) + `@[label](mailto:email)` token grammar (`comment-context.ts:55`).                                                                                                                                        | **Yes, already built. Harden, don't rebuild.**                           |
 | When you comment on a location and pass to the agent, is it **fully clear**? | For **text**: yes-ish — quote + section, with `contextBefore/After` fields that exist but are **unevenly populated**. For **visual/canvas**: **no** — the agent gets coordinates + a label only, and the screenshot path that does exist is **bound to the wrong DOM surface** so canvas pins capture garbage.               | **Text: tighten. Visual: broken — this is the #1 fix.**                  |
 | Do agents get a **screenshot** of the visual location?                       | An in-app capture path exists (`captureFocusedFeedbackImages`, `:2289`, html2canvas + red-ring marker) but: (1) it rasterizes the **prose reader**, not the canvas world, so canvas/wireframe/diagram pins produce empty crops; (2) crops reach **only** the in-app inline agent — external/MCP agents get text-only.        | **No, not reliably. Fix the surface + deliver via the handoff.**         |
 | Does text-by-location attach to the **nearest text**?                        | It stores `textQuote` + `sectionTitle`; `contextBefore/After` (prefix/suffix) exist in the type but aren't reliably filled, and `resolveAnchorTarget` silently picks the first match for duplicate phrases.                                                                                                                  | **Mostly — guarantee prefix/suffix + nearest blockId + ambiguity flag.** |
@@ -176,7 +176,7 @@ rewrite, do not re-derive the anchor type, do not rebuild the mention grammar.
 4. **The handoff is one ordered, target-grouped manifest** — per target, the
    human's edit hunk first, then the comments about that target; open +
    agent-targeted first; resolved/human collapsed; orphaned surfaced, never dropped.
-5. **Additive-only, Neon/Postgres-safe, dialect-agnostic.** No drops / renames /
+5. **Additive-only, Neon/Postgres-safe.** No drops / renames /
    truncation. Backfill-on-read; dual-write for one release.
 
 ---
@@ -209,7 +209,7 @@ resolvedAt:    text("resolved_at"),    // ISO timestamp
 > `mentions_json` / `resolved_by` / `resolved_at` are genuinely nullable (null =
 > unknown / unresolved), so they carry no such hazard. Confirm the approach against
 > the repo's migration/startup pattern; additive only, never `drizzle-kit push` at
-> prod, Neon-dialect-agnostic.
+> prod, Neon/Postgres-safe.
 
 - Re-export `PLAN_COMMENT_RESOLUTION_TARGETS` from `shared/types.ts` (it currently
   lives in `comment-context.ts:1`); extend the `PlanComment` interface

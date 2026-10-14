@@ -1,6 +1,10 @@
-import type { ReasoningEffort } from "../shared/reasoning-effort.js";
-import type { AgentMcpAppPayload } from "../mcp-client/app-result.js";
+import type { AgentSuggestion } from "@agent-native/agentkit/protocol";
+
+import type { A2AAgentActivitySnapshot } from "../a2a/activity.js";
 import type { ActionChatUIConfig } from "../action-ui.js";
+import type { ArtifactReceipt } from "../artifacts/detect.js";
+import type { AgentMcpAppPayload } from "../mcp-client/app-result.js";
+import type { ReasoningEffort } from "../shared/reasoning-effort.js";
 
 export interface AgentNativeJsonSchema {
   type?: string | string[];
@@ -25,6 +29,7 @@ export interface AgentNativeJsonSchema {
 }
 
 export interface ActionTool {
+  title?: string;
   description: string;
   parameters?: AgentNativeJsonSchema & {
     type: "object";
@@ -41,8 +46,130 @@ export interface AgentMessage {
   content: string;
 }
 
+export interface AgentFileMutationProof {
+  path: string;
+  contentSha256: string;
+}
+
+export type AgentActionScopeJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | AgentActionScopeJsonValue[]
+  | { [key: string]: AgentActionScopeJsonValue };
+
+export type AgentActionScope = Record<string, AgentActionScopeJsonValue>;
+
+export const AGENT_ACTION_SCOPE_MAX_BYTES = 8 * 1024;
+const AGENT_ACTION_SCOPE_MAX_DEPTH = 8;
+const AGENT_ACTION_SCOPE_MAX_NODES = 256;
+
+function cloneAgentActionScopeValue(
+  value: unknown,
+  depth: number,
+  state: { nodes: number },
+): AgentActionScopeJsonValue {
+  state.nodes += 1;
+  if (
+    depth > AGENT_ACTION_SCOPE_MAX_DEPTH ||
+    state.nodes > AGENT_ACTION_SCOPE_MAX_NODES
+  ) {
+    throw new TypeError("actionScope exceeds its structural limits");
+  }
+  if (
+    value === null ||
+    typeof value === "boolean" ||
+    typeof value === "string"
+  ) {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new TypeError("actionScope must contain only JSON values");
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const keys = Reflect.ownKeys(value);
+    if (
+      keys.some(
+        (key) =>
+          typeof key !== "string" ||
+          (key !== "length" &&
+            (String(Number(key)) !== key || Number(key) >= value.length)),
+      ) ||
+      Object.keys(value).length !== value.length
+    ) {
+      throw new TypeError("actionScope must contain only JSON arrays");
+    }
+    return Array.from(value, (item) =>
+      cloneAgentActionScopeValue(item, depth + 1, state),
+    );
+  }
+  if (typeof value !== "object") {
+    throw new TypeError("actionScope must contain only JSON values");
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("actionScope must contain only JSON objects");
+  }
+  const object = value as Record<string, unknown>;
+  const keys = Reflect.ownKeys(object);
+  if (
+    keys.some((key) => {
+      if (typeof key !== "string") return true;
+      const descriptor = Object.getOwnPropertyDescriptor(object, key);
+      return !descriptor?.enumerable || !("value" in descriptor);
+    })
+  ) {
+    throw new TypeError("actionScope must contain only JSON values");
+  }
+  return Object.fromEntries(
+    Object.entries(object).map(([key, item]) => [
+      key,
+      cloneAgentActionScopeValue(item, depth + 1, state),
+    ]),
+  );
+}
+
+export function normalizeAgentActionScope(value: unknown): AgentActionScope {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("actionScope must be a JSON object");
+  }
+  const cloned = cloneAgentActionScopeValue(value, 0, {
+    nodes: 0,
+  }) as AgentActionScope;
+  if (
+    new TextEncoder().encode(JSON.stringify(cloned)).byteLength >
+    AGENT_ACTION_SCOPE_MAX_BYTES
+  ) {
+    throw new TypeError(
+      `actionScope must be at most ${AGENT_ACTION_SCOPE_MAX_BYTES} bytes`,
+    );
+  }
+  return cloned;
+}
+
+export function tryNormalizeAgentActionScope(
+  value: unknown,
+): AgentActionScope | undefined {
+  try {
+    return normalizeAgentActionScope(value);
+  } catch (error) {
+    if (error instanceof TypeError) return undefined;
+    throw error;
+  }
+}
+
 export type AgentChatStructuredContentPart =
   | { type: "text"; text: string }
+  | {
+      type: "image-reference";
+      url: string;
+      mediaType?: string;
+      name?: string;
+    }
   | {
       type: "tool-call";
       id?: string;
@@ -51,15 +178,18 @@ export type AgentChatStructuredContentPart =
       toolName?: string;
       input?: unknown;
       args?: unknown;
+      approvalKey?: string;
+      approvalAskId?: string;
     }
   | {
       type: "tool-result";
       toolCallId: string;
-      /** Persisted for replay; omitted in older rows is backfilled server-side. */
       toolName?: string;
       toolInput?: string;
       content: string;
       isError?: boolean;
+      approvalPause?: boolean;
+      approvalAskId?: string;
     };
 
 export interface AgentChatStructuredMessage {
@@ -74,16 +204,54 @@ export interface AgentChatReference {
   source: string;
   refType?: string;
   refId?: string;
+  slotKey?: string;
+  slotLabel?: string;
+  metadata?: Record<string, unknown>;
 }
+
+export type MentionItemMedia =
+  | {
+      type: "text";
+      text: string;
+      backgroundColor?: string;
+    }
+  | {
+      type: "image";
+      src: string;
+      fit?: "contain" | "cover";
+      backgroundColor?: string;
+    }
+  | { type: "none" };
 
 export interface MentionProviderItem {
   id: string;
   label: string;
   description?: string;
   icon?: string;
+  media?: MentionItemMedia;
   refType: string;
   refId?: string;
   refPath?: string;
+  slotKey?: string;
+  slotLabel?: string;
+  metadata?: Record<string, unknown>;
+  clearsSlots?: string[];
+  relatedReferences?: MentionProviderReference[];
+}
+
+export interface MentionProviderReference {
+  label: string;
+  icon?: string;
+  media?: MentionItemMedia;
+  source?: string;
+  refType: string;
+  refId?: string | null;
+  refPath?: string | null;
+  slotKey?: string;
+  slotLabel?: string;
+  metadata?: Record<string, unknown>;
+  clearsSlots?: string[];
+  relatedReferences?: MentionProviderReference[];
 }
 
 export interface MentionProvider {
@@ -91,7 +259,6 @@ export interface MentionProvider {
   icon?: string;
   search: (
     query: string,
-    /** The H3 event for the current request — use to make internal API calls */
     event?: any,
   ) => MentionProviderItem[] | Promise<MentionProviderItem[]>;
 }
@@ -99,7 +266,14 @@ export interface MentionProvider {
 export interface AgentChatAttachment {
   type: string;
   name: string;
+  displayOnly?: boolean;
   data?: string;
+  url?: string;
+  uploadProvider?: string;
+  referenceOnly?: boolean;
+  securityNote?: string;
+  storageRequired?: boolean;
+  storageUploadFailed?: boolean;
   contentType?: string;
   text?: string;
 }
@@ -110,94 +284,209 @@ export interface AgentChatScope {
   label?: string;
 }
 
+export interface AgentChatHarnessRequest {
+  runtime: "claude-code" | "codex" | "pi" | "opencode";
+}
+
 export interface AgentChatRequest {
   message: string;
-  /**
-   * User-visible text to persist in chat history. `message` may be normalized
-   * for the model (for example mention markup or internal continuation text).
-   */
+  /** AgentKit's submitted user message ID, used only to reconcile projections. */
+  agentKitMessageId?: string;
+  actionScope?: AgentActionScope;
+  queuedMessageId?: string;
+  queuedMessageClaimId?: string;
   displayMessage?: string;
   history?: AgentMessage[];
-  /**
-   * Provider-neutral transcript used for run recovery. Unlike `history`,
-   * this preserves assistant tool calls and matching tool results so
-   * continuation turns do not re-run completed read-only tools.
-   */
   structuredHistory?: AgentChatStructuredMessage[];
+  loadedSkillSlugs?: string[];
   references?: AgentChatReference[];
   threadId?: string;
+  parentId?: string | null;
   attachments?: AgentChatAttachment[];
-  /** Internal retry/continuation requests should not create visible user turns. */
   internalContinuation?: boolean;
+  /** The time-limit stop this request continues, in the same turn. */
+  autoContinueOfRunId?: string;
+  /** The stopped run a person chose to continue, in the same turn. */
+  continueOfRunId?: string;
+  __backgroundRun?: {
+    runId: string;
+    turnId?: string;
+    continuationReason?:
+      | "run_timeout"
+      | "loop_limit"
+      | "max_tokens"
+      | "no_progress"
+      | "stream_ended"
+      | "gateway_timeout"
+      | "network_interrupted"
+      | "rate_limited";
+    actionPreparationTool?: string;
+    continuationCount?: number;
+    noProgressErrorCode?: string;
+    noProgressCount?: number;
+    backgroundFunctionRuntimeExpected?: boolean;
+    payloadRef?: boolean;
+  };
   /**
-   * Stable identity for the logical assistant turn this request belongs to.
-   * The client sends the SAME turnId for the initial POST and every
-   * auto-continuation re-POST of one turn, so the server can fold each
-   * continuation run's output onto a single durable assistant message instead
-   * of dropping the earlier chunks. Defaults to the run id when absent.
+   * Server-resolved action authorization carried across authenticated durable
+   * background dispatches. Normal client requests must not trust this field;
+   * the foreground handler deletes and replaces it before persistence.
    */
+  __resolvedActionSurface?:
+    | {
+        orgId: string | null;
+        allowedActionNames: string[];
+        actionScope?: AgentActionScope;
+      }
+    | {
+        orgId: string | null;
+        mode: "default";
+      };
+  /**
+   * Names of the request-scoped additional actions the turn started with,
+   * carried across authenticated durable background dispatches so a
+   * continuation keeps the same tool set. Deleted from client requests.
+   */
+  __resolvedAdditionalActionNames?: string[];
   turnId?: string;
-  /** Execution mode for this turn. Plan mode is read-only and proposes before acting. */
+  /** Turn metadata the client forwards; read only for the keys it names. */
+  metadata?: Record<string, unknown>;
   mode?: "act" | "plan";
-  /** Per-request model override (ephemeral, from the composer model picker). */
   model?: string;
-  /** Per-request engine override (sent alongside model for cross-provider switches). */
   engine?: string;
-  /** Per-request reasoning effort override (ephemeral, from the composer picker). */
   effort?: ReasoningEffort;
-  /** Usage-tracking label for this call (e.g. "chat", "summarize"). Default: "chat". */
   usageLabel?: string;
-  /** Stable browser tab id so screen/url context and navigation commands are tab-scoped. */
   browserTabId?: string;
-  /** Resource scope for this chat thread, e.g. the deck currently bound to the tab. */
   scope?: AgentChatScope | null;
-  /** When true, expose this chat turn as a user-visible run in RunsTray. */
+  harness?: AgentChatHarnessRequest;
   trackInRunsTray?: boolean;
-  /**
-   * Approval grants for human-in-the-loop actions. Each entry is a stable
-   * approval key (see the `approval_required` event's `approvalKey`). When the
-   * agent calls an action declared `needsApproval`, the loop pauses and emits
-   * `approval_required`; the client re-issues the turn (typically an empty
-   * continuation) with the approved call's key here so the gate lets it run.
-   * Keys not present here keep the action paused. The model never sees or sets
-   * this — it is supplied by the human's approve affordance.
-   */
   approvedToolCalls?: string[];
+  approvedToolCallAskIds?: string[];
+  skipPendingSelectionContext?: boolean;
+}
+
+export type AgentToolInput = Record<string, unknown>;
+
+export interface AgentChatRichEventReference {
+  kind: string;
+  id: string;
+  label?: string;
+  uri?: string;
+}
+
+export interface AgentChatRichEventEnvelope {
+  namespace: string;
+  name: string;
+  version?: number;
+  data?: unknown;
+  references?: AgentChatRichEventReference[];
+  metadata?: Record<string, unknown>;
 }
 
 export type AgentChatEvent =
   | { type: "text"; text: string }
   | { type: "thinking"; text: string }
-  | { type: "activity"; label: string; tool?: string }
-  | { type: "tool_start"; tool: string; input: Record<string, string> }
+  | { type: "suggestions"; suggestions: AgentSuggestion[] }
+  | { type: "rich_event"; event: AgentChatRichEventEnvelope }
+  | {
+      type: "activity";
+      label: string;
+      tool?: string;
+      id?: string;
+      progressBytes?: number;
+    }
+  /** The model is still assembling an action input; sent before tool_start. */
+  | { type: "tool_input_start"; tool?: string; id?: string }
+  /** Incremental action-input text, kept separate from the finalized input. */
+  | { type: "tool_input_delta"; tool?: string; id?: string; text: string }
+  | { type: "stream_keepalive" }
+  | {
+      type: "model_stream";
+      status: "start" | "end";
+      reason?:
+        | "end_turn"
+        | "tool_use"
+        | "max_tokens"
+        | "stop_sequence"
+        | "error";
+      errorCode?: string;
+    }
+  | {
+      type: "tool_start";
+      tool: string;
+      id?: string;
+      input: AgentToolInput;
+      inputFingerprint?: string;
+      inputStoredFingerprint?: string;
+    }
   | {
       type: "tool_done";
       tool: string;
+      id?: string;
+      input?: AgentToolInput;
+      inputFingerprint?: string;
+      inputStoredFingerprint?: string;
       result: string;
+      isError?: boolean;
+      errorCode?: string;
+      completedSideEffect?: boolean;
+      /** False marks current completed events; absence is reserved for older journals. */
+      approvalPause?: boolean;
+      outcomeUnknown?: true;
+      replayed?: true;
+      fileMutation?: AgentFileMutationProof;
+      artifacts?: ArtifactReceipt[];
       mcpApp?: AgentMcpAppPayload;
       chatUI?: ActionChatUIConfig;
+      chatUIResult?: unknown;
     }
   | {
-      /**
-       * The agent tried to call an action declared `needsApproval` and the loop
-       * paused instead of executing it. The client should surface an
-       * approve/deny affordance; on approve, re-issue the turn with
-       * `approvedToolCalls: [approvalKey]` so the gate lets this call run.
-       */
       type: "approval_required";
       tool: string;
       input: Record<string, string>;
-      /** Stable key the client echoes back in `approvedToolCalls` to approve. */
       approvalKey: string;
-      /** The model-side tool-call id for this paused call, when available. */
+      allowPersistentApproval?: false;
       toolCallId?: string;
+      askId?: string;
+    }
+  | {
+      type: "connection_required";
+      requestId: string;
+      provider: string;
+      reason: "connect" | "grant" | "reauthorize" | "admin_required";
+      appId?: string;
+      detail?: string;
+      source?: { id: string; kind?: string; label?: string };
     }
   | {
       type: "agent_call";
       agent: string;
-      status: "start" | "done" | "error";
+      status: "start" | "done" | "pending" | "error";
+      agentCallId?: string;
+      taskId?: string;
+      durationMs?: number;
+      terminalCode?: string;
     }
-  | { type: "agent_call_text"; agent: string; text: string }
+  | {
+      type: "agent_call_progress";
+      agent: string;
+      state: string;
+      elapsedSeconds: number;
+      detail?: string;
+      agentCallId?: string;
+    }
+  | {
+      type: "agent_call_text";
+      agent: string;
+      text: string;
+      agentCallId?: string;
+    }
+  | {
+      type: "agent_call_activity";
+      agent: string;
+      snapshot: A2AAgentActivitySnapshot;
+      agentCallId?: string;
+    }
   | {
       type: "agent_task";
       taskId: string;
@@ -216,22 +505,19 @@ export type AgentChatEvent =
       taskId: string;
       summary: string;
     }
-  | { type: "done" }
+  | {
+      type: "done";
+      reason?: "user" | "loop_breaker";
+      message?: string;
+    }
   | {
       type: "error";
       error: string;
-      /**
-       * Optional machine-readable error code. Builder gateway uses codes
-       * like "credits-limit-monthly" / "unauthorized" / "gateway_not_enabled"
-       * so the chat UI can render a structured CTA (e.g. upgrade button).
-       */
       errorCode?: string;
-      /** Optional link paired with errorCode — e.g. Builder billing page. */
       upgradeUrl?: string;
-      /** Optional details for expandable UI/debugging. */
       details?: string;
-      /** True when the user can reasonably continue/retry from partial work. */
       recoverable?: boolean;
+      providerRetryable?: boolean;
     }
   /**
    * Legacy SSE terminal event. New streams emit
@@ -240,33 +526,45 @@ export type AgentChatEvent =
   | { type: "missing_api_key" }
   | { type: "loop_limit"; maxIterations?: number }
   | {
-      /**
-       * An in-loop `Processor` aborted the run via `abort()` (which throws a
-       * `TripWire`). The loop catches it, emits this event, stops cleanly, and
-       * surfaces the reason as a final assistant message. Structural hook for
-       * real-time guardrails and a proof-of-done / coverage gate.
-       */
       type: "tripwire";
       reason: string;
-      /** Name of the processor that aborted, when it declared one. */
       processor?: string;
     }
   | {
       type: "auto_continue";
-      reason:
-        | "run_timeout"
-        | "loop_limit"
-        | "no_progress"
-        | "stream_ended"
-        | "gateway_timeout"
-        | "network_interrupted";
+      reason: ContinuationReason;
       maxIterations?: number;
     }
   | { type: "clear" };
+
+export const CONTINUATION_REASONS = [
+  "run_timeout",
+  "loop_limit",
+  "max_tokens",
+  "no_progress",
+  "stream_ended",
+  "gateway_timeout",
+  "network_interrupted",
+  "rate_limited",
+] as const;
+
+export type ContinuationReason = (typeof CONTINUATION_REASONS)[number];
+
+export function isContinuationTerminalReason(reason: unknown): boolean {
+  return (
+    reason === "auto_continue" ||
+    CONTINUATION_REASONS.includes(reason as ContinuationReason)
+  );
+}
 
 export interface RunEvent {
   seq: number;
   event: AgentChatEvent;
 }
 
-export type RunStatus = "running" | "completed" | "errored" | "aborted";
+export type RunStatus =
+  | "running"
+  | "completed"
+  | "truncated"
+  | "errored"
+  | "aborted";

@@ -1,14 +1,55 @@
+import { useLocale, useT } from "@agent-native/core/client/i18n";
+import {
+  chatModelSelectionStorageKey,
+  focusAgentChat,
+  useAgentEngineConfigured,
+  useChatModels,
+} from "@agent-native/toolkit/app/chat";
+import { BuilderSetupCard } from "@agent-native/toolkit/app/chat/chat/run-recovery";
+import { isLocalRuntimeEngine } from "@agent-native/toolkit/app/chat/composer";
+import { submitToAgent } from "@agent-native/toolkit/app/shared";
+import {
+  IconLayoutSidebarRight,
+  IconMessage,
+  IconMoon,
+  IconSun,
+} from "@tabler/icons-react";
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useNavigate, Link } from "react-router";
 import { createPortal } from "react-dom";
-import { buildSearchIndex, type SearchEntry } from "./docs-content";
+import { useNavigate, Link } from "react-router";
 
-// Lazily built on first open — not at module scope — so the index and the full
-// docs corpus are not included in the initial page bundle.
-let cachedIndex: SearchEntry[] | null = null;
-function getSearchIndex(): SearchEntry[] {
-  if (!cachedIndex) cachedIndex = buildSearchIndex();
-  return cachedIndex;
+import { useAssistantReady } from "../shell-ready";
+import { buildSearchIndexAsync, type SearchEntry } from "./docs-content";
+import { docsPathForSlug } from "./docs-locale";
+import { useDocsTheme } from "./ThemeToggle";
+
+const cachedIndexes = new Map<string, SearchEntry[]>();
+const pendingIndexes = new Map<string, Promise<SearchEntry[]>>();
+function getCachedSearchIndex(locale: string): SearchEntry[] | null {
+  const cached = cachedIndexes.get(locale);
+  return cached ?? null;
+}
+
+function loadSearchIndex(locale: string): Promise<SearchEntry[]> {
+  const cached = cachedIndexes.get(locale);
+  if (cached) return Promise.resolve(cached);
+
+  const pending = pendingIndexes.get(locale);
+  if (pending) return pending;
+
+  const promise = Promise.resolve()
+    .then(() => buildSearchIndexAsync(locale))
+    .then((index) => {
+      cachedIndexes.set(locale, index);
+      pendingIndexes.delete(locale);
+      return index;
+    })
+    .catch((error) => {
+      pendingIndexes.delete(locale);
+      throw error;
+    });
+  pendingIndexes.set(locale, promise);
+  return promise;
 }
 
 function highlightMatch(text: string, query: string) {
@@ -32,9 +73,8 @@ function highlightMatch(text: string, query: string) {
   );
 }
 
-function search(query: string): SearchEntry[] {
+function search(query: string, index: SearchEntry[]): SearchEntry[] {
   if (!query.trim()) return [];
-  const index = getSearchIndex();
   const q = query.toLowerCase();
   const words = q.split(/\s+/).filter(Boolean);
 
@@ -53,7 +93,6 @@ function search(query: string): SearchEntry[] {
         if (pageLower.includes(word)) score += isPageEntry ? 5 : 2;
         if (textLower.includes(word)) score += 3;
       }
-      // exact phrase bonus
       if (keywordsLower.includes(q)) score += 35;
       if (pageLower.includes(q)) score += isPageEntry ? 25 : 5;
       if (textLower.includes(q)) score += 20;
@@ -68,23 +107,6 @@ function search(query: string): SearchEntry[] {
   return scored.map((r) => r.entry);
 }
 
-export function useSearchModal() {
-  const [open, setOpen] = useState(false);
-
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
-        e.preventDefault();
-        setOpen(true);
-      }
-    }
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, []);
-
-  return { open, setOpen };
-}
-
 export function SearchModal({
   open,
   onClose,
@@ -93,15 +115,123 @@ export function SearchModal({
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const searchGeneration = useRef(0);
+  const ensureAssistantReady = useAssistantReady();
   const [activeIdx, setActiveIdx] = useState(0);
+  const [index, setIndex] = useState<SearchEntry[]>([]);
+  const [indexError, setIndexError] = useState<unknown>(null);
+  const [retryCount, setRetryCount] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const modalRef = useRef<HTMLDivElement>(null);
+  const activeItemRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<Element | null>(null);
   const navigate = useNavigate();
-  const results = search(query);
+  const { locale } = useLocale();
+  const t = useT();
+  const models = useChatModels({
+    enabled: false,
+    storageKey: chatModelSelectionStorageKey("docs"),
+  });
+  const shouldCheckProviderStatus = !isLocalRuntimeEngine(
+    models.selectedEngine,
+  );
+  const providerStatusCheck = useAgentEngineConfigured(
+    shouldCheckProviderStatus,
+  );
+  const providerStatus = shouldCheckProviderStatus
+    ? providerStatusCheck.state
+    : "configured";
+  const chatReady = providerStatus === "configured";
+  const { theme, toggleTheme } = useDocsTheme();
+  const results = search(query, index);
+  const themeSearchTerms = [
+    t("theme.toggle"),
+    t("theme.light"),
+    t("theme.dark"),
+    "theme",
+    "light",
+    "dark",
+    "mode",
+  ]
+    .join(" ")
+    .toLowerCase();
+  const sidebarSearchTerms = [
+    t("search.toggleChatSidebar"),
+    "chat",
+    "sidebar",
+    "assistant",
+  ]
+    .join(" ")
+    .toLowerCase();
+  const queryWords = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+  const showThemeAction =
+    queryWords.length === 0 ||
+    queryWords.every((word) => themeSearchTerms.includes(word));
+  const showSidebarAction =
+    queryWords.length === 0 ||
+    queryWords.every((word) => sidebarSearchTerms.includes(word));
+  const actionItems = [
+    showThemeAction ? "theme" : null,
+    showSidebarAction ? "sidebar" : null,
+  ].filter((action): action is "theme" | "sidebar" => action !== null);
+  const resultIndexOffset = actionItems.length;
+  const askAiIndex = resultIndexOffset + results.length;
 
-  // Focus management: save focus before open, restore on close
+  const toggleChatSidebar = useCallback(() => {
+    window.dispatchEvent(new Event("agent-panel:toggle"));
+  }, []);
+
+  const submitAskAi = useCallback(async () => {
+    if (!chatReady || submitting) return;
+    const message = query.trim();
+    const generation = searchGeneration.current;
+    setSubmitting(true);
+    await ensureAssistantReady();
+    if (searchGeneration.current !== generation) return;
+    onClose();
+    setSubmitting(false);
+    if (!message) {
+      focusAgentChat();
+      return;
+    }
+    submitToAgent(message);
+  }, [chatReady, submitting, ensureAssistantReady, onClose, query]);
+
+  const retryProviderStatus = useCallback(() => {
+    window.dispatchEvent(new Event("agent-engine:configured-changed"));
+  }, []);
+
   useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    const cached = getCachedSearchIndex(locale);
+    if (cached) {
+      setIndex(cached);
+      setIndexError(null);
+      return;
+    }
+    setIndex([]);
+    setIndexError(null);
+    void loadSearchIndex(locale)
+      .then((loaded) => {
+        if (cancelled) return;
+        setIndex(loaded);
+        setIndexError(null);
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        console.error("Docs search index failed to load", error);
+        setIndexError(error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [locale, open, retryCount]);
+
+  useEffect(() => {
+    searchGeneration.current += 1;
+    setSubmitting(false);
     if (open) {
       previousFocusRef.current = document.activeElement;
       setQuery("");
@@ -111,15 +241,22 @@ export function SearchModal({
       previousFocusRef.current.focus();
       previousFocusRef.current = null;
     }
+    return () => {
+      searchGeneration.current += 1;
+    };
   }, [open]);
 
   useEffect(() => {
     setActiveIdx(0);
   }, [query]);
 
+  useEffect(() => {
+    activeItemRef.current?.scrollIntoView({ block: "nearest" });
+  }, [activeIdx, results, showSidebarAction, showThemeAction]);
+
   const go = useCallback(
     (entry: SearchEntry) => {
-      navigate(
+      void navigate(
         entry.sectionId ? `${entry.path}#${entry.sectionId}` : entry.path,
       );
       onClose();
@@ -127,7 +264,6 @@ export function SearchModal({
     [navigate, onClose],
   );
 
-  // Keyboard: Escape, arrows, Enter, and Tab focus trap
   useEffect(() => {
     if (!open) return;
     function onKey(e: KeyboardEvent) {
@@ -135,14 +271,31 @@ export function SearchModal({
         onClose();
       } else if (e.key === "ArrowDown") {
         e.preventDefault();
-        setActiveIdx((i) => Math.min(i + 1, results.length - 1));
+        const maxIndex = askAiIndex;
+        setActiveIdx((i) => Math.min(i + 1, maxIndex));
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
         setActiveIdx((i) => Math.max(i - 1, 0));
-      } else if (e.key === "Enter" && results[activeIdx]) {
-        go(results[activeIdx]);
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        if (showThemeAction && activeIdx === 0) {
+          toggleTheme();
+          onClose();
+          return;
+        }
+        const sidebarActionIndex = showThemeAction ? 1 : 0;
+        if (showSidebarAction && activeIdx === sidebarActionIndex) {
+          toggleChatSidebar();
+          onClose();
+          return;
+        }
+        if (activeIdx === askAiIndex) {
+          submitAskAi();
+          return;
+        }
+        const result = results[activeIdx - resultIndexOffset];
+        if (result) go(result);
       } else if (e.key === "Tab") {
-        // Focus trap: cycle focus within the modal
         const modal = modalRef.current;
         if (!modal) return;
         const focusable = Array.from(
@@ -168,7 +321,67 @@ export function SearchModal({
     }
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [open, results, activeIdx, go, onClose]);
+  }, [
+    open,
+    results,
+    activeIdx,
+    askAiIndex,
+    go,
+    onClose,
+    resultIndexOffset,
+    showSidebarAction,
+    showThemeAction,
+    submitAskAi,
+    toggleChatSidebar,
+    toggleTheme,
+  ]);
+
+  const actionButtons = actionItems.map((action, i) => (
+    <button
+      key={action}
+      ref={i === activeIdx ? activeItemRef : undefined}
+      type="button"
+      onClick={() => {
+        if (action === "theme") toggleTheme();
+        else toggleChatSidebar();
+        onClose();
+      }}
+      onMouseEnter={() => setActiveIdx(i)}
+      className={`flex w-full items-center gap-3 px-4 py-3 text-start text-sm transition-colors ${
+        i === activeIdx
+          ? "bg-[var(--docs-accent)]/10"
+          : "hover:bg-[var(--bg-secondary)]"
+      }`}
+    >
+      {action === "theme" ? (
+        theme === "dark" ? (
+          <IconSun
+            size={16}
+            stroke={1.5}
+            className="shrink-0 text-[var(--docs-accent)]"
+            aria-hidden="true"
+          />
+        ) : (
+          <IconMoon
+            size={16}
+            stroke={1.5}
+            className="shrink-0 text-[var(--docs-accent)]"
+            aria-hidden="true"
+          />
+        )
+      ) : (
+        <IconLayoutSidebarRight
+          size={16}
+          stroke={1.5}
+          className="shrink-0 text-[var(--docs-accent)]"
+          aria-hidden="true"
+        />
+      )}
+      <span className="font-medium text-[var(--fg)]">
+        {action === "theme" ? t("theme.toggle") : t("search.toggleChatSidebar")}
+      </span>
+    </button>
+  ));
 
   if (!open) return null;
 
@@ -185,7 +398,7 @@ export function SearchModal({
         ref={modalRef}
         role="dialog"
         aria-modal="true"
-        aria-label="Search documentation"
+        aria-label={t("search.dialogLabel")}
         className="relative w-full max-w-[600px] mx-4 overflow-hidden rounded-xl border border-[var(--docs-border)] bg-[var(--bg)] shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
@@ -209,11 +422,15 @@ export function SearchModal({
           <input
             ref={inputRef}
             type="text"
-            placeholder="Search documentation..."
+            placeholder={t("search.placeholder")}
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              searchGeneration.current += 1;
+              setSubmitting(false);
+              setQuery(e.target.value);
+            }}
             className="flex-1 border-0 bg-transparent text-base text-[var(--fg)] outline-none placeholder:text-[var(--fg-secondary)]"
-            aria-label="Search documentation"
+            aria-label={t("search.dialogLabel")}
           />
           <kbd className="rounded border border-[var(--docs-border)] px-1.5 py-0.5 text-[10px] text-[var(--fg-secondary)]">
             Esc
@@ -222,30 +439,50 @@ export function SearchModal({
 
         {/* results */}
         <div className="max-h-[400px] overflow-y-auto">
-          {query.trim() === "" ? (
+          {query.trim() ? actionButtons : null}
+          {indexError ? (
             <div className="px-4 py-8 text-center text-sm text-[var(--fg-secondary)]">
-              Type to search across all documentation
+              <p className="mb-3">{t("search.loadError")}</p>
+              <button
+                type="button"
+                onClick={() => setRetryCount((count) => count + 1)}
+                className="inline-flex items-center rounded-md border border-[var(--docs-border)] px-3 py-1.5 text-xs text-[var(--fg)] transition hover:border-[var(--fg-secondary)]"
+              >
+                {t("search.retry")}
+              </button>
             </div>
-          ) : results.length === 0 ? (
+          ) : query.trim() === "" ? (
+            <div className="px-4 pt-8 text-center text-sm text-[var(--fg-secondary)]">
+              {t("search.empty")}
+              <div className="-mx-4 mt-6 border-t border-[var(--docs-border)] py-2">
+                {actionButtons}
+              </div>
+            </div>
+          ) : results.length === 0 && actionItems.length === 0 ? (
             <div className="px-4 py-8 text-center text-sm text-[var(--fg-secondary)]">
-              <p className="mb-3">No results found for &quot;{query}&quot;</p>
+              <p className="mb-3">{t("search.noResults", { query })}</p>
               <Link
-                to="/docs"
+                to={docsPathForSlug("getting-started", locale)}
                 onClick={onClose}
                 className="inline-flex items-center gap-1 rounded-md border border-[var(--docs-border)] px-3 py-1.5 text-xs text-[var(--fg)] no-underline transition hover:border-[var(--fg-secondary)]"
               >
-                Browse all docs
+                {t("search.browseAllDocs")}
               </Link>
             </div>
           ) : (
-            <div className="py-2">
+            <div className={results.length > 0 ? "py-2" : undefined}>
               {results.map((entry, i) => (
                 <button
                   key={`${entry.path}-${entry.sectionId}`}
+                  ref={
+                    i + resultIndexOffset === activeIdx
+                      ? activeItemRef
+                      : undefined
+                  }
                   onClick={() => go(entry)}
-                  onMouseEnter={() => setActiveIdx(i)}
-                  className={`flex w-full flex-col gap-1 px-4 py-3 text-left transition ${
-                    i === activeIdx
+                  onMouseEnter={() => setActiveIdx(i + resultIndexOffset)}
+                  className={`flex w-full flex-col gap-1 px-4 py-3 text-start transition ${
+                    i + resultIndexOffset === activeIdx
                       ? "bg-[var(--docs-accent)]/10"
                       : "hover:bg-[var(--bg-secondary)]"
                   }`}
@@ -257,7 +494,7 @@ export function SearchModal({
                       viewBox="0 0 24 24"
                       fill="none"
                       stroke={
-                        i === activeIdx
+                        i + resultIndexOffset === activeIdx
                           ? "var(--docs-accent)"
                           : "var(--fg-secondary)"
                       }
@@ -281,11 +518,11 @@ export function SearchModal({
                       </>
                     )}
                     <span
-                      className={`text-sm font-medium ${i === activeIdx ? "text-[var(--docs-accent)]" : "text-[var(--fg)]"}`}
+                      className={`text-sm font-medium ${i + resultIndexOffset === activeIdx ? "text-[var(--docs-accent)]" : "text-[var(--fg)]"}`}
                     >
                       {entry.section}
                     </span>
-                    {i === activeIdx && (
+                    {i + resultIndexOffset === activeIdx && (
                       <svg
                         width="14"
                         height="14"
@@ -295,7 +532,7 @@ export function SearchModal({
                         strokeWidth="2"
                         strokeLinecap="round"
                         strokeLinejoin="round"
-                        className="ml-auto shrink-0"
+                        className="ms-auto shrink-0 rtl:-scale-x-100"
                         aria-hidden="true"
                       >
                         <polyline points="9 10 4 15 9 20" />
@@ -303,7 +540,7 @@ export function SearchModal({
                       </svg>
                     )}
                   </div>
-                  <div className="pl-[22px] text-xs leading-relaxed">
+                  <div className="ps-[22px] text-xs leading-relaxed">
                     {highlightMatch(entry.text, query)}
                   </div>
                 </button>
@@ -312,32 +549,60 @@ export function SearchModal({
           )}
         </div>
 
-        {/* footer */}
-        {results.length > 0 && (
-          <div className="flex items-center gap-4 border-t border-[var(--docs-border)] px-4 py-2 text-[10px] text-[var(--fg-secondary)]">
-            <span className="inline-flex items-center gap-1">
-              <kbd className="rounded border border-[var(--docs-border)] px-1 py-0.5">
-                ↑
-              </kbd>
-              <kbd className="rounded border border-[var(--docs-border)] px-1 py-0.5">
-                ↓
-              </kbd>
-              navigate
+        <div className="border-t border-[var(--docs-border)] py-2">
+          {providerStatus === "missing" ? (
+            <BuilderSetupCard attached fullWidth layout="sidebar" />
+          ) : providerStatus === "unavailable" ? (
+            <div
+              className="mx-3 mb-1 flex items-center justify-between gap-3 rounded-md border border-[var(--docs-border)] bg-[var(--bg-secondary)] px-3 py-2 text-sm text-[var(--fg-secondary)]"
+              role="status"
+            >
+              <span>{t("agentChat.setup.providerStatusUnavailable")}</span>
+              {providerStatus === "unavailable" ? (
+                <button
+                  type="button"
+                  className="shrink-0 font-medium text-[var(--fg)] underline-offset-4 hover:underline"
+                  onClick={retryProviderStatus}
+                >
+                  {t("agentChat.common.retry")}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          <button
+            ref={activeIdx === askAiIndex ? activeItemRef : undefined}
+            type="button"
+            onClick={submitAskAi}
+            onMouseEnter={() => setActiveIdx(askAiIndex)}
+            disabled={!chatReady || submitting}
+            aria-busy={submitting}
+            className={`flex w-full items-center gap-3 px-4 py-3 text-start text-sm transition disabled:cursor-not-allowed disabled:opacity-50 ${
+              activeIdx === askAiIndex
+                ? "bg-[var(--docs-accent)]/10"
+                : "hover:bg-[var(--bg-secondary)]"
+            }`}
+          >
+            <IconMessage
+              size={16}
+              stroke={1.5}
+              className="shrink-0 text-[var(--docs-accent)]"
+              aria-hidden="true"
+            />
+            <span className="min-w-0 truncate font-medium text-[var(--fg)]">
+              {t("header.askAssistant")}
+              {query.trim() ? (
+                <span className="font-normal text-[var(--fg-secondary)]">
+                  : "{query}"
+                </span>
+              ) : null}
             </span>
-            <span className="inline-flex items-center gap-1">
-              <kbd className="rounded border border-[var(--docs-border)] px-1 py-0.5">
+            {query.trim() ? (
+              <kbd className="ms-auto shrink-0 text-[10px] text-[var(--fg-secondary)]">
                 ↵
               </kbd>
-              open
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <kbd className="rounded border border-[var(--docs-border)] px-1 py-0.5">
-                esc
-              </kbd>
-              close
-            </span>
-          </div>
-        )}
+            ) : null}
+          </button>
+        </div>
       </div>
     </div>,
     document.body,

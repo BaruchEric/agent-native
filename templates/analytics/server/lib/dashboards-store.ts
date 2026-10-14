@@ -1,18 +1,13 @@
-/**
- * Dashboards + analyses store — SQL first, legacy settings-KV as
- * read-only fallback. Writes always go to SQL.
- *
- * Lazy migration: when a record is fetched by id and exists only in the
- * legacy settings store, it is copied into SQL on the fly using the
- * settings key as the source of truth for `ownerEmail` / `orgId` /
- * `visibility`, then returned. Subsequent reads hit SQL directly.
- *
- * - `u:<email>:dashboard-{id}`     → kind='explorer', owner=email,  visibility='private'
- * - `u:<email>:sql-dashboard-{id}` → kind='sql',      owner=email,  visibility='private'
- * - `o:<orgId>:sql-dashboard-{id}` → kind='sql',      owner=caller, visibility='org'
- * - `adhoc-analysis-{id}`          → owner=caller,   legacy visibility from its source key
- */
-import { and, eq, isNotNull, isNull } from "drizzle-orm";
+import { createHash } from "node:crypto";
+
+import { getRequestRunContext, recordChange } from "@agent-native/core/server";
+import {
+  getOrgSetting,
+  getUserSetting,
+  deleteOrgSetting,
+  deleteUserSetting,
+  listSettingsByPrefix,
+} from "@agent-native/core/settings";
 import {
   accessFilter,
   assertAccess,
@@ -20,15 +15,30 @@ import {
   resolveAccess,
   type ShareRole,
 } from "@agent-native/core/sharing";
-import { recordChange } from "@agent-native/core/server";
 import {
-  getAllSettings,
-  getOrgSetting,
-  getUserSetting,
-  deleteOrgSetting,
-  deleteUserSetting,
-} from "@agent-native/core/settings";
+  and,
+  asc,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  or,
+  sql,
+} from "drizzle-orm";
+
+import { normalizeDashboardConfig } from "../../shared/dashboard-config-normalization";
 import { getDb, schema } from "../db/index.js";
+import {
+  decodeSearchCursor,
+  matchSearchFields,
+  paginateSearchResults,
+  searchTerms,
+} from "./analytics-term-matcher.js";
+import {
+  parseDashboardCertification,
+  type DashboardCertification,
+} from "./dashboard-certification.js";
 
 export type DashboardKind = "explorer" | "sql";
 export type AccessRole = "owner" | ShareRole;
@@ -42,17 +52,83 @@ export interface DashboardRecord {
   orgId: string | null;
   visibility: "private" | "org" | "public";
   createdAt: string;
+  createdBy: string | null;
   updatedAt: string;
-  /** ISO timestamp set when the dashboard is archived. Null = active. */
+  updatedBy: string | null;
   archivedAt: string | null;
-  /** ISO timestamp set when the dashboard is hidden from default navigation. */
   hiddenAt: string | null;
   hiddenBy: string | null;
-  /** Effective role for the caller when loaded by id. List rows omit this. */
+  certification?: DashboardCertification;
   role?: AccessRole;
   canEdit?: boolean;
   canManage?: boolean;
 }
+
+export interface DashboardSummaryRecord {
+  id: string;
+  kind: DashboardKind;
+  name: string;
+  description: string | null;
+  configName: string | null;
+  catalogTemplateId: string | null;
+  demoId: string | null;
+  parentId: string | null;
+  folderId: string | null;
+  ownerEmail: string;
+  orgId: string | null;
+  visibility: "private" | "org" | "public";
+  createdAt: string;
+  updatedAt: string;
+  archivedAt: string | null;
+  hiddenAt: string | null;
+  hiddenBy: string | null;
+  certification?: DashboardCertification;
+  favorite?: boolean;
+}
+
+export interface DashboardReferenceRecord {
+  id: string;
+  kind: DashboardKind;
+  name: string;
+  description: string | null;
+  ownerEmail: string;
+  orgId: string | null;
+  visibility: "private" | "org" | "public";
+  updatedAt: string;
+  certification?: DashboardCertification;
+  certified?: boolean;
+  matchedFields: Array<"id" | "name" | "description" | "config">;
+}
+
+export interface DashboardCatalogRecord {
+  id: string;
+  kind: DashboardKind;
+  title: string;
+  description: string | null;
+  config: Record<string, unknown>;
+  updatedAt?: string;
+  certification?: DashboardCertification;
+}
+
+const MAX_CATALOG_DASHBOARD_HYDRATION = 24;
+
+export interface DashboardRevisionRecord {
+  id: string;
+  dashboardId: string;
+  kind: DashboardKind;
+  title: string;
+  config: Record<string, unknown>;
+  createdAt: string;
+  createdBy: string | null;
+  chatContext: AnalyticsRevisionChatContext | null;
+}
+
+export type DashboardRevisionMetadata = Omit<
+  DashboardRevisionRecord,
+  "config"
+> & {
+  chatContextStatus: RevisionChatContextStatus;
+};
 
 export type DashboardArchiveFilter = "active" | "archived" | "all";
 export type DashboardHiddenFilter = "visible" | "hidden" | "all";
@@ -72,26 +148,385 @@ export interface AnalysisRecord {
   visibility: "private" | "org" | "public";
   createdAt: string;
   updatedAt: string;
-  /** ISO timestamp set when the analysis is hidden from default navigation. */
   hiddenAt: string | null;
   hiddenBy: string | null;
-  /** Effective role for the caller when loaded by id. List rows omit this. */
   role?: AccessRole;
   canEdit?: boolean;
   canManage?: boolean;
 }
+
+export interface AnalysisRevisionRecord {
+  id: string;
+  analysisId: string;
+  name: string;
+  description: string;
+  question: string;
+  instructions: string;
+  dataSources: string[];
+  resultMarkdown: string;
+  resultData: Record<string, unknown> | null;
+  createdAt: string;
+  createdBy: string | null;
+  chatContext: AnalyticsRevisionChatContext | null;
+}
+
+export interface AnalyticsRevisionChatContext {
+  threadId?: string;
+  runId?: string;
+  turnId?: string;
+}
+
+export type RevisionChatContextStatus = "absent" | "valid" | "unreadable";
+
+export type AnalysisRevisionMetadata = Pick<
+  AnalysisRevisionRecord,
+  | "id"
+  | "analysisId"
+  | "name"
+  | "description"
+  | "createdAt"
+  | "createdBy"
+  | "chatContext"
+> & {
+  chatContextStatus: RevisionChatContextStatus;
+};
 
 interface AccessCtx {
   email: string;
   orgId: string | null;
 }
 
+async function getScopedLegacySettings(
+  ctx: Pick<AccessCtx, "email" | "orgId">,
+  options?: {
+    resourceKind?: DashboardKind | "analysis";
+    limit?: number;
+  },
+): Promise<Record<string, Record<string, unknown>>> {
+  // User scope first, then org: callers append these to the SQL rows in
+  // iteration order and never re-sort, so the order is user-visible. The
+  // previous full-table read inherited whatever order the settings table
+  // returned, which no query pinned.
+  const prefixes: string[] = [];
+  const keyPrefix =
+    options?.resourceKind === "sql"
+      ? SQL_PREFIX
+      : options?.resourceKind === "analysis"
+        ? ANALYSIS_PREFIX
+        : null;
+  if (keyPrefix) {
+    if (ctx.email) prefixes.push(`u:${ctx.email}:${keyPrefix}`);
+    if (ctx.orgId) prefixes.push(`o:${ctx.orgId}:${keyPrefix}`);
+  } else {
+    if (ctx.email) prefixes.push(`u:${ctx.email}:`);
+    if (ctx.orgId) prefixes.push(`o:${ctx.orgId}:`);
+  }
+  if (prefixes.length === 0) return {};
+  const scoped: Record<string, Record<string, unknown>> = {};
+  for (const entries of await Promise.all(
+    prefixes.map((prefix) =>
+      listSettingsByPrefix(
+        prefix,
+        options?.limit === undefined ? undefined : { limit: options.limit },
+      ),
+    ),
+  )) {
+    for (const { key, value } of entries) scoped[key] = value;
+  }
+  return scoped;
+}
+
 const SQL_PREFIX = "sql-dashboard-";
 const EXPLORER_PREFIX = "dashboard-";
+
+function isLegacyDashboardId(id: string): boolean {
+  return id.length > 0 && !/:|%3a/i.test(id);
+}
 const ANALYSIS_PREFIX = "adhoc-analysis-";
+const DASHBOARD_REVISION_LIMIT = 50;
+const ANALYSIS_REVISION_LIMIT = 30;
+const MAX_DASHBOARD_REFERENCE_RESULTS = 24;
+const MAX_DASHBOARD_REFERENCE_CANDIDATES = 200;
+const OUT_OF_SCOPE_REFERENCE_PROBE_LIMIT = 5;
+
+function stableStringify(value: unknown): string {
+  if (value === undefined) return "undefined";
+  if (value === null || typeof value !== "object") {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) {
+      throw new Error("Analytics revision contains an unserializable value.");
+    }
+    return serialized;
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(object[key])}`)
+    .join(",")}}`;
+}
+
+function comparableJson(raw: string | null): string | null {
+  if (raw === null) return null;
+  try {
+    return stableStringify(JSON.parse(raw));
+  } catch {
+    // coercion-ok: invalid legacy JSON stays distinct and cannot suppress a save.
+    return raw;
+  }
+}
+
+function revisionId(
+  prefix: string,
+  resourceId: string,
+  previousRevisionId: string | undefined,
+  payload: unknown,
+): string {
+  const fingerprint = stableStringify({
+    resourceId,
+    previousRevisionId: previousRevisionId ?? "initial",
+    payload,
+  });
+  return `${prefix}-${createHash("sha256").update(fingerprint).digest("hex")}`;
+}
+
+export function normalizeDashboardName(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
+}
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function nextRevisionTimestamp(previous: string | null | undefined): string {
+  const previousMs = previous ? Date.parse(previous) : Number.NaN;
+  return new Date(
+    Math.max(Date.now(), Number.isFinite(previousMs) ? previousMs + 1 : 0),
+  ).toISOString();
+}
+
+function revisionChatContextFromFields(value: {
+  threadId?: unknown;
+  runId?: unknown;
+  turnId?: unknown;
+}): AnalyticsRevisionChatContext | null {
+  const context: AnalyticsRevisionChatContext = {};
+  for (const key of ["threadId", "runId", "turnId"] as const) {
+    if (typeof value[key] === "string" && value[key].trim()) {
+      context[key] = value[key];
+    }
+  }
+  return Object.keys(context).length > 0 ? context : null;
+}
+
+function requestRevisionChatContext(): AnalyticsRevisionChatContext | null {
+  const run = getRequestRunContext();
+  return run ? revisionChatContextFromFields(run) : null;
+}
+
+function parseRevisionChatContext(
+  raw: unknown,
+): AnalyticsRevisionChatContext | null {
+  if (raw == null) return null;
+  if (typeof raw !== "string") {
+    throw new Error("Analytics revision chat metadata is invalid.");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("Analytics revision chat metadata is not valid JSON.");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Analytics revision chat metadata is invalid.");
+  }
+  const context = revisionChatContextFromFields(
+    value as Record<string, unknown>,
+  );
+  if (!context) throw new Error("Analytics revision chat metadata is invalid.");
+  return context;
+}
+
+export function parseRevisionChatContextMetadata(raw: unknown): {
+  chatContext: AnalyticsRevisionChatContext | null;
+  chatContextStatus: RevisionChatContextStatus;
+} {
+  if (raw == null) {
+    return { chatContext: null, chatContextStatus: "absent" };
+  }
+  try {
+    const chatContext = parseRevisionChatContext(raw);
+    return {
+      chatContext,
+      chatContextStatus: chatContext ? "valid" : "absent",
+    };
+  } catch {
+    return { chatContext: null, chatContextStatus: "unreadable" };
+  }
+}
+
+function escapeLikeLiteral(value: string): string {
+  return value.replace(/[\\%_]/g, "\\$&");
+}
+
+type DashboardReferenceSearchQuery = {
+  phrase: string;
+  search: string;
+  terms: string[];
+};
+
+function dashboardReferenceSearchQuery(
+  search: string,
+): DashboardReferenceSearchQuery {
+  const phrase = search.trim().replace(/\s+/g, " ").toLowerCase();
+  return {
+    phrase,
+    search: search.trim(),
+    terms: searchTerms(search).slice(0, 8),
+  };
+}
+
+function dashboardReferenceFieldText(value: unknown): string {
+  if (typeof value === "string") return value.toLowerCase();
+  if (!value || typeof value !== "object") return "";
+  const serialized = JSON.stringify(value);
+  return typeof serialized === "string" ? serialized.toLowerCase() : "";
+}
+
+function dashboardReferenceMatch(
+  row: {
+    id?: unknown;
+    kind?: unknown;
+    name?: unknown;
+    description?: unknown;
+    config?: unknown;
+    ownerEmail?: unknown;
+    orgId?: unknown;
+    visibility?: unknown;
+    updatedAt?: unknown;
+    certification?: DashboardCertification | null;
+  },
+  query: DashboardReferenceSearchQuery,
+): { record: DashboardReferenceRecord; score: number } | null {
+  const fields = {
+    id: dashboardReferenceFieldText(row.id),
+    name: dashboardReferenceFieldText(row.name),
+    description: dashboardReferenceFieldText(row.description),
+    config: dashboardReferenceFieldText(row.config),
+  } satisfies Record<DashboardReferenceRecord["matchedFields"][number], string>;
+  const fieldWeights = { id: 30, name: 80, description: 45, config: 10 };
+  const matches = matchSearchFields(
+    query.search,
+    Object.entries(fields).map(([field, value]) => ({
+      value,
+      weight: fieldWeights[field as keyof typeof fieldWeights],
+    })),
+  );
+  if (matches.score <= 0) return null;
+  const matchedFields = Object.entries(fields)
+    .filter(
+      ([, value]) =>
+        matchSearchFields(query.search, [{ value, weight: 1 }]).score > 0,
+    )
+    .map(
+      ([field]) => field as DashboardReferenceRecord["matchedFields"][number],
+    );
+  let score = matches.score;
+  for (const [field, value] of Object.entries(fields)) {
+    const weight =
+      field === "name"
+        ? 80
+        : field === "description"
+          ? 45
+          : field === "id"
+            ? 30
+            : 10;
+    if (value.includes(query.phrase)) score += 100 + weight;
+    if (field === "name" && value === query.phrase) score += 300;
+    if (field === "name" && value.startsWith(query.phrase)) score += 40;
+  }
+  const certification = row.certification;
+  const certified = Boolean(
+    certification &&
+    certification.certifiedForUpdatedAt === row.updatedAt &&
+    certification.status === "certified",
+  );
+  if (certified) {
+    score += 60;
+  }
+
+  return {
+    record: {
+      id: typeof row.id === "string" ? row.id : (JSON.stringify(row.id) ?? ""),
+      kind: row.kind === "explorer" ? "explorer" : "sql",
+      name:
+        typeof row.name === "string"
+          ? row.name
+          : (JSON.stringify(row.name) ?? "Untitled dashboard"),
+      description: typeof row.description === "string" ? row.description : null,
+      ownerEmail:
+        typeof row.ownerEmail === "string"
+          ? row.ownerEmail
+          : (JSON.stringify(row.ownerEmail) ?? ""),
+      orgId: typeof row.orgId === "string" ? row.orgId : null,
+      visibility:
+        row.visibility === "public" || row.visibility === "org"
+          ? row.visibility
+          : "private",
+      updatedAt:
+        typeof row.updatedAt === "string"
+          ? row.updatedAt
+          : (JSON.stringify(row.updatedAt) ?? ""),
+      ...(row.certification ? { certification: row.certification } : {}),
+      ...(row.certification ? { certified } : {}),
+      matchedFields,
+    },
+    score,
+  };
+}
+
+function legacyDashboardReferenceScope(
+  key: string,
+  ctx: AccessCtx,
+): {
+  id: string;
+  kind: DashboardKind;
+  ownerEmail: string;
+  orgId: string | null;
+  visibility: DashboardReferenceRecord["visibility"];
+} | null {
+  if (ctx.orgId && key.startsWith(`o:${ctx.orgId}:${SQL_PREFIX}`)) {
+    return {
+      id: key.slice(`o:${ctx.orgId}:${SQL_PREFIX}`.length),
+      kind: "sql",
+      ownerEmail: ctx.email,
+      orgId: ctx.orgId,
+      visibility: "org",
+    };
+  }
+  if (ctx.email && key.startsWith(`u:${ctx.email}:${SQL_PREFIX}`)) {
+    return {
+      id: key.slice(`u:${ctx.email}:${SQL_PREFIX}`.length),
+      kind: "sql",
+      ownerEmail: ctx.email,
+      orgId: null,
+      visibility: "private",
+    };
+  }
+  if (ctx.email && key.startsWith(`u:${ctx.email}:${EXPLORER_PREFIX}`)) {
+    const id = key.slice(`u:${ctx.email}:${EXPLORER_PREFIX}`.length);
+    if (!isLegacyDashboardId(id)) return null;
+    return {
+      id,
+      kind: "explorer",
+      ownerEmail: ctx.email,
+      orgId: null,
+      visibility: "private",
+    };
+  }
+  return null;
 }
 
 function nanoidFallback(): string {
@@ -99,6 +534,41 @@ function nanoidFallback(): string {
     Math.random().toString(36).slice(2, 10) +
     Math.random().toString(36).slice(2, 10)
   );
+}
+
+function affectedRowCount(result: unknown): number | undefined {
+  const candidate = result as
+    | {
+        rowsAffected?: unknown;
+        affectedRows?: unknown;
+        rowCount?: unknown;
+        count?: unknown;
+        changes?: unknown;
+        meta?: { changes?: unknown };
+      }
+    | undefined;
+  const value =
+    candidate?.rowsAffected ??
+    candidate?.affectedRows ??
+    candidate?.rowCount ??
+    candidate?.count ??
+    candidate?.changes ??
+    candidate?.meta?.changes;
+  return typeof value === "number" ? value : undefined;
+}
+
+export class DashboardConflictError extends Error {
+  constructor(id: string) {
+    super(`Dashboard "${id}" changed between read and write.`);
+    this.name = "DashboardConflictError";
+  }
+}
+
+export class AnalysisConflictError extends Error {
+  constructor(id: string) {
+    super(`Analysis "${id}" changed between read and write.`);
+    this.name = "AnalysisConflictError";
+  }
 }
 
 function changeScope(
@@ -127,10 +597,6 @@ function recordScopedChange(
   });
 }
 
-// ---------------------------------------------------------------------------
-// Dashboards
-// ---------------------------------------------------------------------------
-
 function accessFields(role?: AccessRole): {
   role?: AccessRole;
   canEdit?: boolean;
@@ -144,26 +610,85 @@ function accessFields(role?: AccessRole): {
   };
 }
 
+// A legacy migration insert is a no-op when the id already exists. Only a row
+// with the migrating owner and org belongs to the caller; any other row with
+// that id is someone else's resource.
+function isMigratedLegacyRow(
+  row: any,
+  ownerEmail: string,
+  orgId: string | null,
+): boolean {
+  return (
+    !!row && row.ownerEmail === ownerEmail && (row.orgId ?? null) === orgId
+  );
+}
+
 function rowToDashboard(row: any, role?: AccessRole): DashboardRecord {
+  const certification = parseDashboardCertification(row.certification);
+  const rawConfig =
+    typeof row.config === "string" ? JSON.parse(row.config) : row.config;
   return {
     id: row.id,
     kind: row.kind,
     title: row.title,
     config:
-      typeof row.config === "string" ? JSON.parse(row.config) : row.config,
+      row.kind === "sql" ? normalizeDashboardConfig(rawConfig) : rawConfig,
     ownerEmail: row.ownerEmail,
     orgId: row.orgId ?? null,
     visibility: row.visibility,
     createdAt: row.createdAt,
+    createdBy: row.createdBy ?? null,
     updatedAt: row.updatedAt,
+    updatedBy: row.updatedBy ?? null,
     archivedAt: row.archivedAt ?? null,
     hiddenAt: row.hiddenAt ?? null,
     hiddenBy: row.hiddenBy ?? null,
+    ...(certification.status === "valid"
+      ? { certification: certification.certification }
+      : {}),
     ...accessFields(role),
   };
 }
 
-function configFromSettings(data: Record<string, unknown>): {
+function rowToDashboardRevision(row: any): DashboardRevisionRecord {
+  const rawConfig =
+    typeof row.config === "string" ? JSON.parse(row.config) : row.config;
+  return {
+    id: row.id,
+    dashboardId: row.dashboardId,
+    kind: row.kind,
+    title: row.title,
+    config:
+      row.kind === "sql" ? normalizeDashboardConfig(rawConfig) : rawConfig,
+    createdAt: row.createdAt,
+    createdBy: row.createdBy ?? null,
+    chatContext: parseRevisionChatContext(row.chatContext),
+  };
+}
+
+function rowToDashboardRevisionMetadata(row: any): DashboardRevisionMetadata {
+  return {
+    id: row.id,
+    dashboardId: row.dashboardId,
+    kind: row.kind,
+    title: row.title,
+    createdAt: row.createdAt,
+    createdBy: row.createdBy ?? null,
+    ...parseRevisionChatContextMetadata(row.chatContext),
+  };
+}
+
+function configDescriptionFromValue(
+  value: Record<string, unknown>,
+): string | null {
+  const description = value["description"];
+  return typeof description === "string" ? description : null;
+}
+
+function configFromSettings(
+  data: Record<string, unknown>,
+  kind?: DashboardKind,
+): {
   title: string;
   config: Record<string, unknown>;
 } {
@@ -173,7 +698,28 @@ function configFromSettings(data: Record<string, unknown>): {
       : typeof (data as any).title === "string"
         ? (data as any).title
         : "Untitled";
-  return { title, config: data };
+  return {
+    title,
+    config: kind === "sql" ? normalizeDashboardConfig(data) : data,
+  };
+}
+
+function stringProperty(value: unknown, key: string): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const property = (value as Record<string, unknown>)[key];
+  return typeof property === "string" ? property : null;
+}
+
+function catalogMetadataFromConfig(config: Record<string, unknown>): {
+  configName: string | null;
+  catalogTemplateId: string | null;
+  demoId: string | null;
+} {
+  return {
+    configName: typeof config.name === "string" ? config.name : null,
+    catalogTemplateId: stringProperty(config.catalog, "templateId"),
+    demoId: stringProperty(config.demo, "id"),
+  };
 }
 
 async function migrateDashboardFromSettings(
@@ -184,8 +730,8 @@ async function migrateDashboardFromSettings(
   orgId: string | null,
   visibility: DashboardRecord["visibility"],
   role?: AccessRole,
-): Promise<DashboardRecord> {
-  const { title, config } = configFromSettings(settingsValue);
+): Promise<DashboardRecord | null> {
+  const { title, config } = configFromSettings(settingsValue, kind);
   const db = getDb() as any;
   const createdAt =
     (typeof (settingsValue as any).createdAt === "string" &&
@@ -195,6 +741,7 @@ async function migrateDashboardFromSettings(
     (typeof (settingsValue as any).updatedAt === "string" &&
       (settingsValue as any).updatedAt) ||
     createdAt;
+  const createdBy = visibility === "private" ? ownerEmail : null;
   await db
     .insert(schema.dashboards)
     .values({
@@ -206,16 +753,19 @@ async function migrateDashboardFromSettings(
       orgId,
       visibility,
       createdAt,
+      createdBy,
       updatedAt,
+      updatedBy: ownerEmail,
     })
     .onConflictDoNothing();
-  // guard:allow-unscoped — read-after-write of the row just inserted above
-  // with ownerEmail from ctx; eq(id) is sufficient because we know the id we
-  // just wrote and onConflictDoNothing leaves any pre-existing row untouched.
+  // guard:allow-unscoped — read-after-write of the row just inserted above;
+  // isMigratedLegacyRow rejects a pre-existing row that onConflictDoNothing
+  // left untouched.
   const [row] = await db
     .select()
     .from(schema.dashboards)
     .where(eq(schema.dashboards.id, id));
+  if (!isMigratedLegacyRow(row, ownerEmail, orgId)) return null;
   recordScopedChange("dashboards", "change", id, ownerEmail, orgId, visibility);
   return rowToDashboard(row, role);
 }
@@ -230,7 +780,6 @@ async function findLegacyDashboard(
   orgId: string | null;
   visibility: DashboardRecord["visibility"];
 } | null> {
-  // Org-scoped SQL dashboard
   if (ctx.orgId) {
     const v = await getOrgSetting(ctx.orgId, `${SQL_PREFIX}${id}`);
     if (v)
@@ -242,7 +791,6 @@ async function findLegacyDashboard(
         visibility: "org",
       };
   }
-  // User-scoped SQL dashboard
   if (ctx.email) {
     const v = await getUserSetting(ctx.email, `${SQL_PREFIX}${id}`);
     if (v)
@@ -254,7 +802,6 @@ async function findLegacyDashboard(
         visibility: "private",
       };
   }
-  // User-scoped Explorer dashboard
   if (ctx.email) {
     const v = await getUserSetting(ctx.email, `${EXPLORER_PREFIX}${id}`);
     if (v)
@@ -269,21 +816,18 @@ async function findLegacyDashboard(
   return null;
 }
 
-/** Fetch a dashboard by id, enforcing access. Lazy-migrates from legacy keys. */
 export async function getDashboard(
   id: string,
   ctx: AccessCtx,
 ): Promise<DashboardRecord | null> {
-  // 1) SQL first, with access check.
   const access = await resolveAccess("dashboard", id, {
     userEmail: ctx.email,
     orgId: ctx.orgId ?? undefined,
   });
   if (access) return rowToDashboard(access.resource, access.role);
-  // 2) Legacy fallback.
   const legacy = await findLegacyDashboard(id, ctx);
   if (!legacy) return null;
-  return migrateDashboardFromSettings(
+  const migrated = await migrateDashboardFromSettings(
     id,
     legacy.kind,
     legacy.data,
@@ -292,21 +836,83 @@ export async function getDashboard(
     legacy.visibility,
     "owner",
   );
+  if (migrated) return migrated;
+  // Another org member may have migrated the same legacy dashboard first. Read
+  // their row through the normal access check so the caller gets their own role.
+  const migratedByOther = await resolveAccess("dashboard", id, {
+    userEmail: ctx.email,
+    orgId: ctx.orgId ?? undefined,
+  });
+  return migratedByOther
+    ? rowToDashboard(migratedByOther.resource, migratedByOther.role)
+    : null;
 }
 
-/**
- * List dashboards visible to the caller. Union of SQL rows + not-yet-migrated
- * legacy keys.
- *
- * `archived` controls whether archived rows are included:
- *   - `"active"` (default): hide archived rows
- *   - `"archived"`: only archived rows
- *   - `"all"`: both
- *
- * Legacy settings rows have no archive concept, so they are treated as active.
- * Legacy settings rows have no hidden concept, so hidden-only queries skip the
- * legacy scan.
- */
+export type DashboardReviewScope =
+  | { kind: "organization"; orgId: string }
+  | { kind: "super-organization"; orgId: string };
+
+export async function getDashboardForReview(
+  id: string,
+  scope: DashboardReviewScope,
+): Promise<DashboardRecord | null> {
+  const [scopeRow] = await getDb()
+    .select({
+      ownerEmail: schema.dashboards.ownerEmail,
+      orgId: schema.dashboards.orgId,
+    })
+    .from(schema.dashboards)
+    .where(
+      and(
+        eq(schema.dashboards.id, id),
+        eq(schema.dashboards.orgId, scope.orgId),
+      ),
+    )
+    .limit(1);
+  if (!scopeRow) return null;
+  const access = await resolveAccess("dashboard", id, {
+    userEmail: scopeRow.ownerEmail,
+    orgId: scopeRow.orgId ?? undefined,
+  });
+  if (!access || access.resource.orgId !== scopeRow.orgId) return null;
+  return rowToDashboard(access.resource, "viewer");
+}
+
+export async function getPublicDashboardMetadata(id: string) {
+  const config = sql`case
+    when ${schema.dashboards.config} is json
+      then ${schema.dashboards.config}::jsonb
+    else '{}'::jsonb
+  end`;
+  const [row] = await (getDb() as any)
+    .select({
+      title: schema.dashboards.title,
+      description: sql<string | null>`(${config} ->> 'description')`,
+      panelTitlesJson: sql<string>`jsonb_path_query_array(${config}, '$.panels[0 to 2].title')::text`,
+    })
+    .from(schema.dashboards)
+    .where(
+      and(
+        eq(schema.dashboards.id, id),
+        eq(schema.dashboards.visibility, "public"),
+        isNull(schema.dashboards.archivedAt),
+      ),
+    )
+    .limit(1);
+  if (!row) return null;
+
+  const panelTitles: unknown = JSON.parse(row.panelTitlesJson);
+  return {
+    title: row.title,
+    description: row.description,
+    panelTitles: Array.isArray(panelTitles)
+      ? panelTitles.filter(
+          (title): title is string => typeof title === "string",
+        )
+      : [],
+  };
+}
+
 export async function listDashboards(
   ctx: AccessCtx,
   filter?: {
@@ -336,12 +942,9 @@ export async function listDashboards(
   const rows = await db.select().from(schema.dashboards).where(where);
   const out: DashboardRecord[] = rows.map(rowToDashboard);
   const seen = new Set(out.map((r) => r.id));
-  // Legacy: scan settings once and surface anything not yet migrated.
-  // Archived/hidden state doesn't exist in legacy rows, so skip the legacy scan
-  // entirely when the caller wants archived-only or hidden-only records.
   if (archived === "archived" || hidden === "hidden") return out;
   try {
-    const all = await getAllSettings();
+    const all = await getScopedLegacySettings(ctx);
     for (const [key, value] of Object.entries(all)) {
       let id: string | null = null;
       let kind: DashboardKind | null = null;
@@ -361,7 +964,7 @@ export async function listDashboards(
         key.startsWith(`u:${ctx.email}:${EXPLORER_PREFIX}`)
       ) {
         id = key.slice(`u:${ctx.email}:${EXPLORER_PREFIX}`.length);
-        kind = "explorer";
+        kind = isLegacyDashboardId(id) ? "explorer" : null;
       }
       if (!id || !kind) continue;
       if (filter?.kind && filter.kind !== kind) continue;
@@ -375,7 +978,7 @@ export async function listDashboards(
         orgId,
         visibility,
       );
-      out.push(rec);
+      if (rec) out.push(rec);
     }
   } catch {
     // Legacy scan is best-effort.
@@ -383,53 +986,850 @@ export async function listDashboards(
   return out;
 }
 
+export async function listDashboardSummaries(
+  ctx: AccessCtx,
+  filter?: {
+    kind?: DashboardKind;
+    archived?: DashboardArchiveFilter;
+    hidden?: DashboardHiddenFilter;
+    includeCatalogMetadata?: boolean;
+    legacyScan?: "best-effort" | "strict";
+    limit?: number;
+  },
+  dbOverride?: any,
+): Promise<DashboardSummaryRecord[]> {
+  const db = (dbOverride ?? getDb()) as any;
+  const archived = filter?.archived ?? "active";
+  const hidden = filter?.hidden ?? "visible";
+  const includeCatalogMetadata = filter?.includeCatalogMetadata === true;
+  const summaryLimit = filter?.limit;
+  if (
+    summaryLimit !== undefined &&
+    (!Number.isSafeInteger(summaryLimit) || summaryLimit < 0)
+  ) {
+    throw new RangeError(
+      "Dashboard summary limit must be a non-negative integer.",
+    );
+  }
+  const conditions: any[] = [
+    accessFilter(schema.dashboards, schema.dashboardShares, {
+      userEmail: ctx.email,
+      orgId: ctx.orgId ?? undefined,
+    }),
+  ];
+  if (filter?.kind) conditions.push(eq(schema.dashboards.kind, filter.kind));
+  if (archived === "active")
+    conditions.push(isNull(schema.dashboards.archivedAt));
+  else if (archived === "archived")
+    conditions.push(isNotNull(schema.dashboards.archivedAt));
+  if (hidden === "visible") conditions.push(isNull(schema.dashboards.hiddenAt));
+  else if (hidden === "hidden")
+    conditions.push(isNotNull(schema.dashboards.hiddenAt));
+  const where = conditions.length === 1 ? conditions[0] : and(...conditions);
+  const parentId = sql<
+    string | null
+  >`(${schema.dashboards.config}::jsonb ->> 'parentId')`;
+  const description = sql<
+    string | null
+  >`(${schema.dashboards.config}::jsonb ->> 'description')`;
+  const configName = sql<
+    string | null
+  >`(${schema.dashboards.config}::jsonb ->> 'name')`;
+  const catalogTemplateId = sql<
+    string | null
+  >`(${schema.dashboards.config}::jsonb -> 'catalog' ->> 'templateId')`;
+  const demoId = sql<
+    string | null
+  >`(${schema.dashboards.config}::jsonb -> 'demo' ->> 'id')`;
+  const rowsQuery = db
+    .select({
+      id: schema.dashboards.id,
+      kind: schema.dashboards.kind,
+      name: schema.dashboards.title,
+      description,
+      ...(includeCatalogMetadata
+        ? { configName, catalogTemplateId, demoId }
+        : {}),
+      parentId,
+      folderId: schema.dashboards.folderId,
+      ownerEmail: schema.dashboards.ownerEmail,
+      orgId: schema.dashboards.orgId,
+      visibility: schema.dashboards.visibility,
+      createdAt: schema.dashboards.createdAt,
+      updatedAt: schema.dashboards.updatedAt,
+      archivedAt: schema.dashboards.archivedAt,
+      hiddenAt: schema.dashboards.hiddenAt,
+      hiddenBy: schema.dashboards.hiddenBy,
+      certification: schema.dashboards.certification,
+    })
+    .from(schema.dashboards)
+    .where(where);
+  const rows = await (summaryLimit === undefined
+    ? rowsQuery
+    : rowsQuery
+        .orderBy(desc(schema.dashboards.updatedAt), asc(schema.dashboards.id))
+        .limit(summaryLimit));
+  const out: DashboardSummaryRecord[] = rows.map((row: any) => {
+    const certification = parseDashboardCertification(row.certification);
+    const { certification: _rawCertification, ...summaryRow } = row;
+    return {
+      ...summaryRow,
+      description: typeof row.description === "string" ? row.description : null,
+      configName: typeof row.configName === "string" ? row.configName : null,
+      catalogTemplateId:
+        typeof row.catalogTemplateId === "string"
+          ? row.catalogTemplateId
+          : null,
+      demoId: typeof row.demoId === "string" ? row.demoId : null,
+      parentId: typeof row.parentId === "string" ? row.parentId : null,
+      folderId: typeof row.folderId === "string" ? row.folderId : null,
+      orgId: row.orgId ?? null,
+      archivedAt: row.archivedAt ?? null,
+      hiddenAt: row.hiddenAt ?? null,
+      hiddenBy: row.hiddenBy ?? null,
+      ...(certification.status === "valid"
+        ? { certification: certification.certification }
+        : {}),
+    };
+  });
+  const seen = new Set(out.map((row) => row.id));
+
+  if (summaryLimit !== undefined && out.length >= summaryLimit) return out;
+  if (archived === "archived" || hidden === "hidden") return out;
+  try {
+    const all = await getScopedLegacySettings(
+      ctx,
+      summaryLimit === undefined
+        ? undefined
+        : { resourceKind: filter?.kind, limit: summaryLimit },
+    );
+    for (const [key, value] of Object.entries(all)) {
+      if (summaryLimit !== undefined && out.length >= summaryLimit) break;
+      let id: string | null = null;
+      let kind: DashboardKind | null = null;
+      let orgId: string | null = null;
+      let visibility: DashboardSummaryRecord["visibility"] = "private";
+      if (ctx.orgId && key.startsWith(`o:${ctx.orgId}:${SQL_PREFIX}`)) {
+        id = key.slice(`o:${ctx.orgId}:${SQL_PREFIX}`.length);
+        kind = "sql";
+        orgId = ctx.orgId;
+        visibility = "org";
+      } else if (ctx.email && key.startsWith(`u:${ctx.email}:${SQL_PREFIX}`)) {
+        id = key.slice(`u:${ctx.email}:${SQL_PREFIX}`.length);
+        kind = "sql";
+      } else if (
+        ctx.email &&
+        key.startsWith(`u:${ctx.email}:${EXPLORER_PREFIX}`)
+      ) {
+        id = key.slice(`u:${ctx.email}:${EXPLORER_PREFIX}`.length);
+        kind = isLegacyDashboardId(id) ? "explorer" : null;
+      }
+      if (!id || !kind || seen.has(id)) continue;
+      if (filter?.kind && filter.kind !== kind) continue;
+      seen.add(id);
+      const config = value as Record<string, unknown>;
+      const { title } = configFromSettings(config, kind);
+      const catalogMetadata = includeCatalogMetadata
+        ? catalogMetadataFromConfig(config)
+        : {
+            configName: null,
+            catalogTemplateId: null,
+            demoId: null,
+          };
+      const createdAt =
+        typeof config.createdAt === "string" ? config.createdAt : nowIso();
+      out.push({
+        id,
+        kind,
+        name: title,
+        description: configDescriptionFromValue(config),
+        ...catalogMetadata,
+        parentId: typeof config.parentId === "string" ? config.parentId : null,
+        folderId: null,
+        ownerEmail: ctx.email,
+        orgId,
+        visibility,
+        createdAt,
+        updatedAt:
+          typeof config.updatedAt === "string" ? config.updatedAt : createdAt,
+        archivedAt: null,
+        hiddenAt: null,
+        hiddenBy: null,
+      });
+    }
+  } catch (error) {
+    if (filter?.legacyScan === "strict") throw error;
+    // Legacy scan is best-effort.
+  }
+  return out;
+}
+
+export async function searchDashboardReferences(
+  ctx: AccessCtx,
+  search: string,
+  limit = 8,
+  dbOverride?: any,
+): Promise<DashboardReferenceRecord[]> {
+  const result = await searchDashboardReferencesPage(
+    ctx,
+    search,
+    limit,
+    undefined,
+    dbOverride,
+  );
+  return result.results;
+}
+
+export type DashboardReferenceSearchPage = {
+  results: DashboardReferenceRecord[];
+  searched: number;
+  of: number;
+  truncated: boolean;
+  nextPage: string | null;
+};
+
+export async function searchDashboardReferencesPage(
+  ctx: AccessCtx,
+  search: string,
+  limit = 8,
+  nextPage?: string,
+  dbOverride?: any,
+): Promise<DashboardReferenceSearchPage> {
+  const query = dashboardReferenceSearchQuery(search);
+  if (!query.phrase || query.terms.length === 0) {
+    return {
+      results: [],
+      searched: 0,
+      of: 0,
+      truncated: false,
+      nextPage: null,
+    };
+  }
+  const boundedLimit = Math.min(
+    Math.max(Number.isFinite(limit) ? Math.trunc(limit) : 8, 1),
+    MAX_DASHBOARD_REFERENCE_RESULTS,
+  );
+  const db = (dbOverride ?? getDb()) as any;
+  const access = accessFilter(schema.dashboards, schema.dashboardShares, {
+    userEmail: ctx.email,
+    orgId: ctx.orgId ?? undefined,
+  });
+  const wildcardMatches = (term: string) => {
+    const pattern = `%${escapeLikeLiteral(term)}%`;
+    return or(
+      sql<boolean>`lower(${schema.dashboards.id}) LIKE ${pattern} ESCAPE '\\'`,
+      sql<boolean>`lower(${schema.dashboards.title}) LIKE ${pattern} ESCAPE '\\'`,
+      sql<boolean>`lower(coalesce(${schema.dashboards.config}, '')) LIKE ${pattern} ESCAPE '\\'`,
+    );
+  };
+  const phraseMatch = wildcardMatches(query.phrase);
+  const tokenMatch = or(...query.terms.map(wildcardMatches));
+  const where = and(
+    access,
+    isNull(schema.dashboards.archivedAt),
+    isNull(schema.dashboards.hiddenAt),
+    or(phraseMatch, tokenMatch),
+  );
+  // guard:allow-heavy-dashboard-list-read — bounded wildcard candidates need serialized config to rank references.
+  const rows = await db
+    .select({
+      id: schema.dashboards.id,
+      kind: schema.dashboards.kind,
+      name: schema.dashboards.title,
+      config: schema.dashboards.config,
+      certification: schema.dashboards.certification,
+      ownerEmail: schema.dashboards.ownerEmail,
+      orgId: schema.dashboards.orgId,
+      visibility: schema.dashboards.visibility,
+      updatedAt: schema.dashboards.updatedAt,
+    })
+    .from(schema.dashboards)
+    .where(where)
+    .orderBy(desc(schema.dashboards.updatedAt))
+    .limit(MAX_DASHBOARD_REFERENCE_CANDIDATES + 1);
+  const candidateTruncated = rows.length > MAX_DASHBOARD_REFERENCE_CANDIDATES;
+  const candidates = rows.slice(0, MAX_DASHBOARD_REFERENCE_CANDIDATES);
+
+  const ranked: Array<{
+    record: DashboardReferenceRecord;
+    score: number;
+  }> = candidates
+    .map((row: any) => {
+      let description =
+        typeof row.description === "string" ? row.description : null;
+      if (!description && typeof row.config === "string") {
+        try {
+          const config = JSON.parse(row.config) as unknown;
+          if (config && typeof config === "object" && !Array.isArray(config)) {
+            const value = (config as Record<string, unknown>).description;
+            description = typeof value === "string" ? value : null;
+          }
+        } catch (error) {
+          if (!(error instanceof SyntaxError)) throw error;
+          // Keep malformed configs searchable by id/title, without claiming a description.
+        }
+      }
+      const certification = parseDashboardCertification(row.certification);
+      return dashboardReferenceMatch(
+        {
+          ...row,
+          description,
+          certification:
+            certification.status === "valid"
+              ? certification.certification
+              : undefined,
+        },
+        query,
+      );
+    })
+    .filter(
+      (
+        match: { record: DashboardReferenceRecord; score: number } | null,
+      ): match is {
+        record: DashboardReferenceRecord;
+        score: number;
+      } => match !== null,
+    );
+
+  const seen = new Set(
+    ranked.map(({ record }) => `${record.kind}:${record.id}`),
+  );
+  const allSettings = await getScopedLegacySettings(ctx);
+  let searchedLegacySettings = 0;
+  for (const [key, value] of Object.entries(allSettings)) {
+    searchedLegacySettings += 1;
+    const scope = legacyDashboardReferenceScope(key, ctx);
+    if (
+      !scope ||
+      !scope.id ||
+      typeof value !== "object" ||
+      value === null ||
+      Array.isArray(value)
+    ) {
+      continue;
+    }
+    const { title, config } = configFromSettings(
+      value as Record<string, unknown>,
+      scope.kind,
+    );
+    const match = dashboardReferenceMatch(
+      {
+        id: scope.id,
+        kind: scope.kind,
+        name: title,
+        description: configDescriptionFromValue(config),
+        config,
+        ownerEmail: scope.ownerEmail,
+        orgId: scope.orgId,
+        visibility: scope.visibility,
+        updatedAt:
+          typeof config.updatedAt === "string"
+            ? config.updatedAt
+            : typeof config.createdAt === "string"
+              ? config.createdAt
+              : "",
+      },
+      query,
+    );
+    if (!match || seen.has(`${match.record.kind}:${match.record.id}`)) {
+      continue;
+    }
+    seen.add(`${match.record.kind}:${match.record.id}`);
+    ranked.push(match);
+  }
+
+  if (ranked.length === 0) {
+    await assertNoOwnedReferenceHiddenByScope(db, ctx, search, query);
+  }
+
+  const ordered = ranked
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        b.record.updatedAt.localeCompare(a.record.updatedAt),
+    )
+    .map(({ record }) => record);
+  const cursorSearch = `dashboard-references\n${query.phrase}`;
+  const page = paginateSearchResults({
+    search: cursorSearch,
+    results: ordered,
+    searched: candidates.length + searchedLegacySettings,
+    limit: boundedLimit,
+    offset: decodeSearchCursor(cursorSearch, nextPage),
+    truncated: candidateTruncated,
+  });
+  return { ...page, results: page.results };
+}
+
+async function assertNoOwnedReferenceHiddenByScope(
+  db: any,
+  ctx: AccessCtx,
+  search: string,
+  query: ReturnType<typeof dashboardReferenceSearchQuery>,
+): Promise<void> {
+  if (ctx.orgId || !ctx.email) return;
+  const nameMatches = (term: string) => {
+    const pattern = `%${escapeLikeLiteral(term)}%`;
+    return or(
+      sql<boolean>`lower(${schema.dashboards.id}) LIKE ${pattern} ESCAPE '\\'`,
+      sql<boolean>`lower(${schema.dashboards.title}) LIKE ${pattern} ESCAPE '\\'`,
+    );
+  };
+  const rows = await db
+    .select({
+      id: schema.dashboards.id,
+      name: schema.dashboards.title,
+      orgId: schema.dashboards.orgId,
+    })
+    .from(schema.dashboards)
+    .where(
+      and(
+        sql<boolean>`lower(${schema.dashboards.ownerEmail}) = ${ctx.email.toLowerCase()}`,
+        isNotNull(schema.dashboards.orgId),
+        isNull(schema.dashboards.archivedAt),
+        isNull(schema.dashboards.hiddenAt),
+        or(
+          nameMatches(query.phrase),
+          query.terms.length === 1
+            ? nameMatches(query.terms[0]!)
+            : and(...query.terms.map(nameMatches)),
+        ),
+      ),
+    )
+    .limit(OUT_OF_SCOPE_REFERENCE_PROBE_LIMIT);
+  if (!rows?.length) return;
+  const named = rows
+    .map((row: any) => `"${row.name ?? row.id}" (id ${row.id})`)
+    .join(", ");
+  throw new Error(
+    `No dashboard readable in this session matches "${search}", but ${rows.length} organization-scoped dashboard(s) owned by ${ctx.email} do: ${named}. This session resolved no active organization, so they cannot be read. Tell the user their organization context is missing and that the dashboard exists — do not answer from a different data source.`,
+  );
+}
+
+export async function loadDashboardCatalogDashboards(
+  ctx: AccessCtx,
+  ids: readonly string[],
+  dbOverride?: any,
+): Promise<DashboardCatalogRecord[]> {
+  const db = (dbOverride ?? getDb()) as any;
+  const uniqueIds = [
+    ...new Set(ids.map((id) => id.trim()).filter(Boolean)),
+  ].slice(0, MAX_CATALOG_DASHBOARD_HYDRATION);
+  if (!uniqueIds.length) return [];
+
+  const archived = isNull(schema.dashboards.archivedAt);
+  const visible = isNull(schema.dashboards.hiddenAt);
+  const where = and(
+    accessFilter(schema.dashboards, schema.dashboardShares, {
+      userEmail: ctx.email,
+      orgId: ctx.orgId ?? undefined,
+    }),
+    inArray(schema.dashboards.id, uniqueIds),
+    archived,
+    visible,
+  );
+
+  // guard:allow-heavy-dashboard-list-read - bounded explicit ids shortlisted from metadata
+  const sqlRows = await db
+    .select({
+      id: schema.dashboards.id,
+      kind: schema.dashboards.kind,
+      title: schema.dashboards.title,
+      config: schema.dashboards.config,
+      certification: schema.dashboards.certification,
+      updatedAt: schema.dashboards.updatedAt,
+    })
+    .from(schema.dashboards)
+    .where(where);
+
+  const byId = new Map<string, DashboardCatalogRecord>(
+    sqlRows.flatMap((row: any) => {
+      let config: Record<string, unknown> | null = null;
+      try {
+        config =
+          typeof row.config === "string" ? JSON.parse(row.config) : row.config;
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        return [];
+      }
+      if (!config || typeof config !== "object" || Array.isArray(config)) {
+        return [];
+      }
+      if (row.kind === "sql") config = normalizeDashboardConfig(config);
+      const certification = parseDashboardCertification(row.certification);
+      const description =
+        typeof row.description === "string"
+          ? row.description
+          : typeof config.description === "string"
+            ? config.description
+            : null;
+      const catalogRow: DashboardCatalogRecord = {
+        id: row.id,
+        kind: row.kind,
+        title: row.title,
+        description,
+        config,
+        ...(typeof row.updatedAt === "string"
+          ? { updatedAt: row.updatedAt }
+          : {}),
+        ...(certification.status === "valid"
+          ? { certification: certification.certification }
+          : {}),
+      };
+      return [[row.id, catalogRow] as [string, DashboardCatalogRecord]];
+    }),
+  );
+
+  const out: DashboardCatalogRecord[] = [];
+  for (const id of uniqueIds) {
+    const row = byId.get(id);
+    if (row) {
+      out.push(row);
+      continue;
+    }
+
+    const legacy = await findLegacyDashboard(id, ctx);
+    if (!legacy) continue;
+    const { title, config } = configFromSettings(legacy.data, legacy.kind);
+    out.push({
+      id,
+      kind: legacy.kind,
+      title,
+      description: configDescriptionFromValue(config),
+      config,
+      ...(typeof config.updatedAt === "string"
+        ? { updatedAt: config.updatedAt }
+        : {}),
+    });
+  }
+  return out;
+}
+
+export async function assertDashboardNameIsAvailable(
+  name: string,
+  ctx: AccessCtx,
+  excludeId?: string,
+  dbOverride?: any,
+): Promise<void> {
+  const normalized = normalizeDashboardName(name);
+  if (!normalized) return;
+  const conflict = (
+    await listDashboardSummaries(ctx, { legacyScan: "strict" }, dbOverride)
+  ).find(
+    (dashboard) =>
+      dashboard.id !== excludeId &&
+      normalizeDashboardName(dashboard.name) === normalized,
+  );
+  if (!conflict) return;
+  throw new Error(
+    `Dashboard name "${name.trim()}" is already used by visible dashboard "${conflict.name}". Choose a different name.`,
+  );
+}
+
+async function lockDashboardNames(db: any, names: string[]): Promise<void> {
+  const nameKeys = [
+    ...new Set(names.map(normalizeDashboardName).filter(Boolean)),
+  ].sort();
+  for (const nameKey of nameKeys) {
+    await db
+      .insert(schema.dashboardNameLocks)
+      .values({ nameKey, createdAt: nowIso() })
+      .onConflictDoNothing();
+    {
+      await db.execute(
+        sql`SELECT name_key FROM dashboard_name_locks WHERE name_key = ${nameKey} FOR UPDATE`,
+      );
+    }
+  }
+}
+
+/**
+ * Persist a visibility change while holding the same name lock used by create
+ * and rename. Sharing a private duplicate must not bypass the visible-name
+ * invariant by changing visibility after the dashboard was created.
+ */
+export async function persistDashboardVisibilityChange(
+  resource: Pick<DashboardRecord, "id" | "title" | "orgId">,
+  visibility: DashboardRecord["visibility"],
+  update: Record<string, unknown>,
+  ctx: AccessCtx,
+): Promise<void> {
+  const db = getDb() as any;
+  await db.transaction(async (tx: any) => {
+    if (visibility !== "private") {
+      await lockDashboardNames(tx, [resource.title]);
+      await assertDashboardNameIsAvailable(
+        resource.title,
+        ctx,
+        resource.id,
+        tx,
+      );
+    }
+    await tx
+      .update(schema.dashboards)
+      .set(update)
+      .where(eq(schema.dashboards.id, resource.id));
+  });
+}
+
+async function pruneDashboardRevisions(
+  db: any,
+  dashboardId: string,
+): Promise<void> {
+  const rows = await db
+    .select({ id: schema.dashboardRevisions.id })
+    .from(schema.dashboardRevisions)
+    .where(eq(schema.dashboardRevisions.dashboardId, dashboardId))
+    .orderBy(
+      desc(schema.dashboardRevisions.createdAt),
+      desc(schema.dashboardRevisions.id),
+    );
+  const stale = rows.slice(DASHBOARD_REVISION_LIMIT);
+  for (const row of stale) {
+    await db
+      .delete(schema.dashboardRevisions)
+      .where(eq(schema.dashboardRevisions.id, row.id));
+  }
+}
+
+async function snapshotDashboardRevision(
+  db: any,
+  dashboard: DashboardRecord,
+  ctx: AccessCtx,
+  chatContext: AnalyticsRevisionChatContext | null = requestRevisionChatContext(),
+): Promise<string> {
+  const config = stableStringify(dashboard.config);
+  const [latest] = await db
+    .select({
+      kind: schema.dashboardRevisions.kind,
+      title: schema.dashboardRevisions.title,
+      config: schema.dashboardRevisions.config,
+      id: schema.dashboardRevisions.id,
+      createdAt: schema.dashboardRevisions.createdAt,
+    })
+    .from(schema.dashboardRevisions)
+    .where(eq(schema.dashboardRevisions.dashboardId, dashboard.id))
+    .orderBy(
+      desc(schema.dashboardRevisions.createdAt),
+      desc(schema.dashboardRevisions.id),
+    )
+    .limit(1);
+  if (
+    latest?.kind === dashboard.kind &&
+    latest.title === dashboard.title &&
+    comparableJson(latest.config) === config
+  ) {
+    return latest.id;
+  }
+  const id = revisionId("dashrev", dashboard.id, latest?.id, {
+    kind: dashboard.kind,
+    title: dashboard.title,
+    config,
+  });
+  await db
+    .insert(schema.dashboardRevisions)
+    .values({
+      id,
+      dashboardId: dashboard.id,
+      kind: dashboard.kind,
+      title: dashboard.title,
+      config,
+      createdAt: nextRevisionTimestamp(latest?.createdAt),
+      createdBy: ctx.email,
+      ...(chatContext ? { chatContext: JSON.stringify(chatContext) } : {}),
+      ownerEmail: dashboard.ownerEmail,
+      orgId: dashboard.orgId,
+    })
+    .onConflictDoNothing();
+  await pruneDashboardRevisions(db, dashboard.id);
+  return id;
+}
+
+/**
+ * The edit check `upsertDashboard` makes, for callers that must know the
+ * caller can edit before they run anything on the dashboard's behalf.
+ */
+export async function assertDashboardEditable(
+  dashboardId: string,
+  ctx: AccessCtx,
+): Promise<void> {
+  await assertAccess("dashboard", dashboardId, "editor", {
+    userEmail: ctx.email,
+    orgId: ctx.orgId ?? undefined,
+  });
+}
+
+export async function createDashboardRevisionSnapshot(
+  dashboardId: string,
+  ctx: AccessCtx,
+  chatContext?: AnalyticsRevisionChatContext,
+): Promise<string | null> {
+  await assertAccess("dashboard", dashboardId, "editor", {
+    userEmail: ctx.email,
+    orgId: ctx.orgId ?? undefined,
+  });
+  const dashboard = await getDashboard(dashboardId, ctx);
+  if (!dashboard) return null;
+  return snapshotDashboardRevision(
+    getDb(),
+    dashboard,
+    ctx,
+    chatContext ?? requestRevisionChatContext(),
+  );
+}
+
 /**
  * Upsert a dashboard. On create, caller becomes owner and visibility defaults
  * to `private`; users explicitly promote useful dashboards to org/public via
  * sharing. On update, `assertAccess` requires `editor`.
+ *
+ * `expectedUpdatedAt` fences the update against concurrent writers: pass the
+ * `updatedAt` observed by an earlier `getDashboard` call and the UPDATE only
+ * applies `WHERE id = $1 AND updated_at = $2`. If another writer already saved
+ * in between, the fenced UPDATE affects zero rows and this throws
+ * `DashboardConflictError` instead of silently clobbering their write. Omit
+ * it (the default) to keep the prior unconditional last-write-wins behavior,
+ * which existing callers (legacy migration, revision restore, and one-shot
+ * writes) still rely on. Those saves retry the same requested body against the
+ * latest revision so every successful write advances its version token.
  */
-export async function upsertDashboard(
+export interface DashboardUpsertOutcome {
+  dashboard: DashboardRecord;
+  didWrite: boolean;
+}
+
+async function upsertDashboardWithOutcome(
   id: string,
   kind: DashboardKind,
   body: Record<string, unknown>,
   ctx: AccessCtx,
-): Promise<DashboardRecord> {
-  // If the row exists (or legacy-migrates), require editor.
+  expectedUpdatedAt?: string,
+): Promise<DashboardUpsertOutcome> {
   const existing = await getDashboard(id, ctx);
+  const observedUpdatedAt = expectedUpdatedAt ?? existing?.updatedAt;
+  if (!existing && expectedUpdatedAt !== undefined) {
+    throw new DashboardConflictError(id);
+  }
   const db = getDb() as any;
-  const { title, config } = configFromSettings(body);
+  const { title, config } = configFromSettings(body, kind);
+  const configJson = stableStringify(config);
   if (existing) {
     await assertAccess("dashboard", id, "editor", {
       userEmail: ctx.email,
       orgId: ctx.orgId ?? undefined,
     });
-    await db
-      .update(schema.dashboards)
-      .set({
+  }
+  if (
+    existing &&
+    observedUpdatedAt !== undefined &&
+    existing.updatedAt !== observedUpdatedAt
+  ) {
+    throw new DashboardConflictError(id);
+  }
+  const changed =
+    !existing ||
+    existing.kind !== kind ||
+    existing.title !== title ||
+    stableStringify(existing.config) !== configJson;
+  if (existing && !changed) return { dashboard: existing, didWrite: false };
+  let persistedDashboard: DashboardRecord | undefined;
+  const nameChanged =
+    !existing ||
+    normalizeDashboardName(existing.title) !== normalizeDashboardName(title);
+  if (nameChanged) {
+    await assertDashboardNameIsAvailable(title, ctx, existing?.id);
+  }
+  const persist = async (writeDb: any): Promise<void> => {
+    if (existing) {
+      const setValues = {
         kind,
         title,
-        config: JSON.stringify(config),
-        updatedAt: nowIso(),
-      })
-      .where(eq(schema.dashboards.id, id));
-  } else {
-    await db.insert(schema.dashboards).values({
-      id,
-      kind,
-      title,
-      config: JSON.stringify(config),
-      ownerEmail: ctx.email,
-      orgId: ctx.orgId,
-      visibility: "private",
+        config: configJson,
+        updatedAt: nextDashboardVersion(existing.updatedAt),
+        updatedBy: ctx.email,
+      };
+      if (observedUpdatedAt !== undefined) {
+        // Fenced write. Snapshot the revision only after we know this exact
+        // write actually landed — otherwise a lost race would record a
+        // revision for a save that never happened.
+        const [row] = await writeDb
+          .update(schema.dashboards)
+          .set(setValues)
+          .where(
+            and(
+              eq(schema.dashboards.id, id),
+              eq(schema.dashboards.updatedAt, observedUpdatedAt),
+            ),
+          )
+          .returning();
+        if (!row) {
+          throw new DashboardConflictError(id);
+        }
+        persistedDashboard = rowToDashboard(row);
+        if (changed)
+          await snapshotDashboardRevision(
+            writeDb,
+            existing,
+            ctx,
+            requestRevisionChatContext(),
+          );
+      } else {
+        if (changed)
+          await snapshotDashboardRevision(
+            writeDb,
+            existing,
+            ctx,
+            requestRevisionChatContext(),
+          );
+        const [row] = await writeDb
+          .update(schema.dashboards)
+          .set(setValues)
+          .where(eq(schema.dashboards.id, id))
+          .returning();
+        if (!row) {
+          throw new Error(
+            `Dashboard "${id}" disappeared before its update completed.`,
+          );
+        }
+        persistedDashboard = rowToDashboard(row);
+      }
+    } else {
+      const [row] = await writeDb
+        .insert(schema.dashboards)
+        .values({
+          id,
+          kind,
+          title,
+          config: configJson,
+          ownerEmail: ctx.email,
+          orgId: ctx.orgId,
+          visibility: "private",
+          createdBy: ctx.email,
+          updatedBy: ctx.email,
+        })
+        .returning();
+      if (!row) {
+        throw new Error(`Dashboard "${id}" insert returned no row.`);
+      }
+      persistedDashboard = rowToDashboard(row);
+    }
+  };
+  if (nameChanged) {
+    await db.transaction(async (tx: any) => {
+      await lockDashboardNames(tx, [
+        title,
+        ...(existing ? [existing.title] : []),
+      ]);
+      await assertDashboardNameIsAvailable(title, ctx, existing?.id, tx);
+      await persist(tx);
     });
+  } else {
+    await persist(db);
   }
-  const [row] = await db
-    .select()
-    .from(schema.dashboards)
-    .where(eq(schema.dashboards.id, id));
-  // Notify any sibling tabs (sidebar list, command palette, dashboard view)
-  // so create/update propagate just like delete and the legacy-migration path.
-  const dashboard = rowToDashboard(row);
+  if (!persistedDashboard) {
+    throw new Error(`Dashboard "${id}" write returned no persisted row.`);
+  }
+  const dashboard = persistedDashboard;
   recordScopedChange(
     "dashboards",
     "change",
@@ -438,14 +1838,418 @@ export async function upsertDashboard(
     dashboard.orgId,
     dashboard.visibility,
   );
-  return dashboard;
+  return { dashboard, didWrite: true };
+}
+
+export async function upsertDashboardOutcome(
+  id: string,
+  kind: DashboardKind,
+  body: Record<string, unknown>,
+  ctx: AccessCtx,
+  expectedUpdatedAt?: string,
+): Promise<DashboardUpsertOutcome> {
+  return expectedUpdatedAt === undefined
+    ? await upsertDashboardLastWriteWins(id, kind, body, ctx)
+    : await upsertDashboardWithOutcome(id, kind, body, ctx, expectedUpdatedAt);
+}
+
+export async function upsertDashboard(
+  id: string,
+  kind: DashboardKind,
+  body: Record<string, unknown>,
+  ctx: AccessCtx,
+  expectedUpdatedAt?: string,
+): Promise<DashboardRecord> {
+  const outcome = await upsertDashboardOutcome(
+    id,
+    kind,
+    body,
+    ctx,
+    expectedUpdatedAt,
+  );
+  return outcome.dashboard;
+}
+
+export const DASHBOARD_SAVE_MAX_ATTEMPTS = 3;
+
+async function upsertDashboardLastWriteWins(
+  id: string,
+  kind: DashboardKind,
+  body: Record<string, unknown>,
+  ctx: AccessCtx,
+): Promise<DashboardUpsertOutcome> {
+  let lastConflict: unknown;
+  for (let attempt = 0; attempt < DASHBOARD_SAVE_MAX_ATTEMPTS; attempt++) {
+    const existing = await getDashboard(id, ctx);
+    try {
+      return await upsertDashboardWithOutcome(
+        id,
+        kind,
+        body,
+        ctx,
+        existing?.updatedAt,
+      );
+    } catch (err) {
+      if (err instanceof DashboardConflictError) {
+        lastConflict = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+  const finalError = new Error(
+    `Could not save dashboard "${id}" after ${DASHBOARD_SAVE_MAX_ATTEMPTS} attempt(s); it kept changing concurrently. Re-read the dashboard and try again.`,
+  );
+  if (lastConflict !== undefined) {
+    (finalError as Error & { cause?: unknown }).cause = lastConflict;
+  }
+  throw finalError;
 }
 
 /**
- * Archive a dashboard (soft-delete). Requires editor. The row stays in the
- * dashboards table with `archived_at` set, so it disappears from the default
- * sidebar list but remains accessible by id and can be restored.
+ * Read-modify-write helper for the four action call sites that fetch a
+ * dashboard, mutate its config in memory, then save it back. Fences every
+ * save with the `updatedAt` of the record `mutate` was given, so a
+ * concurrent writer (agent adds a panel while a human drags one, or two
+ * agent calls race) never gets silently clobbered.
+ *
+ * `mutate` is invoked with the freshest `DashboardRecord` on every attempt —
+ * re-fetched from `getDashboard` each time — and must recompute the
+ * `{ kind, body }` to save FROM THAT RECORD, not from a closure over an
+ * earlier read; only then does a retry actually merge both writers' changes
+ * instead of re-deriving the same stale result. `mutate` may throw a
+ * non-conflict error (e.g. validation) to abort immediately without
+ * retrying.
+ *
+ * On a lost race, this re-reads and re-invokes `mutate` up to `maxAttempts`
+ * times before failing loud with a clear error so callers never silently
+ * drop a write or loop forever.
  */
+export async function upsertDashboardWithRetryOutcome(
+  id: string,
+  ctx: AccessCtx,
+  mutate: (existing: DashboardRecord) =>
+    | {
+        kind: DashboardKind;
+        body: Record<string, unknown>;
+      }
+    | Promise<{
+        kind: DashboardKind;
+        body: Record<string, unknown>;
+      }>,
+  maxAttempts: number = DASHBOARD_SAVE_MAX_ATTEMPTS,
+): Promise<DashboardUpsertOutcome> {
+  let lastConflict: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const existing = await getDashboard(id, ctx);
+    if (!existing) {
+      throw new Error(
+        `dashboard "${id}" not found (or you don't have access).`,
+      );
+    }
+    const result = await mutate(existing);
+    const { kind, body } = result;
+    try {
+      return await upsertDashboardWithOutcome(
+        id,
+        kind,
+        body,
+        ctx,
+        existing.updatedAt,
+      );
+    } catch (err) {
+      if (err instanceof DashboardConflictError) {
+        lastConflict = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+  const finalError = new Error(
+    `Could not save dashboard "${id}" after ${maxAttempts} attempt(s); it kept changing concurrently. Re-read the dashboard and try again.`,
+  );
+  if (lastConflict !== undefined) {
+    (finalError as Error & { cause?: unknown }).cause = lastConflict;
+  }
+  throw finalError;
+}
+
+export async function upsertDashboardWithRetry(
+  id: string,
+  ctx: AccessCtx,
+  mutate: (existing: DashboardRecord) =>
+    | {
+        kind: DashboardKind;
+        body: Record<string, unknown>;
+      }
+    | Promise<{
+        kind: DashboardKind;
+        body: Record<string, unknown>;
+      }>,
+  maxAttempts: number = DASHBOARD_SAVE_MAX_ATTEMPTS,
+): Promise<DashboardRecord> {
+  const outcome = await upsertDashboardWithRetryOutcome(
+    id,
+    ctx,
+    mutate,
+    maxAttempts,
+  );
+  return outcome.dashboard;
+}
+
+function nextDashboardVersion(updatedAt: string): string {
+  const now = Date.now();
+  const current = Date.parse(updatedAt);
+  return new Date(
+    Number.isFinite(current) && current >= now ? current + 1 : now,
+  ).toISOString();
+}
+
+export async function certifyDashboardWithRetry(
+  id: string,
+  ctx: AccessCtx,
+  maxAttempts: number = DASHBOARD_SAVE_MAX_ATTEMPTS,
+): Promise<DashboardRecord> {
+  let lastConflict: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const existing = await getDashboard(id, ctx);
+    if (!existing) {
+      throw new Error(
+        `dashboard "${id}" not found (or you don't have access).`,
+      );
+    }
+    if (existing.kind !== "sql") {
+      throw new Error("Only SQL dashboards can be certified for AI queries.");
+    }
+    if (!ctx.orgId || existing.orgId !== ctx.orgId) {
+      throw new Error(
+        "Only dashboards owned by the active organization can be certified for AI queries.",
+      );
+    }
+    if (existing.archivedAt) {
+      throw new Error(
+        "Archived dashboards cannot be certified for AI queries.",
+      );
+    }
+    const updatedAt = nextDashboardVersion(existing.updatedAt);
+    const certification: DashboardCertification = {
+      status: "certified",
+      certifiedAt: new Date().toISOString(),
+      certifiedBy: ctx.email,
+      certifiedForUpdatedAt: updatedAt,
+    };
+    const updateResult = await (getDb() as any)
+      .update(schema.dashboards)
+      .set({
+        certification: JSON.stringify(certification),
+        updatedAt,
+        updatedBy: ctx.email,
+      })
+      .where(
+        and(
+          eq(schema.dashboards.id, id),
+          eq(schema.dashboards.orgId, ctx.orgId),
+          eq(schema.dashboards.updatedAt, existing.updatedAt),
+        ),
+      );
+    const affected = affectedRowCount(updateResult);
+    if (affected === undefined) {
+      throw new Error(
+        "The Postgres update did not report an affected-row count for the dashboard certification update.",
+      );
+    }
+    if (affected === 0) {
+      lastConflict = new DashboardConflictError(id);
+      continue;
+    }
+    const [row] = await (getDb() as any)
+      .select()
+      .from(schema.dashboards)
+      .where(eq(schema.dashboards.id, id));
+    if (!row) {
+      throw new Error(`Dashboard "${id}" disappeared after certification.`);
+    }
+    const dashboard = rowToDashboard(row, existing.role);
+    recordScopedChange(
+      "dashboards",
+      "change",
+      dashboard.id,
+      dashboard.ownerEmail,
+      dashboard.orgId,
+      dashboard.visibility,
+    );
+    return dashboard;
+  }
+  const finalError = new Error(
+    `Could not certify dashboard "${id}" after ${maxAttempts} attempt(s); it kept changing concurrently. Re-read the dashboard and try again.`,
+  );
+  if (lastConflict !== undefined) {
+    (finalError as Error & { cause?: unknown }).cause = lastConflict;
+  }
+  throw finalError;
+}
+
+export async function listDashboardRevisions(
+  dashboardId: string,
+  ctx: AccessCtx,
+): Promise<DashboardRevisionRecord[]> {
+  const existing = await getDashboard(dashboardId, ctx);
+  if (!existing) return [];
+  await assertAccess("dashboard", dashboardId, "viewer", {
+    userEmail: ctx.email,
+    orgId: ctx.orgId ?? undefined,
+  });
+  const db = getDb() as any;
+  const rows = await db
+    .select()
+    .from(schema.dashboardRevisions)
+    .where(eq(schema.dashboardRevisions.dashboardId, dashboardId))
+    .orderBy(
+      desc(schema.dashboardRevisions.createdAt),
+      desc(schema.dashboardRevisions.id),
+    )
+    .limit(DASHBOARD_REVISION_LIMIT);
+  return rows.map(rowToDashboardRevision);
+}
+
+export async function listDashboardRevisionMetadata(
+  dashboardId: string,
+  ctx: AccessCtx,
+): Promise<DashboardRevisionMetadata[]> {
+  const existing = await getDashboard(dashboardId, ctx);
+  if (!existing) return [];
+  await assertAccess("dashboard", dashboardId, "viewer", {
+    userEmail: ctx.email,
+    orgId: ctx.orgId ?? undefined,
+  });
+  const db = getDb() as any;
+  const rows = await db
+    .select({
+      id: schema.dashboardRevisions.id,
+      dashboardId: schema.dashboardRevisions.dashboardId,
+      kind: schema.dashboardRevisions.kind,
+      title: schema.dashboardRevisions.title,
+      createdAt: schema.dashboardRevisions.createdAt,
+      createdBy: schema.dashboardRevisions.createdBy,
+      chatContext: schema.dashboardRevisions.chatContext,
+    })
+    .from(schema.dashboardRevisions)
+    .where(eq(schema.dashboardRevisions.dashboardId, dashboardId))
+    .orderBy(
+      desc(schema.dashboardRevisions.createdAt),
+      desc(schema.dashboardRevisions.id),
+    )
+    .limit(DASHBOARD_REVISION_LIMIT);
+  return rows.map(rowToDashboardRevisionMetadata);
+}
+
+export async function restoreDashboardRevision(
+  dashboardId: string,
+  revisionId: string,
+  ctx: AccessCtx,
+  expectedUpdatedAt?: string,
+): Promise<{
+  dashboard: DashboardRecord;
+  snapshotRevisionId: string;
+} | null> {
+  const existing = await getDashboard(dashboardId, ctx);
+  if (!existing) return null;
+  await assertAccess("dashboard", dashboardId, "editor", {
+    userEmail: ctx.email,
+    orgId: ctx.orgId ?? undefined,
+  });
+  if (
+    expectedUpdatedAt !== undefined &&
+    existing.updatedAt !== expectedUpdatedAt
+  ) {
+    throw new DashboardConflictError(dashboardId);
+  }
+  const db = getDb() as any;
+  const [revisionRow] = await db
+    .select()
+    .from(schema.dashboardRevisions)
+    .where(
+      and(
+        eq(schema.dashboardRevisions.id, revisionId),
+        eq(schema.dashboardRevisions.dashboardId, dashboardId),
+      ),
+    )
+    .limit(1);
+  if (!revisionRow) return null;
+  const revision = rowToDashboardRevision(revisionRow);
+  const updatedAt = nowIso();
+  const nameChanged =
+    normalizeDashboardName(existing.title) !==
+    normalizeDashboardName(revision.title);
+  const becomesVisible = !existing.archivedAt && !existing.hiddenAt;
+  if (nameChanged && becomesVisible) {
+    await assertDashboardNameIsAvailable(revision.title, ctx, dashboardId);
+  }
+  const restored = await db.transaction(async (tx: any) => {
+    if (nameChanged && becomesVisible) {
+      await lockDashboardNames(tx, [existing.title, revision.title]);
+      await assertDashboardNameIsAvailable(
+        revision.title,
+        ctx,
+        dashboardId,
+        tx,
+      );
+    }
+    const updateResult = await tx
+      .update(schema.dashboards)
+      .set({
+        kind: revision.kind,
+        title: revision.title,
+        config: JSON.stringify(revision.config),
+        updatedAt,
+        updatedBy: ctx.email,
+      })
+      .where(
+        expectedUpdatedAt === undefined
+          ? eq(schema.dashboards.id, dashboardId)
+          : and(
+              eq(schema.dashboards.id, dashboardId),
+              eq(schema.dashboards.updatedAt, expectedUpdatedAt),
+            ),
+      );
+    if (expectedUpdatedAt !== undefined) {
+      const affected = affectedRowCount(updateResult);
+      if (affected === undefined) {
+        throw new Error(
+          "The Postgres update did not report an affected-row count for the fenced dashboard restore.",
+        );
+      }
+      if (affected === 0) throw new DashboardConflictError(dashboardId);
+    }
+
+    const snapshotRevisionId = await snapshotDashboardRevision(
+      tx,
+      existing,
+      ctx,
+      requestRevisionChatContext(),
+    );
+    const [row] = await tx
+      .select()
+      .from(schema.dashboards)
+      .where(eq(schema.dashboards.id, dashboardId));
+    return {
+      dashboard: rowToDashboard(row),
+      snapshotRevisionId,
+    };
+  });
+  if (!restored) return null;
+  const { dashboard } = restored;
+  recordScopedChange(
+    "dashboards",
+    "change",
+    dashboard.id,
+    dashboard.ownerEmail,
+    dashboard.orgId,
+    dashboard.visibility,
+  );
+  return restored;
+}
+
 export async function archiveDashboard(
   id: string,
   ctx: AccessCtx,
@@ -461,7 +2265,7 @@ export async function archiveDashboard(
   const now = nowIso();
   await db
     .update(schema.dashboards)
-    .set({ archivedAt: now, updatedAt: now })
+    .set({ archivedAt: now, updatedAt: now, updatedBy: ctx.email })
     .where(eq(schema.dashboards.id, id));
   const [row] = await db
     .select()
@@ -479,7 +2283,6 @@ export async function archiveDashboard(
   return dashboard;
 }
 
-/** Restore an archived dashboard. Requires editor. No-op if already active. */
 export async function unarchiveDashboard(
   id: string,
   ctx: AccessCtx,
@@ -491,11 +2294,25 @@ export async function unarchiveDashboard(
     userEmail: ctx.email,
     orgId: ctx.orgId ?? undefined,
   });
+  if (!existing.hiddenAt) {
+    await assertDashboardNameIsAvailable(existing.title, ctx, id);
+  }
   const db = getDb() as any;
-  await db
-    .update(schema.dashboards)
-    .set({ archivedAt: null, updatedAt: nowIso() })
-    .where(eq(schema.dashboards.id, id));
+  const persist = async (writeDb: any) => {
+    await writeDb
+      .update(schema.dashboards)
+      .set({ archivedAt: null, updatedAt: nowIso(), updatedBy: ctx.email })
+      .where(eq(schema.dashboards.id, id));
+  };
+  if (!existing.hiddenAt) {
+    await db.transaction(async (tx: any) => {
+      await lockDashboardNames(tx, [existing.title]);
+      await assertDashboardNameIsAvailable(existing.title, ctx, id, tx);
+      await persist(tx);
+    });
+  } else {
+    await persist(db);
+  }
   const [row] = await db
     .select()
     .from(schema.dashboards)
@@ -512,11 +2329,6 @@ export async function unarchiveDashboard(
   return dashboard;
 }
 
-/**
- * Hide a dashboard from default lists/search-empty states without archiving it.
- * The dashboard remains accessible by id and can be found by search surfaces
- * that explicitly include hidden records.
- */
 export async function hideDashboard(
   id: string,
   ctx: AccessCtx,
@@ -532,7 +2344,12 @@ export async function hideDashboard(
   const now = nowIso();
   await db
     .update(schema.dashboards)
-    .set({ hiddenAt: now, hiddenBy: ctx.email, updatedAt: now })
+    .set({
+      hiddenAt: now,
+      hiddenBy: ctx.email,
+      updatedAt: now,
+      updatedBy: ctx.email,
+    })
     .where(eq(schema.dashboards.id, id));
   const [row] = await db
     .select()
@@ -550,11 +2367,6 @@ export async function hideDashboard(
   return dashboard;
 }
 
-/**
- * Unhide a dashboard. During cleanup, legacy org-shared dashboards can be left
- * with a blank owner; the first user to unhide one becomes the owner so future
- * sharing/editing has a real person behind it.
- */
 export async function unhideDashboard(
   id: string,
   ctx: AccessCtx,
@@ -565,20 +2377,35 @@ export async function unhideDashboard(
     userEmail: ctx.email,
     orgId: ctx.orgId ?? undefined,
   });
+  if (!existing.archivedAt) {
+    await assertDashboardNameIsAvailable(existing.title, ctx, id);
+  }
   const db = getDb() as any;
   const now = nowIso();
   const patch: Record<string, unknown> = {
     hiddenAt: null,
     hiddenBy: null,
     updatedAt: now,
+    updatedBy: ctx.email,
   };
   if (!existing.ownerEmail) {
     patch.ownerEmail = ctx.email;
   }
-  await db
-    .update(schema.dashboards)
-    .set(patch)
-    .where(eq(schema.dashboards.id, id));
+  const persist = async (writeDb: any) => {
+    await writeDb
+      .update(schema.dashboards)
+      .set(patch)
+      .where(eq(schema.dashboards.id, id));
+  };
+  if (!existing.archivedAt) {
+    await db.transaction(async (tx: any) => {
+      await lockDashboardNames(tx, [existing.title]);
+      await assertDashboardNameIsAvailable(existing.title, ctx, id, tx);
+      await persist(tx);
+    });
+  } else {
+    await persist(db);
+  }
   const [row] = await db
     .select()
     .from(schema.dashboards)
@@ -595,7 +2422,6 @@ export async function unhideDashboard(
   return dashboard;
 }
 
-/** Delete a dashboard. Cleans legacy keys too. Requires admin/owner. */
 export async function removeDashboard(
   id: string,
   ctx: AccessCtx,
@@ -609,6 +2435,9 @@ export async function removeDashboard(
   const db = getDb() as any;
   await db.delete(schema.dashboards).where(eq(schema.dashboards.id, id));
   await db
+    .delete(schema.dashboardRevisions)
+    .where(eq(schema.dashboardRevisions.dashboardId, id));
+  await db
     .delete(schema.dashboardShares)
     .where(eq(schema.dashboardShares.resourceId, id));
   recordScopedChange(
@@ -619,7 +2448,6 @@ export async function removeDashboard(
     existing.orgId,
     existing.visibility,
   );
-  // Best-effort legacy cleanup.
   try {
     if (ctx.orgId) await deleteOrgSetting(ctx.orgId, `${SQL_PREFIX}${id}`);
     if (ctx.email) {
@@ -630,10 +2458,6 @@ export async function removeDashboard(
     // legacy cleanup is best-effort
   }
 }
-
-// ---------------------------------------------------------------------------
-// Analyses
-// ---------------------------------------------------------------------------
 
 function rowToAnalysis(row: any, role?: AccessRole): AnalysisRecord {
   return {
@@ -657,6 +2481,35 @@ function rowToAnalysis(row: any, role?: AccessRole): AnalysisRecord {
   };
 }
 
+function rowToAnalysisRevision(row: any): AnalysisRevisionRecord {
+  return {
+    id: row.id,
+    analysisId: row.analysisId,
+    name: row.name,
+    description: row.description,
+    question: row.question,
+    instructions: row.instructions,
+    dataSources: safeJsonParse(row.dataSources, []),
+    resultMarkdown: row.resultMarkdown,
+    resultData: row.resultData ? safeJsonParse(row.resultData, null) : null,
+    createdAt: row.createdAt,
+    createdBy: row.createdBy ?? null,
+    chatContext: parseRevisionChatContext(row.chatContext),
+  };
+}
+
+function rowToAnalysisRevisionMetadata(row: any): AnalysisRevisionMetadata {
+  return {
+    id: row.id,
+    analysisId: row.analysisId,
+    name: row.name,
+    description: row.description,
+    createdAt: row.createdAt,
+    createdBy: row.createdBy ?? null,
+    ...parseRevisionChatContextMetadata(row.chatContext),
+  };
+}
+
 function safeJsonParse<T>(s: unknown, fallback: T): T {
   if (typeof s !== "string") return fallback;
   try {
@@ -666,12 +2519,6 @@ function safeJsonParse<T>(s: unknown, fallback: T): T {
   }
 }
 
-/**
- * Columns selected for the analyses LIST query. Deliberately excludes the heavy
- * `resultMarkdown` (full findings text) and `resultData` (JSON) blobs — the list
- * action only needs metadata, so pulling those for every row wastes bandwidth.
- * The single-analysis GET path (`getAnalysis`) still selects the full row.
- */
 const analysisListColumns = {
   id: schema.analyses.id,
   name: schema.analyses.name,
@@ -689,12 +2536,6 @@ const analysisListColumns = {
   hiddenBy: schema.analyses.hiddenBy,
 } as const;
 
-/**
- * Map a list-projection row (no heavy result blobs) to an AnalysisRecord. The
- * excluded `resultMarkdown` / `resultData` fields are filled with empty
- * defaults so list consumers never transfer them; callers needing the real
- * result must load the analysis by id via `getAnalysis`.
- */
 function listRowToAnalysis(row: any): AnalysisRecord {
   return {
     id: row.id,
@@ -756,7 +2597,7 @@ async function migrateAnalysisFromSettings(
   orgId: string | null,
   visibility: AnalysisRecord["visibility"],
   role?: AccessRole,
-): Promise<AnalysisRecord> {
+): Promise<AnalysisRecord | null> {
   const db = getDb() as any;
   const createdAt =
     (typeof data.createdAt === "string" && data.createdAt) || nowIso();
@@ -781,10 +2622,12 @@ async function migrateAnalysisFromSettings(
       updatedAt,
     })
     .onConflictDoNothing();
+  // guard:allow-unscoped — read-after-write; see isMigratedLegacyRow.
   const [row] = await db
     .select()
     .from(schema.analyses)
     .where(eq(schema.analyses.id, id));
+  if (!isMigratedLegacyRow(row, ownerEmail, orgId)) return null;
   const analysis = rowToAnalysis(row, role);
   recordScopedChange(
     "analyses",
@@ -808,7 +2651,7 @@ export async function getAnalysis(
   if (access) return rowToAnalysis(access.resource, access.role);
   const legacy = await findLegacyAnalysis(id, ctx);
   if (!legacy) return null;
-  return migrateAnalysisFromSettings(
+  const migrated = await migrateAnalysisFromSettings(
     id,
     legacy.data,
     legacy.ownerEmail,
@@ -816,6 +2659,55 @@ export async function getAnalysis(
     legacy.visibility,
     "owner",
   );
+  if (migrated) return migrated;
+  // Another org member may have migrated the same legacy analysis first.
+  const migratedByOther = await resolveAccess("analysis", id, {
+    userEmail: ctx.email,
+    orgId: ctx.orgId ?? undefined,
+  });
+  return migratedByOther
+    ? rowToAnalysis(migratedByOther.resource, migratedByOther.role)
+    : null;
+}
+
+export type AnalysisReviewScope = DashboardReviewScope;
+
+export async function getAnalysisForReview(
+  id: string,
+  scope: AnalysisReviewScope,
+): Promise<AnalysisRecord | null> {
+  const [scopeRow] = await getDb()
+    .select({
+      ownerEmail: schema.analyses.ownerEmail,
+      orgId: schema.analyses.orgId,
+    })
+    .from(schema.analyses)
+    .where(
+      and(eq(schema.analyses.id, id), eq(schema.analyses.orgId, scope.orgId)),
+    )
+    .limit(1);
+  if (!scopeRow) return null;
+  const access = await resolveAccess("analysis", id, {
+    userEmail: scopeRow.ownerEmail,
+    orgId: scopeRow.orgId ?? undefined,
+  });
+  if (!access || access.resource.orgId !== scopeRow.orgId) return null;
+  return rowToAnalysis(access.resource, "viewer");
+}
+
+export async function getPublicAnalysisMetadata(id: string) {
+  const [row] = await (getDb() as any)
+    .select({
+      name: schema.analyses.name,
+      description: schema.analyses.description,
+      question: schema.analyses.question,
+    })
+    .from(schema.analyses)
+    .where(
+      and(eq(schema.analyses.id, id), eq(schema.analyses.visibility, "public")),
+    )
+    .limit(1);
+  return row ?? null;
 }
 
 export async function listAnalyses(
@@ -834,51 +2726,171 @@ export async function listAnalyses(
   else if (hidden === "hidden")
     conditions.push(isNotNull(schema.analyses.hiddenAt));
   const where = conditions.length === 1 ? conditions[0] : and(...conditions);
-  // List-specific projection: never pull the heavy resultMarkdown / resultData
-  // blobs for every analysis. Consumers that need the full result load by id.
   const rows = await db
     .select(analysisListColumns)
     .from(schema.analyses)
     .where(where);
   const out: AnalysisRecord[] = rows.map(listRowToAnalysis);
   const seen = new Set<string>(out.map((r) => r.id));
-  // Legacy settings rows have no hidden concept, so hidden-only queries skip
-  // the legacy scan entirely.
   if (hidden === "hidden") return out;
-  try {
-    const all = await getAllSettings();
-    for (const [key, value] of Object.entries(all)) {
-      let id: string | null = null;
-      let ownerEmail = ctx.email;
-      let orgId: string | null = null;
-      let visibility: AnalysisRecord["visibility"] = "private";
-      if (ctx.orgId && key.startsWith(`o:${ctx.orgId}:${ANALYSIS_PREFIX}`)) {
-        id = key.slice(`o:${ctx.orgId}:${ANALYSIS_PREFIX}`.length);
-        orgId = ctx.orgId;
-        visibility = "org";
-      } else if (
-        ctx.email &&
-        key.startsWith(`u:${ctx.email}:${ANALYSIS_PREFIX}`)
-      ) {
-        id = key.slice(`u:${ctx.email}:${ANALYSIS_PREFIX}`.length);
-      }
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      const rec = await migrateAnalysisFromSettings(
-        id,
-        value as Record<string, unknown>,
-        ownerEmail,
-        orgId,
-        visibility,
-      );
-      out.push(rec);
+  const all = await getScopedLegacySettings(ctx, {
+    resourceKind: "analysis",
+  });
+  for (const [key, value] of Object.entries(all)) {
+    let id: string | null = null;
+    const ownerEmail = ctx.email;
+    let orgId: string | null = null;
+    let visibility: AnalysisRecord["visibility"] = "private";
+    if (ctx.orgId && key.startsWith(`o:${ctx.orgId}:${ANALYSIS_PREFIX}`)) {
+      id = key.slice(`o:${ctx.orgId}:${ANALYSIS_PREFIX}`.length);
+      orgId = ctx.orgId;
+      visibility = "org";
+    } else if (
+      ctx.email &&
+      key.startsWith(`u:${ctx.email}:${ANALYSIS_PREFIX}`)
+    ) {
+      id = key.slice(`u:${ctx.email}:${ANALYSIS_PREFIX}`.length);
     }
-  } catch {
-    // legacy scan best-effort
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const rec = await migrateAnalysisFromSettings(
+      id,
+      value as Record<string, unknown>,
+      ownerEmail,
+      orgId,
+      visibility,
+    );
+    if (rec) out.push(rec);
   }
   return out;
 }
 
+async function pruneAnalysisRevisions(
+  db: any,
+  analysisId: string,
+): Promise<void> {
+  const rows = await db
+    .select({ id: schema.analysisRevisions.id })
+    .from(schema.analysisRevisions)
+    .where(eq(schema.analysisRevisions.analysisId, analysisId))
+    .orderBy(
+      desc(schema.analysisRevisions.createdAt),
+      desc(schema.analysisRevisions.id),
+    );
+  const stale = rows.slice(ANALYSIS_REVISION_LIMIT);
+  for (const row of stale) {
+    await db
+      .delete(schema.analysisRevisions)
+      .where(eq(schema.analysisRevisions.id, row.id));
+  }
+}
+
+async function snapshotAnalysisRevision(
+  db: any,
+  analysis: AnalysisRecord,
+  ctx: AccessCtx,
+  chatContext: AnalyticsRevisionChatContext | null = requestRevisionChatContext(),
+): Promise<void> {
+  const dataSources = stableStringify(analysis.dataSources);
+  const resultData = analysis.resultData
+    ? stableStringify(analysis.resultData)
+    : null;
+  const [latest] = await db
+    .select({
+      id: schema.analysisRevisions.id,
+      name: schema.analysisRevisions.name,
+      description: schema.analysisRevisions.description,
+      question: schema.analysisRevisions.question,
+      instructions: schema.analysisRevisions.instructions,
+      dataSources: schema.analysisRevisions.dataSources,
+      resultMarkdown: schema.analysisRevisions.resultMarkdown,
+      resultData: schema.analysisRevisions.resultData,
+      createdAt: schema.analysisRevisions.createdAt,
+    })
+    .from(schema.analysisRevisions)
+    .where(eq(schema.analysisRevisions.analysisId, analysis.id))
+    .orderBy(
+      desc(schema.analysisRevisions.createdAt),
+      desc(schema.analysisRevisions.id),
+    )
+    .limit(1);
+  if (
+    latest?.name === analysis.name &&
+    latest.description === analysis.description &&
+    latest.question === analysis.question &&
+    latest.instructions === analysis.instructions &&
+    comparableJson(latest.dataSources) === dataSources &&
+    latest.resultMarkdown === analysis.resultMarkdown &&
+    comparableJson(latest.resultData) === resultData
+  ) {
+    return;
+  }
+  const id = revisionId("analysisrev", analysis.id, latest?.id, {
+    name: analysis.name,
+    description: analysis.description,
+    question: analysis.question,
+    instructions: analysis.instructions,
+    dataSources,
+    resultMarkdown: analysis.resultMarkdown,
+    resultData,
+  });
+  await db
+    .insert(schema.analysisRevisions)
+    .values({
+      id,
+      analysisId: analysis.id,
+      name: analysis.name,
+      description: analysis.description,
+      question: analysis.question,
+      instructions: analysis.instructions,
+      dataSources,
+      resultMarkdown: analysis.resultMarkdown,
+      resultData,
+      createdAt: nextRevisionTimestamp(latest?.createdAt),
+      createdBy: ctx.email,
+      ...(chatContext ? { chatContext: JSON.stringify(chatContext) } : {}),
+      ownerEmail: analysis.ownerEmail,
+      orgId: analysis.orgId,
+    })
+    .onConflictDoNothing();
+  await pruneAnalysisRevisions(db, analysis.id);
+}
+
+export async function createAnalysisRevisionSnapshot(
+  analysisId: string,
+  ctx: AccessCtx,
+  chatContext?: AnalyticsRevisionChatContext,
+): Promise<string | null> {
+  await assertAccess("analysis", analysisId, "editor", {
+    userEmail: ctx.email,
+    orgId: ctx.orgId ?? undefined,
+  });
+  const analysis = await getAnalysis(analysisId, ctx);
+  if (!analysis) return null;
+  await snapshotAnalysisRevision(
+    getDb(),
+    analysis,
+    ctx,
+    chatContext ?? requestRevisionChatContext(),
+  );
+  return analysisId;
+}
+
+/**
+ * Upsert an analysis. On create, caller becomes owner and visibility defaults
+ * to `private`. On update, `assertAccess` requires `editor`.
+ *
+ * `expectedUpdatedAt` fences the update against concurrent writers: pass the
+ * `updatedAt` observed by an earlier `getAnalysis` call and the UPDATE only
+ * applies `WHERE id = $1 AND updated_at = $2`. If another writer already saved
+ * in between, the fenced UPDATE affects zero rows and this throws
+ * `AnalysisConflictError` instead of silently clobbering their write. Omit it
+ * (the default) to keep the prior unconditional last-write-wins behavior,
+ * which existing callers (legacy migration, revision restore, and
+ * `save-analysis`'s create/re-run path) still rely on. See
+ * `upsertAnalysisWithRetry` for the read-modify-write pattern that recomputes
+ * the patch from fresh state on a lost race.
+ */
 export async function upsertAnalysis(
   id: string,
   body: {
@@ -891,31 +2903,119 @@ export async function upsertAnalysis(
     resultData?: Record<string, unknown> | null;
   },
   ctx: AccessCtx,
+  expectedUpdatedAt?: string,
 ): Promise<AnalysisRecord> {
   const existing = await getAnalysis(id, ctx);
+  if (!existing && expectedUpdatedAt !== undefined) {
+    throw new AnalysisConflictError(id);
+  }
   const db = getDb() as any;
   if (existing) {
     await assertAccess("analysis", id, "editor", {
       userEmail: ctx.email,
       orgId: ctx.orgId ?? undefined,
     });
+    let storedJson:
+      | { dataSources: string; resultData: string | null }
+      | undefined;
+    if (body.dataSources !== undefined || body.resultData !== undefined) {
+      [storedJson] = await db
+        .select({
+          dataSources: schema.analyses.dataSources,
+          resultData: schema.analyses.resultData,
+        })
+        .from(schema.analyses)
+        .where(eq(schema.analyses.id, id))
+        .limit(1);
+    }
     const patch: Record<string, unknown> = { updatedAt: nowIso() };
     if (body.name !== undefined) patch.name = body.name;
     if (body.description !== undefined) patch.description = body.description;
     if (body.question !== undefined) patch.question = body.question;
     if (body.instructions !== undefined) patch.instructions = body.instructions;
     if (body.dataSources !== undefined)
-      patch.dataSources = JSON.stringify(body.dataSources);
+      patch.dataSources = stableStringify(body.dataSources);
     if (body.resultMarkdown !== undefined)
       patch.resultMarkdown = body.resultMarkdown;
     if (body.resultData !== undefined)
       patch.resultData = body.resultData
-        ? JSON.stringify(body.resultData)
+        ? stableStringify(body.resultData)
         : null;
-    await db
-      .update(schema.analyses)
-      .set(patch)
-      .where(eq(schema.analyses.id, id));
+    const next = {
+      name: (patch.name as string | undefined) ?? existing.name,
+      description:
+        (patch.description as string | undefined) ?? existing.description,
+      question: (patch.question as string | undefined) ?? existing.question,
+      instructions:
+        (patch.instructions as string | undefined) ?? existing.instructions,
+      dataSources:
+        body.dataSources !== undefined
+          ? body.dataSources
+          : existing.dataSources,
+      resultMarkdown:
+        (patch.resultMarkdown as string | undefined) ?? existing.resultMarkdown,
+      resultData:
+        body.resultData !== undefined ? body.resultData : existing.resultData,
+    };
+    const changed =
+      next.name !== existing.name ||
+      next.description !== existing.description ||
+      next.question !== existing.question ||
+      next.instructions !== existing.instructions ||
+      (body.dataSources !== undefined &&
+        (!storedJson ||
+          comparableJson(storedJson.dataSources) !==
+            stableStringify(body.dataSources))) ||
+      next.resultMarkdown !== existing.resultMarkdown ||
+      (body.resultData !== undefined &&
+        (!storedJson ||
+          comparableJson(storedJson.resultData) !==
+            (body.resultData === null
+              ? null
+              : stableStringify(body.resultData))));
+    if (!changed) return existing;
+    if (expectedUpdatedAt !== undefined) {
+      // Fenced write. Snapshot the revision only after we know this exact
+      // write actually landed — otherwise a lost race would record a
+      // revision for a save that never happened.
+      const updateResult = await db
+        .update(schema.analyses)
+        .set(patch)
+        .where(
+          and(
+            eq(schema.analyses.id, id),
+            eq(schema.analyses.updatedAt, expectedUpdatedAt),
+          ),
+        );
+      const affected = affectedRowCount(updateResult);
+      if (affected === undefined) {
+        throw new Error(
+          "The Postgres update did not report an affected-row count for the fenced analysis update.",
+        );
+      }
+      if (affected === 0) {
+        throw new AnalysisConflictError(id);
+      }
+      if (changed)
+        await snapshotAnalysisRevision(
+          db,
+          existing,
+          ctx,
+          requestRevisionChatContext(),
+        );
+    } else {
+      if (changed)
+        await snapshotAnalysisRevision(
+          db,
+          existing,
+          ctx,
+          requestRevisionChatContext(),
+        );
+      await db
+        .update(schema.analyses)
+        .set(patch)
+        .where(eq(schema.analyses.id, id));
+    }
   } else {
     await db.insert(schema.analyses).values({
       id,
@@ -943,6 +3043,191 @@ export async function upsertAnalysis(
   return rowToAnalysis(row);
 }
 
+export const ANALYSIS_SAVE_MAX_ATTEMPTS = 3;
+
+/**
+ * Read-modify-write helper for action call sites that fetch an analysis,
+ * mutate its fields in memory, then save it back. Fences every save with the
+ * `updatedAt` of the record `mutate` was given, so a concurrent writer (e.g.
+ * `save-analysis` re-running with fresh results while someone renames it)
+ * never gets silently clobbered.
+ *
+ * `mutate` is invoked with the freshest `AnalysisRecord` on every attempt —
+ * re-fetched from `getAnalysis` each time — and must recompute the body patch
+ * to save FROM THAT RECORD, not from a closure over an earlier read; only
+ * then does a retry actually merge both writers' changes instead of
+ * re-deriving the same stale result. `mutate` may throw a non-conflict error
+ * (e.g. validation) to abort immediately without retrying.
+ *
+ * On a lost race, this re-reads and re-invokes `mutate` up to `maxAttempts`
+ * times before failing loud with a clear error so callers never silently
+ * drop a write or loop forever.
+ */
+export async function upsertAnalysisWithRetry(
+  id: string,
+  ctx: AccessCtx,
+  mutate: (existing: AnalysisRecord) =>
+    | {
+        name?: string;
+        description?: string;
+        question?: string;
+        instructions?: string;
+        dataSources?: string[];
+        resultMarkdown?: string;
+        resultData?: Record<string, unknown> | null;
+      }
+    | Promise<{
+        name?: string;
+        description?: string;
+        question?: string;
+        instructions?: string;
+        dataSources?: string[];
+        resultMarkdown?: string;
+        resultData?: Record<string, unknown> | null;
+      }>,
+  maxAttempts: number = ANALYSIS_SAVE_MAX_ATTEMPTS,
+): Promise<AnalysisRecord> {
+  let lastConflict: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const existing = await getAnalysis(id, ctx);
+    if (!existing) {
+      throw new Error(`analysis "${id}" not found (or you don't have access).`);
+    }
+    const body = await mutate(existing);
+    try {
+      return await upsertAnalysis(id, body, ctx, existing.updatedAt);
+    } catch (err) {
+      if (err instanceof AnalysisConflictError) {
+        lastConflict = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+  const finalError = new Error(
+    `Could not save analysis "${id}" after ${maxAttempts} attempt(s); it kept changing concurrently. Re-read the analysis and try again.`,
+  );
+  if (lastConflict !== undefined) {
+    (finalError as Error & { cause?: unknown }).cause = lastConflict;
+  }
+  throw finalError;
+}
+
+export async function listAnalysisRevisions(
+  analysisId: string,
+  ctx: AccessCtx,
+): Promise<AnalysisRevisionRecord[]> {
+  const existing = await getAnalysis(analysisId, ctx);
+  if (!existing) return [];
+  await assertAccess("analysis", analysisId, "viewer", {
+    userEmail: ctx.email,
+    orgId: ctx.orgId ?? undefined,
+  });
+  const db = getDb() as any;
+  const rows = await db
+    .select()
+    .from(schema.analysisRevisions)
+    .where(eq(schema.analysisRevisions.analysisId, analysisId))
+    .orderBy(
+      desc(schema.analysisRevisions.createdAt),
+      desc(schema.analysisRevisions.id),
+    )
+    .limit(ANALYSIS_REVISION_LIMIT);
+  return rows.map(rowToAnalysisRevision);
+}
+
+export async function listAnalysisRevisionMetadata(
+  analysisId: string,
+  ctx: AccessCtx,
+): Promise<AnalysisRevisionMetadata[]> {
+  const existing = await getAnalysis(analysisId, ctx);
+  if (!existing) return [];
+  await assertAccess("analysis", analysisId, "viewer", {
+    userEmail: ctx.email,
+    orgId: ctx.orgId ?? undefined,
+  });
+  const db = getDb() as any;
+  const rows = await db
+    .select({
+      id: schema.analysisRevisions.id,
+      analysisId: schema.analysisRevisions.analysisId,
+      name: schema.analysisRevisions.name,
+      description: schema.analysisRevisions.description,
+      createdAt: schema.analysisRevisions.createdAt,
+      createdBy: schema.analysisRevisions.createdBy,
+      chatContext: schema.analysisRevisions.chatContext,
+    })
+    .from(schema.analysisRevisions)
+    .where(eq(schema.analysisRevisions.analysisId, analysisId))
+    .orderBy(
+      desc(schema.analysisRevisions.createdAt),
+      desc(schema.analysisRevisions.id),
+    )
+    .limit(ANALYSIS_REVISION_LIMIT);
+  return rows.map(rowToAnalysisRevisionMetadata);
+}
+
+export async function restoreAnalysisRevision(
+  analysisId: string,
+  revisionId: string,
+  ctx: AccessCtx,
+): Promise<AnalysisRecord | null> {
+  const existing = await getAnalysis(analysisId, ctx);
+  if (!existing) return null;
+  await assertAccess("analysis", analysisId, "editor", {
+    userEmail: ctx.email,
+    orgId: ctx.orgId ?? undefined,
+  });
+  const db = getDb() as any;
+  const [revisionRow] = await db
+    .select()
+    .from(schema.analysisRevisions)
+    .where(
+      and(
+        eq(schema.analysisRevisions.id, revisionId),
+        eq(schema.analysisRevisions.analysisId, analysisId),
+      ),
+    )
+    .limit(1);
+  if (!revisionRow) return null;
+  const revision = rowToAnalysisRevision(revisionRow);
+  await snapshotAnalysisRevision(
+    db,
+    existing,
+    ctx,
+    requestRevisionChatContext(),
+  );
+  await db
+    .update(schema.analyses)
+    .set({
+      name: revision.name,
+      description: revision.description,
+      question: revision.question,
+      instructions: revision.instructions,
+      dataSources: JSON.stringify(revision.dataSources),
+      resultMarkdown: revision.resultMarkdown,
+      resultData: revision.resultData
+        ? JSON.stringify(revision.resultData)
+        : null,
+      updatedAt: nowIso(),
+    })
+    .where(eq(schema.analyses.id, analysisId));
+  const [row] = await db
+    .select()
+    .from(schema.analyses)
+    .where(eq(schema.analyses.id, analysisId));
+  const analysis = rowToAnalysis(row);
+  recordScopedChange(
+    "analyses",
+    "change",
+    analysis.id,
+    analysis.ownerEmail,
+    analysis.orgId,
+    analysis.visibility,
+  );
+  return analysis;
+}
+
 export async function removeAnalysis(
   id: string,
   ctx: AccessCtx,
@@ -955,6 +3240,9 @@ export async function removeAnalysis(
   });
   const db = getDb() as any;
   await db.delete(schema.analyses).where(eq(schema.analyses.id, id));
+  await db
+    .delete(schema.analysisRevisions)
+    .where(eq(schema.analysisRevisions.analysisId, id));
   await db
     .delete(schema.analysisShares)
     .where(eq(schema.analysisShares.resourceId, id));
@@ -975,11 +3263,6 @@ export async function removeAnalysis(
   }
 }
 
-/**
- * Hide an analysis from default lists/navigation without deleting it. The
- * analysis remains accessible by id and can be found by surfaces that
- * explicitly include hidden records.
- */
 export async function hideAnalysis(
   id: string,
   ctx: AccessCtx,
@@ -1013,11 +3296,6 @@ export async function hideAnalysis(
   return analysis;
 }
 
-/**
- * Unhide an analysis. During cleanup, legacy org-shared analyses can be left
- * with a blank owner; the first user to unhide one becomes the owner so future
- * sharing/editing has a real person behind it.
- */
 export async function unhideAnalysis(
   id: string,
   ctx: AccessCtx,
@@ -1055,25 +3333,26 @@ export async function unhideAnalysis(
   return analysis;
 }
 
-// ---------------------------------------------------------------------------
-// Dashboard views (child of dashboard — no separate sharing)
-// ---------------------------------------------------------------------------
-
 export interface DashboardViewRecord {
   id: string;
   dashboardId: string;
   name: string;
   filters: Record<string, string>;
+  isDefault: boolean;
   createdBy: string | null;
   createdAt: string;
 }
 
 function rowToView(row: any): DashboardViewRecord {
+  if (typeof row.isDefault !== "boolean") {
+    throw new Error("Dashboard view is missing its default status");
+  }
   return {
     id: row.id,
     dashboardId: row.dashboardId,
     name: row.name,
     filters: safeJsonParse(row.filters, {} as Record<string, string>),
+    isDefault: row.isDefault,
     createdBy: row.createdBy ?? null,
     createdAt: row.createdAt,
   };
@@ -1083,9 +3362,40 @@ export async function listDashboardViews(
   dashboardId: string,
   ctx: AccessCtx,
 ): Promise<DashboardViewRecord[]> {
-  // Parent access gates view visibility.
-  const dash = await getDashboard(dashboardId, ctx);
-  if (!dash) return [];
+  const access = await resolveAccess(
+    "dashboard",
+    dashboardId,
+    {
+      userEmail: ctx.email,
+      orgId: ctx.orgId ?? undefined,
+    },
+    { skipResourceBody: true },
+  );
+  if (!access) {
+    const legacy = await findLegacyDashboard(dashboardId, ctx);
+    if (!legacy) return [];
+    const migrated = await migrateDashboardFromSettings(
+      dashboardId,
+      legacy.kind,
+      legacy.data,
+      legacy.ownerEmail,
+      legacy.orgId,
+      legacy.visibility,
+      "owner",
+    );
+    // Another org member may have migrated the same legacy dashboard first.
+    if (
+      !migrated &&
+      !(await resolveAccess(
+        "dashboard",
+        dashboardId,
+        { userEmail: ctx.email, orgId: ctx.orgId ?? undefined },
+        { skipResourceBody: true },
+      ))
+    ) {
+      return [];
+    }
+  }
   const db = getDb() as any;
   const rows = await db
     .select()
@@ -1096,7 +3406,12 @@ export async function listDashboardViews(
 
 export async function saveDashboardView(
   dashboardId: string,
-  view: { id?: string; name: string; filters: Record<string, string> },
+  view: {
+    id?: string;
+    name: string;
+    filters: Record<string, string>;
+    isDefault?: boolean;
+  },
   ctx: AccessCtx,
 ): Promise<DashboardViewRecord> {
   await assertAccess("dashboard", dashboardId, "editor", {
@@ -1104,25 +3419,80 @@ export async function saveDashboardView(
     orgId: ctx.orgId ?? undefined,
   });
   const db = getDb() as any;
-  const id = view.id ?? nanoidFallback();
-  if (view.id) {
-    await db
-      .update(schema.dashboardViews)
-      .set({ name: view.name, filters: JSON.stringify(view.filters) })
-      .where(eq(schema.dashboardViews.id, id));
-  } else {
-    await db.insert(schema.dashboardViews).values({
-      id,
-      dashboardId,
-      name: view.name,
-      filters: JSON.stringify(view.filters),
-      createdBy: ctx.email || null,
-    });
-  }
-  const [row] = await db
-    .select()
-    .from(schema.dashboardViews)
-    .where(eq(schema.dashboardViews.id, id));
+  const row = await db.transaction(async (tx: any) => {
+    if (view.isDefault) {
+      await tx
+        .select({ id: schema.dashboards.id })
+        .from(schema.dashboards)
+        .where(eq(schema.dashboards.id, dashboardId))
+        .for("update");
+      await tx
+        .update(schema.dashboardViews)
+        .set({ isDefault: false })
+        .where(
+          and(
+            eq(schema.dashboardViews.dashboardId, dashboardId),
+            eq(schema.dashboardViews.isDefault, true),
+          ),
+        );
+    }
+
+    let id = view.id ?? nanoidFallback();
+    let existing = false;
+    if (view.id) {
+      const [existingRow] = await tx
+        .select({
+          id: schema.dashboardViews.id,
+          dashboardId: schema.dashboardViews.dashboardId,
+        })
+        .from(schema.dashboardViews)
+        .where(eq(schema.dashboardViews.id, view.id))
+        .limit(1);
+      if (existingRow?.dashboardId === dashboardId) {
+        existing = true;
+      } else if (existingRow) {
+        id = nanoidFallback();
+      }
+    }
+
+    if (existing) {
+      await tx
+        .update(schema.dashboardViews)
+        .set({
+          name: view.name,
+          filters: JSON.stringify(view.filters),
+          ...(view.isDefault ? { isDefault: true } : {}),
+        })
+        .where(
+          and(
+            eq(schema.dashboardViews.id, id),
+            eq(schema.dashboardViews.dashboardId, dashboardId),
+          ),
+        );
+    } else {
+      await tx.insert(schema.dashboardViews).values({
+        id,
+        dashboardId,
+        name: view.name,
+        filters: JSON.stringify(view.filters),
+        isDefault: view.isDefault === true,
+        createdBy: ctx.email || null,
+      });
+    }
+    const [saved] = await tx
+      .select()
+      .from(schema.dashboardViews)
+      .where(
+        and(
+          eq(schema.dashboardViews.id, id),
+          eq(schema.dashboardViews.dashboardId, dashboardId),
+        ),
+      );
+    if (!saved) {
+      throw new Error("Dashboard view was not persisted");
+    }
+    return saved;
+  });
   const dash = await getDashboard(dashboardId, ctx);
   if (dash) {
     recordScopedChange(
@@ -1149,7 +3519,12 @@ export async function deleteDashboardView(
   const db = getDb() as any;
   await db
     .delete(schema.dashboardViews)
-    .where(eq(schema.dashboardViews.id, viewId));
+    .where(
+      and(
+        eq(schema.dashboardViews.id, viewId),
+        eq(schema.dashboardViews.dashboardId, dashboardId),
+      ),
+    );
   const dash = await getDashboard(dashboardId, ctx);
   if (dash) {
     recordScopedChange(

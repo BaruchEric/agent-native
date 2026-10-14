@@ -1,19 +1,26 @@
+import { configureClientRouterBasename } from "@agent-native/core/client/api-path";
+import {
+  installRouteChunkRecovery,
+  stripBuildCompatibilityCacheBuster,
+} from "@agent-native/core/client/route-chunk-recovery";
 import { hydrateRoot } from "react-dom/client";
 import { HydratedRouter } from "react-router/dom";
-import { appBasePath } from "@agent-native/core/client/api-path";
 
-const basePath = appBasePath();
-const pathname = window.location.pathname;
-const routerBasePath =
-  basePath && (pathname === basePath || pathname.startsWith(`${basePath}/`))
-    ? basePath
-    : "";
+import { i18nCatalog } from "./i18n";
 
-const context = (
-  window as Window & { __reactRouterContext?: { basename?: string } }
-).__reactRouterContext;
-if (context) {
-  context.basename = routerBasePath;
+installRouteChunkRecovery();
+
+const hydratedLocale = window.__AGENT_NATIVE_LOCALE__?.locale;
+if (hydratedLocale && hydratedLocale !== "en-US") {
+  try {
+    await i18nCatalog.loadMessages(hydratedLocale);
+  } catch {
+    // coercion-ok: a missing locale chunk must not block hydration; message
+    // readers fall back to en-US and the provider re-resolves the locale.
+  }
 }
 
+configureClientRouterBasename();
+
 hydrateRoot(document, <HydratedRouter />);
+stripBuildCompatibilityCacheBuster();

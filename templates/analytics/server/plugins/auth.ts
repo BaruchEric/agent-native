@@ -1,9 +1,55 @@
-import { createAuthPlugin } from "@agent-native/core/server";
+import {
+  isInBackgroundFunctionRuntime,
+  markDefaultPluginProvided,
+} from "@agent-native/core/server";
+import { createToolkitAuthPlugin } from "@agent-native/toolkit/app/auth/server";
 
-export default createAuthPlugin({
-  publicPaths: ["/track", "/api/analytics/track"],
+import {
+  ANALYTICS_ANALYSIS_AGENT_CONTEXT_ENDPOINT,
+  ANALYTICS_DASHBOARD_AGENT_CONTEXT_ENDPOINT,
+} from "../../shared/resource-agent-access.js";
+import {
+  SESSION_REPLAY_AGENT_CONTEXT_ENDPOINT,
+  SESSION_REPLAY_AGENT_DIAGNOSTICS_ENDPOINT,
+  SESSION_REPLAY_AGENT_EVENTS_ENDPOINT,
+} from "../../shared/session-replay-agent-access.js";
+
+const authPlugin = createToolkitAuthPlugin({
+  workspaceAppPublicPaths: ["/"],
+  publicPaths: [
+    // Agent-readable context links: fetched with no session cookie, so the
+    // gate must not 401 before each handler verifies its scoped token. One
+    // by one: a `/api/session-replay` prefix would also expose recordings.
+    ANALYTICS_DASHBOARD_AGENT_CONTEXT_ENDPOINT,
+    ANALYTICS_ANALYSIS_AGENT_CONTEXT_ENDPOINT,
+    SESSION_REPLAY_AGENT_CONTEXT_ENDPOINT,
+    SESSION_REPLAY_AGENT_EVENTS_ENDPOINT,
+    SESSION_REPLAY_AGENT_DIAGNOSTICS_ENDPOINT,
+    "/track",
+    "/api/analytics/track",
+    "/api/analytics/replay",
+    "/status",
+    "/_agent-native/actions/get-public-status-page",
+  ],
+  publicPathsWithQueryToken: [
+    {
+      path: "/api/session-replay/recordings/:recordingId/manifest",
+      queryParam: "agent_access",
+    },
+    {
+      path: "/api/session-replay/recordings/:recordingId/chunks/:seq",
+      queryParam: "agent_access",
+    },
+    {
+      path: "/api/session-replay/recordings/:recordingId/chunks",
+      queryParam: "agent_access",
+    },
+  ],
+  publicCorsPaths: ["/track", "/api/analytics/track", "/api/analytics/replay"],
   marketing: {
-    appName: "Agent-Native Analytics",
+    appName: "Analytics",
+    learnMoreUrl:
+      "https://agent-native.com/apps/analytics?utm_source=app&utm_medium=product&utm_content=onboarding-learn-more",
     tagline:
       "Your AI agent queries your data sources, builds dashboards, and answers business questions alongside you.",
     features: [
@@ -13,3 +59,14 @@ export default createAuthPlugin({
     ],
   },
 });
+
+export default async (nitroApp: any): Promise<void> => {
+  markDefaultPluginProvided(nitroApp, "auth");
+  if (isInBackgroundFunctionRuntime()) {
+    console.info(
+      "[auth] Skipping Better Auth setup in durable background runtime",
+    );
+    return;
+  }
+  await authPlugin(nitroApp);
+};

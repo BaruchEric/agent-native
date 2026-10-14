@@ -1,29 +1,19 @@
-/**
- * Shared SSR catch-all handler for React Router framework mode.
- *
- * Templates wire this up via:
- *
- *   // server/routes/[...page].get.ts
- *   import { createH3SSRHandler } from "@agent-native/core/server/ssr-handler";
- *   export default createH3SSRHandler(
- *     () => import("virtual:react-router/server-build"),
- *   );
- *
- * The `getBuild` callback MUST live in the template's own source so Vite's
- * @react-router/dev plugin can resolve the `virtual:` module. Pulling the
- * import into core (e.g. via a re-export) puts it in node_modules where
- * Vite's SSR externalizer leaves it untouched and Node's ESM loader rejects
- * the unknown scheme — silently 302'ing every request to "/".
- */
-import { createRequestHandler } from "react-router";
 import { defineEventHandler } from "h3";
-import { getSentryClientConfigScript } from "./sentry-config.js";
-import { computeInlineScriptHash } from "./security-headers.js";
+import { createRequestHandler } from "react-router";
+
+import { getAppConfig, resolveAppHomePath } from "../app-config/index.js";
+import { isMcpPublicPath } from "../mcp/route-paths.js";
 import {
-  getAppBasePathFromViteEnv,
-  stripAppBasePath as canonicalStripAppBasePath,
-} from "./app-base-path.js";
-import { runWithRequestContext } from "./request-context.js";
+  DEFAULT_SPECULATION_RULES_PATH,
+  resolveChunkRecoveryCacheHeaders,
+  resolveSsrCacheHeaders,
+  resolveSsrCacheKeyHeaders,
+  SSR_QUERY_CACHE_KEY_HEADER,
+} from "../shared/cache-control.js";
+import {
+  CHUNK_RECOVERY_PATH_SUFFIX,
+  isLegacyChunkRecoveryRequest,
+} from "../shared/route-chunk-recovery-bootstrap.js";
 import {
   AGENT_NATIVE_SOCIAL_IMAGE_ALT,
   AGENT_NATIVE_SOCIAL_IMAGE_HEIGHT,
@@ -32,15 +22,35 @@ import {
   AGENT_NATIVE_SOCIAL_IMAGE_WIDTH,
   withAgentNativeSocialImageCacheBuster,
 } from "../shared/social-meta.js";
+import { getSsrAuthRedirectScript } from "../shared/ssr-auth-redirect.js";
 import {
-  DEFAULT_SSR_CACHE_HEADERS,
-  DEFAULT_SPECULATION_RULES_PATH,
-} from "../shared/cache-control.js";
+  getAppBasePathFromViteEnv,
+  stripAppBasePath as canonicalStripAppBasePath,
+} from "./app-base-path.js";
+import { getAppOriginClientConfigScript } from "./app-origin-config.js";
+import { captureError } from "./capture-error.js";
+import {
+  frameworkSessionHintCookieName,
+  resolveAuthCookieNamespace,
+} from "./cookie-namespace.js";
+import { getFrameworkRoutePrefix } from "./framework-route-prefix.js";
+import { getPostHogClientConfigScript } from "./posthog-config.js";
+import { runWithRequestContext } from "./request-context.js";
+import {
+  getRealtimeClientConfigScript,
+  getSentryClientConfigScript,
+} from "./sentry-config.js";
 
 export {
   DEFAULT_SSR_CACHE_HEADERS,
   DEFAULT_SPECULATION_RULES_HEADER,
   DEFAULT_SSR_CACHE_CONTROL,
+  DISABLED_SSR_CACHE_HEADERS,
+  isSsrCacheEnabled,
+  resolveSsrCacheHeaders,
+  resolveSsrCacheKeyHeaders,
+  resolveSsrNetlifyQueryVary,
+  SSR_CACHE_ENV_VAR,
 } from "../shared/cache-control.js";
 
 function getAppBasePath(): string {
@@ -49,6 +59,67 @@ function getAppBasePath(): string {
 
 function stripAppBasePath(pathname: string): string {
   return canonicalStripAppBasePath(pathname, getAppBasePath());
+}
+
+function splitReactRouterDataPathname(pathname: string): {
+  routePath: string;
+  dataSuffix: string;
+  trailingSlash: string;
+} {
+  const trailingSlash = pathname.endsWith("/") ? "/" : "";
+  const pathWithoutTrailingSlash = trailingSlash
+    ? pathname.slice(0, -trailingSlash.length)
+    : pathname;
+  if (pathWithoutTrailingSlash.endsWith("/_.data")) {
+    return {
+      routePath: pathWithoutTrailingSlash.slice(0, -"/_.data".length),
+      dataSuffix: "/_.data",
+      trailingSlash,
+    };
+  }
+  if (pathWithoutTrailingSlash.endsWith(".data")) {
+    return {
+      routePath: pathWithoutTrailingSlash.slice(0, -".data".length),
+      dataSuffix: ".data",
+      trailingSlash,
+    };
+  }
+  return {
+    routePath: pathWithoutTrailingSlash,
+    dataSuffix: "",
+    trailingSlash,
+  };
+}
+
+function stripChunkRecoveryPathSuffix(pathname: string): string {
+  const { routePath, dataSuffix, trailingSlash } =
+    splitReactRouterDataPathname(pathname);
+  const routeHasTrailingSlash = routePath.endsWith("/");
+  const routePathWithoutTrailingSlash = routeHasTrailingSlash
+    ? routePath.slice(0, -1)
+    : routePath;
+  if (!routePathWithoutTrailingSlash.endsWith(CHUNK_RECOVERY_PATH_SUFFIX)) {
+    return pathname;
+  }
+
+  const routePathWithoutAlias =
+    routePathWithoutTrailingSlash.slice(
+      0,
+      -CHUNK_RECOVERY_PATH_SUFFIX.length,
+    ) || "/";
+  const separator =
+    routePathWithoutAlias === "/" && dataSuffix.startsWith("/")
+      ? dataSuffix.slice(1)
+      : dataSuffix;
+  const suffix = `${separator}${trailingSlash}`;
+  return routePathWithoutAlias === "/" && suffix === "/"
+    ? "/"
+    : `${routePathWithoutAlias}${suffix}`;
+}
+
+function isChunkRecoveryPath(pathname: string): boolean {
+  const { routePath } = splitReactRouterDataPathname(pathname);
+  return routePath.replace(/\/+$/, "").endsWith(CHUNK_RECOVERY_PATH_SUFFIX);
 }
 
 function stripBasePath(pathname: string, basePath: string): string {
@@ -97,15 +168,37 @@ function requestWithPathname(
   return new Request(url, init);
 }
 
+function requestForAnonymousSsr(request: Request): Request {
+  const headers = new Headers(request.headers);
+  headers.delete("cookie");
+  headers.delete("authorization");
+  const init: RequestInit & { duplex?: "half" } = {
+    method: request.method,
+    headers,
+    signal: request.signal,
+  };
+  if (request.body && !["GET", "HEAD"].includes(request.method.toUpperCase())) {
+    init.body = request.body;
+    init.duplex = "half";
+  }
+  return new Request(request.url, init);
+}
+
 function prefixMountedPath(path: string, basePath: string): string {
   if (!basePath || !path.startsWith("/") || path.startsWith("//")) return path;
-  if (path === basePath || path.startsWith(`${basePath}/`)) return path;
+  const pathname = path.split(/[?#]/, 1)[0] ?? path;
+  if (
+    pathname === basePath ||
+    pathname === `${basePath}.data` ||
+    pathname.startsWith(`${basePath}/`)
+  )
+    return path;
   return `${basePath}${path}`;
 }
 
 function prefixMountedHtml(html: string, basePath: string): string {
   if (!basePath) return html;
-  return html
+  const prefixedHtml = html
     .replace(
       /\b(href|src|action|formaction|poster)=(["'])(\/(?!\/)[^"']*)\2/g,
       (_match, attr: string, quote: string, path: string) =>
@@ -115,6 +208,11 @@ function prefixMountedHtml(html: string, basePath: string): string {
       const q = quote || "";
       return `url(${q}${prefixMountedPath(path, basePath)}${q})`;
     });
+
+  return prefixedHtml.replace(
+    /(window\.__reactRouterContext\s*=\s*\{\s*"basename"\s*:\s*)"(?:\\.|[^"\\])*"/,
+    `$1${JSON.stringify(basePath)}`,
+  );
 }
 
 function injectHeadScript(html: string, script: string | null): string {
@@ -177,12 +275,15 @@ function injectDefaultSocialImageMeta(html: string, imageUrl: string): string {
   return html.slice(0, headCloseIdx) + tags.join("") + html.slice(headCloseIdx);
 }
 
+const CACHEABLE_ERROR_STATUSES = new Set([404, 410]);
+
 function isSsrHtmlOrDataResponse(
   headers: Headers,
   status: number,
   pathname: string,
 ): boolean {
-  if (status < 200 || status >= 400) return false;
+  if (status < 200) return false;
+  if (status >= 400 && !CACHEABLE_ERROR_STATUSES.has(status)) return false;
   const contentType = headers.get("content-type")?.toLowerCase() ?? "";
   if (contentType.includes("text/html")) return true;
   return pathname.endsWith(".data") && contentType.includes("text/x-script");
@@ -194,12 +295,14 @@ function isSsrHtmlOrDataResponse(
  * ┌──────────────────────────────────────────────────────────────────────────┐
  * │ SSR IS A PUBLIC, HARD-CDN-CACHED SHELL — SERVED IDENTICALLY TO EVERYONE.   │
  * │                                                                            │
- * │ Every SSR HTML / React Router `.data` response gets the same public        │
- * │ stale-while-revalidate policy for ALL visitors, authenticated or not, so   │
- * │ the edge serves one shared copy and never stampedes origin.                │
+ * │ Normal SSR HTML / React Router `.data` responses get the same public      │
+ * │ stale-while-revalidate policy for ALL visitors, authenticated or not, so  │
+ * │ the edge serves one shared copy and never stampedes origin. Recovery via │
+ * │ the fixed path or exact legacy marker revalidates in browsers and bypasses│
+ * │ CDN storage so the reload always gets the current shell.                  │
  * │                                                                            │
  * │ DO NOT reintroduce per-user / cookie-based cache variation here (no        │
- * │ `private`, no `no-store`, no `Vary: Cookie`, no "authenticated → don't     │
+ * │ `private`, no `Vary: Cookie`, no "authenticated → don't                    │
  * │ cache" branch). That makes pages uncacheable for every logged-in visitor,  │
  * │ which is slow and expensive — exactly the regression this guardrail        │
  * │ prevents. The reason it is SAFE to hard-cache is that the SSR response is  │
@@ -209,22 +312,78 @@ function isSsrHtmlOrDataResponse(
  * │ resolved CLIENT-SIDE after load. Keep it that way: if you need the SSR     │
  * │ output to differ per user, the fix is to move that work client-side, not   │
  * │ to disable caching here.                                                   │
+ * │                                                                            │
+ * │ HOW LONG the shell is cached is deployment-wide and configurable through   │
+ * │ AGENT_NATIVE_SSR_CACHE (see `resolveSsrCacheHeaders`), for hosts that do   │
+ * │ not purge their CDN on deploy. What remains forbidden is PER-REQUEST /     │
+ * │ PER-USER response variation — no `private`, no `Vary: Cookie`, and no     │
+ * │ request-specific content. Recovery keeps a bounded alias and never adds  │
+ * │ arbitrary query-key variation to the normally cached shell.               │
  * └──────────────────────────────────────────────────────────────────────────┘
+ *
+ * The same sharing rule governs any DIAGNOSTIC header on this response. A
+ * per-request timing written here is stored once by the origin render and
+ * replayed unchanged to every later visitor, so it must not wear a live-looking
+ * phase name. `installHttpResponseTelemetryHooks` detects the shared-cacheable
+ * policy stamped below and collapses `server-timing` to one `origin` entry
+ * carrying the render's wall-clock time; do not add a per-request header here
+ * that contradicts that.
  */
 function applyDefaultSsrCacheHeader(
   headers: Headers,
   status: number,
   pathname: string,
+  isRecoveryAlias = false,
+  isLegacyRecovery = false,
 ) {
+  const responseRequestsQueryVary =
+    headers.get(SSR_QUERY_CACHE_KEY_HEADER)?.trim().toLowerCase() === "query";
+  headers.delete(SSR_QUERY_CACHE_KEY_HEADER);
   if (!isSsrHtmlOrDataResponse(headers, status, pathname)) return;
 
-  // Netlify Functions/proxies are not cached by default. Set all three cache
-  // headers: Cache-Control for browsers, CDN-Cache-Control for generic CDNs,
-  // and Netlify-CDN-Cache-Control (with durable) so Netlify's shared cache
-  // actually serves SSR HTML/.data from the edge instead of forwarding every
-  // request to origin — for every visitor, authenticated or not.
-  for (const [name, value] of Object.entries(DEFAULT_SSR_CACHE_HEADERS)) {
+  // Current recovery uses one fixed path alias. Still-deployed clients use the
+  // exact legacy marker below, which varies only on that allowlisted query key.
+  // Do not cache recovery responses at the CDN: a stale alias shell can make
+  // the recovery reload repeat the same missing-chunk failure.
+  const varyByQuery = responseRequestsQueryVary;
+
+  // A public shell must never set a viewer cookie or vary by credentials.
+  // Preserve harmless content-negotiation dimensions such as Accept-Encoding.
+  headers.delete("set-cookie");
+  const vary = headers.get("vary");
+  if (vary) {
+    const publicVary = vary
+      .split(",")
+      .map((value) => value.trim())
+      .filter((value) => {
+        const normalized = value.toLowerCase();
+        return (
+          normalized &&
+          normalized !== "*" &&
+          normalized !== "cookie" &&
+          normalized !== "authorization"
+        );
+      });
+    if (publicVary.length > 0) headers.set("vary", publicVary.join(", "));
+    else headers.delete("vary");
+  }
+
+  for (const [name, value] of Object.entries(resolveSsrCacheHeaders())) {
     headers.set(name, value);
+  }
+  const cacheKeyHeaders = resolveSsrCacheKeyHeaders(undefined, {
+    varyByQuery,
+    varyByLegacyRecovery: isLegacyRecovery,
+  });
+  const netlifyVary = cacheKeyHeaders["netlify-vary"];
+  if (netlifyVary) headers.set("netlify-vary", netlifyVary);
+  else headers.delete("netlify-vary");
+  if (isRecoveryAlias || isLegacyRecovery) {
+    for (const [name, value] of Object.entries(
+      resolveChunkRecoveryCacheHeaders(),
+    )) {
+      headers.set(name, value);
+    }
   }
 }
 
@@ -239,89 +398,29 @@ function applyDefaultSpeculationRulesHeader(
   const contentType = headers.get("content-type")?.toLowerCase() ?? "";
   if (!contentType.includes("text/html")) return;
 
-  // Cloudflare Speed Brain injects its own Speculation-Rules header when the
-  // origin omits one. Those browser prefetches carry `Sec-Purpose: prefetch`,
-  // and Cloudflare refuses cache-ineligible dynamic pages with a 503 before
-  // the request can reach Netlify/origin. We publish an explicit no-op ruleset
-  // by default so Cloudflare does not inject its edge prefetch rules. Preserve
-  // an app-provided Speculation-Rules header above if a template deliberately
-  // owns this behavior.
   const rulesPath = prefixMountedPath(DEFAULT_SPECULATION_RULES_PATH, basePath);
   headers.set("speculation-rules", `"${rulesPath}"`);
 }
 
-/**
- * Extract the plain JS body from a `<script ...>body</script>` string.
- * Returns `null` if the input is falsy or has no recognisable `</script>` end.
- * Used to compute the sha256 hash of framework-injected inline scripts so the
- * hash can be listed in the `script-src` CSP directive without relying on
- * `'unsafe-inline'`.
- */
-function extractScriptBody(scriptTag: string | null): string | null {
-  if (!scriptTag) return null;
-  const start = scriptTag.indexOf(">") + 1;
-  const end = scriptTag.lastIndexOf("</script>");
-  if (start <= 0 || end < start) return null;
-  return scriptTag.slice(start, end);
+function removeDocumentCsp(headers: Headers): void {
+  headers.delete("content-security-policy");
+  headers.delete("content-security-policy-report-only");
 }
 
-/**
- * Apply a Content-Security-Policy header to HTML document responses.
- *
- * Two directives are always enforced in production:
- *
- *   - `object-src 'none'`  — disables Flash / Java / PDF plugin execution,
- *     which are a reliable code-execution vector even in modern browsers.
- *   - `base-uri 'self'`    — prevents a `<base href="...">` injection from
- *     hijacking all relative URLs in the document (a common attack target when
- *     user-controlled content reaches the HTML).
- *
- * A third directive, `script-src`, is emitted via `Content-Security-Policy-
- * Report-Only` rather than enforced. The framework injects one deterministic
- * inline script per process (the Sentry config block — its hash is computed
- * once at process startup from the resolved env vars). Templates additionally
- * render a theme-init inline script whose exact content varies by template
- * (default theme param, custom docs variant, etc.) and which is rendered by
- * React Router, not this handler, so its hash is not available here. Shipping
- * script-src as Report-Only surfaces violations without breaking template
- * customisations; teams can graduate to enforcement once their hashes are
- * enumerated.
- *
- * Skipped in development (`NODE_ENV !== 'production'`) so HMR eval and Vite
- * dev-server injects are never blocked. Set `AGENT_NATIVE_DISABLE_DOC_CSP=1`
- * to opt out in production for a template with exotic needs.
- */
-function applyDocumentCsp(headers: Headers, sentryScript: string | null): void {
-  if (process.env.NODE_ENV !== "production") return;
-  if (process.env.AGENT_NATIVE_DISABLE_DOC_CSP === "1") return;
-
-  // object-src / base-uri: enforced; neither directive mentions scripts, so
-  // they are safe even when a template's inline script hashes are unknown.
-  const existing = headers.get("content-security-policy") ?? "";
-  if (!existing) {
-    headers.set(
-      "content-security-policy",
-      "object-src 'none'; base-uri 'self'",
-    );
-  }
-
-  // script-src as Report-Only: list 'self' plus the hash for the Sentry config
-  // script the SSR handler injects into every HTML response (the hash is
-  // computed once from the resolved env vars at process startup). Template
-  // theme-init hashes are NOT included here — see function comment above.
-  const sentryBody = extractScriptBody(sentryScript);
-  const sentryHash = sentryBody ? computeInlineScriptHash(sentryBody) : null;
-  const scriptSrcTokens = ["'self'", ...(sentryHash ? [sentryHash] : [])];
-  const scriptSrc = `script-src ${scriptSrcTokens.join(" ")}`;
-
-  const existingRo = headers.get("content-security-policy-report-only") ?? "";
-  if (!existingRo) {
-    headers.set("content-security-policy-report-only", scriptSrc);
-  }
+function textSafeErrorMessage(err: unknown): string {
+  const message = String((err as { message?: unknown })?.message ?? err);
+  return message.replace(
+    /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g,
+    (char) => {
+      const code = char.codePointAt(0) ?? 0;
+      return code === 0 ? "\\0" : `\\x${code.toString(16).padStart(2, "0")}`;
+    },
+  );
 }
 
 function isFrameworkOrAssetPath(pathname: string): boolean {
   return (
+    isMcpPublicPath(pathname) ||
     pathname.startsWith("/.well-known/") ||
     pathname.startsWith("/_agent_native/") ||
     pathname.startsWith("/_agent-native/") ||
@@ -343,10 +442,35 @@ async function rewriteMountedResponse(
   basePath: string,
   pathname: string,
   requestUrl: string,
+  isRecoveryAlias = false,
+  isLegacyRecovery = false,
 ): Promise<Response> {
-  const sentryClientConfigScript = getSentryClientConfigScript();
+  const clientConfigScript =
+    [
+      getSentryClientConfigScript(),
+      getPostHogClientConfigScript(),
+      getRealtimeClientConfigScript(),
+      getAppOriginClientConfigScript(),
+      pathname === "/"
+        ? getSsrAuthRedirectScript(
+            frameworkSessionHintCookieName(
+              resolveAuthCookieNamespace().frameworkCookieName,
+            ),
+            resolveAppHomePath(getAppConfig().app, getAppConfig().workspace),
+            getFrameworkRoutePrefix(),
+          )
+        : null,
+    ]
+      .filter(Boolean)
+      .join("") || null;
   const headers = new Headers(response.headers);
-  applyDefaultSsrCacheHeader(headers, response.status, pathname);
+  applyDefaultSsrCacheHeader(
+    headers,
+    response.status,
+    pathname,
+    isRecoveryAlias,
+    isLegacyRecovery,
+  );
   applyDefaultSpeculationRulesHeader(headers, response.status, basePath);
 
   const location = headers.get("location");
@@ -355,7 +479,15 @@ async function rewriteMountedResponse(
   }
 
   const contentType = headers.get("content-type") ?? "";
-  if (!contentType.toLowerCase().includes("text/html") || !response.body) {
+  if (!contentType.toLowerCase().includes("text/html")) {
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  }
+  removeDocumentCsp(headers);
+  if (!response.body) {
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -365,14 +497,13 @@ async function rewriteMountedResponse(
 
   const html = await response.text();
   headers.delete("content-length");
-  applyDocumentCsp(headers, sentryClientConfigScript);
   return new Response(
     injectHeadScript(
       injectDefaultSocialImageMeta(
         prefixMountedHtml(html, basePath),
         defaultSocialImageUrl(requestUrl, basePath),
       ),
-      sentryClientConfigScript,
+      clientConfigScript,
     ),
     {
       status: response.status,
@@ -382,31 +513,21 @@ async function rewriteMountedResponse(
   );
 }
 
-/**
- * Create an h3 catch-all that hands page routes to React Router and
- * returns 404 for framework / asset paths that React Router doesn't own.
- */
-export function createH3SSRHandler(getBuild: () => Promise<unknown> | unknown) {
+export function createH3SSRHandler(getBuild: () => unknown) {
   const handler = createRequestHandler(getBuild as any);
   return defineEventHandler(async (event) => {
     const basePath = getAppBasePath();
-    const p = stripAppBasePath(event.url.pathname);
+    const appPath = stripAppBasePath(event.url.pathname);
+    const isRecoveryAlias = isChunkRecoveryPath(appPath);
+    const isLegacyRecovery = isLegacyChunkRecoveryRequest(event.url);
+    const p = stripChunkRecoveryPathSuffix(appPath);
     if (isFrameworkOrAssetPath(p)) {
       return new Response(null, { status: 404 });
     }
     try {
-      const request = requestWithPathname(event.req as Request, p, basePath);
-      // SSR renders an IMPERSONAL public shell — we deliberately do NOT read the
-      // request's session/cookies here, and pin an explicitly anonymous request
-      // context. That keeps the SSR HTML/.data identical for every visitor so it
-      // can be hard-cached at the CDN for everyone (see applyDefaultSsrCacheHeader).
-      //
-      // Consequence: SSR loaders that call `getRequestUserEmail()` / `accessFilter()`
-      // always see the unauthenticated branch and render public content only. Any
-      // per-user view (private records, share-grant access, who's logged in) MUST
-      // be resolved CLIENT-SIDE after load, never baked into SSR. Do not re-pin the
-      // session here to "fix" a per-user page — that silently makes the page
-      // uncacheable and/or leaks one user's data into another's cached copy.
+      const request = requestForAnonymousSsr(
+        requestWithPathname(event.req as Request, p, basePath),
+      );
       const ctx = { userEmail: undefined, orgId: undefined };
       if (request.method === "HEAD") {
         const getRequest = new Request(request.url, {
@@ -426,6 +547,8 @@ export function createH3SSRHandler(getBuild: () => Promise<unknown> | unknown) {
           basePath,
           p,
           request.url,
+          isRecoveryAlias,
+          isLegacyRecovery,
         );
       }
       return await rewriteMountedResponse(
@@ -433,17 +556,21 @@ export function createH3SSRHandler(getBuild: () => Promise<unknown> | unknown) {
         basePath,
         p,
         request.url,
+        isRecoveryAlias,
+        isLegacyRecovery,
       );
     } catch (err) {
-      // Log the full stack server-side, but never leak it to the client.
-      // Stack traces expose file paths, library versions, and code structure
-      // that aid reconnaissance attacks. In dev we surface the message text
-      // so devtools shows something useful; in prod we return a bare 500.
       console.error("[ssr-handler] SSR error:", err);
+      captureError(err, {
+        route: p,
+        method: event.req.method,
+        userAgent: event.req.headers.get("user-agent") ?? undefined,
+        tags: { renderMode: "anonymous-public", surface: "ssr" },
+      });
       const isProd = process.env.NODE_ENV === "production";
       const body = isProd
         ? "Internal Server Error"
-        : `Internal Server Error: ${(err as Error)?.message ?? err}`;
+        : `Internal Server Error: ${textSafeErrorMessage(err)}`;
       return new Response(body, {
         status: 500,
         headers: { "content-type": "text/plain" },

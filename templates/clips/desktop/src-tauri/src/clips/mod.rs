@@ -1,47 +1,73 @@
 #[cfg(target_os = "macos")]
+use objc2_foundation::{NSPoint, NSProcessInfo, NSRect, NSSize};
+use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
-    WebviewWindowBuilder,
+    AppHandle, Emitter, Listener, Manager, PhysicalPosition, PhysicalSize, WebviewUrl,
+    WebviewWindow, WebviewWindowBuilder,
 };
 
 use crate::dlog;
 use crate::state::{
-    DictationActive, LastTranscript, RecordingActive, TrayAnchor, VoiceTargetBundle,
-    VoiceWakePopover,
+    ActiveMeetingId, DictationActive, LastTranscript, MeetingActive, PopoverParked,
+    RecordingActive, TrayAnchor, VoiceTargetBundle, VoiceTargetTextField, VoiceWakePopover,
 };
 use crate::util::{
     build_overlay_url, configure_overlay_behavior, hide_voice_wake_popover, is_recording_active,
-    mark_popover_shown, set_capture_excluded, set_capture_excluded_always, set_capture_included,
-    set_dictation_active, tray_monitor_physical_rect,
+    mark_popover_shown, present_interactive_window, raise_to_status_level, set_capture_excluded,
+    set_capture_excluded_always, set_capture_included, set_window_opacity, show_without_activation,
+    start_topmost_reassert_loop, tray_monitor_physical_rect,
 };
 
-/// Native overlay windows for the recording experience. These render the same
-/// React bundle with a hash route that `main.tsx` uses to pick the component.
 const COUNTDOWN_LABEL: &str = "countdown";
 const TOOLBAR_LABEL: &str = "toolbar";
+static TOOLBAR_TOPMOST_GENERATION: AtomicU64 = AtomicU64::new(0);
+const COUNTDOWN_CONTROL_OFFSET_X: f64 = 200.0;
+const COUNTDOWN_CONTROL_DIAMETER: f64 = 64.0;
+const COUNTDOWN_CONTROL_HIT_PAD: f64 = 8.0;
+static COUNTDOWN_CONTROL_TRACKING: AtomicBool = AtomicBool::new(false);
+static TOOLBAR_FINISHING: AtomicBool = AtomicBool::new(false);
 const BUBBLE_LABEL: &str = "bubble";
+const BUBBLE_DESTROYED_EVENT: &str = "clips:bubble-destroyed";
+const PREPARING_LABEL: &str = "preparing";
 const FINALIZING_LABEL: &str = "finalizing";
 const FLOW_BAR_LABEL: &str = "flow-bar";
+static VOICE_FLOW_IDLE: AtomicBool = AtomicBool::new(true);
 const REGION_GUIDES_LABEL: &str = "region-guides";
 const REGION_GUIDE_EDITOR_LABEL: &str = "region-guide-editor";
+const REGION_RECORD_BORDER_LABEL: &str = "region-record-border";
+const MONITOR_PICKER_LABEL_PREFIX: &str = "monitor-picker-";
+const OVERLAY_LABELS: &[&str] = &[
+    COUNTDOWN_LABEL,
+    TOOLBAR_LABEL,
+    BUBBLE_LABEL,
+    PREPARING_LABEL,
+    FINALIZING_LABEL,
+    FLOW_BAR_LABEL,
+    REGION_GUIDES_LABEL,
+    REGION_RECORD_BORDER_LABEL,
+];
 
-/// Physical-pixel bubble sizes. Logical px on retina = physical / 2, so these
-/// map to ~96 (small) and ~180 (medium) logical px — matching Loom's camera
-/// bubble sizes exactly. Small is the default so the bubble feels like a
-/// quiet PiP rather than a giant circle the user has to shrink on every
-/// launch — this matches Loom's out-of-the-box behavior.
-const BUBBLE_SIZE_SMALL: u32 = 360;
-const BUBBLE_SIZE_MEDIUM: u32 = 504;
-const POPOVER_SHADOW_GUTTER_LOGICAL: f64 = 12.0;
-const POPOVER_DEFAULT_WIDTH_LOGICAL: f64 = 360.0;
+const BUBBLE_SIZE_SMALL_LOGICAL: u32 = 180;
+const BUBBLE_SIZE_MEDIUM_LOGICAL: u32 = 252;
+const BUBBLE_CONTROLS_BUDGET_LOGICAL: u32 = 40;
+const BUBBLE_POSITION_GEOMETRY_VERSION: u8 = 1;
+const LEGACY_BUBBLE_SIZE_SMALL_PHYSICAL: u32 = 360;
+const LEGACY_BUBBLE_SIZE_MEDIUM_PHYSICAL: u32 = 504;
+const LEGACY_BUBBLE_CONTROLS_BUDGET_PHYSICAL: u32 = 80;
+const POPOVER_DEFAULT_WIDTH_LOGICAL: f64 = 320.0;
 const POPOVER_DEFAULT_HEIGHT_LOGICAL: f64 = 520.0;
+const POPOVER_MIN_HEIGHT_LOGICAL: f64 = 260.0;
+const POPOVER_SCREEN_MARGIN_LOGICAL: f64 = 16.0;
 const OVERLAY_SHADOW_GUTTER_LOGICAL: f64 = 18.0;
 
 #[cfg(target_os = "macos")]
@@ -61,17 +87,6 @@ enum TextInsertionStrategy {
     UnicodeType,
 }
 
-/// Extra vertical real-estate reserved beneath the circular bubble for the
-/// hover-controls pill (small-dot + medium-dot). The Tauri window is
-/// `transparent: true`, so the budget paints through as empty space until the
-/// user hovers the bubble and the pill fades in. We'd otherwise have no pixels
-/// to paint the pill into — WebKit can't render outside its window bounds, no
-/// matter what CSS `overflow` says.
-///
-/// 80 physical px ≈ 40 logical px on retina — enough for the ~28px pill plus
-/// an 8px gap from the circle, with a small cushion at the window bottom.
-const BUBBLE_CONTROLS_BUDGET_PX: u32 = 80;
-
 fn overlay_scale_factor(app: &AppHandle) -> f64 {
     app.get_webview_window("popover")
         .and_then(|w| w.scale_factor().ok())
@@ -89,28 +104,333 @@ fn overlay_shadow_gutter_physical(app: &AppHandle) -> u32 {
     (OVERLAY_SHADOW_GUTTER_LOGICAL * overlay_scale_factor(app)).round() as u32
 }
 
-fn popover_window_size_logical(content_width: f64, content_height: f64) -> (f64, f64) {
-    let gutter = POPOVER_SHADOW_GUTTER_LOGICAL * 2.0;
-    (content_width + gutter, content_height + gutter)
-}
-
 fn bubble_size_for_name(name: &str) -> u32 {
     match name {
-        "medium" => BUBBLE_SIZE_MEDIUM,
-        _ => BUBBLE_SIZE_SMALL,
+        "medium" => BUBBLE_SIZE_MEDIUM_LOGICAL,
+        _ => BUBBLE_SIZE_SMALL_LOGICAL,
     }
 }
 
-/// Total window height for a bubble of the given diameter — includes the
-/// controls-budget strip beneath the circle.
-fn bubble_window_height_for(size: u32) -> u32 {
-    size + BUBBLE_CONTROLS_BUDGET_PX
+fn bubble_window_size_for_scale(size_logical: u32, scale_factor: f64) -> (u32, u32) {
+    let scale = scale_factor.max(1.0);
+    let content = (f64::from(size_logical) * scale).round() as u32;
+    let controls = (f64::from(BUBBLE_CONTROLS_BUDGET_LOGICAL) * scale).round() as u32;
+    let gutter = (OVERLAY_SHADOW_GUTTER_LOGICAL * scale).round() as u32;
+    (content + gutter * 2, content + controls + gutter * 2)
 }
 
-/// Path to the JSON blob that stores the last-known bubble position on disk.
-/// Lives in the Tauri app-data dir (platform-specific — `~/Library/Application
-/// Support/<bundle-id>/` on macOS). Returns None if the app-data dir cannot be
-/// resolved.
+fn bubble_visible_center(position: (i32, i32), size: (u32, u32)) -> (i32, i32) {
+    (
+        position.0 + size.0 as i32 / 2,
+        position.1 + size.1 as i32 - size.0 as i32 / 2,
+    )
+}
+
+fn bubble_window_center(position: (i32, i32), size: (u32, u32)) -> (i32, i32) {
+    (
+        position.0 + size.0 as i32 / 2,
+        position.1 + size.1 as i32 / 2,
+    )
+}
+
+fn bubble_position_preserving_visible_center(
+    position: (i32, i32),
+    current_size: (u32, u32),
+    target_size: (u32, u32),
+) -> (i32, i32) {
+    let center = bubble_visible_center(position, current_size);
+    (
+        center.0 - target_size.0 as i32 / 2,
+        center.1 - target_size.1 as i32 + target_size.0 as i32 / 2,
+    )
+}
+
+fn legacy_bubble_window_size_for_scale(size_name: &str, scale_factor: f64) -> (u32, u32) {
+    let content = match size_name {
+        "medium" => LEGACY_BUBBLE_SIZE_MEDIUM_PHYSICAL,
+        _ => LEGACY_BUBBLE_SIZE_SMALL_PHYSICAL,
+    };
+    let gutter = (OVERLAY_SHADOW_GUTTER_LOGICAL * scale_factor.max(1.0)).round() as u32;
+    (
+        content + gutter * 2,
+        content + LEGACY_BUBBLE_CONTROLS_BUDGET_PHYSICAL + gutter * 2,
+    )
+}
+
+fn migrate_legacy_bubble_position(
+    position: (i32, i32),
+    size_name: &str,
+    legacy_scale: f64,
+    current_scale: f64,
+) -> (i32, i32) {
+    bubble_position_preserving_visible_center(
+        position,
+        legacy_bubble_window_size_for_scale(size_name, legacy_scale),
+        bubble_window_size_for_scale(bubble_size_for_name(size_name), current_scale),
+    )
+}
+
+fn bubble_saved_geometry_scale(preference: &BubblePositionPreference, fallback_scale: f64) -> f64 {
+    preference.scale_factor.unwrap_or(fallback_scale).max(1.0)
+}
+
+fn bubble_saved_window_size(
+    preference: &BubblePositionPreference,
+    size_name: &str,
+    scale_factor: f64,
+) -> (u32, u32) {
+    if preference.geometry_version < BUBBLE_POSITION_GEOMETRY_VERSION {
+        legacy_bubble_window_size_for_scale(size_name, scale_factor)
+    } else {
+        bubble_window_size_for_scale(bubble_size_for_name(size_name), scale_factor)
+    }
+}
+
+fn bubble_position_for_target_scale(
+    preference: &BubblePositionPreference,
+    size_name: &str,
+    fallback_scale: f64,
+    target_scale: f64,
+) -> ((i32, i32), bool) {
+    let previous_scale = bubble_saved_geometry_scale(preference, fallback_scale);
+    let previous_size = bubble_saved_window_size(preference, size_name, previous_scale);
+    let target_size = bubble_window_size_for_scale(bubble_size_for_name(size_name), target_scale);
+    let needs_rebase = preference.geometry_version < BUBBLE_POSITION_GEOMETRY_VERSION
+        || (previous_scale - target_scale).abs() > 0.01;
+    let origin = (preference.x, preference.y);
+    if needs_rebase {
+        let position = if preference.geometry_version < BUBBLE_POSITION_GEOMETRY_VERSION {
+            migrate_legacy_bubble_position(origin, size_name, previous_scale, target_scale)
+        } else {
+            bubble_position_preserving_visible_center(origin, previous_size, target_size)
+        };
+        (position, true)
+    } else {
+        (origin, false)
+    }
+}
+
+fn bubble_scale_factor_for_monitors(
+    x: i32,
+    y: i32,
+    monitors: &[(i32, i32, u32, u32, f64)],
+) -> Option<f64> {
+    monitors
+        .iter()
+        .copied()
+        .find(|(mx, my, width, height, _)| {
+            x >= *mx && x < *mx + *width as i32 && y >= *my && y < *my + *height as i32
+        })
+        .or_else(|| {
+            monitors
+                .iter()
+                .copied()
+                .min_by_key(|(mx, my, width, height, _)| {
+                    distance_to_rect_squared(x, y, (*mx, *my, *width, *height))
+                })
+        })
+        .map(|(_, _, _, _, scale)| scale.max(1.0))
+}
+
+fn bubble_scale_factor_for_position(app: &AppHandle, x: i32, y: i32) -> f64 {
+    let scale = app
+        .get_webview_window(BUBBLE_LABEL)
+        .or_else(|| app.get_webview_window("popover"))
+        .and_then(|window| window.available_monitors().ok())
+        .map(|monitors| {
+            let monitors: Vec<_> = monitors
+                .into_iter()
+                .map(|monitor| {
+                    let position = monitor.position();
+                    let size = monitor.size();
+                    (
+                        position.x,
+                        position.y,
+                        size.width,
+                        size.height,
+                        monitor.scale_factor(),
+                    )
+                })
+                .collect();
+            bubble_scale_factor_for_monitors(x, y, &monitors)
+        })
+        .flatten()
+        .unwrap_or_else(|| overlay_scale_factor(app));
+    scale.max(1.0)
+}
+
+fn monitor_rects_for_bubble(app: &AppHandle) -> Vec<(i32, i32, u32, u32)> {
+    app.get_webview_window(BUBBLE_LABEL)
+        .or_else(|| app.get_webview_window("popover"))
+        .and_then(|window| window.available_monitors().ok())
+        .map(|monitors| {
+            monitors
+                .into_iter()
+                .map(|monitor| {
+                    let pos = monitor.position();
+                    let size = monitor.size();
+                    (pos.x, pos.y, size.width, size.height)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn distance_to_rect_squared(cx: i32, cy: i32, rect: (i32, i32, u32, u32)) -> i64 {
+    let (rx, ry, rw, rh) = rect;
+    let right = rx + rw as i32;
+    let bottom = ry + rh as i32;
+    let dx = i64::from(if cx < rx {
+        rx - cx
+    } else if cx > right {
+        cx - right
+    } else {
+        0
+    });
+    let dy = i64::from(if cy < ry {
+        ry - cy
+    } else if cy > bottom {
+        cy - bottom
+    } else {
+        0
+    });
+    dx * dx + dy * dy
+}
+
+fn bubble_target_monitor_rect(
+    app: &AppHandle,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> (i32, i32, u32, u32) {
+    let (cx, cy) = bubble_window_center((x, y), (width, height));
+    let rects = monitor_rects_for_bubble(app);
+
+    rects
+        .iter()
+        .copied()
+        .find(|(rx, ry, rw, rh)| {
+            cx >= *rx && cx < *rx + *rw as i32 && cy >= *ry && cy < *ry + *rh as i32
+        })
+        .or_else(|| {
+            rects
+                .iter()
+                .copied()
+                .min_by_key(|rect| distance_to_rect_squared(cx, cy, *rect))
+        })
+        .unwrap_or_else(|| tray_monitor_physical_rect(app))
+}
+
+fn clamp_bubble_window_position(
+    app: &AppHandle,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> (i32, i32) {
+    let (mx, my, mw, mh) = bubble_target_monitor_rect(app, x, y, width, height);
+    let max_x = (mx + mw as i32 - width as i32).max(mx);
+    let max_y = (my + mh as i32 - height as i32).max(my);
+    (x.clamp(mx, max_x), y.clamp(my, max_y))
+}
+
+fn clamp_existing_bubble_window(
+    app: &AppHandle,
+    window: &WebviewWindow,
+) -> Result<(i32, i32), String> {
+    let pos = window
+        .outer_position()
+        .map_err(|error| format!("read bubble window position: {error}"))?;
+    let size = window
+        .outer_size()
+        .map_err(|error| format!("read bubble window size: {error}"))?;
+    let (x, y) = clamp_bubble_window_position(app, pos.x, pos.y, size.width, size.height);
+    if x != pos.x || y != pos.y {
+        window
+            .set_position(PhysicalPosition::new(x, y))
+            .map_err(|error| format!("clamp bubble window position: {error}"))?;
+    }
+    let position = window
+        .outer_position()
+        .map_err(|error| format!("read clamped bubble window position: {error}"))?;
+    Ok((position.x, position.y))
+}
+
+fn sync_bubble_window_geometry(app: &AppHandle, window: &WebviewWindow) -> Result<(), String> {
+    let scale = window
+        .scale_factor()
+        .map_err(|error| format!("read bubble scale factor: {error}"))?
+        .max(1.0);
+    let size_name = load_bubble_size_name(app);
+    let size_logical = bubble_size_for_name(&size_name);
+    let (width, height) = bubble_window_size_for_scale(size_logical, scale);
+    let current_size = window
+        .outer_size()
+        .map_err(|error| format!("read bubble window size: {error}"))?;
+    let current_position = window
+        .outer_position()
+        .map_err(|error| format!("read bubble window position: {error}"))?;
+    let previous_position_preference = snapshot_bubble_position_preference(app)?;
+
+    commit_bubble_size_transaction(
+        || {
+            if current_size.width == width && current_size.height == height {
+                clamp_existing_bubble_window(app, window)?;
+            } else {
+                let (target_x, target_y) = bubble_position_preserving_visible_center(
+                    (current_position.x, current_position.y),
+                    (current_size.width, current_size.height),
+                    (width, height),
+                );
+                let (x, y) = clamp_bubble_window_position(app, target_x, target_y, width, height);
+                window
+                    .set_size(tauri::Size::Physical(PhysicalSize::new(width, height)))
+                    .map_err(|error| format!("resize bubble window: {error}"))?;
+                window
+                    .set_position(PhysicalPosition::new(x, y))
+                    .map_err(|error| format!("reposition bubble window: {error}"))?;
+            }
+            Ok(())
+        },
+        || {
+            let position = window
+                .outer_position()
+                .map_err(|error| format!("read resized bubble window position: {error}"))?;
+            save_bubble_position_at(app, position.x, position.y).map(|_| ())
+        },
+        || Ok(()),
+        |position_persisted| {
+            rollback_bubble_size_geometry(
+                app,
+                window,
+                current_position,
+                current_size,
+                position_persisted,
+                previous_position_preference.as_deref(),
+            )
+        },
+    )
+}
+
+static BUBBLE_DRAGGING: AtomicBool = AtomicBool::new(false);
+
+pub fn is_bubble_dragging() -> bool {
+    BUBBLE_DRAGGING.load(Ordering::SeqCst)
+}
+
+struct BubbleDragAnchor {
+    cursor_x: i32,
+    cursor_y: i32,
+    win_x: i32,
+    win_y: i32,
+}
+
+fn bubble_drag_anchor() -> &'static Mutex<Option<BubbleDragAnchor>> {
+    static ANCHOR: OnceLock<Mutex<Option<BubbleDragAnchor>>> = OnceLock::new();
+    ANCHOR.get_or_init(|| Mutex::new(None))
+}
+
 fn bubble_position_path(app: &AppHandle) -> Option<PathBuf> {
     let dir = app.path().app_data_dir().ok()?;
     if let Err(err) = std::fs::create_dir_all(&dir) {
@@ -124,8 +444,6 @@ fn bubble_position_path(app: &AppHandle) -> Option<PathBuf> {
     Some(dir.join("bubble-position.json"))
 }
 
-/// Path to the JSON blob that stores the last-chosen bubble size ("small" or
-/// "medium"). Same storage pattern as `bubble-position.json`.
 fn bubble_size_path(app: &AppHandle) -> Option<PathBuf> {
     let dir = app.path().app_data_dir().ok()?;
     if let Err(err) = std::fs::create_dir_all(&dir) {
@@ -139,10 +457,6 @@ fn bubble_size_path(app: &AppHandle) -> Option<PathBuf> {
     Some(dir.join("bubble-size.json"))
 }
 
-/// Load the last-saved bubble size name, default "small" if nothing is saved
-/// or parsing fails. Small is the out-of-the-box default so the bubble feels
-/// like a quiet PiP on first launch — users can bump it to medium from the
-/// hover-controls pill if they want it bigger.
 fn load_bubble_size_name(app: &AppHandle) -> String {
     let Some(path) = bubble_size_path(app) else {
         return "small".to_string();
@@ -160,54 +474,144 @@ fn load_bubble_size_name(app: &AppHandle) -> String {
     }
 }
 
-/// Persist the chosen bubble size to disk (atomic write via temp + rename).
-fn save_bubble_size_name(app: &AppHandle, name: &str) {
-    let Some(path) = bubble_size_path(app) else {
-        return;
-    };
-    let body = match serde_json::to_vec(&serde_json::json!({ "size": name })) {
-        Ok(b) => b,
-        Err(err) => {
-            eprintln!("[clips-tray] save_bubble_size_name serialize failed: {err}");
-            return;
-        }
-    };
+fn save_bubble_size_name(app: &AppHandle, name: &str) -> Result<(), String> {
+    let path = bubble_size_path(app).ok_or("bubble size path unavailable")?;
+    let body = serde_json::to_vec(&serde_json::json!({ "size": name }))
+        .map_err(|error| format!("serialize bubble size: {error}"))?;
     let tmp = path.with_extension("json.tmp");
     if let Err(err) = std::fs::write(&tmp, &body) {
-        eprintln!("[clips-tray] save_bubble_size_name write tmp failed: {err}");
-        return;
+        return Err(format!("write bubble size: {err}"));
     }
     if let Err(err) = std::fs::rename(&tmp, &path) {
-        eprintln!("[clips-tray] save_bubble_size_name rename failed: {err}");
         let _ = std::fs::remove_file(&tmp);
+        return Err(format!("save bubble size: {err}"));
+    }
+    Ok(())
+}
+
+fn snapshot_bubble_position_preference_at(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("read bubble position preference: {error}")),
     }
 }
 
-/// Load the saved bubble position, if any. Returns (x, y) in physical
-/// pixels. Any IO or parse failure is treated as "no saved position" — the
-/// caller will fall back to the default Loom-style anchor.
-fn load_bubble_position(app: &AppHandle) -> Option<(i32, i32)> {
-    let path = bubble_position_path(app)?;
-    let bytes = std::fs::read(&path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let x = value.get("x")?.as_i64()? as i32;
-    let y = value.get("y")?.as_i64()? as i32;
-    Some((x, y))
+fn restore_bubble_position_preference_at(
+    path: &Path,
+    snapshot: Option<&[u8]>,
+) -> Result<(), String> {
+    match snapshot {
+        Some(bytes) => {
+            let tmp = path.with_extension("json.tmp");
+            if let Err(error) = std::fs::write(&tmp, bytes) {
+                return Err(format!(
+                    "write restored bubble position preference: {error}"
+                ));
+            }
+            if let Err(error) = std::fs::rename(&tmp, path) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("restore bubble position preference: {error}"));
+            }
+            Ok(())
+        }
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("remove bubble position preference: {error}")),
+        },
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Tauri commands
-// ---------------------------------------------------------------------------
+fn snapshot_bubble_position_preference(app: &AppHandle) -> Result<Option<Vec<u8>>, String> {
+    let path = bubble_position_path(app).ok_or("bubble position path unavailable")?;
+    snapshot_bubble_position_preference_at(&path)
+}
 
-/// Full-screen transparent overlay that runs the 3-2-1 countdown. It ignores
-/// cursor events so the user can still click into whatever they're about to
-/// record, and closes itself when the countdown finishes.
+fn restore_bubble_position_preference(
+    app: &AppHandle,
+    snapshot: Option<&[u8]>,
+) -> Result<(), String> {
+    let path = bubble_position_path(app).ok_or("bubble position path unavailable")?;
+    restore_bubble_position_preference_at(&path, snapshot)
+}
+
+fn commit_bubble_size_transaction(
+    apply_geometry: impl FnOnce() -> Result<(), String>,
+    persist_position: impl FnOnce() -> Result<(), String>,
+    persist_size: impl FnOnce() -> Result<(), String>,
+    rollback: impl FnOnce(bool) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut position_persisted = false;
+    let result = (|| {
+        apply_geometry()?;
+        persist_position()?;
+        position_persisted = true;
+        persist_size()
+    })();
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => match rollback(position_persisted) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; restoring the previous bubble geometry failed: {rollback_error}"
+            )),
+        },
+    }
+}
+
+fn rollback_bubble_size_geometry(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    position: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
+    restore_position_preference: bool,
+    previous_position_preference: Option<&[u8]>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if let Err(error) = window.set_size(tauri::Size::Physical(size)) {
+        errors.push(format!("restore bubble window size: {error}"));
+    }
+    if let Err(error) = window.set_position(position) {
+        errors.push(format!("restore bubble window position: {error}"));
+    }
+
+    if restore_position_preference {
+        if let Err(error) = restore_bubble_position_preference(app, previous_position_preference) {
+            errors.push(error);
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[derive(Deserialize)]
+struct BubblePositionPreference {
+    x: i32,
+    y: i32,
+    #[serde(default, rename = "geometryVersion")]
+    geometry_version: u8,
+    #[serde(default, rename = "scaleFactor")]
+    scale_factor: Option<f64>,
+}
+
+fn load_bubble_position(app: &AppHandle) -> Option<BubblePositionPreference> {
+    let path = bubble_position_path(app)?;
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 #[tauri::command]
-pub async fn show_countdown(app: AppHandle) -> Result<(), String> {
+pub async fn show_countdown(app: AppHandle) -> Result<u64, String> {
     dlog!("[clips-tray] show_countdown invoked");
     mark_popover_shown(&app);
     if let Some(existing) = app.get_webview_window(COUNTDOWN_LABEL) {
-        let _ = app.emit("clips:countdown-shortcuts-active", false);
+        stop_countdown_control_tracking();
         let _ = existing.close();
     }
     let (mx, my, mw, mh) = tray_monitor_physical_rect(&app);
@@ -226,11 +630,7 @@ pub async fn show_countdown(app: AppHandle) -> Result<(), String> {
         .skip_taskbar(true)
         .shadow(false)
         .visible(false)
-        // Don't steal focus from the popover when the overlay opens —
-        // otherwise macOS fires Focused(false) on the popover, which
-        // kicks off a cascade of blur-related React re-renders and
-        // eventually (past the 1500ms guard) auto-hides the popover.
-        .focused(false)
+        .focused(true)
         .build()
         .map_err(|e| {
             eprintln!("[clips-tray] countdown build failed: {}", e);
@@ -241,54 +641,159 @@ pub async fn show_countdown(app: AppHandle) -> Result<(), String> {
     let _ = win.set_ignore_cursor_events(true);
     set_capture_excluded(&win);
     configure_overlay_behavior(&win);
-    let _ = win.show();
-    let _ = app.emit("clips:countdown-shortcuts-active", true);
+    let generation = match crate::shortcuts::prepare_countdown_shortcuts(app.clone()).await {
+        Ok(generation) => generation,
+        Err(error) => {
+            let _ = win.close();
+            return Err(error);
+        }
+    };
+    present_interactive_window(&win);
+    start_countdown_control_tracking(&app);
     dlog!("[clips-tray] countdown shown");
+    Ok(generation)
+}
+
+#[tauri::command]
+pub async fn finish_countdown_shortcuts(app: AppHandle, generation: u64) -> Result<(), String> {
+    crate::shortcuts::finish_countdown_shortcuts(app, generation).await
+}
+
+fn cursor_over_countdown_control(window: &WebviewWindow) -> bool {
+    let (Ok(c), Ok(p), Ok(s), Ok(scale)) = (
+        window.cursor_position(),
+        window.outer_position(),
+        window.outer_size(),
+        window.scale_factor(),
+    ) else {
+        return false;
+    };
+    let center_x = p.x as f64 + s.width as f64 / 2.0;
+    let center_y = p.y as f64 + s.height as f64 / 2.0;
+    let half = (COUNTDOWN_CONTROL_DIAMETER / 2.0 + COUNTDOWN_CONTROL_HIT_PAD) * scale;
+    let offset = COUNTDOWN_CONTROL_OFFSET_X * scale;
+    let in_button = |bx: f64| -> bool {
+        c.x >= bx - half && c.x <= bx + half && c.y >= center_y - half && c.y <= center_y + half
+    };
+    in_button(center_x - offset) || in_button(center_x + offset)
+}
+
+fn start_countdown_control_tracking(app: &AppHandle) {
+    if COUNTDOWN_CONTROL_TRACKING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut prev_interactive = false;
+        while COUNTDOWN_CONTROL_TRACKING.load(Ordering::Relaxed) {
+            let Some(win) = app.get_webview_window(COUNTDOWN_LABEL) else {
+                break;
+            };
+            let over = cursor_over_countdown_control(&win);
+            if over != prev_interactive {
+                prev_interactive = over;
+                let _ = win.set_ignore_cursor_events(!over);
+            }
+            tokio::time::sleep(Duration::from_millis(70)).await;
+        }
+        COUNTDOWN_CONTROL_TRACKING.store(false, Ordering::SeqCst);
+    });
+}
+
+fn stop_countdown_control_tracking() {
+    COUNTDOWN_CONTROL_TRACKING.store(false, Ordering::SeqCst);
+}
+
+#[tauri::command]
+pub async fn show_preparing(app: AppHandle) -> Result<(), String> {
+    if let Some(existing) = app.get_webview_window(PREPARING_LABEL) {
+        let _ = existing.close();
+    }
+    let (mx, my, mw, mh) = tray_monitor_physical_rect(&app);
+    let win = WebviewWindowBuilder::new(&app, PREPARING_LABEL, build_overlay_url("preparing"))
+        .title("Preparing recording")
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .shadow(false)
+        .visible(false)
+        .focused(true)
+        .build()
+        .map_err(|error| format!("preparing window build failed: {error}"))?;
+    let _ = win.set_size(tauri::Size::Physical(PhysicalSize::new(mw, mh)));
+    let _ = win.set_position(PhysicalPosition::new(mx, my));
+    let _ = win.set_ignore_cursor_events(true);
+    set_capture_excluded(&win);
+    configure_overlay_behavior(&win);
+    present_interactive_window(&win);
+    let _ = app.emit("clips:toolbar-preparing", true);
+    // A newly-created webview needs one paint before the async preparation can
+    // race ahead and replace it with the countdown. Without this brief yield,
+    // fast machines can show only a disabled toolbar and never render the
+    // promised textual readiness state.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    dlog!("[clips-tray] preparing recording shown");
     Ok(())
 }
 
-/// Full-screen transparent overlay that shows compact bottom-left progress
-/// while the recorder flushes its final chunks and awaits the server finalize.
-/// Rendered immediately after the user clicks Stop so they don't stare at a
-/// blank screen for a few seconds while `recorder.stop()` completes. Ignores
-/// cursor events so the progress card does not block the screen. Marked
-/// non-sharable for consistency with the other Clips overlays, even though
-/// the recording has already ended by the time this appears.
+#[tauri::command]
+pub async fn hide_preparing(app: AppHandle) -> Result<(), String> {
+    let _ = app.emit("clips:toolbar-preparing", false);
+    if let Some(window) = app.get_webview_window(PREPARING_LABEL) {
+        let _ = window.close();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn show_finalizing(app: AppHandle) -> Result<(), String> {
     dlog!("[clips-tray] show_finalizing invoked");
     if let Some(existing) = app.get_webview_window(FINALIZING_LABEL) {
         let _ = existing.close();
     }
-    let (mx, my, mw, mh) = tray_monitor_physical_rect(&app);
-    dlog!("[clips-tray] finalizing target size {}x{} physical", mw, mh);
-    let win = WebviewWindowBuilder::new(&app, FINALIZING_LABEL, build_overlay_url("finalizing"))
-        .title("Finalizing")
-        .decorations(false)
-        .transparent(true)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .shadow(false)
-        .visible(false)
-        // Don't steal focus — same rationale as the countdown overlay.
-        .focused(false)
-        .build()
-        .map_err(|e| {
-            eprintln!("[clips-tray] finalizing build failed: {}", e);
-            e.to_string()
-        })?;
-    let _ = win.set_size(tauri::Size::Physical(PhysicalSize::new(mw, mh)));
-    let _ = win.set_position(PhysicalPosition::new(mx, my));
-    let _ = win.set_ignore_cursor_events(true);
+    let (mx, my, _mw, mh) = tray_monitor_physical_rect(&app);
+    let scale = overlay_scale_factor(&app);
+    let content_w: u32 = (336.0 * scale).round() as u32;
+    let content_h: u32 = (86.0 * scale).round() as u32;
+    let margin: i32 = (14.0 * scale).round() as i32;
+    let gutter = overlay_shadow_gutter_physical(&app);
+    let w = content_w + gutter * 2;
+    let h = content_h + gutter * 2;
+    let x = (mx + margin - gutter as i32).max(mx);
+    let y = (my + mh as i32 - h as i32 - margin).max(my);
+    dlog!("[clips-tray] finalizing target size {}x{} physical", w, h);
+    #[allow(unused_mut)]
+    let mut builder =
+        WebviewWindowBuilder::new(&app, FINALIZING_LABEL, build_overlay_url("finalizing"))
+            .title("Finalizing")
+            .decorations(false)
+            .transparent(true)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .resizable(false)
+            .shadow(false)
+            .visible(false)
+            .focused(false);
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.accept_first_mouse(true);
+    }
+    let win = builder.build().map_err(|e| {
+        eprintln!("[clips-tray] finalizing build failed: {}", e);
+        e.to_string()
+    })?;
+    let _ = win.set_size(tauri::Size::Physical(PhysicalSize::new(w, h)));
+    let _ = win.set_position(PhysicalPosition::new(x, y));
+    let _ = win.set_ignore_cursor_events(false);
     set_capture_excluded(&win);
     configure_overlay_behavior(&win);
-    let _ = win.show();
+    crate::util::show_without_activation(&win);
     dlog!("[clips-tray] finalizing shown");
     Ok(())
 }
 
-/// Close the finalizing spinner overlay. Called from the recorder stop path
-/// right after `openExternal` opens the browser to the recording URL.
 #[tauri::command]
 pub async fn hide_finalizing(app: AppHandle) -> Result<(), String> {
     if let Some(w) = app.get_webview_window(FINALIZING_LABEL) {
@@ -297,9 +802,6 @@ pub async fn hide_finalizing(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Full-screen, click-through recording guides. The React view renders the
-/// saved translucent rectangles, while AppKit marks the whole overlay as
-/// non-shareable so the guides stay private to the recorder.
 #[tauri::command]
 pub async fn show_region_guides(app: AppHandle) -> Result<(), String> {
     let guides = crate::config::feature_config(&app).region_guides;
@@ -352,11 +854,58 @@ pub async fn hide_region_guides(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Reconcile the always-on region-guides overlay with the current config.
-/// Called from config saves and on startup so the guides window matches the
-/// `always_visible` toggle without needing a recording-flow round trip. When a
-/// recording is active the recording flow owns the `region-guides` window, so
-/// we leave it alone.
+#[tauri::command]
+pub async fn show_region_record_border(
+    app: AppHandle,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    if !(width > 0.0 && height > 0.0) {
+        return Ok(());
+    }
+    if let Some(existing) = app.get_webview_window(REGION_RECORD_BORDER_LABEL) {
+        let _ = existing.close();
+    }
+
+    let (mx, my, mw, mh) = tray_monitor_physical_rect(&app);
+    let url = WebviewUrl::App(
+        format!("index.html?region={x:.6},{y:.6},{width:.6},{height:.6}#region-record-border")
+            .into(),
+    );
+    let win = WebviewWindowBuilder::new(&app, REGION_RECORD_BORDER_LABEL, url)
+        .title("Clips Recording Region")
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .shadow(false)
+        .visible(false)
+        .focused(false)
+        .build()
+        .map_err(|e| {
+            eprintln!("[clips-tray] region record border build failed: {}", e);
+            e.to_string()
+        })?;
+    let _ = win.set_size(tauri::Size::Physical(PhysicalSize::new(mw, mh)));
+    let _ = win.set_position(PhysicalPosition::new(mx, my));
+    let _ = win.set_ignore_cursor_events(true);
+    set_capture_excluded_always(&win);
+    configure_overlay_behavior(&win);
+    crate::util::show_without_activation(&win);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn hide_region_record_border(app: AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(REGION_RECORD_BORDER_LABEL) {
+        let _ = w.close();
+    }
+    Ok(())
+}
+
 pub fn reconcile_region_guides(app: &AppHandle) {
     let g = crate::config::feature_config(app).region_guides;
     if crate::util::is_recording_active(app) {
@@ -373,9 +922,6 @@ pub fn reconcile_region_guides(app: &AppHandle) {
     }
 }
 
-/// Interactive full-screen editor for the region-guide preset. It is also
-/// capture-excluded so opening it during an active recording won't leak the
-/// preset UI into the video.
 #[tauri::command]
 pub async fn show_region_guide_editor(app: AppHandle) -> Result<(), String> {
     if let Some(existing) = app.get_webview_window(REGION_GUIDE_EDITOR_LABEL) {
@@ -415,36 +961,501 @@ pub async fn show_region_guide_editor(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Vertical recording pill anchored to the left edge. Stop + timer + pause,
-/// with hover-revealed restart/cancel controls matching Loom's left-rail
-/// placement. Draggable, always on top.
+#[tauri::command]
+pub async fn show_region_capture_selector(app: AppHandle) -> Result<(), String> {
+    if let Some(existing) = app.get_webview_window(REGION_GUIDE_EDITOR_LABEL) {
+        let _ = existing.close();
+    }
+
+    let (mx, my, mw, mh) = tray_monitor_physical_rect(&app);
+    #[allow(unused_mut)]
+    let mut builder = WebviewWindowBuilder::new(
+        &app,
+        REGION_GUIDE_EDITOR_LABEL,
+        build_overlay_url("region-capture-selector"),
+    )
+    .title("Select Clips Recording Region")
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .shadow(false)
+    .visible(false)
+    .focused(true);
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.accept_first_mouse(true);
+    }
+    let win = builder.build().map_err(|e| {
+        eprintln!("[clips-tray] region capture selector build failed: {}", e);
+        e.to_string()
+    })?;
+    let _ = win.set_size(tauri::Size::Physical(PhysicalSize::new(mw, mh)));
+    let _ = win.set_position(PhysicalPosition::new(mx, my));
+    set_capture_excluded_always(&win);
+    configure_overlay_behavior(&win);
+    let _ = win.show();
+    let _ = win.set_focus();
+    Ok(())
+}
+
+fn close_monitor_picker_windows(app: &AppHandle) {
+    for (label, window) in app.webview_windows() {
+        if label.starts_with(MONITOR_PICKER_LABEL_PREFIX) {
+            let _ = window.hide();
+            let _ = window.close();
+        }
+    }
+    crate::shortcuts::set_monitor_picker_escape(app, false);
+}
+
+#[cfg(target_os = "macos")]
+fn display_id_for_monitor_rect(x: i32, y: i32, width: u32, height: u32, scale: f64) -> Option<u32> {
+    let cx_phys = x as f64 + width as f64 / 2.0;
+    let cy_phys = y as f64 + height as f64 / 2.0;
+    crate::native_screen::cg_display_id_at_physical_point(cx_phys, cy_phys, scale)
+}
+
+#[tauri::command]
+pub async fn show_monitor_picker(app: AppHandle) -> Result<bool, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Ok(false)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        close_monitor_picker_windows(&app);
+        crate::state::SelectedRecordingDisplay::set(&app, None);
+        crate::state::SelectedRecordingWindow::set(&app, None);
+        let monitors = app
+            .get_webview_window("popover")
+            .and_then(|w| w.available_monitors().ok())
+            .unwrap_or_default();
+        if monitors.len() <= 1 {
+            return Ok(false);
+        }
+        let total = monitors.len();
+        crate::shortcuts::set_monitor_picker_escape(&app, true);
+        let mut last_window: Option<WebviewWindow> = None;
+        for (index, monitor) in monitors.iter().enumerate() {
+            let pos = monitor.position();
+            let size = monitor.size();
+            let scale = monitor.scale_factor().max(1.0);
+            let Some(display_id) =
+                display_id_for_monitor_rect(pos.x, pos.y, size.width, size.height, scale)
+            else {
+                eprintln!(
+                    "[clips-tray] monitor picker: could not resolve a display id for monitor {index}"
+                );
+                close_monitor_picker_windows(&app);
+                return Err("Could not identify one of the connected displays.".to_string());
+            };
+            let gutter = overlay_shadow_gutter_physical(&app);
+            let content_w: u32 = (240.0 * scale).round() as u32;
+            let content_h: u32 = (150.0 * scale).round() as u32;
+            let w = content_w + gutter * 2;
+            let h = content_h + gutter * 2;
+            let x = pos.x + (size.width as i32 - w as i32) / 2;
+            let y = pos.y + (size.height as i32 - h as i32) / 2;
+            let label = format!("{MONITOR_PICKER_LABEL_PREFIX}{index}");
+            let url = WebviewUrl::App(
+                format!(
+                    "index.html?index={}&total={}&displayId={}#monitor-picker",
+                    index + 1,
+                    total,
+                    display_id
+                )
+                .into(),
+            );
+            let win = match WebviewWindowBuilder::new(&app, &label, url)
+                .title("Choose a screen to record")
+                .decorations(false)
+                .transparent(true)
+                .always_on_top(true)
+                .skip_taskbar(true)
+                .resizable(false)
+                .shadow(false)
+                .visible(false)
+                .focused(false)
+                .accept_first_mouse(true)
+                .build()
+            {
+                Ok(win) => win,
+                Err(e) => {
+                    eprintln!("[clips-tray] monitor picker build failed: {}", e);
+                    close_monitor_picker_windows(&app);
+                    return Err(e.to_string());
+                }
+            };
+            let _ = win.set_size(tauri::Size::Physical(PhysicalSize::new(w, h)));
+            let _ = win.set_position(PhysicalPosition::new(x, y));
+            let _ = win.set_ignore_cursor_events(false);
+            set_capture_excluded_always(&win);
+            configure_overlay_behavior(&win);
+            show_without_activation(&win);
+            last_window = Some(win);
+        }
+        if let Some(win) = last_window {
+            present_interactive_window(&win);
+        }
+        Ok(true)
+    }
+}
+
+#[tauri::command]
+pub async fn close_monitor_picker(app: AppHandle) -> Result<(), String> {
+    close_monitor_picker_windows(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_recording_display_override(
+    app: AppHandle,
+    display_id: Option<u32>,
+) -> Result<(), String> {
+    crate::state::SelectedRecordingDisplay::set(&app, display_id);
+    crate::state::SelectedRecordingWindow::set(&app, None);
+    Ok(())
+}
+
+fn toolbar_position_path(app: &AppHandle) -> Option<PathBuf> {
+    let dir = app.path().app_data_dir().ok()?;
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    Some(dir.join("toolbar-pill-position.json"))
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolbarPositionPreference {
+    x: i32,
+    y: i32,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    location: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct ToolbarDragAnchor {
+    cursor_x: i32,
+    cursor_y: i32,
+    win_x: i32,
+    win_y: i32,
+}
+
+fn toolbar_drag_anchor() -> &'static Mutex<Option<ToolbarDragAnchor>> {
+    static ANCHOR: OnceLock<Mutex<Option<ToolbarDragAnchor>>> = OnceLock::new();
+    ANCHOR.get_or_init(|| Mutex::new(None))
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ToolbarDockPreference {
+    pub mode: String,
+    pub location: Option<String>,
+}
+
+fn normalized_toolbar_dock_preference(
+    saved: Option<&ToolbarPositionPreference>,
+) -> ToolbarDockPreference {
+    let location = saved
+        .and_then(|value| value.location.as_deref())
+        .filter(|value| matches!(*value, "left" | "right" | "top" | "bottom"))
+        .map(str::to_string);
+    let mode = if saved
+        .and_then(|value| value.mode.as_deref())
+        .is_some_and(|value| value == "docked")
+        && location.is_some()
+    {
+        "docked"
+    } else {
+        "floating"
+    }
+    .to_string();
+    ToolbarDockPreference { mode, location }
+}
+
+fn load_toolbar_position(app: &AppHandle) -> Option<ToolbarPositionPreference> {
+    let path = toolbar_position_path(app)?;
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_toolbar_position_file(
+    app: &AppHandle,
+    x: i32,
+    y: i32,
+    mode: &str,
+    location: Option<&str>,
+) -> Result<(), String> {
+    let Some(path) = toolbar_position_path(app) else {
+        return Ok(());
+    };
+    let body = serde_json::to_vec(&serde_json::json!({
+        "x": x,
+        "y": y,
+        "mode": mode,
+        "location": location,
+    }))
+    .map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &body).is_err() {
+        return Ok(());
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn toolbar_save_position(
+    app: AppHandle,
+    x: i32,
+    y: i32,
+    mode: Option<String>,
+    location: Option<String>,
+) -> Result<(), String> {
+    save_toolbar_position_file(
+        &app,
+        x,
+        y,
+        &mode.unwrap_or_else(|| "floating".to_string()),
+        location.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub async fn toolbar_get_dock_preference(app: AppHandle) -> Result<ToolbarDockPreference, String> {
+    Ok(normalized_toolbar_dock_preference(
+        load_toolbar_position(&app).as_ref(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn appkit_frame_for_physical_bounds(
+    current_frame: NSRect,
+    current_x: i32,
+    current_y: i32,
+    target_x: i32,
+    target_y: i32,
+    target_width: u32,
+    target_height: u32,
+    scale: f64,
+) -> NSRect {
+    let scale = scale.max(1.0);
+    let width = target_width as f64 / scale;
+    let height = target_height as f64 / scale;
+    let delta_x = (target_x - current_x) as f64 / scale;
+    let delta_y = (target_y - current_y) as f64 / scale;
+    NSRect::new(
+        NSPoint::new(
+            current_frame.origin.x + delta_x,
+            current_frame.origin.y + current_frame.size.height - height - delta_y,
+        ),
+        NSSize::new(width, height),
+    )
+}
+
+#[tauri::command]
+pub async fn toolbar_set_bounds(
+    app: AppHandle,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(TOOLBAR_LABEL) else {
+        return Ok(());
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        let current_position = window.outer_position().map_err(|err| err.to_string())?;
+        let scale = window.scale_factor().map_err(|err| err.to_string())?;
+        let win = window.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        win.clone()
+            .run_on_main_thread(move || {
+                let result = (|| -> Result<(), String> {
+                    let ns_window_ptr = win.ns_window().map_err(|err| err.to_string())?;
+                    if ns_window_ptr.is_null() {
+                        return Err("toolbar NSWindow is unavailable".to_string());
+                    }
+                    // SAFETY: Tauri owns this live NSWindow and the closure is
+                    // executing on AppKit's main thread. `setFrame:display:`
+                    // updates origin and size in one transaction.
+                    unsafe {
+                        let obj = ns_window_ptr as *mut objc2::runtime::AnyObject;
+                        let current_frame: NSRect = objc2::msg_send![&*obj, frame];
+                        let target_frame = appkit_frame_for_physical_bounds(
+                            current_frame,
+                            current_position.x,
+                            current_position.y,
+                            x,
+                            y,
+                            width,
+                            height,
+                            scale,
+                        );
+                        let _: () = objc2::msg_send![&*obj, setFrame: target_frame, display: true];
+                    }
+                    Ok(())
+                })();
+                let _ = tx.send(result);
+            })
+            .map_err(|err| err.to_string())?;
+        return rx
+            .await
+            .map_err(|_| "toolbar frame update was cancelled".to_string())?;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        window
+            .set_size(tauri::Size::Physical(PhysicalSize::new(width, height)))
+            .map_err(|err| err.to_string())?;
+        window
+            .set_position(PhysicalPosition::new(x, y))
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+}
+
+fn toolbar_monitor_for_cursor(
+    window: &WebviewWindow,
+    cursor_x: i32,
+    cursor_y: i32,
+) -> Option<(i32, i32, u32, u32)> {
+    let monitors = window.available_monitors().ok()?;
+    monitors
+        .iter()
+        .find(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            cursor_x >= position.x
+                && cursor_x < position.x + size.width as i32
+                && cursor_y >= position.y
+                && cursor_y < position.y + size.height as i32
+        })
+        .or_else(|| monitors.first())
+        .map(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            (position.x, position.y, size.width, size.height)
+        })
+}
+
+#[tauri::command]
+pub async fn toolbar_drag_start(app: AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(TOOLBAR_LABEL) else {
+        return Ok(());
+    };
+    let (Ok(cursor), Ok(position)) = (window.cursor_position(), window.outer_position()) else {
+        return Ok(());
+    };
+    *toolbar_drag_anchor()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(ToolbarDragAnchor {
+        cursor_x: cursor.x.round() as i32,
+        cursor_y: cursor.y.round() as i32,
+        win_x: position.x,
+        win_y: position.y,
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn toolbar_drag_move(app: AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(TOOLBAR_LABEL) else {
+        return Ok(());
+    };
+    let Ok(cursor) = window.cursor_position() else {
+        return Ok(());
+    };
+    let anchor = *toolbar_drag_anchor()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(anchor) = anchor else {
+        return Ok(());
+    };
+    let Ok(size) = window.outer_size() else {
+        return Ok(());
+    };
+    let cursor_x = cursor.x.round() as i32;
+    let cursor_y = cursor.y.round() as i32;
+    let target_x = anchor.win_x + cursor_x - anchor.cursor_x;
+    let target_y = anchor.win_y + cursor_y - anchor.cursor_y;
+    let Some((monitor_x, monitor_y, monitor_width, monitor_height)) =
+        toolbar_monitor_for_cursor(&window, cursor_x, cursor_y)
+    else {
+        return Ok(());
+    };
+    let gutter = (16.0 * window.scale_factor().unwrap_or(2.0)).round() as i32;
+    let min_x = monitor_x + gutter;
+    let min_y = monitor_y + gutter;
+    let max_x = (monitor_x + monitor_width as i32 - size.width as i32 - gutter).max(min_x);
+    let max_y = (monitor_y + monitor_height as i32 - size.height as i32 - gutter).max(min_y);
+    let x = target_x.clamp(min_x, max_x);
+    let y = target_y.clamp(min_y, max_y);
+    let _ = window.set_position(PhysicalPosition::new(x, y));
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn toolbar_drag_end() -> Result<(), String> {
+    *toolbar_drag_anchor()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    Ok(())
+}
+
+/// Hold or release the stop-flow toolbar preservation described on
+/// `TOOLBAR_FINISHING`. The pill sets the hold synchronously before emitting
+/// `clips:recorder-stop` so the recorder's teardown cannot race it.
+#[tauri::command]
+pub async fn set_toolbar_finishing(hold: bool) -> Result<(), String> {
+    TOOLBAR_FINISHING.store(hold, Ordering::SeqCst);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn show_toolbar(app: AppHandle) -> Result<(), String> {
     dlog!("[clips-tray] show_toolbar invoked");
-    // Reset the blur guard — spawning an overlay can briefly steal focus
-    // from the popover on some macOS versions even with .focused(false).
+    TOOLBAR_FINISHING.store(false, Ordering::SeqCst);
     mark_popover_shown(&app);
-    let (mx, my, _mw, mh) = tray_monitor_physical_rect(&app);
+    let (mx, my, mw, mh) = tray_monitor_physical_rect(&app);
     let scale = overlay_scale_factor(&app);
-    let gutter = overlay_shadow_gutter_physical(&app);
-    // CSS is authored in logical px, while this command sizes the native
-    // window in physical px. Keep the visible toolbar large enough for the
-    // fixed 30px circular controls on high-DPI displays.
-    let content_w: u32 = (72.0 * scale).round() as u32;
-    let collapsed_content_h: u32 = (150.0 * scale).round() as u32;
-    let w: u32 = content_w + gutter * 2;
-    let h: u32 = collapsed_content_h + gutter * 2;
-    // Flush-left with a small margin; vertically center the collapsed pill.
-    // The React toolbar temporarily resizes this window while hover/focus
-    // reveals extra controls so transparent pixels don't block clicks.
-    let x: i32 = mx + 48 - gutter as i32;
-    let y: i32 = my + (mh as i32 - collapsed_content_h as i32) / 2 - gutter as i32;
+    let saved = load_toolbar_position(&app);
+    let preference = normalized_toolbar_dock_preference(saved.as_ref());
+    let vertical = preference.mode == "docked"
+        && matches!(preference.location.as_deref(), Some("left" | "right"));
+    let w: u32 = ((if vertical { 42.0 } else { 150.0 }) * scale).round() as u32;
+    let h: u32 = ((if vertical { 118.0 } else { 42.0 }) * scale).round() as u32;
+    let gutter = (16.0 * scale).round() as i32;
+    let default_x: i32 = mx + (mw as i32 - w as i32) / 2;
+    let default_y: i32 = my + mh as i32 - h as i32 - (20.0 * scale).round() as i32;
+    let (x, y) = match saved {
+        Some(saved) => (
+            saved
+                .x
+                .clamp(mx + gutter, mx + mw as i32 - w as i32 - gutter),
+            saved
+                .y
+                .clamp(my + gutter, my + mh as i32 - h as i32 - gutter),
+        ),
+        None => (default_x, default_y),
+    };
     dlog!("[clips-tray] toolbar pos=({},{}) size={}x{}", x, y, w, h);
     if let Some(existing) = app.get_webview_window(TOOLBAR_LABEL) {
         let _ = existing.set_size(tauri::Size::Physical(PhysicalSize::new(w, h)));
         let _ = existing.set_position(PhysicalPosition::new(x, y));
-        let _ = existing.show();
-        let _ = existing.set_focus();
+        set_capture_excluded(&existing);
+        configure_overlay_behavior(&existing);
+        raise_to_status_level(&existing);
+        start_topmost_reassert_loop(&app, TOOLBAR_LABEL, &TOOLBAR_TOPMOST_GENERATION);
         return Ok(());
     }
     #[allow(unused_mut)]
@@ -455,19 +1466,9 @@ pub async fn show_toolbar(app: AppHandle) -> Result<(), String> {
         .always_on_top(true)
         .skip_taskbar(true)
         .resizable(false)
-        // IMPORTANT: native window shadow MUST stay off — macOS draws it
-        // based on the rectangular window bounds, not the rounded React
-        // content, so it shows up as a hard-edged black rectangle around
-        // the rounded pill.
-        .shadow(false)
+        .shadow(true)
         .visible(false)
         .focused(false);
-    // macOS: without this, the first click on an unfocused window is
-    // swallowed activating the window and only the SECOND click reaches
-    // the React button. `accept_first_mouse(true)` tells WKWebView to
-    // treat the activating click as a real click too — one-click stop,
-    // as the user expects. The builder method exists on all platforms
-    // but is only honored on macOS (no-op elsewhere).
     #[cfg(target_os = "macos")]
     {
         builder = builder.accept_first_mouse(true);
@@ -480,52 +1481,83 @@ pub async fn show_toolbar(app: AppHandle) -> Result<(), String> {
     let _ = win.set_position(PhysicalPosition::new(x, y));
     set_capture_excluded(&win);
     configure_overlay_behavior(&win);
-    let _ = win.show();
-    dlog!("[clips-tray] toolbar shown");
+    raise_to_status_level(&win);
+    dlog!("[clips-tray] toolbar created (hidden until renderer is ready)");
 
     Ok(())
 }
 
-/// Circular, draggable webcam bubble — small always-on-top window that hosts
-/// its own getUserMedia stream and floats over everything the user captures.
+#[tauri::command]
+pub async fn toolbar_set_visible(app: AppHandle, visible: bool) -> Result<(), String> {
+    let Some(win) = app.get_webview_window(TOOLBAR_LABEL) else {
+        return Ok(());
+    };
+    if visible {
+        raise_to_status_level(&win);
+        start_topmost_reassert_loop(&app, TOOLBAR_LABEL, &TOOLBAR_TOPMOST_GENERATION);
+        crate::util::show_without_activation(&win);
+    } else {
+        let _ = win.hide();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn show_bubble(app: AppHandle) -> Result<(), String> {
     dlog!("[clips-tray] show_bubble invoked");
-    // Reset the blur guard — getUserMedia for the camera can trigger a
-    // macOS permission dialog that steals focus from the popover.
     mark_popover_shown(&app);
     if let Some(existing) = app.get_webview_window(BUBBLE_LABEL) {
-        let _ = existing.show();
+        let sync_result = sync_bubble_window_geometry(&app, &existing);
+        crate::util::show_without_activation(&existing);
+        if let Err(error) = sync_result {
+            eprintln!("[clips-tray] bubble reuse sync failed: {error}");
+            return Err(error);
+        }
         dlog!("[clips-tray] bubble reused");
         return Ok(());
     }
-    // Honor the user's last-chosen size. Default is "small" (192 physical =
-    // 96 logical) so new users get a quiet PiP rather than a giant circle.
     let size_name = load_bubble_size_name(&app);
-    let size: u32 = bubble_size_for_name(&size_name);
-    // The actual window is TALLER than the circle — see
-    // `BUBBLE_CONTROLS_BUDGET_PX` — to give the hover controls pill room.
-    let content_h: u32 = bubble_window_height_for(size);
-    let gutter = overlay_shadow_gutter_physical(&app);
-    let win_w: u32 = size + gutter * 2;
-    let win_h: u32 = content_h + gutter * 2;
+    let size_logical = bubble_size_for_name(&size_name);
 
     let (mon_x, mon_y, mon_w, mon_h) = tray_monitor_physical_rect(&app);
+    let saved_preference = load_bubble_position(&app);
+    let fallback_scale = overlay_scale_factor(&app);
+    let scale_anchor = saved_preference
+        .as_ref()
+        .map(|preference| {
+            let position = (preference.x, preference.y);
+            let geometry_scale = bubble_saved_geometry_scale(preference, fallback_scale);
+            let geometry_size = bubble_saved_window_size(preference, &size_name, geometry_scale);
+            bubble_window_center(position, geometry_size)
+        })
+        .unwrap_or((mon_x + mon_w as i32 / 2, mon_y + mon_h as i32 / 2));
+    let scale = bubble_scale_factor_for_position(&app, scale_anchor.0, scale_anchor.1);
+    let (saved_position, position_rebased) = saved_preference
+        .as_ref()
+        .map(|preference| {
+            let (position, needs_rebase) =
+                bubble_position_for_target_scale(preference, &size_name, fallback_scale, scale);
+            (Some(position), needs_rebase)
+        })
+        .unwrap_or((None, false));
+    let gutter = (OVERLAY_SHADOW_GUTTER_LOGICAL * scale).round() as u32;
+    let (win_w, win_h) = bubble_window_size_for_scale(size_logical, scale);
 
-    // Default Loom-style anchor: flush-left with a small margin, a hair
-    // above the bottom edge of the target monitor. On Retina the 60
-    // physical-px offset maps to ~30 logical px.
-    let default_x: i32 = mon_x + 48 - gutter as i32;
-    let default_y: i32 = mon_y + mon_h as i32 - content_h as i32 - 60 - gutter as i32;
-    // Clamp bounds within the target monitor.
-    let max_x = (mon_x + mon_w as i32 - win_w as i32).max(mon_x);
-    let max_y = (mon_y + mon_h as i32 - win_h as i32).max(mon_y);
-    // Use the saved position only if it already falls on the target monitor.
-    // A position from a previous session on a different display would strand
-    // the bubble off-screen, so fall back to the default anchor instead.
-    let (x, y, source) = match load_bubble_position(&app) {
-        Some((sx, sy)) if sx >= mon_x && sx <= max_x && sy >= mon_y && sy <= max_y => {
-            (sx, sy, "saved")
+    let default_x: i32 = mon_x + (48.0 * scale).round() as i32 - gutter as i32;
+    let default_y: i32 = mon_y + mon_h as i32 - win_h as i32;
+    let (default_x, default_y) =
+        clamp_bubble_window_position(&app, default_x, default_y, win_w, win_h);
+    let (x, y, source) = match saved_position {
+        Some((sx, sy)) => {
+            let (cx, cy) = clamp_bubble_window_position(&app, sx, sy, win_w, win_h);
+            let source = if position_rebased {
+                "saved-migrated"
+            } else if cx == sx && cy == sy {
+                "saved"
+            } else {
+                "saved-clamped"
+            };
+            (cx, cy, source)
         }
         _ => (default_x, default_y, "default"),
     };
@@ -558,16 +1590,56 @@ pub async fn show_bubble(app: AppHandle) -> Result<(), String> {
         eprintln!("[clips-tray] bubble build failed: {}", e);
         e.to_string()
     })?;
-    let _ = win.set_size(tauri::Size::Physical(PhysicalSize::new(win_w, win_h)));
-    let _ = win.set_position(PhysicalPosition::new(x, y));
-    // NOTE: intentionally NOT calling `set_capture_excluded` on the bubble.
-    // The bubble is the user's face — Loom's behavior is that the camera
-    // PiP IS composited into the final recording (that's the whole point of
-    // the bubble). NSWindowSharingNone would make macOS exclude it from
-    // `getDisplayMedia`, which matches the other Clips chrome (popover,
-    // toolbar, countdown) but NOT what users want for the camera bubble.
+    let initial_geometry_result = (|| {
+        win.set_size(tauri::Size::Physical(PhysicalSize::new(win_w, win_h)))
+            .map_err(|error| format!("size bubble window: {error}"))?;
+        win.set_position(PhysicalPosition::new(x, y))
+            .map_err(|error| format!("position bubble window: {error}"))?;
+        Ok(())
+    })();
+    let close_failed_initialization = |error: String| match win.close() {
+        Ok(()) => error,
+        Err(close_error) => format!("{error}; close failed bubble window: {close_error}"),
+    };
+    if let Err(error) = initial_geometry_result {
+        eprintln!("[clips-tray] bubble initial geometry failed: {error}");
+        return Err(close_failed_initialization(error));
+    }
+    if position_rebased {
+        let position_persistence_result = win
+            .outer_position()
+            .map_err(|error| format!("read migrated bubble window position: {error}"))
+            .and_then(|position| save_bubble_position_at(&app, position.x, position.y).map(|_| ()));
+        if let Err(error) = position_persistence_result {
+            eprintln!("[clips-tray] migrated bubble position save failed: {error}");
+            return Err(close_failed_initialization(error));
+        }
+    }
+    let app_for_bounds = app.clone();
+    let win_for_bounds = win.clone();
+    win.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            let _ = app_for_bounds.emit(BUBBLE_DESTROYED_EVENT, ());
+            return;
+        }
+        if BUBBLE_DRAGGING.load(Ordering::SeqCst) {
+            return;
+        }
+        if matches!(event, tauri::WindowEvent::ScaleFactorChanged { .. }) {
+            if let Err(error) = sync_bubble_window_geometry(&app_for_bounds, &win_for_bounds) {
+                eprintln!("[clips-tray] bubble scale change failed: {error}");
+            }
+        } else if matches!(
+            event,
+            tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+        ) {
+            if let Err(error) = clamp_existing_bubble_window(&app_for_bounds, &win_for_bounds) {
+                eprintln!("[clips-tray] clamp bubble after window event failed: {error}");
+            }
+        }
+    });
     configure_overlay_behavior(&win);
-    let _ = win.show();
+    crate::util::show_without_activation(&win);
     dlog!("[clips-tray] bubble shown at ({},{}) size {}", x, y, win_w);
     Ok(())
 }
@@ -584,41 +1656,50 @@ pub async fn set_bubble_capture_excluded(app: AppHandle, excluded: bool) -> Resu
     Ok(())
 }
 
+fn overlay_labels_to_hide(preserve_finalizing: bool) -> impl Iterator<Item = &'static str> {
+    let preserve_toolbar = TOOLBAR_FINISHING.load(Ordering::SeqCst);
+    OVERLAY_LABELS.iter().copied().filter(move |label| {
+        if preserve_finalizing && *label == FINALIZING_LABEL {
+            return false;
+        }
+        if preserve_toolbar && *label == TOOLBAR_LABEL {
+            return false;
+        }
+        true
+    })
+}
+
 #[tauri::command]
-pub async fn hide_overlays(app: AppHandle) -> Result<(), String> {
-    let _ = app.emit("clips:countdown-shortcuts-active", false);
-    for label in [
-        COUNTDOWN_LABEL,
-        TOOLBAR_LABEL,
-        BUBBLE_LABEL,
-        FINALIZING_LABEL,
-        FLOW_BAR_LABEL,
-        REGION_GUIDES_LABEL,
-    ] {
+pub async fn hide_overlays(
+    app: AppHandle,
+    preserve_finalizing: Option<bool>,
+) -> Result<(), String> {
+    stop_countdown_control_tracking();
+    close_monitor_picker_windows(&app);
+    for label in overlay_labels_to_hide(preserve_finalizing.unwrap_or(false)) {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.close();
         }
     }
-    // A recording pill may be owned by meeting or voice flows; tear it down too.
-    let _ = crate::recording_indicator::recording_pill_hide(app).await;
+    if !crate::util::is_meeting_active(&app) {
+        let _ = crate::recording_indicator::recording_pill_hide(app).await;
+    }
     Ok(())
 }
 
-/// Close just the recording-specific overlays (countdown + toolbar),
-/// leaving the bubble alone. Used on recording stop/cancel when the
-/// popover owns the camera bubble for the entire session — we don't
-/// want to rip the bubble away mid-session; its lifecycle is governed
-/// by the popover's session effect (show on popover-open, hide on
-/// popover-close).
 #[tauri::command]
-pub async fn hide_recording_chrome(app: AppHandle) -> Result<(), String> {
-    let _ = app.emit("clips:countdown-shortcuts-active", false);
-    // The countdown + toolbar always tear down on recording stop. The region
-    // guides only tear down when they aren't pinned on-screen via the always-on
-    // toggle — otherwise we'd flicker close→reopen right after stop.
+pub async fn hide_recording_chrome(
+    app: AppHandle,
+    preserve_display_override: Option<bool>,
+    preserve_window_override: Option<bool>,
+) -> Result<(), String> {
+    stop_countdown_control_tracking();
     let g = crate::config::feature_config(&app).region_guides;
     let keep_region_guides = g.always_visible && g.enabled && !g.rects.is_empty();
-    let mut labels: Vec<&str> = vec![COUNTDOWN_LABEL, TOOLBAR_LABEL];
+    let mut labels: Vec<&str> = vec![COUNTDOWN_LABEL, REGION_RECORD_BORDER_LABEL];
+    if !TOOLBAR_FINISHING.load(Ordering::SeqCst) {
+        labels.push(TOOLBAR_LABEL);
+    }
     if !keep_region_guides {
         labels.push(REGION_GUIDES_LABEL);
     }
@@ -627,8 +1708,12 @@ pub async fn hide_recording_chrome(app: AppHandle) -> Result<(), String> {
             let _ = w.close();
         }
     }
-    // If meeting or voice flows showed a recording pill, auto-hide it after
-    // recording stops. Bail early if a new recording came up in the meantime.
+    if !preserve_display_override.unwrap_or(false) {
+        crate::state::SelectedRecordingDisplay::set(&app, None);
+    }
+    if !preserve_window_override.unwrap_or(false) {
+        crate::state::SelectedRecordingWindow::set(&app, None);
+    }
     let app_for_pill = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
@@ -639,44 +1724,94 @@ pub async fn hide_recording_chrome(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// DESTROY the bubble webview (not just hide it). This is the critical
-/// difference from `hide_overlays`: we need the WebKit webview gone so the
-/// macOS camera hardware is fully released. When the popover then calls
-/// `getDisplayMedia` / `getUserMedia({audio})` for MediaRecorder, WebKit
-/// doesn't try to renegotiate a capture graph that has a live camera in
-/// another webview — the camera is simply not held by anyone.
-///
-/// The recorder driver calls this right before acquiring screen + mic,
-/// and then calls `show_bubble` again once MediaRecorder is running +
-/// stable. At that point the bubble webview is freshly spawned, acquires
-/// the camera cleanly, and there's no cross-webview contention because
-/// MediaRecorder doesn't touch the camera after start.
-#[tauri::command]
-pub async fn close_bubble(app: AppHandle) -> Result<(), String> {
+fn close_bubble_window(app: &AppHandle) {
+    let _ = app.emit("clips:release-camera", ());
     if let Some(w) = app.get_webview_window(BUBBLE_LABEL) {
-        dlog!("[clips-tray] close_bubble — destroying bubble webview");
+        let _ = w.hide();
+        dlog!("[clips-tray] close_bubble - destroying bubble webview");
         let _ = w.close();
     } else {
-        dlog!("[clips-tray] close_bubble — no bubble window to close");
+        dlog!("[clips-tray] close_bubble - no bubble window to close");
     }
+}
+
+async fn close_bubble_window_and_wait(app: &AppHandle) -> Result<(), String> {
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let listener = app.once(BUBBLE_DESTROYED_EVENT, move |_| {
+        let _ = closed_tx.send(());
+    });
+    if app.get_webview_window(BUBBLE_LABEL).is_none() {
+        app.unlisten(listener);
+        return Ok(());
+    }
+
+    close_bubble_window(app);
+    closed_rx
+        .await
+        .map_err(|_| "camera bubble destruction acknowledgement was dropped".to_string())
+}
+
+pub fn close_bubble_if_idle(app: &AppHandle) {
+    if is_recording_active(app) {
+        return;
+    }
+    close_bubble_window(app);
+}
+
+#[tauri::command]
+pub async fn close_bubble(app: AppHandle) -> Result<(), String> {
+    close_bubble_window(&app);
     Ok(())
 }
 
-/// Show the popover window without toggling, and keep it shown even if it
-/// loses focus (popover hides on blur by default, but during post-recording
-/// review we want it sticky while the user reads the "Recording saved" copy).
-/// Resize the popover window to match the rendered React app height. The
-/// React side measures its own shell with a ResizeObserver and calls this
-/// whenever the height changes — gives us auto-sizing without having to
-/// pick a fixed popover size that fits every state.
+fn clamp_popover_logical_size(
+    height: f64,
+    width: Option<f64>,
+    work_area: PhysicalSize<u32>,
+    scale: f64,
+) -> (f64, f64) {
+    let scale = scale.max(1.0);
+    let max_height =
+        (work_area.height as f64 / scale - POPOVER_SCREEN_MARGIN_LOGICAL).clamp(1.0, 820.0);
+    let max_width =
+        (work_area.width as f64 / scale - POPOVER_SCREEN_MARGIN_LOGICAL).clamp(1.0, 960.0);
+    (
+        width
+            .unwrap_or(POPOVER_DEFAULT_WIDTH_LOGICAL)
+            .clamp(POPOVER_DEFAULT_WIDTH_LOGICAL.min(max_width), max_width),
+        height.clamp(POPOVER_MIN_HEIGHT_LOGICAL.min(max_height), max_height),
+    )
+}
+
+fn physical_rect_center(rect: tauri::Rect) -> (i32, i32) {
+    let (x, y) = match rect.position {
+        tauri::Position::Physical(p) => (p.x, p.y),
+        tauri::Position::Logical(p) => (p.x as i32, p.y as i32),
+    };
+    let (width, height) = match rect.size {
+        tauri::Size::Physical(s) => (s.width as i32, s.height as i32),
+        tauri::Size::Logical(s) => (s.width as i32, s.height as i32),
+    };
+    (x + width / 2, y + height / 2)
+}
+
+fn monitor_containing_point(window: &WebviewWindow, x: i32, y: i32) -> Option<tauri::Monitor> {
+    window
+        .available_monitors()
+        .ok()?
+        .into_iter()
+        .find(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            x >= position.x
+                && x < position.x + size.width as i32
+                && y >= position.y
+                && y < position.y + size.height as i32
+        })
+}
+
 #[tauri::command]
 pub async fn resize_popover(app: AppHandle, height: f64, width: Option<f64>) -> Result<(), String> {
-    // CRITICAL: bail out when the popover is parked at 2x2 for voice
-    // wake-up. The React shell's ResizeObserver fires on every mount
-    // and would un-park the window back to full size, making the
-    // Clips UI flash on every Fn press AND steal focus from the
-    // foreground app. The window must stay invisible-but-alive until
-    // hide_flow_bar clears the wake flag.
     let voice_woken = app
         .try_state::<VoiceWakePopover>()
         .and_then(|state| state.0.lock().ok().map(|g| *g))
@@ -684,33 +1819,42 @@ pub async fn resize_popover(app: AppHandle, height: f64, width: Option<f64>) -> 
     if voice_woken {
         return Ok(());
     }
-    if is_recording_active(&app) {
-        return Ok(());
-    }
     if let Some(w) = app.get_webview_window("popover") {
-        let max_logical_height = w
-            .current_monitor()
-            .ok()
-            .flatten()
-            .or_else(|| w.primary_monitor().ok().flatten())
+        let tray_center = app
+            .try_state::<TrayAnchor>()
+            .and_then(|anchor| anchor.0.lock().ok().and_then(|guard| *guard))
+            .map(physical_rect_center);
+        let monitor = tray_center
+            .and_then(|(x, y)| monitor_containing_point(&w, x, y))
+            .or_else(|| w.current_monitor().ok().flatten())
+            .or_else(|| w.primary_monitor().ok().flatten());
+        let (width, clamped) = monitor
+            .as_ref()
             .map(|monitor| {
-                let scale = monitor.scale_factor().max(1.0);
-                ((monitor.size().height as f64) / scale
-                    - 24.0
-                    - POPOVER_SHADOW_GUTTER_LOGICAL * 2.0)
-                    .clamp(260.0, 820.0)
+                clamp_popover_logical_size(
+                    height,
+                    width,
+                    monitor.work_area().size,
+                    monitor.scale_factor(),
+                )
             })
-            .unwrap_or(820.0);
-        let clamped = height.clamp(200.0, max_logical_height);
-        let width = width.unwrap_or(360.0).clamp(320.0, 480.0);
-        let (window_width, window_height) = popover_window_size_logical(width, clamped);
+            .unwrap_or_else(|| {
+                clamp_popover_logical_size(height, width, PhysicalSize::new(976, 836), 1.0)
+            });
+        let (window_width, window_height) = (width, clamped);
         let _ = w.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-            window_width,
-            window_height,
+            width, clamped,
         )));
-        // Re-anchor to the tray icon so the window doesn't drift below the
-        // bottom of the monitor after a growth.
-        position_popover(&app, &w);
+        let target_scale = monitor
+            .as_ref()
+            .map(|monitor| monitor.scale_factor())
+            .unwrap_or_else(|| w.scale_factor().unwrap_or(1.0))
+            .max(1.0);
+        let target_physical = PhysicalSize::new(
+            (window_width * target_scale).round() as u32,
+            (window_height * target_scale).round() as u32,
+        );
+        position_popover_with_size(&app, &w, target_physical);
     }
     Ok(())
 }
@@ -726,21 +1870,21 @@ pub fn open_macos_privacy_settings(pane: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let url = match pane.as_str() {
-            "camera" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
+            "camera" => "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Camera",
             "microphone" => {
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+                "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone"
             }
             "screen" => {
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture"
             }
             "speech" => {
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition"
+                "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_SpeechRecognition"
             }
             "accessibility" => {
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+                "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility"
             }
             "input-monitoring" => {
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+                "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ListenEvent"
             }
             _ => return Err(format!("Unknown macOS privacy pane: {pane}")),
         };
@@ -749,6 +1893,157 @@ pub fn open_macos_privacy_settings(pane: String) -> Result<(), String> {
             .status()
             .map_err(|e| format!("failed to open System Settings: {e}"))?;
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RewindExcludedApplication {
+    bundle_id: String,
+    name: String,
+    path: Option<String>,
+    installed: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn app_bundle_id(path: &str) -> Option<String> {
+    let output = Command::new("/usr/bin/mdls")
+        .args(["-name", "kMDItemCFBundleIdentifier", "-raw", path])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let bundle_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!bundle_id.is_empty() && bundle_id != "(null)").then_some(bundle_id)
+}
+
+#[cfg(target_os = "macos")]
+fn app_name_from_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Application")
+        .to_string()
+}
+
+fn fallback_app_name(bundle_id: &str) -> String {
+    match bundle_id {
+        "com.1password.1password" | "com.agilebits.onepassword7" => "1Password".to_string(),
+        "com.bitwarden.desktop" => "Bitwarden".to_string(),
+        "com.dashlane.dashlane" => "Dashlane".to_string(),
+        "com.lastpass.lastpass" => "LastPass".to_string(),
+        _ => bundle_id
+            .rsplit('.')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Application")
+            .to_string(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn find_installed_app(bundle_id: &str) -> Option<String> {
+    let query = format!("kMDItemCFBundleIdentifier == '{bundle_id}'");
+    let output = Command::new("/usr/bin/mdfind").arg(query).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|path| path.ends_with(".app"))
+        .map(str::to_string)
+}
+
+#[tauri::command]
+pub fn resolve_rewind_excluded_apps(
+    bundle_ids: Vec<String>,
+) -> Result<Vec<RewindExcludedApplication>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(bundle_ids
+            .into_iter()
+            .map(|bundle_id| {
+                let path = find_installed_app(&bundle_id);
+                let name = path
+                    .as_deref()
+                    .map(app_name_from_path)
+                    .unwrap_or_else(|| fallback_app_name(&bundle_id));
+                RewindExcludedApplication {
+                    bundle_id,
+                    name,
+                    installed: path.is_some(),
+                    path,
+                }
+            })
+            .collect());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(bundle_ids
+            .into_iter()
+            .map(|bundle_id| RewindExcludedApplication {
+                name: fallback_app_name(&bundle_id),
+                bundle_id,
+                path: None,
+                installed: false,
+            })
+            .collect())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn choose_rewind_excluded_apps_blocking() -> Result<Vec<RewindExcludedApplication>, String> {
+    let script = r#"
+set chosenApps to choose application with prompt "Choose apps Rewind should never remember" with multiple selections allowed
+set chosenPaths to {}
+repeat with chosenApp in chosenApps
+    set end of chosenPaths to POSIX path of (chosenApp as alias)
+end repeat
+set AppleScript's text item delimiters to linefeed
+return chosenPaths as text
+"#;
+    let output = Command::new("/usr/bin/osascript")
+        .args(["-e", script])
+        .output()
+        .map_err(|error| format!("Could not open the application picker: {error}"))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        if error.contains("-128") || error.to_ascii_lowercase().contains("canceled") {
+            return Ok(Vec::new());
+        }
+        return Err(format!("Could not choose applications: {}", error.trim()));
+    }
+    let mut apps = Vec::new();
+    for path in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let Some(bundle_id) = app_bundle_id(path) else {
+            continue;
+        };
+        apps.push(RewindExcludedApplication {
+            bundle_id,
+            name: app_name_from_path(path),
+            path: Some(path.to_string()),
+            installed: true,
+        });
+    }
+    Ok(apps)
+}
+
+#[tauri::command]
+pub async fn choose_rewind_excluded_apps() -> Result<Vec<RewindExcludedApplication>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return tauri::async_runtime::spawn_blocking(choose_rewind_excluded_apps_blocking)
+            .await
+            .map_err(|error| format!("The application picker stopped unexpectedly: {error}"))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Choosing excluded applications is currently available on macOS only.".to_string())
     }
 }
 
@@ -829,12 +2124,6 @@ pub fn request_macos_screen_recording_access() -> Result<bool, String> {
     }
 }
 
-/// Open a login window pointed at the Clips server's /login route. The
-/// WebView has its own persistent cookie jar, so once the user signs in
-/// here the session cookie is available to every subsequent fetch from
-/// the popover (localhost:1420 and localhost:8094 are same-site — ports
-/// aren't part of the site check — so SameSite=Lax cookies cross-send
-/// correctly with credentials: "include").
 #[tauri::command]
 pub async fn show_signin(app: AppHandle, url: String) -> Result<(), String> {
     const LABEL: &str = "signin";
@@ -867,39 +2156,23 @@ pub async fn close_signin(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Show the dictation pill at the bottom-center of the
-/// primary display. The React overlay is driven by `voice:*` events.
-///
-/// Reuses an existing flow-bar window if one is alive (just repositions
-/// and shows it), so back-to-back Fn presses don't pay the ~200ms WebKit
-/// spin-up cost on every press. The React component listens for
-/// `voice:state-change` to reset its visual state.
 #[tauri::command]
 pub async fn show_flow_bar(app: AppHandle) -> Result<(), String> {
     dlog!("[clips-tray] show_flow_bar invoked");
 
     let (mx, my, mw, mh) = tray_monitor_physical_rect(&app);
     let scale = overlay_scale_factor(&app);
-    // Wider + taller than the pill alone so the live transcript chip
-    // can stack above it. Height accommodates: bottom-anchored 32px pill
-    // + 6px gap + ~28px transcript chip + transparent window margin.
-    let content_w: u32 = (420.0 * scale).round() as u32;
-    let content_h: u32 = (120.0 * scale).round() as u32;
-    let bottom_margin: i32 = (14.0 * scale).round() as i32;
-    let gutter = overlay_shadow_gutter_physical(&app);
-    let w: u32 = content_w + gutter * 2;
-    let h: u32 = content_h + gutter * 2;
-    let x: i32 = (mx + (mw as i32 - content_w as i32) / 2 - gutter as i32).max(mx);
+    let w: u32 = (300.0 * scale).round() as u32;
+    let h: u32 = (80.0 * scale).round() as u32;
+    let bottom_margin: i32 = (32.0 * scale).round() as i32;
+    let x: i32 = (mx + (mw as i32 - w as i32) / 2).max(mx);
     let y: i32 = (my + mh as i32 - h as i32 - bottom_margin).max(my);
 
     if let Some(existing) = app.get_webview_window(FLOW_BAR_LABEL) {
-        // Reposition (in case the user changed display geometry between
-        // sessions) and bring it back into view WITHOUT stealing focus
-        // from the user's foreground app. State reset is handled by the
-        // JS side emitting voice:state-change.
         let _ = existing.set_size(tauri::Size::Physical(PhysicalSize::new(w, h)));
         let _ = existing.set_position(PhysicalPosition::new(x, y));
         let _ = existing.set_ignore_cursor_events(false);
+        configure_overlay_behavior(&existing);
         crate::util::show_without_activation(&existing);
         return Ok(());
     }
@@ -911,7 +2184,7 @@ pub async fn show_flow_bar(app: AppHandle) -> Result<(), String> {
         .always_on_top(true)
         .skip_taskbar(true)
         .resizable(false)
-        .shadow(false)
+        .shadow(true)
         .visible(false)
         .focused(false)
         .build()
@@ -921,28 +2194,20 @@ pub async fn show_flow_bar(app: AppHandle) -> Result<(), String> {
         })?;
     let _ = win.set_size(tauri::Size::Physical(PhysicalSize::new(w, h)));
     let _ = win.set_position(PhysicalPosition::new(x, y));
-    // The flow bar contains a visible cancel button, so it must be a real
-    // click target. Keep the OS window compact instead of making a wide
-    // click-through rectangle that strands the X button.
     let _ = win.set_ignore_cursor_events(false);
     set_capture_excluded(&win);
     configure_overlay_behavior(&win);
     crate::util::show_without_activation(&win);
     let app_for_timeout = app.clone();
     thread::spawn(move || {
-        // Long-tail safety net: if the JS cleanup path doesn't reach
-        // hide_flow_bar (hung getUserMedia, missed listener, network
-        // stall during transcription), force-close the overlay so the
-        // user is never stuck staring at it. 15s is past any realistic
-        // Whisper round-trip and well past the recording / processing
-        // happy paths. Re-checks DictationActive so we don't kill the
-        // bar while the user is still holding the shortcut.
         thread::sleep(Duration::from_secs(15));
-        let dictating = app_for_timeout
+        let key_held = app_for_timeout
             .try_state::<DictationActive>()
             .and_then(|state| state.0.lock().ok().map(|g| *g))
             .unwrap_or(false);
-        if !dictating {
+        // Toggle-mode dictation runs with the key released, so key state alone
+        // can't tell a live session from a stale overlay.
+        if !key_held && VOICE_FLOW_IDLE.load(Ordering::SeqCst) {
             if let Some(w) = app_for_timeout.get_webview_window(FLOW_BAR_LABEL) {
                 eprintln!("[clips-tray] hiding stale voice overlay after timeout");
                 let _ = w.hide();
@@ -952,12 +2217,24 @@ pub async fn show_flow_bar(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+pub fn install_voice_flow_state_listener(app: &tauri::App) {
+    app.listen("voice:state-change", |event| {
+        let idle = serde_json::from_str::<serde_json::Value>(event.payload())
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .get("state")
+                    .and_then(|state| state.as_str())
+                    .map(|state| state == "idle")
+            })
+            .unwrap_or(true);
+        VOICE_FLOW_IDLE.store(idle, Ordering::SeqCst);
+    });
+}
+
 #[tauri::command]
 pub async fn hide_flow_bar(app: AppHandle) -> Result<(), String> {
-    set_dictation_active(&app, false);
-    // Hide (don't close) so the next show_flow_bar can reuse the window
-    // and avoid the ~200ms WebKit cold-start that creates the stutter
-    // on second/third Fn presses.
+    crate::shortcuts::set_dictation_active_and_sync_escape(&app, false);
     if let Some(w) = app.get_webview_window(FLOW_BAR_LABEL) {
         let _ = w.hide();
     }
@@ -965,50 +2242,120 @@ pub async fn hide_flow_bar(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+const MESSAGING_APP_BUNDLES: &[&str] = &[
+    "com.tinyspeck.slackmacgap", // Slack
+    "com.apple.MobileSMS",       // Messages
+    "com.apple.iChat",           // Messages (legacy bundle id)
+    "net.whatsapp.WhatsApp",
+    "com.hnc.Discord",
+    "ru.keepcoder.Telegram",
+];
+
+fn strip_trailing_period_for_messaging(text: &str, bundle_id: Option<&str>) -> String {
+    let Some(bundle_id) = bundle_id else {
+        return text.to_string();
+    };
+    if !MESSAGING_APP_BUNDLES.contains(&bundle_id) {
+        return text.to_string();
+    }
+    if text.contains('\n') {
+        return text.to_string();
+    }
+    if text.ends_with('.') && !text.ends_with("..") {
+        return text[..text.len() - 1].to_string();
+    }
+    text.to_string()
+}
+
 #[tauri::command]
-pub async fn complete_voice_dictation(app: AppHandle, text: String) -> Result<(), String> {
+pub async fn complete_voice_dictation(app: AppHandle, text: String) -> Result<String, String> {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
         eprintln!("[clips-tray] complete_voice_dictation: empty text — nothing to paste");
-        return Ok(());
+        return Ok("inserted".into());
     }
+    if let Some(last) = app.try_state::<LastTranscript>() {
+        if let Ok(mut g) = last.0.lock() {
+            *g = Some(trimmed.clone());
+        }
+    }
+    crate::tray::rebuild_tray_menu(&app);
+    #[cfg(target_os = "macos")]
+    {
+        let had_text_field_at_start = app
+            .try_state::<VoiceTargetTextField>()
+            .and_then(|state| state.0.lock().ok().and_then(|g| *g))
+            .unwrap_or_else(crate::accessibility::focused_text_field_available);
+        if !had_text_field_at_start {
+            write_clipboard(&trimmed)?;
+            eprintln!(
+                "[clips-tray] complete_voice_dictation: no focused text field — copied to clipboard"
+            );
+            return Ok("copied".into());
+        }
+    }
+
+    insert_text_for_frontmost(&app, &trimmed, "complete_voice_dictation")?;
+    Ok("inserted".into())
+}
+
+#[tauri::command]
+pub async fn paste_last_dictation(app: AppHandle) -> Result<(), String> {
+    let text = match app.try_state::<LastTranscript>() {
+        Some(last) => last.0.lock().ok().and_then(|g| g.clone()),
+        None => None,
+    };
+    let Some(text) = text.filter(|t| !t.trim().is_empty()) else {
+        return Ok(());
+    };
+    insert_text_for_frontmost(&app, text.trim(), "paste_last_dictation")
+}
+
+fn insert_text_for_frontmost(
+    app: &AppHandle,
+    trimmed: &str,
+    caller: &'static str,
+) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let frontmost_bundle_id = frontmost_bundle_identifier();
     #[cfg(target_os = "macos")]
-    let voice_target_bundle_id = remembered_voice_target_bundle(&app);
+    let voice_target_bundle_id = if caller == "paste_last_dictation" {
+        None
+    } else {
+        remembered_voice_target_bundle(app)
+    };
+    #[cfg(target_os = "macos")]
+    let trimmed = strip_trailing_period_for_messaging(
+        trimmed,
+        voice_target_bundle_id
+            .as_deref()
+            .or(frontmost_bundle_id.as_deref()),
+    );
     #[cfg(target_os = "macos")]
     let strategy = text_insertion_strategy(frontmost_bundle_id.as_deref());
     #[cfg(target_os = "macos")]
     eprintln!(
-        "[clips-tray] complete_voice_dictation: inserting {} chars via {:?} (frontmost={})",
+        "[clips-tray] {caller}: inserting {} chars via {:?} (frontmost={})",
         trimmed.chars().count(),
         strategy,
         frontmost_bundle_id.as_deref().unwrap_or("unknown"),
     );
     #[cfg(not(target_os = "macos"))]
     eprintln!(
-        "[clips-tray] complete_voice_dictation: inserting {} chars",
+        "[clips-tray] {caller}: inserting {} chars",
         trimmed.chars().count(),
     );
-    if let Some(last) = app.try_state::<LastTranscript>() {
-        if let Ok(mut g) = last.0.lock() {
-            *g = Some(trimmed.clone());
-        }
-    }
-    // Keep the clipboard updated so users can Cmd+V again to repeat the
-    // last dictation. For normal GUI apps, paste via the clipboard so
-    // Chrome/Gmail receives one ordinary paste operation instead of a long
-    // stream of synthetic Unicode key events through AppKit text input.
-    // Known terminal apps still use direct Unicode typing because custom
-    // terminal paste bindings can intercept Cmd+V or bypass paste handling.
-    write_clipboard(&trimmed)?;
     #[cfg(target_os = "macos")]
     match strategy {
-        TextInsertionStrategy::ClipboardPaste => paste_clipboard(voice_target_bundle_id),
+        TextInsertionStrategy::ClipboardPaste => {
+            let prior_clipboard = read_clipboard();
+            write_clipboard(&trimmed)?;
+            paste_clipboard(voice_target_bundle_id, trimmed.clone(), prior_clipboard);
+        }
         TextInsertionStrategy::UnicodeType => type_text_unicode(&trimmed, voice_target_bundle_id),
     }
     #[cfg(not(target_os = "macos"))]
-    type_text_unicode(&trimmed);
+    type_text_unicode(trimmed);
     Ok(())
 }
 
@@ -1041,9 +2388,15 @@ pub fn remember_voice_target(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     {
         let target = frontmost_bundle_identifier();
+        let has_text_field = crate::accessibility::focused_text_field_available();
         if let Some(state) = app.try_state::<VoiceTargetBundle>() {
             if let Ok(mut g) = state.0.lock() {
                 *g = target;
+            }
+        }
+        if let Some(state) = app.try_state::<VoiceTargetTextField>() {
+            if let Ok(mut g) = state.0.lock() {
+                *g = Some(has_text_field);
             }
         }
     }
@@ -1061,7 +2414,265 @@ fn remembered_voice_target_bundle(app: &AppHandle) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{text_insertion_strategy, TextInsertionStrategy};
+    use super::{
+        bubble_position_for_target_scale, bubble_position_preserving_visible_center,
+        bubble_saved_window_size, bubble_scale_factor_for_monitors, bubble_size_for_name,
+        bubble_visible_center, bubble_window_center, bubble_window_size_for_scale,
+        clamp_popover_logical_size, commit_bubble_size_transaction,
+        legacy_bubble_window_size_for_scale, migrate_legacy_bubble_position,
+        overlay_labels_to_hide, restore_bubble_position_preference_at,
+        snapshot_bubble_position_preference_at, strip_trailing_period_for_messaging,
+        text_insertion_strategy, BubblePositionPreference, TextInsertionStrategy, BUBBLE_LABEL,
+        BUBBLE_POSITION_GEOMETRY_VERSION, FINALIZING_LABEL,
+    };
+    use tauri::PhysicalSize;
+
+    #[test]
+    fn bubble_position_preference_snapshot_restores_exact_file_state() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "clips-bubble-preference-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create test preference directory");
+        let existing_path = directory.join("bubble-position.json");
+        let original = b"{\"x\":17,\"y\":29,\"scaleFactor\":2}";
+        std::fs::write(&existing_path, original).expect("write original preference");
+
+        let snapshot = snapshot_bubble_position_preference_at(&existing_path)
+            .expect("read original preference");
+        std::fs::write(&existing_path, b"new preference").expect("write changed preference");
+        restore_bubble_position_preference_at(&existing_path, snapshot.as_deref())
+            .expect("restore original preference");
+        assert_eq!(
+            std::fs::read(&existing_path).expect("read restored preference"),
+            original
+        );
+
+        let absent_path = directory.join("previously-absent.json");
+        let snapshot =
+            snapshot_bubble_position_preference_at(&absent_path).expect("read absent preference");
+        assert!(snapshot.is_none());
+        std::fs::write(&absent_path, b"new preference").expect("write new preference");
+        restore_bubble_position_preference_at(&absent_path, snapshot.as_deref())
+            .expect("remove newly created preference");
+        assert!(!absent_path.exists());
+
+        std::fs::remove_dir_all(directory).expect("remove test preference directory");
+    }
+
+    #[test]
+    fn offscreen_popover_requires_supported_background_throttling() {
+        assert!(!crate::util::supports_disabled_background_throttling(13));
+        assert!(crate::util::supports_disabled_background_throttling(14));
+    }
+
+    #[test]
+    fn bubble_size_transaction_does_not_persist_after_geometry_fails() {
+        let position_persisted = std::cell::Cell::new(false);
+        let size_persisted = std::cell::Cell::new(false);
+        let rollback_called = std::cell::Cell::new(false);
+
+        let result = commit_bubble_size_transaction(
+            || Err("resize failed".to_string()),
+            || {
+                position_persisted.set(true);
+                Ok(())
+            },
+            || {
+                size_persisted.set(true);
+                Ok(())
+            },
+            |position_was_persisted| {
+                rollback_called.set(true);
+                assert!(!position_was_persisted);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err("resize failed".to_string()));
+        assert!(rollback_called.get());
+        assert!(!position_persisted.get());
+        assert!(!size_persisted.get());
+    }
+
+    #[test]
+    fn bubble_size_transaction_rolls_back_when_position_save_fails() {
+        let live_size = std::cell::Cell::new("small");
+        let saved_size = std::cell::Cell::new("small");
+        let rollback_called = std::cell::Cell::new(false);
+
+        let result = commit_bubble_size_transaction(
+            || {
+                live_size.set("medium");
+                Ok(())
+            },
+            || Err("position write failed".to_string()),
+            || {
+                saved_size.set("medium");
+                Ok(())
+            },
+            |position_persisted| {
+                rollback_called.set(true);
+                assert!(!position_persisted);
+                live_size.set("small");
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err("position write failed".to_string()));
+        assert!(rollback_called.get());
+        assert_eq!(live_size.get(), "small");
+        assert_eq!(saved_size.get(), "small");
+    }
+
+    #[test]
+    fn bubble_size_transaction_restores_saved_position_when_size_save_fails() {
+        let live_size = std::cell::Cell::new("small");
+        let live_position = std::cell::Cell::new("old");
+        let saved_position = std::cell::Cell::new("old");
+        let rollback_called = std::cell::Cell::new(false);
+
+        let result = commit_bubble_size_transaction(
+            || {
+                live_size.set("medium");
+                live_position.set("new");
+                Ok(())
+            },
+            || {
+                saved_position.set("new");
+                Ok(())
+            },
+            || Err("size preference write failed".to_string()),
+            |position_persisted| {
+                rollback_called.set(true);
+                assert!(position_persisted);
+                live_size.set("small");
+                live_position.set("old");
+                saved_position.set("old");
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err("size preference write failed".to_string()));
+        assert!(rollback_called.get());
+        assert_eq!(live_size.get(), "small");
+        assert_eq!(live_position.get(), "old");
+        assert_eq!(saved_position.get(), "old");
+    }
+
+    #[test]
+    fn popover_size_uses_work_area_and_preserves_recorder_controls() {
+        assert_eq!(
+            clamp_popover_logical_size(120.0, Some(1_000.0), PhysicalSize::new(800, 600), 1.0),
+            (784.0, 260.0)
+        );
+        assert_eq!(
+            clamp_popover_logical_size(1_000.0, None, PhysicalSize::new(1_600, 1_200), 2.0),
+            (320.0, 584.0)
+        );
+        assert_eq!(
+            clamp_popover_logical_size(260.0, Some(320.0), PhysicalSize::new(200, 180), 1.0),
+            (184.0, 164.0)
+        );
+    }
+
+    #[test]
+    fn bubble_window_geometry_keeps_the_same_logical_size_across_display_scales() {
+        assert_eq!(bubble_window_size_for_scale(180, 1.0), (216, 256));
+        assert_eq!(bubble_window_size_for_scale(180, 2.0), (432, 512));
+        assert_eq!(bubble_window_size_for_scale(252, 1.0), (288, 328));
+        assert_eq!(bubble_window_size_for_scale(252, 2.0), (576, 656));
+    }
+
+    #[test]
+    fn bubble_scale_change_preserves_the_visible_camera_center() {
+        let current_position = (220, 310);
+        let current_size = bubble_window_size_for_scale(180, 1.0);
+        let target_size = bubble_window_size_for_scale(180, 2.0);
+        let target_position =
+            bubble_position_preserving_visible_center(current_position, current_size, target_size);
+
+        assert_eq!(
+            bubble_visible_center(current_position, current_size),
+            bubble_visible_center(target_position, target_size)
+        );
+    }
+
+    #[test]
+    fn legacy_bubble_position_migration_preserves_the_visible_camera_center() {
+        let old_position = (420, 280);
+        for size_name in ["small", "medium"] {
+            for (legacy_scale, current_scale) in [(1.0, 1.0), (1.0, 2.0), (2.0, 2.0)] {
+                let old_size = legacy_bubble_window_size_for_scale(size_name, legacy_scale);
+                let current_size =
+                    bubble_window_size_for_scale(bubble_size_for_name(size_name), current_scale);
+                let migrated_position = migrate_legacy_bubble_position(
+                    old_position,
+                    size_name,
+                    legacy_scale,
+                    current_scale,
+                );
+
+                assert_eq!(
+                    bubble_visible_center(old_position, old_size),
+                    bubble_visible_center(migrated_position, current_size),
+                    "size={size_name} legacy_scale={legacy_scale} current_scale={current_scale}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bubble_position_without_a_geometry_version_is_legacy() {
+        let preference = serde_json::from_str::<BubblePositionPreference>(r#"{"x":17,"y":42}"#)
+            .expect("legacy bubble position should load");
+
+        assert_eq!((preference.x, preference.y), (17, 42));
+        assert!(preference.geometry_version < BUBBLE_POSITION_GEOMETRY_VERSION);
+        assert_eq!(preference.scale_factor, None);
+    }
+
+    #[test]
+    fn restored_bubble_scale_comes_from_the_window_center_monitor() {
+        let preference = serde_json::from_str::<BubblePositionPreference>(
+            r#"{"x":900,"y":100,"geometryVersion":1,"scaleFactor":2.0}"#,
+        )
+        .expect("current bubble position should load");
+        let position = (preference.x, preference.y);
+        let previous_size = bubble_saved_window_size(&preference, "medium", 2.0);
+        let window_center = bubble_window_center(position, previous_size);
+        let monitors = [(0, 0, 1_000, 800, 2.0), (1_000, 0, 1_000, 800, 1.0)];
+
+        assert_eq!(
+            bubble_scale_factor_for_monitors(position.0, position.1, &monitors),
+            Some(2.0)
+        );
+        let target_scale =
+            bubble_scale_factor_for_monitors(window_center.0, window_center.1, &monitors)
+                .expect("restored window center should be on a monitor");
+        assert_eq!(target_scale, 1.0);
+
+        let (restored_position, was_rebased) =
+            bubble_position_for_target_scale(&preference, "medium", 2.0, target_scale);
+        let target_size =
+            bubble_window_size_for_scale(bubble_size_for_name("medium"), target_scale);
+        assert!(was_rebased);
+        assert_eq!(
+            bubble_visible_center(position, previous_size),
+            bubble_visible_center(restored_position, target_size)
+        );
+    }
+
+    #[test]
+    fn overlay_cleanup_can_preserve_finalizing_progress() {
+        assert!(!overlay_labels_to_hide(true).any(|label| label == FINALIZING_LABEL));
+        assert!(overlay_labels_to_hide(false).any(|label| label == FINALIZING_LABEL));
+        assert!(overlay_labels_to_hide(false).any(|label| label == BUBBLE_LABEL));
+    }
 
     #[test]
     fn uses_clipboard_paste_for_chrome() {
@@ -1086,11 +2697,141 @@ mod tests {
             TextInsertionStrategy::ClipboardPaste
         ));
     }
+
+    #[test]
+    fn strips_lone_trailing_period_in_slack() {
+        assert_eq!(
+            strip_trailing_period_for_messaging(
+                "let's grab lunch.",
+                Some("com.tinyspeck.slackmacgap")
+            ),
+            "let's grab lunch"
+        );
+    }
+
+    #[test]
+    fn keeps_ellipsis_in_messaging_apps() {
+        assert_eq!(
+            strip_trailing_period_for_messaging("hold on...", Some("net.whatsapp.WhatsApp")),
+            "hold on..."
+        );
+    }
+
+    #[test]
+    fn keeps_trailing_period_in_non_messaging_apps() {
+        assert_eq!(
+            strip_trailing_period_for_messaging("Final report.", Some("com.google.Chrome")),
+            "Final report."
+        );
+    }
+
+    #[test]
+    fn keeps_trailing_period_for_multiline_text() {
+        assert_eq!(
+            strip_trailing_period_for_messaging(
+                "line one\nline two.",
+                Some("com.tinyspeck.slackmacgap")
+            ),
+            "line one\nline two."
+        );
+    }
+
+    #[test]
+    fn keeps_trailing_period_when_bundle_unknown() {
+        assert_eq!(
+            strip_trailing_period_for_messaging("Final report.", None),
+            "Final report."
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    mod macos_only {
+        use super::super::{
+            appkit_frame_for_physical_bounds, chunk_graphemes_by_utf16_units,
+            utf8_pasteboard_command,
+        };
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        use std::ffi::OsStr;
+
+        fn assert_close(actual: f64, expected: f64) {
+            assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
+        }
+
+        #[test]
+        fn atomic_toolbar_bounds_preserve_the_requested_screen_anchor() {
+            let current = NSRect::new(NSPoint::new(50.0, 300.0), NSSize::new(176.0, 176.0));
+
+            let right_anchored =
+                appkit_frame_for_physical_bounds(current, 100, 200, 368, 200, 84, 352, 2.0);
+            assert_close(
+                right_anchored.origin.x + right_anchored.size.width,
+                current.origin.x + current.size.width,
+            );
+
+            let bottom_anchored =
+                appkit_frame_for_physical_bounds(current, 100, 200, 100, 468, 352, 84, 2.0);
+            assert_close(bottom_anchored.origin.y, current.origin.y);
+        }
+
+        #[test]
+        fn pasteboard_commands_force_utf8_for_gui_launches() {
+            let command = utf8_pasteboard_command("pbcopy");
+            let env_value = |key: &str| {
+                command
+                    .get_envs()
+                    .find(|(name, _)| *name == OsStr::new(key))
+                    .and_then(|(_, value)| value)
+            };
+            assert_eq!(env_value("LANG"), Some(OsStr::new("en_US.UTF-8")));
+            assert_eq!(env_value("LC_ALL"), Some(OsStr::new("en_US.UTF-8")));
+        }
+
+        #[test]
+        fn never_splits_a_zwj_family_emoji_across_chunks() {
+            let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+            let text = format!("{}{}{}", "a".repeat(18), family, "b".repeat(5));
+            let chunks = chunk_graphemes_by_utf16_units(&text, 20);
+            let rejoined = chunks.concat();
+            assert_eq!(rejoined, text);
+            assert!(
+                chunks.iter().any(|c| c.contains(family)),
+                "family emoji grapheme cluster must stay intact in a single chunk"
+            );
+        }
+
+        #[test]
+        fn never_splits_a_flag_regional_indicator_pair() {
+            let flag = "\u{1F1FA}\u{1F1F8}";
+            let text = format!("{}{}", "a".repeat(19), flag);
+            let chunks = chunk_graphemes_by_utf16_units(&text, 20);
+            assert!(chunks.iter().any(|c| c.contains(flag)));
+            assert_eq!(chunks.concat(), text);
+        }
+
+        #[test]
+        fn chunks_plain_ascii_at_the_utf16_cap() {
+            let text = "a".repeat(45);
+            let chunks = chunk_graphemes_by_utf16_units(&text, 20);
+            assert_eq!(chunks.len(), 3);
+            assert_eq!(chunks[0].len(), 20);
+            assert_eq!(chunks[1].len(), 20);
+            assert_eq!(chunks[2].len(), 5);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn utf8_pasteboard_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env("LANG", "en_US.UTF-8")
+        .env("LC_ALL", "en_US.UTF-8");
+    command
 }
 
 #[cfg(target_os = "macos")]
 fn write_clipboard(text: &str) -> Result<(), String> {
-    let mut child = Command::new("pbcopy")
+    let mut child = utf8_pasteboard_command("pbcopy")
         .stdin(Stdio::piped())
         .spawn()
         .map_err(|e| format!("pbcopy spawn: {e}"))?;
@@ -1107,12 +2848,18 @@ fn write_clipboard(text: &str) -> Result<(), String> {
     }
 }
 
-// Voice-dictation paste relies on macOS-specific `pbcopy` + CGEvent paste; the
-// non-mac path is an explicit error so the JS layer can surface a clear
-// message rather than the user seeing a silent failure.
 #[cfg(not(target_os = "macos"))]
 fn write_clipboard(_text: &str) -> Result<(), String> {
     Err("voice dictation is currently macOS-only".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn read_clipboard() -> Option<String> {
+    let out = utf8_pasteboard_command("pbpaste").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -1150,18 +2897,20 @@ unsafe fn ns_string_to_owned(ptr: *mut objc2::runtime::AnyObject) -> Option<Stri
 }
 
 #[cfg(target_os = "macos")]
-fn paste_clipboard(target_bundle_id: Option<String>) {
+fn paste_clipboard(
+    target_bundle_id: Option<String>,
+    dictated_text: String,
+    prior_clipboard: Option<String>,
+) {
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
     thread::spawn(move || {
         reactivate_voice_target(target_bundle_id.as_deref());
-        thread::sleep(Duration::from_millis(90));
         let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
             eprintln!("[clips-tray] paste failed: no CGEventSource");
             return;
         };
-        // macOS virtual keycode 9 is "V".
         let Ok(down) = CGEvent::new_keyboard_event(source.clone(), 9, true) else {
             eprintln!("[clips-tray] paste failed: no keydown event");
             return;
@@ -1176,6 +2925,14 @@ fn paste_clipboard(target_bundle_id: Option<String>) {
         down.post(CGEventTapLocation::HID);
         thread::sleep(Duration::from_millis(8));
         up.post(CGEventTapLocation::HID);
+
+        let Some(prior) = prior_clipboard else {
+            return;
+        };
+        thread::sleep(Duration::from_millis(1200));
+        if read_clipboard().as_deref() == Some(dictated_text.as_str()) {
+            let _ = write_clipboard(&prior);
+        }
     });
 }
 
@@ -1193,6 +2950,34 @@ fn reactivate_voice_target(target_bundle_id: Option<&str>) {
     if let Err(err) = Command::new("open").arg("-b").arg(bundle_id).status() {
         eprintln!("[clips-tray] could not reactivate voice target {bundle_id}: {err}");
     }
+    for _ in 0..20 {
+        if frontmost_bundle_identifier().as_deref() == Some(bundle_id) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn chunk_graphemes_by_utf16_units(text: &str, max_utf16_units: usize) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut units = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_units = grapheme.encode_utf16().count();
+        if units > 0 && units + grapheme_units > max_utf16_units {
+            out.push(std::mem::take(&mut current));
+            units = 0;
+        }
+        current.push_str(grapheme);
+        units += grapheme_units;
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 #[cfg(target_os = "macos")]
@@ -1203,31 +2988,11 @@ fn type_text_unicode(text: &str, target_bundle_id: Option<String>) {
     let owned = text.to_string();
     thread::spawn(move || {
         reactivate_voice_target(target_bundle_id.as_deref());
-        thread::sleep(Duration::from_millis(90));
         let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
             eprintln!("[clips-tray] type failed: no CGEventSource");
             return;
         };
-        // CGEventKeyboardSetUnicodeString has a per-event payload limit
-        // (Apple docs: ~20 UTF-16 units, with longer bounded by ~75 char
-        // in practice). Chunk by codepoint to stay safely under that.
-        let chunks: Vec<String> = {
-            let mut out: Vec<String> = Vec::new();
-            let mut current = String::new();
-            let mut count = 0usize;
-            for c in owned.chars() {
-                current.push(c);
-                count += 1;
-                if count >= 20 {
-                    out.push(std::mem::take(&mut current));
-                    count = 0;
-                }
-            }
-            if !current.is_empty() {
-                out.push(current);
-            }
-            out
-        };
+        let chunks = chunk_graphemes_by_utf16_units(&owned, 20);
         for chunk in chunks {
             let utf16: Vec<u16> = chunk.encode_utf16().collect();
             let Ok(down) = CGEvent::new_keyboard_event(source.clone(), 0, true) else {
@@ -1242,9 +3007,6 @@ fn type_text_unicode(text: &str, target_bundle_id: Option<String>) {
             up.set_string_from_utf16_unchecked(&utf16);
             down.post(CGEventTapLocation::HID);
             up.post(CGEventTapLocation::HID);
-            // Tiny gap between chunks gives terminal apps time to digest
-            // each batch — without this, Ghostty occasionally drops the
-            // tail of long inserts.
             thread::sleep(Duration::from_millis(2));
         }
     });
@@ -1253,9 +3015,6 @@ fn type_text_unicode(text: &str, target_bundle_id: Option<String>) {
 #[cfg(not(target_os = "macos"))]
 fn type_text_unicode(_text: &str) {}
 
-/// Record the popover's current recording state. When active, clicking the
-/// tray icon emits a stop event instead of toggling the popover — so the
-/// user can stop a recording from anywhere with one click.
 #[tauri::command]
 pub async fn set_recording_state(app: AppHandle, active: bool) -> Result<(), String> {
     dlog!("[clips-tray] set_recording_state active={}", active);
@@ -1268,10 +3027,74 @@ pub async fn set_recording_state(app: AppHandle, active: bool) -> Result<(), Str
     Ok(())
 }
 
-/// Last-resort recovery command: clear `is_recording_active` and show the
-/// popover. Not wired to any UI by default — available for debugging when
-/// the recording-flow side-effects wedge the tray in a dead state.
-/// Invoke from the webview via `invoke("reset_state")`.
+#[tauri::command]
+pub async fn release_recording_state(app: AppHandle) -> Result<(), String> {
+    dlog!("[clips-tray] release_recording_state");
+    if let Some(state) = app.try_state::<RecordingActive>() {
+        if let Ok(mut g) = state.0.lock() {
+            *g = false;
+        }
+    }
+    crate::tray::rebuild_tray_menu(&app);
+    close_bubble_window_and_wait(&app).await
+}
+
+#[tauri::command]
+pub async fn set_meeting_active(
+    app: AppHandle,
+    active: bool,
+    meeting_id: Option<String>,
+) -> Result<(), String> {
+    dlog!(
+        "[clips-tray] set_meeting_active active={} meeting_id={:?}",
+        active,
+        meeting_id
+    );
+    if let Some(state) = app.try_state::<MeetingActive>() {
+        if let Ok(mut g) = state.0.lock() {
+            *g = active;
+        }
+    }
+    if let Some(state) = app.try_state::<ActiveMeetingId>() {
+        if let Ok(mut g) = state.0.lock() {
+            *g = if active { meeting_id } else { None };
+        }
+    }
+    crate::tray::rebuild_tray_menu(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_active_meeting_id(app: AppHandle) -> Result<Option<String>, String> {
+    Ok(app
+        .try_state::<ActiveMeetingId>()
+        .and_then(|s| s.0.lock().ok().and_then(|g| g.clone())))
+}
+
+pub static QUIT_TEARDOWN_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Called by the popover webview once it has finished (or given up on)
+/// stopping an in-progress meeting during app quit. Marks teardown done and
+/// asks Tauri to exit again — this second `app.exit(0)` is the one that
+/// actually terminates the process, since the `ExitRequested` handler only
+/// calls `prevent_exit()` on the FIRST pass (gated on this same atomic).
+///
+/// compare_exchange (not load-then-store) so this and lib.rs's 3s watchdog
+/// can't both observe state==1 and both call `app.exit()` — only whichever
+/// wins the CAS proceeds. If this loses the race (watchdog already fired),
+/// there's nothing left to do: the process is already exiting.
+#[tauri::command]
+pub async fn quit_teardown_done(app: AppHandle) -> Result<(), String> {
+    if QUIT_TEARDOWN_STATE
+        .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        eprintln!("[clips-tray] quit_teardown_done — meeting teardown finished, exiting");
+        app.exit(0);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn reset_state(app: AppHandle) -> Result<(), String> {
     eprintln!("[clips-tray] reset_state invoked — clearing recording flag + showing popover");
@@ -1280,233 +3103,354 @@ pub async fn reset_state(app: AppHandle) -> Result<(), String> {
             *g = false;
         }
     }
+    if let Some(state) = app.try_state::<MeetingActive>() {
+        if let Ok(mut g) = state.0.lock() {
+            *g = false;
+        }
+    }
+    if let Some(state) = app.try_state::<ActiveMeetingId>() {
+        if let Ok(mut g) = state.0.lock() {
+            *g = None;
+        }
+    }
     if let Some(w) = app.get_webview_window(REGION_GUIDES_LABEL) {
         let _ = w.close();
     }
-    if let Some(window) = app.get_webview_window("popover") {
-        // Restore normal size in case the window was shrunk to a pinhole
-        // during recording — otherwise it would reappear as a 2×2 dot.
-        configure_overlay_behavior(&window);
-        let (w, h) = popover_window_size_logical(
-            POPOVER_DEFAULT_WIDTH_LOGICAL,
-            POPOVER_DEFAULT_HEIGHT_LOGICAL,
-        );
-        let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(w, h)));
-        position_popover(&app, &window);
-        mark_popover_shown(&app);
-        let _ = window.show();
-        let _ = window.set_focus();
-        let _ = app.emit("clips:popover-visible", true);
+    if let Some(w) = app.get_webview_window(REGION_RECORD_BORDER_LABEL) {
+        let _ = w.close();
     }
+    force_show_popover(&app);
     Ok(())
 }
 
-/// Load the saved bubble size and return it to the frontend. Default is
-/// "medium". Exposed to JS via `invoke("load_bubble_size")`.
 #[tauri::command]
 pub async fn load_bubble_size(app: AppHandle) -> Result<String, String> {
     Ok(load_bubble_size_name(&app))
 }
 
-/// Resize the bubble window to match the named size ("small" | "medium") and
-/// persist the choice. Clamps to valid names silently — unknown values fall
-/// back to medium so a typo in the frontend doesn't brick persistence.
 #[tauri::command]
 pub async fn set_bubble_size(app: AppHandle, size: String) -> Result<(), String> {
     let name = match size.as_str() {
         "medium" => "medium",
         _ => "small",
     };
-    let px = bubble_size_for_name(name);
-    let gutter = overlay_shadow_gutter_physical(&app);
-    let win_w = px + gutter * 2;
-    let win_h = bubble_window_height_for(px) + gutter * 2;
-    if let Some(win) = app.get_webview_window(BUBBLE_LABEL) {
-        // Re-center the resize around the current circle's center so the
-        // bubble visually grows / shrinks around its current spot instead of
-        // jumping toward the top-left corner (Tauri resizes from the window's
-        // origin by default). We center on the CIRCLE's center — not the
-        // window center — since the controls budget strip is always beneath
-        // the circle, not around it.
-        let current_pos = win
-            .outer_position()
-            .ok()
-            .map(|p| (p.x, p.y))
-            .unwrap_or((0, 0));
-        let current_size = win
+    let Some(win) = app.get_webview_window(BUBBLE_LABEL) else {
+        return save_bubble_size_name(&app, name);
+    };
+    let size_logical = bubble_size_for_name(name);
+    let scale = win
+        .scale_factor()
+        .map_err(|error| format!("read bubble scale factor: {error}"))?
+        .max(1.0);
+    let gutter = (OVERLAY_SHADOW_GUTTER_LOGICAL * scale).round() as u32;
+    let content_size = (f64::from(size_logical) * scale).round() as u32;
+    let (win_w, win_h) = bubble_window_size_for_scale(size_logical, scale);
+    let current_pos = win
+        .outer_position()
+        .map_err(|error| format!("read bubble window position: {error}"))?;
+    let current_size = win
+        .outer_size()
+        .map_err(|error| format!("read bubble window size: {error}"))?;
+    let previous_position_preference = snapshot_bubble_position_preference(&app)?;
+    let current_circle_size = current_size.width as i32 - (gutter * 2) as i32;
+    let delta = (current_circle_size - content_size as i32) / 2;
+    let new_x = current_pos.x + delta;
+    let new_y = current_pos.y + delta;
+    let (new_x, new_y) = clamp_bubble_window_position(&app, new_x, new_y, win_w, win_h);
+    let new_position = PhysicalPosition::new(new_x, new_y);
+    let new_size = PhysicalSize::new(win_w, win_h);
+
+    commit_bubble_size_transaction(
+        || {
+            win.set_size(tauri::Size::Physical(new_size))
+                .map_err(|error| format!("resize bubble window: {error}"))?;
+            win.set_position(new_position)
+                .map_err(|error| format!("reposition bubble window: {error}"))?;
+            Ok(())
+        },
+        || {
+            let position = win
+                .outer_position()
+                .map_err(|error| format!("read resized bubble position: {error}"))?;
+            save_bubble_position_at(&app, position.x, position.y).map(|_| ())
+        },
+        || save_bubble_size_name(&app, name),
+        |position_persisted| {
+            rollback_bubble_size_geometry(
+                &app,
+                &win,
+                current_pos,
+                current_size,
+                position_persisted,
+                previous_position_preference.as_deref(),
+            )
+        },
+    )
+}
+
+#[tauri::command]
+pub async fn save_bubble_position(app: AppHandle, x: i32, y: i32) -> Result<(), String> {
+    save_bubble_position_at(&app, x, y).map(|_| ())
+}
+
+fn save_bubble_position_at(app: &AppHandle, x: i32, y: i32) -> Result<(i32, i32), String> {
+    let path = bubble_position_path(app).ok_or("bubble position path unavailable")?;
+    let (width, height, scale_factor) = if let Some(window) = app.get_webview_window(BUBBLE_LABEL) {
+        let size = window
             .outer_size()
-            .ok()
-            .map(|s| s.width as i32)
-            .unwrap_or((BUBBLE_SIZE_SMALL + gutter * 2) as i32);
-        let new_px = px as i32;
-        let current_circle_size = current_size - (gutter * 2) as i32;
-        let delta = (current_circle_size - new_px) / 2;
-        let new_x = current_pos.0 + delta;
-        let new_y = current_pos.1 + delta;
-        let _ = win.set_size(tauri::Size::Physical(PhysicalSize::new(win_w, win_h)));
-        let _ = win.set_position(PhysicalPosition::new(new_x, new_y));
+            .map_err(|error| format!("read bubble window size: {error}"))?;
+        let scale_factor = window
+            .scale_factor()
+            .map_err(|error| format!("read bubble scale factor: {error}"))?;
+        (size.width, size.height, scale_factor.max(1.0))
+    } else {
+        let size_name = load_bubble_size_name(app);
+        let size_logical = bubble_size_for_name(&size_name);
+        let fallback_scale = overlay_scale_factor(app);
+        let assumed_size = bubble_window_size_for_scale(size_logical, fallback_scale);
+        let (center_x, center_y) = bubble_window_center((x, y), assumed_size);
+        let scale_factor = bubble_scale_factor_for_position(app, center_x, center_y);
+        let (width, height) = bubble_window_size_for_scale(size_logical, scale_factor);
+        (width, height, scale_factor)
+    };
+    let (x, y) = clamp_bubble_window_position(app, x, y, width, height);
+    if let Some(window) = app.get_webview_window(BUBBLE_LABEL) {
+        let current = window
+            .outer_position()
+            .map_err(|error| format!("read bubble window position: {error}"))?;
+        if current.x != x || current.y != y {
+            window
+                .set_position(PhysicalPosition::new(x, y))
+                .map_err(|error| format!("clamp bubble window position: {error}"))?;
+        }
     }
-    save_bubble_size_name(&app, name);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "x": x,
+        "y": y,
+        "geometryVersion": BUBBLE_POSITION_GEOMETRY_VERSION,
+        "scaleFactor": scale_factor,
+    }))
+    .map_err(|e| format!("serialize: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    if let Err(error) = std::fs::write(&tmp, &body) {
+        return Err(format!("write bubble position: {error}"));
+    }
+    if let Err(error) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("save bubble position: {error}"));
+    }
+    Ok((x, y))
+}
+
+#[tauri::command]
+pub async fn bubble_drag_start(app: AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(BUBBLE_LABEL) else {
+        return Ok(());
+    };
+    let (Ok(cursor), Ok(pos)) = (window.cursor_position(), window.outer_position()) else {
+        return Ok(());
+    };
+    let mut anchor = bubble_drag_anchor()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *anchor = Some(BubbleDragAnchor {
+        cursor_x: cursor.x.round() as i32,
+        cursor_y: cursor.y.round() as i32,
+        win_x: pos.x,
+        win_y: pos.y,
+    });
+    BUBBLE_DRAGGING.store(true, Ordering::SeqCst);
+    drop(anchor);
+    mark_popover_shown(&app);
     Ok(())
 }
 
-/// Persist the bubble position so it survives restarts. Exposed to JS via
-/// `invoke("save_bubble_position", { x, y })`. Writes atomically (temp file +
-/// rename) so a crash mid-write can't corrupt the JSON blob.
 #[tauri::command]
-pub async fn save_bubble_position(app: AppHandle, x: i32, y: i32) -> Result<(), String> {
-    let Some(path) = bubble_position_path(&app) else {
-        // No writable app-data dir — log and swallow so the UI doesn't
-        // treat this as a fatal error.
-        eprintln!("[clips-tray] save_bubble_position: no app_data_dir, skipping");
+pub async fn bubble_drag_move(app: AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(BUBBLE_LABEL) else {
         return Ok(());
     };
-    let body = serde_json::to_vec(&serde_json::json!({ "x": x, "y": y }))
-        .map_err(|e| format!("serialize: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    if let Err(err) = std::fs::write(&tmp, &body) {
-        eprintln!("[clips-tray] save_bubble_position write tmp failed: {err}");
+    // Drag end takes this lock before saving, so no earlier move can land later.
+    let anchor = bubble_drag_anchor()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(anchor) = anchor.as_ref() else {
         return Ok(());
-    }
-    if let Err(err) = std::fs::rename(&tmp, &path) {
-        eprintln!("[clips-tray] save_bubble_position rename failed: {err}");
-        // Best-effort cleanup of the tmp file so it doesn't linger.
-        let _ = std::fs::remove_file(&tmp);
+    };
+    let Ok(cursor) = window.cursor_position() else {
         return Ok(());
+    };
+    let target = (
+        anchor.win_x + (cursor.x.round() as i32 - anchor.cursor_x),
+        anchor.win_y + (cursor.y.round() as i32 - anchor.cursor_y),
+    );
+    let Ok(size) = window.outer_size() else {
+        return Ok(());
+    };
+    let (x, y) = clamp_bubble_window_position(&app, target.0, target.1, size.width, size.height);
+    window
+        .set_position(PhysicalPosition::new(x, y))
+        .map_err(|error| format!("move bubble window: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn bubble_drag_end(app: AppHandle) -> Result<(), String> {
+    {
+        let mut anchor = bubble_drag_anchor()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *anchor = None;
+        BUBBLE_DRAGGING.store(false, Ordering::SeqCst);
     }
+    if let Some(window) = app.get_webview_window(BUBBLE_LABEL) {
+        if let Err(sync_error) = sync_bubble_window_geometry(&app, &window) {
+            let save_result = window
+                .outer_position()
+                .map_err(|error| format!("read dragged bubble position: {error}"))
+                .and_then(|position| {
+                    save_bubble_position_at(&app, position.x, position.y).map(|_| ())
+                });
+            return match save_result {
+                Ok(()) => Err(sync_error),
+                Err(save_error) => Err(format!(
+                    "{sync_error}; save drag-end position: {save_error}"
+                )),
+            };
+        }
+    }
+    // Repositioning is still user activity; replaying its blur at release
+    // hides the camera before the user can start recording.
     Ok(())
 }
 
 #[tauri::command]
 pub async fn show_popover(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("popover") {
-        set_capture_included(&window);
-        // Re-apply Space behavior — `orderOut:` resets it, so without this
-        // the popover sticks to whichever Space it was first shown on.
-        configure_overlay_behavior(&window);
-        // Restore the popover's normal size — it may have been shrunk to 2×2
-        // during recording by `park_popover_offscreen` (kept the JS alive
-        // while keeping the window out of the way). The content's
-        // ResizeObserver will call `resize_popover` on the next render to
-        // fine-tune the height, but we need a sensible starting size so
-        // `position_popover` can anchor correctly.
-        let (w, h) = popover_window_size_logical(
-            POPOVER_DEFAULT_WIDTH_LOGICAL,
-            POPOVER_DEFAULT_HEIGHT_LOGICAL,
-        );
-        let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(w, h)));
-        position_popover(&app, &window);
-        mark_popover_shown(&app);
-        let _ = window.show();
-        let _ = window.set_focus();
-        let _ = app.emit("clips:popover-visible", true);
+        present_popover(&app, &window);
     }
     Ok(())
 }
 
-/// Shrink the popover to a 2x2 pinhole anchored on the primary screen WITHOUT
-/// hiding it. Used during recording to hide the popover from the user while
-/// keeping its JS alive.
-///
-/// History: we used to park the window off-screen at (99999,99999). That kept
-/// AppKit's backing surface alive, but on macOS 15+ WKWebView treats a window
-/// with no on-screen pixels as "occluded" and throttles the whole page's JS —
-/// `requestAnimationFrame`, `setInterval`, and (critically) `<video>` playback
-/// + `requestVideoFrameCallback` all stall. The bubble frame pump is owned by
-/// this popover, so the moment we parked it the bubble showed its last frame
-/// and froze.
-///
-/// Fix: anchor the window at a visible coordinate on the primary screen and
-/// shrink it to 2x2 physical pixels. From WKWebView's point of view the
-/// window IS on-screen — no occlusion, no throttling, pump keeps ticking. The
-/// user sees a 2-pixel dot that effectively vanishes against any pixel the
-/// cursor won't touch. NSWindowSharingNone is already set on the popover, so
-/// it stays out of the recording either way.
-///
-/// Call `show_popover` to restore normal size + tray-anchored position when
-/// the recording ends.
+pub fn hide_popover(app: &AppHandle) {
+    set_popover_parked(app, false);
+    if let Some(window) = app.get_webview_window("popover") {
+        let _ = window.hide();
+    }
+    close_bubble_if_idle(app);
+    let _ = app.emit("clips:popover-visible", false);
+}
+
 #[tauri::command]
 pub async fn park_popover_offscreen(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("popover") {
+        set_popover_parked(&app, true);
         set_capture_excluded(&window);
-        // Anchor near the top-left of the primary display. We avoid (0,0)
-        // exactly because on some macOS versions that corner falls under the
-        // menu-bar cutout — 2,2 is safely inside every real display's bounds.
-        let _ = window.set_position(PhysicalPosition::new(2_i32, 2_i32));
-        // 2x2 physical px = 1x1 logical on retina — visually a dot that
-        // disappears into the menu-bar shadow. Going smaller than 2x2 has
-        // caused AppKit to treat the window as "empty" on some macOS builds.
-        let _ = window.set_size(tauri::Size::Physical(PhysicalSize::new(2, 2)));
+        let _ = window.set_ignore_cursor_events(true);
+        #[cfg(target_os = "macos")]
+        let can_park_offscreen = {
+            let major_version = NSProcessInfo::processInfo()
+                .operatingSystemVersion()
+                .majorVersion;
+            crate::util::supports_disabled_background_throttling(major_version)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let can_park_offscreen = true;
+
+        if can_park_offscreen {
+            let _ = window.set_position(PhysicalPosition::new(-10_000_i32, -10_000_i32));
+            set_window_opacity(&window, 0.0);
+        } else {
+            // Keep a visible pixel on older macOS versions so WKWebView timers keep
+            // running.
+            let _ = window.set_position(PhysicalPosition::new(2_i32, 2_i32));
+            let _ = window.set_size(tauri::Size::Physical(PhysicalSize::new(2, 2)));
+            set_window_opacity(&window, 1.0);
+        }
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Public helpers used by tray.rs and shortcuts.rs
-// ---------------------------------------------------------------------------
+fn clear_voice_wake_state(app: &AppHandle) {
+    if let Some(state) = app.try_state::<VoiceWakePopover>() {
+        if let Ok(mut g) = state.0.lock() {
+            *g = false;
+        }
+    }
+}
+
+fn set_popover_parked(app: &AppHandle, parked: bool) {
+    if let Some(state) = app.try_state::<PopoverParked>() {
+        state.0.store(parked, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub fn popover_is_parked(app: &AppHandle) -> bool {
+    app.try_state::<PopoverParked>()
+        .map(|state| state.0.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+fn is_pinhole_popover(window: &WebviewWindow) -> bool {
+    window
+        .outer_size()
+        .map(|size| size.width <= 4 || size.height <= 4)
+        .unwrap_or(false)
+}
+
+fn present_popover(app: &AppHandle, window: &WebviewWindow) {
+    set_popover_parked(app, false);
+    clear_voice_wake_state(app);
+    set_window_opacity(window, 1.0);
+    let _ = window.set_ignore_cursor_events(false);
+    set_capture_excluded(window);
+    configure_overlay_behavior(window);
+    let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
+        POPOVER_DEFAULT_WIDTH_LOGICAL,
+        POPOVER_DEFAULT_HEIGHT_LOGICAL,
+    )));
+    position_popover(app, window);
+    mark_popover_shown(app);
+    present_interactive_window(window);
+    let _ = app.emit("clips:popover-visible", true);
+}
+
+pub fn force_show_popover(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("popover") {
+        present_popover(app, &window);
+    }
+}
 
 pub fn toggle_popover(app: &AppHandle) {
     let Some(window) = app.get_webview_window("popover") else {
         return;
     };
-    // Voice-wake parks the popover at 2x2 px and leaves it "visible" from
-    // AppKit's perspective so its JS keeps running. If a tray click lands
-    // while the wake flag is still set, the user wants to OPEN the
-    // popover normally — not toggle it shut. Treat the parked state as
-    // "user-invisible" so we always show full size on click. Without
-    // this, the user has to click the tray icon twice to see the popover
-    // after any voice dictation: first click hides the parked window,
-    // second click finally shows it.
     let voice_woken = app
         .try_state::<VoiceWakePopover>()
         .and_then(|s| s.0.lock().ok().map(|g| *g))
         .unwrap_or(false);
-    let user_visible = window.is_visible().unwrap_or(false) && !voice_woken;
+    let user_visible =
+        window.is_visible().unwrap_or(false) && !voice_woken && !is_pinhole_popover(&window);
     if user_visible {
-        let _ = window.hide();
-        let _ = app.emit("clips:popover-visible", false);
+        hide_popover(app);
         return;
     }
-    if voice_woken {
-        // Voice wake is over from the user's POV — clear the flag so the
-        // hide_flow_bar safety net doesn't double-hide the popover later.
-        if let Some(state) = app.try_state::<VoiceWakePopover>() {
-            if let Ok(mut g) = state.0.lock() {
-                *g = false;
-            }
-        }
-    }
-    // Restore normal size in case the window was shrunk to a pinhole
-    // during recording / voice-wake — otherwise it would reappear as a
-    // 2x2 dot.
-    set_capture_included(&window);
-    // Re-apply Space behavior — `orderOut:` resets it on every `hide()`,
-    // so without this the popover sticks to whichever Space it was first
-    // shown on.
-    configure_overlay_behavior(&window);
-    let (w, h) = popover_window_size_logical(
-        POPOVER_DEFAULT_WIDTH_LOGICAL,
-        POPOVER_DEFAULT_HEIGHT_LOGICAL,
-    );
-    let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(w, h)));
-    position_popover(app, &window);
-    mark_popover_shown(app);
-    let _ = window.show();
-    let _ = window.set_focus();
-    let _ = app.emit("clips:popover-visible", true);
+    present_popover(app, &window);
 }
 
 pub fn position_popover(app: &AppHandle, window: &WebviewWindow) {
-    // If we have a recent tray icon rect, anchor the popover's top edge just
-    // below the icon and center it horizontally on the icon — same feel as
-    // Loom / Raycast / 1Password.
+    let win_size = window.outer_size().unwrap_or(PhysicalSize::new(360, 440));
+    position_popover_with_size(app, window, win_size);
+}
+
+pub fn position_popover_with_size(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    win_size: PhysicalSize<u32>,
+) {
     let anchor = app.state::<TrayAnchor>();
     let tray_rect = anchor.0.lock().ok().and_then(|g| *g);
 
-    let win_size: PhysicalSize<u32> = window.outer_size().unwrap_or(PhysicalSize::new(360, 440));
-    // IMPORTANT: `current_monitor()` returns None when the window is offscreen
-    // (we park it at 99999,99999 on boot to hide the initial flash). Fall back
-    // to the primary monitor so we can still position correctly on first show.
     let monitor = window
         .current_monitor()
         .ok()
@@ -1521,13 +3465,11 @@ pub fn position_popover(app: &AppHandle, window: &WebviewWindow) {
     let Some(monitor) = monitor else {
         return;
     };
-    let mon_size = monitor.size();
-    let mon_pos = monitor.position();
+    let work_area = monitor.work_area();
+    let mon_size = &work_area.size;
+    let mon_pos = &work_area.position;
 
     if let Some(rect) = tray_rect {
-        // `Rect { position, size }` on macOS is in physical pixels with the
-        // origin at the active monitor's top-left (matching macOS's coord
-        // system, y grows downward in Tauri v2).
         let icon_x = match rect.position {
             tauri::Position::Physical(p) => p.x,
             tauri::Position::Logical(p) => p.x as i32,
@@ -1545,45 +3487,18 @@ pub fn position_popover(app: &AppHandle, window: &WebviewWindow) {
             tauri::Size::Logical(s) => s.height as i32,
         };
 
-        // Center the popover horizontally on the icon.
         let mut x = icon_x + icon_w / 2 - (win_size.width as i32) / 2;
-        // Drop the visible panel below the icon with a tiny gap. The native
-        // window itself starts a shadow-gutter earlier so the top shadow has
-        // real transparent pixels to paint into without moving the panel down.
-        let gap = 6_i32;
-        let mut y = icon_y + icon_h + gap;
+        let mut y = icon_y + icon_h;
 
-        // Find the monitor that actually contains the tray icon. The popover
-        // is parked at (2,2) on the primary display, so current_monitor()
-        // always resolves to the primary monitor — wrong when the user clicked
-        // the icon on a secondary display
-        let icon_cx = icon_x + icon_w / 2;
-        let icon_cy = icon_y + icon_h / 2;
-        let tray_monitor = window.available_monitors().ok().and_then(|monitors| {
-            monitors.into_iter().find(|m| {
-                let mp = m.position();
-                let ms = m.size();
-                icon_cx >= mp.x
-                    && icon_cx < mp.x + ms.width as i32
-                    && icon_cy >= mp.y
-                    && icon_cy < mp.y + ms.height as i32
-            })
-        });
-        let popover_gutter = (POPOVER_SHADOW_GUTTER_LOGICAL
-            * tray_monitor
-                .as_ref()
-                .map(|m| m.scale_factor())
-                .unwrap_or_else(|| monitor.scale_factor())
-                .max(1.0))
-        .round() as i32;
-        y -= popover_gutter;
-
+        let tray_monitor =
+            monitor_containing_point(window, icon_x + icon_w / 2, icon_y + icon_h / 2);
         let (clamp_pos, clamp_size) = tray_monitor
-            .map(|m| (*m.position(), *m.size()))
+            .map(|m| {
+                let work_area = m.work_area();
+                (work_area.position, work_area.size)
+            })
             .unwrap_or((*mon_pos, *mon_size));
 
-        // Clamp so settings and long error states don't run off the edge of
-        // shorter displays or get stranded in a corner after a resize.
         let min_x = clamp_pos.x + 8;
         let max_x = clamp_pos.x + clamp_size.width as i32 - win_size.width as i32 - 8;
         let min_y = clamp_pos.y + 8;
@@ -1604,18 +3519,15 @@ pub fn position_popover(app: &AppHandle, window: &WebviewWindow) {
         return;
     }
 
-    // Fallback: top-right of the active monitor (used before the tray has
-    // fired its first event).
     let scale = monitor.scale_factor();
     let margin_right = (12.0 * scale) as i32;
     let margin_top = (36.0 * scale) as i32;
-    let popover_gutter = (POPOVER_SHADOW_GUTTER_LOGICAL * scale.max(1.0)).round() as i32;
     let min_x = mon_pos.x + 8;
     let max_x = mon_pos.x + mon_size.width as i32 - win_size.width as i32 - 8;
     let min_y = mon_pos.y + 8;
     let max_y = mon_pos.y + mon_size.height as i32 - win_size.height as i32 - 8;
     let x = (mon_pos.x + mon_size.width as i32 - win_size.width as i32 - margin_right)
         .clamp(min_x, max_x.max(min_x));
-    let y = (mon_pos.y + margin_top - popover_gutter).clamp(min_y, max_y.max(min_y));
+    let y = (mon_pos.y + margin_top).clamp(min_y, max_y.max(min_y));
     let _ = window.set_position(PhysicalPosition::new(x, y));
 }

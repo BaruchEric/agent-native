@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+
 import type { ActionTool } from "../../agent/types.js";
 import { parseArgs } from "../utils.js";
 
@@ -56,7 +57,6 @@ const BINARY_EXTS = new Set([
   ".gz",
   ".tar",
   ".db",
-  ".sqlite",
   ".pdf",
 ]);
 

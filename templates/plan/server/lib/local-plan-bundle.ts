@@ -1,11 +1,13 @@
 import type { PlanContent } from "../../shared/plan-content.js";
 import type { PlanBundle, PlanComment, PlanKind } from "../../shared/types.js";
-import { exportPlanContentToMdxFolder } from "../plan-mdx.js";
+import {
+  exportPlanContentToMdxFolder,
+  referencedBlockIdsForPlanComments,
+} from "../plan-mdx.js";
 import { buildPlanHtml, nowIso } from "../plans.js";
 import { getLocalPlanOwnerEmail } from "./local-identity.js";
 import type { LocalPlanReadResult } from "./local-plan-files.js";
 
-// Count blocks by type (descending into tabs/columns) for the bundle summary.
 function countLocalPlanBlocks(blocks: PlanContent["blocks"]) {
   const counts: Record<string, number> = {};
   const visitBlocks = (items: PlanContent["blocks"]) => {
@@ -22,8 +24,6 @@ function countLocalPlanBlocks(blocks: PlanContent["blocks"]) {
   return counts;
 }
 
-// Shared DB-free PlanBundle response for the local-folder actions; comments are
-// passed in from comments.json rather than hardcoded to [].
 export async function buildLocalPlanBundleResult(opts: {
   local: LocalPlanReadResult;
   kind: PlanKind;
@@ -91,6 +91,7 @@ export async function buildLocalPlanBundleResult(opts: {
       brief: bundle.plan.brief,
       planId: id,
       url: local.routePath,
+      referencedBlockIds: referencedBlockIdsForPlanComments(visibleComments),
     }),
   };
 }

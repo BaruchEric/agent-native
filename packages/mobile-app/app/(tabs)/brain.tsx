@@ -1,21 +1,5 @@
-import { SafeAreaView, StyleSheet } from "react-native";
-import AppWebView from "@/components/AppWebView";
-import { TEMPLATE_APPS } from "@agent-native/shared-app-config";
-import { getAppUrl } from "@/lib/get-app-url";
-
-const brain = TEMPLATE_APPS.find((a) => a.id === "brain")!;
+import WorkspaceAppTab from "@/components/WorkspaceAppTab";
 
 export default function BrainTab() {
-  return (
-    <SafeAreaView style={styles.container}>
-      <AppWebView url={getAppUrl(brain)} />
-    </SafeAreaView>
-  );
+  return <WorkspaceAppTab appId="brain" />;
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: "#111111",
-  },
-});

@@ -1,18 +1,36 @@
 import crypto from "node:crypto";
-import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
+
+import { fail, type ActionRunContext } from "@agent-native/core/action";
 import {
+  isResolvedEngineUsableForRequest,
+  resolveEngine,
+} from "@agent-native/core/agent/engine";
+import {
+  and,
+  desc,
+  eq,
+  inArray,
+  isNull,
+  or,
+} from "@agent-native/core/db/schema";
+import {
+  organizationIdFromResourceOwner,
   resourceGetByPath,
   resourceList,
   resourcePut,
   SHARED_OWNER,
 } from "@agent-native/core/resources/store";
+import { runWithRequestContext } from "@agent-native/core/server/request-context";
 import {
   getOrgSetting,
   getUserSetting,
   putOrgSetting,
   putUserSetting,
 } from "@agent-native/core/settings";
+import { ForbiddenError } from "@agent-native/core/sharing";
+
 import { getDb, schema } from "../../db/index.js";
+import { authorizeDispatchAdmin } from "./app-roles.js";
 import {
   createApprovalRequest,
   currentOrgId,
@@ -254,7 +272,7 @@ function normalizeDreamSettings(
   raw: Record<string, unknown> | null | undefined,
 ): Omit<DreamSettings, "scope" | "scopeId"> {
   const sourceIds = normalizeSourceIds(raw?.sourceIds);
-  const sourceId = String(raw?.sourceId ?? "").trim() || "all";
+  const sourceId = compactText(raw?.sourceId).trim() || "all";
   return {
     enabled: raw?.enabled === true,
     schedule:
@@ -435,7 +453,10 @@ function scopeFor<T extends { ownerEmail: any; orgId: any }>(
   if (!ctx.orgId) {
     return and(eq(table.ownerEmail, ctx.ownerEmail), isNull(table.orgId));
   }
-  return or(eq(table.ownerEmail, ctx.ownerEmail), eq(table.orgId, ctx.orgId));
+  return or(
+    and(eq(table.ownerEmail, ctx.ownerEmail), isNull(table.orgId)),
+    eq(table.orgId, ctx.orgId),
+  );
 }
 
 function safeJson(value: unknown): string {
@@ -449,7 +470,9 @@ function safeJson(value: unknown): string {
 function safeJsonParse<T>(value: unknown, fallback: T): T {
   if (value == null || value === "") return fallback;
   try {
-    return JSON.parse(String(value)) as T;
+    return JSON.parse(
+      typeof value === "string" ? value : JSON.stringify(value),
+    ) as T;
   } catch {
     return fallback;
   }
@@ -488,7 +511,7 @@ function objectText(value: unknown): string {
 }
 
 function isFailureStatus(status: unknown): boolean {
-  const value = String(status ?? "").toLowerCase();
+  const value = lowerString(status);
   return (
     value.includes("fail") ||
     value.includes("error") ||
@@ -499,7 +522,7 @@ function isFailureStatus(status: unknown): boolean {
 }
 
 function isSuccessStatus(status: unknown): boolean {
-  const value = String(status ?? "").toLowerCase();
+  const value = lowerString(status);
   return (
     value === "success" ||
     value === "succeeded" ||
@@ -525,16 +548,16 @@ function isNegativeFeedback(row: Record<string, unknown>): boolean {
 }
 
 function lowerString(value: unknown): string {
-  return String(value ?? "").toLowerCase();
+  return typeof value === "string"
+    ? value.toLowerCase()
+    : typeof value === "number"
+      ? String(value).toLowerCase()
+      : compactText(value).toLowerCase();
 }
 
 function sameOwnerEmail(a: unknown, b: unknown): boolean {
-  const left = String(a ?? "")
-    .trim()
-    .toLowerCase();
-  const right = String(b ?? "")
-    .trim()
-    .toLowerCase();
+  const left = compactText(a).trim().toLowerCase();
+  const right = compactText(b).trim().toLowerCase();
   return Boolean(left && right && left === right);
 }
 
@@ -1302,8 +1325,8 @@ async function scanDreamSource(
     const completedAt = now();
     const durationMs = completedAt - startedAt;
     const sourceInfo = result.source ?? {};
-    const sourceId = String(sourceInfo.id ?? source.id);
-    const label = String(sourceInfo.label ?? source.label ?? source.id);
+    const sourceId = compactText(sourceInfo.id ?? source.id);
+    const label = compactText(sourceInfo.label ?? source.label ?? source.id);
     return {
       ...result,
       sources: [
@@ -1537,7 +1560,7 @@ function looksLikeSingleAppUiWordingCorrection(
 }
 
 const NON_DURABLE_FAILURE_TERMS =
-  /\b(credits[- ]?limit|daily ai credits|current plan|missing[_ -]?credentials|no llm provider|provider key|connect builder\.io|email[_ -]?verification[_ -]?required|verify their email|gateway)\b/i;
+  /\b(credits[- ]?limit|daily ai credits|current plan|missing[_ -]?credentials|no llm provider|provider key|(?:connect|use) builder\.io|email[_ -]?verification[_ -]?required|verify their email|gateway)\b/i;
 
 function isDurableFailureEvidence(entry: DreamEvidence): boolean {
   if (entry.kind === "eval-failure") return false;
@@ -2383,6 +2406,36 @@ async function getProposalRow(
   return row ?? null;
 }
 
+export async function authorizeDreamProposalMutation(
+  args: { id: string },
+  ctx?: ActionRunContext,
+): Promise<void> {
+  const ownerEmail =
+    ctx?.userEmail !== undefined ? ctx.userEmail : currentOwnerEmail();
+  const orgId = ctx?.orgId !== undefined ? ctx.orgId : currentOrgId();
+  const proposal = await getProposalRow(args.id, {
+    ownerEmail,
+    orgId: orgId?.trim() || null,
+  });
+  if (!proposal) {
+    throw new ForbiddenError("Dream proposal not found");
+  }
+
+  if (proposal.targetType === "personal-memory") {
+    if (
+      proposal.ownerEmail.trim().toLowerCase() !==
+      ownerEmail.trim().toLowerCase()
+    ) {
+      throw new ForbiddenError(
+        "Personal memory proposals can only be changed by their owner",
+      );
+    }
+    return;
+  }
+
+  await authorizeDispatchAdmin(args, ctx);
+}
+
 export async function createDreamReport(input: {
   sourceId?: string;
   sourceIds?: string[];
@@ -3052,7 +3105,7 @@ export async function rejectDreamProposal(
 function cronLooksValid(schedule: string): boolean {
   const parts = schedule.trim().split(/\s+/);
   if (parts.length !== 5) return false;
-  return parts.every((part) => /^[\d*/,\-]+$/.test(part));
+  return parts.every((part) => /^[\d*/,-]+$/.test(part));
 }
 
 function dreamJobBody(settings: Omit<DreamSettings, "scope" | "scopeId">) {
@@ -3085,6 +3138,29 @@ Run a safe Dispatch dreaming pass.
 6. Only apply personal-memory proposals when the evidence is explicit user-grounded correction or a remember request.
 7. Leave all other proposals pending for a human to review.
 `;
+}
+
+/**
+ * A `__shared__` or `__organization__:*` owner is a scope, not a person, so its
+ * jobs can only use a credential connected for that scope. Without one the job
+ * would fail `missing_credentials` on every scheduler tick, so it is not
+ * scheduled at all.
+ */
+async function pseudoOwnerHasNoLlmCredential(
+  owner: string,
+  orgId: string | null,
+): Promise<boolean> {
+  const identityOrgId = organizationIdFromResourceOwner(owner) ?? orgId;
+  const credentialIdentity = {
+    userEmail: owner,
+    orgId: identityOrgId ?? undefined,
+  };
+  return runWithRequestContext(credentialIdentity, async () => {
+    const engine = await resolveEngine({ credentialIdentity });
+    return !(await isResolvedEngineUsableForRequest(engine, {
+      credentialIdentity,
+    }));
+  });
 }
 
 export async function ensureDreamJob(input: {
@@ -3124,6 +3200,20 @@ export async function ensureDreamJob(input: {
   }
   const owner = currentOwnerEmail();
   const orgId = currentOrgId();
+  if (
+    (owner === SHARED_OWNER || organizationIdFromResourceOwner(owner)) &&
+    (await pseudoOwnerHasNoLlmCredential(owner, orgId))
+  ) {
+    const message = `The Dispatch dream job was not scheduled: it would run as ${owner}, which has no LLM provider connected. An admin of that organization or workspace must connect one in Settings > Agent > AI providers first.`;
+    await recordAudit({
+      action: "dream.job.skipped",
+      targetType: "job",
+      targetId: DREAM_JOB_PATH,
+      summary: message,
+      metadata: { reason: "missing_credentials", owner },
+    });
+    fail(message, { errorCode: "missing_credentials", statusCode: 409 });
+  }
   const jobSettings = { ...settings, schedule, enabled: true };
   const content = [
     "---",

@@ -1,41 +1,57 @@
+import { trackEvent } from "@agent-native/core/client/analytics";
+import { actionErrorMessage } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { AI_FILTER_LABEL, type AiFilterTarget } from "@shared/ai-filter";
+import {
+  AI_IMPORTANT_LABEL,
+  AI_PRIORITY_MAX_EMAILS,
+  aiPriorityEmailKey,
+  type AiPriorityEmail,
+  type MailSortMode,
+} from "@shared/ai-priority";
+import { type GmailReadState } from "@shared/gmail-freshness";
+import { mailLabelsInclude } from "@shared/gmail-labels";
+import { mailSettingsRoute } from "@shared/settings-navigation";
+import type { EmailMessage, Label } from "@shared/types";
 import {
   IconAlertCircle,
   IconArchive,
+  IconCheck,
+  IconChevronDown,
   IconDots,
+  IconFilter,
   IconFolder,
+  IconInbox,
   IconMail,
   IconMailOpened,
   IconTrash,
   IconX,
+  IconSettings,
 } from "@tabler/icons-react";
+import {
+  useQueryClient,
+  type InfiniteData,
+  type QueryClient,
+} from "@tanstack/react-query";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router";
-import { cn } from "@/lib/utils";
-import { EmailListItem } from "./EmailListItem";
-import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
-import {
-  useEmails,
-  useMarkRead,
-  useMarkThreadRead,
-  useToggleStar,
-  useArchiveEmail,
-  useUnarchiveEmail,
-  useTrashEmail,
-  useUntrashEmail,
-  useLabels,
-  useMoveEmail,
-  unsuppressThread,
-} from "@/hooks/use-emails";
-import {
-  useDeleteScheduledJob,
-  useSendScheduledJobNow,
-} from "@/hooks/use-scheduled-jobs";
-import { useQueryClient, type InfiniteData } from "@tanstack/react-query";
-import { ensureThread, warmThreads } from "@/lib/thread-cache";
+import { toast } from "sonner";
+
+import { AiFilterDialog } from "@/components/email/AiFilterDialog";
 import { GoogleConnectBanner } from "@/components/GoogleConnectBanner";
-import { Spinner } from "@/components/ui/spinner";
-import { isMcpEmbedSurface } from "@/lib/mcp-embed";
-import type { EmailMessage } from "@shared/types";
+import { useSetHeaderActions } from "@/components/layout/HeaderActions";
+import { JevConnectionPrompt } from "@/components/settings/JevConnectionPrompt";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -47,12 +63,60 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { useSetHeaderActions } from "@/components/layout/HeaderActions";
+import { Spinner } from "@/components/ui/spinner";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useAccountFilter } from "@/hooks/use-account-filter";
+import { useAiPriority } from "@/hooks/use-ai-priority";
+import {
+  askAgentToDraftImportanceRules,
+  useAiPriorityFeedback,
+} from "@/hooks/use-ai-priority-feedback";
+import { useAutomations } from "@/hooks/use-automations";
+import {
+  useEmails,
+  useMarkRead,
+  useMarkThreadRead,
+  useToggleStar,
+  useArchiveEmail,
+  useUnarchiveEmail,
+  useTrashEmail,
+  useUntrashEmail,
+  useBulkArchiveEmails,
+  useBulkTrashEmails,
+  useBulkToggleStar,
+  useBulkMarkRead,
+  useLabels,
+  EMPTY_LABELS,
+  useMoveEmail,
+  MoveEmailPartialFailure,
+  releaseOwnedInboxRemoval,
+  releaseSuppressionClaims,
+  type AccountError,
+} from "@/hooks/use-emails";
+import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
+import {
+  useConfirmUncertainScheduledEmail,
+  useDeleteScheduledJob,
+  useRetryUncertainScheduledEmail,
+  useSendScheduledJobNow,
+} from "@/hooks/use-scheduled-jobs";
+import { setUndoAction, setUndoToastId, UNDO_DURATION } from "@/hooks/use-undo";
+import { isMcpEmbedSurface } from "@/lib/mcp-embed";
+import { ensureThread, warmThreads } from "@/lib/thread-cache";
+import { groupIntoThreads, type ThreadSummary } from "@/lib/threads";
+import { cn } from "@/lib/utils";
+
+import { EmailListItem } from "./EmailListItem";
+import { GmailCooldownNotice } from "./GmailCooldownNotice";
+import {
+  observeNextPage,
+  retryNextPage as runPaginationRetry,
+  shouldShowPaginationRetry,
+} from "./infinite-pagination";
 
 type EmailsPage = { emails: EmailMessage[]; nextPageToken?: string };
 type InfiniteEmails = InfiniteData<EmailsPage, string | undefined>;
@@ -60,33 +124,111 @@ type SnoozeTarget = {
   emailId: string;
   accountEmail?: string;
 };
-import { setUndoAction } from "@/hooks/use-undo";
-import { toast } from "sonner";
-import { groupIntoThreads, type ThreadSummary } from "@/lib/threads";
+
+function toPriorityEmail(email: EmailMessage): AiPriorityEmail {
+  return {
+    id: email.id,
+    threadId: email.threadId,
+    accountEmail: email.accountEmail,
+    from: email.from.email,
+    to: email.to.map((recipient) => recipient.email).join(", "),
+    subject: email.subject,
+    snippet: email.snippet,
+    labelIds: email.labelIds,
+    date: email.date,
+    isArchived: email.isArchived,
+    isTrashed: email.isTrashed,
+  };
+}
+
+function priorityEmailCacheKey(
+  email: EmailMessage,
+  ruleRevision: string,
+): string {
+  const priorityEmail = toPriorityEmail(email);
+  return JSON.stringify([
+    ruleRevision,
+    priorityEmail.accountEmail,
+    priorityEmail.id,
+    priorityEmail.date,
+    priorityEmail.from,
+    priorityEmail.to,
+    priorityEmail.subject,
+    priorityEmail.snippet,
+  ]);
+}
+
+type CachedPriorityScore = { inputKey: string; score: number };
+type FrozenPriorityOrder = {
+  ruleRevision: string;
+  keys: string[];
+  priorityKeys: string[];
+  scores: Record<string, number>;
+};
+
+const priorityScoreCaches = new WeakMap<
+  QueryClient,
+  Map<string, CachedPriorityScore>
+>();
+
+function priorityScoreCache(queryClient: QueryClient) {
+  let cache = priorityScoreCaches.get(queryClient);
+  if (!cache) {
+    cache = new Map();
+    priorityScoreCaches.set(queryClient, cache);
+  }
+  return cache;
+}
+
+export function rememberPriorityScore(
+  cache: Map<string, CachedPriorityScore>,
+  key: string,
+  score: CachedPriorityScore,
+) {
+  cache.delete(key);
+  cache.set(key, score);
+  while (cache.size > AI_PRIORITY_MAX_EMAILS) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey === undefined) break;
+    cache.delete(oldestKey);
+  }
+}
 
 interface EmailListProps {
   emails?: EmailMessage[];
   isLoading?: boolean;
   isFetching?: boolean;
   emailsError?: Error | null;
+  accountErrors?: AccountError[];
+  /** Set when the rows are not live from Gmail (cooldown); shown as a notice. */
+  read?: GmailReadState;
+  labels?: Label[];
   refetchEmails?: () => unknown;
   hasNextPage?: boolean;
   fetchNextPage?: () => Promise<unknown>;
   isFetchingNextPage?: boolean;
+  isFetchNextPageError?: boolean;
   focusedId: string | null;
   setFocusedId: (id: string | null) => void;
   selectedIds: Set<string>;
   setSelectedIds: React.Dispatch<React.SetStateAction<Set<string>>>;
-  onCompose?: (email: EmailMessage, mode: "reply" | "forward") => void;
+  onCompose?: (
+    email: EmailMessage,
+    mode: "reply" | "replyAll" | "forward",
+  ) => void;
   onArchived?: (id: string) => void;
   onDraftOpen?: (email: EmailMessage) => void;
   onNavigateThread?: (threadId: string) => void;
+  showPrioritySort?: boolean;
+  jevConfigured?: boolean;
+  jevAvailabilityLoading?: boolean;
+  jevAvailabilityError?: boolean;
+  onJevConnected?: () => void;
+  onJevRetry?: () => void;
+  sortMode?: MailSortMode;
+  onSortModeChange?: (mode: MailSortMode) => void;
 }
 
-// ─── Inbox Zero ─────────────────────────────────────────────────────────────
-
-// Curated collection of stunning landscape/nature photos from Unsplash.
-// Using direct Unsplash photo IDs for reliable, high-quality images.
 const INBOX_ZERO_PHOTOS = [
   "photo-1506744038136-46273834b3fb", // Yosemite valley
   "photo-1470071459604-3b5ec3a7fe05", // Misty green mountains
@@ -119,44 +261,43 @@ const INBOX_ZERO_PHOTOS = [
   "photo-1552083375-1447ce886485", // Japanese garden
 ];
 
-function emptyStateHintForView(view: string): string {
+function emptyStateHintKeyForView(view: string): string {
   switch (view) {
     case "snoozed":
-      return "No snoozed emails right now.";
+      return "mail.empty.snoozed";
     case "drafts":
-      return "Drafts you save will appear here.";
+      return "mail.empty.drafts";
     case "starred":
-      return "Star an email to keep it close at hand.";
+      return "mail.empty.starred";
     case "sent":
-      return "Emails you send will appear here.";
+      return "mail.empty.sent";
     case "scheduled":
-      return "Scheduled sends will appear here.";
+      return "mail.empty.scheduled";
     case "archive":
-      return "Archived emails will appear here.";
+      return "mail.empty.archive";
     case "trash":
-      return "Trashed emails appear here for 30 days.";
+      return "mail.empty.trash";
     case "spam":
-      return "Spam Gmail flags will appear here.";
+      return "mail.empty.spam";
     case "all":
-      return "All your mail will appear here.";
+      return "mail.empty.all";
     case "unread":
-      return "You're caught up — no unread mail.";
+      return "mail.empty.unread";
     default:
-      return "Emails matching this view will appear here.";
+      return "mail.empty.default";
   }
 }
 
 export function InboxZero() {
+  const t = useT();
   const [loaded, setLoaded] = useState(false);
   const isEmbedded = isMcpEmbedSurface();
 
-  // Toggle class on root so the header can go transparent
   useEffect(() => {
     document.documentElement.classList.add("inbox-zero");
     return () => document.documentElement.classList.remove("inbox-zero");
   }, []);
 
-  // Pick a photo based on the day of the year
   const today = new Date();
   const dayOfYear = Math.floor(
     (today.getTime() - new Date(today.getFullYear(), 0, 0).getTime()) /
@@ -190,15 +331,15 @@ export function InboxZero() {
       <div className="fixed inset-x-0 bottom-0 h-44 bg-gradient-to-t from-black/70 to-transparent" />
 
       {/* Fallback bg while image loads */}
-      <div className="absolute inset-0 bg-muted dark:bg-[hsl(220,6%,8%)] -z-10" />
+      <div className="absolute inset-0 bg-muted dark:bg-[var(--mail-sidebar-surface)] -z-10" />
 
       {/* Bottom text */}
       <div className="relative mt-auto px-6 pb-6">
         <p className="text-[15px] font-medium text-white/90 drop-shadow-lg">
-          You&rsquo;ve hit Inbox Zero
+          {t("mail.empty.inboxZeroTitle")}
         </p>
         <p className="text-[13px] text-white/60 drop-shadow-lg mt-0.5">
-          You&rsquo;re all caught up
+          {t("mail.empty.inboxZeroSubtitle")}
         </p>
       </div>
     </div>
@@ -213,35 +354,54 @@ function MailLoadingState({
   return (
     <div className="flex h-full flex-col" ref={containerRef}>
       <div className="flex-1 overflow-y-auto">
-        {Array.from({ length: 12 }).map((_, i) => (
-          <div
-            key={i}
-            className="flex h-[48px] items-center gap-3 px-4 sm:h-[38px]"
-          >
-            <div className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-muted" />
-            <div className="h-3 w-28 animate-pulse rounded bg-muted" />
-            <div className="h-3 flex-1 animate-pulse rounded bg-muted" />
-            <div className="h-3 w-12 animate-pulse rounded bg-muted" />
-          </div>
-        ))}
+        <MailLoadingRows count={12} />
       </div>
     </div>
   );
 }
 
-// ─── Error state ────────────────────────────────────────────────────────────
-// Rendered when the emails query fails. The "Try again" button must give
-// visible feedback during the refetch — without it, clicking on a persistent
-// rate-limit error looks like nothing happens (the same error re-renders
-// identically so the user assumes the button is broken). For 429/quota errors
-// we auto-schedule one retry after a short delay so recovery is hands-off,
-// and gate the manual button behind a 15s cooldown so a flurry of clicks
-// can't itself trip the rate limit.
+function MailLoadingRows({ count }: { count: number }) {
+  return (
+    <div aria-hidden="true">
+      {Array.from({ length: count }, (_, index) => (
+        <div
+          key={index}
+          className="email-list-row flex h-[48px] items-center px-3 sm:h-[38px]"
+        >
+          <div className="me-2 flex h-full w-5 shrink-0 items-center justify-center">
+            <div className="h-[7px] w-[7px] animate-pulse rounded-full bg-muted" />
+          </div>
+          <div className="me-3 flex w-[100px] shrink-0 items-center sm:w-[160px]">
+            <div className="h-3 w-3/4 animate-pulse rounded bg-muted" />
+          </div>
+          {index % 2 === 1 && (
+            <div className="me-2 h-4 w-14 shrink-0 animate-pulse rounded bg-muted" />
+          )}
+          <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+            <div className="h-3 w-36 shrink-0 animate-pulse rounded bg-muted" />
+            <div className="h-3 min-w-0 flex-1 animate-pulse rounded bg-muted" />
+          </div>
+          <div className="ms-2 h-3 w-12 shrink-0 animate-pulse rounded bg-muted" />
+        </div>
+      ))}
+    </div>
+  );
+}
 
 const RATE_LIMIT_RETRY_MS = 60_000;
 
-function getRateLimitRetryMs(message: string): number {
-  const match = message.match(/retry in\s+(\d+)s/i);
+function getRateLimitRetryMs(error: {
+  message?: string;
+  retryAfterMs?: number;
+}): number {
+  if (
+    typeof error.retryAfterMs === "number" &&
+    Number.isFinite(error.retryAfterMs) &&
+    error.retryAfterMs > 0
+  ) {
+    return Math.min(Math.max(error.retryAfterMs, 15_000), 5 * 60_000);
+  }
+  const match = (error.message ?? "").match(/retry in\s+(\d+)s/i);
   if (!match) return RATE_LIMIT_RETRY_MS;
   const seconds = Number(match[1]);
   if (!Number.isFinite(seconds) || seconds <= 0) return RATE_LIMIT_RETRY_MS;
@@ -251,29 +411,28 @@ function getRateLimitRetryMs(message: string): number {
 function EmailErrorState({
   isQuotaError,
   message,
+  retryAfterMs,
   isFetching,
   onRetry,
   containerRef,
 }: {
   isQuotaError: boolean;
   message: string;
+  retryAfterMs?: number;
   isFetching: boolean;
   onRetry: () => unknown;
   containerRef: React.RefObject<HTMLDivElement | null>;
 }) {
-  const rateLimitRetryMs = isQuotaError ? getRateLimitRetryMs(message) : 0;
+  const t = useT();
+  const rateLimitRetryMs = isQuotaError
+    ? getRateLimitRetryMs({ message, retryAfterMs })
+    : 0;
   const [cooldownRemaining, setCooldownRemaining] = useState(rateLimitRetryMs);
-  const autoRetryFired = useRef(false);
 
   useEffect(() => {
     setCooldownRemaining(rateLimitRetryMs);
-    autoRetryFired.current = false;
   }, [rateLimitRetryMs]);
 
-  // Tick the cooldown countdown every second. Depend on the boolean so the
-  // effect only re-runs when the cooldown starts or stops — not on every tick.
-  // The functional setter pattern reads `prev` from the latest state, so we
-  // don't need `cooldownRemaining` in the deps array.
   const isCoolingDown = cooldownRemaining > 0;
   useEffect(() => {
     if (!isCoolingDown) return;
@@ -283,20 +442,9 @@ function EmailErrorState({
     return () => clearInterval(handle);
   }, [isCoolingDown]);
 
-  // Auto-retry once when a rate-limit cooldown elapses so the user doesn't
-  // have to babysit the screen waiting for Google to recover.
-  useEffect(() => {
-    if (!isQuotaError) return;
-    if (autoRetryFired.current) return;
-    if (cooldownRemaining > 0) return;
-    autoRetryFired.current = true;
-    void onRetry();
-  }, [cooldownRemaining, isQuotaError, onRetry]);
-
   const handleClick = useCallback(() => {
     if (cooldownRemaining > 0 || isFetching) return;
     setCooldownRemaining(rateLimitRetryMs);
-    autoRetryFired.current = true;
     void onRetry();
   }, [cooldownRemaining, isFetching, onRetry, rateLimitRetryMs]);
 
@@ -305,11 +453,11 @@ function EmailErrorState({
 
   let buttonLabel: string;
   if (isFetching) {
-    buttonLabel = "Retrying…";
+    buttonLabel = t("mail.error.retrying");
   } else if (cooldownRemaining > 0) {
-    buttonLabel = `Try again in ${cooldownSeconds}s`;
+    buttonLabel = t("mail.error.tryAgainIn", { seconds: cooldownSeconds });
   } else {
-    buttonLabel = "Try again";
+    buttonLabel = t("mail.error.tryAgain");
   }
 
   return (
@@ -321,12 +469,12 @@ function EmailErrorState({
           </div>
           <div className="space-y-1">
             <p className="text-sm font-medium text-foreground">
-              {isQuotaError ? "Gmail rate limit hit" : "Unable to load emails"}
+              {isQuotaError
+                ? t("mail.error.rateLimitTitle")
+                : t("mail.error.loadTitle")}
             </p>
             <p className="text-xs text-muted-foreground">
-              {isQuotaError
-                ? "Too many recent requests to Google. Waiting a moment before retrying."
-                : message}
+              {isQuotaError ? t("mail.error.rateLimitDescription") : message}
             </p>
           </div>
           <button
@@ -343,17 +491,33 @@ function EmailErrorState({
   );
 }
 
-// ─── Email List ─────────────────────────────────────────────────────────────
+function AccountErrorsNotice({ errors }: { errors: AccountError[] }) {
+  const t = useT();
+  return (
+    <div className="flex shrink-0 items-center gap-2 border-b border-border/30 bg-muted/40 px-4 py-1.5 text-xs text-muted-foreground">
+      <IconAlertCircle className="h-3.5 w-3.5 shrink-0" />
+      <span className="min-w-0 flex-1 truncate">
+        {t("mail.error.someAccountsFailed", {
+          accounts: errors.map((e) => e.email).join(", "),
+        })}
+      </span>
+    </div>
+  );
+}
 
 export function EmailList({
   emails: emailsProp,
   isLoading: isLoadingProp,
   isFetching: isFetchingProp,
   emailsError: emailsErrorProp,
+  accountErrors: accountErrorsProp,
+  read: readProp,
+  labels: labelsProp,
   refetchEmails,
   hasNextPage: hasNextPageProp,
   fetchNextPage: fetchNextPageProp,
   isFetchingNextPage: isFetchingNextPageProp,
+  isFetchNextPageError: isFetchNextPageErrorProp,
   focusedId,
   setFocusedId,
   selectedIds,
@@ -362,18 +526,40 @@ export function EmailList({
   onArchived,
   onDraftOpen,
   onNavigateThread,
+  showPrioritySort = false,
+  jevConfigured = false,
+  jevAvailabilityLoading = false,
+  jevAvailabilityError = false,
+  onJevConnected,
+  onJevRetry,
+  sortMode = "newest",
+  onSortModeChange,
 }: EmailListProps) {
+  const t = useT();
+  const { isPending: isPriorityPending, mutateAsync: requestPriority } =
+    useAiPriority();
+  const priorityFeedback = useAiPriorityFeedback();
   const navigate = useNavigate();
   const { view = "inbox", threadId } = useParams<{
     view: string;
     threadId: string;
   }>();
+  const { data: automationRules = [], isFetching: areAutomationRulesFetching } =
+    useAutomations({ enabled: view === "inbox" });
   const [searchParams] = useSearchParams();
   const searchQuery = searchParams.get("q") ?? undefined;
   const labelParam = searchParams.get("label");
+  const currentSortMode: MailSortMode =
+    showPrioritySort && view === "inbox" && !searchQuery && !labelParam
+      ? sortMode
+      : "newest";
   const routeSearchSuffix = searchParams.toString()
     ? `?${searchParams.toString()}`
     : "";
+  const [aiFilterDialog, setAiFilterDialog] = useState<{
+    action: "filter" | "keep";
+    targets: AiFilterTarget[];
+  } | null>(null);
 
   const {
     data: fetchedEmails = [],
@@ -384,6 +570,9 @@ export function EmailList({
     hasNextPage: fetchedEmailsHasNextPage,
     fetchNextPage: fetchFetchedNextPage,
     isFetchingNextPage: fetchedEmailsFetchingNextPage,
+    isFetchNextPageError: fetchedEmailsFetchNextPageError,
+    accountErrors: fetchedAccountErrors,
+    read: fetchedRead,
   } = useEmails(view, searchQuery, labelParam ?? undefined, {
     enabled: emailsProp === undefined,
   });
@@ -392,11 +581,20 @@ export function EmailList({
   const isLoading = isLoadingProp ?? fetchedEmailsLoading;
   const isFetching = isFetchingProp ?? fetchedEmailsFetching;
   const emailsError = emailsErrorProp ?? fetchedEmailsError;
+  const accountErrors = accountErrorsProp ?? fetchedAccountErrors;
+  const read = readProp ?? fetchedRead;
   const refetch = refetchEmails ?? refetchFetchedEmails;
   const hasNextPage = hasNextPageProp ?? fetchedEmailsHasNextPage;
   const fetchNextPage = fetchNextPageProp ?? fetchFetchedNextPage;
   const isFetchingNextPage =
     isFetchingNextPageProp ?? fetchedEmailsFetchingNextPage;
+  const isFetchNextPageError =
+    isFetchNextPageErrorProp ?? fetchedEmailsFetchNextPageError;
+  const paginationRetryInFlightRef = useRef(false);
+  const retryNextPage = useCallback(
+    () => runPaginationRetry(fetchNextPage, paginationRetryInFlightRef),
+    [fetchNextPage],
+  );
   const markRead = useMarkRead();
   const markThreadRead = useMarkThreadRead();
   const toggleStar = useToggleStar();
@@ -404,10 +602,27 @@ export function EmailList({
   const unarchiveEmail = useUnarchiveEmail();
   const trashEmail = useTrashEmail();
   const untrashEmail = useUntrashEmail();
-  const { data: labels = [] } = useLabels();
+  const bulkArchiveEmails = useBulkArchiveEmails();
+  const bulkTrashEmails = useBulkTrashEmails();
+  const bulkToggleStar = useBulkToggleStar();
+  const bulkMarkRead = useBulkMarkRead();
+  const { activeAccounts } = useAccountFilter();
+  const { data: labelsData } = useLabels(
+    activeAccounts.size > 0 ? [...activeAccounts] : undefined,
+  );
+  const labels = labelsProp ?? labelsData ?? EMPTY_LABELS;
+  const labelNames = useMemo(
+    () => new Map(labels.map((label) => [label.id, label.name])),
+    [labels],
+  );
   const moveEmail = useMoveEmail();
   const cancelScheduledJob = useDeleteScheduledJob();
   const sendScheduledJobNow = useSendScheduledJobNow();
+  const confirmUncertainScheduled = useConfirmUncertainScheduledEmail();
+  const retryUncertainScheduled = useRetryUncertainScheduledEmail();
+  const [retryUncertainJobId, setRetryUncertainJobId] = useState<string | null>(
+    null,
+  );
   const queryClient = useQueryClient();
   const movableLabels = useMemo(
     () =>
@@ -418,17 +633,479 @@ export function EmailList({
   );
 
   const containerRef = useRef<HTMLDivElement>(null);
+  const scrollParentRef = useRef<HTMLDivElement>(null);
 
-  // Group emails into threads
-  const threads = useMemo(() => groupIntoThreads(emails), [emails]);
+  const chronologicalThreads = useMemo(
+    () => groupIntoThreads(emails),
+    [emails],
+  );
+  const priorityEmails = useMemo(
+    () =>
+      chronologicalThreads
+        .map((thread) => thread.latestMessage)
+        .filter(
+          (email) =>
+            !email.isArchived &&
+            !email.isTrashed &&
+            mailLabelsInclude(email.labelIds, "inbox"),
+        ),
+    [chronologicalThreads],
+  );
+  const priorityWindowEmails = useMemo(
+    () => priorityEmails.slice(0, AI_PRIORITY_MAX_EMAILS),
+    [priorityEmails],
+  );
+  const priorityWindowIds = useMemo(
+    () =>
+      new Set(
+        priorityWindowEmails.map((email) =>
+          aiPriorityEmailKey(email.accountEmail, email.id),
+        ),
+      ),
+    [priorityWindowEmails],
+  );
+  const priorityRuleRevision = useMemo(
+    () =>
+      automationRules
+        .filter(
+          (rule) =>
+            rule.kind === "ai-filter" &&
+            rule.domain === "mail" &&
+            rule.enabled &&
+            rule.actions.some(
+              (action) =>
+                action.type === "label" &&
+                action.labelName === AI_IMPORTANT_LABEL,
+            ) &&
+            !rule.actions.some((action) => action.type === "archive"),
+        )
+        .sort((a, b) => a.id.localeCompare(b.id))
+        .map(
+          (rule) =>
+            `${rule.id}:${rule.updatedAt}:${rule.condition}:${JSON.stringify(rule.actions)}`,
+        )
+        .join("\u001f"),
+    [automationRules],
+  );
+  const chronologicalIndexes = useMemo(
+    () =>
+      new Map(
+        chronologicalThreads.map((thread, index) => [
+          aiPriorityEmailKey(
+            thread.latestMessage.accountEmail,
+            thread.latestMessage.id,
+          ),
+          index,
+        ]),
+      ),
+    [chronologicalThreads],
+  );
+  const priorityInputKey = useMemo(
+    () =>
+      [priorityRuleRevision]
+        .concat(
+          priorityWindowEmails.map(
+            (email) =>
+              `${email.accountEmail}:${email.id}:${email.date}:${email.from.email}:${JSON.stringify(email.to)}:${email.subject}:${email.snippet}`,
+          ),
+        )
+        .join("\u001f"),
+    [priorityRuleRevision, priorityWindowEmails],
+  );
+  const [priorityScores, setPriorityScores] = useState(
+    () => new Map(priorityScoreCache(queryClient)),
+  );
+  const [priorityOrder, setPriorityOrder] =
+    useState<FrozenPriorityOrder | null>(null);
+  const recordPriorityFeedback = useCallback(
+    (email: EmailMessage, decision: "important" | "not-important") => {
+      const key = aiPriorityEmailKey(email.accountEmail, email.id);
+      const score = decision === "important" ? 1 : 0;
+      const cache = priorityScoreCache(queryClient);
+      const previousScore = cache.get(key) ?? priorityScores.get(key);
+      const optimisticScore = {
+        inputKey: priorityEmailCacheKey(email, priorityRuleRevision),
+        score,
+      };
+      setPriorityOrder(null);
+      rememberPriorityScore(cache, key, optimisticScore);
+      setPriorityScores((current) => {
+        const next = new Map(current);
+        next.set(key, optimisticScore);
+        return next;
+      });
+      void priorityFeedback
+        .mutateAsync({
+          emailId: email.id,
+          accountEmail: email.accountEmail,
+          decision,
+          sender: email.from.name || email.from.email,
+          subject: email.subject,
+        })
+        .then(({ totalVotes, recentVotes }) => {
+          if (totalVotes % 5 !== 0) return;
+          let showSuggestion = true;
+          try {
+            const key = "mail-priority-feedback-suggestion-count";
+            const shownCount = Number(localStorage.getItem(key) ?? 0);
+            showSuggestion = shownCount < totalVotes;
+            if (showSuggestion) localStorage.setItem(key, String(totalVotes));
+            // coercion-ok: feedback was saved server-side; this only tracks a local reminder.
+          } catch {
+            // Feedback is saved server-side even when browser storage is unavailable.
+          }
+          if (!showSuggestion) return;
+          toast.info(t("mail.sort.priorityFeedbackSuggestion"), {
+            duration: 8_000,
+            action: {
+              label: t("mail.sort.priorityFeedbackAskAgent"),
+              onClick: () =>
+                askAgentToDraftImportanceRules(
+                  t("mail.sort.priorityFeedbackSuggestion"),
+                  recentVotes,
+                ),
+            },
+          });
+        })
+        .catch(() => {
+          setPriorityOrder(null);
+          setPriorityScores((current) => {
+            if (current.get(key) !== optimisticScore) return current;
+            const next = new Map(current);
+            if (previousScore) next.set(key, previousScore);
+            else next.delete(key);
+            return next;
+          });
+          if (cache.get(key) === optimisticScore) {
+            if (previousScore) rememberPriorityScore(cache, key, previousScore);
+            else cache.delete(key);
+          }
+          toast.error(t("mail.aiFilter.actionFailed"));
+        });
+    },
+    [
+      navigate,
+      priorityFeedback,
+      priorityRuleRevision,
+      priorityScores,
+      queryClient,
+      t,
+    ],
+  );
+  const cachedPriorityScores = useMemo(() => {
+    const cached = new Map<string, number>();
+    for (const email of priorityWindowEmails) {
+      const key = aiPriorityEmailKey(email.accountEmail, email.id);
+      const score = priorityScores.get(key);
+      if (
+        score?.inputKey === priorityEmailCacheKey(email, priorityRuleRevision)
+      ) {
+        cached.set(key, score.score);
+      }
+    }
+    return cached;
+  }, [priorityRuleRevision, priorityScores, priorityWindowEmails]);
+  const priorityRequestKeyRef = useRef("");
+  const priorityRequestGenerationRef = useRef(0);
+  const previousSortModeRef = useRef(currentSortMode);
+  const runPriority = useCallback(async () => {
+    const uncachedPriorityEmails = priorityWindowEmails.filter(
+      (email) =>
+        !cachedPriorityScores.has(
+          aiPriorityEmailKey(email.accountEmail, email.id),
+        ),
+    );
+    if (
+      areAutomationRulesFetching ||
+      isPriorityPending ||
+      priorityWindowEmails.length === 0 ||
+      priorityRequestKeyRef.current === priorityInputKey
+    ) {
+      return;
+    }
+    if (uncachedPriorityEmails.length === 0) {
+      priorityRequestKeyRef.current = priorityInputKey;
+      return;
+    }
+    const requestKey = priorityInputKey;
+    const requestGeneration = ++priorityRequestGenerationRef.current;
+    priorityRequestKeyRef.current = requestKey;
+    const pendingEmailsByKey = new Map(
+      uncachedPriorityEmails.map((email) => [
+        aiPriorityEmailKey(email.accountEmail, email.id),
+        email,
+      ]),
+    );
+    const uniquePendingEmailById = new Map<string, EmailMessage | null>();
+    for (const email of uncachedPriorityEmails) {
+      uniquePendingEmailById.set(
+        email.id,
+        uniquePendingEmailById.has(email.id) ? null : email,
+      );
+    }
+    const pendingInputKeys = new Map(
+      uncachedPriorityEmails.map((email) => [
+        aiPriorityEmailKey(email.accountEmail, email.id),
+        priorityEmailCacheKey(email, priorityRuleRevision),
+      ]),
+    );
+    try {
+      const result = await requestPriority({
+        emails: uncachedPriorityEmails.map(toPriorityEmail),
+      });
+      if (priorityRequestGenerationRef.current !== requestGeneration) return;
+      const cache = priorityScoreCache(queryClient);
+      const next = new Map(cache);
+      const scoredKeys = new Set<string>();
+      for (const score of result.scores) {
+        const email =
+          score.accountEmail === undefined
+            ? uniquePendingEmailById.get(score.emailId)
+            : pendingEmailsByKey.get(
+                aiPriorityEmailKey(score.accountEmail, score.emailId),
+              );
+        if (!email) {
+          if (
+            score.accountEmail === undefined &&
+            uniquePendingEmailById.has(score.emailId)
+          ) {
+            throw new Error(t("mail.sort.priorityFailed"));
+          }
+          continue;
+        }
+        const key = aiPriorityEmailKey(email.accountEmail, email.id);
+        scoredKeys.add(key);
+        const inputKey = pendingInputKeys.get(key);
+        if (inputKey) {
+          const cachedScore = { inputKey, score: score.score };
+          rememberPriorityScore(cache, key, cachedScore);
+          rememberPriorityScore(next, key, cachedScore);
+        }
+      }
+      if (scoredKeys.size !== uncachedPriorityEmails.length) {
+        throw new Error(t("mail.sort.priorityFailed"));
+      }
+      setPriorityScores(next);
+    } catch (error) {
+      if (priorityRequestGenerationRef.current !== requestGeneration) return;
+      priorityRequestKeyRef.current = "";
+      onSortModeChange?.("newest");
+      toast.error(
+        error instanceof Error ? error.message : t("mail.sort.priorityFailed"),
+      );
+    }
+  }, [
+    onSortModeChange,
+    areAutomationRulesFetching,
+    isPriorityPending,
+    priorityInputKey,
+    priorityRuleRevision,
+    cachedPriorityScores,
+    priorityWindowEmails,
+    queryClient,
+    requestPriority,
+    t,
+  ]);
+  useEffect(() => {
+    if (currentSortMode !== "priority") {
+      priorityRequestGenerationRef.current += 1;
+      setPriorityOrder(null);
+      previousSortModeRef.current = currentSortMode;
+      return;
+    }
+    if (
+      currentSortMode === "priority" &&
+      previousSortModeRef.current !== "priority"
+    ) {
+      priorityRequestKeyRef.current = "";
+      setPriorityOrder(null);
+    }
+    previousSortModeRef.current = currentSortMode;
+    if (currentSortMode === "priority") void runPriority();
+  }, [currentSortMode, isPriorityPending, runPriority]);
+  const rankedPriorityThreads = useMemo(
+    () =>
+      currentSortMode === "priority"
+        ? [...chronologicalThreads].sort((a, b) => {
+            const aKey = aiPriorityEmailKey(
+              a.latestMessage.accountEmail,
+              a.latestMessage.id,
+            );
+            const bKey = aiPriorityEmailKey(
+              b.latestMessage.accountEmail,
+              b.latestMessage.id,
+            );
+            const aIsPriority = priorityWindowIds.has(aKey);
+            const bIsPriority = priorityWindowIds.has(bKey);
+            if (aIsPriority !== bIsPriority) return aIsPriority ? -1 : 1;
+            if (!aIsPriority) {
+              return (
+                (chronologicalIndexes.get(aKey) ?? 0) -
+                (chronologicalIndexes.get(bKey) ?? 0)
+              );
+            }
+            return (
+              (cachedPriorityScores.get(bKey) ?? 0.5) -
+                (cachedPriorityScores.get(aKey) ?? 0.5) ||
+              new Date(b.latestMessage.date).getTime() -
+                new Date(a.latestMessage.date).getTime() ||
+              b.latestMessage.id.localeCompare(a.latestMessage.id)
+            );
+          })
+        : chronologicalThreads,
+    [
+      chronologicalIndexes,
+      chronologicalThreads,
+      currentSortMode,
+      cachedPriorityScores,
+      priorityWindowIds,
+    ],
+  );
+  useEffect(() => {
+    if (
+      currentSortMode !== "priority" ||
+      priorityWindowEmails.length === 0 ||
+      !priorityWindowEmails.every((email) =>
+        cachedPriorityScores.has(
+          aiPriorityEmailKey(email.accountEmail, email.id),
+        ),
+      )
+    ) {
+      return;
+    }
+    if (
+      priorityOrder?.ruleRevision === priorityRuleRevision &&
+      priorityOrder.keys.length > 0
+    ) {
+      return;
+    }
+    setPriorityOrder({
+      ruleRevision: priorityRuleRevision,
+      keys: rankedPriorityThreads
+        .filter((thread) =>
+          priorityWindowIds.has(
+            aiPriorityEmailKey(
+              thread.latestMessage.accountEmail,
+              thread.latestMessage.id,
+            ),
+          ),
+        )
+        .map((thread) =>
+          aiPriorityEmailKey(
+            thread.latestMessage.accountEmail,
+            thread.latestMessage.id,
+          ),
+        ),
+      priorityKeys: [...priorityWindowIds],
+      scores: Object.fromEntries(cachedPriorityScores),
+    });
+  }, [
+    cachedPriorityScores,
+    currentSortMode,
+    priorityOrder,
+    priorityWindowIds,
+    priorityRuleRevision,
+    priorityWindowEmails,
+    rankedPriorityThreads,
+  ]);
+  useEffect(() => {
+    if (
+      currentSortMode !== "priority" ||
+      !priorityOrder ||
+      priorityOrder.ruleRevision !== priorityRuleRevision
+    ) {
+      return;
+    }
+    const priorityKeys = new Set(priorityOrder.priorityKeys);
+    const scores = { ...priorityOrder.scores };
+    let changed = false;
+    for (const email of priorityWindowEmails) {
+      const key = aiPriorityEmailKey(email.accountEmail, email.id);
+      const score = cachedPriorityScores.get(key);
+      if (priorityKeys.has(key) || score === undefined) continue;
+      priorityKeys.add(key);
+      scores[key] = score;
+      changed = true;
+    }
+    if (!changed) return;
+    setPriorityOrder((current) =>
+      current === priorityOrder
+        ? { ...current, priorityKeys: [...priorityKeys], scores }
+        : current,
+    );
+  }, [
+    cachedPriorityScores,
+    currentSortMode,
+    priorityOrder,
+    priorityRuleRevision,
+    priorityWindowEmails,
+  ]);
+  const activePriorityOrder =
+    priorityOrder?.ruleRevision === priorityRuleRevision ? priorityOrder : null;
+  const threads = useMemo(() => {
+    if (currentSortMode !== "priority") return chronologicalThreads;
+    if (!activePriorityOrder) return rankedPriorityThreads;
+    const order = new Map(
+      activePriorityOrder.keys
+        .filter((key) => priorityWindowIds.has(key))
+        .map((key, index) => [key, index]),
+    );
+    const frozenPriorityKeys = new Set(
+      activePriorityOrder.priorityKeys.filter((key) =>
+        priorityWindowIds.has(key),
+      ),
+    );
+    return [...rankedPriorityThreads].sort((a, b) => {
+      const aKey = aiPriorityEmailKey(
+        a.latestMessage.accountEmail,
+        a.latestMessage.id,
+      );
+      const bKey = aiPriorityEmailKey(
+        b.latestMessage.accountEmail,
+        b.latestMessage.id,
+      );
+      const aIndex = order.get(aKey);
+      const bIndex = order.get(bKey);
+      if (aIndex !== undefined && bIndex !== undefined) return aIndex - bIndex;
+      const aIsPriority =
+        aIndex !== undefined
+          ? frozenPriorityKeys.has(aKey)
+          : priorityWindowIds.has(aKey);
+      const bIsPriority =
+        bIndex !== undefined
+          ? frozenPriorityKeys.has(bKey)
+          : priorityWindowIds.has(bKey);
+      if (aIsPriority !== bIsPriority) return aIsPriority ? -1 : 1;
+      if (aIsPriority) {
+        const scoreDifference =
+          (activePriorityOrder.scores[bKey] ??
+            cachedPriorityScores.get(bKey) ??
+            0.5) -
+          (activePriorityOrder.scores[aKey] ??
+            cachedPriorityScores.get(aKey) ??
+            0.5);
+        if (scoreDifference !== 0) return scoreDifference;
+      }
+      const chronologicalDifference =
+        (chronologicalIndexes.get(aKey) ?? 0) -
+        (chronologicalIndexes.get(bKey) ?? 0);
+      if (chronologicalDifference !== 0) return chronologicalDifference;
+      return b.latestMessage.id.localeCompare(a.latestMessage.id);
+    });
+  }, [
+    cachedPriorityScores,
+    chronologicalIndexes,
+    chronologicalThreads,
+    currentSortMode,
+    activePriorityOrder,
+    priorityWindowIds,
+    rankedPriorityThreads,
+  ]);
 
   const focusedIndex = threads.findIndex(
     (t) => t.latestMessage.id === focusedId,
   );
 
-  // Refs so keyboard handlers always read the latest values without stale closures.
-  // Without this, rapid j/k presses fire before React re-renders, causing the
-  // second press to compute the same next index as the first (appears to "skip").
   const focusedIndexRef = useRef(focusedIndex);
   focusedIndexRef.current = focusedIndex;
   const focusedIdRef = useRef(focusedId);
@@ -481,7 +1158,6 @@ export function EmailList({
       setSelectedIds(new Set());
       if (threads.length === 0) return;
       let current = focusedIndexRef.current;
-      // If index is stale (-1), re-derive from the current focusedId
       if (current === -1 && focusedIdRef.current) {
         current = threads.findIndex(
           (t) => t.latestMessage.id === focusedIdRef.current,
@@ -493,9 +1169,8 @@ export function EmailList({
       );
       setFocusedId(threads[next].latestMessage.id);
       focusedIndexRef.current = next;
-      // Scroll focused row into view
-      const rows = containerRef.current?.querySelectorAll("[role='row']");
-      rows?.[next]?.scrollIntoView({ block: "nearest" });
+      // Scrolling the focused row into view is handled by the effect that
+      // watches `focusedIndex` and calls `rowVirtualizer.scrollToIndex`.
     },
     [threads, setFocusedId, setSelectedIds],
   );
@@ -514,8 +1189,6 @@ export function EmailList({
 
       setSelectedIds((prev) => {
         const updated = new Set(prev);
-        // Include anchor on first shift-move — derive the thread key from the
-        // currently focused email id.
         if (prev.size === 0 && focusedIdRef.current) {
           const anchorThread = threads.find(
             (t) => t.latestMessage.id === focusedIdRef.current,
@@ -533,15 +1206,11 @@ export function EmailList({
 
       setFocusedId(newFocusId);
       focusedIndexRef.current = next;
-      // Scroll into view
-      const rows = containerRef.current?.querySelectorAll("[role='row']");
-      rows?.[next]?.scrollIntoView({ block: "nearest" });
+      // Scrolling into view is handled by the `focusedIndex` effect above.
     },
     [threads, setFocusedId, setSelectedIds],
   );
 
-  // Returns thread keys (latestMessage.threadId || latestMessage.id) of the
-  // emails to act on — multi-selection if present, else the focused row.
   const getActionThreadKeys = useCallback((): string[] => {
     if (selectedIdsRef.current.size > 0)
       return Array.from(selectedIdsRef.current);
@@ -559,14 +1228,21 @@ export function EmailList({
     const thread = threads.find((t) => t.latestMessage.id === id);
     if (!thread) return;
     const targetThreadId = thread.latestMessage.threadId || id;
-    // Enter on a single focused row is a single-thread action — clear any
-    // in-progress multi-selection so shortcuts in detail view start fresh.
     setSelectedIds(new Set());
-    void ensureThread(targetThreadId, thread.latestMessage.accountEmail);
+    void ensureThread(targetThreadId, thread.latestMessage.accountEmail).catch(
+      () => {},
+    );
     onNavigateThread?.(targetThreadId);
-    navigate(`/${view}/${targetThreadId}${routeSearchSuffix}`);
+    void navigate(`/${view}/${targetThreadId}${routeSearchSuffix}`);
     if (thread.hasUnread) {
-      setTimeout(() => markThreadRead.mutate(targetThreadId), 0);
+      setTimeout(
+        () =>
+          markThreadRead.mutate({
+            threadId: targetThreadId,
+            accountEmail: thread.latestMessage.accountEmail,
+          }),
+        0,
+      );
     }
   }, [
     threads,
@@ -583,7 +1259,6 @@ export function EmailList({
       if (threadKeys.length === 0) return;
       const actionKeySet = new Set(threadKeys);
 
-      // Resolve each thread key to its latestMessage + accountEmail up front.
       const targets = threadKeys
         .map((key) =>
           threads.find(
@@ -592,8 +1267,12 @@ export function EmailList({
         )
         .filter((t): t is ThreadSummary => !!t);
       const emailIds = targets.map((t) => t.latestMessage.id);
+      const emailRefs = targets.map((t) => ({
+        id: t.latestMessage.id,
+        accountEmail: t.latestMessage.accountEmail,
+        threadId: t.latestMessage.threadId || t.latestMessage.id,
+      }));
 
-      // Move focus to the next non-selected thread (or previous if at end)
       const lastIdx = threads.findIndex(
         (t) =>
           (t.latestMessage.threadId || t.latestMessage.id) ===
@@ -607,58 +1286,119 @@ export function EmailList({
         const nextIdx = Math.min(lastIdx, remaining.length - 1);
         const nextThread = remaining[nextIdx];
         setFocusedId(nextThread.latestMessage.id);
-        // Warm the thread that's about to take focus so repeated `e` stays
-        // instant down the list.
         const nextTid =
           nextThread.latestMessage.threadId || nextThread.latestMessage.id;
-        void ensureThread(nextTid, nextThread.latestMessage.accountEmail);
+        void ensureThread(nextTid, nextThread.latestMessage.accountEmail).catch(
+          () => {},
+        );
       } else {
         setFocusedId(null);
       }
 
-      // Snapshot removed thread emails so undo can restore them
       const snapshots: EmailMessage[] = [];
       for (const key of threadKeys) {
         snapshots.push(...emails.filter((e) => (e.threadId || e.id) === key));
       }
       for (const id of emailIds) onArchived?.(id);
 
+      const suppressionToken =
+        targets.length > 1
+          ? bulkArchiveEmails.createSuppressionToken()
+          : archiveEmail.createSuppressionToken();
       const undo = () => {
-        for (const key of threadKeys) unsuppressThread(key);
-        queryClient.setQueriesData<InfiniteEmails>(
-          { queryKey: ["emails"] },
-          (old) => {
-            if (!old) return old;
-            // Re-insert snapshots into the first page
-            const firstPage = old.pages[0];
-            const restored = [...(firstPage?.emails ?? []), ...snapshots].sort(
-              (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
-            );
-            return {
-              ...old,
-              pages: [
-                { ...firstPage, emails: restored },
-                ...old.pages.slice(1),
-              ],
-            };
-          },
+        const getSuppressionIds =
+          targets.length > 1
+            ? bulkArchiveEmails.getSuppressionIds
+            : archiveEmail.getSuppressionIds;
+        const restorableThreadIds = new Set<string>();
+        const inboxRemovalSnapshots = new Map<
+          string,
+          ReturnType<typeof releaseOwnedInboxRemoval>
+        >();
+        for (const key of threadKeys) {
+          const inboxRemovalSnapshot = releaseOwnedInboxRemoval(
+            queryClient,
+            key,
+            suppressionToken,
+          );
+          if (
+            releaseSuppressionClaims(
+              key,
+              getSuppressionIds(suppressionToken, key),
+            )
+          ) {
+            restorableThreadIds.add(key);
+            inboxRemovalSnapshots.set(key, inboxRemovalSnapshot);
+          }
+        }
+        const restorableSnapshots = snapshots.filter((email) =>
+          restorableThreadIds.has(email.threadId || email.id),
         );
-        for (const id of emailIds) unarchiveEmail.mutate(id);
+        if (restorableSnapshots.length > 0) {
+          queryClient.setQueriesData<InfiniteEmails>(
+            { queryKey: ["emails"] },
+            (old) => {
+              if (!old) return old;
+              const firstPage = old.pages[0];
+              const restored = [
+                ...(firstPage?.emails ?? []),
+                ...restorableSnapshots,
+              ].sort(
+                (a, b) =>
+                  new Date(b.date).getTime() - new Date(a.date).getTime(),
+              );
+              return {
+                ...old,
+                pages: [
+                  { ...firstPage, emails: restored },
+                  ...old.pages.slice(1),
+                ],
+              };
+            },
+          );
+        }
+        for (const ref of emailRefs) {
+          if (restorableThreadIds.has(ref.threadId || ref.id))
+            unarchiveEmail.mutate({
+              ...ref,
+              suppressionToken,
+              inboxRemovalSnapshot: inboxRemovalSnapshots.get(
+                ref.threadId || ref.id,
+              ),
+            });
+        }
       };
-      setUndoAction(undo);
-      toast(
+      const consumeUndo = setUndoAction(undo);
+      const toastId = toast(
         threadKeys.length > 1
-          ? `Archived ${threadKeys.length} conversations.`
-          : "Archived.",
-        { action: { label: "UNDO", onClick: undo } },
+          ? t("mail.toasts.archivedMany", { count: threadKeys.length })
+          : t("mail.toasts.archived"),
+        {
+          action: { label: t("mail.actions.undo"), onClick: consumeUndo },
+          duration: UNDO_DURATION,
+        },
       );
-      for (const t of targets) {
-        archiveEmail.mutate({
-          id: t.latestMessage.id,
-          accountEmail: t.latestMessage.accountEmail,
+      setUndoToastId(toastId);
+      if (targets.length > 1) {
+        bulkArchiveEmails.mutate({
+          targets: targets.map((t) => ({
+            id: t.latestMessage.id,
+            accountEmail: t.latestMessage.accountEmail,
+            threadId: t.latestMessage.threadId || t.latestMessage.id,
+          })),
           removeLabel: labelParam || undefined,
-          threadId: t.latestMessage.threadId || t.latestMessage.id,
+          suppressionToken,
         });
+      } else {
+        for (const t of targets) {
+          archiveEmail.mutate({
+            id: t.latestMessage.id,
+            accountEmail: t.latestMessage.accountEmail,
+            removeLabel: labelParam || undefined,
+            threadId: t.latestMessage.threadId || t.latestMessage.id,
+            suppressionToken,
+          });
+        }
       }
       setSelectedIds(new Set());
     },
@@ -666,6 +1406,7 @@ export function EmailList({
       threads,
       emails,
       archiveEmail,
+      bulkArchiveEmails,
       unarchiveEmail,
       onArchived,
       labelParam,
@@ -691,9 +1432,12 @@ export function EmailList({
           ),
         )
         .filter((t): t is ThreadSummary => !!t);
-      const emailIds = targets.map((t) => t.latestMessage.id);
+      const emailRefs = targets.map((t) => ({
+        id: t.latestMessage.id,
+        accountEmail: t.latestMessage.accountEmail,
+        threadId: t.latestMessage.threadId || t.latestMessage.id,
+      }));
 
-      // Move focus to the next non-selected thread
       const lastIdx = threads.findIndex(
         (t) =>
           (t.latestMessage.threadId || t.latestMessage.id) ===
@@ -710,47 +1454,109 @@ export function EmailList({
         setFocusedId(null);
       }
 
-      // Snapshot removed thread emails so undo can restore them
       const snapshots: EmailMessage[] = [];
       for (const key of threadKeys) {
         snapshots.push(...emails.filter((e) => (e.threadId || e.id) === key));
       }
 
+      const suppressionToken =
+        targets.length > 1
+          ? bulkTrashEmails.createSuppressionToken()
+          : trashEmail.createSuppressionToken();
       const undo = () => {
-        for (const key of threadKeys) unsuppressThread(key);
-        queryClient.setQueriesData<InfiniteEmails>(
-          { queryKey: ["emails"] },
-          (old) => {
-            if (!old) return old;
-            const firstPage = old.pages[0];
-            const restored = [...(firstPage?.emails ?? []), ...snapshots].sort(
-              (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
-            );
-            return {
-              ...old,
-              pages: [
-                { ...firstPage, emails: restored },
-                ...old.pages.slice(1),
-              ],
-            };
-          },
+        const getSuppressionIds =
+          targets.length > 1
+            ? bulkTrashEmails.getSuppressionIds
+            : trashEmail.getSuppressionIds;
+        const restorableThreadIds = new Set<string>();
+        const inboxRemovalSnapshots = new Map<
+          string,
+          ReturnType<typeof releaseOwnedInboxRemoval>
+        >();
+        for (const key of threadKeys) {
+          const inboxRemovalSnapshot = releaseOwnedInboxRemoval(
+            queryClient,
+            key,
+            suppressionToken,
+          );
+          if (
+            releaseSuppressionClaims(
+              key,
+              getSuppressionIds(suppressionToken, key),
+            )
+          ) {
+            restorableThreadIds.add(key);
+            inboxRemovalSnapshots.set(key, inboxRemovalSnapshot);
+          }
+        }
+        const restorableSnapshots = snapshots.filter((email) =>
+          restorableThreadIds.has(email.threadId || email.id),
         );
-        for (const id of emailIds) untrashEmail.mutate(id);
+        if (restorableSnapshots.length > 0) {
+          queryClient.setQueriesData<InfiniteEmails>(
+            { queryKey: ["emails"] },
+            (old) => {
+              if (!old) return old;
+              const firstPage = old.pages[0];
+              const restored = [
+                ...(firstPage?.emails ?? []),
+                ...restorableSnapshots,
+              ].sort(
+                (a, b) =>
+                  new Date(b.date).getTime() - new Date(a.date).getTime(),
+              );
+              return {
+                ...old,
+                pages: [
+                  { ...firstPage, emails: restored },
+                  ...old.pages.slice(1),
+                ],
+              };
+            },
+          );
+        }
+        for (const ref of emailRefs) {
+          if (restorableThreadIds.has(ref.threadId || ref.id))
+            untrashEmail.mutate({
+              ...ref,
+              suppressionToken,
+              inboxRemovalSnapshot: inboxRemovalSnapshots.get(
+                ref.threadId || ref.id,
+              ),
+            });
+        }
       };
-      setUndoAction(undo);
-      toast(
+      const consumeUndo = setUndoAction(undo);
+      const toastId = toast(
         threadKeys.length > 1
-          ? `Trashed ${threadKeys.length} conversations.`
-          : "Moved to Trash.",
-        { action: { label: "UNDO", onClick: undo } },
+          ? t("mail.toasts.trashedMany", { count: threadKeys.length })
+          : t("mail.toasts.trashed"),
+        {
+          action: { label: t("mail.actions.undo"), onClick: consumeUndo },
+          duration: UNDO_DURATION,
+        },
       );
-      for (const id of emailIds) trashEmail.mutate(id);
+      setUndoToastId(toastId);
+      if (targets.length > 1) {
+        bulkTrashEmails.mutate({
+          targets: targets.map((t) => ({
+            id: t.latestMessage.id,
+            accountEmail: t.latestMessage.accountEmail,
+            threadId: t.latestMessage.threadId || t.latestMessage.id,
+          })),
+          suppressionToken,
+        });
+      } else {
+        for (const ref of emailRefs)
+          trashEmail.mutate({ ...ref, suppressionToken });
+      }
       setSelectedIds(new Set());
     },
     [
       threads,
       emails,
       trashEmail,
+      bulkTrashEmails,
       untrashEmail,
       setFocusedId,
       setSelectedIds,
@@ -775,6 +1581,33 @@ export function EmailList({
         )
         .filter((t): t is ThreadSummary => !!t),
     [threads],
+  );
+
+  const openAiFilterDialog = useCallback(
+    (action: "filter" | "keep") => {
+      const targets = resolveTargets(getActionThreadKeys()).map(
+        (thread): AiFilterTarget => {
+          const email = thread.latestMessage;
+          return {
+            id: email.id,
+            threadId: email.threadId || email.id,
+            ...(email.accountEmail && email.accountEmail !== "local"
+              ? { accountEmail: email.accountEmail }
+              : {}),
+            sender: email.from.name
+              ? `${email.from.name} <${email.from.email}>`
+              : email.from.email,
+            subject: email.subject,
+          };
+        },
+      );
+      if (targets.length === 0) {
+        toast.error(t("mail.toasts.noEmailSelected"));
+        return;
+      }
+      setAiFilterDialog({ action, targets });
+    },
+    [getActionThreadKeys, resolveTargets, t],
   );
 
   useEffect(() => {
@@ -804,14 +1637,31 @@ export function EmailList({
   const toggleFocusedRead = useCallback(() => {
     const keys = getActionThreadKeys();
     if (keys.length === 0) return;
-    for (const t of resolveTargets(keys)) {
-      if (t.hasUnread) {
-        markThreadRead.mutate(t.latestMessage.threadId || t.latestMessage.id);
-      } else {
+    const targets = resolveTargets(keys);
+    const toMarkRead = targets.filter((t) => t.hasUnread);
+    const toMarkUnread = targets.filter((t) => !t.hasUnread);
+    for (const t of toMarkRead) {
+      markThreadRead.mutate({
+        threadId: t.latestMessage.threadId || t.latestMessage.id,
+        accountEmail: t.latestMessage.accountEmail,
+      });
+    }
+    if (toMarkUnread.length > 1) {
+      bulkMarkRead.mutate({
+        targets: toMarkUnread.map((t) => ({
+          id: t.latestMessage.id,
+          accountEmail: t.latestMessage.accountEmail,
+          threadId: t.latestMessage.threadId || t.latestMessage.id,
+        })),
+        isRead: false,
+      });
+    } else {
+      for (const t of toMarkUnread) {
         markRead.mutate({
           id: t.latestMessage.id,
           isRead: false,
           accountEmail: t.latestMessage.accountEmail,
+          threadId: t.latestMessage.threadId || t.latestMessage.id,
         });
       }
     }
@@ -819,6 +1669,7 @@ export function EmailList({
   }, [
     markRead,
     markThreadRead,
+    bulkMarkRead,
     getActionThreadKeys,
     resolveTargets,
     setSelectedIds,
@@ -826,40 +1677,86 @@ export function EmailList({
 
   const markFocusedRead = useCallback(() => {
     for (const t of resolveTargets(getActionThreadKeys())) {
-      markThreadRead.mutate(t.latestMessage.threadId || t.latestMessage.id);
+      markThreadRead.mutate({
+        threadId: t.latestMessage.threadId || t.latestMessage.id,
+        accountEmail: t.latestMessage.accountEmail,
+      });
     }
     setSelectedIds(new Set());
   }, [markThreadRead, getActionThreadKeys, resolveTargets, setSelectedIds]);
 
   const markFocusedUnread = useCallback(() => {
-    for (const t of resolveTargets(getActionThreadKeys())) {
-      markRead.mutate({
-        id: t.latestMessage.id,
+    const targets = resolveTargets(getActionThreadKeys());
+    if (targets.length > 1) {
+      bulkMarkRead.mutate({
+        targets: targets.map((t) => ({
+          id: t.latestMessage.id,
+          accountEmail: t.latestMessage.accountEmail,
+          threadId: t.latestMessage.threadId || t.latestMessage.id,
+        })),
         isRead: false,
-        accountEmail: t.latestMessage.accountEmail,
       });
+    } else {
+      for (const t of targets) {
+        markRead.mutate({
+          id: t.latestMessage.id,
+          isRead: false,
+          accountEmail: t.latestMessage.accountEmail,
+          threadId: t.latestMessage.threadId || t.latestMessage.id,
+        });
+      }
     }
     setSelectedIds(new Set());
-  }, [markRead, getActionThreadKeys, resolveTargets, setSelectedIds]);
+  }, [
+    markRead,
+    bulkMarkRead,
+    getActionThreadKeys,
+    resolveTargets,
+    setSelectedIds,
+  ]);
 
   const moveFocusedToLabel = useCallback(
-    (labelId: string, labelName: string) => {
+    async (labelId: string, labelName: string) => {
       const keys = getActionThreadKeys();
       if (keys.length === 0) return;
       const targets = resolveTargets(keys);
-      for (const t of targets) {
-        moveEmail.mutate({
-          id: t.latestMessage.id,
+      try {
+        const result = await moveEmail.mutateAsync({
+          id: targets.map((target) => target.latestMessage.id).join(","),
           label: labelId,
           removeLabel: labelParam || undefined,
+          accountEmails: targets
+            .map((target) => target.latestMessage.accountEmail ?? "")
+            .join(","),
+          threadIds: targets
+            .map(
+              (target) =>
+                target.latestMessage.threadId || target.latestMessage.id,
+            )
+            .join(","),
         });
+        setSelectedIds(new Set());
+        toast(
+          targets.length > 1
+            ? t("mail.toasts.moveManySucceeded", {
+                count: result.succeeded.length,
+                label: labelName,
+              })
+            : t("mail.toasts.moveSucceeded", { label: labelName }),
+        );
+      } catch (error) {
+        if (error instanceof MoveEmailPartialFailure) {
+          toast.error(
+            t("mail.toasts.movePartialFailed", {
+              succeeded: error.result.succeeded.length,
+              total: error.result.requested.length,
+              failed: error.result.failed.length,
+            }),
+          );
+        } else {
+          toast.error(actionErrorMessage(error) ?? t("mail.toasts.moveFailed"));
+        }
       }
-      setSelectedIds(new Set());
-      toast(
-        targets.length > 1
-          ? `Moved ${targets.length} conversations to ${labelName}.`
-          : `Moved to ${labelName}.`,
-      );
     },
     [
       getActionThreadKeys,
@@ -867,6 +1764,7 @@ export function EmailList({
       moveEmail,
       labelParam,
       setSelectedIds,
+      t,
     ],
   );
 
@@ -900,17 +1798,47 @@ export function EmailList({
   const starFocused = useCallback(() => {
     const keys = getActionThreadKeys();
     if (keys.length === 0) return;
-    for (const t of resolveTargets(keys)) {
-      setThreadStarred(t, !t.hasStarred);
+    const targets = resolveTargets(keys);
+    if (targets.length > 1) {
+      const toStar = targets.filter((t) => !t.hasStarred);
+      const toUnstar = targets.filter((t) => t.hasStarred);
+      if (toStar.length > 0) {
+        bulkToggleStar.mutate({
+          targets: toStar.map((t) => ({
+            id: t.latestMessage.id,
+            accountEmail: t.latestMessage.accountEmail,
+            threadId: t.latestMessage.threadId || t.latestMessage.id,
+          })),
+          isStarred: true,
+        });
+      }
+      if (toUnstar.length > 0) {
+        for (const t of toUnstar) setThreadStarred(t, false);
+      }
+    } else {
+      for (const t of targets) setThreadStarred(t, !t.hasStarred);
     }
     setSelectedIds(new Set());
-  }, [getActionThreadKeys, resolveTargets, setSelectedIds, setThreadStarred]);
+  }, [
+    getActionThreadKeys,
+    resolveTargets,
+    setSelectedIds,
+    setThreadStarred,
+    bulkToggleStar,
+  ]);
 
   const replyFocused = useCallback(() => {
     const id = focusedIdRef.current;
     if (!id || !onCompose) return;
     const thread = threads.find((t) => t.latestMessage.id === id);
     if (thread) onCompose(thread.latestMessage, "reply");
+  }, [threads, onCompose]);
+
+  const replyAllFocused = useCallback(() => {
+    const id = focusedIdRef.current;
+    if (!id || !onCompose) return;
+    const thread = threads.find((t) => t.latestMessage.id === id);
+    if (thread) onCompose(thread.latestMessage, "replyAll");
   }, [threads, onCompose]);
 
   const forwardFocused = useCallback(() => {
@@ -925,7 +1853,6 @@ export function EmailList({
     [setSelectedIds],
   );
 
-  // Keyboard navigation — Gmail / Superhuman standard shortcuts
   useKeyboardShortcuts([
     { key: "a", meta: true, handler: selectAllThreads },
     { key: "j", handler: () => moveFocus(1) },
@@ -940,17 +1867,17 @@ export function EmailList({
     { key: "o", handler: openFocused },
     { key: "e", handler: archiveFocused },
     { key: "d", handler: trashFocused },
+    { key: "#", shift: "either", handler: trashFocused },
     { key: "u", handler: toggleFocusedRead },
     { key: "I", handler: markFocusedRead, shift: true },
     { key: "U", handler: markFocusedUnread, shift: true },
     { key: "s", handler: starFocused },
     { key: "r", handler: replyFocused },
     { key: "f", handler: forwardFocused },
-    { key: "a", handler: replyFocused }, // reply-all (same as reply for single messages)
+    { key: "a", handler: replyAllFocused },
     { key: "Escape", handler: clearSelection },
   ]);
 
-  // Auto-focus first thread when list loads, or reset if focused email was removed
   useEffect(() => {
     if (threads.length === 0) return;
     if (!focusedId || !threads.some((t) => t.latestMessage.id === focusedId)) {
@@ -958,8 +1885,6 @@ export function EmailList({
     }
   }, [threads, focusedId, setFocusedId]);
 
-  // Warm only the first few visible threads on list load. Direct clicks still
-  // fetch immediately, while background work stays below Gmail's quota.
   useEffect(() => {
     if (threads.length === 0) return;
     warmThreads(
@@ -970,7 +1895,6 @@ export function EmailList({
     );
   }, [threads]);
 
-  // When focus moves, prefetch the focused row and its closest neighbors only.
   useEffect(() => {
     if (!focusedId || threads.length === 0) return;
     const idx = threads.findIndex((t) => t.latestMessage.id === focusedId);
@@ -986,34 +1910,43 @@ export function EmailList({
     );
   }, [focusedId, threads]);
 
-  // Infinite scroll — fetch next page when the sentinel enters the viewport.
-  // isFetchingNextPage is read via ref (not a dep) because re-observe fires
-  // the callback synchronously with the current intersection state; if the
-  // sentinel is still visible after a fetch, a reconnecting observer would
-  // immediately fire again and we'd loop (visible to the user as "Loading
-  // more..." flashing every ~second while tab is idle).
+  const [rowHeightEstimate, setRowHeightEstimate] = useState(() =>
+    typeof window !== "undefined" && window.innerWidth >= 640 ? 38 : 48,
+  );
+  useEffect(() => {
+    const mql = window.matchMedia("(min-width: 640px)");
+    const onChange = () => setRowHeightEstimate(mql.matches ? 38 : 48);
+    onChange();
+    mql.addEventListener("change", onChange);
+    return () => mql.removeEventListener("change", onChange);
+  }, []);
+
+  const rowVirtualizer = useVirtualizer({
+    count: threads.length,
+    getScrollElement: () => scrollParentRef.current,
+    estimateSize: () => rowHeightEstimate,
+    overscan: 10,
+    getItemKey: (index) => threads[index]?.latestMessage.id ?? index,
+  });
+
+  useEffect(() => {
+    if (focusedIndex < 0) return;
+    rowVirtualizer.scrollToIndex(focusedIndex, { align: "auto" });
+  }, [focusedIndex, rowVirtualizer]);
+
   const sentinelRef = useRef<HTMLDivElement>(null);
-  const isFetchingNextPageRef = useRef(isFetchingNextPage);
-  isFetchingNextPageRef.current = isFetchingNextPage;
   useEffect(() => {
     const el = sentinelRef.current;
-    if (!el || !hasNextPage) return;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries[0].isIntersecting && !isFetchingNextPageRef.current) {
-          void fetchNextPage().catch(() => {
-            // React Query owns the visible error state; avoid a global
-            // unhandledrejection for transient list-page fetch failures.
-          });
-        }
-      },
-      { rootMargin: "200px" },
-    );
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [hasNextPage, fetchNextPage]);
+    if (!el) return;
+    return observeNextPage({
+      element: el,
+      hasNextPage: Boolean(hasNextPage),
+      isFetchingNextPage: Boolean(isFetchingNextPage),
+      isFetchNextPageError: Boolean(isFetchNextPageError),
+      fetchNextPage,
+    });
+  }, [hasNextPage, isFetchingNextPage, isFetchNextPageError, fetchNextPage]);
 
-  // Advance selection when an email is snoozed (same logic as archiveFocused)
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (
@@ -1046,127 +1979,215 @@ export function EmailList({
     return () => window.removeEventListener("email:snoozed", handler);
   }, [threads, setFocusedId, setSelectedIds]);
 
-  const handleSelect = (thread: ThreadSummary) => {
-    const email = thread.latestMessage;
-    const targetThreadId = email.threadId || email.id;
-    setFocusedId(email.id);
-    // A plain click is a single-thread action — clear any in-progress
-    // multi-selection so the next keyboard shortcut doesn't act on a stale set.
-    setSelectedIds(new Set());
-    // Draft emails: open in compose window instead of thread view
-    if (email.isDraft && onDraftOpen) {
-      onDraftOpen(email);
-      return;
-    }
-    void ensureThread(targetThreadId, email.accountEmail);
-    onNavigateThread?.(targetThreadId);
-    navigate(`/${view}/${targetThreadId}${routeSearchSuffix}`);
-    if (thread.hasUnread) {
-      setTimeout(() => markThreadRead.mutate(targetThreadId), 0);
-    }
-  };
-
-  const handleStar = (e: React.MouseEvent, thread: ThreadSummary) => {
-    e.stopPropagation();
-    setThreadStarred(thread, !thread.hasStarred);
-  };
-
-  const handleToggleReadThread = (
-    e: React.MouseEvent,
-    thread: ThreadSummary,
-  ) => {
-    e.stopPropagation();
-    const email = thread.latestMessage;
-    if (thread.hasUnread) {
-      markThreadRead.mutate(email.threadId || email.id);
-    } else {
-      markRead.mutate({
-        id: email.id,
-        isRead: false,
-        accountEmail: email.accountEmail,
+  const handleSelect = useCallback(
+    (thread: ThreadSummary) => {
+      const email = thread.latestMessage;
+      const targetThreadId = email.threadId || email.id;
+      trackEvent(email.isDraft ? "email_draft_opened" : "email_thread_opened", {
+        app_name: "mail",
+        template_name: "mail",
+        view,
       });
-    }
-  };
+      setFocusedId(email.id);
+      setSelectedIds(new Set());
+      if (email.isDraft && onDraftOpen) {
+        onDraftOpen(email);
+        return;
+      }
+      void ensureThread(targetThreadId, email.accountEmail).catch(() => {});
+      onNavigateThread?.(targetThreadId);
+      void navigate(`/${view}/${targetThreadId}${routeSearchSuffix}`);
+      if (thread.hasUnread) {
+        setTimeout(
+          () =>
+            markThreadRead.mutate({
+              threadId: targetThreadId,
+              accountEmail: email.accountEmail,
+            }),
+          0,
+        );
+      }
+    },
+    [
+      setFocusedId,
+      setSelectedIds,
+      onDraftOpen,
+      onNavigateThread,
+      navigate,
+      view,
+      routeSearchSuffix,
+      markThreadRead,
+    ],
+  );
 
-  const handleToggleMultiSelect = (
-    e: React.SyntheticEvent,
-    thread: ThreadSummary,
-  ) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const key = thread.latestMessage.threadId || thread.latestMessage.id;
-    setFocusedId(thread.latestMessage.id);
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  };
+  const handleStar = useCallback(
+    (e: React.MouseEvent, thread: ThreadSummary) => {
+      e.stopPropagation();
+      setThreadStarred(thread, !thread.hasStarred);
+    },
+    [setThreadStarred],
+  );
 
-  const handleTrashThread = (e: React.MouseEvent, thread: ThreadSummary) => {
-    e.stopPropagation();
-    if (view === "trash") return;
-    const key = thread.latestMessage.threadId || thread.latestMessage.id;
-    trashThreadKeys([key]);
-  };
+  const handleToggleReadThread = useCallback(
+    (e: React.MouseEvent, thread: ThreadSummary) => {
+      e.stopPropagation();
+      const email = thread.latestMessage;
+      if (thread.hasUnread) {
+        markThreadRead.mutate({
+          threadId: email.threadId || email.id,
+          accountEmail: email.accountEmail,
+        });
+      } else {
+        markRead.mutate({
+          id: email.id,
+          isRead: false,
+          accountEmail: email.accountEmail,
+          threadId: email.threadId || email.id,
+        });
+      }
+    },
+    [markThreadRead, markRead],
+  );
 
-  const handleArchiveThread = (e: React.MouseEvent, thread: ThreadSummary) => {
-    e.stopPropagation();
-    archiveThreadKeys([
-      thread.latestMessage.threadId || thread.latestMessage.id,
-    ]);
-  };
+  const handleToggleMultiSelect = useCallback(
+    (e: React.SyntheticEvent, thread: ThreadSummary) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const key = thread.latestMessage.threadId || thread.latestMessage.id;
+      setFocusedId(thread.latestMessage.id);
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      });
+    },
+    [setFocusedId, setSelectedIds],
+  );
 
-  const getScheduledJobId = (email: EmailMessage): string | null =>
-    view === "scheduled" && email.id.startsWith("scheduled-")
-      ? email.id.slice("scheduled-".length)
-      : null;
+  const handleTrashThread = useCallback(
+    (e: React.MouseEvent, thread: ThreadSummary) => {
+      e.stopPropagation();
+      if (view === "trash") return;
+      const key = thread.latestMessage.threadId || thread.latestMessage.id;
+      trashThreadKeys([key]);
+    },
+    [view, trashThreadKeys],
+  );
 
-  const handleSendScheduledNow = (
-    e: React.MouseEvent,
-    thread: ThreadSummary,
-  ) => {
-    e.stopPropagation();
-    const jobId = getScheduledJobId(thread.latestMessage);
-    if (!jobId) return;
-    sendScheduledJobNow.mutate(jobId, {
-      onSuccess: () => toast("Scheduled email sent."),
-      onError: (error) =>
-        toast.error(
-          error instanceof Error
-            ? error.message
-            : "Failed to send scheduled email",
-        ),
-    });
-  };
+  const handleArchiveThread = useCallback(
+    (e: React.MouseEvent, thread: ThreadSummary) => {
+      e.stopPropagation();
+      archiveThreadKeys([
+        thread.latestMessage.threadId || thread.latestMessage.id,
+      ]);
+    },
+    [archiveThreadKeys],
+  );
 
-  const handleCancelScheduled = (
-    e: React.MouseEvent,
-    thread: ThreadSummary,
-  ) => {
-    e.stopPropagation();
-    const jobId = getScheduledJobId(thread.latestMessage);
-    if (!jobId) return;
-    cancelScheduledJob.mutate(jobId, {
-      onSuccess: () => toast("Scheduled email cancelled."),
-      onError: () => toast.error("Failed to cancel scheduled email"),
-    });
-  };
+  const handleHoverThread = useCallback(
+    (thread: ThreadSummary) => {
+      setFocusedId(thread.latestMessage.id);
+    },
+    [setFocusedId],
+  );
 
-  // ── Swipe gesture handlers ─────────────────────────────────────────────
-  // Swipe targets exactly one thread (the swiped one) — unlike the keyboard
-  // `e` shortcut, which respects multi-selection. We also clear any existing
-  // multi-selection so the next keyboard shortcut (e/d/u/s) doesn't act on a
-  // stale set — getActionThreadKeys() prefers selectedIds over focusedId.
+  const getScheduledJobId = useCallback(
+    (email: EmailMessage): string | null =>
+      view === "scheduled" && email.id.startsWith("scheduled-")
+        ? email.id.slice("scheduled-".length)
+        : null,
+    [view],
+  );
+
+  const handleSendScheduledNow = useCallback(
+    (e: React.MouseEvent, thread: ThreadSummary) => {
+      e.stopPropagation();
+      const jobId = getScheduledJobId(thread.latestMessage);
+      if (!jobId) return;
+      sendScheduledJobNow.mutate(jobId, {
+        onSuccess: () => toast(t("mail.toasts.scheduledSent")),
+        onError: (error) =>
+          toast.error(
+            error instanceof Error
+              ? error.message
+              : t("mail.toasts.scheduledSendFailed"),
+          ),
+      });
+    },
+    [getScheduledJobId, sendScheduledJobNow, t],
+  );
+
+  const handleCancelScheduled = useCallback(
+    (e: React.MouseEvent, thread: ThreadSummary) => {
+      e.stopPropagation();
+      const jobId = getScheduledJobId(thread.latestMessage);
+      if (!jobId) return;
+      cancelScheduledJob.mutate(jobId, {
+        onSuccess: () => toast(t("mail.toasts.scheduledCancelled")),
+        onError: () => toast.error(t("mail.toasts.scheduledCancelFailed")),
+      });
+    },
+    [getScheduledJobId, cancelScheduledJob, t],
+  );
+
+  const handleConfirmUncertainScheduled = useCallback(
+    (e: React.MouseEvent, thread: ThreadSummary) => {
+      e.stopPropagation();
+      const jobId = getScheduledJobId(thread.latestMessage);
+      if (!jobId) return;
+      confirmUncertainScheduled.mutate(
+        { id: jobId },
+        {
+          onSuccess: () => toast(t("mail.toasts.uncertainScheduledMarkedSent")),
+          onError: (error) =>
+            toast.error(
+              error instanceof Error
+                ? error.message
+                : t("mail.toasts.uncertainScheduledResolveFailed"),
+            ),
+        },
+      );
+    },
+    [getScheduledJobId, confirmUncertainScheduled, t],
+  );
+
+  const handleRetryUncertainScheduled = useCallback(
+    (e: React.MouseEvent, thread: ThreadSummary) => {
+      e.stopPropagation();
+      const jobId = getScheduledJobId(thread.latestMessage);
+      if (jobId) setRetryUncertainJobId(jobId);
+    },
+    [getScheduledJobId],
+  );
+
+  const handleConfirmRetryUncertainScheduled = useCallback(() => {
+    if (!retryUncertainJobId) return;
+    retryUncertainScheduled.mutate(
+      { id: retryUncertainJobId },
+      {
+        onSuccess: () => {
+          setRetryUncertainJobId(null);
+          toast(t("mail.toasts.uncertainScheduledRetryStarted"));
+        },
+        onError: (error) =>
+          toast.error(
+            error instanceof Error
+              ? error.message
+              : t("mail.toasts.uncertainScheduledRetryFailed"),
+          ),
+      },
+    );
+  }, [retryUncertainJobId, retryUncertainScheduled, t]);
+
   const handleSwipeArchive = useCallback(
     (thread: ThreadSummary) => {
       const id = thread.latestMessage.id;
+      const accountEmail = thread.latestMessage.accountEmail;
       const tid = thread.latestMessage.threadId || id;
 
       setSelectedIds(new Set());
 
-      // Advance focus past the row that's about to disappear.
       const idx = threads.findIndex((t) => t.latestMessage.id === id);
       if (threads.length > 1) {
         const nextIdx =
@@ -1176,12 +2197,21 @@ export function EmailList({
         setFocusedId(null);
       }
 
-      // Snapshot so undo can restore.
       const snapshots = emails.filter((e) => (e.threadId || e.id) === tid);
       onArchived?.(id);
 
+      const suppressionToken = archiveEmail.createSuppressionToken();
       const undo = () => {
-        unsuppressThread(tid);
+        const inboxRemovalSnapshot = releaseOwnedInboxRemoval(
+          queryClient,
+          tid,
+          suppressionToken,
+        );
+        const shouldRestore = releaseSuppressionClaims(
+          tid,
+          archiveEmail.getSuppressionIds(suppressionToken, tid),
+        );
+        if (!shouldRestore) return;
         queryClient.setQueriesData<InfiniteEmails>(
           { queryKey: ["emails"] },
           (old) => {
@@ -1199,17 +2229,26 @@ export function EmailList({
             };
           },
         );
-        unarchiveEmail.mutate(id);
+        unarchiveEmail.mutate({
+          id,
+          accountEmail,
+          threadId: tid,
+          suppressionToken,
+          inboxRemovalSnapshot,
+        });
       };
-      setUndoAction(undo);
-      toast("Archived.", {
-        action: { label: "UNDO", onClick: undo },
+      const consumeUndo = setUndoAction(undo);
+      const toastId = toast(t("mail.toasts.archived"), {
+        action: { label: t("mail.actions.undo"), onClick: consumeUndo },
+        duration: UNDO_DURATION,
       });
+      setUndoToastId(toastId);
       archiveEmail.mutate({
         id,
         accountEmail: thread.latestMessage.accountEmail,
         removeLabel: labelParam || undefined,
         threadId: tid,
+        suppressionToken,
       });
     },
     [
@@ -1225,10 +2264,6 @@ export function EmailList({
     ],
   );
 
-  // Snooze fires a global event that AppLayout's SnoozeModal listens for.
-  // Routing through an event (instead of prop drilling) avoids coupling
-  // the list to the layout's modal state. Clear multi-selection for the
-  // same reason as handleSwipeArchive.
   const handleSwipeSnooze = useCallback(
     (thread: ThreadSummary) => {
       setSelectedIds(new Set());
@@ -1244,123 +2279,296 @@ export function EmailList({
     [setSelectedIds],
   );
 
-  const bulkHeaderActions =
-    selectedIds.size > 0 ? (
-      <div className="flex h-7 max-w-[calc(100vw-11rem)] shrink-0 items-center gap-1 rounded-md border border-border/50 bg-muted/50 px-1.5 text-muted-foreground shadow-sm">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              onClick={clearSelection}
-              className="flex size-5 items-center justify-center rounded transition-colors hover:bg-accent hover:text-foreground"
-              aria-label="Clear selection"
-            >
-              <IconX className="h-3.5 w-3.5" />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent>Clear selection</TooltipContent>
-        </Tooltip>
-        <span className="whitespace-nowrap text-xs font-medium text-foreground/80">
-          {selectedIds.size} selected
-        </span>
-        <DropdownMenu>
+  const handleSnoozeButtonClick = useCallback(
+    (e: React.MouseEvent, thread: ThreadSummary) => {
+      e.stopPropagation();
+      handleSwipeSnooze(thread);
+    },
+    [handleSwipeSnooze],
+  );
+
+  const sortHeaderAction = useMemo(
+    () =>
+      view === "inbox" && !searchQuery && !labelParam && threads.length > 0 ? (
+        <div className="flex items-center gap-1">
+          <DropdownMenu>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className="flex h-7 w-[112px] items-center justify-between rounded-md border border-input bg-transparent px-2.5 text-[11px] text-foreground hover:bg-accent/40"
+                    aria-label={`${t("mail.sort.label")} · ⌘I`}
+                    aria-busy={isPriorityPending}
+                  >
+                    <span>
+                      {currentSortMode === "priority"
+                        ? t("mail.sort.priority")
+                        : t("mail.sort.newest")}
+                    </span>
+                    {isPriorityPending ? (
+                      <Spinner className="size-3" />
+                    ) : (
+                      <IconChevronDown className="size-3.5 text-muted-foreground" />
+                    )}
+                  </button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent>{`${t("mail.sort.label")} · ⌘I`}</TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent align="end" className="w-44">
+              <DropdownMenuItem
+                onSelect={() => onSortModeChange?.("newest")}
+                className="justify-between"
+              >
+                {t("mail.sort.newest")}
+                {currentSortMode === "newest" && (
+                  <IconCheck className="size-3.5" />
+                )}
+              </DropdownMenuItem>
+              {showPrioritySort && (
+                <div className="flex items-center">
+                  <DropdownMenuItem
+                    onSelect={() => onSortModeChange?.("priority")}
+                    className="flex-1 justify-between"
+                  >
+                    {t("mail.sort.priority")}
+                    {currentSortMode === "priority" && (
+                      <IconCheck className="size-3.5" />
+                    )}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() =>
+                      navigate(
+                        `${mailSettingsRoute("ai-filter")}#importance-rules`,
+                      )
+                    }
+                    aria-label={t("mail.sort.priorityEditRules")}
+                    title={t("mail.sort.priorityEditRules")}
+                    className="px-2"
+                  >
+                    <IconSettings className="size-3.5" />
+                  </DropdownMenuItem>
+                </div>
+              )}
+              {!showPrioritySort &&
+                (jevAvailabilityError ? (
+                  <DropdownMenuItem
+                    onSelect={onJevRetry}
+                    disabled={jevAvailabilityLoading}
+                    className="justify-between"
+                  >
+                    {t("mail.sort.priority")}
+                    <span className="text-xs text-muted-foreground">
+                      {t("mail.error.tryAgain")}
+                    </span>
+                  </DropdownMenuItem>
+                ) : (
+                  <JevConnectionPrompt
+                    variant="menu-item"
+                    disabled={jevAvailabilityLoading}
+                    onConnected={onJevConnected}
+                  />
+                ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      ) : null,
+    [
+      isPriorityPending,
+      labelParam,
+      navigate,
+      showPrioritySort,
+      jevConfigured,
+      jevAvailabilityLoading,
+      jevAvailabilityError,
+      onJevConnected,
+      onJevRetry,
+      currentSortMode,
+      onSortModeChange,
+      searchQuery,
+      t,
+      threads.length,
+      view,
+    ],
+  );
+
+  const bulkHeaderActions = useMemo(
+    () =>
+      selectedIds.size > 0 ? (
+        <div className="flex h-7 max-w-[calc(100vw-11rem)] shrink-0 items-center gap-1 rounded-md border border-border/50 bg-muted/50 px-1.5 text-muted-foreground shadow-sm">
           <Tooltip>
             <TooltipTrigger asChild>
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  className="flex size-5 items-center justify-center rounded transition-colors hover:bg-accent hover:text-foreground"
-                  aria-label="Selection actions"
-                >
-                  <IconDots className="h-3.5 w-3.5" />
-                </button>
-              </DropdownMenuTrigger>
-            </TooltipTrigger>
-            <TooltipContent>Selection actions</TooltipContent>
-          </Tooltip>
-          <DropdownMenuContent align="end" className="w-56">
-            <DropdownMenuItem
-              onClick={archiveFocused}
-              className="gap-2 text-xs"
-            >
-              <IconArchive className="h-3.5 w-3.5" />
-              Archive
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={markFocusedRead}
-              className="gap-2 text-xs"
-            >
-              <IconMailOpened className="h-3.5 w-3.5" />
-              Mark read
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={markFocusedUnread}
-              className="gap-2 text-xs"
-            >
-              <IconMail className="h-3.5 w-3.5" />
-              Mark unread
-            </DropdownMenuItem>
-            {movableLabels.length > 0 && (
-              <DropdownMenuSub>
-                <DropdownMenuSubTrigger className="gap-2 text-xs">
-                  <IconFolder className="h-3.5 w-3.5" />
-                  Move to
-                </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent className="max-h-72 w-56 overflow-y-auto">
-                  {movableLabels.map((label) => (
-                    <DropdownMenuItem
-                      key={label.id}
-                      onClick={() => moveFocusedToLabel(label.id, label.name)}
-                      className="text-xs"
-                    >
-                      {label.name}
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuSubContent>
-              </DropdownMenuSub>
-            )}
-            {view !== "trash" && (
-              <DropdownMenuItem
-                onClick={trashFocused}
-                className="gap-2 text-xs text-destructive focus:text-destructive"
+              <button
+                type="button"
+                onClick={clearSelection}
+                className="flex size-5 items-center justify-center rounded transition-colors hover:bg-accent hover:text-foreground"
+                aria-label={t("mail.selection.clear")}
               >
-                <IconTrash className="h-3.5 w-3.5" />
-                Move to Trash
+                <IconX className="h-3.5 w-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>{t("mail.selection.clear")}</TooltipContent>
+          </Tooltip>
+          <span className="whitespace-nowrap text-xs font-medium text-foreground/80">
+            {t("mail.selection.selected", { count: selectedIds.size })}
+          </span>
+          <DropdownMenu>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className="flex size-5 items-center justify-center rounded transition-colors hover:bg-accent hover:text-foreground"
+                    aria-label={t("mail.selection.actions")}
+                  >
+                    <IconDots className="h-3.5 w-3.5" />
+                  </button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent>{t("mail.selection.actions")}</TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent align="end" className="w-56">
+              <DropdownMenuItem
+                onClick={() =>
+                  openAiFilterDialog(
+                    labelParam?.toLowerCase() === AI_FILTER_LABEL
+                      ? "keep"
+                      : "filter",
+                  )
+                }
+                className="gap-2 text-xs"
+              >
+                {labelParam?.toLowerCase() === AI_FILTER_LABEL ? (
+                  <IconInbox className="h-3.5 w-3.5" />
+                ) : (
+                  <IconFilter className="h-3.5 w-3.5" />
+                )}
+                {labelParam?.toLowerCase() === AI_FILTER_LABEL
+                  ? t("mail.aiFilter.keepButton")
+                  : t("mail.aiFilter.filterButton")}
               </DropdownMenuItem>
-            )}
-            <DropdownMenuSeparator />
-            <DropdownMenuLabel>Select</DropdownMenuLabel>
-            <DropdownMenuItem onClick={selectAllThreads} className="text-xs">
-              All
-            </DropdownMenuItem>
-            <DropdownMenuItem onClick={clearSelection} className="text-xs">
-              None
-            </DropdownMenuItem>
-            <DropdownMenuItem onClick={selectReadThreads} className="text-xs">
-              Read
-            </DropdownMenuItem>
-            <DropdownMenuItem onClick={selectUnreadThreads} className="text-xs">
-              Unread
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={selectStarredThreads}
-              className="text-xs"
-            >
-              Starred
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={selectUnstarredThreads}
-              className="text-xs"
-            >
-              Unstarred
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </div>
-    ) : null;
-  useSetHeaderActions(bulkHeaderActions);
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={archiveFocused}
+                className="gap-2 text-xs"
+              >
+                <IconArchive className="h-3.5 w-3.5" />
+                {t("mail.actions.archive")}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={markFocusedRead}
+                className="gap-2 text-xs"
+              >
+                <IconMailOpened className="h-3.5 w-3.5" />
+                {t("mail.actions.markRead")}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={markFocusedUnread}
+                className="gap-2 text-xs"
+              >
+                <IconMail className="h-3.5 w-3.5" />
+                {t("mail.actions.markUnread")}
+              </DropdownMenuItem>
+              {movableLabels.length > 0 && (
+                <DropdownMenuSub>
+                  <DropdownMenuSubTrigger className="gap-2 text-xs">
+                    <IconFolder className="h-3.5 w-3.5" />
+                    {t("mail.actions.moveTo")}
+                  </DropdownMenuSubTrigger>
+                  <DropdownMenuSubContent className="max-h-72 w-56 overflow-y-auto">
+                    {movableLabels.map((label) => (
+                      <DropdownMenuItem
+                        key={label.id}
+                        onClick={() => moveFocusedToLabel(label.id, label.name)}
+                        className="text-xs"
+                      >
+                        {label.name}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuSubContent>
+                </DropdownMenuSub>
+              )}
+              {view !== "trash" && (
+                <DropdownMenuItem
+                  onClick={trashFocused}
+                  className="gap-2 text-xs text-destructive focus:text-destructive"
+                >
+                  <IconTrash className="h-3.5 w-3.5" />
+                  {t("mail.actions.moveToTrash")}
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel>
+                {t("mail.selection.select")}
+              </DropdownMenuLabel>
+              <DropdownMenuItem onClick={selectAllThreads} className="text-xs">
+                {t("mail.selection.all")}
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={clearSelection} className="text-xs">
+                {t("mail.selection.none")}
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={selectReadThreads} className="text-xs">
+                {t("mail.selection.read")}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={selectUnreadThreads}
+                className="text-xs"
+              >
+                {t("mail.views.unread")}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={selectStarredThreads}
+                className="text-xs"
+              >
+                {t("mail.views.starred")}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={selectUnstarredThreads}
+                className="text-xs"
+              >
+                {t("mail.selection.unstarred")}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      ) : null,
+    [
+      selectedIds.size,
+      t,
+      clearSelection,
+      openAiFilterDialog,
+      archiveFocused,
+      markFocusedRead,
+      markFocusedUnread,
+      movableLabels,
+      moveFocusedToLabel,
+      view,
+      trashFocused,
+      selectAllThreads,
+      selectReadThreads,
+      selectUnreadThreads,
+      selectStarredThreads,
+      selectUnstarredThreads,
+    ],
+  );
+  const headerActions = useMemo(
+    () =>
+      sortHeaderAction || bulkHeaderActions ? (
+        <>
+          {sortHeaderAction}
+          {bulkHeaderActions}
+        </>
+      ) : null,
+    [bulkHeaderActions, sortHeaderAction],
+  );
+  useSetHeaderActions(headerActions);
 
-  // Error state
+  const cooldownNotice =
+    read && read.freshness !== "live" ? (
+      <GmailCooldownNotice read={read} onRetry={refetch} />
+    ) : null;
+
   if (emailsError) {
     const needsCredentials =
       emailsError.message?.includes("GOOGLE_CLIENT_ID") ||
@@ -1374,14 +2582,15 @@ export function EmailList({
       );
     }
 
-    const isQuotaError = /\((429|403)\)|quota|rate limit/i.test(
-      emailsError.message ?? "",
-    );
+    const isQuotaError =
+      (emailsError as { status?: number }).status === 429 ||
+      /\((429|403)\)|quota|rate limit/i.test(emailsError.message ?? "");
 
     return (
       <EmailErrorState
         isQuotaError={isQuotaError}
         message={emailsError.message ?? ""}
+        retryAfterMs={(emailsError as { retryAfterMs?: number }).retryAfterMs}
         isFetching={isFetching}
         onRetry={refetch}
         containerRef={containerRef}
@@ -1389,9 +2598,55 @@ export function EmailList({
     );
   }
 
-  // Loading skeleton — Superhuman-style single-line rows
   if (isLoading) {
     return <MailLoadingState containerRef={containerRef} />;
+  }
+
+  if (
+    currentSortMode === "priority" &&
+    !activePriorityOrder &&
+    priorityWindowEmails.length > cachedPriorityScores.size
+  ) {
+    return <MailLoadingState containerRef={containerRef} />;
+  }
+
+  // Client-sliced inbox tabs can have no matches on the first page even when
+  // later inbox pages contain matching threads. Keep the sentinel mounted so
+  // the infinite query can continue before showing an empty state.
+  if (threads.length === 0 && hasNextPage) {
+    return (
+      <div className="flex h-full flex-col" ref={containerRef}>
+        {cooldownNotice}
+        {!!accountErrors?.length && (
+          <AccountErrorsNotice errors={accountErrors} />
+        )}
+        <div className="flex flex-1 items-center justify-center" />
+        <div
+          ref={sentinelRef}
+          className="flex items-center justify-center py-3"
+        >
+          {isFetchingNextPage && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Spinner className="size-3 text-muted-foreground" />
+              {t("mail.empty.loadingMore")}
+            </div>
+          )}
+          {shouldShowPaginationRetry({
+            hasNextPage: Boolean(hasNextPage),
+            isFetchingNextPage: Boolean(isFetchingNextPage),
+            isFetchNextPageError: Boolean(isFetchNextPageError),
+          }) && (
+            <button
+              type="button"
+              onClick={() => void retryNextPage()}
+              className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground shadow-sm hover:bg-primary/90"
+            >
+              {t("mail.error.tryAgain")}
+            </button>
+          )}
+        </div>
+      </div>
+    );
   }
 
   // Empty state
@@ -1399,6 +2654,10 @@ export function EmailList({
     if (searchQuery) {
       return (
         <div className="flex h-full flex-col" ref={containerRef}>
+          {cooldownNotice}
+          {!!accountErrors?.length && (
+            <AccountErrorsNotice errors={accountErrors} />
+          )}
           <div className="flex flex-1 flex-col items-center justify-center">
             <div className="text-center px-8">
               <div className="mb-4">
@@ -1417,28 +2676,36 @@ export function EmailList({
                 </svg>
               </div>
               <p className="text-sm font-medium text-foreground/80">
-                No results for &ldquo;{searchQuery}&rdquo;
+                {t("mail.empty.noSearchResults", { query: searchQuery })}
               </p>
               <p className="text-xs text-muted-foreground mt-1">
-                Try different keywords
+                {t("mail.empty.tryDifferentKeywords")}
               </p>
             </div>
           </div>
         </div>
       );
     }
-    if (view === "inbox" || view === "important") {
+    if (
+      (view === "inbox" || view === "important" || labelParam) &&
+      !accountErrors?.length &&
+      !cooldownNotice
+    ) {
       return <InboxZero />;
     }
     return (
       <div className="flex h-full flex-col" ref={containerRef}>
+        {cooldownNotice}
+        {!!accountErrors?.length && (
+          <AccountErrorsNotice errors={accountErrors} />
+        )}
         <div className="flex flex-1 flex-col items-center justify-center">
           <div className="text-center px-8">
             <p className="text-sm font-medium text-foreground/80">
-              Nothing here yet
+              {t("mail.empty.nothingHere")}
             </p>
             <p className="text-xs text-muted-foreground mt-1">
-              {emptyStateHintForView(view)}
+              {t(emptyStateHintKeyForView(view))}
             </p>
           </div>
         </div>
@@ -1446,67 +2713,130 @@ export function EmailList({
     );
   }
 
+  const canArchiveInView =
+    view !== "archive" &&
+    view !== "trash" &&
+    view !== "sent" &&
+    view !== "drafts" &&
+    view !== "scheduled" &&
+    view !== "snoozed";
+  const canSnoozeInView =
+    view !== "snoozed" &&
+    view !== "scheduled" &&
+    view !== "sent" &&
+    view !== "drafts" &&
+    view !== "trash";
+  const canTrashInView = view !== "inbox" && view !== "trash";
+  const virtualItems = rowVirtualizer.getVirtualItems();
+
   return (
     <div className="flex h-full flex-col" ref={containerRef}>
-      <div className="flex-1 overflow-y-auto">
-        {threads.map((thread) => (
-          <EmailListItem
-            key={thread.latestMessage.id}
-            email={thread.latestMessage}
-            thread={thread}
-            isSelected={thread.latestMessage.id === threadId}
-            isFocused={thread.latestMessage.id === focusedId}
-            isMultiSelected={selectedIds.has(
-              thread.latestMessage.threadId || thread.latestMessage.id,
-            )}
-            onSelect={() => handleSelect(thread)}
-            onToggleMultiSelect={(e) => handleToggleMultiSelect(e, thread)}
-            onStar={(e) => handleStar(e, thread)}
-            onToggleRead={(e) => handleToggleReadThread(e, thread)}
-            onArchive={
-              view !== "archive" &&
-              view !== "trash" &&
-              view !== "sent" &&
-              view !== "drafts" &&
-              view !== "scheduled" &&
-              view !== "snoozed"
-                ? (e) => handleArchiveThread(e, thread)
-                : undefined
-            }
-            onSnooze={
-              view !== "snoozed" &&
-              view !== "scheduled" &&
-              view !== "sent" &&
-              view !== "drafts" &&
-              view !== "trash"
-                ? (e) => {
-                    e.stopPropagation();
-                    handleSwipeSnooze(thread);
+      {cooldownNotice}
+      <div className="flex-1 overflow-y-auto" ref={scrollParentRef}>
+        <AiFilterDialog
+          open={!!aiFilterDialog}
+          onOpenChange={(open) => !open && setAiFilterDialog(null)}
+          action={aiFilterDialog?.action ?? "filter"}
+          targets={aiFilterDialog?.targets ?? []}
+          onComplete={() => setSelectedIds(new Set())}
+        />
+        <div
+          style={{
+            height: rowVirtualizer.getTotalSize(),
+            position: "relative",
+            width: "100%",
+          }}
+        >
+          {virtualItems.map((virtualRow) => {
+            const thread = threads[virtualRow.index];
+            if (!thread) return null;
+            return (
+              <div
+                key={virtualRow.key}
+                ref={rowVirtualizer.measureElement}
+                data-index={virtualRow.index}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  transform: `translateY(${virtualRow.start}px)`,
+                }}
+              >
+                <EmailListItem
+                  email={thread.latestMessage}
+                  importanceScore={
+                    view === "inbox" && currentSortMode === "priority"
+                      ? cachedPriorityScores.get(
+                          aiPriorityEmailKey(
+                            thread.latestMessage.accountEmail,
+                            thread.latestMessage.id,
+                          ),
+                        )
+                      : undefined
                   }
-                : undefined
-            }
-            onTrash={
-              view === "trash" ? undefined : (e) => handleTrashThread(e, thread)
-            }
-            onSendNow={
-              getScheduledJobId(thread.latestMessage)
-                ? (e) => handleSendScheduledNow(e, thread)
-                : undefined
-            }
-            onCancelSchedule={
-              getScheduledJobId(thread.latestMessage)
-                ? (e) => handleCancelScheduled(e, thread)
-                : undefined
-            }
-            onHover={() => {
-              setFocusedId(thread.latestMessage.id);
-            }}
-            onSwipeArchive={() => handleSwipeArchive(thread)}
-            onSwipeSnooze={() => handleSwipeSnooze(thread)}
-            highlight={searchQuery}
-          />
-        ))}
-        {/* Sentinel for infinite scroll + loading indicator */}
+                  labelNames={labelNames}
+                  thread={thread}
+                  isSelected={thread.latestMessage.id === threadId}
+                  isFocused={thread.latestMessage.id === focusedId}
+                  isMultiSelected={selectedIds.has(
+                    thread.latestMessage.threadId || thread.latestMessage.id,
+                  )}
+                  canArchive={canArchiveInView}
+                  canSnooze={canSnoozeInView}
+                  canTrash={canTrashInView}
+                  scheduledJobId={getScheduledJobId(thread.latestMessage)}
+                  onSelect={handleSelect}
+                  onToggleMultiSelect={handleToggleMultiSelect}
+                  onStar={handleStar}
+                  onToggleRead={handleToggleReadThread}
+                  onArchive={handleArchiveThread}
+                  onSnooze={handleSnoozeButtonClick}
+                  onTrash={handleTrashThread}
+                  onImportanceFeedback={
+                    view === "inbox"
+                      ? (decision) =>
+                          recordPriorityFeedback(thread.latestMessage, decision)
+                      : undefined
+                  }
+                  onSendNow={handleSendScheduledNow}
+                  onCancelSchedule={handleCancelScheduled}
+                  onConfirmUncertainScheduled={handleConfirmUncertainScheduled}
+                  onRetryUncertainScheduled={handleRetryUncertainScheduled}
+                  onHover={handleHoverThread}
+                  onSwipeArchive={handleSwipeArchive}
+                  onSwipeSnooze={handleSwipeSnooze}
+                  highlight={searchQuery}
+                />
+              </div>
+            );
+          })}
+        </div>
+        <AlertDialog
+          open={retryUncertainJobId !== null}
+          onOpenChange={(open) => !open && setRetryUncertainJobId(null)}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {t("mail.sendLater.confirmSendNewCopyTitle")}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {t("mail.sendLater.confirmSendNewCopyDescription")}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>{t("mail.compose.cancel")}</AlertDialogCancel>
+              <AlertDialogAction onClick={handleConfirmRetryUncertainScheduled}>
+                {t("mail.sendLater.sendNewCopy")}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+        {/* Sentinel for infinite scroll + loading indicator — lives after the
+            virtualizer's sized inner container so it still sits at the true
+            end of scrollable content and the IntersectionObserver above
+            continues to fire as the user nears the bottom. */}
         {hasNextPage && (
           <div
             ref={sentinelRef}
@@ -1515,8 +2845,21 @@ export function EmailList({
             {isFetchingNextPage && (
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
                 <Spinner className="size-3 text-muted-foreground" />
-                Loading more...
+                {t("mail.empty.loadingMore")}
               </div>
+            )}
+            {shouldShowPaginationRetry({
+              hasNextPage: Boolean(hasNextPage),
+              isFetchingNextPage: Boolean(isFetchingNextPage),
+              isFetchNextPageError: Boolean(isFetchNextPageError),
+            }) && (
+              <button
+                type="button"
+                onClick={() => void retryNextPage()}
+                className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground shadow-sm hover:bg-primary/90"
+              >
+                {t("mail.error.tryAgain")}
+              </button>
             )}
           </div>
         )}

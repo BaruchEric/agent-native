@@ -1,236 +1,36 @@
 # Analytics — Agent Guide
 
-Analytics is an agent-native BI workspace. The agent manages data sources,
-queries, dashboards, charts, analyses, and connected warehouse integrations
-through actions and SQL-backed state.
-
-Keep this file essential. Querying, dashboard, warehouse, and implementation
-details live in `.agents/skills/`.
-
-## Core Rules
-
-- Never hardcode API keys, tokens, webhook URLs, signing secrets, private Builder/internal data, customer data, or credential-looking literals. Use secrets/OAuth/runtime configuration and obvious placeholders in examples.
-- Data integrity comes first. Do not invent numbers, dimensions, filters, or
-  source semantics. State uncertainty and inspect the source when needed.
-- Catalog-first: before querying, consult known data sources (data-source
-  status) and the injected `<data-dictionary>` to learn what exists and which
-  table/columns/join paths to use. Don't fan out blind queries when the catalog
-  already answers where a fact lives.
-- Clarify-first for ambiguous ad-hoc work: when the metric definition, date
-  range, or grain is ambiguous and a wrong guess would change the numbers, use
-  the `ask-question` clarifying tool (multiple-choice) before computing. Ask at
-  most once per turn, and never when the dictionary or the user already settled
-  it.
-- Verify before claiming: only present numbers you actually retrieved from a
-  source. Never report a value you did not query.
-- The built-in Node Exporter demo dashboard uses the `demo` source. It queries
-  the built-in public demo Prometheus endpoint by default, not the user's
-  Prometheus credential slot. Treat it as demo-environment data: do not use it
-  for `REAL_DATA_REQUIRED`, saved analyses, or real user analytics answers
-  unless the user explicitly asks to inspect the demo dashboard.
-- Every analytical answer should include enough audit context for the user to
-  trust it: source(s), time window, filters, sample size or row count,
-  join/match method when relevant, and caveats/gaps.
-- Use actions for data sources, queries, charts, dashboards, analyses, and
-  sharing. Do not bypass app access checks with raw SQL for ownable resources.
-- In dev, call actions with `pnpm action <name>`; in production, call native
-  tools. The action schema is authoritative.
-- Prefer app query actions and provider readers over hand-written ad hoc SQL
-  unless the user explicitly asks for low-level inspection.
-- Provider actions are shortcuts, not limits. When a canned action cannot
-  express the endpoint, filters, request body, pagination, or API version the
-  user needs, call `provider-api-catalog` / `provider-api-docs`, then
-  `provider-api-request` against the provider's real HTTP API. The generic
-  request action uses the shared `@agent-native/core/provider-api` runtime,
-  injects configured credentials, blocks private/internal URLs, and redacts
-  secrets.
-- For named account/deal deep dives, call `account-deep-dive` first. It bundles
-  HubSpot deal/account/contact activity with Gong call detail and compact
-  transcript evidence so the final report can match Fusion-style depth.
-- For HubSpot deal cohorts, use structured `hubspot-deals` filters for the
-  cohort definition: `product` for the `products` field, `pipeline` for deal
-  pipeline, `closedStatus` for won/lost/open, and `closedDateFrom` /
-  `closedDateTo` for close-date windows. `query` is full-text search across
-  deals and is not valid proof that a specific property matched.
-- For BigQuery, Prometheus, or other external providers, use the provider skill
-  and existing credential/integration flow.
-- For questions that span multiple sources, follow `cross-source-analysis`:
-  stitch identities on BOTH a stable id AND email, de-duplicate, and cite
-  per-source provenance.
-- When the user challenges coverage or asks why records are missing, rerun or
-  revise from the source cohort and provide the updated answer directly. Do not
-  say a revised analysis exists unless you include it or save it.
-- Dashboards and charts should be useful, explainable, and scoped to the user's
-  question. Avoid decorative metrics.
-- For shipped dashboard templates, call `list-dashboard-templates` first, then
-  `install-dashboard-template` with the selected `templateId`. Do not recreate a
-  catalog template by hand unless the user asks for a custom variant.
-- Native dashboards and saved analyses are constrained artifacts. If a requested
-  dashboard, analysis surface, visualization, interaction model, custom layout,
-  or bespoke workflow cannot be done faithfully with the built-in dashboard JSON
-  config/components or saved-analysis markdown/chart format, automatically build
-  it as an extension instead and tell the user why.
-- Use framework sharing and access helpers for dashboards, analyses, and saved
-  resources.
-
-## Application State
-
-- `navigation` exposes current dashboard, analysis, source, chart, and selected
-  context.
-- `navigate` moves the user to the relevant analytics view, including
-  `view="catalog"` for the template catalog.
-- Use `view-screen` when the active dashboard/chart context is unclear.
-
-## Dashboard Template Catalog
-
-- `list-dashboard-templates` lists source-controlled dashboard templates with
-  `id`, category, data sources, panel count, and installed dashboard IDs.
-- `install-dashboard-template` installs a catalog template into normal
-  SQL-backed dashboards. Required: `templateId`. Optional: `dashboardId`,
-  `name`, `overwrite`, and `forceNew`.
-- Node Exporter ships as `node-exporter-macos` for Darwin/Homebrew
-  `node_exporter` scrapes and `node-exporter-full` for the Linux-focused
-  Grafana 1860 revision 45 full dashboard converted into native Analytics
-  panels. `node-exporter-full` also includes Prometheus Observability Demo app
-  metrics (`demo_http_*`, `demo_chaos_mode`, and synthetic CPU/disk/memory
-  workload metrics). Keep the first-open `App / Overview` tab light: it should
-  show the Request Latency highlight plus current app state, while Traffic,
-  Latency, and Workload details stay split across their own `App / *` tabs.
-
-## Demo Dashboard
-
-- `ensure-demo-dashboards` installs one private per-user demo on first app
-  open: `demo-node-exporter`. The Analytics root route calls this before
-  honoring local last-opened state; when the action creates the demo, the user
-  should land directly on the Node Exporter demo's `App / Overview` tab without
-  visiting the template catalog or data-source setup.
-- The demo dashboard is generated from the same `node-exporter-full` seed as
-  the catalog template. Its Prometheus panels keep the same PromQL descriptors
-  and use `source: "demo"` so queries route to the demo Prometheus endpoint
-  instead of the user's `PROMETHEUS_*` credential slot.
-- The demo Prometheus endpoint defaults to the public read-only
-  `https://prometheus.agent-native.foo`, so cloud and local MPX installs work
-  without user setup. Deployments can override it with
-  `ANALYTICS_DEMO_PROMETHEUS_URL` and optional
-  `ANALYTICS_DEMO_PROMETHEUS_USERNAME`,
-  `ANALYTICS_DEMO_PROMETHEUS_PASSWORD`, or
-  `ANALYTICS_DEMO_PROMETHEUS_BEARER_TOKEN`. Do not put credential values in
-  source, docs, fixtures, tests, prompts, or dashboard seeds.
-- Demo dashboards are ordinary SQL dashboard rows, so rename, share, archive,
-  and delete flows apply. Deleted demo IDs are tombstoned in SQL settings and
-  are not recreated unless the user explicitly asks to reset demos.
-- Use `ensure-demo-dashboards --reset=true` only when the user asks to restore
-  a deleted or changed demo dashboard.
-
-## Deep Analysis Rules
-
-**The analytics agent IS Claude with provider access** — the same 200K context
-window, the same reasoning capability, plus direct access to BigQuery, Gong,
-HubSpot, Pylon, Sentry, Grafana, etc. It can do everything a standalone AI
-conversation can do, including reading large unstructured text and producing
-long-form memo-style output.
-
-**NEVER suggest the user move to a separate AI tool, project, or external service for:**
-
-- Reasoning or synthesis over data fetched in this session
-- Deep analysis across multiple accounts, calls, or data points
-- Holding context and judgment across a complex multi-step investigation
-- Generating written summaries, memos, findings, or recommendations
-
-### Answer with Real Data
-
-When the user asks a data question, **query real data first**, then present the
-answer directly in chat with tables, inline charts, and findings. Never deflect
-to "check the dashboard" — actually run the query, get the data, and present it.
-
-### Incident / Metric Investigations
-
-When investigating a production incident, metric anomaly, or performance issue:
-
-1. **Query real metrics FIRST** — Prometheus/Grafana for service metrics, Sentry
-   for errors, BigQuery for event trends. Real data tells you what happened.
-2. **Check upstream dependencies** — many incidents are caused by provider-side
-   degradation (LLM APIs, external services), not local code.
-3. **Only analyze code/config after you have data** — code tells you what _could_
-   happen; metrics tell you what _did_ happen.
-
-### Batch / Large Fan-Out Analyses
-
-For analyses spanning 30+ accounts, deals, or calls:
-
-1. Define the cohort and chunk into groups of 5-10 items.
-2. Process each chunk, writing per-item findings as intermediate notes.
-3. Synthesize across all chunks in a final pass.
-
-Do not try to hold 30+ full records in one context pass.
-
-### Corpus-First Provider Analysis
-
-For broad provider searches, cross-source joins, mention counts, classifications,
-or questions where absence matters:
-
-1. Inspect the provider catalog/docs when a canned action cannot express the
-   exact endpoint, filter, body, or pagination needed.
-2. Fetch the full relevant cohort, or an explicit bounded cohort, using
-   `provider-api-request` with `fetchAllPages`, `stageAs`, or `saveToFile` when
-   the payload is large.
-3. Use `run-code` with `providerSearchAll` for broad mention/phrase/term/regex
-   searches across transcripts, messages, tickets, issues, notes, events, or
-   documents; it preserves provider item IDs, snippets, paths, page/item counts,
-   and pagination status. Use `providerFetch`, `appAction`, and
-   Resources-backed workspace helpers to join, classify, count, and aggregate
-   without flooding chat context. Write temporary files under `scratch/`; write
-   durable, user-facing files under a descriptive Resources folder only when
-   they should remain visible after the analysis.
-   Give durable corpus jobs descriptive, source-neutral names and preserve the
-   `jobId`; completed, quota-waiting, and failed jobs are surfaced in the app
-   with their coverage counts so the user can resume or inspect the exact run.
-4. Report coverage: source, filters, time window, row/record counts, joins,
-   failed/aborted pages, truncation, and any remaining gaps.
-
-Never turn sampled records, default limits, truncated excerpts, or aborted tool
-calls into a confident "none found", "all records", or exhaustive conclusion.
-Recover coverage first, or answer as explicitly partial.
-
-### Learnings Flywheel
-
-After completing any significant analysis, record discoveries to `LEARNINGS.md`
-via the `resources` tool (`action: "read"` then `action: "write"`). Capture:
-
-- Confirmed metric definitions
-- Provider gotchas discovered
-- Schema discoveries (table/column names, join patterns that worked)
-- Identity-stitching rules confirmed across sources
-
-The `save-memory` tool works for personal-scope learnings; `LEARNINGS.md` is the
-shared team knowledge layer.
+Analytics owns sources, queries, charts, and dashboards; dashboards are canonical and legacy analyses remain readable.
 
 ## Skills
 
-Read the relevant skill before deeper work:
+The skills summary lists every skill; find more with `rg --hidden --follow` in `.agents/skills/<name>/SKILL.md` and read one with `pnpm action docs-search --slug "skill-<name>"` before deeper work.
 
-- `data-querying` for source inspection, SQL/query generation, and result
-  handling.
-- `cross-source-analysis` for questions that span multiple data sources
-  (identity stitching, de-duplication, consolidated provenance). Includes the
-  default account deep-dive source order: CRM → support → community → calls →
-  product usage → service health → tickets.
-- `hubspot` for CRM deals, companies, contacts, tickets, owners, and account
-  context. Includes stage-entry date fields and multi-dimensional loss analysis.
-- `gong` for call metadata, transcript excerpts, objections, risks, and next
-  steps. Includes the two-pass search algorithm and external-monologue pattern.
-- `bigquery` for warehouse SQL, data-dictionary-first discipline, table priority
-  order, and date-bounding rules.
-- `prometheus` for metrics queries and incident investigation pattern.
-- `actions` for the shared provider API pattern when a first-class action is too
-  narrow for arbitrary authenticated provider HTTP calls and API docs lookup.
-- `dashboard-management` for dashboard/chart creation and layout.
-- `adhoc-analysis` for one-off analytical answers and batch fan-out pattern.
-- `analysis-workspace` for large-scale multi-source analyses: Resources-backed
-  files, `scratch/` temporary staging, chunked batch processing with per-item
-  memos, `run-code` aggregation, `saveToFile`/`fetchAllPages` for large API
-  pulls, and multi-turn synthesis.
-  Read this before any analysis spanning 30+ items or requiring data larger
-  than one context window.
-- `storing-data`, `real-time-sync`, `security`, `actions`, and
-  `frontend-design` for framework work.
+Use local docs only (no web research): `pnpm action docs-search --query "<topic>"` and `pnpm action docs-search --slug "<slug>"`. Source examples: `pnpm action source-search --query "<pattern>"` or `pnpm action source-search --path <path>`.
+
+## Data questions
+
+- Edit a panel on the open dashboard with `get-sql-dashboard` (`panelIds`), then `mutate-dashboard`; no skill read is needed (read `dashboard-management` to create a dashboard or move, reorder, or lay out panels). A dashboard edit is done only when `mutate-dashboard` returns `verified: true`. `noRenderAffected: true` means no chart changed. On `verified: false`, an error, or "the change isn't visible", follow `nextStep` and call `inspect-dashboard-panel` before saying anything; "Applied N ops", a raw `bigquery` result, or no warning banner is not proof.
+- Start from the closest query example (a preloaded reference, else one `find-data` search); to build or clone a dashboard from another, call `search-dashboard-references`, then inspect matches with `get-sql-dashboard` or `get-explorer-dashboard` by `kind`. A match is context, not live data.
+- Use one bounded SQL or server-side `run-code` call for lists, filters, counts, or cohorts. If the catalog misses, call `find-data` once, then inspect exact metadata with `search-bigquery-schema` or provider status only when needed; do not fan out per item or add unasked breakdowns.
+- For an exact owner-defined dbt metric, use `query-dbt-semantic-metric` when a dbt workspace connection is available. dbt defines metric meaning and grain; Sigma and Amplitude are examples and cross-checks. Do not infer an owner-approved metric from a model name or dashboard.
+- Answer shape: when a saved or certified dashboard answers, open with one line naming and linking it (`[Title](/dashboards/<id>)`) and how to read it there, then answer. Add a short "How it's computed" note (source, window, filters, sample size, caveats) only when it changes how to read the number. Show SQL, tables, or schema only when asked, when the user writes SQL or asks about tables or columns, or when no dashboard matches. Label figures “Unverified” if no live query ran; never cite the public `demo` source as real evidence unless asked.
+- Create or change saved artifacts only when asked. For named accounts, use `account-deep-dive`; for health, read `account-health`. When challenged on coverage, rerun from the source cohort and provide the updated answer.
+
+## Core rules
+
+- UI feedback: target 100 ms, never exceed 400 ms; acknowledge before network work.
+- Sibling apps delegate metrics and product questions over A2A in natural language, never SQL. Analytics owns schema, source selection, and stable shaped reads.
+- Use actions for data and sharing; respect ownable access checks. Provider actions are shortcuts: for broad/absence-sensitive Gong work stage and reduce raw data with `query-staged-dataset` or a Data Program.
+- Reports/alerts use SQL actions and cap at five recipients. Store large payloads in file/blob storage, not SQL or app state.
+- Never invent data or source semantics. For external integrations, inspect the workspace/provider connection catalog first; reuse its scoped resolver.
+- For MCP, use allowlisted cataloged actions; use `ask_app` for interpretation, source selection, multi-step, or unsupported actions.
+- Replay-key MCP write: `update-analytics-public-key` appends origins; the first origin restricts replay.
+
+## Sessions and state
+
+- `list-session-recordings` filters scoped replays. Use `paginated: true` for sorted pages with a real total and app counts. With the Sessions triage Lab, `didEvents` / `didNotEvents` filter tracked events and `slow` filters speed. Get names/counts from `list-session-event-names` and event health from `list-event-catalog`; Analytics' index covers sessions only since its coverage start. Never query BigQuery for these views.
+- `navigation` tracks dashboard, analysis, source, chart, and selection. `navigate` opens supported Analytics views, including `sessions`, `event-catalog`, `performance`, `monitoring`, and `agents`. Use `view-screen` when context is unclear.
+- Clicking a panel stages a chat context chip and sets `selected-object` with `type="dashboard-panel"`; read `dashboard-management` for dashboard overview/folder actions.
+
+Before building common workspace or agent UI, read `agent-native-toolkit`; for supported customization, read `customizing-agent-native`.

@@ -1,13 +1,18 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 import {
+  _resetHostHardReloadCooldownForTests,
   AGENT_NATIVE_HOST_MESSAGE_TYPES,
   announceAgentNativeFrameReady,
   createAgentNativeHostBridge,
+  defaultAgentNativeHostCommands,
   readAgentNativeScreenContext,
   requestAgentNativeHostActions,
   requestAgentNativeHostContext,
+  requestAgentNativeHostWebMcpTools,
   runAgentNativeHostAction,
+  runAgentNativeHostWebMcpTool,
   sendAgentNativeHostCommand,
 } from "./host-bridge.js";
 
@@ -256,6 +261,78 @@ describe("createAgentNativeHostBridge", () => {
     bridge.stop();
   });
 
+  it("lists and runs explicitly enabled WebMCP tools", async () => {
+    const target = targetWindow();
+    const webmcp = {
+      supported: true,
+      listTools: vi.fn(async () => [
+        {
+          name: "get-order",
+          description: "Read an order",
+          origin: "https://shop.example",
+          inputSchema: { type: "object" },
+          annotations: { readOnlyHint: true },
+        },
+      ]),
+      executeTool: vi.fn(async () => '{"status":"shipped"}'),
+      executeListedTool: vi.fn(async () => '{"status":"shipped"}'),
+    };
+    const requestApproval = vi.fn(() => ({ approved: true }));
+    const bridge = createAgentNativeHostBridge({
+      targetWindow: target.win,
+      agentOrigin: "https://agent.example",
+      commands: { requestApproval },
+      webmcp,
+    }).start();
+
+    dispatchFromAgent(target.win, "https://agent.example", {
+      type: AGENT_NATIVE_HOST_MESSAGE_TYPES.LIST_WEBMCP_TOOLS,
+      requestId: "webmcp-list-1",
+    });
+    await nextTick();
+    expect(target.sent[0].message).toMatchObject({
+      type: AGENT_NATIVE_HOST_MESSAGE_TYPES.WEBMCP_TOOLS,
+      ok: true,
+      tools: [expect.objectContaining({ name: "get-order" })],
+    });
+
+    dispatchFromAgent(target.win, "https://agent.example", {
+      type: AGENT_NATIVE_HOST_MESSAGE_TYPES.RUN_WEBMCP_TOOL,
+      requestId: "webmcp-run-1",
+      name: "get-order",
+      origin: "https://shop.example",
+      args: { id: "order-1" },
+    });
+    await nextTick();
+    expect(requestApproval).toHaveBeenCalledWith(
+      expect.objectContaining({
+        command: "requestApproval",
+        payload: expect.objectContaining({
+          action: expect.objectContaining({
+            source: "webmcp",
+            requiresApproval: true,
+          }),
+          webmcp: expect.objectContaining({ name: "get-order" }),
+        }),
+      }),
+      expect.any(MessageEvent),
+    );
+    expect(webmcp.executeListedTool).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "get-order",
+        origin: "https://shop.example",
+      }),
+      { id: "order-1" },
+    );
+    expect(target.sent[1].message).toMatchObject({
+      type: AGENT_NATIVE_HOST_MESSAGE_TYPES.WEBMCP_TOOL_RESULT,
+      ok: true,
+      result: '{"status":"shipped"}',
+    });
+
+    bridge.stop();
+  });
+
   it("requires host approval before running destructive client actions", async () => {
     const target = targetWindow();
     const run = vi.fn(() => ({ deleted: true }));
@@ -461,6 +538,71 @@ describe("iframe-side host helpers", () => {
     );
   });
 
+  it("requests and runs a host WebMCP tool", async () => {
+    const host = {
+      postMessage: vi.fn((message: Record<string, unknown>) => {
+        setTimeout(() => {
+          if (
+            message.type === AGENT_NATIVE_HOST_MESSAGE_TYPES.LIST_WEBMCP_TOOLS
+          ) {
+            dispatchFromAgent(
+              host as unknown as Window,
+              "https://host.example",
+              {
+                type: AGENT_NATIVE_HOST_MESSAGE_TYPES.WEBMCP_TOOLS,
+                requestId: message.requestId,
+                ok: true,
+                tools: [
+                  {
+                    name: "get-order",
+                    description: "Read an order",
+                    origin: "https://shop.example",
+                  },
+                ],
+              },
+            );
+          } else {
+            dispatchFromAgent(
+              host as unknown as Window,
+              "https://host.example",
+              {
+                type: AGENT_NATIVE_HOST_MESSAGE_TYPES.WEBMCP_TOOL_RESULT,
+                requestId: message.requestId,
+                ok: true,
+                result: '{"status":"shipped"}',
+              },
+            );
+          }
+        }, 0);
+      }),
+    } as unknown as Window;
+    const options = {
+      targetWindow: host,
+      targetOrigin: "https://host.example",
+      hostOrigin: "https://host.example",
+    };
+
+    await expect(requestAgentNativeHostWebMcpTools(options)).resolves.toEqual([
+      expect.objectContaining({ name: "get-order" }),
+    ]);
+    await expect(
+      runAgentNativeHostWebMcpTool(
+        { name: "get-order", origin: "https://shop.example" },
+        { id: "order-1" },
+        options,
+      ),
+    ).resolves.toBe('{"status":"shipped"}');
+    expect(host.postMessage).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        type: AGENT_NATIVE_HOST_MESSAGE_TYPES.RUN_WEBMCP_TOOL,
+        name: "get-order",
+        origin: "https://shop.example",
+        args: { id: "order-1" },
+      }),
+      "https://host.example",
+    );
+  });
+
   it("sends host commands and resolves command results", async () => {
     const host = {
       postMessage: vi.fn((message: Record<string, unknown>) => {
@@ -527,5 +669,67 @@ describe("readAgentNativeScreenContext", () => {
       }),
     });
     expect(context.screen?.html).toContain("<body>");
+  });
+});
+
+describe("defaultAgentNativeHostCommands hard-reload cooldown", () => {
+  const commandRequest = (command: string) => ({
+    command,
+    origin: "https://host.example",
+  });
+  const fakeEvent = new MessageEvent("message");
+
+  beforeEach(() => {
+    _resetHostHardReloadCooldownForTests();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function mockReload() {
+    const reload = vi.fn();
+    Object.defineProperty(window.location, "reload", {
+      configurable: true,
+      value: reload,
+    });
+    return reload;
+  }
+
+  it("reloads on the first command and swallows repeats inside the cooldown", async () => {
+    const reload = mockReload();
+
+    expect(
+      defaultAgentNativeHostCommands.hardReload?.(
+        commandRequest("hardReload"),
+        fakeEvent,
+      ),
+    ).toEqual({ reloading: true });
+    expect(
+      defaultAgentNativeHostCommands["hard-reload"]?.(
+        commandRequest("hard-reload"),
+        fakeEvent,
+      ),
+    ).toEqual({ reloading: true });
+
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("reloads again once the cooldown has elapsed", async () => {
+    const reload = mockReload();
+
+    await defaultAgentNativeHostCommands.hardReload?.(
+      commandRequest("hardReload"),
+      fakeEvent,
+    );
+    vi.advanceTimersByTime(2_100);
+    await defaultAgentNativeHostCommands.hardReload?.(
+      commandRequest("hardReload"),
+      fakeEvent,
+    );
+
+    expect(reload).toHaveBeenCalledTimes(2);
   });
 });

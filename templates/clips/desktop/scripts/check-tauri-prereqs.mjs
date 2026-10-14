@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-// Preflight: verify Tauri's native prerequisites before invoking `tauri dev` /
-// `tauri build`. Without this, devs see a cryptic
-// `failed to run 'cargo metadata' command` error from the Tauri CLI.
 
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -14,6 +11,7 @@ const RED = "\x1b[31m";
 const YELLOW = "\x1b[33m";
 const CYAN = "\x1b[36m";
 const DIM = "\x1b[2m";
+const MIN_RUST_VERSION = [1, 88, 0];
 
 function has(cmd) {
   try {
@@ -27,8 +25,6 @@ function has(cmd) {
 }
 
 function cargoOnDisk() {
-  // rustup installs to ~/.cargo/bin but the shell PATH update only takes effect
-  // in new shells — detect this case so we can give a clearer "restart shell" hint.
   const bin = platform() === "win32" ? "cargo.exe" : "cargo";
   const candidate = join(homedir(), ".cargo", "bin", bin);
   return existsSync(candidate) ? candidate : null;
@@ -106,4 +102,48 @@ if (!has("cargo")) {
   }
 
   fail(installLines);
+}
+
+function parseRustVersion(output) {
+  const match = output.match(/rustc\s+(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return null;
+  return match.slice(1, 4).map((part) => Number(part));
+}
+
+function compareVersions(a, b) {
+  for (let i = 0; i < 3; i += 1) {
+    if (a[i] > b[i]) return 1;
+    if (a[i] < b[i]) return -1;
+  }
+  return 0;
+}
+
+let rustcOutput = "";
+try {
+  rustcOutput = execFileSync("rustc", ["--version"], {
+    encoding: "utf8",
+  });
+} catch {
+  fail([
+    "",
+    `${YELLOW}Cargo is installed, but ${BOLD}rustc${RESET}${YELLOW} is not available.${RESET}`,
+    "",
+    `${BOLD}Fix:${RESET} update your Rust toolchain, then retry:`,
+    "",
+    `  ${CYAN}rustup update stable${RESET}`,
+  ]);
+}
+
+const rustVersion = parseRustVersion(rustcOutput);
+if (!rustVersion || compareVersions(rustVersion, MIN_RUST_VERSION) < 0) {
+  fail([
+    "",
+    `${YELLOW}Clips Desktop needs Rust ${BOLD}${MIN_RUST_VERSION.join(".")}+${RESET}${YELLOW} for the current Tauri/Sentry native SDKs.${RESET}`,
+    "",
+    `Found: ${DIM}${rustcOutput.trim() || "unknown"}${RESET}`,
+    "",
+    `${BOLD}Fix:${RESET} update Rust, then retry:`,
+    "",
+    `  ${CYAN}rustup update stable${RESET}`,
+  ]);
 }

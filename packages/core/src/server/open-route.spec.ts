@@ -1,7 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// h3 stub: defineEventHandler returns the handler as-is, getMethod reads a
-// field we set on the fake event. Mirrors poll-handler.spec's h3 stub.
 vi.mock("h3", () => ({
   defineEventHandler: (handler: any) => handler,
   getHeader: (event: any, name: string) =>
@@ -19,6 +17,14 @@ const getConfiguredLoginHtml = vi.hoisted(() => vi.fn());
 vi.mock("./auth.js", () => ({
   getSession: (...a: any[]) => getSession(...a),
   getConfiguredLoginHtml: (...a: any[]) => getConfiguredLoginHtml(...a),
+  redirectWithStagedCookies: (event: any, location: string, status = 302) => {
+    const headers = new Headers({ Location: location });
+    const staged = event.res?.headers?.getSetCookie?.() ?? [];
+    for (const cookie of staged) headers.append("set-cookie", cookie);
+    const referrerPolicy = event.res?.headers?.get?.("Referrer-Policy");
+    if (referrerPolicy) headers.set("Referrer-Policy", referrerPolicy);
+    return new Response("", { status, headers });
+  },
 }));
 
 const appStatePut = vi.hoisted(() => vi.fn());
@@ -35,16 +41,36 @@ vi.mock("./embed-session.js", () => ({
   requestHasEmbedAuthMarker: (...a: any[]) => requestHasEmbedAuthMarker(...a),
 }));
 
-import { createOpenRouteHandler } from "./open-route.js";
 import {
   MCP_APP_CHAT_BRIDGE_QUERY_PARAM,
   EMBED_MODE_QUERY_PARAM,
   EMBED_TOKEN_QUERY_PARAM,
 } from "../shared/embed-auth.js";
+import { createOpenRouteHandler } from "./open-route.js";
 
-/** Build a fake H3 event the open route understands. */
-function fakeEvent(url: string, method = "GET") {
-  return { method, node: { req: { url } }, path: url } as any;
+function fakeEvent(
+  url: string,
+  method = "GET",
+  opts: {
+    stagedSetCookies?: string[];
+    stagedReferrerPolicy?: string;
+  } = {},
+) {
+  const responseHeaders = new Headers();
+  for (const cookie of opts.stagedSetCookies ?? []) {
+    responseHeaders.append("set-cookie", cookie);
+  }
+  if (opts.stagedReferrerPolicy) {
+    responseHeaders.set("Referrer-Policy", opts.stagedReferrerPolicy);
+  }
+  return {
+    method,
+    node: { req: { url } },
+    path: url,
+    ...(opts.stagedSetCookies || opts.stagedReferrerPolicy
+      ? { res: { headers: responseHeaders } }
+      : {}),
+  } as any;
 }
 
 describe("createOpenRouteHandler", () => {
@@ -88,9 +114,91 @@ describe("createOpenRouteHandler", () => {
     expect(res.headers.get("Location")).toBe("/inbox?agentSidebar=closed");
   });
 
+  it("carries a Set-Cookie staged during getSession() (e.g. `_session` promotion) onto the 302 response instead of dropping it", async () => {
+    getSession.mockResolvedValue({ email: "user@example.com" });
+    const handler = createOpenRouteHandler();
+
+    const res: Response = await handler(
+      fakeEvent(
+        "/_agent-native/open?app=design&view=editor&designId=design_1&to=%2Fdesign%2Fdesign_1&_session=some-token",
+        "GET",
+        {
+          stagedSetCookies: [
+            "an_session=some-token; Path=/; HttpOnly; SameSite=Lax",
+          ],
+        },
+      ),
+    );
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get("set-cookie")).toContain("an_session=some-token");
+  });
+
+  it("carries the no-referrer policy staged with a promoted query session onto the redirect", async () => {
+    getSession.mockResolvedValue({ email: "user@example.com" });
+    const handler = createOpenRouteHandler();
+
+    const res: Response = await handler(
+      fakeEvent(
+        "/_agent-native/open?app=design&view=editor&designId=design_1&to=%2Fdesign%2Fdesign_1&_session=some-token",
+        "GET",
+        {
+          stagedSetCookies: [
+            "an_session=some-token; Path=/; HttpOnly; SameSite=Lax",
+          ],
+          stagedReferrerPolicy: "no-referrer",
+        },
+      ),
+    );
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get("Referrer-Policy")).toBe("no-referrer");
+  });
+
+  it("never persists a `_session` bridge token into the navigate application-state payload", async () => {
+    getSession.mockResolvedValue({ email: "user@example.com" });
+    const handler = createOpenRouteHandler();
+
+    const res: Response = await handler(
+      fakeEvent(
+        "/_agent-native/open?app=design&view=editor&designId=design_1&to=%2Fdesign%2Fdesign_1&_session=super-secret-token",
+      ),
+    );
+
+    expect(appStatePut).toHaveBeenCalledTimes(1);
+    const [, , payload] = appStatePut.mock.calls[0];
+    expect(payload).not.toHaveProperty("_session");
+    expect(JSON.stringify(payload)).not.toContain("super-secret-token");
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get("Location")).not.toContain("super-secret-token");
+  });
+
+  it("a forged/unknown `_session` value grants nothing: still unauthenticated with no app-state write", async () => {
+    getSession.mockResolvedValue(null);
+    getConfiguredLoginHtml.mockReturnValue({
+      html: "<html>login</html>",
+      status: 200,
+    });
+    const handler = createOpenRouteHandler();
+
+    const res: Response = await handler(
+      fakeEvent(
+        "/_agent-native/open?app=design&view=editor&designId=design_1&to=%2Fdesign%2Fdesign_1&_session=guessed-or-stale",
+      ),
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("<html>login</html>");
+    expect(appStatePut).not.toHaveBeenCalled();
+  });
+
   it("unauthenticated returns the configured login HTML with status 200 and no app-state write", async () => {
     getSession.mockResolvedValue(null);
-    getConfiguredLoginHtml.mockReturnValue("<html>login</html>");
+    getConfiguredLoginHtml.mockReturnValue({
+      html: "<html>login</html>",
+      status: 200,
+    });
     const handler = createOpenRouteHandler();
 
     const res: Response = await handler(
@@ -99,6 +207,67 @@ describe("createOpenRouteHandler", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toContain("text/html");
+    expect(await res.text()).toBe("<html>login</html>");
+    expect(appStatePut).not.toHaveBeenCalled();
+  });
+
+  it("passes through the setup page's 503 while sign-in cannot work", async () => {
+    getSession.mockResolvedValue(null);
+    getConfiguredLoginHtml.mockReturnValue({
+      html: "<html>setup</html>",
+      status: 503,
+    });
+    const handler = createOpenRouteHandler();
+
+    const res: Response = await handler(
+      fakeEvent("/_agent-native/open?view=inbox"),
+    );
+
+    expect(res.status).toBe(503);
+    expect(await res.text()).toBe("<html>setup</html>");
+    expect(appStatePut).not.toHaveBeenCalled();
+  });
+
+  it("unauthenticated may redirect to an app-allowed public open target without app-state writes", async () => {
+    getSession.mockResolvedValue(null);
+    getConfiguredLoginHtml.mockReturnValue({
+      html: "<html>login</html>",
+      status: 200,
+    });
+    const handler = createOpenRouteHandler({
+      allowUnauthenticatedOpen: ({ target }) =>
+        target.split(/[?#]/, 1)[0]?.startsWith("/design/") ?? false,
+    });
+
+    const res: Response = await handler(
+      fakeEvent(
+        "/_agent-native/open?app=design&view=editor&to=%2Fdesign%2Fdesign_123%3FeditorView%3Doverview&designId=design_123&editorView=overview",
+      ),
+    );
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get("Location")).toBe(
+      "/design/design_123?editorView=overview&agentSidebar=closed",
+    );
+    expect(appStatePut).not.toHaveBeenCalled();
+  });
+
+  it("unauthenticated still gets login HTML when the app does not allow the resolved open target", async () => {
+    getSession.mockResolvedValue(null);
+    getConfiguredLoginHtml.mockReturnValue({
+      html: "<html>login</html>",
+      status: 200,
+    });
+    const handler = createOpenRouteHandler({
+      allowUnauthenticatedOpen: ({ target }) =>
+        target.split(/[?#]/, 1)[0]?.startsWith("/design/") ?? false,
+    });
+
+    const res: Response = await handler(
+      fakeEvent("/_agent-native/open?app=design&view=editor"),
+    );
+
+    expect(res.status).toBe(200);
     expect(await res.text()).toBe("<html>login</html>");
     expect(appStatePut).not.toHaveBeenCalled();
   });
@@ -145,9 +314,20 @@ describe("createOpenRouteHandler", () => {
     getSession.mockResolvedValue({ email: "user@example.com" });
     const handler = createOpenRouteHandler();
 
-    // %01 is a control character (Start of Heading).
     const res: Response = await handler(
       fakeEvent("/_agent-native/open?to=%2Ffoo%01bar"),
+    );
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get("Location")).toBe("/?agentSidebar=closed");
+  });
+
+  it("open-redirect guard rejects an auth entry path as `to` so a deep link cannot land on a login form", async () => {
+    getSession.mockResolvedValue({ email: "user@example.com" });
+    const handler = createOpenRouteHandler();
+
+    const res: Response = await handler(
+      fakeEvent("/_agent-native/open?to=%2F_agent-native%2Fsign-in"),
     );
 
     expect(res.status).toBe(302);
@@ -171,11 +351,8 @@ describe("createOpenRouteHandler", () => {
     expect(sp.get("f_range")).toBe("30d");
     expect(sp.get("f_team")).toBe("growth");
     expect(sp.get("agentSidebar")).toBe("closed");
-    // Non-filter record ids are NOT forwarded onto the URL (they ride the
-    // navigate app-state command instead).
     expect(sp.has("dashboardId")).toBe(false);
 
-    // The navigate payload still carries every non-reserved param.
     const [, , payload] = appStatePut.mock.calls[0];
     expect(payload).toMatchObject({
       view: "dashboard",

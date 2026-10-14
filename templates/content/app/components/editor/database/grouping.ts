@@ -1,3 +1,4 @@
+// i18n-raw-literal-disable-file -- unused pure helper copy; live database editor owns localized UI.
 // Board grouping logic: group definitions, item assignment, board-specific helpers.
 // Pure logic — no React, no icons.
 import type {
@@ -7,6 +8,7 @@ import type {
   DocumentPropertyType,
   DocumentPropertyValue,
 } from "@shared/api";
+
 import { type DatabaseBoardGroup, BOARD_UNGROUPED_VALUE } from "./types";
 import { createDatabaseView } from "./view-config";
 import { isDatabasePropertyVisibleInView } from "./view-state";
@@ -71,7 +73,8 @@ export function databaseViewGroupingProperty(
   if (
     view.type !== "table" &&
     view.type !== "list" &&
-    view.type !== "gallery"
+    view.type !== "gallery" &&
+    view.type !== "sidebar"
   ) {
     return null;
   }
@@ -176,7 +179,7 @@ function databaseBoardItemGroupValues(
   item: ContentDatabaseItem,
   property: DocumentProperty,
   optionIds: Set<string>,
-): Array<DocumentPropertyValue | typeof BOARD_UNGROUPED_VALUE> {
+): DocumentPropertyValue[] {
   const value =
     item.properties.find(
       (candidate) => candidate.definition.id === property.definition.id,
@@ -202,14 +205,20 @@ function databaseBoardItemGroupValues(
 
 function databaseBoardGroupId(
   property: DocumentProperty,
-  value: DocumentPropertyValue | typeof BOARD_UNGROUPED_VALUE,
+  value: DocumentPropertyValue,
 ) {
-  return `${property.definition.id}:${String(value)}`;
+  return `${property.definition.id}:${
+    typeof value === "string"
+      ? value
+      : typeof value === "number" || typeof value === "boolean"
+        ? String(value)
+        : (JSON.stringify(value) ?? "")
+  }`;
 }
 
 export function boardGroupValueForProperty(
   property: DocumentProperty,
-  value: DocumentPropertyValue | typeof BOARD_UNGROUPED_VALUE,
+  value: DocumentPropertyValue,
 ): DocumentPropertyValue {
   if (value === BOARD_UNGROUPED_VALUE) {
     return property.definition.type === "multi_select" ? [] : null;

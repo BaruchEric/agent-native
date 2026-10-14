@@ -1,8 +1,44 @@
-import { defineAction } from "@agent-native/core";
-import { getRequestUserEmail } from "@agent-native/core/server";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
-import { trashEmail } from "../server/lib/email-state.js";
+import { getRequestUserEmail } from "@agent-native/core/server";
 import { z } from "zod";
+
+import { trashEmail } from "../server/lib/email-state.js";
+
+const TRASH_CONCURRENCY = 5;
+
+export type TrashEmailActionResult = {
+  requested: string[];
+  succeeded: string[];
+  failed: { id: string; error: string }[];
+};
+
+async function trashWithBoundedConcurrency(
+  ids: string[],
+  run: (id: string, index: number) => Promise<void>,
+): Promise<{ id: string; success: boolean; error?: string }[]> {
+  const results: { id: string; success: boolean; error?: string }[] = new Array(
+    ids.length,
+  );
+  let next = 0;
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= ids.length) return;
+      const id = ids[i];
+      try {
+        await run(id, i);
+        results[i] = { id, success: true };
+      } catch (err: any) {
+        results[i] = { id, success: false, error: err?.message ?? "failed" };
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(TRASH_CONCURRENCY, ids.length) }, worker),
+  );
+  return results;
+}
 
 export default defineAction({
   description: "Move one or more emails to trash by ID.",
@@ -12,6 +48,12 @@ export default defineAction({
       .string()
       .optional()
       .describe("Specific connected account to use"),
+    accountEmails: z
+      .string()
+      .optional()
+      .describe(
+        "Per-id account emails, comma-separated and positionally matched to --id (bulk UI calls only)",
+      ),
   }),
   run: async (args) => {
     const ids = args.id
@@ -23,16 +65,17 @@ export default defineAction({
     const ownerEmail = getRequestUserEmail();
     if (!ownerEmail) throw new Error("no authenticated user");
 
-    const results: { id: string; success: boolean; error?: string }[] = [];
+    const accountEmailList = args.accountEmails
+      ?.split(",")
+      .map((s) => s.trim());
 
-    for (const id of ids) {
-      try {
-        await trashEmail({ id, ownerEmail, accountEmail: args.accountEmail });
-        results.push({ id, success: true });
-      } catch (err: any) {
-        results.push({ id, success: false, error: err?.message ?? "failed" });
-      }
-    }
+    const results = await trashWithBoundedConcurrency(ids, (id, i) =>
+      trashEmail({
+        id,
+        ownerEmail,
+        accountEmail: accountEmailList?.[i] || args.accountEmail,
+      }).then(() => undefined),
+    );
 
     await writeAppState("refresh-signal", { ts: Date.now() });
 
@@ -40,9 +83,26 @@ export default defineAction({
     const failed = results.filter((r) => !r.success);
 
     if (failed.length > 0) {
+      if (ids.length > 1) {
+        return {
+          requested: ids,
+          succeeded: results.filter((r) => r.success).map((r) => r.id),
+          failed: failed.map(({ id, error }) => ({
+            id,
+            error: error ?? "failed",
+          })),
+        } satisfies TrashEmailActionResult;
+      }
       throw new Error(
         `Trashed ${succeeded}/${ids.length} email(s). Failures: ${failed.map((r) => `${r.id}: ${r.error}`).join("; ")}`,
       );
+    }
+    if (ids.length > 1) {
+      return {
+        requested: ids,
+        succeeded: results.map((r) => r.id),
+        failed: [],
+      } satisfies TrashEmailActionResult;
     }
     return `Trashed ${succeeded} email(s) successfully`;
   },

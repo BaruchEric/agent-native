@@ -1,42 +1,126 @@
 ---
 name: create-deck
-description: How to create a new deck with slides from scratch. Read this before creating any deck. Contains exact HTML templates for every slide layout — no codebase exploration needed.
+description: >-
+  Create a new deck with slides from scratch. Use before creating a deck or
+  standalone visual; resolve source fidelity, creative context, and the active
+  design system before using the fallback HTML patterns in this skill.
 ---
 
 # Creating a Deck
 
-**Do not explore the codebase.** Everything you need is here.
+**Do not explore the codebase for routine deck creation.** Use the app actions
+and linked skills. This does not override the active design system, Creative
+Context, reference deck, or source material that the app already provides.
+
+## Read before
+
+Read a reference with `docs-search --slug "skill-create-deck--references-<file>"`,
+for example `skill-create-deck--references-reference-inputs`.
+
+| Situation | Read |
+| --- | --- |
+| A reference deck, attached PDF/PPTX/DOCX, or workspace default applies | `references/reference-inputs.md` |
+| The source is a transcript, meeting notes, or a Google Docs URL | `references/source-material.md` |
+| Writing slide HTML from the fallback title/content patterns or image placeholders | `references/slide-templates.md` |
 
 ## Workflow
 
-1. Plan the slides (title, section dividers, content slides)
-2. Call `create-deck --title "..." --slides '[]'` to create an empty deck
-3. Navigate to the new deck
-4. Call `add-slide` once per slide in slide order, waiting for each result
-   before adding the next slide
+1. Read the `creative-context` skill and retrieve factual evidence separately
+   from presentation structure. Respect `contextMode: "off"`.
+2. Unless the user named a reference deck or design system, call
+   `get-workspace-defaults` once and use the available reference and design
+   system defaults. Call `get-design-system` once for the selected system and
+   reuse its context. `create-deck` also resolves and attaches the effective
+   default; use its returned context for later edits.
+3. Plan the slides and write a compact deck brief: audience, thesis, one message
+   per slide, visual direction, and the deck-level theme contract.
+4. For a short, fully planned deck, call `create-deck` once with every slide
+   in order. Include speaker notes and per-slide Creative Context reuse labels
+   in the payload. Never create an empty deck and then add a finished short
+   deck one slide at a time.
+5. For long or live in-app generation, call `create-deck` with `slides: []`,
+   then add slides sequentially as they are authored so each write preserves
+   its per-slide Creative Context provenance. Wait for each result, but do not
+   read back slides you just wrote: you already hold their HTML, and the
+   `add-slide` result carries the stored `contentHash`. Check the finished deck
+   once at the end (`get-layout-overflows` and `audit-contrast` together).
+6. If the connected browser does not consume the navigation command, call
+   `navigate` with the new deck id.
 
-Do not create multiple slides in parallel for the same deck. Do not spawn
-sub-agents to write into the same deck at the same time. Sub-agents may research
-or draft slide copy, but one writer should call `add-slide` sequentially so the
-editor stays stable and the user can watch progress.
+When speaker notes are requested, put presenter-only text in each slide's
+   `notes` field on `create-deck` or `add-slide`; keep it out of the slide HTML.
+Write notes as speech, not a summary of the slide: the opener, the transition
+to the next slide, numbers to cite, a timing cue.
+Preserve existing notes when editing or importing a source deck.
 
-If the user provides a Google Docs URL as source material, call
-`import-google-doc --url <url>` first and build from the returned text. If the
-action cannot read a private document, the user can connect Google Docs and
-choose the file through the picker, or share the Doc with the configured service
-account. Relay the action's exact access instructions instead of generating from
-the URL alone.
+When the UI has already created the empty deck, keep its id and rename it before
+adding the first slide. Call `patch-deck` with a `patch-deck-fields` operation
+whose `fields.title` is the generated title. Do not leave the pre-created deck's
+placeholder title in place. Include only `title` in that operation's `fields`;
+omit all other optional fields.
+
+Follow the creative-context reuse ladder before inventing a slide language:
+reuse an approved native template unchanged, compose approved pieces, lightly
+adapt a real approved example, generate from narrowly retrieved references,
+then go net-new only when the relevant corpus is empty. Retrieval is a separate
+step from generation. Persist the immutable `contextPackId` and concise reuse
+labels with the deck's generation provenance; never infer provenance later from
+rendered slide HTML.
+
+## Direction and source checkpoint
+
+Before authoring slide HTML, make a compact deck brief with the audience, job,
+narrative thesis, one-sentence visual direction, active design-system tokens,
+reference-deck composition pattern, image treatment, and known fit risks. The
+linked Agent-Native design system controls tokens, typography, spacing, imagery,
+and slide chrome. Read `slide-design` for visual craft; it works inside the
+active system and reference deck, never as a competing theme. If the
+request is open-ended and no approved direction exists, ask one targeted guided
+question or present a bounded choice before writing; do not silently pick a new
+brand language. Write a direction choice for this topic: three options, each a
+vibe word plus one concrete visual cue (palette, type, motif; for example "rust
+technical editorial: warm rust on charcoal, mono headings, code-grid layout"),
+clearly different from each other, the best fit marked recommended. Never offer
+generic labels such as "minimal" or "corporate" alone. Take everything else
+(density, slide count, structure) from the request and do the work.
+
+Before the first slide, lock a deck-level visual contract: background family,
+text and surface roles, accent treatment, heading/body type pairing, spacing
+scale, radius, and image treatment. With a linked system, derive the contract
+from its hydrated tokens. Without one, choose a subject-appropriate direction
+and repeat the same semantic `--deck-*` values on every slide wrapper. Vary
+composition and information hierarchy, not the canvas, font system, or palette.
+Alternating light and dark slides are a theme failure unless the user explicitly
+asks for that structure.
+
+When creative context is available, pass the pre-generation search result's
+`contextPackId` to `create-deck`, pass deck-wide `reuseLabels`, and add
+`creativeContextReuseLabels` to each slide that reused a specific item/version.
+Do not omit these fields and let the final write action search after the HTML
+has already been authored; that would fabricate influence. With an empty
+library, omit them. With Library mode Off, omit them and create normally.
+
+Do not create multiple independent writes in parallel for the same deck. Do not
+spawn sub-agents to write into the same deck at the same time. Every newly
+generated slide in a short, completed deck belongs in the initial `create-deck`
+slides array. Use sequential `add-slide` writes only while a long deck is being
+authored live. Reserve `patch-deck` for deck fields, existing-slide edits,
+ordering, or source-preserving work. Sub-agents may research or draft slide
+copy, but one writer owns every deck mutation so the editor stays stable and the
+user can watch progress.
 
 ```bash
 pnpm action create-deck --title "My Deck" --slides '[]'
 ```
 
-Then navigate:
+`create-deck` also writes the navigation command. If the connected browser did
+not consume it, navigate explicitly:
+
 ```bash
 pnpm action navigate --deckId=<id from create-deck output>
 ```
 
-Then add slides one by one:
+For long or live generation, then add slides one by one:
 
 ```bash
 pnpm action add-slide --deckId=<id> --layout title --content "..."
@@ -45,187 +129,109 @@ pnpm action add-slide --deckId=<id> --layout content --content "..."
 
 ## Slide Wrapper
 
-Every slide's `content` must use this exact outer div:
+Every slide's `content` must use the semantic `--deck-*` contract on its outer
+div. Which of the two forms you use depends on whether a design system is
+linked.
+
+**A design system is linked.** Inherit the renderer's hydrated variables
+(`--ds-bg`, `--ds-text`, `--ds-text-muted`, `--ds-accent`, `--ds-surface`,
+`--ds-heading-font`, `--ds-body-font`, `--ds-radius`) through the contract
+rather than copying values into individual elements:
 
 ```html
-<div class="fmd-slide" style="padding: 80px 110px; display: flex; flex-direction: column; justify-content: flex-start; font-family: 'Poppins', sans-serif;">
+<div class="fmd-slide" style="--deck-bg: var(--ds-bg); --deck-ink: var(--ds-text); --deck-muted: var(--ds-text-muted); --deck-accent: var(--ds-accent); --deck-surface: var(--ds-surface); --deck-heading-font: var(--ds-heading-font); --deck-body-font: var(--ds-body-font); --deck-radius: var(--ds-radius); background: var(--deck-bg); color: var(--deck-ink); padding: 64px 80px; display: flex; flex-direction: column; justify-content: flex-start; font-family: var(--deck-body-font);">
   <!-- slide content here -->
 </div>
 ```
 
-Background is pure black (`bg-[#000000]`) — set by the renderer, not the slide HTML.
-
-## Ready-to-Use Templates
-
-Copy and fill in the bracketed values. Use `\` to escape quotes inside the JSON string.
-
----
-
-### Title Slide
+**No design system is linked.** There is no house style to fall back to, and
+the renderer publishes no `--ds-*` tokens beyond the slide's own background.
+Derive a contract from the deck's subject and write it as literal values:
 
 ```html
-<div class="fmd-slide" style="padding: 80px 110px; display: flex; flex-direction: column; justify-content: center; align-items: flex-start; font-family: 'Poppins', sans-serif;">
-  <div style="font-size: 16px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: #00E5FF; margin-bottom: 24px;">[LABEL OR DATE]</div>
-  <h1 style="font-size: 64px; font-weight: 900; color: #fff; line-height: 1.1; letter-spacing: -2px; margin: 0 0 24px 0;">[TITLE]</h1>
-  <p style="font-size: 22px; color: rgba(255,255,255,0.55); margin: 0;">[SUBTITLE OR PRESENTER]</p>
+<div class="fmd-slide" style="--deck-bg: #10261C; --deck-ink: #F2EFE6; --deck-muted: #A8B8AC; --deck-accent: #7FB069; --deck-surface: rgba(255,255,255,0.05); --deck-heading-font: 'Fraunces', Georgia, serif; --deck-body-font: 'Inter', sans-serif; --deck-radius: 4px; background: var(--deck-bg); color: var(--deck-ink); padding: 64px 80px; display: flex; flex-direction: column; justify-content: flex-start; font-family: var(--deck-body-font);">
+  <!-- slide content here -->
 </div>
 ```
 
----
+That example is a nature-related deck, so colors match the topic of deck. Pick the values once, before the first slide, and repeat the identical contract on every wrapper.
 
-### Section Divider
+Inheriting when nothing is linked is the failure mode to avoid: a
+`var(--ds-accent, currentColor)` reference on an unlinked deck silently
+resolves to a browser default, so the deck reads as unstyled rather than as the
+direction you chose. Never import a stock presentation palette, font, or
+component language as a substitute for choosing.
 
-```html
-<div class="fmd-slide" style="padding: 80px 110px; display: flex; flex-direction: column; justify-content: center; align-items: flex-start; font-family: 'Poppins', sans-serif;">
-  <div style="font-size: 16px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: #00E5FF; margin-bottom: 20px;">[SECTION NUMBER, e.g. 01]</div>
-  <h2 style="font-size: 72px; font-weight: 900; color: #fff; line-height: 1.05; letter-spacing: -2px; margin: 0;">[SECTION TITLE]</h2>
-</div>
-```
+## Slide numbers
 
----
+For a footer page number, use the tokens `<span data-slide-number></span>` and
+`<span data-slide-total></span>`, never typed digits: reorders, inserts, and
+deletes would leave a typed `04 / 08` stale. Add `="pad"` for two digits
+(`<span data-slide-number="pad"></span> / <span data-slide-total="pad"></span>`
+renders `04 / 08`). Leave the spans empty; the renderer fills them from the
+slide's position in the deck.
 
-### Content Slide (bullets)
+## Fit budget
 
-```html
-<div class="fmd-slide" style="padding: 80px 110px; display: flex; flex-direction: column; justify-content: flex-start; font-family: 'Poppins', sans-serif;">
-  <div style="font-size: 14px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: #00E5FF; margin-bottom: 16px;">[SECTION LABEL]</div>
-  <h2 style="font-size: 40px; font-weight: 900; color: #fff; line-height: 1.15; letter-spacing: -1px; margin: 0 0 48px 0;">[SLIDE HEADING]</h2>
-  <div style="display: flex; flex-direction: column; gap: 20px;">
-    <div style="display: flex; align-items: flex-start; gap: 16px;">
-      <span style="font-size: 8px; color: #fff; margin-top: 8px; flex-shrink: 0;">&#x25CF;</span>
-      <span style="font-size: 22px; color: rgba(255,255,255,0.85); line-height: 1.5;">[BULLET TEXT]</span>
-    </div>
-    <div style="display: flex; align-items: flex-start; gap: 16px;">
-      <span style="font-size: 8px; color: #fff; margin-top: 8px; flex-shrink: 0;">&#x25CF;</span>
-      <span style="font-size: 22px; color: rgba(255,255,255,0.85); line-height: 1.5;">[BULLET TEXT]</span>
-    </div>
-    <div style="display: flex; align-items: flex-start; gap: 16px;">
-      <span style="font-size: 8px; color: #fff; margin-top: 8px; flex-shrink: 0;">&#x25CF;</span>
-      <span style="font-size: 22px; color: rgba(255,255,255,0.85); line-height: 1.5;">[BULLET TEXT]</span>
-    </div>
-  </div>
-</div>
-```
+The canvas is fixed at its aspect-ratio dimensions. With the standard 16:9
+canvas (960x540) and `padding: 64px 80px`, the usable content area is only
+800x412px (usable height is canvas height minus both vertical paddings). Treat
+that as a hard budget for the main flow: use at most two title lines, three
+short bullets or cards, and two or three short items per column. A content slide
+carries about 40 words besides its title. A bullet fits on one line (about 70
+characters at 18px); only a card may wrap, to two lines. Split dense source
+material across slides instead of shrinking it into a dense stack. Keep body
+text at or above 16px. Never hide overflow with zoom, `transform: scale()`,
+clipping, or scroll overflow. A later structural repair may reduce the slide's
+explicit padding, and that padding must remain intact when the saved HTML is
+rendered.
 
----
+Before writing a slide, total its flow height: per text block, font-size x
+line-height x wrapped lines (average glyph width is about 0.5 x font-size), plus
+padding and gaps. Count every wrapped line and keep about 10% slack for the
+measured check. Example: a two-line 34px/1.12 heading (76) + 18 gap + three
+cards of two 18px/1.4 lines plus 24 padding (3 x 74 = 223) + two 14px gaps (28)
+= 345, inside 412; a fourth card adds 88 and does not fit. When the total
+exceeds the budget, split the slide; do not shrink type, padding, or gaps.
 
-### Two-Column Slide (text left, image/visual right)
+Build an intentional composition beyond a text dump: use a title block,
+two-column split, metric treatment, rule, callout, visual placeholder, or
+simple diagram where it fits the message. Keep the canvas stable across the
+deck, use accents only for hierarchy or meaning, and do not add decorative
+cards, gradients, fake logos, or shapes without a semantic role. A slide
+with nothing real to show is complete with type, spacing, and a rule. A
+built-in template's signature art belongs to that template; do not carry it
+into other decks.
 
-```html
-<div class="fmd-slide" style="padding: 80px 110px; display: flex; flex-direction: column; justify-content: flex-start; font-family: 'Poppins', sans-serif;">
-  <div style="font-size: 14px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: #00E5FF; margin-bottom: 16px;">[SECTION LABEL]</div>
-  <h2 style="font-size: 40px; font-weight: 900; color: #fff; line-height: 1.15; letter-spacing: -1px; margin: 0 0 40px 0;">[HEADING]</h2>
-  <div style="display: flex; gap: 60px; flex: 1;">
-    <div style="flex: 1; display: flex; flex-direction: column; gap: 20px;">
-      <div style="display: flex; align-items: flex-start; gap: 16px;">
-        <span style="font-size: 8px; color: #fff; margin-top: 8px; flex-shrink: 0;">&#x25CF;</span>
-        <span style="font-size: 20px; color: rgba(255,255,255,0.85); line-height: 1.5;">[BULLET]</span>
-      </div>
-      <div style="display: flex; align-items: flex-start; gap: 16px;">
-        <span style="font-size: 8px; color: #fff; margin-top: 8px; flex-shrink: 0;">&#x25CF;</span>
-        <span style="font-size: 20px; color: rgba(255,255,255,0.85); line-height: 1.5;">[BULLET]</span>
-      </div>
-    </div>
-    <div class="fmd-img-placeholder" style="flex: 1; border-radius: 12px; min-height: 300px;">[IMAGE DESCRIPTION]</div>
-  </div>
-</div>
-```
+Author in normal flex/grid flow; the card, wrapper, height, and `contain` rules
+are in `slide-editing` (Flow Layout and the Editor).
 
----
+## Bounded visual QA
 
-### Statement / Quote Slide
+Before calling the deck complete, render every changed slide at its canonical
+aspect-ratio dimensions and make one batched review pass. Check hierarchy and
+source fidelity, overflow or clipping, contrast, minimum readable text,
+placeholder remnants, broken or missing images, asset fit, and preserved
+`data-slide-object-id` values. Fix the findings in one correction pass and
+recheck. After all slide writes, call `get-layout-overflows` once; after a
+measured-overflow repair, call it once more. If status is unknown, name the
+unmeasured slide numbers and IDs, do not claim the deck fits, and do not repeat
+the call this turn unless the editor has produced a new measurement. Then, as
+the last step before the final response, call
+`audit-contrast` for the deck and follow the Contrast section of
+`slide-editing`; never judge contrast by eye or from hex values. Do not claim
+full-deck or pixel-perfect fidelity unless the whole deck
+was rendered and compared.
 
-```html
-<div class="fmd-slide" style="padding: 80px 110px; display: flex; flex-direction: column; justify-content: center; align-items: flex-start; font-family: 'Poppins', sans-serif;">
-  <div style="width: 60px; height: 4px; background: #00E5FF; margin-bottom: 40px;"></div>
-  <p style="font-size: 48px; font-weight: 800; color: #fff; line-height: 1.2; letter-spacing: -1px; margin: 0 0 32px 0;">&ldquo;[STATEMENT OR QUOTE]&rdquo;</p>
-  <p style="font-size: 18px; color: rgba(255,255,255,0.45); margin: 0;">[SOURCE OR ATTRIBUTION]</p>
-</div>
-```
+## Batch and incremental generation
 
----
+Use a non-empty `create-deck --slides '[...]'` payload for a short, fully
+planned generated deck, imports, or an intentional atomic bulk replacement.
+For long or live in-app generation, use the empty-deck workflow above and add
+each completed slide sequentially.
 
-### Metrics / Stats Slide
-
-```html
-<div class="fmd-slide" style="padding: 80px 110px; display: flex; flex-direction: column; justify-content: flex-start; font-family: 'Poppins', sans-serif;">
-  <div style="font-size: 14px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: #00E5FF; margin-bottom: 16px;">[SECTION LABEL]</div>
-  <h2 style="font-size: 40px; font-weight: 900; color: #fff; line-height: 1.15; letter-spacing: -1px; margin: 0 0 60px 0;">[HEADING]</h2>
-  <div style="display: flex; gap: 60px;">
-    <div style="flex: 1;">
-      <div style="font-size: 72px; font-weight: 900; color: #00E5FF; letter-spacing: -2px; line-height: 1;">[METRIC]</div>
-      <div style="font-size: 18px; color: rgba(255,255,255,0.55); margin-top: 12px;">[LABEL]</div>
-    </div>
-    <div style="flex: 1;">
-      <div style="font-size: 72px; font-weight: 900; color: #00E5FF; letter-spacing: -2px; line-height: 1;">[METRIC]</div>
-      <div style="font-size: 18px; color: rgba(255,255,255,0.55); margin-top: 12px;">[LABEL]</div>
-    </div>
-    <div style="flex: 1;">
-      <div style="font-size: 72px; font-weight: 900; color: #00E5FF; letter-spacing: -2px; line-height: 1;">[METRIC]</div>
-      <div style="font-size: 18px; color: rgba(255,255,255,0.55); margin-top: 12px;">[LABEL]</div>
-    </div>
-  </div>
-</div>
-```
-
----
-
-### Closing / CTA Slide
-
-```html
-<div class="fmd-slide" style="padding: 80px 110px; display: flex; flex-direction: column; justify-content: center; align-items: flex-start; font-family: 'Poppins', sans-serif;">
-  <div style="font-size: 16px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: #00E5FF; margin-bottom: 24px;">[LABEL, e.g. GET STARTED]</div>
-  <h2 style="font-size: 64px; font-weight: 900; color: #fff; line-height: 1.1; letter-spacing: -2px; margin: 0 0 32px 0;">[CLOSING STATEMENT]</h2>
-  <p style="font-size: 22px; color: rgba(255,255,255,0.55); margin: 0;">[CONTACT OR NEXT STEP]</p>
-</div>
-```
-
-## Image Placeholders
-
-When a slide needs a visual, use this div — it renders as a styled placeholder and can later be replaced with a generated image:
-
-```html
-<div class="fmd-img-placeholder" style="width: 100%; height: 300px; border-radius: 12px;">[Description of what image should show]</div>
-```
-
-## Bold Terms with Description
-
-For definition-style bullets:
-
-```html
-<div style="display: flex; align-items: flex-start; gap: 16px;">
-  <span style="font-size: 8px; color: #fff; margin-top: 8px; flex-shrink: 0;">&#x25CF;</span>
-  <span style="font-size: 22px; line-height: 1.5;">
-    <strong style="font-weight: 800; color: #fff;">[Term]</strong>
-    <span style="color: rgba(255,255,255,0.55);"> — [description]</span>
-  </span>
-</div>
-```
-
-## Bulk Replacement Only
-
-Use a non-empty `create-deck --slides '[...]'` payload only for imports or an
-intentional atomic bulk replacement. For normal AI-generated decks, use the
-empty-deck plus sequential `add-slide` workflow above.
-
-A bulk payload looks like this:
-
-```bash
-pnpm action create-deck --title "Product Vision 2025" --slides '[
-  {
-    "id": "slide-1",
-    "layout": "title",
-    "content": "<div class=\"fmd-slide\" style=\"padding: 80px 110px; display: flex; flex-direction: column; justify-content: center; align-items: flex-start; font-family: '\''Poppins'\'', sans-serif;\"><div style=\"font-size: 16px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: #00E5FF; margin-bottom: 24px;\">ANNUAL STRATEGY</div><h1 style=\"font-size: 64px; font-weight: 900; color: #fff; line-height: 1.1; letter-spacing: -2px; margin: 0 0 24px 0;\">Product Vision 2025</h1><p style=\"font-size: 22px; color: rgba(255,255,255,0.55); margin: 0;\">Engineering Leadership — Q1 2025</p></div>"
-  },
-  {
-    "id": "slide-2",
-    "layout": "content",
-    "content": "<div class=\"fmd-slide\" style=\"padding: 80px 110px; display: flex; flex-direction: column; justify-content: flex-start; font-family: '\''Poppins'\'', sans-serif;\"><div style=\"font-size: 14px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; color: #00E5FF; margin-bottom: 16px;\">OVERVIEW</div><h2 style=\"font-size: 40px; font-weight: 900; color: #fff; line-height: 1.15; letter-spacing: -1px; margin: 0 0 48px 0;\">Three Core Priorities</h2><div style=\"display: flex; flex-direction: column; gap: 20px;\"><div style=\"display: flex; align-items: flex-start; gap: 16px;\"><span style=\"font-size: 8px; color: #fff; margin-top: 8px; flex-shrink: 0;\">&#x25CF;</span><span style=\"font-size: 22px; color: rgba(255,255,255,0.85); line-height: 1.5;\">Ship the agent platform by March</span></div><div style=\"display: flex; align-items: flex-start; gap: 16px;\"><span style=\"font-size: 8px; color: #fff; margin-top: 8px; flex-shrink: 0;\">&#x25CF;</span><span style=\"font-size: 22px; color: rgba(255,255,255,0.85); line-height: 1.5;\">Grow to 10k active teams</span></div><div style=\"display: flex; align-items: flex-start; gap: 16px;\"><span style=\"font-size: 8px; color: #fff; margin-top: 8px; flex-shrink: 0;\">&#x25CF;</span><span style=\"font-size: 22px; color: rgba(255,255,255,0.85); line-height: 1.5;\">Reduce time-to-value to under 5 minutes</span></div></div></div>"
-  }
-]'
-```
-
-After creating, navigate to the deck:
+For a bulk replacement, pass the same fully styled HTML templates in the
+`slides` array. After creating, navigate to the deck:
 ```bash
 pnpm action navigate --deckId=<id>
 ```

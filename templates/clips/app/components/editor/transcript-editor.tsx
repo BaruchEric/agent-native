@@ -1,13 +1,16 @@
-import { useMemo, useRef, useState } from "react";
+import { useT } from "@agent-native/core/client/i18n";
 import { IconScissors } from "@tabler/icons-react";
+import { useMemo, useRef, useState } from "react";
+
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
-import { formatMs, isExcluded, type EditsJson } from "@/lib/timestamp-mapping";
+import { Empty, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { formatMs, isExcluded, type EditsJson } from "@/lib/timestamp-mapping";
+import { cn } from "@/lib/utils";
 
 export interface TranscriptSegment {
   startMs: number;
@@ -20,10 +23,6 @@ export interface TranscriptEditorProps {
   edits: EditsJson;
   currentMs: number;
   onSeek?: (originalMs: number) => void;
-  /**
-   * Fires with an (original) ms range when the user trims a selection — the
-   * parent should call `trim-recording` with it.
-   */
   onTrimRange?: (range: { startMs: number; endMs: number }) => void;
   className?: string;
 }
@@ -34,14 +33,6 @@ interface Selection {
   text: string;
 }
 
-/**
- * Transcript viewer with selection-to-trim support.
- *
- * Users select text → press Delete (or the "Trim selection" button) → we
- * resolve the selected text's timestamp range via `segmentsJson` and call
- * `onTrimRange` with it. Segments that fall inside an excluded range render
- * with strikethrough.
- */
 export function TranscriptEditor({
   segments,
   edits,
@@ -50,11 +41,10 @@ export function TranscriptEditor({
   onTrimRange,
   className,
 }: TranscriptEditorProps) {
+  const t = useT();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [selection, setSelection] = useState<Selection | null>(null);
 
-  // For each segment we add a data-start-ms attribute so we can resolve the
-  // browser's text Selection back to original timestamps.
   const resolveSelection = (): Selection | null => {
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
@@ -120,14 +110,16 @@ export function TranscriptEditor({
     <div className={cn("flex flex-col h-full min-h-0", className)}>
       <div className="flex items-center justify-between gap-3 border-b border-border px-3 py-2 text-xs text-muted-foreground">
         <div>
-          Transcript{" "}
+          {t("transcriptEditor.transcript")}{" "}
           {selection ? (
             <span className="text-foreground">
-              · selection {formatMs(selection.startMs)} →{" "}
-              {formatMs(selection.endMs)}
+              {t("transcriptEditor.selectionRange", {
+                start: formatMs(selection.startMs),
+                end: formatMs(selection.endMs),
+              })}
             </span>
           ) : (
-            <span>· select text to trim</span>
+            <span>{t("transcriptEditor.selectTextToTrim")}</span>
           )}
         </div>
         {selection ? (
@@ -144,7 +136,7 @@ export function TranscriptEditor({
             }}
           >
             <IconScissors className="mr-1 h-3.5 w-3.5" />
-            Cut selection
+            {t("transcriptEditor.cutSelection")}
           </Button>
         ) : null}
       </div>
@@ -157,9 +149,13 @@ export function TranscriptEditor({
         className="flex-1 overflow-auto p-3 text-[14px] leading-relaxed outline-none"
       >
         {segments.length === 0 ? (
-          <div className="text-muted-foreground text-sm">
-            No transcript yet.
-          </div>
+          <Empty className="min-h-full gap-2 rounded-none p-4 md:p-6">
+            <EmptyHeader>
+              <EmptyTitle className="text-sm font-normal text-muted-foreground">
+                {t("transcriptEditor.noTranscript")}
+              </EmptyTitle>
+            </EmptyHeader>
+          </Empty>
         ) : (
           rendered
         )}

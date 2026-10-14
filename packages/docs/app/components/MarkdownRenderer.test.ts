@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+
 import {
   renderMarkdownToHtml,
   resolveRenderedMarkdownHtml,
@@ -13,6 +14,13 @@ describe("renderMarkdownToHtml", () => {
     expect(html).not.toContain("<img");
   });
 
+  it("keeps legacy empty anchors as invisible fragment targets", () => {
+    const html = renderMarkdownToHtml('<a id="legacy-section"></a>');
+
+    expect(html).toContain('<span id="legacy-section"></span>');
+    expect(html).not.toContain("&lt;a");
+  });
+
   it("drops unsafe markdown link and image URLs", () => {
     const html = renderMarkdownToHtml(
       "[run](javascript:alert(1)) ![bad](javascript:alert(1)) [encoded](javascript&#58;alert(1))",
@@ -25,10 +33,14 @@ describe("renderMarkdownToHtml", () => {
     expect(html).not.toContain("<img");
   });
 
-  it("keeps normal links", () => {
-    const html = renderMarkdownToHtml("[docs](/docs) [site](https://x.test)");
+  it("canonicalizes same-site links and leaves external ones alone", () => {
+    const html = renderMarkdownToHtml(
+      "[docs](/docs) [policy](/legal/takedown) [site](https://x.test)",
+      "es-ES",
+    );
 
-    expect(html).toContain('<a href="/docs">docs</a>');
+    expect(html).toContain('<a href="/es-es/docs/">docs</a>');
+    expect(html).toContain('<a href="/es-es/legal/takedown/">policy</a>');
     expect(html).toContain('<a href="https://x.test">site</a>');
   });
 
@@ -44,6 +56,19 @@ describe("renderMarkdownToHtml", () => {
     expect(html).toContain('decoding="async"');
   });
 
+  it("renders Builder CDN images as responsive WebP", () => {
+    const source =
+      "https://cdn.builder.io/api/v1/image/assets%2Fspace%2Fasset-id";
+    const html = renderMarkdownToHtml(`![Builder image](${source})`);
+
+    expect(html).toContain(`${source}?format=webp&amp;width=800`);
+    expect(html).toContain(`${source}?format=webp&amp;width=240 240w`);
+    expect(html).toContain(`${source}?format=webp&amp;width=1200 1200w`);
+    expect(html).toContain(`${source}?format=webp&amp;width=2400 2400w`);
+    expect(html).not.toContain(" sizes=");
+    expect(html).not.toContain(`src="${source}"`);
+  });
+
   it("infers markdown highlighting for generic markdown-like snippets", () => {
     const html = renderMarkdownToHtml(`
 \`\`\`text
@@ -52,7 +77,7 @@ describe("renderMarkdownToHtml", () => {
 # Company
 
 - Company: Example Co
-- Product: Agent-native workspace for internal teams
+- Product: Agent-Native workspace for internal teams
 \`\`\`
 `);
 
@@ -73,6 +98,72 @@ describe("renderMarkdownToHtml", () => {
     expect(
       resolveCodeBlockLanguage('ts title="example.ts"', "const x = 1"),
     ).toBe("typescript");
+    expect(
+      resolveCodeBlockLanguage("yaml maxLines=12", "services:\n  app:"),
+    ).toBe("yaml");
+  });
+
+  it("collapses long code fences by default", () => {
+    const code = Array.from(
+      { length: 32 },
+      (_, index) => `line ${index + 1}`,
+    ).join("\n");
+    const html = renderMarkdownToHtml(`\`\`\`text\n${code}\n\`\`\``);
+
+    expect(html).toContain('data-collapsed="true"');
+    expect(html).toContain('data-code-max-lines="17"');
+    expect(html).toContain("Show 15 more lines");
+  });
+
+  it("renders a filename label bar for fences with a filename attribute", () => {
+    const html = renderMarkdownToHtml(
+      '```ts filename="actions/foo.ts"\nexport const foo = 1;\n```',
+    );
+
+    expect(html).toContain('data-filename="true"');
+    expect(html).toContain('class="code-block-filename"');
+    expect(html).toContain("actions/foo.ts");
+    expect(html).toContain('class="language-typescript"');
+  });
+
+  it("supports bare (unquoted) filename attribute values", () => {
+    const html = renderMarkdownToHtml(
+      "```bash filename=scripts/setup.sh\necho hi\n```",
+    );
+
+    expect(html).toContain("scripts/setup.sh");
+    expect(html).toContain('class="code-block-filename"');
+  });
+
+  it("omits the filename bar when no filename attribute is present", () => {
+    const html = renderMarkdownToHtml("```ts\nconst x = 1;\n```");
+
+    expect(html).not.toContain("code-block-filename");
+    expect(html).not.toContain('data-filename="true"');
+  });
+
+  it("does not confuse filename with the language token", () => {
+    expect(
+      resolveCodeBlockLanguage('tsx filename="app/root.tsx"', "const x = 1"),
+    ).toBe("tsx");
+  });
+
+  it("supports per-fence max line overrides and showAll", () => {
+    const code = Array.from(
+      { length: 12 },
+      (_, index) => `line ${index + 1}`,
+    ).join("\n");
+
+    const collapsed = renderMarkdownToHtml(
+      `\`\`\`bash maxLines=5\n${code}\n\`\`\``,
+    );
+    const expanded = renderMarkdownToHtml(
+      `\`\`\`bash showAll\n${code}\n\`\`\``,
+    );
+
+    expect(collapsed).toContain('data-code-max-lines="5"');
+    expect(collapsed).toContain("Show 7 more lines");
+    expect(expanded).not.toContain("code-block-toggle");
   });
 });
 

@@ -1,208 +1,1228 @@
-export type NavItem = { label: string; to?: string; children?: NavItem[] };
-export type NavSection = { title: string; items: NavItem[] };
+import enUS from "../i18n/en-US";
+import {
+  DEFAULT_DOCS_LOCALE,
+  docsPathForSlug,
+  docsLocaleFromSegment,
+  type DocsLocale,
+} from "./docs-locale";
 
-export const NAV_SECTIONS: NavSection[] = [
+export type NavItem = {
+  id: string;
+  label: string;
+  to?: string;
+  draft?: boolean;
+  children?: NavItem[];
+};
+export type NavSection = { id: string; title: string; items: NavItem[] };
+
+type Translate = (key: string) => string;
+
+type NavItemConfig = {
+  id: string;
+  labelKey: keyof typeof enUS.nav;
+  slug?: string;
+  anchor?: string;
+  draft?: boolean;
+  children?: NavItemConfig[];
+};
+
+type NavSectionConfig = {
+  id: string;
+  titleKey: keyof typeof enUS.nav;
+  items: NavItemConfig[];
+};
+
+const NAV_SECTION_CONFIG: NavSectionConfig[] = [
   {
-    title: "Overview",
+    id: "overview",
+    titleKey: "overview",
     items: [
-      { label: "Getting Started", to: "/docs" as const },
       {
-        label: "What Is Agent-Native?",
-        to: "/docs/what-is-agent-native" as const,
+        id: "getting-started",
+        labelKey: "gettingStarted",
+        slug: "getting-started",
       },
-      { label: "Agent Surfaces", to: "/docs/agent-surfaces" as const },
-      { label: "Key Concepts", to: "/docs/key-concepts" as const },
-      { label: "Templates", to: "/docs/cloneable-saas" as const },
-      { label: "FAQ", to: "/docs/faq" as const },
+      {
+        id: "what-is-agent-native",
+        labelKey: "whatIsAgentNative",
+        slug: "what-is-agent-native",
+      },
+      { id: "key-concepts", labelKey: "keyConcepts", slug: "key-concepts" },
     ],
   },
   {
-    title: "Core Architecture",
+    id: "deployment",
+    titleKey: "deployment",
     items: [
-      { label: "Server", to: "/docs/server" as const },
-      { label: "Client", to: "/docs/client" as const },
-      { label: "Routing", to: "/docs/routing" as const },
-      { label: "Actions", to: "/docs/actions" as const },
-      { label: "Human Approval", to: "/docs/human-approval" as const },
-      { label: "Public Agent Web", to: "/docs/agent-web-surfaces" as const },
-      { label: "Database", to: "/docs/database" as const },
-      { label: "Local File Mode", to: "/docs/local-file-mode" as const },
-      { label: "File Uploads", to: "/docs/file-uploads" as const },
-      { label: "Deployment", to: "/docs/deployment" as const },
-      { label: "Progress", to: "/docs/progress" as const },
-    ],
-  },
-  {
-    title: "Data, Auth & Governance",
-    items: [
-      { label: "Authentication", to: "/docs/authentication" as const },
-      { label: "Multi-Tenancy", to: "/docs/multi-tenancy" as const },
-      { label: "Security & Data Scoping", to: "/docs/security" as const },
-      { label: "Sharing & Privacy", to: "/docs/sharing" as const },
-      { label: "Tracking & Analytics", to: "/docs/tracking" as const },
-      { label: "Observability", to: "/docs/observability" as const },
       {
-        label: "Observational Memory",
-        to: "/docs/observational-memory" as const,
-      },
-      { label: "CI Eval Gate", to: "/docs/evals" as const },
-    ],
-  },
-  {
-    title: "Using Your Agent",
-    items: [
-      { label: "Overview", to: "/docs/using-your-agent" as const },
-      { label: "Context Awareness", to: "/docs/context-awareness" as const },
-      { label: "Agent Mentions", to: "/docs/agent-mentions" as const },
-      { label: "Voice Input", to: "/docs/voice-input" as const },
-      { label: "Drop-in Agent", to: "/docs/drop-in-agent" as const },
-      { label: "Component API", to: "/docs/components" as const },
-      { label: "Native Chat UI", to: "/docs/native-chat-ui" as const },
-      {
-        label: "Real-Time Collaboration",
-        to: "/docs/real-time-collaboration" as const,
-      },
-    ],
-  },
-  {
-    title: "Workspace",
-    items: [
-      { label: "Workspace Overview", to: "/docs/workspace" as const },
-      { label: "Skills", to: "/docs/skills-guide" as const },
-      { label: "Custom Agents & Teams", to: "/docs/agent-teams" as const },
-      {
-        label: "Workspace Governance",
-        to: "/docs/workspace-management" as const,
-      },
-      { label: "Recurring Jobs", to: "/docs/recurring-jobs" as const },
-      { label: "Automations", to: "/docs/automations" as const },
-      { label: "Extensions", to: "/docs/extensions" as const },
-      {
-        label: "Multi-App Workspaces",
-        to: "/docs/multi-app-workspace" as const,
-      },
-      { label: "Onboarding & API Keys", to: "/docs/onboarding" as const },
-    ],
-  },
-  {
-    title: "Integrations",
-    items: [
-      { label: "Messaging (Slack, Email…)", to: "/docs/messaging" as const },
-      { label: "Dispatch", to: "/docs/dispatch" as const },
-      { label: "A2A Protocol", to: "/docs/a2a-protocol" as const },
-      {
-        label: "MCP Clients (Add Tools)",
-        to: "/docs/mcp-clients" as const,
+        id: "deployment",
+        labelKey: "deploymentOverview",
+        slug: "deployment",
       },
       {
-        label: "MCP Server (Expose Your App)",
-        to: "/docs/mcp-protocol" as const,
+        id: "deploy-an-app",
+        labelKey: "deployAnApp",
+        slug: "deploy-an-app",
       },
       {
-        label: "External Agents (Connect a Host)",
-        to: "/docs/external-agents" as const,
+        id: "workspace-deployment",
+        labelKey: "workspaceDeployment",
+        slug: "workspace-deployment",
       },
-      { label: "MCP Apps (Inline UIs)", to: "/docs/mcp-apps" as const },
-      { label: "Cross-App SSO", to: "/docs/cross-app-sso" as const },
-      { label: "Notifications", to: "/docs/notifications" as const },
       {
-        label: "Workspace Connections",
-        to: "/docs/workspace-connections" as const,
-      },
-    ],
-  },
-  {
-    title: "Build Apps",
-    items: [
-      { label: "Creating Templates", to: "/docs/creating-templates" as const },
-      {
-        label: "Writing Agent Instructions",
-        to: "/docs/writing-agent-instructions" as const,
-      },
-      { label: "Embedding SDK", to: "/docs/embedding-sdk" as const },
-      { label: "Frames", to: "/docs/frames" as const },
-    ],
-  },
-  {
-    title: "Advanced: Extend the Runtime",
-    items: [
-      { label: "Agent-Native Code UI", to: "/docs/code-agents-ui" as const },
-      {
-        label: "Migrating (/migrate)",
-        to: "/docs/migration-workbench" as const,
-      },
-      { label: "Harness Agents", to: "/docs/harness-agents" as const },
-      { label: "Adapters", to: "/docs/sandbox-adapters" as const },
-      { label: "CLI Adapters", to: "/docs/cli-adapters" as const },
-      { label: "In-Loop Processors", to: "/docs/processors" as const },
-      { label: "Durable Resume", to: "/docs/durable-resume" as const },
-      {
-        label: "Blueprint Installer",
-        to: "/docs/blueprint-installer" as const,
-      },
-    ],
-  },
-  {
-    title: "Templates",
-    // ── DO NOT add new templates here directly. ──
-    // The public-facing template list is the strict allow-list in
-    // `packages/shared-app-config/templates.ts` (entries with `hidden: false`).
-    // To surface a new template in the docs sidebar, first flip its `hidden`
-    // flag in that file. The CI guard `scripts/guard-template-list.mjs`
-    // enforces this — adding a slug here that isn't in the allow-list will
-    // fail the build.
-    //
-    // Important: this is the docs sidebar, so these links must point to the
-    // markdown docs under `/docs/template-<slug>`, never the marketing/demo
-    // landing pages under `/templates/<slug>`. The tests and guard script
-    // intentionally enforce this because this list has regressed before.
-    items: [
-      { label: "Chat", to: "/docs/template-chat" as const },
-      { label: "Calendar", to: "/docs/template-calendar" as const },
-      { label: "Content", to: "/docs/template-content" as const },
-      {
-        // Chevron-only group: no `to`, so it renders as an expand/collapse
-        // toggle, not a link. The main Plans doc is the first child below.
-        label: "Plans",
+        id: "deployment-providers",
+        labelKey: "deploymentProviders",
         children: [
-          { label: "Visual Plans", to: "/docs/template-plan" as const },
-          { label: "PR Visual Recap", to: "/docs/pr-visual-recap" as const },
           {
-            label: "Plan Plugin & Marketplace",
-            to: "/docs/plan-plugin" as const,
+            id: "node-js",
+            labelKey: "deploymentNodeDocker",
+            slug: "node-js",
+          },
+          {
+            id: "docker",
+            labelKey: "deploymentDocker",
+            slug: "docker",
+          },
+          {
+            id: "vercel",
+            labelKey: "deploymentVercel",
+            slug: "vercel",
+          },
+          {
+            id: "netlify",
+            labelKey: "deploymentNetlify",
+            slug: "netlify",
+          },
+          {
+            id: "cloudflare",
+            labelKey: "deploymentCloudflare",
+            slug: "cloudflare",
+          },
+          {
+            id: "render",
+            labelKey: "deploymentRender",
+            slug: "render",
+          },
+          {
+            id: "koyeb",
+            labelKey: "deploymentKoyeb",
+            slug: "koyeb",
+          },
+          {
+            id: "deno-deploy",
+            labelKey: "deploymentDenoDeploy",
+            slug: "deno-deploy",
+          },
+          {
+            id: "azure-static-web-apps",
+            labelKey: "deploymentAzureStaticWebApps",
+            slug: "azure-static-web-apps",
+          },
+          {
+            id: "aws-lambda",
+            labelKey: "deploymentAwsLambda",
+            slug: "aws-lambda",
+          },
+          {
+            id: "aws-amplify",
+            labelKey: "deploymentAwsAmplify",
+            slug: "aws-amplify",
           },
         ],
       },
-      { label: "Slides", to: "/docs/template-slides" as const },
-      { label: "Video", to: "/docs/template-videos" as const },
-      { label: "Analytics", to: "/docs/template-analytics" as const },
-      { label: "Mail", to: "/docs/template-mail" as const },
-      { label: "Clips", to: "/docs/template-clips" as const },
-      { label: "Brain", to: "/docs/template-brain" as const },
-      { label: "Assets", to: "/docs/template-assets" as const },
-      { label: "Design", to: "/docs/template-design" as const },
-      { label: "Dispatch", to: "/docs/template-dispatch" as const },
-      { label: "Forms", to: "/docs/template-forms" as const },
+      {
+        id: "database-providers",
+        labelKey: "databaseProviders",
+        children: [
+          {
+            id: "database-neon",
+            labelKey: "databaseNeon",
+            slug: "neon",
+          },
+          {
+            id: "database-supabase",
+            labelKey: "databaseSupabase",
+            slug: "supabase",
+          },
+          {
+            id: "database-aws-rds",
+            labelKey: "databaseAwsRds",
+            slug: "aws-rds",
+          },
+          {
+            id: "database-cloud-sql",
+            labelKey: "databaseCloudSql",
+            slug: "cloud-sql",
+          },
+          {
+            id: "database-azure-postgres",
+            labelKey: "databaseAzurePostgres",
+            slug: "azure-postgresql",
+          },
+          {
+            id: "database-postgres",
+            labelKey: "databasePostgres",
+            slug: "postgres",
+          },
+        ],
+      },
+      {
+        id: "deployment-production",
+        labelKey: "deploymentProduction",
+        children: [
+          { id: "ssr-caching", labelKey: "ssrCaching", slug: "ssr-caching" },
+          {
+            id: "deployment-environment-variables",
+            labelKey: "deploymentEnvironmentVariables",
+            slug: "deployment-environment-variables",
+          },
+          {
+            id: "updating-ui-in-production",
+            labelKey: "updatingUiInProduction",
+            slug: "updating-ui-in-production",
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "apps",
+    titleKey: "templatesSection",
+    items: [
+      {
+        id: "cloneable-saas",
+        labelKey: "templatesOverview",
+        slug: "cloneable-saas",
+      },
+      {
+        id: "creating-templates",
+        labelKey: "creatingTemplates",
+        slug: "creating-templates",
+      },
+      {
+        id: "syncing-template-changes",
+        labelKey: "syncingTemplateChanges",
+        slug: "syncing-template-changes",
+      },
+      {
+        id: "pure-agent-apps",
+        labelKey: "pureAgentApps",
+        slug: "pure-agent-apps",
+      },
+      {
+        id: "chat-group",
+        labelKey: "chat",
+        children: [
+          {
+            id: "template-chat",
+            labelKey: "chatOverview",
+            slug: "template-chat",
+          },
+          {
+            id: "template-chat-first-edits",
+            labelKey: "chatFirstEdits",
+            slug: "template-chat-first-edits",
+          },
+          {
+            id: "template-chat-developers",
+            labelKey: "chatDevelopers",
+            slug: "template-chat-developers",
+          },
+        ],
+      },
+      {
+        id: "calendar-group",
+        labelKey: "calendar",
+        children: [
+          {
+            id: "template-calendar",
+            labelKey: "calendarOverview",
+            slug: "template-calendar",
+          },
+          {
+            id: "template-calendar-features",
+            labelKey: "calendarFeatures",
+            slug: "template-calendar-features",
+          },
+          {
+            id: "template-calendar-agent",
+            labelKey: "calendarAgent",
+            slug: "template-calendar-agent",
+          },
+          {
+            id: "template-calendar-integrations",
+            labelKey: "calendarIntegrations",
+            slug: "template-calendar-integrations",
+          },
+          {
+            id: "template-calendar-developers",
+            labelKey: "calendarDevelopers",
+            slug: "template-calendar-developers",
+          },
+        ],
+      },
+      {
+        id: "content-group",
+        labelKey: "content",
+        children: [
+          {
+            id: "template-content",
+            labelKey: "contentOverview",
+            slug: "template-content",
+          },
+          {
+            id: "template-content-editing",
+            labelKey: "contentEditing",
+            slug: "template-content-editing",
+          },
+          {
+            id: "template-content-databases",
+            labelKey: "contentDatabases",
+            slug: "template-content-databases",
+          },
+          {
+            id: "template-content-sync",
+            labelKey: "contentSync",
+            slug: "template-content-sync",
+          },
+          {
+            id: "template-content-local-files",
+            labelKey: "localFileMode",
+            slug: "template-content-local-files",
+          },
+          {
+            id: "template-content-developers",
+            labelKey: "contentDevelopers",
+            slug: "template-content-developers",
+          },
+        ],
+      },
+      {
+        id: "plans-group",
+        labelKey: "plans",
+        children: [
+          {
+            id: "template-plan",
+            labelKey: "visualPlans",
+            slug: "template-plan",
+          },
+          {
+            id: "template-plan-review-workflow",
+            labelKey: "planReviewWorkflow",
+            slug: "template-plan-review-workflow",
+          },
+          {
+            id: "template-plan-automations",
+            labelKey: "planAutomations",
+            slug: "template-plan-automations",
+          },
+          {
+            id: "template-plan-local-and-desktop",
+            labelKey: "planLocalAndDesktop",
+            slug: "template-plan-local-and-desktop",
+          },
+          {
+            id: "template-plan-developers",
+            labelKey: "planDevelopers",
+            slug: "template-plan-developers",
+          },
+          {
+            id: "pr-visual-recap",
+            labelKey: "prVisualRecap",
+            slug: "pr-visual-recap",
+          },
+          {
+            id: "plan-plugin",
+            labelKey: "planPluginMarketplace",
+            slug: "plan-plugin",
+          },
+        ],
+      },
+      {
+        id: "slides-group",
+        labelKey: "slides",
+        children: [
+          {
+            id: "template-slides",
+            labelKey: "slidesOverview",
+            slug: "template-slides",
+          },
+          {
+            id: "template-slides-features",
+            labelKey: "slidesFeatures",
+            slug: "template-slides-features",
+          },
+          {
+            id: "template-slides-agent",
+            labelKey: "slidesAgent",
+            slug: "template-slides-agent",
+          },
+          {
+            id: "template-slides-integrations",
+            labelKey: "slidesIntegrations",
+            slug: "template-slides-integrations",
+          },
+          {
+            id: "template-slides-developers",
+            labelKey: "slidesDevelopers",
+            slug: "template-slides-developers",
+          },
+        ],
+      },
+      {
+        id: "analytics-group",
+        labelKey: "analytics",
+        children: [
+          {
+            id: "template-analytics",
+            labelKey: "analyticsOverview",
+            slug: "template-analytics",
+          },
+          {
+            id: "template-analytics-dashboards",
+            labelKey: "analyticsDashboards",
+            slug: "template-analytics-dashboards",
+          },
+          {
+            id: "template-analytics-connectors",
+            labelKey: "analyticsConnectors",
+            slug: "template-analytics-connectors",
+          },
+          {
+            id: "template-analytics-monitoring-and-sessions",
+            labelKey: "analyticsMonitoringAndSessions",
+            slug: "template-analytics-monitoring-and-sessions",
+          },
+          {
+            id: "template-analytics-developers",
+            labelKey: "analyticsDevelopers",
+            slug: "template-analytics-developers",
+          },
+        ],
+      },
+      {
+        id: "mail-group",
+        labelKey: "mail",
+        children: [
+          {
+            id: "template-mail",
+            labelKey: "mailOverview",
+            slug: "template-mail",
+          },
+          {
+            id: "template-mail-agent",
+            labelKey: "mailAgent",
+            slug: "template-mail-agent",
+          },
+          {
+            id: "template-mail-inbox",
+            labelKey: "mailInbox",
+            slug: "template-mail-inbox",
+          },
+          {
+            id: "template-mail-drafts-and-queue",
+            labelKey: "mailDraftsAndQueue",
+            slug: "template-mail-drafts-and-queue",
+          },
+          {
+            id: "template-mail-developers",
+            labelKey: "mailDevelopers",
+            slug: "template-mail-developers",
+          },
+        ],
+      },
+      {
+        id: "clips-group",
+        labelKey: "clips",
+        children: [
+          {
+            id: "template-clips",
+            labelKey: "clipsOverview",
+            slug: "template-clips",
+          },
+          {
+            id: "template-clips-features",
+            labelKey: "clipsFeatures",
+            slug: "template-clips-features",
+          },
+          {
+            id: "template-clips-embed",
+            labelKey: "clipsEmbed",
+            slug: "template-clips-embed",
+          },
+          {
+            id: "template-clips-agent",
+            labelKey: "clipsAgent",
+            slug: "template-clips-agent",
+          },
+          {
+            id: "template-clips-integrations",
+            labelKey: "clipsIntegrations",
+            slug: "template-clips-integrations",
+          },
+          {
+            id: "template-clips-developers",
+            labelKey: "clipsDevelopers",
+            slug: "template-clips-developers",
+          },
+        ],
+      },
+      {
+        id: "assets-group",
+        labelKey: "assets",
+        children: [
+          {
+            id: "template-assets",
+            labelKey: "assetsOverview",
+            slug: "template-assets",
+          },
+          {
+            id: "template-assets-generation",
+            labelKey: "assetsGeneration",
+            slug: "template-assets-generation",
+          },
+          {
+            id: "template-assets-presets",
+            labelKey: "assetsPresets",
+            slug: "template-assets-presets",
+          },
+          {
+            id: "template-assets-integrations",
+            labelKey: "assetsIntegrations",
+            slug: "template-assets-integrations",
+          },
+          {
+            id: "template-assets-developers",
+            labelKey: "assetsDevelopers",
+            slug: "template-assets-developers",
+          },
+        ],
+      },
+      {
+        id: "design-group",
+        labelKey: "design",
+        children: [
+          {
+            id: "template-design",
+            labelKey: "designOverview",
+            slug: "template-design",
+          },
+          {
+            id: "template-design-features",
+            labelKey: "designFeatures",
+            slug: "template-design-features",
+          },
+          {
+            id: "template-design-agent",
+            labelKey: "designAgent",
+            slug: "template-design-agent",
+          },
+          {
+            id: "template-design-integrations",
+            labelKey: "designIntegrations",
+            slug: "template-design-integrations",
+          },
+          {
+            id: "template-design-developers",
+            labelKey: "designDevelopers",
+            slug: "template-design-developers",
+          },
+        ],
+      },
+      {
+        id: "dispatch-group",
+        labelKey: "dispatch",
+        children: [
+          {
+            id: "template-dispatch",
+            labelKey: "dispatchOverview",
+            slug: "template-dispatch",
+          },
+          {
+            id: "template-dispatch-features",
+            labelKey: "dispatchFeatures",
+            slug: "template-dispatch-features",
+          },
+          {
+            id: "template-dispatch-agent",
+            labelKey: "dispatchAgent",
+            slug: "template-dispatch-agent",
+          },
+          {
+            id: "template-dispatch-integrations",
+            labelKey: "dispatchIntegrations",
+            slug: "template-dispatch-integrations",
+          },
+          {
+            id: "template-dispatch-developers",
+            labelKey: "dispatchDevelopers",
+            slug: "template-dispatch-developers",
+          },
+          {
+            id: "template-dispatch-reference",
+            labelKey: "dispatchReference",
+            slug: "template-dispatch-reference",
+          },
+        ],
+      },
+      {
+        id: "forms-group",
+        labelKey: "forms",
+        children: [
+          {
+            id: "template-forms",
+            labelKey: "formsOverview",
+            slug: "template-forms",
+          },
+          {
+            id: "template-forms-features",
+            labelKey: "formsFeatures",
+            slug: "template-forms-features",
+          },
+          {
+            id: "template-forms-agent",
+            labelKey: "formsAgent",
+            slug: "template-forms-agent",
+          },
+          {
+            id: "template-forms-integrations",
+            labelKey: "formsIntegrations",
+            slug: "template-forms-integrations",
+          },
+          {
+            id: "template-forms-developers",
+            labelKey: "formsDevelopers",
+            slug: "template-forms-developers",
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "core-architecture",
+    titleKey: "coreArchitecture",
+    items: [
+      {
+        id: "server-section",
+        labelKey: "server",
+        children: [
+          {
+            id: "server-overview",
+            labelKey: "serverOverview",
+            slug: "server-overview",
+          },
+          {
+            id: "server-database",
+            labelKey: "database",
+            slug: "server-database",
+          },
+          {
+            id: "server-middleware",
+            labelKey: "serverMiddleware",
+            slug: "server-middleware",
+          },
+          {
+            id: "server-plugins",
+            labelKey: "serverPlugins",
+            slug: "server-plugins",
+          },
+          {
+            id: "server-routes",
+            labelKey: "serverRoutes",
+            slug: "server-routes",
+          },
+        ],
+      },
+      {
+        id: "client-section",
+        labelKey: "client",
+        children: [
+          {
+            id: "client-overview",
+            labelKey: "clientOverview",
+            slug: "client-overview",
+          },
+          {
+            id: "client-data",
+            labelKey: "clientDataSync",
+            slug: "client-data",
+          },
+          {
+            id: "client-agent-chat",
+            labelKey: "clientAgentChat",
+            slug: "client-agent-chat",
+          },
+          {
+            id: "client-routing",
+            labelKey: "routing",
+            slug: "client-routing",
+          },
+          {
+            id: "client-advanced",
+            labelKey: "clientAdvanced",
+            slug: "client-advanced",
+          },
+          {
+            id: "client-sync-internals",
+            labelKey: "clientSyncInternals",
+            slug: "client-sync-internals",
+          },
+          {
+            id: "client-entry-points",
+            labelKey: "clientEntryPoints",
+            slug: "client-entry-points",
+          },
+        ],
+      },
+      {
+        id: "actions-section",
+        labelKey: "actions",
+        children: [
+          {
+            id: "actions-overview",
+            labelKey: "actionsOverview",
+            slug: "actions-overview",
+          },
+          {
+            id: "actions-defining",
+            labelKey: "actionsDefining",
+            slug: "actions-defining",
+          },
+          {
+            id: "actions-access-control",
+            labelKey: "actionsAccessControl",
+            slug: "actions-access-control",
+          },
+          {
+            id: "actions-run-context",
+            labelKey: "actionsRunContext",
+            slug: "actions-run-context",
+          },
+          {
+            id: "actions-other-surfaces",
+            labelKey: "actionsOtherSurfaces",
+            slug: "actions-other-surfaces",
+          },
+          {
+            id: "actions-advanced",
+            labelKey: "actionsAdvanced",
+            slug: "actions-advanced",
+          },
+          {
+            id: "actions-agent-tools",
+            labelKey: "actionsAgentTools",
+            slug: "actions-agent-tools",
+          },
+        ],
+      },
+      {
+        id: "agent-surfaces",
+        labelKey: "agentSurfaces",
+        slug: "agent-surfaces",
+      },
+      {
+        id: "internationalization",
+        labelKey: "internationalization",
+        slug: "internationalization",
+      },
+      { id: "file-uploads", labelKey: "fileUploads", slug: "file-uploads" },
+      {
+        id: "environment-variables",
+        labelKey: "environmentVariables",
+        slug: "environment-variables",
+      },
+      {
+        id: "agent-native-config",
+        labelKey: "agentNativeConfig",
+        slug: "agent-native-config",
+      },
+    ],
+  },
+  {
+    id: "data-auth-governance",
+    titleKey: "dataAuthGovernance",
+    items: [
+      {
+        id: "authentication",
+        labelKey: "authentication",
+        slug: "authentication",
+      },
+      { id: "multi-tenancy", labelKey: "multiTenancy", slug: "multi-tenancy" },
+      {
+        id: "organizations-teams-permissions",
+        labelKey: "organizationsTeamsPermissions",
+        slug: "organizations-teams-permissions",
+      },
+      {
+        id: "administered-deployments",
+        labelKey: "administeredDeployments",
+        slug: "administered-deployments",
+      },
+      {
+        id: "security",
+        labelKey: "securityDataScoping",
+        slug: "security",
+      },
+      { id: "sharing", labelKey: "sharingPrivacy", slug: "sharing" },
+      {
+        id: "tracking",
+        labelKey: "trackingAnalytics",
+        slug: "tracking",
+      },
+      { id: "audit-log", labelKey: "auditLog", slug: "audit-log" },
+      {
+        id: "doctor",
+        labelKey: "doctorCodeChecks",
+        slug: "doctor",
+      },
+      { id: "observability", labelKey: "observability", slug: "observability" },
+      {
+        id: "observational-memory",
+        labelKey: "observationalMemory",
+        slug: "observational-memory",
+      },
+      { id: "evals", labelKey: "ciEvalGate", slug: "evals" },
+    ],
+  },
+  {
+    id: "using-your-agent",
+    titleKey: "usingYourAgent",
+    items: [
+      {
+        id: "using-your-agent-overview",
+        labelKey: "usingYourAgentOverview",
+        slug: "using-your-agent",
+      },
+      {
+        id: "context-awareness",
+        labelKey: "contextAwareness",
+        slug: "context-awareness",
+      },
+      {
+        id: "agent-mentions",
+        labelKey: "agentMentions",
+        slug: "agent-mentions",
+      },
+      { id: "voice-input", labelKey: "voiceInput", slug: "voice-input" },
+      { id: "drop-in-agent", labelKey: "dropInAgent", slug: "drop-in-agent" },
+      { id: "components", labelKey: "componentApi", slug: "components" },
+      {
+        id: "native-chat-ui",
+        labelKey: "nativeChatUi",
+        slug: "native-chat-ui",
+      },
+      {
+        id: "agentkit",
+        labelKey: "agentkit",
+        slug: "agentkit",
+      },
+      {
+        id: "generative-ui",
+        labelKey: "generativeUi",
+        slug: "generative-ui",
+      },
+      {
+        id: "embedding-sdk",
+        labelKey: "embeddingSdk",
+        slug: "embedding-sdk",
+      },
+      {
+        id: "real-time-collaboration",
+        labelKey: "realTimeCollaboration",
+        slug: "real-time-collaboration",
+      },
+    ],
+  },
+  {
+    id: "agent-resources",
+    titleKey: "agentResources",
+    items: [
+      {
+        id: "agent-resources-overview",
+        labelKey: "agentResourcesOverview",
+        slug: "agent-resources",
+      },
+      {
+        id: "writing-agent-instructions",
+        labelKey: "writingAgentInstructions",
+        slug: "writing-agent-instructions",
+      },
+      { id: "skills-guide", labelKey: "skills", slug: "skills-guide" },
+      {
+        id: "turn-into-app",
+        labelKey: "turnIntoApp",
+        slug: "turn-into-app",
+      },
+      {
+        id: "agent-teams",
+        labelKey: "customAgentsTeams",
+        slug: "agent-teams",
+      },
+      {
+        id: "workspace-management",
+        labelKey: "workspaceGovernance",
+        slug: "workspace-management",
+      },
+      {
+        id: "recurring-jobs",
+        labelKey: "recurringJobs",
+        slug: "recurring-jobs",
+      },
+      { id: "automations", labelKey: "automations", slug: "automations" },
+      { id: "extensions", labelKey: "extensions", slug: "extensions" },
+      {
+        id: "data-programs",
+        labelKey: "dataPrograms",
+        slug: "data-programs",
+      },
+      {
+        id: "multi-app-workspace",
+        labelKey: "multiAppWorkspaces",
+        slug: "multi-app-workspace",
+      },
+      {
+        id: "onboarding",
+        labelKey: "onboardingApiKeys",
+        slug: "onboarding",
+      },
+    ],
+  },
+  {
+    id: "integrations",
+    titleKey: "integrations",
+    items: [
+      {
+        id: "integration-directory",
+        labelKey: "integrations",
+        slug: "integrations",
+      },
+      { id: "messaging", labelKey: "messaging", slug: "messaging" },
+      {
+        id: "messaging-recipes",
+        labelKey: "messagingRecipes",
+        slug: "messaging-recipes",
+      },
+      {
+        id: "messaging-internals",
+        labelKey: "messagingInternals",
+        slug: "messaging-internals",
+      },
+      { id: "dispatch", labelKey: "dispatch", slug: "dispatch" },
+      { id: "portal", labelKey: "portal", slug: "portal" },
+      { id: "a2a-protocol", labelKey: "a2aProtocol", slug: "a2a-protocol" },
+      { id: "mcp-clients", labelKey: "mcpClients", slug: "mcp-clients" },
+      { id: "http-api", labelKey: "httpApi", slug: "http-api" },
+      {
+        id: "mcp-protocol",
+        labelKey: "mcpServer",
+        slug: "mcp-protocol",
+      },
+      {
+        id: "external-agents",
+        labelKey: "externalAgents",
+        slug: "external-agents",
+      },
+      {
+        id: "external-agents-catalog",
+        labelKey: "externalAgentsCatalog",
+        slug: "external-agents-catalog",
+      },
+      {
+        id: "agent-web-surfaces",
+        labelKey: "publicAgentWeb",
+        slug: "agent-web-surfaces",
+      },
+      { id: "mcp-apps", labelKey: "mcpApps", slug: "mcp-apps" },
+      { id: "webmcp", labelKey: "webMcp", slug: "webmcp" },
+      { id: "cross-app-sso", labelKey: "crossAppSso", slug: "cross-app-sso" },
+      { id: "notifications", labelKey: "notifications", slug: "notifications" },
+      { id: "progress", labelKey: "progress", slug: "progress" },
+      {
+        id: "automation-connectors",
+        labelKey: "automationConnectors",
+        slug: "automation-connectors",
+      },
+      {
+        id: "workspace-connections",
+        labelKey: "workspaceConnections",
+        slug: "workspace-connections",
+      },
+    ],
+  },
+  {
+    id: "toolkits",
+    titleKey: "agentNativeToolkit",
+    items: [
+      {
+        id: "agent-native-toolkit",
+        labelKey: "toolkitOverview",
+        slug: "agent-native-toolkit",
+      },
+      {
+        id: "toolkit-feature-kits",
+        labelKey: "featureKits",
+        children: [
+          {
+            id: "toolkit-sharing",
+            labelKey: "toolkitSharing",
+            slug: "toolkit-sharing",
+          },
+          {
+            id: "toolkit-collaboration",
+            labelKey: "toolkitCollaboration",
+            slug: "toolkit-collaboration",
+          },
+          {
+            id: "toolkit-history",
+            labelKey: "toolkitHistory",
+            slug: "toolkit-history",
+          },
+          {
+            id: "toolkit-comments-review",
+            labelKey: "toolkitCommentsReview",
+            slug: "toolkit-comments-review",
+          },
+          {
+            id: "toolkit-observability",
+            labelKey: "toolkitObservability",
+            slug: "toolkit-observability",
+          },
+          {
+            id: "toolkit-dashboard",
+            labelKey: "toolkitDashboard",
+            slug: "agent-native-toolkit",
+            anchor: "dashboard-kit",
+          },
+        ],
+      },
+      {
+        id: "toolkit-app-chrome",
+        labelKey: "appChrome",
+        children: [
+          {
+            id: "toolkit-settings",
+            labelKey: "toolkitSettings",
+            slug: "toolkit-settings",
+          },
+          {
+            id: "toolkit-org-team",
+            labelKey: "toolkitOrgTeam",
+            slug: "toolkit-org-team",
+          },
+          {
+            id: "toolkit-setup-connections",
+            labelKey: "toolkitSetupConnections",
+            slug: "toolkit-setup-connections",
+          },
+          {
+            id: "toolkit-command-navigation",
+            labelKey: "toolkitCommandNavigation",
+            slug: "toolkit-command-navigation",
+          },
+          {
+            id: "toolkit-resources",
+            labelKey: "toolkitResources",
+            slug: "toolkit-resources",
+          },
+          {
+            id: "toolkit-agent-ux",
+            labelKey: "toolkitAgentUx",
+            slug: "toolkit-agent-ux",
+          },
+          {
+            id: "toolkit-chat-history",
+            labelKey: "toolkitChatHistory",
+            slug: "toolkit-agent-ux",
+            anchor: "chat-history",
+          },
+          {
+            id: "toolkit-agent-page",
+            labelKey: "toolkitAgentPage",
+            slug: "agent-surfaces",
+            anchor: "agent-page",
+          },
+          {
+            id: "toolkit-notifications",
+            labelKey: "toolkitNotifications",
+            slug: "notifications",
+          },
+        ],
+      },
+      {
+        id: "toolkit-capability-packages",
+        labelKey: "capabilityPackages",
+        children: [
+          {
+            id: "toolkit-capability-packages-overview",
+            labelKey: "capabilityPackagesOverview",
+            slug: "toolkit-capability-packages",
+          },
+          {
+            id: "package-lifecycle",
+            labelKey: "packageLifecycle",
+            slug: "package-lifecycle",
+          },
+          {
+            id: "versioning-and-stability",
+            labelKey: "versioningAndStability",
+            slug: "versioning-and-stability",
+          },
+        ],
+      },
+      {
+        id: "toolkit-foundations",
+        labelKey: "toolkitFoundations",
+        children: [
+          {
+            id: "toolkit-ui",
+            labelKey: "toolkitUiPrimitives",
+            slug: "toolkit-ui",
+          },
+          {
+            id: "toolkit-editors-canvases",
+            labelKey: "toolkitEditorsCanvases",
+            slug: "toolkit-editors-canvases",
+          },
+          {
+            id: "toolkit-context-knowledge",
+            labelKey: "toolkitContextKnowledge",
+            slug: "toolkit-context-knowledge",
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "advanced-runtime",
+    titleKey: "advancedRuntime",
+    items: [
+      {
+        id: "code-agents-ui",
+        labelKey: "agentNativeCodeUi",
+        slug: "code-agents-ui",
+      },
+      {
+        id: "harness-agents",
+        labelKey: "harnessAgents",
+        slug: "harness-agents",
+      },
+      {
+        id: "sandbox-adapters",
+        labelKey: "adapters",
+        slug: "sandbox-adapters",
+      },
+      { id: "cli-adapters", labelKey: "cliAdapters", slug: "cli-adapters" },
+      { id: "processors", labelKey: "processors", slug: "processors" },
+      {
+        id: "durable-resume",
+        labelKey: "durableResume",
+        slug: "durable-resume",
+      },
+      {
+        id: "durable-background-runs",
+        labelKey: "durableBackgroundRuns",
+        slug: "durable-background-runs",
+      },
+      {
+        id: "blueprint-installer",
+        labelKey: "blueprintInstaller",
+        slug: "blueprint-installer",
+      },
     ],
   },
 ];
 
-// Flat list for prev/next navigation and current-item lookups. Nested
-// children (e.g. the plan docs under the Plans group) are flattened in place
-// where their parent sits; chevron-only group headers (no `to`) are skipped
-// so reading order stays intuitive and prev/next only lands on real pages.
+function enMessage(key: string): string {
+  const value = key
+    .split(".")
+    .reduce<unknown>(
+      (current, part) =>
+        current && typeof current === "object"
+          ? (current as Record<string, unknown>)[part]
+          : undefined,
+      enUS,
+    );
+  return typeof value === "string" ? value : key;
+}
+
+function navLabel(t: Translate, key: keyof typeof enUS.nav): string {
+  return t(`nav.${key}`) || enMessage(`nav.${key}`);
+}
+
+const SHOW_DRAFTS = import.meta.env.VITE_SHOW_DRAFTS === "true";
+
+const NAV_SECTION_CONFIG_IN_DISPLAY_ORDER = (() => {
+  const appsSection = NAV_SECTION_CONFIG.find(
+    (section) => section.id === "apps",
+  );
+  const toolkitsSection = NAV_SECTION_CONFIG.find(
+    (section) => section.id === "toolkits",
+  );
+  if (!appsSection || !toolkitsSection) return NAV_SECTION_CONFIG;
+
+  return NAV_SECTION_CONFIG.flatMap((section) =>
+    section.id === "apps" || section.id === "toolkits"
+      ? []
+      : section.id === "deployment"
+        ? [section, toolkitsSection]
+        : section.id === "core-architecture"
+          ? [section, appsSection]
+          : [section],
+  );
+})();
+
+function toNavItem(
+  config: NavItemConfig,
+  locale: DocsLocale,
+  t: Translate,
+): NavItem | null {
+  if (config.draft && !SHOW_DRAFTS) return null;
+  const slug = config.slug;
+  const children = config.children
+    ?.map((child) => toNavItem(child, locale, t))
+    .filter((item): item is NavItem => item !== null);
+  return {
+    id: config.id,
+    label: navLabel(t, config.labelKey),
+    to: slug
+      ? docsPathForSlug(slug, locale) +
+        (config.anchor ? "#" + config.anchor : "")
+      : undefined,
+    draft: config.draft || undefined,
+    children,
+  };
+}
+
+export function getDocsNavSections(
+  locale: unknown = DEFAULT_DOCS_LOCALE,
+  t: Translate = enMessage,
+): NavSection[] {
+  const docsLocale = docsLocaleFromSegment(locale) ?? DEFAULT_DOCS_LOCALE;
+  return NAV_SECTION_CONFIG_IN_DISPLAY_ORDER.map((section) => ({
+    id: section.id,
+    title: navLabel(t, section.titleKey),
+    items: section.items
+      .map((item) => toNavItem(item, docsLocale, t))
+      .filter((item): item is NavItem => item !== null),
+  })).filter((section) => section.items.length > 0);
+}
+
 function flattenItems(items: NavItem[]): NavItem[] {
   return items.flatMap((item) =>
     item.children
-      ? // A group header has no `to`; keep only real pages in the flat
-        // prev/next list so navigation never targets a non-page.
-        [...(item.to ? [item] : []), ...flattenItems(item.children)]
+      ? [...(item.to ? [item] : []), ...flattenItems(item.children)]
       : [item],
   );
 }
 
-// flattenItems already drops chevron-only group headers, so every entry here
-// has a real `to`; narrow the type so prev/next consumers see a definite path.
-export const NAV_ITEMS: (NavItem & { to: string })[] = NAV_SECTIONS.flatMap(
-  (s) => flattenItems(s.items),
-).filter((item): item is NavItem & { to: string } => item.to !== undefined);
+export function getDocsNavItems(
+  locale: unknown = DEFAULT_DOCS_LOCALE,
+  t: Translate = enMessage,
+): (NavItem & { to: string })[] {
+  return getDocsNavSections(locale, t)
+    .flatMap((section) => flattenItems(section.items))
+    .filter((item): item is NavItem & { to: string } => item.to !== undefined);
+}
+
+export const NAV_SECTIONS: NavSection[] = getDocsNavSections();
+export const NAV_ITEMS: (NavItem & { to: string })[] = getDocsNavItems();

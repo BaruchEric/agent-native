@@ -1,12 +1,25 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { nanoid } from "nanoid";
-import { eq, inArray } from "drizzle-orm";
-import { assertAccess } from "@agent-native/core/sharing";
+import { defineAction } from "@agent-native/core/action";
 import { getRequestUserEmail } from "@agent-native/core/server/request-context";
+import {
+  recordGenerationCreativeContext,
+  resolveGenerationCreativeContext,
+} from "@agent-native/creative-context/server";
+import type { CreativeContextReuseLabel } from "@agent-native/creative-context/types";
+import { eq, inArray } from "drizzle-orm";
+import { nanoid } from "nanoid";
+import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import { nowIso, stringifyJson } from "../server/lib/json.js";
+import {
+  assertCanDraft,
+  assertCanUseAssets,
+  assertCanUseRuns,
+  draftProvenanceAccess,
+  draftScopeForLibrary,
+} from "../server/lib/library-access.js";
 import { serializeGenerationSession } from "./_helpers.js";
+import { resolveTemplateAccess } from "./_template-access.js";
 
 export default defineAction({
   description:
@@ -22,9 +35,28 @@ export default defineAction({
     runIds: z.array(z.string()).optional(),
     feedback: z.string().optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
+    contextModeOverride: z
+      .literal("off")
+      .optional()
+      .describe(
+        "Disable Creative Context for this generation session only without changing the saved preference.",
+      ),
   }),
   run: async (args) => {
-    await assertAccess("asset-library", args.libraryId, "editor");
+    const creativeContext = await resolveGenerationCreativeContext({
+      query: [args.title, args.brief].filter(Boolean).join("\n"),
+      role: "assets",
+      contextModeOverride: args.contextModeOverride,
+    });
+    const reuseLabels =
+      creativeContext.reuseLabels as CreativeContextReuseLabel[];
+    const creativeContextProvenance = {
+      contextMode: creativeContext.contextMode,
+      contextPackId: creativeContext.contextPackId,
+      reuseLabels,
+    };
+    const draftAccess = await assertCanDraft(args.libraryId);
+    const draftScope = await draftScopeForLibrary(args.libraryId, draftAccess);
     const db = getDb();
     if (args.collectionId) {
       const [collection] = await db
@@ -36,23 +68,19 @@ export default defineAction({
         throw new Error("Collection does not belong to this asset library.");
       }
     }
-    let preset: typeof schema.assetGenerationPresets.$inferSelect | null = null;
+    let preset: typeof schema.assetTemplates.$inferSelect | null = null;
     if (args.presetId) {
-      const [row] = await db
-        .select()
-        .from(schema.assetGenerationPresets)
-        .where(eq(schema.assetGenerationPresets.id, args.presetId))
-        .limit(1);
-      preset = row ?? null;
-      if (!preset || preset.libraryId !== args.libraryId) {
-        throw new Error("Generation preset does not belong to this library.");
+      preset = (await resolveTemplateAccess(args.presetId, "viewer")).resource;
+      if (!preset) throw new Error("Template not found.");
+      if (preset.libraryId && preset.libraryId !== args.libraryId) {
+        throw new Error("Template is associated to a different brand kit.");
       }
       if (
         args.collectionId &&
         preset.collectionId &&
         preset.collectionId !== args.collectionId
       ) {
-        throw new Error("Generation preset belongs to a different collection.");
+        throw new Error("Template is associated to a different collection.");
       }
     }
     const assetIds = [...new Set(args.assetIds ?? [])];
@@ -61,7 +89,13 @@ export default defineAction({
     }
     if (assetIds.length) {
       const assets = await db
-        .select({ id: schema.assets.id, libraryId: schema.assets.libraryId })
+        .select({
+          id: schema.assets.id,
+          libraryId: schema.assets.libraryId,
+          role: schema.assets.role,
+          status: schema.assets.status,
+          generationRunId: schema.assets.generationRunId,
+        })
         .from(schema.assets)
         .where(inArray(schema.assets.id, assetIds));
       const foundIds = new Set(assets.map((asset) => asset.id));
@@ -70,6 +104,13 @@ export default defineAction({
       if (assets.some((asset) => asset.libraryId !== args.libraryId)) {
         throw new Error("All assets must belong to this asset library.");
       }
+      assertCanUseAssets(
+        draftScope,
+        args.libraryId,
+        draftAccess.role,
+        assets,
+        "A generation session",
+      );
     }
     const runIds = [...new Set(args.runIds ?? [])];
     if (runIds.length) {
@@ -88,6 +129,13 @@ export default defineAction({
           "All generation runs must belong to this asset library.",
         );
       }
+      assertCanUseRuns(
+        draftScope,
+        args.libraryId,
+        draftAccess.role,
+        runs,
+        "A generation session",
+      );
     }
 
     const now = nowIso();
@@ -103,6 +151,7 @@ export default defineAction({
       feedbackSummary: args.feedback ?? "",
       metadata: stringifyJson({
         ...(args.metadata ?? {}),
+        creativeContext: creativeContextProvenance,
         feedbackHistory: args.feedback
           ? [{ at: now, feedback: args.feedback }]
           : [],
@@ -139,6 +188,35 @@ export default defineAction({
       });
       sortOrder += 10;
     }
-    return serializeGenerationSession(session);
+    await recordGenerationCreativeContext(
+      {
+        appId: "assets",
+        artifactType: "generation-session",
+        artifactId: session.id,
+        ...creativeContextProvenance,
+        elementProvenance: reuseLabels.length
+          ? reuseLabels.map((label) => ({
+              elementId: session.id,
+              influence: label.influence ?? ("reference-conditioned" as const),
+              ...(label.itemId ? { itemId: label.itemId } : {}),
+              ...(label.itemVersionId
+                ? { itemVersionId: label.itemVersionId }
+                : {}),
+              label: label.label,
+            }))
+          : [
+              {
+                elementId: session.id,
+                influence: "generated",
+                label: "Asset generation session",
+              },
+            ],
+      },
+      { artifactAccess: draftProvenanceAccess(args.libraryId) },
+    );
+    return {
+      ...serializeGenerationSession(session),
+      ...creativeContextProvenance,
+    };
   },
 });

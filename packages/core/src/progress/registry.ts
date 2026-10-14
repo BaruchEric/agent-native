@@ -1,7 +1,9 @@
 import { z } from "zod";
+
 import { emit as emitBusEvent } from "../event-bus/bus.js";
 import { registerEvent } from "../event-bus/registry.js";
 import type { EventDefinition } from "../event-bus/types.js";
+import { truncate } from "../shared/truncate.js";
 import { insertRun, updateRun, getRun, listRuns, deleteRun } from "./store.js";
 import {
   PROGRESS_STATUSES,
@@ -9,7 +11,6 @@ import {
   type StartRunInput,
   type UpdateProgressInput,
 } from "./types.js";
-import { truncate } from "../shared/truncate.js";
 
 registerEvent({
   name: "run.progress.started",
@@ -48,10 +49,6 @@ registerEvent({
 const MAX_TITLE_LEN = 100;
 const MAX_STEP_LEN = 200;
 
-/**
- * Start a new run. Emits `run.progress.started` on the event bus so
- * automations can react (e.g. pinning the row in a UI tray).
- */
 export async function startRun(input: StartRunInput): Promise<AgentRun> {
   const run = await insertRun({
     ...input,
@@ -74,10 +71,6 @@ export async function startRun(input: StartRunInput): Promise<AgentRun> {
   return run;
 }
 
-/**
- * Update a run in-flight. Emits `run.progress.updated`. Caller supplies
- * partial fields — any omitted field stays unchanged.
- */
 export async function updateRunProgress(
   id: string,
   owner: string,
@@ -105,10 +98,6 @@ export async function updateRunProgress(
   return run;
 }
 
-/**
- * Finalize a run with a terminal status. Convenience wrapper around
- * `updateRunProgress` that ensures `completed_at` is set.
- */
 export async function completeRun(
   id: string,
   owner: string,

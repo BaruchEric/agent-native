@@ -1,10 +1,19 @@
 import {
+  buildDeepLink,
   emailStrong,
+  getAppProductionUrl,
   isEmailConfigured,
   renderEmail,
   sendEmail,
+  toAbsoluteOpenUrl,
 } from "@agent-native/core/server";
+
 import type { CalendarEvent, DeleteEventScope } from "../../shared/api.js";
+import { dateKeyInTimezone } from "../../shared/timezone.js";
+import {
+  CALENDAR_EVENT_CANCELLATION_NOTE_EMAIL_ID,
+  CALENDAR_EVENT_UPDATE_NOTE_EMAIL_ID,
+} from "./emails.js";
 
 export interface GuestNotificationResult {
   requested: boolean;
@@ -63,6 +72,16 @@ function safeTimeZone(event: CalendarEvent): string | undefined {
   }
 }
 
+function eventDateKey(event: CalendarEvent): string | undefined {
+  if (!event.start) return undefined;
+  if (event.allDay || /^\d{4}-\d{2}-\d{2}$/.test(event.start)) {
+    return event.start.slice(0, 10);
+  }
+  const timezone = safeTimeZone(event);
+  if (!timezone) return event.start.slice(0, 10);
+  return dateKeyInTimezone(new Date(event.start), timezone);
+}
+
 function formatWhen(event: CalendarEvent): string {
   const zone = safeTimeZone(event);
   const start = new Date(event.start);
@@ -93,6 +112,53 @@ function scopeLabel(scope: DeleteEventScope | undefined): string | undefined {
   if (!scope || scope === "single") return undefined;
   if (scope === "all") return "all events in the series";
   return "this and following events";
+}
+
+export function renderEventGuestNote({
+  title,
+  organizer,
+  message,
+  when,
+  kind,
+  appliesTo,
+  calendarLink,
+}: {
+  title: string;
+  organizer: string;
+  message: string;
+  when: string;
+  kind: GuestNotificationKind;
+  appliesTo?: string;
+  calendarLink?: string | null;
+}) {
+  const heading =
+    kind === "cancellation" ? "Event cancellation note" : "Event update note";
+  const subjectPrefix =
+    kind === "cancellation" ? "Cancellation note" : "Update note";
+  const eventAction = kind === "cancellation" ? "cancelling" : "updating";
+  const paragraphs = [
+    `${emailStrong(organizer)} added this note while ${eventAction} ${emailStrong(title)}.`,
+    messageParagraph(message),
+    `When: ${emailStrong(when)}.`,
+  ];
+  if (appliesTo) {
+    paragraphs.push(`Applies to: ${emailStrong(appliesTo)}.`);
+  }
+
+  return {
+    subject: `${subjectPrefix}: ${title}`,
+    ...renderEmail({
+      preheader: `${subjectPrefix}: ${title}`,
+      heading,
+      paragraphs,
+      cta:
+        kind === "update" && calendarLink
+          ? { label: "Open in AN Calendar", url: calendarLink }
+          : undefined,
+      footer:
+        "Google Calendar sends the calendar update separately. This message carries the organizer note.",
+    }),
+  };
 }
 
 export async function sendEventGuestNotificationNote({
@@ -128,7 +194,7 @@ export async function sendEventGuestNotificationNote({
     };
   }
 
-  if (!isEmailConfigured()) {
+  if (!(await isEmailConfigured())) {
     return {
       requested: true,
       recipientCount: recipients.length,
@@ -137,33 +203,26 @@ export async function sendEventGuestNotificationNote({
     };
   }
 
-  const title = stripCrlf(event.title) || "Calendar event";
-  const organizer = stripCrlf(event.organizer?.displayName) || organizerEmail;
-  const heading =
-    kind === "cancellation" ? "Event cancellation note" : "Event update note";
-  const subjectPrefix =
-    kind === "cancellation" ? "Cancellation note" : "Update note";
-  const eventAction = kind === "cancellation" ? "cancelling" : "updating";
-  const paragraphs = [
-    `${emailStrong(organizer)} added this note while ${eventAction} ${emailStrong(title)}.`,
-    messageParagraph(normalizedMessage),
-    `When: ${emailStrong(formatWhen(event))}.`,
-  ];
-  const appliesTo = scopeLabel(scope);
-  if (appliesTo) {
-    paragraphs.push(`Applies to: ${emailStrong(appliesTo)}.`);
-  }
+  const calendarLink = toAbsoluteOpenUrl(
+    buildDeepLink({
+      app: "calendar",
+      view: "calendar",
+      params: {
+        eventId: event.id,
+        date: eventDateKey(event),
+      },
+    }),
+    getAppProductionUrl(),
+  );
 
-  const rendered = renderEmail({
-    preheader: `${subjectPrefix}: ${title}`,
-    heading,
-    paragraphs,
-    cta:
-      kind === "update" && event.htmlLink
-        ? { label: "Open in Google Calendar", url: event.htmlLink }
-        : undefined,
-    footer:
-      "Google Calendar sends the calendar update separately. This message carries the organizer note.",
+  const rendered = renderEventGuestNote({
+    title: stripCrlf(event.title) || "Calendar event",
+    organizer: stripCrlf(event.organizer?.displayName) || organizerEmail,
+    message: normalizedMessage,
+    when: formatWhen(event),
+    kind,
+    appliesTo: scopeLabel(scope),
+    calendarLink,
   });
 
   let sentCount = 0;
@@ -173,10 +232,14 @@ export async function sendEventGuestNotificationNote({
       try {
         await sendEmail({
           to,
-          subject: `${subjectPrefix}: ${title}`,
+          subject: rendered.subject,
           html: rendered.html,
           text: rendered.text,
           replyTo: organizerEmail,
+          templateId:
+            kind === "cancellation"
+              ? CALENDAR_EVENT_CANCELLATION_NOTE_EMAIL_ID
+              : CALENDAR_EVENT_UPDATE_NOTE_EMAIL_ID,
         });
         sentCount += 1;
       } catch (error) {

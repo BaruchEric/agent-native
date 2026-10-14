@@ -1,22 +1,13 @@
-/**
- * Export a CSV of every recording in the organization with view / engagement
- * counts. Returned as `text/csv` with Content-Disposition attachment so the
- * browser downloads it.
- *
- * Usage:
- *   pnpm action export-insights-csv
- *   pnpm action export-insights-csv --organizationId=<id>
- */
-
-import { defineAction } from "@agent-native/core";
-import { eq, inArray, sql } from "drizzle-orm";
+import { defineAction } from "@agent-native/core/action";
+import { desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import { requireOrganizationAccess } from "../server/lib/recordings.js";
 
 function csvEscape(value: unknown): string {
   if (value === null || value === undefined) return "";
-  const s = String(value);
+  const s = typeof value === "string" ? value : (JSON.stringify(value) ?? "");
   if (/[",\n\r]/.test(s)) {
     return `"${s.replace(/"/g, '""')}"`;
   }
@@ -26,6 +17,8 @@ function csvEscape(value: unknown): string {
 function formatDate(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
+
+const MAX_RECORDINGS = 5000;
 
 export default defineAction({
   description:
@@ -47,23 +40,35 @@ export default defineAction({
     const recordings = await db
       .select()
       .from(schema.recordings)
-      .where(eq(schema.recordings.organizationId, organizationId));
+      .where(eq(schema.recordings.organizationId, organizationId))
+      .orderBy(desc(schema.recordings.createdAt))
+      .limit(MAX_RECORDINGS);
+    const truncated = recordings.length >= MAX_RECORDINGS;
 
     const recordingIds = recordings.map((r) => r.id);
 
     const viewCountByRec: Record<string, number> = {};
     const totalViewsByRec: Record<string, number> = {};
     if (recordingIds.length) {
-      const viewers = await db
-        .select()
+      const viewCounts = await db
+        .select({
+          recordingId: schema.recordingViewers.recordingId,
+          countedView: schema.recordingViewers.countedView,
+          count: sql<number>`COUNT(1)`,
+        })
         .from(schema.recordingViewers)
-        .where(inArray(schema.recordingViewers.recordingId, recordingIds));
-      for (const v of viewers) {
+        .where(inArray(schema.recordingViewers.recordingId, recordingIds))
+        .groupBy(
+          schema.recordingViewers.recordingId,
+          schema.recordingViewers.countedView,
+        );
+      for (const v of viewCounts) {
+        const count = Number(v.count ?? 0);
         totalViewsByRec[v.recordingId] =
-          (totalViewsByRec[v.recordingId] ?? 0) + 1;
+          (totalViewsByRec[v.recordingId] ?? 0) + count;
         if (v.countedView) {
           viewCountByRec[v.recordingId] =
-            (viewCountByRec[v.recordingId] ?? 0) + 1;
+            (viewCountByRec[v.recordingId] ?? 0) + count;
         }
       }
     }
@@ -142,6 +147,7 @@ export default defineAction({
       csv,
       filename,
       rows: recordings.length,
+      truncated,
     };
   },
 });

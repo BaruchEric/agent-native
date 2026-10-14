@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { agentNativePath } from "@agent-native/core/client/api-path";
+import { useT } from "@agent-native/core/client/i18n";
 import {
   IconCheck,
   IconLoader2,
@@ -8,6 +8,10 @@ import {
   IconPlayerPlay,
   IconCpu,
 } from "@tabler/icons-react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -16,12 +20,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
-import { agentNativePath } from "@agent-native/core/client";
-
-// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface EngineCapabilities {
   thinking: boolean;
@@ -47,8 +47,6 @@ interface EnginesResponse {
   current: { engine: string; model: string };
 }
 
-// ─── API helpers ──────────────────────────────────────────────────────────────
-
 async function manageAgentEngine<T>(body: Record<string, unknown>): Promise<T> {
   const res = await fetch(
     agentNativePath("/_agent-native/actions/manage-agent-engine"),
@@ -64,7 +62,6 @@ async function manageAgentEngine<T>(body: Record<string, unknown>): Promise<T> {
   }
   const text = await res.text();
   try {
-    // The script returns a JSON string as the result
     const outer = JSON.parse(text);
     if (typeof outer === "string") return JSON.parse(outer) as T;
     return outer as T;
@@ -72,8 +69,6 @@ async function manageAgentEngine<T>(body: Record<string, unknown>): Promise<T> {
     return text as unknown as T;
   }
 }
-
-// ─── Capability badge ─────────────────────────────────────────────────────────
 
 function CapBadge({ label, enabled }: { label: string; enabled: boolean }) {
   return (
@@ -89,8 +84,6 @@ function CapBadge({ label, enabled }: { label: string; enabled: boolean }) {
     </span>
   );
 }
-
-// ─── Engine card ──────────────────────────────────────────────────────────────
 
 function EngineCard({
   engine,
@@ -157,9 +150,8 @@ function EngineCard({
   );
 }
 
-// ─── AgentEnginePicker ────────────────────────────────────────────────────────
-
 export function AgentEnginePicker() {
+  const t = useT();
   const qc = useQueryClient();
   const [localEngine, setLocalEngine] = useState<string | null>(null);
   const [localModel, setLocalModel] = useState<string | null>(null);
@@ -169,26 +161,23 @@ export function AgentEnginePicker() {
     error?: string;
   } | null>(null);
 
-  // Fetch engine list
   const { data, isLoading, error } = useQuery<EnginesResponse>({
     queryKey: ["agent-engines"],
     queryFn: () => manageAgentEngine<EnginesResponse>({ action: "list" }),
     staleTime: 30_000,
   });
 
-  // Set engine mutation
   const setEngine = useMutation({
     mutationFn: ({ engine, model }: { engine: string; model: string }) =>
       manageAgentEngine({ action: "set", engine, model }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["agent-engines"] });
+      void qc.invalidateQueries({ queryKey: ["agent-engines"] });
       setLocalEngine(null);
       setLocalModel(null);
       setTestResult(null);
     },
   });
 
-  // Test engine mutation
   const testEngine = useMutation({
     mutationFn: ({ engine, model }: { engine: string; model: string }) =>
       manageAgentEngine<{ ok: boolean; latencyMs?: number; error?: string }>({
@@ -221,7 +210,7 @@ export function AgentEnginePicker() {
   if (error || !data) {
     return (
       <div className="rounded-lg border border-destructive/20 bg-destructive/5 p-4 text-[13px] text-destructive/70">
-        Failed to load engine list. Make sure the server is running.
+        {t("mail.agentEngine.loadFailed")}
       </div>
     );
   }
@@ -260,7 +249,7 @@ export function AgentEnginePicker() {
         <IconCpu className="h-4 w-4 text-indigo-400 shrink-0" />
         <div className="flex-1 min-w-0">
           <p className="text-[12px] font-medium text-foreground">
-            Active engine
+            {t("mail.agentEngine.activeEngine")}
           </p>
           <p className="text-[11px] text-muted-foreground font-mono">
             {current.engine} / {current.model}
@@ -279,7 +268,7 @@ export function AgentEnginePicker() {
       {/* Engine cards */}
       <div>
         <p className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider mb-2">
-          Select engine
+          {t("mail.agentEngine.selectEngine")}
         </p>
         <div className="grid gap-2 sm:grid-cols-2">
           {engines.map((engine) => (
@@ -390,7 +379,7 @@ export function AgentEnginePicker() {
 
       {setEngine.isSuccess && !isDirty && (
         <p className="text-[12px] text-emerald-400">
-          Engine saved. Takes effect on the next conversation.
+          {t("mail.agentEngine.engineSaved")}
         </p>
       )}
 

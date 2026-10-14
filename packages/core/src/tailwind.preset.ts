@@ -1,5 +1,3 @@
-import type { Config } from "tailwindcss";
-
 /**
  * @deprecated Legacy Tailwind v3 preset.
  *
@@ -8,7 +6,7 @@ import type { Config } from "tailwindcss";
  *
  *   // app/global.css
  *   @import "tailwindcss";
- *   @import "@agent-native/core/styles/agent-native.css";
+ *   @import "@agent-native/toolkit/styles.css";
  *
  * No `tailwind.config.ts` or `postcss.config.js` is needed. The
  * `@tailwindcss/vite` plugin is auto-injected by `defineConfig()`.
@@ -18,27 +16,15 @@ import type { Config } from "tailwindcss";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
-// Scan @agent-native/core's dist/client for Tailwind classes used in
-// core components (AgentPanel, AssistantChat, etc.)
+import type { Config } from "tailwindcss";
+
 const thisDir =
   typeof __dirname !== "undefined"
     ? __dirname
     : dirname(fileURLToPath(import.meta.url));
 
-/**
- * Glob pattern that matches all core client component files.
- * Templates MUST include this in their `content` array — Tailwind v3
- * does NOT merge `content` from presets, so the preset alone isn't enough.
- *
- * Usage:
- *   import preset, { coreContentGlob } from "@agent-native/core/tailwind";
- *   export default { presets: [preset], content: ["./app/**\/*.{ts,tsx}", coreContentGlob] };
- */
 export const coreContentGlob = join(thisDir, "client", "**/*.{js,mjs}");
 
-// Cast to `any` for the inner config — Tailwind v4 ships stricter Config types
-// than v3 (e.g. `darkMode: ["class"]` is v3-only). This file exists only to
-// keep third-party v3 setups working until they migrate.
 const preset = {
   darkMode: ["class"],
   content: [coreContentGlob],
@@ -119,7 +105,6 @@ const preset = {
     },
   },
   plugins: [
-    // tailwindcss-animate is v3-only and is no longer a peer dep — guard the require.
     (() => {
       try {
         return require("tailwindcss-animate");

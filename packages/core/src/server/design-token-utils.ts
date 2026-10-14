@@ -1,30 +1,11 @@
-/**
- * Shared design-token extraction utilities.
- *
- * Pure functions for parsing Tailwind configs, CSS files, package.json,
- * documents, and URLs to extract colors, fonts, spacing, border-radius,
- * and CSS custom properties. Used by the import-* actions across all
- * templates (design, slides, videos).
- *
- * No framework dependencies — no defineAction, no zod, no drizzle.
- */
-
 import { ssrfSafeFetch } from "../extensions/url-safety.js";
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/** Maximum number of files to fetch from a single GitHub repo. */
 export const MAX_FILES = 10;
 
-/** Maximum individual file size (100 KB). */
 export const MAX_FILE_SIZE = 100 * 1024;
 
-/** Timeout for GitHub API / URL fetch calls (ms). */
 export const FETCH_TIMEOUT = 15000;
 
-/** File-name patterns to look for at the repo root. */
 export const ROOT_PATTERNS: RegExp[] = [
   /^tailwind\.config\.\w+$/,
   /^postcss\.config\.\w+$/,
@@ -34,7 +15,6 @@ export const ROOT_PATTERNS: RegExp[] = [
   /\.css$/,
 ];
 
-/** Secondary paths (files and directories) to check for design tokens. */
 export const SECONDARY_PATHS: string[] = [
   "src/styles",
   "styles",
@@ -46,28 +26,39 @@ export const SECONDARY_PATHS: string[] = [
   "src/app/globals.css",
 ];
 
-/** Maximum files accepted in import-code. */
 export const CODE_MAX_FILES = 20;
 
-/** Maximum total bytes accepted in import-code. */
 export const CODE_MAX_TOTAL_BYTES = 500 * 1024;
 
-/** Regex for hex colors (3-8 digit, including alpha). */
+export interface CodeAnalysisFile {
+  filename: string;
+  content: string;
+}
+
+export interface CodeAnalysisResult {
+  source: "code";
+  fileCount: number;
+  filesAnalyzed: string[];
+  colors: Record<string, string>;
+  cssCustomProperties: Record<string, string>;
+  fonts: CodeAnalysisState["fonts"];
+  spacing: CodeAnalysisState["spacing"];
+  borderRadius: CodeAnalysisState["borderRadius"];
+  stylingFramework: CodeAnalysisState["stylingFramework"];
+  rawExtracts: CodeAnalysisState["rawExtracts"];
+}
+
 export const HEX_COLOR_RE = /#(?:[0-9a-fA-F]{3,4}){1,2}\b/g;
 
-/** Regex for well-known named CSS colors. */
 export const NAMED_COLOR_RE =
   /\b(red|blue|green|yellow|orange|purple|pink|cyan|magenta|teal|navy|maroon|coral|salmon|gold|silver|gray|grey|indigo|violet|lime|olive|aqua|fuchsia|crimson|turquoise|ivory|beige|lavender|tan|khaki|plum|orchid|sienna)\b/gi;
 
-/** Regex for well-known font family names found in documents. */
 export const FONT_NAME_RE =
   /\b(Helvetica|Arial|Times New Roman|Georgia|Garamond|Futura|Bodoni|Avenir|Proxima Nova|Montserrat|Open Sans|Lato|Poppins|Raleway|Playfair Display|Merriweather|Source Sans|Noto Sans|Work Sans|Nunito|Rubik|Oswald|Roboto|Inter|DM Sans|Space Grotesk|SF Pro|Segoe UI|Calibri|Cambria|Century Gothic|Franklin Gothic|Gill Sans|Fira Sans|Barlow|Manrope|Sora|Plus Jakarta Sans|IBM Plex Sans|IBM Plex Serif|Libre Baskerville|Cormorant|Crimson Text)\b/gi;
 
-/** Regex matching CSS custom property values that look like colors. */
 export const COLOR_VAR_PATTERN =
   /^(#[0-9a-fA-F]{3,8}|rgba?\(|hsla?\(|oklch\(|color\()/;
 
-/** Well-known styling framework deps to detect in package.json. */
 export const FRAMEWORK_DETECTORS: { name: string; label: string }[] = [
   { name: "tailwindcss", label: "tailwind" },
   { name: "@tailwindcss/cli", label: "tailwind" },
@@ -85,10 +76,6 @@ export const FRAMEWORK_DETECTORS: { name: string; label: string }[] = [
   { name: "unocss", label: "unocss" },
   { name: "windicss", label: "windi" },
 ];
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 export type ContentType =
   | "presentation"
@@ -131,10 +118,20 @@ export interface UrlExtractionResult {
   googleFonts?: string[];
   ogImage?: string;
   favicon?: string;
+  stylesheetUrls?: string[];
+  stylesheetFailures?: { url: string; error: string }[];
 }
 
 export interface GitHubFetchOptions {
   token?: string | null;
+  ref?: string;
+}
+
+export interface GitHubRepoReference {
+  owner: string;
+  repo: string;
+  ref?: string;
+  subpath?: string;
 }
 
 export interface GitHubJsonResult<T = unknown> {
@@ -144,18 +141,6 @@ export interface GitHubJsonResult<T = unknown> {
   message?: string;
 }
 
-// ---------------------------------------------------------------------------
-// SSRF Guard
-// ---------------------------------------------------------------------------
-
-/**
- * Cheap synchronous pre-filter for obviously-internal URLs. This is a fast
- * fail, NOT the real guard: it cannot resolve DNS and does not re-check
- * redirects. All actual outbound fetches in this module go through
- * `ssrfSafeFetch`, which performs the DNS-aware check, a connect-time
- * private-IP guard, and per-redirect re-validation. Keep both: this gives a
- * clear early error for literal private hosts, ssrfSafeFetch is the backstop.
- */
 export function validateUrl(url: string): void {
   const parsed = new URL(url);
   if (!["http:", "https:"].includes(parsed.protocol)) {
@@ -185,44 +170,93 @@ export function validateUrl(url: string): void {
   }
 }
 
-// ---------------------------------------------------------------------------
-// GitHub helpers
-// ---------------------------------------------------------------------------
-
-/** Parse a GitHub URL or "org/repo" shorthand into owner + repo. */
-export function parseOwnerRepo(raw: string): {
-  owner: string;
-  repo: string;
-} {
+export function parseGitHubRepoReference(raw: string): GitHubRepoReference {
   const cleaned = raw
     .trim()
     .replace(/[?#].*$/, "")
     .replace(/\/+$/, "");
+  if (!cleaned) throw new Error("GitHub repository reference cannot be empty.");
 
   const sshMatch = cleaned.match(
     /^(?:ssh:\/\/)?git@github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?$/,
   );
-  if (sshMatch) {
-    return { owner: sshMatch[1], repo: sshMatch[2] };
-  }
+  if (sshMatch) return { owner: sshMatch[1], repo: sshMatch[2] };
 
   const shorthand = cleaned.match(/^([^/\s]+)\/([^/\s]+?)(?:\.git)?$/);
-  if (shorthand) {
-    return { owner: shorthand[1], repo: shorthand[2] };
+  if (shorthand) return { owner: shorthand[1], repo: shorthand[2] };
+
+  let parsed: URL;
+  try {
+    parsed = new URL(cleaned);
+  } catch {
+    throw new Error(
+      "Could not parse GitHub owner/repo from URL. " +
+        'Expected format: "https://github.com/org/repo", "org/repo", or "git@github.com:org/repo.git"',
+    );
   }
-  const urlMatch = cleaned.match(
-    /github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?(?:\/.*)?$/,
-  );
-  if (urlMatch) {
-    return { owner: urlMatch[1], repo: urlMatch[2] };
+  if (parsed.hostname.toLowerCase() !== "github.com") {
+    throw new Error("GitHub repository URL must use github.com.");
   }
-  throw new Error(
-    "Could not parse GitHub owner/repo from URL. " +
-      'Expected format: "https://github.com/org/repo", "org/repo", or "git@github.com:org/repo.git"',
-  );
+
+  const parts = parsed.pathname
+    .split("/")
+    .filter(Boolean)
+    .map((part) => {
+      try {
+        return decodeURIComponent(part);
+      } catch {
+        return part;
+      }
+    });
+  const owner = parts[0];
+  const repo = parts[1]?.replace(/\.git$/, "");
+  if (!owner || !repo) {
+    throw new Error(
+      "Could not parse GitHub owner/repo from URL. " +
+        'Expected format: "https://github.com/org/repo", "org/repo", or "git@github.com:org/repo.git"',
+    );
+  }
+
+  const kind = parts[2];
+  if ((kind === "tree" || kind === "blob") && parts[3]) {
+    return {
+      owner,
+      repo,
+      ref: parts[3],
+      ...(parts.length > 4 ? { subpath: parts.slice(4).join("/") } : {}),
+    };
+  }
+  return { owner, repo };
 }
 
-/** Fetch a path from the GitHub Contents API as JSON. Returns null on error. */
+export function parseOwnerRepo(raw: string): { owner: string; repo: string } {
+  const { owner, repo } = parseGitHubRepoReference(raw);
+  return { owner, repo };
+}
+
+export function canonicalGitHubRepoUrl(raw: string): string {
+  const { owner, repo } = parseGitHubRepoReference(raw);
+  return `https://github.com/${owner}/${repo}`;
+}
+
+function githubContentsUrl(
+  owner: string,
+  repo: string,
+  path: string,
+  ref?: string,
+): URL {
+  const encodedPath = path
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  const url = new URL(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedPath}`,
+  );
+  if (ref?.trim()) url.searchParams.set("ref", ref.trim());
+  return url;
+}
+
 function githubHeaders(
   accept: string,
   options: GitHubFetchOptions = {},
@@ -234,16 +268,15 @@ function githubHeaders(
   };
 }
 
-/** Fetch a path from the GitHub Contents API as JSON with status details. */
 export async function fetchGitHubJsonResult<T = unknown>(
   owner: string,
   repo: string,
   path: string,
   options: GitHubFetchOptions = {},
 ): Promise<GitHubJsonResult<T>> {
-  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
-  validateUrl(url);
-  const res = await ssrfSafeFetch(url, {
+  const url = githubContentsUrl(owner, repo, path, options.ref);
+  validateUrl(url.toString());
+  const res = await ssrfSafeFetch(url.toString(), {
     headers: githubHeaders("application/vnd.github.v3+json", options),
     signal: AbortSignal.timeout(FETCH_TIMEOUT),
   });
@@ -265,7 +298,6 @@ export async function fetchGitHubJsonResult<T = unknown>(
   return { ok: true, status: res.status, data: (await res.json()) as T };
 }
 
-/** Fetch a path from the GitHub Contents API as JSON. Returns null on error. */
 export async function fetchGitHubJson(
   owner: string,
   repo: string,
@@ -276,16 +308,15 @@ export async function fetchGitHubJson(
   return result.ok ? result.data : null;
 }
 
-/** Fetch raw file content from the GitHub Contents API. Returns null on error or oversize. */
 export async function fetchGitHubRaw(
   owner: string,
   repo: string,
   path: string,
   options: GitHubFetchOptions = {},
 ): Promise<string | null> {
-  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
-  validateUrl(url);
-  const res = await ssrfSafeFetch(url, {
+  const url = githubContentsUrl(owner, repo, path, options.ref);
+  validateUrl(url.toString());
+  const res = await ssrfSafeFetch(url.toString(), {
     headers: githubHeaders("application/vnd.github.v3.raw", options),
     signal: AbortSignal.timeout(FETCH_TIMEOUT),
   });
@@ -299,11 +330,6 @@ export async function fetchGitHubRaw(
   return text;
 }
 
-// ---------------------------------------------------------------------------
-// Tailwind config parser
-// ---------------------------------------------------------------------------
-
-/** Extract colors, fonts, spacing, borderRadius from a Tailwind config file string. */
 export function parseTailwindConfig(content: string): Record<string, unknown> {
   const result: Record<string, unknown> = {};
 
@@ -370,11 +396,6 @@ export function parseTailwindConfig(content: string): Record<string, unknown> {
   return result;
 }
 
-// ---------------------------------------------------------------------------
-// CSS parser
-// ---------------------------------------------------------------------------
-
-/** Extract CSS custom properties and @font-face / Google Fonts from CSS content. */
 export function parseCss(content: string): ParsedCss {
   const cssCustomProperties: Record<string, string> = {};
   const varMatches = content.matchAll(/--([\w-]+)\s*:\s*([^;}\n]+)/g);
@@ -408,11 +429,6 @@ export function parseCss(content: string): ParsedCss {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Styling framework detection
-// ---------------------------------------------------------------------------
-
-/** Detect the styling framework from a package.json string. */
 export function detectStylingFramework(content: string): string | undefined {
   try {
     const pkg = JSON.parse(content);
@@ -434,11 +450,6 @@ export function detectStylingFramework(content: string): string | undefined {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Code file analysis helpers (import-code)
-// ---------------------------------------------------------------------------
-
-/** Create a fresh state object for code file analysis. */
 export function createCodeAnalysisState(): CodeAnalysisState {
   return {
     colors: {},
@@ -452,7 +463,6 @@ export function createCodeAnalysisState(): CodeAnalysisState {
   };
 }
 
-/** De-duplicate and add a font to the analysis state. */
 export function addFont(
   state: CodeAnalysisState,
   family: string,
@@ -464,7 +474,6 @@ export function addFont(
   state.fonts.push({ family: normalized, source });
 }
 
-/** Extract CSS custom properties, classifying them by name into colors/spacing/radius. */
 export function extractCssVars(
   state: CodeAnalysisState,
   content: string,
@@ -490,7 +499,6 @@ export function extractCssVars(
   }
 }
 
-/** Extract literal color values (hex, rgb, hsl, oklch) from content. */
 export function extractCodeColors(
   state: CodeAnalysisState,
   content: string,
@@ -520,7 +528,6 @@ export function extractCodeColors(
   }
 }
 
-/** Extract font-family declarations and @font-face blocks from CSS-like content. */
 export function extractCodeFonts(
   state: CodeAnalysisState,
   content: string,
@@ -553,7 +560,6 @@ export function extractCodeFonts(
   }
 }
 
-/** Analyze a CSS/SCSS/LESS file, extracting vars, colors, and fonts. */
 export function analyzeCssFile(
   state: CodeAnalysisState,
   content: string,
@@ -565,7 +571,6 @@ export function analyzeCssFile(
   state.rawExtracts.push({ filename, type: "css", data: { parsed: true } });
 }
 
-/** Analyze a Tailwind config file for tokens. */
 export function analyzeTailwindConfig(
   state: CodeAnalysisState,
   content: string,
@@ -623,7 +628,6 @@ export function analyzeTailwindConfig(
   });
 }
 
-/** Walk a parsed JSON theme object, extracting tokens into state. */
 export function analyzeJsonTheme(
   state: CodeAnalysisState,
   content: string,
@@ -674,7 +678,6 @@ export function analyzeJsonTheme(
   }
 }
 
-/** Analyze package.json for styling framework deps. */
 export function analyzePackageJson(
   state: CodeAnalysisState,
   content: string,
@@ -711,7 +714,6 @@ export function analyzePackageJson(
   }
 }
 
-/** Analyze a theme source file (theme.ts, tokens.ts) for design tokens. */
 export function analyzeThemeSourceFile(
   state: CodeAnalysisState,
   content: string,
@@ -750,7 +752,6 @@ export function analyzeThemeSourceFile(
   });
 }
 
-/** Route a file to the correct analyzer based on filename. */
 export function analyzeCodeFile(
   state: CodeAnalysisState,
   filename: string,
@@ -804,29 +805,57 @@ export function analyzeCodeFile(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Document analysis helpers (import-document)
-// ---------------------------------------------------------------------------
+export function analyzeCodeFiles(
+  files: CodeAnalysisFile[],
+): CodeAnalysisResult {
+  const truncated = files.slice(0, CODE_MAX_FILES);
+  let totalBytes = 0;
+  const accepted: CodeAnalysisFile[] = [];
+  for (const file of truncated) {
+    const size = new TextEncoder().encode(file.content).byteLength;
+    if (totalBytes + size > CODE_MAX_TOTAL_BYTES) break;
+    totalBytes += size;
+    accepted.push(file);
+  }
 
-/** Deduplicate and trim an array of strings. */
+  const state = createCodeAnalysisState();
+  const filesAnalyzed: string[] = [];
+  for (const file of accepted) {
+    filesAnalyzed.push(file.filename);
+    analyzeCodeFile(state, file.filename, file.content);
+  }
+
+  return {
+    source: "code",
+    fileCount: accepted.length,
+    filesAnalyzed,
+    colors: Object.fromEntries(Object.entries(state.colors).slice(0, 60)),
+    cssCustomProperties: Object.fromEntries(
+      Object.entries(state.cssCustomProperties).slice(0, 80),
+    ),
+    fonts: state.fonts.slice(0, 20),
+    spacing: state.spacing,
+    borderRadius: state.borderRadius,
+    stylingFramework: state.stylingFramework,
+    rawExtracts: state.rawExtracts,
+  };
+}
+
 export function unique(arr: string[]): string[] {
   return [...new Set(arr.map((s) => s.trim()))];
 }
 
-/** Extract hex and named colors from plain text. */
 export function extractDocumentColors(text: string): string[] {
   const hex = text.match(HEX_COLOR_RE) ?? [];
   const named = text.match(NAMED_COLOR_RE) ?? [];
   return unique([...hex, ...named.map((n) => n.toLowerCase())]);
 }
 
-/** Extract known font family names from plain text. */
 export function extractDocumentFonts(text: string): string[] {
   const matches = text.match(FONT_NAME_RE) ?? [];
   return unique(matches);
 }
 
-/** Classify a file type string into a content category. */
 export function classifyFile(fileType: string): ContentType {
   const ft = fileType.toLowerCase();
   if (
@@ -854,7 +883,6 @@ export function classifyFile(fileType: string): ContentType {
   return "other";
 }
 
-/** Return per-type suggestions for how to use a document for design extraction. */
 export function suggestionsForType(
   contentType: ContentType,
   hasText: boolean,
@@ -912,120 +940,365 @@ export function suggestionsForType(
   return base;
 }
 
-// ---------------------------------------------------------------------------
-// URL scraping helpers (import-from-url)
-// ---------------------------------------------------------------------------
+const URL_FETCH_TIMEOUT = 10_000;
+const MAX_URL_HTML_CHARS = 1_000_000;
+const MAX_URL_STYLESHEETS = 10;
+const MAX_URL_STYLESHEET_CHARS = 256 * 1024;
+const MAX_URL_STYLESHEET_TOTAL_CHARS = 512 * 1024;
 
-/** Fetch and extract design tokens from a URL's HTML. */
-export async function extractDesignTokensFromUrl(
-  rawUrl: string,
-): Promise<UrlExtractionResult> {
-  const url = rawUrl.startsWith("http") ? rawUrl : `https://${rawUrl}`;
-  validateUrl(url);
+interface FetchedStylesheet {
+  url: string;
+  content: string;
+}
 
-  const response = await ssrfSafeFetch(url, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (compatible; AgentNative/1.0; +https://agent-native.com)",
-    },
-    signal: AbortSignal.timeout(10000),
-  });
-  const html = await response.text();
+interface StylesheetFetchResult {
+  fetched: FetchedStylesheet[];
+  urls: string[];
+  failures: { url: string; error: string }[];
+}
 
-  const result: UrlExtractionResult = { url };
+function normalizeUrlInput(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) throw new Error("Website URL is required");
+  const candidate = /^[a-z][a-z\d+.-]*:/i.test(trimmed)
+    ? trimmed
+    : `https://${trimmed}`;
+  return new URL(candidate).href;
+}
 
-  // Title
-  const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
-  if (titleMatch) {
-    result.pageTitle = titleMatch[1].trim();
-  }
+function decodeHtmlAttribute(value: string): string {
+  return value
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'");
+}
 
-  // Meta description
-  const descMatch = html.match(
-    /<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["']/i,
+function readHtmlAttribute(tag: string, attribute: string): string | undefined {
+  const match = tag.match(
+    new RegExp(
+      `\\b${attribute}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`,
+      "i",
+    ),
   );
-  if (descMatch) {
-    result.metaDescription = descMatch[1];
-  }
+  const value = match?.[1] ?? match?.[2] ?? match?.[3];
+  return value === undefined ? undefined : decodeHtmlAttribute(value.trim());
+}
 
-  // Meta theme-color
-  const themeColorMatch = html.match(
-    /<meta[^>]*name=["']theme-color["'][^>]*content=["']([^"']+)["']/i,
-  );
-  if (themeColorMatch) {
-    result.themeColor = themeColorMatch[1];
+function resolveHttpUrl(
+  value: string | undefined,
+  baseUrl: string,
+):
+  | { kind: "missing" }
+  | { kind: "resolved"; url: string }
+  | { kind: "invalid"; value: string } {
+  if (!value) return { kind: "missing" };
+  try {
+    const parsed = new URL(value, baseUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return { kind: "missing" };
+    }
+    return { kind: "resolved", url: parsed.href };
+  } catch {
+    return { kind: "invalid", value };
   }
+}
 
-  // CSS custom properties
-  const cssVarMatches = html.matchAll(/--([\w-]+)\s*:\s*([^;}\n]+)/g);
-  const cssVars: Record<string, string> = {};
-  for (const match of cssVarMatches) {
-    cssVars[`--${match[1]}`] = match[2].trim();
+function readMetaContent(
+  html: string,
+  attribute: string,
+  value: string,
+): string | undefined {
+  for (const match of html.matchAll(/<meta\b[^>]*>/gi)) {
+    const tag = match[0];
+    if (readHtmlAttribute(tag, attribute)?.toLowerCase() !== value) continue;
+    const content = readHtmlAttribute(tag, "content");
+    if (content !== undefined) return content;
   }
-  if (Object.keys(cssVars).length > 0) {
-    const entries = Object.entries(cssVars).slice(0, 50);
-    result.cssCustomProperties = Object.fromEntries(entries);
-  }
+  return undefined;
+}
 
-  // Inline colors (hex, rgb)
-  const colorMatches = new Set<string>();
-  const hexPattern = /#[0-9a-fA-F]{3,8}\b/g;
-  let hexMatch;
-  while ((hexMatch = hexPattern.exec(html)) !== null) {
-    colorMatches.add(hexMatch[0]);
+function extractStylesheetUrls(html: string, baseUrl: string): string[] {
+  const urls = new Set<string>();
+  for (const match of html.matchAll(/<link\b[^>]*>/gi)) {
+    const tag = match[0];
+    const rel = readHtmlAttribute(tag, "rel");
+    if (
+      !rel?.split(/\s+/).some((token) => token.toLowerCase() === "stylesheet")
+    ) {
+      continue;
+    }
+    const resolved = resolveHttpUrl(readHtmlAttribute(tag, "href"), baseUrl);
+    if (resolved.kind === "resolved") urls.add(resolved.url);
   }
-  const rgbPattern =
-    /rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+(?:\s*,\s*[\d.]+)?\s*\)/g;
-  let rgbMatch;
-  while ((rgbMatch = rgbPattern.exec(html)) !== null) {
-    colorMatches.add(rgbMatch[0]);
-  }
-  if (colorMatches.size > 0) {
-    result.colors = [...colorMatches].slice(0, 30);
-  }
+  return [...urls];
+}
 
-  // @font-face
-  const fontFaceMatches = html.matchAll(/@font-face\s*\{([^}]+)\}/g);
+function extractInlineCss(html: string): string {
+  const parts: string[] = [];
+  for (const match of html.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi)) {
+    parts.push(match[1]);
+  }
+  for (const match of html.matchAll(/<[a-z][^>]*>/gi)) {
+    const style = readHtmlAttribute(match[0], "style");
+    if (style) parts.push(style);
+  }
+  return parts.join("\n");
+}
+
+function extractFontFaces(
+  content: string,
+): { family?: string; src?: string }[] {
   const fonts: { family?: string; src?: string }[] = [];
-  for (const match of fontFaceMatches) {
+  for (const match of content.matchAll(/@font-face\s*\{([^}]+)\}/g)) {
     const block = match[1];
-    const familyMatch = block.match(/font-family\s*:\s*["']?([^"';]+)["']?/);
+    const familyMatch = block.match(/font-family\s*:\s*["']?([^"';]+)/);
     const srcMatch = block.match(/src\s*:\s*([^;]+)/);
     fonts.push({
       family: familyMatch?.[1]?.trim(),
       src: srcMatch?.[1]?.trim()?.slice(0, 200),
     });
   }
+  return fonts;
+}
+
+function extractGoogleFontUrls(content: string): string[] {
+  return [
+    ...content.matchAll(/fonts\.googleapis\.com\/css2?\?[^"'>\s)]+/g),
+  ].map((match) => match[0]);
+}
+
+function addColorMatches(content: string, colors: Set<string>): void {
+  for (const match of content.matchAll(/#[0-9a-fA-F]{3,8}\b/g)) {
+    colors.add(match[0]);
+  }
+  for (const match of content.matchAll(
+    /\b(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch|color)\([^)]*\)/gi,
+  )) {
+    colors.add(match[0]);
+  }
+}
+
+async function readBoundedResponseText(
+  response: Response,
+  maxChars: number,
+  label: string,
+): Promise<string> {
+  const contentLength = Number.parseInt(
+    response.headers.get("content-length") ?? "",
+    10,
+  );
+  if (Number.isFinite(contentLength) && contentLength > maxChars) {
+    throw new Error(`${label} exceeds the ${maxChars}-character limit`);
+  }
+
+  if (!response.body) {
+    const text = await response.text();
+    if (text.length > maxChars) {
+      throw new Error(`${label} exceeds the ${maxChars}-character limit`);
+    }
+    return text;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        text += decoder.decode();
+        break;
+      }
+      text += decoder.decode(chunk.value, { stream: true });
+      if (text.length > maxChars) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error(`${label} exceeds the ${maxChars}-character limit`);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return text;
+}
+
+async function fetchStylesheets(
+  pageUrl: string,
+  html: string,
+): Promise<StylesheetFetchResult> {
+  const discovered = extractStylesheetUrls(html, pageUrl);
+  const fetched: FetchedStylesheet[] = [];
+  const urls: string[] = [];
+  const failures: { url: string; error: string }[] = [];
+  let totalChars = 0;
+
+  for (const stylesheetUrl of discovered.slice(0, MAX_URL_STYLESHEETS)) {
+    if (totalChars >= MAX_URL_STYLESHEET_TOTAL_CHARS) {
+      failures.push({
+        url: stylesheetUrl,
+        error: `Skipped because the ${MAX_URL_STYLESHEET_TOTAL_CHARS}-character stylesheet budget was reached`,
+      });
+      continue;
+    }
+
+    try {
+      const response = await ssrfSafeFetch(
+        stylesheetUrl,
+        {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (compatible; AgentNative/1.0; +https://agent-native.com)",
+          },
+          signal: AbortSignal.timeout(URL_FETCH_TIMEOUT),
+        },
+        { maxRedirects: 3 },
+      );
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const remainingChars = MAX_URL_STYLESHEET_TOTAL_CHARS - totalChars;
+      const content = await readBoundedResponseText(
+        response,
+        Math.min(MAX_URL_STYLESHEET_CHARS, remainingChars),
+        `Stylesheet ${stylesheetUrl}`,
+      );
+      totalChars += content.length;
+      fetched.push({ url: stylesheetUrl, content });
+      urls.push(stylesheetUrl);
+    } catch (error) {
+      failures.push({
+        url: stylesheetUrl,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  if (discovered.length > MAX_URL_STYLESHEETS) {
+    failures.push({
+      url: pageUrl,
+      error: `Skipped ${discovered.length - MAX_URL_STYLESHEETS} stylesheet(s) after the ${MAX_URL_STYLESHEETS}-stylesheet limit`,
+    });
+  }
+
+  return { fetched, urls, failures };
+}
+
+export async function extractDesignTokensFromUrl(
+  rawUrl: string,
+): Promise<UrlExtractionResult> {
+  const url = normalizeUrlInput(rawUrl);
+  validateUrl(url);
+
+  const response = await ssrfSafeFetch(
+    url,
+    {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (compatible; AgentNative/1.0; +https://agent-native.com)",
+      },
+      signal: AbortSignal.timeout(URL_FETCH_TIMEOUT),
+    },
+    { maxRedirects: 3 },
+  );
+  if (!response.ok) {
+    throw new Error(`Failed to fetch ${url}: HTTP ${response.status}`);
+  }
+  const html = await readBoundedResponseText(
+    response,
+    MAX_URL_HTML_CHARS,
+    `Website ${url}`,
+  );
+  const pageUrl = response.url || url;
+
+  const result: UrlExtractionResult = { url };
+
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (titleMatch) {
+    result.pageTitle = titleMatch[1].trim();
+  }
+
+  const metaDescription = readMetaContent(html, "name", "description");
+  if (metaDescription !== undefined) {
+    result.metaDescription = metaDescription;
+  }
+  const themeColor = readMetaContent(html, "name", "theme-color");
+  if (themeColor !== undefined) {
+    result.themeColor = themeColor;
+  }
+
+  const inlineCss = extractInlineCss(html);
+  const pageCss = parseCss(inlineCss);
+  const stylesheetResult = await fetchStylesheets(pageUrl, html);
+  const stylesheetCssVars: Record<string, string> = {};
+  const fonts = extractFontFaces(inlineCss);
+  const googleFonts = new Set(extractGoogleFontUrls(html));
+  const colorMatches = new Set<string>();
+  addColorMatches(html, colorMatches);
+
+  for (const stylesheet of stylesheetResult.fetched) {
+    const parsed = parseCss(stylesheet.content);
+    Object.assign(stylesheetCssVars, parsed.cssCustomProperties);
+    fonts.push(...extractFontFaces(stylesheet.content));
+    for (const fontUrl of extractGoogleFontUrls(stylesheet.content)) {
+      googleFonts.add(fontUrl);
+    }
+    addColorMatches(stylesheet.content, colorMatches);
+  }
+
+  const cssVars = {
+    ...stylesheetCssVars,
+    ...(pageCss.cssCustomProperties ?? {}),
+  };
+  if (Object.keys(cssVars).length > 0) {
+    const entries = Object.entries(cssVars).slice(0, 50);
+    result.cssCustomProperties = Object.fromEntries(entries);
+  }
+
+  if (colorMatches.size > 0) {
+    result.colors = [...colorMatches].slice(0, 30);
+  }
+
   if (fonts.length > 0) {
-    result.fontFaces = fonts.slice(0, 20);
+    const seenFonts = new Set<string>();
+    result.fontFaces = fonts
+      .filter((font) => {
+        const key = `${font.family ?? ""}\u0000${font.src ?? ""}`;
+        if (seenFonts.has(key)) return false;
+        seenFonts.add(key);
+        return true;
+      })
+      .slice(0, 20);
   }
 
-  // Google Fonts
-  const googleFontMatches = html.matchAll(
-    /fonts\.googleapis\.com\/css2?\?[^"'>\s]+/g,
-  );
-  const googleFonts: string[] = [];
-  for (const match of googleFontMatches) {
-    googleFonts.push(match[0]);
-  }
-  if (googleFonts.length > 0) {
-    result.googleFonts = googleFonts;
+  if (googleFonts.size > 0) {
+    result.googleFonts = [...googleFonts];
   }
 
-  // OG image
-  const ogImageMatch = html.match(
-    /<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i,
-  );
-  if (ogImageMatch) {
-    result.ogImage = ogImageMatch[1];
+  const ogImage = readMetaContent(html, "property", "og:image");
+  if (ogImage) {
+    const resolved = resolveHttpUrl(ogImage, pageUrl);
+    result.ogImage = resolved.kind === "resolved" ? resolved.url : ogImage;
   }
 
-  // Favicon
-  const faviconMatch = html.match(
-    /<link[^>]*rel=["'](?:icon|shortcut icon)["'][^>]*href=["']([^"']+)["']/i,
-  );
-  if (faviconMatch) {
-    result.favicon = faviconMatch[1];
+  for (const match of html.matchAll(/<link\b[^>]*>/gi)) {
+    const tag = match[0];
+    const rel = readHtmlAttribute(tag, "rel");
+    if (!rel?.split(/\s+/).some((token) => token.toLowerCase() === "icon")) {
+      continue;
+    }
+    const href = readHtmlAttribute(tag, "href");
+    if (href && !/^data:/i.test(href)) {
+      const resolved = resolveHttpUrl(href, pageUrl);
+      result.favicon = resolved.kind === "resolved" ? resolved.url : href;
+    }
+    break;
+  }
+
+  if (stylesheetResult.urls.length > 0) {
+    result.stylesheetUrls = stylesheetResult.urls;
+  }
+  if (stylesheetResult.failures.length > 0) {
+    result.stylesheetFailures = stylesheetResult.failures;
   }
 
   return result;

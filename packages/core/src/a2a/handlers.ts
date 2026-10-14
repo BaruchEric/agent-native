@@ -1,5 +1,62 @@
+import crypto from "node:crypto";
+
 import { setResponseHeader, setResponseStatus } from "h3";
+
+import {
+  AGENT_BACKGROUND_PROCESSOR_A2A,
+  AGENT_BACKGROUND_PROCESSOR_FIELD,
+  dispatchPathTargetsNetlifyBackgroundFunction,
+  isAgentChatDurableBackgroundEnabled,
+  resolveAgentChatProcessRunDispatchPath,
+} from "../agent/durable-background.js";
+import { uploadFile } from "../file-upload/registry.js";
+import { trackingIdentityProperties } from "../observability/tracking-identity.js";
+import { parseServiceIdentityEmail } from "../org/service-identity.js";
+import {
+  assertServicePrincipalMayRun,
+  recordServicePrincipalDenial,
+  ServicePrincipalRefusedError,
+} from "../org/service-principal-guard.js";
+import { findWorkspaceDispatchAgent } from "../server/agent-discovery.js";
+import { withConfiguredAppBasePath } from "../server/app-base-path.js";
+import { getOrigin, isConfiguredAppOrigin } from "../server/google-oauth.js";
+import {
+  DEFAULT_UPLOAD_MAX_FILE_BYTES,
+  isAllowedUploadMimeType,
+} from "../server/h3-helpers.js";
+import { markExplicitPersonalOrgScope } from "../server/request-context.js";
+import { fireInternalDispatch } from "../server/self-dispatch.js";
+import { agentChat } from "../shared/agent-chat.js";
+import { track } from "../tracking/registry.js";
+import {
+  hasConfiguredA2ASecret,
+  isA2AProductionRuntime,
+} from "./auth-policy.js";
+import { callAction } from "./client.js";
+import { sanitizeA2ACorrelationMetadata } from "./correlation.js";
+import { assertA2APersistablePayload } from "./persistence-safety.js";
+import {
+  createTask,
+  createOrReuseTask,
+  getTask,
+  getTaskOwnership,
+  updateTask,
+  claimA2ATaskForProcessing,
+  getA2ATaskDispatchState,
+  failStuckA2ATask,
+  failStuckQueuedA2ATask,
+  settleProcessingA2ATask,
+  resetStuckA2ATaskForRetry,
+  touchQueuedA2ATaskDispatch,
+  touchProcessingA2ATask,
+  pauseProcessingA2ATask,
+  MAX_A2A_IDEMPOTENCY_KEY_CHARS,
+  A2A_PERSONAL_OWNER_SCOPE,
+  A2A_ORG_ID_OWNER_SCOPE_PREFIX,
+} from "./task-store.js";
 import type {
+  A2ASourceContext,
+  A2ASourceContextReference,
   A2AConfig,
   A2AHandler,
   A2AHandlerContext,
@@ -8,118 +65,257 @@ import type {
   Message,
   Artifact,
 } from "./types.js";
-import {
-  createTask,
-  getTask,
-  getTaskOwner,
-  updateTask,
-  claimA2ATaskForProcessing,
-  getA2ATaskDispatchState,
-  failStuckA2ATask,
-  touchQueuedA2ATaskDispatch,
-  touchProcessingA2ATask,
-} from "./task-store.js";
-import { agentChat } from "../shared/agent-chat.js";
-import { signInternalToken } from "../integrations/internal-token.js";
-import { withConfiguredAppBasePath } from "../server/app-base-path.js";
-import {
-  hasConfiguredA2ASecret,
-  isA2AProductionRuntime,
-} from "./auth-policy.js";
 
-// Inlined to avoid pulling the entire core-routes-plugin (and its h3
-// transitive deps) into the a2a/handlers test boundary. Must stay in sync
-// with FRAMEWORK_ROUTE_PREFIX in `server/core-routes-plugin.ts`.
 const A2A_PROCESS_TASK_PATH = "/_agent-native/a2a/_process-task";
+const PORTABLE_FALLBACK_HANDOFF_TIMEOUT_MS = 1_000;
 const A2A_QUEUED_DISPATCH_STUCK_AFTER_MS = 10_000;
 const A2A_PROCESSING_STUCK_AFTER_MS = 5 * 60 * 1000;
 const A2A_PROCESSING_HEARTBEAT_MS = 30_000;
+const MAX_A2A_DIRECT_ACTION_NAME_CHARS = 200;
+const MAX_A2A_DIRECT_ACTION_INPUT_BYTES = 64 * 1024;
+const A2A_READ_INVOKE_EVENT = "$a2a_read_invoke";
 
-/**
- * Resolve the base URL we should fire the A2A processor request to. Mirrors
- * the integration-webhook resolveBaseUrl pattern — prefer explicit env vars
- * (most reliable on serverless), fall back to inbound request headers.
- */
-function resolveSelfBaseUrl(event: any | undefined): string {
-  const fromEnv =
-    process.env.APP_URL ||
-    process.env.URL ||
-    process.env.DEPLOY_URL ||
-    process.env.BETTER_AUTH_URL;
-  if (fromEnv) return withConfiguredAppBasePath(String(fromEnv));
-  if (isA2AProductionRuntime()) {
-    throw new Error(
-      "A2A self-dispatch requires APP_URL, URL, DEPLOY_URL, or BETTER_AUTH_URL in production.",
-    );
+function sourceContextReference(
+  value: unknown,
+): A2ASourceContextReference | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (
+    candidate.platform !== "slack" ||
+    typeof candidate.integrationTaskId !== "string"
+  ) {
+    return undefined;
+  }
+  const integrationTaskId = candidate.integrationTaskId;
+  if (
+    !integrationTaskId ||
+    integrationTaskId !== integrationTaskId.trim() ||
+    integrationTaskId.length > 200
+  ) {
+    return undefined;
+  }
+  return { platform: "slack", integrationTaskId };
+}
+
+function resolvedSlackSourceContext(
+  value: unknown,
+): A2ASourceContext | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Record<string, unknown>;
+  if (
+    candidate.platform !== "slack" ||
+    typeof candidate.sourceUrl !== "string"
+  ) {
+    return undefined;
+  }
+  const sourceUrl = candidate.sourceUrl;
+  if (!sourceUrl || sourceUrl !== sourceUrl.trim()) return undefined;
+  try {
+    const parsed = new URL(sourceUrl);
+    const isSlackHost =
+      parsed.hostname === "slack.com" || parsed.hostname.endsWith(".slack.com");
+    if (
+      parsed.protocol !== "https:" ||
+      !isSlackHost ||
+      parsed.username ||
+      parsed.password ||
+      parsed.port
+    ) {
+      return undefined;
+    }
+    return { platform: "slack", sourceUrl };
+  } catch {
+    return undefined;
+  }
+}
+
+async function trustedSourceContext(
+  value: unknown,
+  event: any,
+): Promise<A2ASourceContext | undefined> {
+  const verifiedEmail = event?.context?.__a2aVerifiedEmail as
+    | string
+    | undefined;
+  const reference = sourceContextReference(value);
+  if (
+    !verifiedEmail ||
+    event?.context?.__a2aAudienceVerified !== true ||
+    !reference
+  ) {
+    return undefined;
+  }
+
+  const dispatch = await findWorkspaceDispatchAgent();
+  if (!dispatch) return undefined;
+  const orgDomain = event?.context?.__a2aOrgDomain as string | undefined;
+  const verifiedOrgId = event?.context?.__a2aVerifiedOrgId as
+    | string
+    | undefined;
+  let orgSecret: string | undefined;
+  if (orgDomain) {
+    const { resolveA2AOrganizationCredentialsByDomain } =
+      await import("../org/context.js");
+    const organization =
+      await resolveA2AOrganizationCredentialsByDomain(orgDomain);
+    if (!verifiedOrgId || organization?.orgId !== verifiedOrgId) {
+      return undefined;
+    }
+    orgSecret = organization.secret;
   }
 
   try {
-    const headers = event?.node?.req?.headers ?? event?.headers;
-    const get = (name: string): string | undefined => {
-      if (!headers) return undefined;
-      if (typeof headers.get === "function") {
-        return headers.get(name) ?? undefined;
-      }
-      const map = headers as Record<string, string | undefined>;
-      return map[name] ?? map[String(name).toLowerCase()];
-    };
-    const proto = get("x-forwarded-proto") || "http";
-    const host = get("host") || `localhost:${process.env.PORT || 3000}`;
-    return withConfiguredAppBasePath(`${proto}://${host}`);
-  } catch {
-    return withConfiguredAppBasePath(
-      `http://localhost:${process.env.PORT || 3000}`,
+    const result = await callAction(
+      dispatch.url,
+      "resolve-integration-source-context",
+      { integrationTaskId: reference.integrationTaskId },
+      {
+        userEmail: verifiedEmail,
+        orgDomain,
+        orgSecret,
+        requestTimeoutMs: 5_000,
+      },
     );
+    if (result.status !== "completed") return undefined;
+    return resolvedSlackSourceContext(JSON.parse(result.output));
+  } catch {
+    return undefined;
+  }
+}
+
+function requestOriginFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): string | undefined {
+  const raw = metadata?.requestOrigin;
+  if (typeof raw !== "string" || !raw.trim()) return undefined;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    return url.origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function requestOriginFromEvent(event: any): string | undefined {
+  if (!event) return undefined;
+  try {
+    return requestOriginFromMetadata({
+      requestOrigin: getOrigin(event as any),
+    });
+  } catch {
+    return undefined;
   }
 }
 
 /**
- * Fire-and-forget POST to the A2A processor route on the same deployment.
- * Used when an A2A send is requested in async mode — the processor runs the
- * handler in a fresh function execution so it gets its own full timeout.
+ * Prefer the origin resolved from the receiving request. A distinct public
+ * browser origin is allowed only when the receiver configured it explicitly;
+ * arbitrary caller metadata must not steer links or service-token URLs.
  */
+function requestOriginForContext(
+  metadata: Record<string, unknown> | undefined,
+  event: any,
+): string | undefined {
+  if (!event) return undefined;
+  const receiverOrigin = requestOriginFromEvent(event);
+  const metadataOrigin = requestOriginFromMetadata(metadata);
+  if (
+    metadataOrigin &&
+    (metadataOrigin === receiverOrigin || isConfiguredAppOrigin(metadataOrigin))
+  ) {
+    return metadataOrigin;
+  }
+  return receiverOrigin;
+}
+
+function trustedA2AMetadata(
+  metadata: Record<string, unknown> | undefined,
+  event: any,
+): Record<string, unknown> | undefined {
+  if (!metadata) return undefined;
+  const trusted = { ...metadata };
+  delete trusted.sourceContext;
+  const requestOrigin = requestOriginForContext(metadata, event);
+  if (requestOrigin) trusted.requestOrigin = requestOrigin;
+  else delete trusted.requestOrigin;
+  return trusted;
+}
+
+/**
+ * Hard cap on how long a task may sit in submitted/working (never reaching
+ * `processing`) before the dispatch-retry loop in
+ * `refireStuckAsyncTaskIfNeeded` gives up and fails it. Without this, a
+ * persistently failing dispatch (missing background function, bad A2A
+ * secret, 404) throttles-and-retries forever — the queued bucket otherwise
+ * has no terminal state. Override with A2A_QUEUED_LIFETIME_MAX_MS.
+ */
+function a2aQueuedLifetimeMaxMs(): number {
+  const raw = Number(process.env.A2A_QUEUED_LIFETIME_MAX_MS);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return 3 * 60 * 1000;
+}
+
+function a2aProcessingLifetimeMaxMs(): number {
+  const raw = Number(process.env.A2A_PROCESSING_LIFETIME_MAX_MS);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return 30 * 60 * 1000;
+}
+
+export function getA2ATaskRecoveryLimits() {
+  return {
+    queuedLifetimeMaxMs: a2aQueuedLifetimeMaxMs(),
+    processingStuckAfterMs: A2A_PROCESSING_STUCK_AFTER_MS,
+    processingLifetimeMaxMs: a2aProcessingLifetimeMaxMs(),
+  };
+}
+
 async function fireProcessTaskDispatch(
   event: any,
   taskId: string,
+  config: A2AConfig,
 ): Promise<void> {
-  const baseUrl = resolveSelfBaseUrl(event);
-  const url = `${baseUrl}${A2A_PROCESS_TASK_PATH}`;
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  try {
-    headers["Authorization"] = `Bearer ${signInternalToken(taskId)}`;
-  } catch {
-    // No A2A_SECRET configured — self-fire unsigned. The processor accepts
-    // unsigned dispatches when no secret is set (mirrors the integration
-    // webhook flow).
+  const backgroundPath = resolveAgentChatProcessRunDispatchPath();
+  const useBackgroundWorker =
+    isAgentChatDurableBackgroundEnabled({
+      appOptIn: config.durableBackgroundRuns,
+    }) && dispatchPathTargetsNetlifyBackgroundFunction(backgroundPath);
+
+  if (!useBackgroundWorker) {
+    await fireInternalDispatch({
+      event,
+      path: A2A_PROCESS_TASK_PATH,
+      taskId,
+    });
+    return;
   }
-  // Race the fetch against a short timer. On Netlify Lambda, returning
-  // immediately can freeze the function before the outbound TCP handshake
-  // starts, leaving the request stuck. This gives it ~250ms to leave the
-  // box at the cost of slightly higher response latency on async A2A sends.
-  const dispatchPromise = fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ taskId }),
-  }).catch((err) => {
-    console.error("[a2a] Process-task dispatch fetch failed:", err);
-  });
-  await Promise.race([
-    dispatchPromise,
-    new Promise<void>((resolve) => setTimeout(resolve, 250)),
-  ]);
+
+  try {
+    await fireInternalDispatch({
+      event,
+      path: backgroundPath,
+      taskId,
+      body: {
+        [AGENT_BACKGROUND_PROCESSOR_FIELD]: AGENT_BACKGROUND_PROCESSOR_A2A,
+      },
+      awaitResponse: true,
+    });
+  } catch (backgroundError) {
+    console.error(
+      "[a2a] Durable background dispatch failed; falling back to portable processor:",
+      backgroundError,
+    );
+    await fireInternalDispatch({
+      event,
+      path: A2A_PROCESS_TASK_PATH,
+      taskId,
+      awaitResponse: true,
+      responseTimeoutMs: PORTABLE_FALLBACK_HANDOFF_TIMEOUT_MS,
+    });
+  }
 }
 
-/**
- * Process a previously-enqueued A2A task. Called by the `_process-task`
- * route in `server.ts`, in a fresh function execution. Atomically claims the
- * task, reconstructs the caller's request context from the task's metadata,
- * runs the handler, and persists the outcome.
- *
- * Idempotent on duplicate dispatches: the atomic claim returns null if some
- * other invocation already picked the task up, in which case we no-op.
- */
 export async function processA2ATaskFromQueue(
   taskId: string,
   config: A2AConfig,
@@ -127,13 +323,12 @@ export async function processA2ATaskFromQueue(
 ): Promise<void> {
   const claimed = await claimA2ATaskForProcessing(taskId);
   if (!claimed) {
-    // Already in flight, terminal, or missing. Nothing to do.
     return;
   }
 
   const message = claimed.history?.[0];
   if (!message) {
-    await updateTask(taskId, {
+    await settleProcessingA2ATask(taskId, {
       state: "failed",
       message: {
         role: "agent",
@@ -146,7 +341,51 @@ export async function processA2ATaskFromQueue(
   const meta = (claimed.metadata ?? {}) as Record<string, unknown>;
   const processorMeta = (meta.__a2a_processor ?? {}) as Record<string, unknown>;
   const verifiedEmail = processorMeta.verifiedEmail as string | undefined;
+  const identityAssurance =
+    processorMeta.identityAssurance === "organization"
+      ? "organization"
+      : processorMeta.identityAssurance === "user"
+        ? "user"
+        : undefined;
   const orgDomainHint = processorMeta.orgDomainHint as string | undefined;
+  const verifiedOrgId =
+    typeof processorMeta.verifiedOrgId === "string"
+      ? processorMeta.verifiedOrgId.trim()
+      : undefined;
+  let servicePrincipalAllowedActions: string[] | null | undefined;
+  try {
+    const admission = await assertServicePrincipalMayRun(
+      verifiedEmail,
+      verifiedOrgId,
+    );
+    if (parseServiceIdentityEmail(verifiedEmail)) {
+      servicePrincipalAllowedActions = admission.allowedActions;
+    }
+  } catch (error) {
+    if (!(error instanceof ServicePrincipalRefusedError)) throw error;
+    if (error.statusCode === 503) {
+      await resetStuckA2ATaskForRetry(taskId, Date.now());
+      throw error;
+    }
+    if (error.statusCode !== 403) throw error;
+    await recordServicePrincipalDenial({
+      email: verifiedEmail,
+      orgId: verifiedOrgId,
+      actionName: "a2a:process-task",
+      caller: "a2a",
+      error,
+    });
+    await settleProcessingA2ATask(taskId, {
+      state: "failed",
+      message: {
+        role: "agent",
+        parts: [{ type: "text", text: error.message }],
+      },
+    });
+    return;
+  }
+  const requestOrigin =
+    requestOriginFromMetadata(processorMeta) ?? requestOriginFromEvent(event);
   const contextId =
     (processorMeta.contextId as string | null | undefined) ?? undefined;
   const callerMetadata =
@@ -154,11 +393,24 @@ export async function processA2ATaskFromQueue(
       | Record<string, unknown>
       | null
       | undefined) ?? undefined;
+  const sourceContext = processorMeta.sourceContext as
+    | A2ASourceContext
+    | undefined;
 
-  const resolvedOrgId = await resolveVerifiedA2AOrgId(
-    verifiedEmail,
-    orgDomainHint,
-  );
+  const resolvedOrgId = verifiedOrgId || undefined;
+  if (event?.context) {
+    if (verifiedEmail) event.context.__a2aVerifiedEmail = verifiedEmail;
+    if (identityAssurance) {
+      event.context.__a2aIdentityAssurance = identityAssurance;
+    }
+    if (orgDomainHint) event.context.__a2aOrgDomain = orgDomainHint;
+    if (verifiedOrgId) event.context.__a2aVerifiedOrgId = verifiedOrgId;
+    if (servicePrincipalAllowedActions !== undefined) {
+      event.context.__a2aServicePrincipalAllowedActions =
+        servicePrincipalAllowedActions;
+    }
+    if (verifiedEmail && !resolvedOrgId) markExplicitPersonalOrgScope(event);
+  }
 
   const { runWithRequestContext } =
     await import("../server/request-context.js");
@@ -172,7 +424,15 @@ export async function processA2ATaskFromQueue(
   ).unref?.();
   try {
     await runWithRequestContext(
-      { userEmail: verifiedEmail, orgId: resolvedOrgId },
+      {
+        userEmail: verifiedEmail,
+        ...(resolvedOrgId
+          ? { orgId: resolvedOrgId }
+          : verifiedEmail
+            ? { orgScope: "personal" as const }
+            : {}),
+        ...(requestOrigin ? { requestOrigin } : {}),
+      },
       () =>
         runHandlerAndPersist(
           taskId,
@@ -181,16 +441,15 @@ export async function processA2ATaskFromQueue(
           contextId,
           callerMetadata,
           event,
+          sourceContext,
+          verifiedEmail,
         ),
     );
   } catch (err: any) {
     try {
-      await updateTask(taskId, {
+      await settleProcessingA2ATask(taskId, {
         state: "failed",
-        message: {
-          role: "agent",
-          parts: [{ type: "text", text: err?.message ?? "Handler crashed" }],
-        },
+        message: taskFailureMessage(err, "Handler crashed"),
       });
     } catch {}
   } finally {
@@ -198,15 +457,36 @@ export async function processA2ATaskFromQueue(
   }
 }
 
-/**
- * Default A2A handler that delegates to agentChat.call().
- * Used when no custom handler is provided in A2AConfig.
- */
 const defaultHandler: A2AHandler = async (
   message: Message,
-  _context: A2AHandlerContext,
+  context: A2AHandlerContext,
 ): Promise<A2AHandlerResult> => {
-  // Extract text from message parts
+  const eventContext = (
+    context.event as { context?: Record<string, unknown> } | undefined
+  )?.context;
+  const verifiedEmail =
+    typeof eventContext?.__a2aVerifiedEmail === "string"
+      ? eventContext.__a2aVerifiedEmail
+      : undefined;
+  const serviceIdentity = parseServiceIdentityEmail(verifiedEmail);
+  if (serviceIdentity) {
+    const error = new ServicePrincipalRefusedError(
+      "service_principal_handoff_unsupported",
+      "The default A2A chat handoff cannot preserve service-principal authorization. Use a service-aware A2A handler.",
+    );
+    await recordServicePrincipalDenial({
+      email: verifiedEmail,
+      orgId:
+        typeof eventContext?.__a2aVerifiedOrgId === "string"
+          ? eventContext.__a2aVerifiedOrgId
+          : undefined,
+      actionName: "a2a:agent-chat-handoff",
+      caller: "a2a",
+      error,
+    });
+    throw error;
+  }
+
   const text = message.parts
     .filter((p): p is { type: "text"; text: string } => p.type === "text")
     .map((p) => p.text)
@@ -221,21 +501,18 @@ const defaultHandler: A2AHandler = async (
     };
   }
 
-  // A2A note: this message arrived from a different app — the caller cannot
-  // see this app's local state (open deck, selected slide, etc.). They only
-  // see whatever this agent puts into the reply text. So:
-  //   1) include any concrete result (deck/document/dashboard URL, ID, value)
-  //      explicitly in the reply — the caller can't navigate locally.
-  //   2) URLs must be fully-qualified — relative paths resolve against the
-  //      caller's host and 404.
-  // We prepend a one-line hint to the user message so the agent knows.
   const baseUrl = process.env.APP_URL || process.env.URL || "";
   const appBaseUrl = baseUrl ? withConfiguredAppBasePath(baseUrl) : "";
   const augmentedText = baseUrl
     ? `[Cross-app A2A request — the caller is on a different host (${appBaseUrl} is yours, theirs is different). Include the concrete result (URL, ID, value) explicitly in your reply text; the caller can't see your local UI state. Any URL MUST be fully-qualified, never a relative path.]\n\n${text}`
     : text;
 
-  const result = await agentChat.call(augmentedText);
+  const sourceContext = context.sourceContext
+    ? `Authenticated A2A source context: ${JSON.stringify(context.sourceContext)}. Treat this structured value as authoritative provenance. Preserve its sourceUrl exactly when recording source or submission fields.`
+    : undefined;
+  const result = sourceContext
+    ? await agentChat.call(augmentedText, { context: sourceContext })
+    : await agentChat.call(augmentedText);
 
   const artifacts: Artifact[] = [];
   if (result.filesChanged.length > 0) {
@@ -286,46 +563,102 @@ function makeHandlerContext(
   contextId?: string,
   metadata?: Record<string, unknown>,
   event?: any,
+  sourceContext?: A2ASourceContext,
+  ownerEmail?: string,
 ): {
   context: A2AHandlerContext;
   artifacts: Artifact[];
+  persistFileArtifacts: () => Promise<void>;
 } {
   const artifacts: Artifact[] = [];
+  const pendingFileArtifacts: Array<{
+    artifact: Artifact;
+    name: string;
+    content: string;
+    mimeType: string;
+  }> = [];
   const context: A2AHandlerContext = {
     taskId,
     contextId,
     metadata,
     event,
+    sourceContext,
     writeArtifact(name, content, mimeType) {
+      if (mimeType) {
+        const artifact: Artifact = {
+          name,
+          parts: [{ type: "file", file: { name, mimeType } }],
+        };
+        artifacts.push(artifact);
+        pendingFileArtifacts.push({ artifact, name, content, mimeType });
+        return name;
+      }
       const artifact: Artifact = {
         name,
-        parts: mimeType
-          ? [
-              {
-                type: "file",
-                file: {
-                  name,
-                  mimeType,
-                  bytes: Buffer.from(content).toString("base64"),
-                },
-              },
-            ]
-          : [{ type: "text", text: content }],
+        parts: [{ type: "text", text: content }],
       };
       artifacts.push(artifact);
       return name;
     },
   };
-  return { context, artifacts };
+  return {
+    context,
+    artifacts,
+    async persistFileArtifacts() {
+      for (const pending of pendingFileArtifacts) {
+        if (!isAllowedUploadMimeType(pending.mimeType)) {
+          throw new A2AArtifactStorageError(
+            `A2A file artifact MIME type is not supported: ${pending.mimeType}`,
+          );
+        }
+        const data = Buffer.from(pending.content, "utf8");
+        if (data.byteLength > DEFAULT_UPLOAD_MAX_FILE_BYTES) {
+          throw new A2AArtifactStorageError(
+            `A2A file artifacts cannot exceed ${Math.round(DEFAULT_UPLOAD_MAX_FILE_BYTES / 1024 / 1024)} MB.`,
+          );
+        }
+        let uploaded;
+        try {
+          uploaded = await uploadFile({
+            data,
+            filename: pending.name,
+            mimeType: pending.mimeType,
+            ownerEmail:
+              ownerEmail ??
+              (event?.context?.__a2aVerifiedEmail as string | undefined) ??
+              undefined,
+          });
+        } catch {
+          throw new A2AArtifactStorageError();
+        }
+        if (!uploaded?.url) throw new A2AArtifactStorageError();
+        try {
+          assertA2APersistablePayload(uploaded.url, "A2A artifact URI");
+        } catch {
+          throw new A2AArtifactStorageError();
+        }
+        const part = pending.artifact.parts[0];
+        if (part?.type !== "file") throw new A2AArtifactStorageError();
+        part.file.uri = uploaded.url;
+      }
+    },
+  };
 }
 
-/**
- * Resolve org context from A2A metadata / event context and wrap `fn`
- * inside `runWithRequestContext` so downstream actions see the org.
- */
+class A2AArtifactStorageError extends Error {
+  readonly agentNativeErrorCode = "A2A_ARTIFACT_STORAGE_UNAVAILABLE";
+
+  constructor(
+    message = "A durable file storage provider is required to write A2A file artifacts.",
+  ) {
+    super(message);
+    this.name = "A2AArtifactStorageError";
+  }
+}
+
 async function withA2ARequestContext<T>(
-  _metadata: Record<string, unknown> | undefined,
-  event: any | undefined,
+  metadata: Record<string, unknown> | undefined,
+  event: any,
   fn: () => Promise<T>,
 ): Promise<T> {
   const { runWithRequestContext } =
@@ -333,52 +666,27 @@ async function withA2ARequestContext<T>(
 
   const verifiedEmail =
     (event?.context?.__a2aVerifiedEmail as string | undefined) ?? undefined;
-  // Only trust the org domain from the cryptographically verified JWT claim on
-  // the event context. metadata.orgDomain is caller-supplied and must not be
-  // used for org resolution — an unauthenticated caller could forge it and
-  // gain access to another org's data.
-  const orgDomain =
-    (event?.context?.__a2aOrgDomain as string | undefined) ?? undefined;
-
-  const resolvedOrgId = await resolveVerifiedA2AOrgId(verifiedEmail, orgDomain);
+  const verifiedOrgId =
+    (event?.context?.__a2aVerifiedOrgId as string | undefined) ?? undefined;
+  const requestOrigin = requestOriginForContext(metadata, event);
+  if (event?.context && verifiedEmail && !verifiedOrgId) {
+    markExplicitPersonalOrgScope(event);
+  }
 
   return runWithRequestContext(
-    { userEmail: verifiedEmail, orgId: resolvedOrgId },
+    {
+      userEmail: verifiedEmail,
+      ...(verifiedOrgId
+        ? { orgId: verifiedOrgId }
+        : verifiedEmail
+          ? { orgScope: "personal" as const }
+          : {}),
+      ...(requestOrigin ? { requestOrigin } : {}),
+    },
     fn,
   ) as Promise<T>;
 }
 
-async function resolveVerifiedA2AOrgId(
-  verifiedEmail: string | undefined,
-  verifiedOrgDomain: string | undefined,
-): Promise<string | undefined> {
-  if (verifiedOrgDomain) {
-    try {
-      const { resolveOrgByDomain } = await import("../org/context.js");
-      const org = await resolveOrgByDomain(verifiedOrgDomain);
-      if (org) return org.orgId;
-    } catch {
-      // Org tables may not exist — continue without org context
-    }
-  }
-
-  if (verifiedEmail) {
-    try {
-      const { resolveOrgIdForEmail } = await import("../org/context.js");
-      return (await resolveOrgIdForEmail(verifiedEmail)) ?? undefined;
-    } catch {
-      // Org tables may not exist — continue without org context
-    }
-  }
-
-  return undefined;
-}
-
-/**
- * Run the handler against the message and persist the outcome to the task store.
- * Used in sync mode (awaited inline) and in async mode (called by the
- * `_process-task` processor route in a fresh function execution).
- */
 async function runHandlerAndPersist(
   taskId: string,
   message: Message,
@@ -386,12 +694,16 @@ async function runHandlerAndPersist(
   contextId: string | undefined,
   metadata: Record<string, unknown> | undefined,
   event?: any,
+  sourceContext?: A2ASourceContext,
+  ownerEmail?: string,
 ): Promise<void> {
-  const { context, artifacts } = makeHandlerContext(
+  const { context, artifacts, persistFileArtifacts } = makeHandlerContext(
     taskId,
     contextId,
     metadata,
     event,
+    sourceContext,
+    ownerEmail,
   );
   try {
     const result = getHandler(config)(message, context);
@@ -405,7 +717,12 @@ async function runHandlerAndPersist(
       for await (const msg of result as AsyncGenerator<Message>) {
         lastMessage = msg;
       }
-      await updateTask(taskId, {
+      if (lastMessage?.metadata?.agentNativeTaskState === "input-required") {
+        await pauseProcessingA2ATask(taskId, lastMessage);
+        return;
+      }
+      await persistFileArtifacts();
+      await settleProcessingA2ATask(taskId, {
         state: "completed",
         message: lastMessage,
         artifacts: artifacts.length > 0 ? artifacts : undefined,
@@ -415,20 +732,72 @@ async function runHandlerAndPersist(
 
     const handlerResult = await (result as Promise<A2AHandlerResult>);
     const allArtifacts = [...artifacts, ...(handlerResult.artifacts ?? [])];
-    await updateTask(taskId, {
+    if (handlerResult.taskState === "input-required") {
+      await pauseProcessingA2ATask(taskId, handlerResult.message);
+      return;
+    }
+    await persistFileArtifacts();
+    await settleProcessingA2ATask(taskId, {
       state: "completed",
       message: handlerResult.message,
       artifacts: allArtifacts.length > 0 ? allArtifacts : undefined,
     });
   } catch (err: any) {
-    await updateTask(taskId, {
+    await settleProcessingA2ATask(taskId, {
       state: "failed",
-      message: {
-        role: "agent",
-        parts: [{ type: "text", text: err?.message ?? "Handler failed" }],
-      },
+      message: taskFailureMessage(err, "Handler failed"),
     });
   }
+}
+
+function taskFailureMessage(error: unknown, fallback: string): Message {
+  const candidate = error as
+    | { message?: unknown; agentNativeErrorCode?: unknown }
+    | null
+    | undefined;
+  const text =
+    typeof candidate?.message === "string" ? candidate.message : fallback;
+  const rawErrorCode = candidate?.agentNativeErrorCode;
+  const errorCode =
+    typeof rawErrorCode === "string" ? rawErrorCode.trim().slice(0, 200) : "";
+  return {
+    role: "agent",
+    parts: [{ type: "text", text }],
+    ...(errorCode ? { metadata: { agentNativeErrorCode: errorCode } } : {}),
+  };
+}
+
+function verifiedTaskOwner(event?: any): {
+  ownerEmail: string | null;
+  ownerScope: string | null;
+} {
+  const ownerEmail =
+    (event?.context?.__a2aVerifiedEmail as string | undefined) ?? null;
+  const verifiedOrgId =
+    (event?.context?.__a2aVerifiedOrgId as string | undefined)
+      ?.trim()
+      .toLowerCase() ?? "";
+  const identityAssurance = event?.context?.__a2aIdentityAssurance;
+  return {
+    ownerEmail,
+    ownerScope: ownerEmail
+      ? verifiedOrgId
+        ? `${A2A_ORG_ID_OWNER_SCOPE_PREFIX}${verifiedOrgId}`
+        : A2A_PERSONAL_OWNER_SCOPE
+      : identityAssurance === "organization" && verifiedOrgId
+        ? `${A2A_ORG_ID_OWNER_SCOPE_PREFIX}${verifiedOrgId}`
+        : null,
+  };
+}
+
+function hasUnboundVerifiedOrgIdentity(event?: any): boolean {
+  const verifiedEmail =
+    (event?.context?.__a2aVerifiedEmail as string | undefined)?.trim() ?? "";
+  const verifiedOrgDomain =
+    (event?.context?.__a2aOrgDomain as string | undefined)?.trim() ?? "";
+  const verifiedOrgId =
+    (event?.context?.__a2aVerifiedOrgId as string | undefined)?.trim() ?? "";
+  return Boolean(verifiedEmail && verifiedOrgDomain && !verifiedOrgId);
 }
 
 async function handleSend(
@@ -447,17 +816,62 @@ async function handleSend(
       _id: 0,
     };
   }
+  try {
+    assertA2APersistablePayload(message, "A2A message");
+    assertA2APersistablePayload(params.metadata, "A2A metadata");
+  } catch (error) {
+    return {
+      ...jsonRpcError(
+        0,
+        -32602,
+        error instanceof Error ? error.message : "Invalid A2A message payload",
+      ),
+      _id: 0,
+    };
+  }
+  if (hasUnboundVerifiedOrgIdentity(event)) {
+    return {
+      ...jsonRpcError(
+        0,
+        -32001,
+        "A stable verified organization identity is required",
+      ),
+      _id: 0,
+    };
+  }
 
   const contextId = params.contextId as string | undefined;
   const metadata = params.metadata as Record<string, unknown> | undefined;
+  const sourceContext = await trustedSourceContext(
+    metadata?.sourceContext,
+    event,
+  );
 
-  // The JWT-verified caller email (set by mountA2A in server.ts) is the
-  // single source of truth for task ownership — bound at creation, checked
-  // on every subsequent tasks/get and tasks/cancel call. Caller-supplied
-  // metadata.userEmail is NEVER used for ownership; that would re-introduce
-  // the IDOR class fixed here.
-  const ownerEmailForTask =
-    (event?.context?.__a2aVerifiedEmail as string | undefined) ?? null;
+  const { ownerEmail: ownerEmailForTask, ownerScope: ownerScopeForTask } =
+    verifiedTaskOwner(event);
+  let idempotencyKey: string | undefined;
+  if (ownerScopeForTask && params.idempotencyKey !== undefined) {
+    if (typeof params.idempotencyKey !== "string") {
+      return {
+        ...jsonRpcError(
+          0,
+          -32602,
+          "Invalid params: idempotencyKey must be a string",
+        ),
+        _id: 0,
+      };
+    }
+    idempotencyKey = params.idempotencyKey.trim();
+    if (
+      !idempotencyKey ||
+      idempotencyKey.length > MAX_A2A_IDEMPOTENCY_KEY_CHARS
+    ) {
+      return {
+        ...jsonRpcError(0, -32602, "Invalid params: idempotencyKey is invalid"),
+        _id: 0,
+      };
+    }
+  }
 
   // Async mode: return the task immediately in `working` state, run the
   // handler in the background, and let the caller poll `tasks/get`. This is
@@ -470,74 +884,103 @@ async function handleSend(
   // production — see the additional gate below.
   const asyncMode =
     params.async === true || (event && event.context?.__a2aForceAsync === true);
+  if (!asyncMode) idempotencyKey = undefined;
 
   if (asyncMode) {
-    // Refuse async mode entirely when no auth is configured in production.
-    // The async dispatch path self-fires the `_process-task` route, which
-    // accepts unsigned dispatches when A2A_SECRET is unset — that combined
-    // with the lack of caller identity here would let any unauthenticated
-    // attacker queue and trigger handler runs. In production, require some
-    // form of auth so the verifiedEmail is bound to the task.
-    const hasA2ASecret = hasConfiguredA2ASecret();
-    const hasApiKey = !!(config.apiKeyEnv && process.env[config.apiKeyEnv]);
-    if (isA2AProductionRuntime() && !hasA2ASecret && !hasApiKey) {
+    // Refuse async mode entirely without the shared secret in production.
+    // The async dispatch path self-fires the `_process-task` route, which is
+    // authenticated with an internal HMAC signed by A2A_SECRET. A legacy
+    // apiKeyEnv can authenticate the JSON-RPC request, but it cannot
+    // authenticate that internal handoff. Accepting it here would create a
+    // working task that can never start and leaves the caller polling until
+    // its timeout.
+    if (isA2AProductionRuntime() && !hasConfiguredA2ASecret()) {
       return {
         ...jsonRpcError(
           0,
           -32001,
-          "A2A async mode is not available — A2A_SECRET or apiKeyEnv must be configured.",
+          "A2A async mode requires A2A_SECRET for internal processor dispatch; apiKeyEnv only supports synchronous A2A.",
         ),
         _id: 0,
       };
     }
-    // Resolve identity up front (cheap), bake it into the task's metadata,
-    // and dispatch the actual handler run to a SEPARATE function execution.
-    // On serverless hosts (Netlify, Vercel, Cloudflare) detached promises get
-    // killed when the response is flushed, so we self-fire a webhook to a
-    // dedicated processor route — same cross-platform pattern the integration
-    // webhook queue uses. The processor reconstructs the request context from
-    // the task metadata and runs the handler with its own full timeout.
     const verifiedEmail =
       (event?.context?.__a2aVerifiedEmail as string | undefined) ?? undefined;
-    // Only trust the verified org domain from the JWT claim — do not fall back
-    // to metadata.orgDomain which is caller-supplied and unverified.
     const orgDomainHint =
       (event?.context?.__a2aOrgDomain as string | undefined) ?? undefined;
+    const requestOrigin = requestOriginForContext(metadata, event);
+    const safeMetadata = trustedA2AMetadata(metadata, event);
 
     const taskMetadata: Record<string, unknown> = {
-      ...(metadata ?? {}),
+      ...(safeMetadata ?? {}),
       __a2a_processor: {
         verifiedEmail,
+        ...(typeof event?.context?.__a2aIdentityAssurance === "string"
+          ? { identityAssurance: event.context.__a2aIdentityAssurance }
+          : {}),
         orgDomainHint,
+        ...(typeof event?.context?.__a2aVerifiedOrgId === "string"
+          ? { verifiedOrgId: event.context.__a2aVerifiedOrgId }
+          : {}),
+        ...(requestOrigin ? { requestOrigin } : {}),
         contextId: contextId ?? null,
-        callerMetadata: metadata ?? null,
+        callerMetadata: safeMetadata ?? null,
+        sourceContext: sourceContext ?? null,
       },
     };
-    const task = await createTask(
+    event?.context?.__a2aBeforeTaskPersistence?.();
+    const { task, reused } = await createOrReuseTask(
       message,
       contextId,
       taskMetadata,
       ownerEmailForTask,
+      ownerScopeForTask,
+      idempotencyKey,
     );
+    if (reused) {
+      return {
+        ...jsonRpcResult(0, sanitizeTaskForResponse(task)),
+        _id: 0,
+      };
+    }
     const working = await updateTask(task.id, { state: "working" });
 
-    fireProcessTaskDispatch(event, task.id).catch((err) => {
+    try {
+      await fireProcessTaskDispatch(event, task.id, config);
+    } catch (err) {
       console.error("[a2a] Failed to dispatch process-task:", err);
-    });
+    }
 
-    return { ...jsonRpcResult(0, working ?? task), _id: 0 };
+    return {
+      ...jsonRpcResult(0, sanitizeTaskForResponse(working ?? task)),
+      _id: 0,
+    };
   }
 
   return withA2ARequestContext(metadata, event, async () => {
-    const task = await createTask(
+    const { task, reused } = await createOrReuseTask(
       message,
       contextId,
       undefined,
       ownerEmailForTask,
+      ownerScopeForTask,
+      idempotencyKey,
     );
+    if (reused) {
+      return {
+        ...jsonRpcResult(0, sanitizeTaskForResponse(task)),
+        _id: 0,
+      };
+    }
     await updateTask(task.id, { state: "working" });
 
-    const ctx = makeHandlerContext(task.id, contextId, metadata, event);
+    const ctx = makeHandlerContext(
+      task.id,
+      contextId,
+      trustedA2AMetadata(metadata, event),
+      event,
+      sourceContext,
+    );
 
     try {
       const result = getHandler(config)(message, ctx.context);
@@ -551,6 +994,14 @@ async function handleSend(
         for await (const msg of result as AsyncGenerator<Message>) {
           lastMessage = msg;
         }
+        if (lastMessage?.metadata?.agentNativeTaskState === "input-required") {
+          const updated = await updateTask(task.id, {
+            state: "input-required",
+            message: lastMessage,
+          });
+          return { ...jsonRpcResult(0, updated), _id: 0 };
+        }
+        await ctx.persistFileArtifacts();
         const updated = await updateTask(task.id, {
           state: "completed",
           message: lastMessage,
@@ -564,6 +1015,14 @@ async function handleSend(
         ...ctx.artifacts,
         ...(handlerResult.artifacts ?? []),
       ];
+      if (handlerResult.taskState === "input-required") {
+        const updated = await updateTask(task.id, {
+          state: "input-required",
+          message: handlerResult.message,
+        });
+        return { ...jsonRpcResult(0, updated), _id: 0 };
+      }
+      await ctx.persistFileArtifacts();
       const updated = await updateTask(task.id, {
         state: "completed",
         message: handlerResult.message,
@@ -571,15 +1030,19 @@ async function handleSend(
       });
       return { ...jsonRpcResult(0, updated), _id: 0 };
     } catch (err: any) {
+      const failureMessage = taskFailureMessage(err, "Handler failed");
       await updateTask(task.id, {
         state: "failed",
-        message: {
-          role: "agent",
-          parts: [{ type: "text", text: err.message ?? "Handler failed" }],
-        },
+        message: failureMessage,
       });
       return {
-        ...jsonRpcError(0, -32000, err.message ?? "Handler failed"),
+        ...jsonRpcError(
+          0,
+          -32000,
+          failureMessage.parts[0]?.type === "text"
+            ? failureMessage.parts[0].text
+            : "Handler failed",
+        ),
         _id: 0,
       };
     }
@@ -600,11 +1063,46 @@ async function handleStream(
     res.end();
     return;
   }
+  try {
+    assertA2APersistablePayload(message, "A2A message");
+    assertA2APersistablePayload(params.metadata, "A2A metadata");
+  } catch (error) {
+    res.write(
+      `data: ${JSON.stringify(
+        jsonRpcError(
+          0,
+          -32602,
+          error instanceof Error
+            ? error.message
+            : "Invalid A2A message payload",
+        ),
+      )}\n\n`,
+    );
+    res.end();
+    return;
+  }
+  if (hasUnboundVerifiedOrgIdentity(event)) {
+    res.write(
+      `data: ${JSON.stringify(
+        jsonRpcError(
+          0,
+          -32001,
+          "A stable verified organization identity is required",
+        ),
+      )}\n\n`,
+    );
+    res.end();
+    return;
+  }
 
   const contextId = params.contextId as string | undefined;
   const metadata = params.metadata as Record<string, unknown> | undefined;
-  const ownerEmailForTask =
-    (event?.context?.__a2aVerifiedEmail as string | undefined) ?? null;
+  const sourceContext = await trustedSourceContext(
+    metadata?.sourceContext,
+    event,
+  );
+  const { ownerEmail: ownerEmailForTask, ownerScope: ownerScopeForTask } =
+    verifiedTaskOwner(event);
 
   await withA2ARequestContext(metadata, event, async () => {
     const task = await createTask(
@@ -612,15 +1110,17 @@ async function handleStream(
       contextId,
       undefined,
       ownerEmailForTask,
+      ownerScopeForTask,
     );
 
     await updateTask(task.id, { state: "working" });
 
-    const { context, artifacts } = makeHandlerContext(
+    const { context, artifacts, persistFileArtifacts } = makeHandlerContext(
       task.id,
       contextId,
-      metadata,
+      trustedA2AMetadata(metadata, event),
       event,
+      sourceContext,
     );
 
     try {
@@ -643,6 +1143,7 @@ async function handleStream(
       } else {
         const handlerResult = await (result as Promise<A2AHandlerResult>);
         const allArtifacts = [...artifacts, ...(handlerResult.artifacts ?? [])];
+        await persistFileArtifacts();
         const updated = await updateTask(task.id, {
           state: "completed",
           message: handlerResult.message,
@@ -654,15 +1155,25 @@ async function handleStream(
       }
 
       const allArtifacts = [...artifacts];
+      await persistFileArtifacts();
       const final = await updateTask(task.id, {
         state: "completed",
         artifacts: allArtifacts.length > 0 ? allArtifacts : undefined,
       });
       res.write(`data: ${JSON.stringify(jsonRpcResult(0, final))}\n\n`);
     } catch (err: any) {
-      await updateTask(task.id, { state: "failed" });
+      const failureMessage = taskFailureMessage(err, "Handler failed");
+      await updateTask(task.id, { state: "failed", message: failureMessage });
       res.write(
-        `data: ${JSON.stringify(jsonRpcError(0, -32000, err.message ?? "Handler failed"))}\n\n`,
+        `data: ${JSON.stringify(
+          jsonRpcError(
+            0,
+            -32000,
+            failureMessage.parts[0]?.type === "text"
+              ? failureMessage.parts[0].text
+              : "Handler failed",
+          ),
+        )}\n\n`,
       );
     }
 
@@ -691,16 +1202,23 @@ const SENSITIVE_METADATA_KEYS = new Set([
 
 function sanitizeTaskForResponse(task: any): any {
   if (!task || typeof task !== "object") return task;
-  if (!task.metadata || typeof task.metadata !== "object") return task;
+  const {
+    ownerEmail: _ownerEmail,
+    ownerScope: _ownerScope,
+    ...publicTask
+  } = task;
+  if (!publicTask.metadata || typeof publicTask.metadata !== "object") {
+    return publicTask;
+  }
 
-  const meta = task.metadata as Record<string, unknown>;
+  const meta = publicTask.metadata as Record<string, unknown>;
   const publicMeta: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(meta)) {
     if (k === "__a2a_processor") continue;
     if (SENSITIVE_METADATA_KEYS.has(k)) continue;
     publicMeta[k] = v;
   }
-  return { ...task, metadata: publicMeta };
+  return { ...publicTask, metadata: publicMeta };
 }
 
 /**
@@ -719,6 +1237,7 @@ function sanitizeTaskForResponse(task: any): any {
  */
 function authorizeTaskAccess(
   taskOwnerEmail: string | null,
+  taskOwnerScope: string | null,
   event: any,
   config: A2AConfig,
 ): JsonRpcResponse | null {
@@ -729,7 +1248,6 @@ function authorizeTaskAccess(
   const inProduction = isA2AProductionRuntime();
 
   if (inProduction && !hasA2ASecret && !hasApiKey) {
-    // No way to authenticate the caller in production — refuse access.
     return jsonRpcError(0, -32001, "Task not found");
   }
 
@@ -740,10 +1258,76 @@ function authorizeTaskAccess(
     if (verifiedEmail.toLowerCase() !== taskOwnerEmail.toLowerCase()) {
       return jsonRpcError(0, -32001, "Task not found");
     }
+    const storedScope = taskOwnerScope?.trim().toLowerCase() ?? "";
+    if (!storedScope) {
+      // Legacy empty scopes cannot distinguish personal tasks from org tasks.
+      return jsonRpcError(0, -32001, "Task not found");
+    }
+    const verifiedOrgId =
+      (event?.context?.__a2aVerifiedOrgId as string | undefined)
+        ?.trim()
+        .toLowerCase() ?? "";
+    const verifiedOrgDomain =
+      (event?.context?.__a2aOrgDomain as string | undefined)?.trim() ?? "";
+    if (storedScope.startsWith(A2A_ORG_ID_OWNER_SCOPE_PREFIX)) {
+      if (
+        !verifiedOrgId ||
+        storedScope !== `${A2A_ORG_ID_OWNER_SCOPE_PREFIX}${verifiedOrgId}`
+      ) {
+        return jsonRpcError(0, -32001, "Task not found");
+      }
+    } else if (
+      storedScope === A2A_PERSONAL_OWNER_SCOPE &&
+      !verifiedOrgId &&
+      !verifiedOrgDomain
+    ) {
+      // A verified identity with no organization is in its personal scope.
+    } else {
+      // Legacy domain scopes cannot be safely rebound after a domain change.
+      return jsonRpcError(0, -32001, "Task not found");
+    }
+  } else if (taskOwnerScope) {
+    const verifiedOrgId =
+      (event?.context?.__a2aVerifiedOrgId as string | undefined)
+        ?.trim()
+        .toLowerCase() ?? "";
+    const identityAssurance = event?.context?.__a2aIdentityAssurance;
+    if (
+      identityAssurance !== "organization" ||
+      !verifiedOrgId ||
+      taskOwnerScope.trim().toLowerCase() !==
+        `${A2A_ORG_ID_OWNER_SCOPE_PREFIX}${verifiedOrgId}`
+    ) {
+      return jsonRpcError(0, -32001, "Task not found");
+    }
+  } else if (event?.context?.__a2aIdentityAssurance === "organization") {
+    return jsonRpcError(0, -32001, "Task not found");
   }
-  // Legacy row (no owner_email recorded). The route-level auth gate is the
-  // only thing protecting it — fall through and serve.
   return null;
+}
+
+function taskAccessScope(
+  ownership: { ownerEmail: string | null; ownerScope: string | null },
+  event: any,
+) {
+  const verifiedEmail =
+    (event?.context?.__a2aVerifiedEmail as string | undefined)?.trim() ?? "";
+  if (!ownership.ownerEmail) {
+    const identityAssurance = event?.context?.__a2aIdentityAssurance;
+    const verifiedOrgId =
+      (event?.context?.__a2aVerifiedOrgId as string | undefined)
+        ?.trim()
+        .toLowerCase() ?? "";
+    const expectedOrgScope = verifiedOrgId
+      ? `${A2A_ORG_ID_OWNER_SCOPE_PREFIX}${verifiedOrgId}`
+      : "";
+    return identityAssurance === "organization" &&
+      ownership.ownerScope?.trim().toLowerCase() === expectedOrgScope
+      ? { ownerEmail: "", ownerScope: expectedOrgScope }
+      : undefined;
+  }
+  if (!verifiedEmail) return undefined;
+  return { ownerEmail: verifiedEmail, ownerScope: ownership.ownerScope };
 }
 
 async function handleGet(
@@ -755,22 +1339,30 @@ async function handleGet(
   if (!id) {
     return jsonRpcError(0, -32602, "Invalid params: id required");
   }
-  const ownerEmail = await getTaskOwner(id);
-  const denied = authorizeTaskAccess(ownerEmail, event, config);
+  const ownership = await getTaskOwnership(id);
+  const denied = authorizeTaskAccess(
+    ownership.ownerEmail,
+    ownership.ownerScope,
+    event,
+    config,
+  );
   if (denied) return denied;
 
-  const task = await getTask(id);
+  const accessScope = taskAccessScope(ownership, event);
+  const task = await getTask(id, accessScope);
   if (!task) {
     return jsonRpcError(0, -32001, "Task not found");
   }
-  const taskChanged = await refireStuckAsyncTaskIfNeeded(id, event).catch(
-    (err) => {
-      console.error("[a2a] Failed to refire stuck async task:", err);
-      return false;
-    },
-  );
+  const taskChanged = await refireStuckAsyncTaskIfNeeded(
+    id,
+    event,
+    config,
+  ).catch((err) => {
+    console.error("[a2a] Failed to refire stuck async task:", err);
+    return false;
+  });
   if (taskChanged) {
-    const updated = await getTask(id);
+    const updated = await getTask(id, accessScope);
     if (updated) return jsonRpcResult(0, sanitizeTaskForResponse(updated));
   }
   return jsonRpcResult(0, sanitizeTaskForResponse(task));
@@ -779,36 +1371,55 @@ async function handleGet(
 async function refireStuckAsyncTaskIfNeeded(
   taskId: string,
   event: any,
+  config: A2AConfig,
 ): Promise<boolean> {
   const state = await getA2ATaskDispatchState(taskId);
   if (!state) return false;
   if (!state.metadata?.__a2a_processor) return false;
 
   const now = Date.now();
-  if (
-    (state.statusState === "submitted" || state.statusState === "working") &&
-    state.updatedAt <= now - A2A_QUEUED_DISPATCH_STUCK_AFTER_MS
-  ) {
-    if (await touchQueuedA2ATaskDispatch(taskId)) {
-      await fireProcessTaskDispatch(event, taskId);
+
+  if (state.statusState === "submitted" || state.statusState === "working") {
+    const queuedLifetimeCutoff = now - a2aQueuedLifetimeMaxMs();
+    if (state.createdAt <= queuedLifetimeCutoff) {
+      return failStuckQueuedA2ATask(
+        taskId,
+        queuedLifetimeCutoff,
+        "The async A2A task could not be started because dispatch kept failing. Please retry the request.",
+      );
+    }
+
+    if (state.updatedAt <= now - A2A_QUEUED_DISPATCH_STUCK_AFTER_MS) {
+      if (!(await touchQueuedA2ATaskDispatch(taskId))) return false;
+      try {
+        await fireProcessTaskDispatch(event, taskId, config);
+      } catch (err) {
+        console.error(
+          "[a2a] Failed to refire stuck queued task dispatch:",
+          err,
+        );
+        return false;
+      }
       return true;
     }
     return false;
   }
 
-  if (
-    state.statusState === "processing" &&
-    state.updatedAt <= now - A2A_PROCESSING_STUCK_AFTER_MS
-  ) {
-    // A processor that died mid-handler may have already performed
-    // side-effectful work. Retrying from the top can duplicate artifacts, so
-    // fail deterministically and let the caller issue an intentional retry.
-    const failed = await failStuckA2ATask(
-      taskId,
-      now - A2A_PROCESSING_STUCK_AFTER_MS,
-      "The async A2A processor timed out before completing. Please retry the request.",
-    );
-    return failed;
+  if (state.statusState === "processing") {
+    const processingStuckCutoff = now - A2A_PROCESSING_STUCK_AFTER_MS;
+    const processingLifetimeCutoff = now - a2aProcessingLifetimeMaxMs();
+    const isStale = state.updatedAt <= processingStuckCutoff;
+    const isOverLifetime = state.createdAt <= processingLifetimeCutoff;
+    if (isStale || isOverLifetime) {
+      return failStuckA2ATask(
+        taskId,
+        processingStuckCutoff,
+        isStale
+          ? "The async A2A processor timed out before completing. Please retry the request."
+          : "The async A2A processor exceeded its maximum run time. Please retry the request.",
+        processingLifetimeCutoff,
+      );
+    }
   }
 
   return false;
@@ -823,21 +1434,120 @@ async function handleCancel(
   if (!id) {
     return jsonRpcError(0, -32602, "Invalid params: id required");
   }
-  const ownerEmail = await getTaskOwner(id);
-  const denied = authorizeTaskAccess(ownerEmail, event, config);
+  const ownership = await getTaskOwnership(id);
+  const denied = authorizeTaskAccess(
+    ownership.ownerEmail,
+    ownership.ownerScope,
+    event,
+    config,
+  );
   if (denied) return denied;
 
-  const task = await updateTask(id, { state: "canceled" });
+  const task = await updateTask(
+    id,
+    { state: "canceled" },
+    taskAccessScope(ownership, event),
+  );
   if (!task) {
     return jsonRpcError(0, -32001, "Task not found");
   }
   return jsonRpcResult(0, sanitizeTaskForResponse(task));
 }
 
-/**
- * H3-compatible JSON-RPC handler. Returns JSON directly (H3 serializes it).
- * Streaming is handled via H3's node response when needed.
- */
+async function handleInvokeReadOnlyAction(
+  params: Record<string, unknown>,
+  event: any,
+  config: A2AConfig,
+): Promise<JsonRpcResponse> {
+  const action = typeof params.action === "string" ? params.action.trim() : "";
+  const input = params.input ?? {};
+
+  if (!action) {
+    return jsonRpcError(0, -32602, "Invalid params: action required");
+  }
+  if (action.length > MAX_A2A_DIRECT_ACTION_NAME_CHARS) {
+    return jsonRpcError(0, -32602, "Invalid params: action is too long");
+  }
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return jsonRpcError(0, -32602, "Invalid params: input must be an object");
+  }
+  let inputBytes: number;
+  try {
+    inputBytes = Buffer.byteLength(JSON.stringify(input), "utf8");
+  } catch {
+    return jsonRpcError(0, -32602, "Invalid params: input must be JSON-safe");
+  }
+  if (inputBytes > MAX_A2A_DIRECT_ACTION_INPUT_BYTES) {
+    return jsonRpcError(0, -32602, "Invalid params: input is too large");
+  }
+  if (
+    !event?.context?.__a2aVerifiedEmail ||
+    event?.context?.__a2aAudienceVerified !== true
+  ) {
+    return jsonRpcError(
+      0,
+      -32001,
+      "A verified, audience-bound user identity is required for direct action invocation",
+    );
+  }
+  if (hasUnboundVerifiedOrgIdentity(event)) {
+    return jsonRpcError(
+      0,
+      -32001,
+      "A stable verified organization identity is required for direct action invocation",
+    );
+  }
+  if (!config.executeReadOnlyAction) {
+    return jsonRpcError(0, -32601, "Direct action invocation not supported");
+  }
+
+  const startedAt = Date.now();
+  const correlation = sanitizeA2ACorrelationMetadata(params.metadata);
+  const invocationId = crypto.randomUUID();
+  const verifiedEmail = event.context.__a2aVerifiedEmail as string;
+  const emitTracking = (status: "completed" | "failed") => {
+    const identity = trackingIdentityProperties();
+    track(
+      A2A_READ_INVOKE_EVENT,
+      {
+        ...identity,
+        action,
+        receiver_app: config.appId ?? identity.app ?? config.name,
+        caller_app: correlation.callerApp ?? "unknown",
+        duration_ms: Math.max(0, Date.now() - startedAt),
+        status,
+        invocation_id: invocationId,
+        ...(correlation.parentRunId
+          ? { parent_run_id: correlation.parentRunId }
+          : {}),
+        ...(correlation.parentTurnId
+          ? { parent_turn_id: correlation.parentTurnId }
+          : {}),
+        ...(correlation.invocationId
+          ? { caller_invocation_id: correlation.invocationId }
+          : {}),
+      },
+      { userId: verifiedEmail },
+    );
+  };
+
+  try {
+    const result = await withA2ARequestContext(undefined, event, () =>
+      config.executeReadOnlyAction!({
+        action,
+        input: input as Record<string, unknown>,
+        invocationId,
+      }),
+    );
+    emitTracking(result.status);
+    return jsonRpcResult(0, { action, ...result });
+  } catch (error) {
+    emitTracking("failed");
+    console.error(`[a2a] Direct action ${action} failed:`, error);
+    return jsonRpcError(0, -32000, "Direct action invocation failed");
+  }
+}
+
 export async function handleJsonRpcH3(
   body: any,
   event: any,
@@ -861,7 +1571,6 @@ export async function handleJsonRpcH3(
       if (!config.streaming) {
         return jsonRpcError(id, -32601, "Streaming not supported");
       }
-      // Use the raw node response for SSE streaming
       const res = event.node?.res;
       if (!res) {
         return jsonRpcError(id, -32000, "Streaming not available");
@@ -870,7 +1579,7 @@ export async function handleJsonRpcH3(
       setResponseHeader(event, "Cache-Control", "no-cache");
       setResponseHeader(event, "Connection", "keep-alive");
       await handleStream(params, config, res, event);
-      return undefined as any; // Response already sent via SSE
+      return undefined as any;
     }
     case "tasks/get": {
       const result = await handleGet(params, event, config);
@@ -878,6 +1587,10 @@ export async function handleJsonRpcH3(
     }
     case "tasks/cancel": {
       const result = await handleCancel(params, event, config);
+      return { ...result, id } as JsonRpcResponse;
+    }
+    case "actions/invoke": {
+      const result = await handleInvokeReadOnlyAction(params, event, config);
       return { ...result, id } as JsonRpcResponse;
     }
     default:

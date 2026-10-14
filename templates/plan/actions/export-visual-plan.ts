@@ -1,8 +1,13 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
-import { exportPlanContentToMdxFolder } from "../server/plan-mdx.js";
+
+import {
+  exportPlanContentToMdxFolder,
+  referencedBlockIdsForPlanComments,
+} from "../server/plan-mdx.js";
 import {
   buildPlanHtml,
+  loadFullPlanEvents,
   loadPlanBundle,
   planDeepLink,
   planPath,
@@ -25,6 +30,7 @@ export default defineAction({
   },
   run: async (args) => {
     const bundle = await loadPlanBundle(args.planId);
+    bundle.events = await loadFullPlanEvents(args.planId);
     const path = planPath(bundle.plan.id, bundle.plan.kind);
     const mdx = await exportPlanContentToMdxFolder({
       content: bundle.plan.content,
@@ -32,6 +38,7 @@ export default defineAction({
       brief: bundle.plan.brief,
       planId: bundle.plan.id,
       url: path,
+      referencedBlockIds: referencedBlockIdsForPlanComments(bundle.comments),
     });
     const sourceMarkdown =
       (bundle.plan.content ? mdx["plan.mdx"] : bundle.plan.markdown) ||

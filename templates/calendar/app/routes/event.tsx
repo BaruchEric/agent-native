@@ -1,5 +1,11 @@
-import { useSearchParams } from "react-router";
-import { format, parseISO, differenceInMinutes } from "date-fns";
+import { useActionQuery } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import {
+  isInAgentEmbed,
+  postNavigate,
+} from "@agent-native/core/client/navigation";
+import { normalizeDocumentTitle } from "@agent-native/core/shared";
+import { getCalendarAttendeeCount, type CalendarEvent } from "@shared/api";
 import {
   IconClock,
   IconMapPin,
@@ -8,16 +14,18 @@ import {
   IconArrowUpRight,
   IconCalendar,
 } from "@tabler/icons-react";
+import { format, parseISO, differenceInMinutes } from "date-fns";
+import { useEffect } from "react";
+import { useSearchParams } from "react-router";
+
 import { Button } from "@/components/ui/button";
-import { Spinner } from "@/components/ui/spinner";
-import { useActionQuery } from "@agent-native/core/client";
-import { postNavigate, isInAgentEmbed } from "@agent-native/core/client";
-import type { CalendarEvent } from "@shared/api";
+import { Skeleton } from "@/components/ui/skeleton";
+import enUSMessages from "@/i18n/en-US";
 
 type EventPreviewResult = CalendarEvent | { error: string };
 
 export function meta() {
-  return [{ title: "Event Preview" }];
+  return [{ title: enUSMessages.routeTitles.eventPreview }];
 }
 
 function formatDuration(start: string, end: string): string {
@@ -30,7 +38,12 @@ function formatDuration(start: string, end: string): string {
 }
 
 function EventCard({ event }: { event: CalendarEvent }) {
+  const t = useT();
   const inEmbed = isInAgentEmbed();
+  const visibleAttendees = (event.attendees ?? []).slice(0, 5);
+  const hiddenAttendeeCount =
+    getCalendarAttendeeCount(event.attendees) -
+    getCalendarAttendeeCount(visibleAttendees);
 
   return (
     <div className="min-h-screen bg-background flex items-start justify-center p-4">
@@ -99,7 +112,7 @@ function EventCard({ event }: { event: CalendarEvent }) {
             <div className="flex items-start gap-2.5 text-sm text-muted-foreground">
               <IconUsers className="mt-0.5 h-4 w-4 shrink-0" />
               <div className="flex flex-col gap-0.5">
-                {event.attendees.slice(0, 5).map((a) => (
+                {visibleAttendees.map((a) => (
                   <span key={a.email} className="truncate">
                     {a.displayName ? (
                       <>
@@ -113,9 +126,9 @@ function EventCard({ event }: { event: CalendarEvent }) {
                     )}
                   </span>
                 ))}
-                {event.attendees.length > 5 && (
+                {hiddenAttendeeCount > 0 && (
                   <span className="text-muted-foreground/60 text-xs">
-                    +{event.attendees.length - 5} more
+                    +{hiddenAttendeeCount} more
                   </span>
                 )}
               </div>
@@ -128,11 +141,11 @@ function EventCard({ event }: { event: CalendarEvent }) {
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-8 px-2 text-muted-foreground hover:text-foreground text-xs gap-1.5"
+                className="px-2 text-muted-foreground hover:text-foreground text-xs gap-1.5"
                 onClick={() => postNavigate("/")}
               >
                 <IconCalendar className="h-3.5 w-3.5" />
-                Open calendar
+                {t("eventPreview.openCalendar")}
                 <IconArrowUpRight className="h-3 w-3" />
               </Button>
             </div>
@@ -143,12 +156,51 @@ function EventCard({ event }: { event: CalendarEvent }) {
   );
 }
 
+function EventCardSkeleton() {
+  return (
+    <div className="flex min-h-screen items-start justify-center bg-background p-4">
+      <div
+        className="w-full max-w-sm overflow-hidden rounded-xl border border-border bg-card shadow-sm"
+        aria-busy="true"
+      >
+        <Skeleton className="h-1 w-full rounded-none" />
+        <div className="space-y-4 px-5 py-4">
+          <div className="space-y-2">
+            <Skeleton className="h-5 w-4/5" />
+            <Skeleton className="h-3 w-20" />
+          </div>
+          <div className="flex gap-2.5">
+            <Skeleton className="mt-0.5 size-4 shrink-0 rounded-full" />
+            <div className="flex-1 space-y-2">
+              <Skeleton className="h-4 w-40 max-w-full" />
+              <Skeleton className="h-3 w-32 max-w-full" />
+            </div>
+          </div>
+          <div className="flex gap-2.5">
+            <Skeleton className="mt-0.5 size-4 shrink-0 rounded-full" />
+            <Skeleton className="h-4 w-48 max-w-full" />
+          </div>
+          <div className="flex gap-2.5">
+            <Skeleton className="mt-0.5 size-4 shrink-0 rounded-full" />
+            <div className="flex-1 space-y-2">
+              <Skeleton className="h-3 w-full" />
+              <Skeleton className="h-3 w-4/5" />
+            </div>
+          </div>
+          <Skeleton className="h-8 w-full" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ErrorCard({ message }: { message: string }) {
+  const t = useT();
   return (
     <div className="min-h-screen bg-background flex items-start justify-center p-4">
       <div className="w-full max-w-sm rounded-xl border border-border bg-card shadow-sm px-5 py-4">
         <p className="text-sm text-destructive font-medium">
-          Could not load event
+          {t("eventPreview.couldNotLoadEvent")}
         </p>
         <p className="mt-1 text-xs text-muted-foreground">{message}</p>
       </div>
@@ -157,6 +209,7 @@ function ErrorCard({ message }: { message: string }) {
 }
 
 export default function EventPreviewRoute() {
+  const t = useT();
   const [searchParams] = useSearchParams();
   const id = searchParams.get("id") ?? "";
   const calendarId = searchParams.get("calendarId") ?? "primary";
@@ -166,22 +219,29 @@ export default function EventPreviewRoute() {
     id ? { id, calendarId } : undefined,
     { enabled: !!id, retry: false },
   );
+  const result = data as EventPreviewResult | undefined;
+  const event = result && !("error" in result) ? result : null;
+
+  useEffect(() => {
+    const nextTitle = `${normalizeDocumentTitle(
+      event?.title,
+      "Event",
+    )} — Calendar`;
+    const previousTitle = document.title;
+    document.title = nextTitle;
+    return () => {
+      if (document.title === nextTitle) document.title = previousTitle;
+    };
+  }, [event?.title]);
 
   if (!id) {
-    return (
-      <ErrorCard message="No event id provided. Add ?id=<eventId> to the URL." />
-    );
+    return <ErrorCard message={t("eventPreview.noEventId")} />;
   }
 
   if (isLoading) {
-    return (
-      <div className="min-h-screen bg-background flex items-center justify-center">
-        <Spinner className="size-6 text-primary" />
-      </div>
-    );
+    return <EventCardSkeleton />;
   }
 
-  const result = data as EventPreviewResult | undefined;
   if (error || !result || "error" in result) {
     return (
       <ErrorCard

@@ -1,0 +1,46 @@
+name: Beta E2E (scheduled)
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: beta-e2e-scheduled
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  beta-e2e:
+    name: Run beta E2E
+    uses: ./.github/workflows/beta-e2e.yml
+    with:
+      apps: all
+      lane: public+authed
+      grep: ""
+      # Scheduled health checks use the separately limited E2E credential so
+      # they cannot spend or inherit the repository-wide provider key.
+      key_source: dedicated
+    secrets: inherit
+    # beta-e2e.yml's report job needs actions: read; without it GitHub refuses
+    # to start the run.
+    permissions:
+      actions: read
+      contents: read
+
+  # Keep one collector and digest implementation for scheduled and manual runs.
+  report:
+    name: Report beta E2E status
+    if: ${{ always() && needs.beta-e2e.result != 'skipped' }}
+    needs: beta-e2e
+    uses: ./.github/workflows/beta-e2e-report.yml
+    with:
+      run_result: ${{ needs.beta-e2e.result }}
+      update_baseline: true
+    secrets:
+      QA_SLACK_BOT_TOKEN: ${{ secrets.QA_SLACK_BOT_TOKEN }}
+    permissions:
+      actions: read
+      contents: read

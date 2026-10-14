@@ -1,20 +1,23 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
+import { defineAction } from "@agent-native/core/action";
 import {
-  discoverAgents,
-  getBuiltinAgents,
-  shouldIncludeRemoteAgentManifest,
-} from "@agent-native/core/server/agent-discovery";
-import { getRequestUserEmail } from "@agent-native/core/server";
+  REMOTE_AGENT_RESOURCE_PREFIXES,
+  parseRemoteAgentManifest,
+} from "@agent-native/core/resources/metadata";
 import {
   resourceGet,
   resourceListAccessible,
   SHARED_OWNER,
 } from "@agent-native/core/resources/store";
+import { getRequestUserEmail } from "@agent-native/core/server";
 import {
-  REMOTE_AGENT_RESOURCE_PREFIXES,
-  parseRemoteAgentManifest,
-} from "@agent-native/core/resources/metadata";
+  discoverAgents,
+  getBuiltinAgents,
+  isBuiltinAgentCatalogId,
+  loadWorkspaceAppsManifest,
+  normalizeAgentId,
+  shouldIncludeRemoteAgentManifest,
+} from "@agent-native/core/server/agent-discovery";
+import { z } from "zod";
 
 export default defineAction({
   description:
@@ -25,9 +28,21 @@ export default defineAction({
     const { hiddenAgentIds = [] } = await import("../server/index.js").then(
       (m) => m.getDispatchConfig(),
     );
-    const discovered = await discoverAgents("dispatch");
+    const [discovered, workspaceApps] = await Promise.all([
+      discoverAgents("dispatch"),
+      loadWorkspaceAppsManifest(),
+    ]);
+    // A mounted workspace app with a built-in's id is a workspace app; the
+    // built-in config never applies to it.
+    const workspaceIds = new Set(
+      (workspaceApps ?? []).map((app) => normalizeAgentId(app.id)),
+    );
+    const builtins = getBuiltinAgents("dispatch");
     const builtinIds = new Set(
-      getBuiltinAgents("dispatch").map((agent) => agent.id),
+      builtins.map((agent) => agent.id).filter((id) => !workspaceIds.has(id)),
+    );
+    const builtinHomeUrls = new Map(
+      builtins.map((agent) => [agent.id, agent.url]),
     );
     const ownerEmail = getRequestUserEmail();
     if (!ownerEmail) throw new Error("no authenticated user");
@@ -48,9 +63,6 @@ export default defineAction({
       }
     >();
 
-    // Only treat a resource as a "custom" agent if its id is not a builtin.
-    // Built-in agents may also be seeded as shared resources so the agent-chat
-    // plugin can overlay them — those should still be reported as builtin.
     for (const resource of resources) {
       if (!resource.path.endsWith(".json")) continue;
       const full = await resourceGet(resource.id);
@@ -58,8 +70,11 @@ export default defineAction({
       const manifest = parseRemoteAgentManifest(full.content, resource.path);
       if (!manifest) continue;
       if (!shouldIncludeRemoteAgentManifest(manifest, "dispatch")) continue;
-      if (builtinIds.has(manifest.id)) continue;
-      customById.set(manifest.id, {
+      const manifestId = normalizeAgentId(manifest.id);
+      // Built-in ids stay under the workspace's built-in config even when a
+      // seeded manifest for them exists in resources.
+      if (isBuiltinAgentCatalogId(manifestId)) continue;
+      customById.set(manifestId, {
         resourceId: resource.id,
         path: resource.path,
         scope: resource.owner === SHARED_OWNER ? "shared" : "personal",
@@ -73,8 +88,10 @@ export default defineAction({
     const connected = discovered.map((agent) => {
       const custom = customById.get(agent.id);
       const isBuiltin = builtinIds.has(agent.id);
+      const homeUrl = isBuiltin ? builtinHomeUrls.get(agent.id) : undefined;
       return {
         ...agent,
+        ...(homeUrl ? { homeUrl } : {}),
         source: isBuiltin ? "builtin" : custom ? "custom" : "workspace",
         resourceId: custom?.resourceId,
         path: custom?.path,

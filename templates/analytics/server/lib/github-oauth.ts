@@ -1,13 +1,14 @@
-import type { CredentialContext } from "./credentials";
-import {
-  resolveLocalAnalyticsProviderCredential,
-  resolveWorkspaceConnectionProviderCredential,
-} from "./provider-credentials";
 import {
   listOAuthAccountsByOwner,
   saveOAuthTokens,
   setOAuthDisplayName,
 } from "@agent-native/core/oauth-tokens";
+
+import type { CredentialContext } from "./credentials";
+import {
+  resolveLocalAnalyticsProviderCredential,
+  resolveWorkspaceConnectionProviderCredential,
+} from "./provider-credentials";
 
 const GITHUB_AUTH_URL = "https://github.com/login/oauth/authorize";
 const GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token";
@@ -40,11 +41,8 @@ export interface GitHubOAuthStatus {
 }
 
 function getGitHubOAuthConfig() {
-  const clientId =
-    process.env.GITHUB_INTEGRATION_CLIENT_ID || process.env.GITHUB_CLIENT_ID;
-  const clientSecret =
-    process.env.GITHUB_INTEGRATION_CLIENT_SECRET ||
-    process.env.GITHUB_CLIENT_SECRET;
+  const clientId = process.env.GITHUB_INTEGRATION_CLIENT_ID;
+  const clientSecret = process.env.GITHUB_INTEGRATION_CLIENT_SECRET;
   if (!clientId || !clientSecret) return null;
   return { clientId, clientSecret };
 }

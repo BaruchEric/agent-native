@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
+
+import type { BuiltinCapability } from "./use-builtin-capabilities.js";
 import {
+  resourceDownloadUrl,
   withAgentScratchFolder,
   withMcpServersFolder,
   type TreeNode,
 } from "./use-resources.js";
-import type { BuiltinCapability } from "./use-builtin-capabilities.js";
 
 function fileNode(
   path: string,
@@ -32,6 +34,28 @@ function fileNode(
     },
   };
 }
+
+describe("resourceDownloadUrl", () => {
+  it("constructs an attachment URL without exposing the resource id as query syntax", () => {
+    expect(resourceDownloadUrl("resource/with?query")).toBe(
+      "/_agent-native/resources/resource%2Fwith%3Fquery?download=1",
+    );
+  });
+});
+
+describe("resourcePackScopeFromPanel", () => {
+  it("maps panel scopes onto pack export scopes", async () => {
+    const { resourcePackScopeFromPanel, resourcePackDownloadFilename } =
+      await import("./use-resources.js");
+    expect(resourcePackScopeFromPanel("shared")).toBe("organization");
+    expect(resourcePackScopeFromPanel("all")).toBe("accessible");
+    expect(resourcePackScopeFromPanel("personal")).toBe("personal");
+    expect(resourcePackScopeFromPanel("workspace")).toBe("workspace");
+    expect(resourcePackDownloadFilename(1_700_000_000_000)).toBe(
+      "agent-resource-pack-1700000000000.json",
+    );
+  });
+});
 
 describe("withAgentScratchFolder", () => {
   it("hides top-level scratch folders when show is false", () => {

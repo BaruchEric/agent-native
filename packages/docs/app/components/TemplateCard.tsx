@@ -1,402 +1,203 @@
-import { useState } from "react";
-import * as Popover from "@radix-ui/react-popover";
+import { trackEvent } from "@agent-native/core/client/analytics";
+import { useLocale, useT } from "@agent-native/core/client/i18n";
 import { Link } from "react-router";
-import { trackEvent } from "@agent-native/core/client";
-import { TemplateDocsLink } from "./template-docs";
+
+import { sendAhrefsEvent } from "../lib/ahrefs-analytics";
+import { sitePathForLocale } from "./docs-locale";
+import {
+  getScreenshotTileScaleX,
+  TEMPLATE_SCREENSHOTS,
+} from "./template-screenshots";
+import { TemplateScreenshot } from "./TemplateScreenshot";
+import { AppStatusBadge } from "./website-redesign/ds/app-status-badge";
+import { CardArrow } from "./website-redesign/ds/card-arrow";
 
 export { trackEvent };
 
 export const templates = [
   {
-    name: "Calendar",
-    slug: "calendar",
-    replaces: "Replaces or augments Google Calendar, Calendly",
+    name: "Clips",
+    slug: "clips",
     cliCommand:
-      "npx @agent-native/core@latest create my-calendar-app --template calendar",
-    demoUrl: "https://calendar.agent-native.com",
-    description:
-      "Full calendar with Google sync, availability management, and a public booking page. The agent finds open slots, creates events, and manages your schedule.",
-    color: "#10b981",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2Ffb6c3b483ca24ab3b6c3a758aeceef4c?format=webp&width=800",
-  },
-  {
-    name: "Content",
-    slug: "content",
-    replaces: "Replaces or augments Obsidian for MDX, Notion, Google Docs",
-    cliCommand:
-      "npx @agent-native/core@latest create my-content-app --template content",
-    demoUrl: "https://content.agent-native.com",
-    description:
-      "Edit local Markdown/MDX files like Obsidian, generate rich interactive custom blocks, and use an AI agent to draft, rewrite, and publish.",
-    color: "#7928ca",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F89bcfc6106304bfbaf8ec8a7ccd721eb?format=webp&width=800",
+      "npx @agent-native/core@latest create my-clips-app --template clips",
+    demoUrl: "https://clips.agent-native.com",
+    color: "#0EA5E9",
+    screenshot: TEMPLATE_SCREENSHOTS.clips,
   },
   {
     name: "Plans",
     slug: "plan",
-    replaces: "Visual plan mode for Codex, Claude Code, and coding agents",
     cliCommand: "npx @agent-native/core@latest skills add visual-plan",
     demoUrl: "https://plan.agent-native.com",
-    description:
-      "Install visual planning as an app-backed skill. Your coding agent can open structured plans with diagrams, wireframes, prototypes, annotations, comments, and shareable review links.",
-    color: "#52525B",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2Fb6f4213ac7cc42eeb10c12e8ccda8936?format=webp&width=800",
-  },
-  {
-    name: "Slides",
-    slug: "slides",
-    replaces: "Replaces or augments Google Slides, Pitch",
-    cliCommand:
-      "npx @agent-native/core@latest create my-slides-app --template slides",
-    demoUrl: "https://slides.agent-native.com",
-    description:
-      "Generate full presentations from a prompt. Edit visually or conversationally. AI image generation, 8 layouts, and presentation mode built in.",
-    color: "#f59e0b",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F2c09b451d40c4a74a89a38d69170c2d8?format=webp&width=800",
-  },
-  {
-    name: "Video",
-    slug: "video",
-    replaces: "Replaces or augments video editing",
-    cliCommand:
-      "npx @agent-native/core@latest create my-video-app --template videos",
-    demoUrl: "https://videos.agent-native.com",
-    description:
-      "Build React-based video compositions with Remotion. Keyframe animation, 30+ easing curves, camera controls, and agent-assisted editing.",
-    color: "#ec4899",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F6b8bfcc18a1d4c47a491da3b2d4148a4?format=webp&width=800",
-  },
-  {
-    name: "Analytics",
-    slug: "analytics",
-    replaces: "Replaces or augments Amplitude, Mixpanel, Looker",
-    cliCommand:
-      "npx @agent-native/core@latest create my-analytics-app --template analytics",
-    demoUrl: "https://analytics.agent-native.com",
-    description:
-      "Connect any data source, prompt for any chart, build reusable dashboards. The agent writes SQL, generates visualizations, and evolves the app.",
-    color: "var(--docs-accent)",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F4933a80cc3134d7e874631f688be828a?format=webp&width=800",
-  },
-  {
-    name: "Mail",
-    slug: "mail",
-    replaces: "Replaces or augments Superhuman, Gmail",
-    cliCommand:
-      "npx @agent-native/core@latest create my-mail-app --template mail",
-    demoUrl: "https://mail.agent-native.com",
-    description:
-      "Superhuman-style email client with keyboard shortcuts, AI triage, multi-account support, and email automations. Own your inbox workflow.",
-    color: "#0ea5e9",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F6f49a81c404d4242b33317491eac7575?format=webp&width=800",
-  },
-  {
-    name: "Forms",
-    slug: "forms",
-    replaces: "Replaces or augments Typeform, Google Forms",
-    cliCommand:
-      "npx @agent-native/core@latest create my-forms-app --template forms",
-    demoUrl: "https://forms.agent-native.com",
-    description:
-      "Agent-native form builder. Generate forms from a prompt, edit fields visually or conversationally, and send submissions to Slack, Discord, Google Sheets, or webhooks.",
-    color: "#06B6D4",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F190c3fabd51f4c1bba5aa4e091ad4e9b?format=webp&width=800",
-  },
-  {
-    name: "Clips",
-    slug: "clips",
-    replaces: "Replaces or augments Loom, Granola, and Wisprflow",
-    cliCommand:
-      "npx @agent-native/core@latest create my-clips-app --template clips",
-    demoUrl: "https://clips.agent-native.com",
-    description:
-      "Screen recordings, calendar-synced meeting notes, and Fn-hold voice dictation — all transcribed, summarized, and searchable, with an agent that can edit any of it.",
-    color: "#0EA5E9",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F678be5a501a14ab8a508e5f7bc92c468?format=webp&width=800",
-  },
-  {
-    name: "Brain",
-    slug: "brain",
-    replaces:
-      "Replaces or augments team wikis, Glean-style recall, and institutional memory tools",
-    cliCommand:
-      "npx @agent-native/core@latest create my-brain-app --template brain",
-    demoUrl: "https://brain.agent-native.com",
-    description:
-      "Full-page company chat over cited memory from approved Slack, Clips, Granola, GitHub, and transcript sources, with review gates, evals, and shared connection readiness built in.",
-    color: "#8B5CF6",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F9c9fe3b5b9494e33803cd3f494cba356?format=webp&width=800",
-  },
-  {
-    name: "Assets",
-    slug: "assets",
-    replaces:
-      "Replaces or augments DAMs, brand asset libraries, and AI media generators",
-    cliCommand:
-      "npx @agent-native/core@latest create my-assets-app --template assets",
-    demoUrl: "https://assets.agent-native.com",
-    description:
-      "Digital asset manager for uploads, brand libraries, searchable references, and on-brand image/video generation that other apps can call through A2A or embed as a picker.",
-    color: "#0F766E",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F769092170a14474f998cbca47384f891?format=webp&width=800",
+    color: "#2F6FED",
+    screenshot: TEMPLATE_SCREENSHOTS.plan,
   },
   {
     name: "Design",
     slug: "design",
-    replaces: "Replaces or augments design prototyping tools",
     cliCommand:
       "npx @agent-native/core@latest create my-design-app --template design",
     demoUrl: "https://design.agent-native.com",
-    description:
-      "Agent-native HTML prototyping studio. Generate interactive Alpine/Tailwind designs, compare variants, refine live tweak controls, and export the result.",
     color: "#F472B6",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2F348da13fcd8b414c87de9066196f7266%2F961bedb713a94463b834c1f2f4643bcf?format=webp&width=800",
+    screenshot: TEMPLATE_SCREENSHOTS.design,
+  },
+  {
+    name: "Content",
+    slug: "content",
+    cliCommand:
+      "npx @agent-native/core@latest create my-content-app --template content",
+    demoUrl: "https://content.agent-native.com",
+    color: "#7928ca",
+    screenshot: TEMPLATE_SCREENSHOTS.content,
+  },
+  {
+    name: "Slides",
+    slug: "slides",
+    cliCommand:
+      "npx @agent-native/core@latest create my-slides-app --template slides",
+    demoUrl: "https://slides.agent-native.com",
+    color: "#f59e0b",
+    screenshot: TEMPLATE_SCREENSHOTS.slides,
+  },
+  {
+    name: "Analytics",
+    slug: "analytics",
+    cliCommand:
+      "npx @agent-native/core@latest create my-analytics-app --template analytics",
+    demoUrl: "https://analytics.agent-native.com",
+    color: "var(--docs-accent)",
+    screenshot: TEMPLATE_SCREENSHOTS.analytics,
+  },
+  {
+    name: "Mail",
+    slug: "mail",
+    cliCommand:
+      "npx @agent-native/core@latest create my-mail-app --template mail",
+    demoUrl: "https://mail.agent-native.com",
+    color: "#0ea5e9",
+    screenshot: TEMPLATE_SCREENSHOTS.mail,
+  },
+  {
+    name: "Forms",
+    slug: "forms",
+    cliCommand:
+      "npx @agent-native/core@latest create my-forms-app --template forms",
+    demoUrl: "https://forms.agent-native.com",
+    color: "#06B6D4",
+    screenshot: TEMPLATE_SCREENSHOTS.forms,
+  },
+  {
+    name: "Assets",
+    slug: "assets",
+    cliCommand:
+      "npx @agent-native/core@latest create my-assets-app --template assets",
+    demoUrl: "https://assets.agent-native.com",
+    color: "#0F766E",
+    screenshot: TEMPLATE_SCREENSHOTS.assets,
+  },
+  {
+    name: "Calendar",
+    slug: "calendar",
+    cliCommand:
+      "npx @agent-native/core@latest create my-calendar-app --template calendar",
+    demoUrl: "https://calendar.agent-native.com",
+    color: "#10b981",
+    screenshot: TEMPLATE_SCREENSHOTS.calendar,
   },
   {
     name: "Dispatch",
     slug: "dispatch",
-    replaces: "Mission control for your agent-native apps",
     cliCommand:
       "npx @agent-native/core@latest create my-dispatch-app --template dispatch",
     demoUrl: "https://dispatch.agent-native.com",
-    description:
-      "Centralized messaging and management for every agent in your stack. Talk to your agents from Slack, Telegram, or the web; route jobs, hold memory, approve actions, and delegate across apps over A2A.",
     color: "#14B8A6",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F104b3ad8d1dc461aa33ab9bff37a4482?format=webp&width=800",
+    screenshot: TEMPLATE_SCREENSHOTS.dispatch,
   },
   {
     name: "Chat",
     slug: "chat",
-    replaces: "A minimal ChatGPT-style app for your own agent",
     cliCommand:
       "npx @agent-native/core@latest create my-chat-app --template chat",
     demoUrl: "https://chat.agent-native.com",
-    description:
-      "Chat-first app scaffold with durable threads, a standard sidebar, actions, auth, live sync, and a clean path to add screens or plug in your own agent backend.",
     color: "#18181B",
-    screenshot:
-      "https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F6b36dc596fca4799815fa34c31e1c406",
+    screenshot: TEMPLATE_SCREENSHOTS.chat,
   },
   // ── DO NOT add new templates here directly. ──
   // The public-facing template list is the strict allow-list defined in
   // `packages/shared-app-config/templates.ts` (the entries with
-  // `hidden: false`). To surface
-  // a new template on the homepage, first flip its `hidden` flag in that
-  // file. The CI guard
-  // `scripts/guard-template-list.mjs` enforces this — adding a slug here
-  // that isn't in the allow-list will fail the build.
-];
+  // `hidden: false`). To surface a new template on the homepage, first flip
+  // its `hidden` flag in that file. The CI guard `scripts/guard-template-list.mjs`
+  // enforces this -- adding a slug here that isn't in the allow-list will fail
+  // the build.
+] as const;
 
 export type Template = (typeof templates)[number];
 
-export const featuredTemplates = templates.filter(
-  (template) => template.slug !== "video",
-);
-
-function CliPopoverContent({ template }: { template: Template }) {
-  const [copied, setCopied] = useState(false);
-
-  function handleCopy() {
-    navigator.clipboard.writeText(template.cliCommand);
-    setCopied(true);
-    trackEvent("copy cli command", {
-      template: template.slug,
-      location: "card",
-    });
-    setTimeout(() => setCopied(false), 2000);
-  }
-
-  return (
-    <>
-      <div className="flex min-w-0 items-center gap-2 px-3 py-2">
-        <code className="block min-w-0 truncate text-xs leading-relaxed text-[var(--fg)]">
-          {template.cliCommand}
-        </code>
-        <button
-          onClick={handleCopy}
-          className="shrink-0 rounded-md p-1 text-[var(--fg-secondary)] transition hover:text-[var(--fg)]"
-          aria-label="Copy command"
-        >
-          {copied ? (
-            <svg
-              width="12"
-              height="12"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <polyline points="20 6 9 17 4 12" />
-            </svg>
-          ) : (
-            <svg
-              width="12"
-              height="12"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-            </svg>
-          )}
-        </button>
-      </div>
-      <div className="border-t border-[var(--code-border)] px-3 py-1.5 text-[10px] text-[var(--fg-secondary)]">
-        Paste into your terminal.{" "}
-        <Link
-          data-an-prefetch="render"
-          to="/docs/getting-started"
-          className="text-[var(--docs-accent)] no-underline hover:underline"
-        >
-          New to the CLI?
-        </Link>
-      </div>
-    </>
-  );
-}
-
-function TemplateLaunchButton({ template }: { template: Template }) {
-  const [showCli, setShowCli] = useState(false);
-  const hasDemoUrl = "demoUrl" in template && template.demoUrl;
-
-  return (
-    <div className="mt-auto flex flex-col gap-2 pt-3">
-      {hasDemoUrl && (
-        <a
-          href={template.demoUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={() =>
-            trackEvent("click try demo", {
-              template: template.slug,
-              location: "card",
-            })
-          }
-          className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-black px-4 py-2 text-sm font-medium text-white no-underline transition hover:bg-gray-800 hover:no-underline dark:bg-white dark:text-black dark:hover:bg-gray-200"
-        >
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-            <polyline points="15 3 21 3 21 9" />
-            <line x1="10" y1="14" x2="21" y2="3" />
-          </svg>
-          Try It
-        </a>
-      )}
-      <div className="flex gap-2">
-        <Popover.Root
-          open={showCli}
-          onOpenChange={(open) => {
-            if (open)
-              trackEvent("click run locally", {
-                template: template.slug,
-                location: "card",
-              });
-            setShowCli(open);
-          }}
-        >
-          <Popover.Trigger asChild>
-            <button className="inline-flex flex-1 items-center justify-center rounded-lg border border-[var(--docs-border)] px-4 py-2 text-sm font-medium text-[var(--fg)] transition hover:border-[var(--fg-secondary)]">
-              Run Locally
-            </button>
-          </Popover.Trigger>
-          <Popover.Portal>
-            <Popover.Content
-              align="start"
-              sideOffset={6}
-              collisionPadding={16}
-              className="z-50 w-max max-w-[calc(100vw-32px)] rounded-lg border border-[var(--code-border)] bg-[var(--bg)] shadow-lg"
-            >
-              <CliPopoverContent template={template} />
-            </Popover.Content>
-          </Popover.Portal>
-        </Popover.Root>
-        <TemplateDocsLink
-          template={template}
-          location="card"
-          className="inline-flex flex-1 items-center justify-center rounded-lg border border-[var(--docs-border)] px-4 py-2 text-sm font-medium text-[var(--fg)] no-underline transition hover:border-[var(--fg-secondary)] hover:no-underline"
-        />
-      </div>
-    </div>
-  );
-}
+export const featuredTemplates = [
+  "design",
+  "slides",
+  "analytics",
+  "calendar",
+  "clips",
+  "mail",
+  "assets",
+  "content",
+  "dispatch",
+  "forms",
+  "plan",
+].map((slug) => templates.find((template) => template.slug === slug)!);
 
 export function TemplateCard({ template }: { template: Template }) {
+  const { locale } = useLocale();
+  const t = useT();
+  const templatePath = sitePathForLocale(`/apps/${template.slug}`, locale);
+  const heroCopy =
+    template.slug === "clips"
+      ? { description: t("templateLanding.clips.s008") }
+      : template.slug === "slides"
+        ? { description: t("templateLanding.slides.s007") }
+        : null;
+  const description =
+    heroCopy?.description ?? t(`templates.${template.slug}.description`);
+
   return (
-    <div className="feature-card flex flex-col gap-3 overflow-hidden">
+    <article className="group flex min-w-0 flex-col overflow-hidden border border-solid border-[var(--b-border-subtle)] bg-[var(--b-bg-page)] transition-[background-color] duration-150 ease-[ease] hover:bg-[var(--b-bg-raised)]">
       <Link
-        data-an-prefetch="render"
-        to={`/templates/${template.slug}`}
-        className="-mx-[24px] -mt-[24px] mb-1 flex aspect-[4/3] items-center justify-center overflow-hidden border-b border-[var(--docs-border)] bg-[var(--bg-secondary)] transition hover:opacity-90"
-        onClick={() =>
+        data-an-prefetch="viewport"
+        to={templatePath}
+        className="flex flex-auto flex-col no-underline"
+        onClick={() => {
           trackEvent("click template", {
             template: template.slug,
             location: "card",
-          })
-        }
+          });
+          sendAhrefsEvent("apps_card_click", { app: template.slug });
+        }}
       >
-        {template.screenshot ? (
-          <img
-            src={template.screenshot}
-            alt={`${template.name} template screenshot`}
-            className="h-full w-full object-cover object-top"
+        <div className="relative aspect-[8/5] overflow-hidden bg-[var(--b-bg-page)]">
+          <TemplateScreenshot
+            alt={t("templateCard.screenshotAlt", { name: template.name })}
+            frame={template.slug === "clips"}
+            scaleX={getScreenshotTileScaleX(template.slug)}
+            sizes="(max-width: 639px) 100vw, (max-width: 1023px) 50vw, 33vw"
+            variants={TEMPLATE_SCREENSHOTS[template.slug]}
           />
-        ) : (
           <div
-            className="flex h-full w-full items-center justify-center"
-            style={{
-              background: `linear-gradient(135deg, ${template.color}, ${template.color}22)`,
-            }}
-          >
-            <span className="rounded-lg bg-[var(--bg)]/80 px-4 py-2 text-sm font-semibold text-[var(--fg)] shadow-sm">
-              {template.name}
-            </span>
-          </div>
-        )}
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-[var(--b-border-subtle)]"
+          />
+        </div>
+        <div className="flex flex-auto flex-col items-start gap-[var(--spacing-3)] p-[var(--spacing-5)]">
+          <h3 className="m-0 flex items-center gap-[var(--spacing-2)] font-[family-name:var(--b-font-sans)] text-[length:var(--b-t-heading-5)] font-medium leading-[1.15] tracking-[-0.02em] text-[var(--b-text-primary)]">
+            {template.name}
+            <AppStatusBadge appId={template.slug} />
+          </h3>
+          <p className="m-0 font-[family-name:var(--b-font-sans)] text-[length:var(--b-t-paragraph-2)] leading-[1.4] text-[var(--b-text-secondary)]">
+            {description}
+          </p>
+          <CardArrow />
+        </div>
       </Link>
-      <h3 className="text-base font-semibold">
-        <Link
-          data-an-prefetch="render"
-          to={`/templates/${template.slug}`}
-          className="text-[var(--fg)] no-underline hover:text-[var(--docs-accent)]"
-        >
-          {template.name}
-        </Link>
-      </h3>
-      <p className="m-0 text-xs text-[var(--docs-accent)]">
-        {template.replaces}
-      </p>
-      <p className="m-0 text-sm leading-relaxed text-[var(--fg-secondary)]">
-        {template.description}
-      </p>
-      <TemplateLaunchButton template={template} />
-    </div>
+    </article>
   );
 }

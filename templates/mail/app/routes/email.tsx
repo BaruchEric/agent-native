@@ -1,19 +1,23 @@
+import { useT } from "@agent-native/core/client/i18n";
+import {
+  postNavigate,
+  isInAgentEmbed,
+} from "@agent-native/core/client/navigation";
+import type { EmailMessage } from "@shared/types";
+import { IconExternalLink } from "@tabler/icons-react";
 import { useMemo } from "react";
 import { useSearchParams } from "react-router";
-import { postNavigate, isInAgentEmbed } from "@agent-native/core/client";
-import { useThreadMessages } from "@/hooks/use-emails";
-import { formatEmailDate, formatEmailDateFull, cn } from "@/lib/utils";
-import { sanitizeHtml } from "@/lib/sanitize-html";
+
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { IconExternalLink } from "@tabler/icons-react";
-import type { EmailMessage } from "@shared/types";
+import { useThreadMessages } from "@/hooks/use-emails";
+import mailMessages from "@/i18n/en-US";
+import { sanitizeHtml } from "@/lib/sanitize-html";
+import { formatEmailDate, formatEmailDateFull, cn } from "@/lib/utils";
 
 export function meta() {
-  return [{ title: "Email" }];
+  return [{ title: mailMessages.mail.routeTitles.emailThread }];
 }
-
-// ─── Message Card ────────────────────────────────────────────────────────────
 
 function MessageCard({ message }: { message: EmailMessage }) {
   const fromName = message.from.name || message.from.email;
@@ -24,7 +28,10 @@ function MessageCard({ message }: { message: EmailMessage }) {
   );
 
   return (
-    <div className="border-b border-border/40 last:border-b-0 py-4 px-4">
+    <div
+      data-an-mask
+      className="border-b border-border/40 last:border-b-0 py-4 px-4"
+    >
       <div className="flex items-start justify-between gap-2 mb-1">
         <div className="flex items-center gap-2 min-w-0">
           <span
@@ -52,11 +59,15 @@ function MessageCard({ message }: { message: EmailMessage }) {
 
       {safeHtml ? (
         <div
+          data-an-block
           className="prose prose-sm dark:prose-invert max-w-none text-foreground/90 overflow-x-auto [&_img]:max-w-full [&_a]:text-primary"
           dangerouslySetInnerHTML={{ __html: safeHtml }}
         />
       ) : (
-        <pre className="whitespace-pre-wrap text-[13px] text-foreground/80 font-sans leading-relaxed">
+        <pre
+          data-an-block
+          className="whitespace-pre-wrap text-[13px] text-foreground/80 font-sans leading-relaxed"
+        >
           {message.body}
         </pre>
       )}
@@ -64,22 +75,19 @@ function MessageCard({ message }: { message: EmailMessage }) {
   );
 }
 
-// ─── Error State ─────────────────────────────────────────────────────────────
-
 function ErrorState({ message }: { message: string }) {
+  const t = useT();
   return (
     <div className="flex h-full w-full items-center justify-center p-6">
       <div className="text-center max-w-sm">
         <div className="text-sm font-medium text-foreground mb-1">
-          Unable to load thread
+          {t("mail.routeTitles.unableToLoadThread")}
         </div>
         <div className="text-xs text-muted-foreground">{message}</div>
       </div>
     </div>
   );
 }
-
-// ─── Loading Skeleton ─────────────────────────────────────────────────────────
 
 function LoadingSkeleton() {
   return (
@@ -102,9 +110,8 @@ function LoadingSkeleton() {
   );
 }
 
-// ─── Route ────────────────────────────────────────────────────────────────────
-
 export default function EmailEmbedRoute() {
+  const t = useT();
   const [params] = useSearchParams();
   const threadId = params.get("threadId");
   const view = params.get("view") ?? "inbox";
@@ -113,13 +120,10 @@ export default function EmailEmbedRoute() {
   const { data: messages, isLoading } = useThreadMessages(
     threadId ?? undefined,
   );
-
+  const subject = messages?.[0]?.subject;
   if (!threadId) {
-    return <ErrorState message="No thread ID provided." />;
+    return <ErrorState message={t("mail.routeTitles.unableToLoadThread")} />;
   }
-
-  const subject =
-    messages && messages.length > 0 ? messages[0].subject : undefined;
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
@@ -127,12 +131,14 @@ export default function EmailEmbedRoute() {
       <header className="flex shrink-0 items-center gap-2 border-b border-border/50 bg-card/80 px-3 py-2">
         <div className="flex-1 min-w-0">
           {subject ? (
-            <h1 className="text-[13px] font-semibold truncate">{subject}</h1>
+            <h1 data-an-mask className="text-[13px] font-semibold truncate">
+              {subject}
+            </h1>
           ) : isLoading ? (
             <Skeleton className="h-4 w-48" />
           ) : (
             <h1 className="text-[13px] font-semibold text-muted-foreground">
-              Email thread
+              {t("mail.routeTitles.emailThread")}
             </h1>
           )}
         </div>
@@ -144,7 +150,7 @@ export default function EmailEmbedRoute() {
             onClick={() => postNavigate(`/${view}/${threadId}`)}
           >
             <IconExternalLink className="h-3.5 w-3.5" />
-            Open in app
+            {t("mail.routeTitles.openInApp")}
           </Button>
         )}
       </header>
@@ -154,7 +160,7 @@ export default function EmailEmbedRoute() {
         {isLoading && !messages ? (
           <LoadingSkeleton />
         ) : !messages || messages.length === 0 ? (
-          <ErrorState message="Thread not found or has no messages." />
+          <ErrorState message={t("mail.routeTitles.unableToLoadThread")} />
         ) : (
           <div>
             {messages.map((msg) => (

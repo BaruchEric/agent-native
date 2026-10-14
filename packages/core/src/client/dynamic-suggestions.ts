@@ -1,10 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
-import { agentNativePath } from "./api-path.js";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { readClientAppState } from "./application-state.js";
+import { getBrowserTabId } from "./browser-tab-id.js";
 import { useChangeVersions } from "./use-change-version.js";
 import type { ChatThreadScope } from "./use-chat-threads.js";
+import { usePollLoop } from "./use-poll-loop.js";
 
 const SAFE_BROWSER_TAB_ID_RE = /^[A-Za-z0-9_-]{1,96}$/;
-const DEFAULT_MAX_SUGGESTIONS = 4;
+const DEFAULT_MAX_SUGGESTIONS = 3;
+const DEFAULT_POLL_MS = 30_000;
 
 export interface AgentDynamicSuggestionContext {
   navigation: unknown;
@@ -15,14 +19,11 @@ export interface AgentDynamicSuggestionContext {
 }
 
 export interface AgentDynamicSuggestionsConfig {
-  /** Enable/disable dynamic suggestions. Defaults to true. */
   enabled?: boolean;
-  /** Maximum number of suggestion chips after merging dynamic + static. */
   max?: number;
-  /** Keep the caller-provided static suggestions after dynamic ones. Default true. */
   includeStatic?: boolean;
-  /** Optional app-specific deterministic suggestion builder. */
   getSuggestions?: (context: AgentDynamicSuggestionContext) => string[];
+  pollMs?: number;
 }
 
 export type AgentDynamicSuggestionsOption =
@@ -47,6 +48,7 @@ interface NormalizedAgentDynamicSuggestionsConfig {
   max: number;
   includeStatic: boolean;
   getSuggestions?: (context: AgentDynamicSuggestionContext) => string[];
+  pollMs: number;
 }
 
 export function normalizeAgentDynamicSuggestionsConfig(
@@ -57,6 +59,7 @@ export function normalizeAgentDynamicSuggestionsConfig(
       enabled: false,
       max: DEFAULT_MAX_SUGGESTIONS,
       includeStatic: true,
+      pollMs: DEFAULT_POLL_MS,
     };
   }
   if (option === true || option === undefined) {
@@ -64,6 +67,7 @@ export function normalizeAgentDynamicSuggestionsConfig(
       enabled: true,
       max: DEFAULT_MAX_SUGGESTIONS,
       includeStatic: true,
+      pollMs: DEFAULT_POLL_MS,
     };
   }
   return {
@@ -74,6 +78,10 @@ export function normalizeAgentDynamicSuggestionsConfig(
         : DEFAULT_MAX_SUGGESTIONS,
     includeStatic: option.includeStatic !== false,
     ...(option.getSuggestions ? { getSuggestions: option.getSuggestions } : {}),
+    pollMs:
+      typeof option.pollMs === "number" && Number.isFinite(option.pollMs)
+        ? Math.max(0, Math.floor(option.pollMs))
+        : DEFAULT_POLL_MS,
   };
 }
 
@@ -88,30 +96,14 @@ function appStateKeyForBrowserTab(key: string, browserTabId?: string): string {
 }
 
 async function readAppState(key: string): Promise<unknown> {
-  const res = await fetch(
-    agentNativePath(`/_agent-native/application-state/${key}`),
-  );
-  if (!res.ok || res.status === 204) return null;
-  const text = await res.text();
-  if (!text) return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
+  return readClientAppState(key).catch(() => null);
 }
 
 async function readScopedAppState(
   key: string,
   browserTabId?: string,
 ): Promise<unknown> {
-  if (browserTabId) {
-    const scoped = await readAppState(
-      appStateKeyForBrowserTab(key, browserTabId),
-    );
-    if (scoped !== null && scoped !== undefined) return scoped;
-  }
-  return readAppState(key);
+  return readAppState(appStateKeyForBrowserTab(key, browserTabId));
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -321,7 +313,7 @@ export function mergeAgentSuggestions(options: {
 }): string[] {
   if (options.dynamicSuggestions.length === 0) {
     return options.includeStatic
-      ? dedupeSuggestions(options.staticSuggestions ?? [])
+      ? dedupeSuggestions(options.staticSuggestions ?? []).slice(0, options.max)
       : [];
   }
 
@@ -339,7 +331,11 @@ export function useAgentDynamicSuggestionsResult(
     [options.dynamicSuggestions],
   );
   const browserTabId = useMemo(
-    () => normalizeBrowserTabId(options.browserTabId),
+    () =>
+      normalizeBrowserTabId(options.browserTabId) ??
+      (options.browserTabId === undefined && typeof window !== "undefined"
+        ? normalizeBrowserTabId(getBrowserTabId())
+        : undefined),
     [options.browserTabId],
   );
   const optionScope = options.scope ?? null;
@@ -350,12 +346,20 @@ export function useAgentDynamicSuggestionsResult(
             type: optionScope.type,
             id: optionScope.id,
             ...(optionScope.label ? { label: optionScope.label } : {}),
+            ...(optionScope.contextVersion
+              ? { contextVersion: optionScope.contextVersion }
+              : {}),
           }
         : null,
-    [optionScope?.type, optionScope?.id, optionScope?.label],
+    [
+      optionScope?.contextVersion,
+      optionScope?.id,
+      optionScope?.label,
+      optionScope?.type,
+    ],
   );
   const scopeKey = scope
-    ? `${scope.type}:${scope.id}:${scope.label ?? ""}`
+    ? `${scope.type}:${scope.id}:${scope.label ?? ""}:${scope.contextVersion ?? ""}`
     : "none";
   const appStateVersion = useChangeVersions(["app-state"]);
   const enabled = options.enabled !== false && config.enabled;
@@ -363,16 +367,14 @@ export function useAgentDynamicSuggestionsResult(
     null,
   );
   const [isLoading, setIsLoading] = useState(false);
+  // Invalidates in-flight loads from a stale scope/browserTabId/enabled
+  // generation — shared between the leading load below and the safety-net
+  // poll so a slow response from an old generation can't clobber a newer one.
+  const loadGenerationRef = useRef(0);
 
-  useEffect(() => {
-    if (!enabled) {
-      setContext(null);
-      setIsLoading(false);
-      return;
-    }
-
-    let cancelled = false;
-    const load = async (showLoading: boolean) => {
+  const load = useCallback(
+    async (showLoading: boolean) => {
+      const generation = loadGenerationRef.current;
       if (showLoading) setIsLoading(true);
       try {
         const [navigation, selection, pendingSelection, url] =
@@ -382,16 +384,10 @@ export function useAgentDynamicSuggestionsResult(
             readScopedAppState("pending-selection-context", browserTabId),
             readScopedAppState("__url__", browserTabId),
           ]);
-        if (cancelled) return;
-        setContext({
-          navigation,
-          selection,
-          pendingSelection,
-          url,
-          scope,
-        });
+        if (generation !== loadGenerationRef.current) return;
+        setContext({ navigation, selection, pendingSelection, url, scope });
       } catch {
-        if (cancelled) return;
+        if (generation !== loadGenerationRef.current) return;
         setContext({
           navigation: null,
           selection: null,
@@ -400,25 +396,34 @@ export function useAgentDynamicSuggestionsResult(
           scope,
         });
       } finally {
-        if (!cancelled && showLoading) setIsLoading(false);
+        if (generation === loadGenerationRef.current && showLoading) {
+          setIsLoading(false);
+        }
       }
-    };
+    },
+    [browserTabId, scope],
+  );
 
+  useEffect(() => {
+    loadGenerationRef.current += 1;
+    if (!enabled) {
+      setContext(null);
+      setIsLoading(false);
+      return;
+    }
     void load(true);
-    const interval = setInterval(() => {
-      void load(false);
-    }, 2_000);
+  }, [appStateVersion, enabled, load, scopeKey, config]);
 
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [appStateVersion, browserTabId, enabled, scope, scopeKey]);
+  usePollLoop(() => load(false), {
+    intervalMs: config.pollMs,
+    leading: false,
+    enabled: enabled && config.pollMs > 0,
+  });
 
   const suggestions = useMemo(() => {
     if (!enabled) {
       return options.staticSuggestions
-        ? dedupeSuggestions(options.staticSuggestions)
+        ? dedupeSuggestions(options.staticSuggestions).slice(0, config.max)
         : undefined;
     }
     if (context === null) return undefined;

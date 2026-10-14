@@ -1,5 +1,13 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { useNavigate, useParams } from "react-router";
+import { useSession } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import {
+  LanguagePicker,
+  PoweredByBadge,
+  WaveBackground,
+} from "@agent-native/toolkit/app/shared";
+import type { Booking } from "@shared/api";
+import { getWeekStartsOn } from "@shared/calendar-week";
+import { IconAlertTriangle, IconCalendar } from "@tabler/icons-react";
 import {
   addMinutes,
   endOfMonth,
@@ -7,39 +15,54 @@ import {
   parseISO,
   startOfMonth,
 } from "date-fns";
-import { IconCalendar } from "@tabler/icons-react";
-import {
-  OpenSourceBadge,
-  PoweredByBadge,
-  StarfieldBackground,
-} from "@agent-native/core/client";
-import { ThemeToggle } from "@/components/ThemeToggle";
-import { DatePicker } from "@/components/booking/DatePicker";
-import { TimeSlotPicker } from "@/components/booking/TimeSlotPicker";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useNavigate, useParams } from "react-router";
+import { toast } from "sonner";
+
+import { BookingConfirmation } from "@/components/booking/BookingConfirmation";
 import {
   BookingForm,
   type BookingFormValue,
 } from "@/components/booking/BookingForm";
-import { BookingConfirmation } from "@/components/booking/BookingConfirmation";
+import { DatePicker } from "@/components/booking/DatePicker";
+import { RequiredHostsBadge } from "@/components/booking/RequiredHostsBadge";
+import { TimeSlotPicker } from "@/components/booking/TimeSlotPicker";
 import {
-  usePublicSettings,
-  usePublicAvailability,
-  usePublicBookingLink,
-} from "@/hooks/use-public-data";
+  TimeZoneGrid,
+  type TimeZoneGridHost,
+} from "@/components/booking/TimeZoneGrid";
+import { ThemeToggle } from "@/components/ThemeToggle";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   useAvailableDays,
   useAvailableSlots,
   useCreateBooking,
 } from "@/hooks/use-bookings";
-import { Button } from "@/components/ui/button";
-import { Spinner } from "@/components/ui/spinner";
-import { toast } from "sonner";
-import type { Booking } from "@shared/api";
+import {
+  usePublicSettings,
+  usePublicAvailability,
+  usePublicBookingLink,
+} from "@/hooks/use-public-data";
 import { cn } from "@/lib/utils";
 
 type Step = "duration" | "date" | "time" | "info" | "confirmed";
 
 const BRAND_LINK_CLASS = "font-semibold text-[#00B5FF] hover:text-[#33C4FF]";
+
+function timezoneAbbreviation(date: Date, timeZone: string): string {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      timeZoneName: "short",
+    }).formatToParts(date);
+    return (
+      parts.find((part) => part.type === "timeZoneName")?.value ?? timeZone
+    );
+  } catch {
+    return timeZone;
+  }
+}
 
 function BookingPageShell({
   children,
@@ -51,23 +74,74 @@ function BookingPageShell({
   return (
     <div
       className={cn(
-        "relative min-h-screen overflow-x-hidden bg-background p-4",
+        "relative min-h-screen bg-background dark:bg-black",
         className,
       )}
     >
-      <StarfieldBackground className="fixed inset-0 opacity-25 dark:opacity-60" />
-      <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(ellipse_at_center,hsl(var(--background)/0.35)_0%,hsl(var(--background)/0.88)_72%)]" />
-      <div className="relative z-10 flow-root">{children}</div>
+      <WaveBackground className="fixed inset-0 z-0" />
+      <div className="fixed top-4 right-4 z-50 flex items-center gap-1">
+        <LanguagePicker variant="ghost-icon" />
+        <ThemeToggle />
+      </div>
+      <div className="fixed bottom-[21px] left-4 z-50 max-sm:static max-sm:mx-auto max-sm:pt-8 [&_.an-powered-logo]:!h-3.5 [&_.an-powered-logo]:brightness-0 dark:[&_.an-powered-logo]:invert">
+        <PoweredByBadge variant="plain" embedded />
+      </div>
+      <div className="relative z-10 min-h-screen overflow-x-hidden p-4">
+        {children}
+      </div>
     </div>
   );
 }
 
+function BookingPageSkeleton() {
+  return (
+    <BookingPageShell className="pb-20">
+      <div className="mx-auto mt-[7.5vh] w-full max-w-lg" aria-busy="true">
+        <div className="mb-8 flex flex-col items-center">
+          <Skeleton className="mb-4 h-12 w-12 rounded-full" />
+          <Skeleton className="h-8 w-36" />
+          <Skeleton className="mt-3 h-5 w-64 max-w-full" />
+          <Skeleton className="mt-4 h-8 w-40 rounded-full" />
+        </div>
+        <div className="rounded-xl border border-border bg-card p-6">
+          <div className="mb-6 flex items-center justify-center gap-2">
+            {[0, 1, 2].map((step) => (
+              <div key={step} className="flex items-center gap-2">
+                <Skeleton className="h-7 w-7 rounded-full" />
+                {step < 2 && <Skeleton className="h-px w-8" />}
+              </div>
+            ))}
+          </div>
+          <Skeleton className="mx-auto mb-6 h-5 w-28" />
+          <div className="mb-4 flex items-center justify-between px-4">
+            <Skeleton className="h-4 w-4" />
+            <Skeleton className="h-5 w-32" />
+            <Skeleton className="h-4 w-4" />
+          </div>
+          <div className="mb-1 grid grid-cols-7 gap-1">
+            {Array.from({ length: 7 }, (_, day) => (
+              <Skeleton key={day} className="mx-auto h-4 w-6" />
+            ))}
+          </div>
+          <div className="grid grid-cols-7 gap-1">
+            {Array.from({ length: 35 }, (_, day) => (
+              <Skeleton key={day} className="h-10 w-full rounded-md" />
+            ))}
+          </div>
+        </div>
+      </div>
+    </BookingPageShell>
+  );
+}
+
 export default function BookingPage() {
+  const t = useT();
+  const { session } = useSession();
   const { slug, username } = useParams<{ slug: string; username?: string }>();
   const navigate = useNavigate();
   const { data: settings, isLoading: settingsLoading } = usePublicSettings();
   const { data: availability, isLoading: availabilityLoading } =
-    usePublicAvailability(slug);
+    usePublicAvailability(slug, username);
   const {
     data: bookingLink,
     isLoading: bookingLinkLoading,
@@ -76,21 +150,30 @@ export default function BookingPage() {
   const isRedirecting =
     !!bookingLink && (!!bookingLink.redirectPath || !!bookingLink.redirect);
 
-  // Handle slug redirects (old URL → new URL)
   useEffect(() => {
     if (bookingLink?.redirectPath) {
-      navigate(bookingLink.redirectPath, { replace: true });
+      void navigate(bookingLink.redirectPath, { replace: true });
       return;
     }
     if (!bookingLink?.redirect) return;
     const newSlug = bookingLink.redirect;
     const path = username ? `/book/${username}/${newSlug}` : `/book/${newSlug}`;
-    navigate(path, { replace: true });
+    void navigate(path, { replace: true });
   }, [bookingLink?.redirect, bookingLink?.redirectPath, username, navigate]);
 
   const [step, setStep] = useState<Step>("date");
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   const [selectedSlot, setSelectedSlot] = useState<string | null>(null);
+  const [showTimeZones, setShowTimeZones] = useState(false);
+  const [extraTimezones, setExtraTimezones] = useState<string[]>([]);
+  const [browserTimezone, setBrowserTimezone] = useState<string | null>(null);
+  useEffect(() => {
+    try {
+      setBrowserTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone);
+    } catch {
+      setBrowserTimezone(null);
+    }
+  }, []);
   const [confirmedBooking, setConfirmedBooking] = useState<Booking | null>(
     null,
   );
@@ -99,9 +182,76 @@ export default function BookingPage() {
   const [bookingForm, setBookingForm] = useState<BookingFormValue>({
     name: "",
     email: "",
+    additionalGuestEmails: [],
     notes: "",
     fieldResponses: {},
   });
+  const signedInEmail = session?.email ?? "";
+  const signedInName = session?.name?.trim() || signedInEmail;
+  const autoFilledIdentityRef = useRef<{ name: string; email: string } | null>(
+    null,
+  );
+  const userEditedIdentityRef = useRef({ name: false, email: false });
+
+  useEffect(() => {
+    const previousAutoFilled = autoFilledIdentityRef.current;
+    setBookingForm((current) => {
+      const nameWasAutoFilled =
+        previousAutoFilled !== null &&
+        !userEditedIdentityRef.current.name &&
+        current.name === previousAutoFilled.name;
+      const emailWasAutoFilled =
+        previousAutoFilled !== null &&
+        !userEditedIdentityRef.current.email &&
+        current.email === previousAutoFilled.email;
+      if (
+        signedInEmail &&
+        !nameWasAutoFilled &&
+        current.name &&
+        previousAutoFilled === null
+      ) {
+        userEditedIdentityRef.current.name = true;
+      }
+      if (
+        signedInEmail &&
+        !emailWasAutoFilled &&
+        current.email &&
+        previousAutoFilled === null
+      ) {
+        userEditedIdentityRef.current.email = true;
+      }
+      return {
+        ...current,
+        name: signedInEmail
+          ? current.name && !nameWasAutoFilled
+            ? current.name
+            : signedInName
+          : nameWasAutoFilled
+            ? ""
+            : current.name,
+        email: signedInEmail
+          ? current.email && !emailWasAutoFilled
+            ? current.email
+            : signedInEmail
+          : emailWasAutoFilled
+            ? ""
+            : current.email,
+      };
+    });
+    autoFilledIdentityRef.current = signedInEmail
+      ? { name: signedInName, email: signedInEmail }
+      : null;
+  }, [signedInEmail, signedInName]);
+
+  function handleBookingFormChange(next: BookingFormValue) {
+    if (next.name !== bookingForm.name) {
+      userEditedIdentityRef.current.name = true;
+    }
+    if (next.email !== bookingForm.email) {
+      userEditedIdentityRef.current.email = true;
+    }
+    setBookingForm(next);
+  }
 
   const dateStr = selectedDate ? format(selectedDate, "yyyy-MM-dd") : "";
   const durationOptions =
@@ -119,23 +269,27 @@ export default function BookingPage() {
     availability?.slotDurationMinutes ??
     settings?.defaultEventDuration ??
     30;
-  const { data: slots = [], isLoading: slotsLoading } = useAvailableSlots(
-    dateStr,
-    duration,
-    slug,
-  );
+  const {
+    data: slots = [],
+    isLoading: slotsLoading,
+    error: slotsError,
+  } = useAvailableSlots(dateStr, duration, slug, undefined, username);
   const monthStart = format(startOfMonth(viewMonth), "yyyy-MM-dd");
   const monthEnd = format(endOfMonth(viewMonth), "yyyy-MM-dd");
-  const { data: availableDates = [], isLoading: availableDatesLoading } =
-    useAvailableDays(
-      monthStart,
-      monthEnd,
-      duration,
-      slug,
-      step === "date" &&
-        !!availability &&
-        (!hasDurationChoice || selectedDuration !== null),
-    );
+  const {
+    data: availableDates = [],
+    isLoading: availableDatesLoading,
+    error: availableDatesError,
+  } = useAvailableDays(
+    monthStart,
+    monthEnd,
+    duration,
+    slug,
+    username,
+    step === "date" &&
+      !!availability &&
+      (!hasDurationChoice || selectedDuration !== null),
+  );
   const createBooking = useCreateBooking();
   const selectedSlotRange = selectedSlot
     ? {
@@ -160,6 +314,7 @@ export default function BookingPage() {
   function handleBookingSubmit(data: {
     name: string;
     email: string;
+    additionalGuestEmails?: string[];
     notes?: string;
     captchaToken?: string;
     fieldResponses?: Record<string, string | boolean>;
@@ -173,6 +328,7 @@ export default function BookingPage() {
       {
         name: data.name,
         email: data.email,
+        additionalGuestEmails: data.additionalGuestEmails,
         notes: data.notes,
         captchaToken: data.captchaToken,
         fieldResponses: data.fieldResponses,
@@ -185,21 +341,35 @@ export default function BookingPage() {
           setConfirmedBooking(booking);
           setStep("confirmed");
         },
-        onError: (error) =>
+        onError: (error) => {
+          const message = error instanceof Error ? error.message : undefined;
           toast.error(
-            error instanceof Error ? error.message : "Failed to create booking",
-          ),
+            !message || message === "Failed to create booking"
+              ? t("bookingLinks.failedToCreateBooking")
+              : message,
+          );
+        },
       },
     );
   }
 
   function handleReset() {
+    userEditedIdentityRef.current = { name: false, email: false };
+    autoFilledIdentityRef.current = signedInEmail
+      ? { name: signedInName, email: signedInEmail }
+      : null;
     setStep(hasDurationChoice ? "duration" : "date");
     setSelectedDate(null);
     setSelectedSlot(null);
     setSelectedDuration(null);
     setConfirmedBooking(null);
-    setBookingForm({ name: "", email: "", notes: "", fieldResponses: {} });
+    setBookingForm({
+      name: signedInName,
+      email: signedInEmail,
+      additionalGuestEmails: [],
+      notes: "",
+      fieldResponses: {},
+    });
   }
 
   function handleStepNavigation(target: Step) {
@@ -224,13 +394,32 @@ export default function BookingPage() {
     }
   }
 
-  const title = settings?.bookingPageTitle || "Book a Meeting";
+  const title = settings?.bookingPageTitle || t("bookingLinks.bookAMeeting");
   const description =
-    settings?.bookingPageDescription || "Pick a time that works for you.";
+    settings?.bookingPageDescription || t("bookingLinks.defaultDescription");
   const isLegacyBookingPage = !!slug && availability?.bookingPageSlug === slug;
   const pageTitle = bookingLink?.title || title;
   const pageDescription = bookingLink?.description || description;
-  const requiredHostCount = (bookingLink?.hosts?.length ?? 0) + 1;
+  const requiredHostCount = (bookingLink?.publicHosts?.length ?? 0) + 1;
+  const availabilityErrorMessage = t("bookingLinks.availabilityUnavailable");
+  const timeZoneHosts: TimeZoneGridHost[] = [
+    ...(bookingLink?.ownerTimezone
+      ? [
+          {
+            id: "owner",
+            label: t("bookingLinks.hostLabel"),
+            timezone: bookingLink.ownerTimezone,
+          },
+        ]
+      : []),
+    ...(bookingLink?.publicHosts ?? [])
+      .filter((host) => host.timezone)
+      .map((host) => ({
+        id: host.id,
+        label: host.label,
+        timezone: host.timezone as string,
+      })),
+  ];
 
   useEffect(() => {
     if (hasDurationChoice && step === "date" && selectedDuration === null) {
@@ -246,22 +435,18 @@ export default function BookingPage() {
     availabilityLoading ||
     isRedirecting
   ) {
-    return (
-      <BookingPageShell>
-        <div className="mx-auto mt-[7.5vh] flex w-full max-w-lg justify-center">
-          <Spinner className="size-8 text-foreground" />
-        </div>
-      </BookingPageShell>
-    );
+    return <BookingPageSkeleton />;
   }
 
   if ((bookingLinkError || !bookingLink) && !isLegacyBookingPage) {
     return (
       <BookingPageShell>
         <div className="mx-auto mt-[7.5vh] w-full max-w-md rounded-2xl border border-border bg-card/95 p-8 text-center shadow-xl shadow-background/20 backdrop-blur">
-          <h1 className="text-xl font-semibold">Booking link not found</h1>
+          <h1 className="text-xl font-semibold">
+            {t("bookingLinks.bookingLinkNotFound")}
+          </h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            This meeting type may have been removed or is no longer active.
+            {t("bookingLinks.meetingTypeUnavailable")}
           </p>
         </div>
       </BookingPageShell>
@@ -270,9 +455,6 @@ export default function BookingPage() {
 
   return (
     <BookingPageShell className="pb-20">
-      <div className="absolute top-4 right-4 z-20">
-        <ThemeToggle />
-      </div>
       <div className="mx-auto mt-[7.5vh] w-full max-w-lg">
         {/* Header */}
         <div className="mb-8 text-center">
@@ -287,13 +469,18 @@ export default function BookingPage() {
             <div className="mt-3 flex flex-wrap justify-center gap-2">
               {!hasDurationChoice && (
                 <span className="inline-flex rounded-full border border-border px-3 py-1 text-xs font-medium text-muted-foreground">
-                  {duration} minute meeting
+                  {t("bookingLinks.minuteMeeting", { count: duration })}
                 </span>
               )}
               {requiredHostCount > 1 && (
-                <span className="inline-flex rounded-full border border-border px-3 py-1 text-xs font-medium text-muted-foreground">
-                  {requiredHostCount} required hosts
-                </span>
+                <RequiredHostsBadge
+                  label={t("bookingLinks.requiredHostsCount", {
+                    count: requiredHostCount,
+                  })}
+                  ownerLabel={t("bookingLinks.hostLabel")}
+                  ownerName={bookingLink?.ownerName}
+                  hosts={bookingLink?.publicHosts ?? []}
+                />
               )}
             </div>
           )}
@@ -311,11 +498,11 @@ export default function BookingPage() {
                 step,
               );
               const stepLabels: Record<Step, string> = {
-                duration: "duration selection",
-                date: "date selection",
-                time: "time selection",
-                info: "your information",
-                confirmed: "confirmation",
+                duration: t("bookingLinks.durationSelection"),
+                date: t("bookingLinks.dateSelection"),
+                time: t("bookingLinks.timeSelection"),
+                info: t("bookingLinks.yourInformation"),
+                confirmed: t("bookingLinks.confirmation"),
               };
               return (
                 <div className="mb-6 flex items-center justify-center gap-2">
@@ -346,7 +533,9 @@ export default function BookingPage() {
                             type="button"
                             onClick={() => handleStepNavigation(s)}
                             className={circleClass}
-                            aria-label={`Go to ${stepLabels[s]}`}
+                            aria-label={t("bookingLinks.goToStep", {
+                              step: stepLabels[s],
+                            })}
                           >
                             {i + 1}
                           </button>
@@ -366,7 +555,7 @@ export default function BookingPage() {
           {step === "duration" && durationOptions && (
             <div>
               <h3 className="mb-4 text-sm font-medium text-center">
-                Choose a Duration
+                {t("bookingLinks.chooseDuration")}
               </h3>
               <div className="grid gap-3">
                 {durationOptions.map((mins) => (
@@ -379,7 +568,9 @@ export default function BookingPage() {
                     }}
                     className="rounded-xl border border-border px-4 py-3 text-left hover:bg-accent/60 hover:border-primary/30"
                   >
-                    <p className="text-sm font-medium">{mins} minutes</p>
+                    <p className="text-sm font-medium">
+                      {t("bookingLinks.minutesLong", { count: mins })}
+                    </p>
                   </button>
                 ))}
               </div>
@@ -389,66 +580,119 @@ export default function BookingPage() {
           {step === "date" && availability && (
             <div>
               <h3 className="mb-4 text-sm font-medium text-center">
-                Select a Date
+                {t("bookingLinks.selectDate")}
               </h3>
-              <div className="flex justify-center">
-                <DatePicker
-                  selectedDate={selectedDate}
-                  onSelect={handleDateSelect}
-                  availability={availability}
-                  availableDates={availableDates}
-                  availabilityLoading={availableDatesLoading}
-                  viewMonth={viewMonth}
-                  onViewMonthChange={setViewMonth}
-                />
-              </div>
+              {availableDatesError ? (
+                <div className="rounded-lg border border-destructive/30 bg-destructive/[0.06] px-3 py-3 text-sm text-destructive">
+                  <div className="flex items-start gap-2">
+                    <IconAlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <p>{availabilityErrorMessage}</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex justify-center">
+                  <DatePicker
+                    selectedDate={selectedDate}
+                    onSelect={handleDateSelect}
+                    availability={availability}
+                    availableDates={availableDates}
+                    availabilityLoading={availableDatesLoading}
+                    viewMonth={viewMonth}
+                    onViewMonthChange={setViewMonth}
+                    weekStartsOn={getWeekStartsOn(settings?.weekStart)}
+                  />
+                </div>
+              )}
             </div>
           )}
 
           {step === "time" && (
             <div>
               <div className="mb-4 flex items-center justify-between">
-                <h3 className="text-sm font-medium">Select a Time</h3>
+                <h3 className="text-sm font-medium">
+                  {t("bookingLinks.selectTime")}
+                </h3>
                 <Button
                   variant="link"
                   size="sm"
                   className={BRAND_LINK_CLASS}
                   onClick={() => setStep("date")}
                 >
-                  Change date
+                  {t("bookingLinks.changeDate")}
                 </Button>
               </div>
-              {selectedDate && (
-                <p className="mb-4 text-sm text-muted-foreground">
-                  {format(selectedDate, "EEEE, MMMM d, yyyy")}
-                </p>
+              <div className="mb-4 flex items-center justify-between gap-2">
+                {selectedDate ? (
+                  <p className="text-sm text-muted-foreground">
+                    {format(selectedDate, "EEEE, MMMM d, yyyy")}
+                    {browserTimezone && (
+                      <span className="ml-1.5 text-xs">
+                        ({timezoneAbbreviation(selectedDate, browserTimezone)})
+                      </span>
+                    )}
+                  </p>
+                ) : (
+                  <span />
+                )}
+                <Button
+                  variant="link"
+                  size="sm"
+                  // guard:allow-raw-color — matches this page's existing BRAND_LINK_CLASS brand color
+                  className="text-xs font-normal text-[#00B5FF] hover:text-[#33C4FF]"
+                  onClick={() => setShowTimeZones((prev) => !prev)}
+                >
+                  {showTimeZones
+                    ? t("bookingLinks.hideTimeZones")
+                    : t("bookingLinks.showTimeZones")}
+                </Button>
+              </div>
+              {showTimeZones ? (
+                <TimeZoneGrid
+                  slots={slots}
+                  selectedSlot={selectedSlot}
+                  onSelect={handleSlotSelect}
+                  loading={slotsLoading}
+                  errorMessage={
+                    slotsError ? availabilityErrorMessage : undefined
+                  }
+                  hosts={timeZoneHosts}
+                  selectedDate={dateStr}
+                  extraTimezones={extraTimezones}
+                  onExtraTimezonesChange={setExtraTimezones}
+                />
+              ) : (
+                <TimeSlotPicker
+                  slots={slots}
+                  selectedSlot={selectedSlot}
+                  onSelect={handleSlotSelect}
+                  loading={slotsLoading}
+                  errorMessage={
+                    slotsError ? availabilityErrorMessage : undefined
+                  }
+                />
               )}
-              <TimeSlotPicker
-                slots={slots}
-                selectedSlot={selectedSlot}
-                onSelect={handleSlotSelect}
-                loading={slotsLoading}
-              />
             </div>
           )}
 
           {step === "info" && (
             <div>
               <div className="mb-4 flex items-center justify-between">
-                <h3 className="text-sm font-medium">Your Information</h3>
+                <h3 className="text-sm font-medium">
+                  {t("bookingLinks.yourInformation")}
+                </h3>
                 <Button
                   variant="link"
                   size="sm"
                   className={BRAND_LINK_CLASS}
                   onClick={() => setStep("time")}
                 >
-                  Change time
+                  {t("bookingLinks.changeTime")}
                 </Button>
               </div>
               {selectedSlotRange && (
                 <div className="mb-4 rounded-lg border border-border bg-muted/30 px-3 py-2 text-sm">
                   <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                    Confirming
+                    {t("bookingLinks.confirming")}
                   </div>
                   <div className="mt-1 font-medium text-foreground">
                     {format(parseISO(selectedSlotRange.start), "EEEE, MMMM d")}
@@ -456,13 +700,23 @@ export default function BookingPage() {
                   <div className="text-muted-foreground">
                     {format(parseISO(selectedSlotRange.start), "h:mm a")} -{" "}
                     {format(parseISO(selectedSlotRange.end), "h:mm a")}
+                    {browserTimezone && (
+                      <span className="ml-1">
+                        (
+                        {timezoneAbbreviation(
+                          parseISO(selectedSlotRange.start),
+                          browserTimezone,
+                        )}
+                        )
+                      </span>
+                    )}
                   </div>
                 </div>
               )}
               <BookingForm
                 onSubmit={handleBookingSubmit}
                 value={bookingForm}
-                onChange={setBookingForm}
+                onChange={handleBookingFormChange}
                 loading={createBooking.isPending}
                 customFields={bookingLink?.customFields}
               />
@@ -478,8 +732,6 @@ export default function BookingPage() {
           )}
         </div>
       </div>
-      <OpenSourceBadge />
-      <PoweredByBadge />
     </BookingPageShell>
   );
 }

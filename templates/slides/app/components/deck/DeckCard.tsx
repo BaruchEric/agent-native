@@ -1,15 +1,23 @@
-import { Link } from "react-router";
+import { useT } from "@agent-native/core/client/i18n";
 import {
+  CreativeContextShareSheet,
+  useCreativeContextLab,
+} from "@agent-native/creative-context/client";
+import { VisibilityBadge } from "@agent-native/toolkit/sharing";
+import {
+  IconBuildingCommunity,
   IconDots,
   IconTrash,
   IconCopy,
   IconPencil,
-  IconPalette,
+  IconPlus,
+  IconShare2,
+  IconStar,
+  IconStarFilled,
 } from "@tabler/icons-react";
-import { useState, useRef, useEffect } from "react";
-import type { Deck } from "@/context/DeckContext";
-import SlideRenderer from "./SlideRenderer";
-import { VisibilityBadge } from "@agent-native/core/client";
+import { useState, useRef } from "react";
+import { Link } from "react-router";
+
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -17,14 +25,21 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
+import type { Deck } from "@/context/DeckContext";
+import { getDeckListingPreviewFrameStyle } from "@/lib/deck-preview-frame";
+
+import ShareDialog from "../editor/ShareDialog";
+import SlideRenderer from "./SlideRenderer";
 
 interface DeckCardProps {
   deck: Deck;
   onDelete: (id: string) => void;
   onRename: (id: string, newTitle: string) => void;
   onDuplicate: (id: string) => void;
-  isDuplicating?: boolean;
-  designSystemTitle?: string | null;
+  onToggleStar: (id: string, starred: boolean) => void;
+  isWorkspaceDefault?: boolean;
+  canSetWorkspaceDefault?: boolean;
+  onSetWorkspaceDefault?: (id: string, isDefault: boolean) => void;
 }
 
 export default function DeckCard({
@@ -32,25 +47,24 @@ export default function DeckCard({
   onDelete,
   onRename,
   onDuplicate,
-  isDuplicating = false,
-  designSystemTitle,
+  onToggleStar,
+  isWorkspaceDefault = false,
+  canSetWorkspaceDefault = false,
+  onSetWorkspaceDefault,
 }: DeckCardProps) {
-  const firstSlide = deck.slides?.[0];
+  const t = useT();
+  const creativeContextEnabled = useCreativeContextLab();
+  const firstSlide = deck.previewSlide ?? deck.slides?.[0];
+  const previewFrameStyle = getDeckListingPreviewFrameStyle(deck.aspectRatio);
   const [isRenaming, setIsRenaming] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(deck.title);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const [contextOpen, setContextOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
   const pendingRenameRef = useRef(false);
-
-  useEffect(() => {
-    if (isRenaming) {
-      setRenameValue(deck.title);
-      setTimeout(() => {
-        inputRef.current?.focus();
-        inputRef.current?.select();
-      }, 0);
-    }
-  }, [isRenaming, deck.title]);
+  const pendingDeleteRef = useRef(false);
+  const pendingWorkspaceDefaultRef = useRef(false);
+  const pendingShareRef = useRef(false);
 
   const commitRename = () => {
     const trimmed = renameValue.trim();
@@ -61,6 +75,7 @@ export default function DeckCard({
   };
 
   const handleRenameKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
     if (e.key === "Enter") {
       e.preventDefault();
       e.stopPropagation();
@@ -78,36 +93,44 @@ export default function DeckCard({
   };
 
   return (
-    <div className="group relative">
+    <div className="agent-template-library-card group relative min-w-0">
       <Link
         to={`/deck/${deck.id}`}
-        className="block rounded-xl border border-border bg-card hover:border-border transition-all duration-200 overflow-hidden hover:shadow-lg hover:shadow-[#609FF8]/5"
+        className="agent-template-library-primary block overflow-hidden rounded-xl border border-transparent bg-card transition-[background-color,border-color] duration-200 hover:border-border hover:bg-accent/30"
         onClick={(e) => {
           if (isRenaming) e.preventDefault();
         }}
       >
         {/* Slide Preview */}
-        <div className="overflow-hidden relative">
+        <div className="agent-template-library-preview relative flex items-center justify-center bg-muted/30">
           {firstSlide && (
-            <SlideRenderer
-              slide={firstSlide}
-              className="rounded-none"
-              aspectRatio={deck.aspectRatio}
-            />
+            <div className="relative overflow-hidden" style={previewFrameStyle}>
+              <SlideRenderer
+                slide={firstSlide}
+                className="rounded-none"
+                aspectRatio={deck.aspectRatio}
+                slidePosition={
+                  deck.slides?.length
+                    ? { number: 1, count: deck.slides.length }
+                    : undefined
+                }
+              />
+            </div>
           )}
-          <div className="absolute inset-0 bg-gradient-to-t from-[hsl(240,5%,8%)] via-transparent to-transparent opacity-60" />
+          <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-[hsl(240,5%,8%)] via-transparent to-transparent opacity-60" />
         </div>
 
         {/* Info */}
-        <div className="p-4">
+        <div className="agent-template-library-caption">
           <div className="flex items-center gap-2 min-w-0">
             {isRenaming ? (
               <input
-                ref={inputRef}
+                autoFocus
                 value={renameValue}
                 onChange={(e) => setRenameValue(e.target.value)}
                 onBlur={commitRename}
                 onKeyDown={handleRenameKeyDown}
+                onFocus={(e) => e.currentTarget.select()}
                 onClick={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
@@ -122,24 +145,35 @@ export default function DeckCard({
             )}
             <VisibilityBadge visibility={deck.visibility} />
           </div>
-          <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
-            <span>
-              {deck.slides.length} slide{deck.slides.length !== 1 ? "s" : ""}
-            </span>
-            {deck.designSystemId && (
-              <span className="inline-flex min-w-0 items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground/80">
-                <IconPalette className="h-3 w-3 shrink-0 text-[#609FF8]" />
-                <span className="max-w-28 truncate">
-                  {designSystemTitle || "Design system"}
-                </span>
-              </span>
-            )}
-          </div>
         </div>
       </Link>
 
-      {/* Menu Button - always visible on touch devices */}
-      <div className="absolute top-2 right-2 sm:opacity-0 sm:group-hover:opacity-100">
+      {/* Star + menu buttons - always visible on touch devices */}
+      <div className="absolute top-2 end-2 flex items-center gap-1">
+        {deck.createdByMe !== false && (
+          <button
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onToggleStar(deck.id, !deck.starred);
+            }}
+            className={`rounded-md border border-border bg-black/60 p-2 backdrop-blur-sm hover:bg-black/80 sm:p-1.5 ${
+              deck.starred
+                ? ""
+                : "sm:invisible sm:pointer-events-none sm:opacity-0 sm:group-hover:visible sm:group-hover:pointer-events-auto sm:group-hover:opacity-100 sm:group-focus-within:visible sm:group-focus-within:pointer-events-auto sm:group-focus-within:opacity-100"
+            }`}
+            aria-label={
+              deck.starred ? t("home.unstarDeck") : t("home.starDeck")
+            }
+            aria-pressed={Boolean(deck.starred)}
+          >
+            {deck.starred ? (
+              <IconStarFilled className="h-3.5 w-3.5 text-[#F5C451]" />
+            ) : (
+              <IconStar className="h-3.5 w-3.5 text-white/70" />
+            )}
+          </button>
+        )}
         <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
           <DropdownMenuTrigger asChild>
             <button
@@ -147,20 +181,40 @@ export default function DeckCard({
                 e.preventDefault();
                 e.stopPropagation();
               }}
-              className="p-2 sm:p-1.5 rounded-md bg-black/60 backdrop-blur-sm border border-border hover:bg-black/80"
-              aria-label="Deck options"
+              className={`rounded-md border border-border bg-black/60 p-2 backdrop-blur-sm hover:bg-black/80 sm:p-1.5 ${
+                menuOpen
+                  ? "sm:visible sm:pointer-events-auto sm:opacity-100"
+                  : "sm:invisible sm:pointer-events-none sm:opacity-0 sm:group-hover:visible sm:group-hover:pointer-events-auto sm:group-hover:opacity-100 sm:group-focus-within:visible sm:group-focus-within:pointer-events-auto sm:group-focus-within:opacity-100"
+              }`}
+              aria-label={t("raw.deckOptions")}
             >
-              <IconDots className="w-3.5 h-3.5 text-foreground/70" />
+              <IconDots className="w-3.5 h-3.5 text-white/70" />
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent
             align="end"
-            className="w-40"
+            className="w-56"
             onCloseAutoFocus={(e) => {
               if (pendingRenameRef.current) {
                 e.preventDefault();
                 pendingRenameRef.current = false;
+                setRenameValue(deck.title);
                 setIsRenaming(true);
+              }
+              if (pendingWorkspaceDefaultRef.current) {
+                e.preventDefault();
+                pendingWorkspaceDefaultRef.current = false;
+                onSetWorkspaceDefault?.(deck.id, !isWorkspaceDefault);
+              }
+              if (pendingShareRef.current) {
+                e.preventDefault();
+                pendingShareRef.current = false;
+                setTimeout(() => setShareOpen(true), 0);
+              }
+              if (pendingDeleteRef.current) {
+                e.preventDefault();
+                pendingDeleteRef.current = false;
+                setTimeout(() => onDelete(deck.id), 0);
               }
             }}
           >
@@ -170,36 +224,81 @@ export default function DeckCard({
                 startRename();
               }}
             >
-              <IconPencil className="w-3.5 h-3.5 mr-2" />
+              <IconPencil className="w-3.5 h-3.5 me-2" />
               Rename
             </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                if (isDuplicating) return;
-                onDuplicate(deck.id);
-              }}
-              disabled={isDuplicating}
-            >
-              <IconCopy className="w-3.5 h-3.5 mr-2" />
-              {isDuplicating ? "Duplicating..." : "Duplicate"}
+            <DropdownMenuItem onSelect={() => onDuplicate(deck.id)}>
+              <IconCopy className="w-3.5 h-3.5 me-2" />
+              Duplicate
             </DropdownMenuItem>
+            <DropdownMenuItem
+              onSelect={(event) => {
+                event.preventDefault();
+                pendingShareRef.current = true;
+                setMenuOpen(false);
+              }}
+            >
+              <IconShare2 className="w-3.5 h-3.5 me-2" />
+              {t("share.title")}
+            </DropdownMenuItem>
+            {creativeContextEnabled ? (
+              <DropdownMenuItem
+                onSelect={(event) => {
+                  event.preventDefault();
+                  setMenuOpen(false);
+                  setContextOpen(true);
+                }}
+              >
+                <IconPlus className="w-3.5 h-3.5 me-2" />
+                {t("creativeContext.addToContext" /* i18n-key-ignore */)}
+              </DropdownMenuItem>
+            ) : null}
+            {canSetWorkspaceDefault && onSetWorkspaceDefault && (
+              <DropdownMenuItem
+                onSelect={(event) => {
+                  event.preventDefault();
+                  pendingWorkspaceDefaultRef.current = true;
+                  setMenuOpen(false);
+                }}
+              >
+                <IconBuildingCommunity className="w-3.5 h-3.5 me-2" />
+                {isWorkspaceDefault
+                  ? t("home.clearWorkspaceDefault")
+                  : t("home.setWorkspaceDefault")}
+              </DropdownMenuItem>
+            )}
             <DropdownMenuSeparator />
             <DropdownMenuItem
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                onDelete(deck.id);
+              onSelect={(event) => {
+                event.preventDefault();
+                pendingDeleteRef.current = true;
+                setMenuOpen(false);
               }}
               className="text-red-400 focus:text-red-400"
             >
-              <IconTrash className="w-3.5 h-3.5 mr-2" />
+              <IconTrash className="w-3.5 h-3.5 me-2" />
               Delete
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
+      {creativeContextEnabled ? (
+        <CreativeContextShareSheet
+          open={contextOpen}
+          onOpenChange={setContextOpen}
+          resource={{
+            appId: "slides",
+            resourceType: "deck",
+            resourceId: deck.id,
+            title: deck.title,
+            updatedAt: deck.updatedAt,
+            visibility: deck.visibility,
+            preview: { kind: "document", label: "Deck" },
+          }}
+          canManage={deck.createdByMe}
+        />
+      ) : null}
+      <ShareDialog deck={deck} open={shareOpen} onOpenChange={setShareOpen} />
     </div>
   );
 }

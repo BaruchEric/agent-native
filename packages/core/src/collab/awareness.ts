@@ -1,32 +1,26 @@
-/**
- * Server-side awareness state management for collaborative editing.
- *
- * Stores per-client awareness state (cursor positions, user info) in memory.
- * Clients POST their state and receive other clients' states via polling.
- * States expire after 30 seconds of no updates.
- *
- * Fast-path: when a client POSTs new awareness state, the server emits an
- * event on the awareness emitter so SSE-connected peers receive cursor moves
- * push-style instead of waiting for the next poll cycle.
- */
-
 import { EventEmitter } from "node:events";
+
 import { defineEventHandler, setResponseStatus, getRouterParam } from "h3";
 import type { H3Event } from "h3";
-import { readBody } from "../server/h3-helpers.js";
 
-const AWARENESS_TIMEOUT = 30_000; // 30 seconds
+import { getSession } from "../server/auth.js";
+import { readBody } from "../server/h3-helpers.js";
+import {
+  deleteAwarenessRow,
+  loadAwarenessRows,
+  upsertAwarenessRow,
+} from "./awareness-store.js";
+
+const AWARENESS_TIMEOUT = 30_000;
+const CLEAR_TOMBSTONE_TTL = AWARENESS_TIMEOUT + 5_000;
+const AWARENESS_SCOPE_TIMEOUT = AWARENESS_TIMEOUT + 5_000;
+const MAX_AWARENESS_SCOPES = 10_000;
 
 export interface AwarenessEntry {
   clientId: number;
-  state: string; // JSON-encoded awareness state object
+  state: string;
   lastSeen: number;
 }
-
-// ---------------------------------------------------------------------------
-// Awareness event emitter — fast-path for push delivery to SSE-connected peers.
-// The SSE handler (poll-events) subscribes and forwards events to its stream.
-// ---------------------------------------------------------------------------
 
 export const AWARENESS_CHANGE_EVENT = "awareness-change" as const;
 
@@ -34,40 +28,145 @@ export interface AwarenessChangeEvent {
   source: "awareness";
   type: "awareness-change";
   docId: string;
-  /** Array of updated states for this document (all non-expired clients). */
   states: Array<{ clientId: number; state: string }>;
-  /** Owner email for access-scoped delivery (taken from session if available). */
   owner?: string;
-  /** Org ID for org-scoped delivery. */
   orgId?: string;
+  resourceType?: string;
+  resourceId?: string;
+}
+
+export interface AwarenessScope {
+  owner?: string;
+  orgId?: string;
+  resourceType?: string;
+  resourceId?: string;
 }
 
 const _awarenessEmitter = new EventEmitter();
 _awarenessEmitter.setMaxListeners(0);
 
+interface AwarenessScopeEntry {
+  scope: AwarenessScope;
+  lastSeen: number;
+}
+
+const _awarenessScopes = new Map<string, AwarenessScopeEntry>();
+
+function pruneAwarenessScopes(now: number): void {
+  for (const [docId, entry] of _awarenessScopes) {
+    if (now - entry.lastSeen > AWARENESS_SCOPE_TIMEOUT) {
+      _awarenessScopes.delete(docId);
+    }
+  }
+
+  while (_awarenessScopes.size > MAX_AWARENESS_SCOPES) {
+    const oldest = _awarenessScopes.keys().next().value as string | undefined;
+    if (!oldest) break;
+    _awarenessScopes.delete(oldest);
+  }
+}
+
 export function getAwarenessEmitter(): EventEmitter {
   return _awarenessEmitter;
+}
+
+export function rememberAwarenessScope(
+  docId: string,
+  scope: AwarenessScope | undefined,
+): void {
+  const now = Date.now();
+  pruneAwarenessScopes(now);
+  const existing = _awarenessScopes.get(docId);
+  if (!scope) {
+    // Agent-presence heartbeats emit scope-less awareness changes. They still
+    // prove the document is active and must keep the access scope alive.
+    if (existing) {
+      _awarenessScopes.delete(docId);
+      _awarenessScopes.set(docId, { ...existing, lastSeen: now });
+    }
+    return;
+  }
+  const next = {
+    ...(existing?.scope ?? {}),
+    ...scope,
+  };
+  if (!next.owner && !next.orgId && !next.resourceType && !next.resourceId) {
+    return;
+  }
+  _awarenessScopes.delete(docId);
+  _awarenessScopes.set(docId, { scope: next, lastSeen: now });
+  pruneAwarenessScopes(now);
 }
 
 export function emitAwarenessChange(
   docId: string,
   states: Array<{ clientId: number; state: string }>,
-  owner?: string,
-  orgId?: string,
+  scope?: AwarenessScope,
 ): void {
+  rememberAwarenessScope(docId, scope);
+  pruneAwarenessScopes(Date.now());
+  const resolvedScope = _awarenessScopes.get(docId)?.scope ?? {};
   const event: AwarenessChangeEvent = {
     source: "awareness",
     type: "awareness-change",
     docId,
     states,
-    ...(owner && { owner }),
-    ...(orgId && { orgId }),
+    ...(resolvedScope.owner && { owner: resolvedScope.owner }),
+    ...(resolvedScope.orgId && { orgId: resolvedScope.orgId }),
+    ...(resolvedScope.resourceType && {
+      resourceType: resolvedScope.resourceType,
+    }),
+    ...(resolvedScope.resourceId && { resourceId: resolvedScope.resourceId }),
   };
   _awarenessEmitter.emit(AWARENESS_CHANGE_EVENT, event);
 }
 
-// docId → Map<clientId, AwarenessEntry>
 const _awarenessMap = new Map<string, Map<number, AwarenessEntry>>();
+const _awarenessClearTombstones = new Map<string, number>();
+
+function awarenessKey(docId: string, clientId: number): string {
+  return `${docId}\0${clientId}`;
+}
+
+function pruneAwarenessClearTombstones(now: number): void {
+  for (const [key, clearedAt] of _awarenessClearTombstones) {
+    if (now - clearedAt > CLEAR_TOMBSTONE_TTL) {
+      _awarenessClearTombstones.delete(key);
+    }
+  }
+}
+
+export function rememberAwarenessClear(
+  docId: string,
+  clientId: number,
+  clearedAt: number = Date.now(),
+): void {
+  pruneAwarenessClearTombstones(clearedAt);
+  const key = awarenessKey(docId, clientId);
+  const prev = _awarenessClearTombstones.get(key);
+  if (prev == null || clearedAt > prev) {
+    _awarenessClearTombstones.set(key, clearedAt);
+  }
+}
+
+export function forgetAwarenessClear(docId: string, clientId: number): void {
+  _awarenessClearTombstones.delete(awarenessKey(docId, clientId));
+}
+
+function isBlockedByAwarenessClear(
+  docId: string,
+  clientId: number,
+  lastSeen: number,
+  now: number,
+): boolean {
+  pruneAwarenessClearTombstones(now);
+  const key = awarenessKey(docId, clientId);
+  const clearedAt = _awarenessClearTombstones.get(key);
+  if (clearedAt == null) return false;
+  if (lastSeen <= clearedAt) return true;
+  _awarenessClearTombstones.delete(key);
+  return false;
+}
 
 export function getDocAwareness(docId: string): Map<number, AwarenessEntry> {
   let map = _awarenessMap.get(docId);
@@ -87,57 +186,71 @@ export function cleanExpired(map: Map<number, AwarenessEntry>): void {
   }
 }
 
-// Drop the per-document map from the registry once it has no entries left,
-// so the outer map does not grow unbounded with every docId ever touched.
 function pruneIfEmpty(docId: string, map: Map<number, AwarenessEntry>): void {
   if (map.size === 0) {
     _awarenessMap.delete(docId);
   }
 }
 
-/**
- * POST /_agent-native/collab/:docId/awareness
- *
- * Client sends its awareness state and receives other clients' states.
- *
- * Body: { clientId: number, state: string (base64) }
- * Response: { states: Array<{ clientId: number, state: string }> }
- */
+async function mergeStoredAwareness(
+  docId: string,
+  map: Map<number, AwarenessEntry>,
+): Promise<void> {
+  const now = Date.now();
+  const rows = await loadAwarenessRows(docId, now);
+  for (const row of rows) {
+    if (isBlockedByAwarenessClear(docId, row.clientId, row.lastSeen, now)) {
+      void deleteAwarenessRow(docId, row.clientId, row.lastSeen);
+      continue;
+    }
+    const existing = map.get(row.clientId);
+    if (!existing || row.lastSeen > existing.lastSeen) {
+      map.set(row.clientId, row);
+    }
+  }
+}
+
 export const postAwareness = defineEventHandler(async (event: H3Event) => {
   const docId = getRouterParam(event, "docId");
   if (!docId) {
     setResponseStatus(event, 400);
     return { error: "docId required" };
   }
+  const session = await getSession(event).catch(() => null);
+  const contextScope = (
+    event.context as { _collabAwarenessScope?: AwarenessScope } | undefined
+  )?._collabAwarenessScope;
 
   const body = await readBody(event);
   const { clientId, state } = body as {
     clientId?: number;
-    state?: string;
+    state?: string | null;
   };
 
-  if (clientId == null || !state) {
-    // `!clientId` would wrongly reject clientId === 0, which is a valid
-    // (if rare) Yjs client id. Only reject missing/null ids here.
+  if (clientId == null || state === undefined) {
     setResponseStatus(event, 400);
     return { error: "clientId and state required" };
   }
 
   const map = getDocAwareness(docId);
 
-  // Store this client's state
-  map.set(clientId, { clientId, state, lastSeen: Date.now() });
+  if (state === null) {
+    const clearedAt = Date.now();
+    map.delete(clientId);
+    rememberAwarenessClear(docId, clientId, clearedAt);
+    void deleteAwarenessRow(docId, clientId, clearedAt);
+  } else {
+    forgetAwarenessClear(docId, clientId);
+    const entry = { clientId, state, lastSeen: Date.now() };
+    map.set(clientId, entry);
+    void upsertAwarenessRow(docId, clientId, state, entry.lastSeen);
+  }
 
-  // Clean expired entries, then prune the outer-map entry if it becomes empty.
-  // Without pruning, a deployment with many transient docIds (e.g. one per
-  // session) would grow _awarenessMap without bound.
+  await mergeStoredAwareness(docId, map);
+
   cleanExpired(map);
-  // map has at least the sender's entry so size >= 1 here; pruneIfEmpty is a
-  // no-op in the normal path but guards against edge cases (e.g. clientId 0
-  // that was immediately evicted by a concurrent cleanExpired run).
   pruneIfEmpty(docId, map);
 
-  // Build the full list of current states (all clients including sender).
   const allStates: Array<{ clientId: number; state: string }> = [];
   const otherStates: Array<{ clientId: number; state: string }> = [];
   for (const [id, entry] of map) {
@@ -147,18 +260,18 @@ export const postAwareness = defineEventHandler(async (event: H3Event) => {
     }
   }
 
-  // Fast-path: push the updated state set to SSE-connected peers so they
-  // don't have to wait for the next poll cycle for cursor/selection updates.
-  emitAwarenessChange(docId, allStates);
+  emitAwarenessChange(
+    docId,
+    allStates,
+    contextScope ?? {
+      ...(session?.email ? { owner: session.email } : {}),
+      ...(session?.orgId ? { orgId: session.orgId } : {}),
+    },
+  );
 
   return { states: otherStates };
 });
 
-/**
- * GET /_agent-native/collab/:docId/users
- *
- * Returns the list of active users for a document (for presence bar).
- */
 export const getActiveUsers = defineEventHandler(async (event: H3Event) => {
   const docId = getRouterParam(event, "docId");
   if (!docId) {
@@ -167,6 +280,7 @@ export const getActiveUsers = defineEventHandler(async (event: H3Event) => {
   }
 
   const map = getDocAwareness(docId);
+  await mergeStoredAwareness(docId, map);
   cleanExpired(map);
   pruneIfEmpty(docId, map);
 

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+
 import {
   bodyToHtml,
   buildRawEmail,
@@ -7,7 +8,6 @@ import {
   resolveComposeAttachments,
 } from "./outgoing-email.js";
 
-/** Decode a URL-safe base64 raw message to a string for header inspection. */
 function decodeRaw(raw: string): string {
   const standard = raw.replace(/-/g, "+").replace(/_/g, "/");
   return Buffer.from(standard, "base64").toString("utf8");
@@ -61,12 +61,6 @@ describe("encodeAddressHeader", () => {
 });
 
 describe("buildRawEmail — CRLF header injection", () => {
-  // Confirms that agent- or upstream-controlled strings containing \r\n cannot
-  // inject extra RFC 2822 header lines into the outgoing message.  The CRLF is
-  // collapsed to a space (still appears inline in the header value) but no
-  // standalone header line is injected — checked by asserting the decoded
-  // output contains no bare \r\nBcc: or \nBcc: separator.
-
   const base = {
     from: "sender@example.com",
     to: "recipient@example.com",
@@ -80,8 +74,6 @@ describe("buildRawEmail — CRLF header injection", () => {
       to: "legit@example.com\r\nBcc: attacker@evil.com",
     });
     const decoded = decodeRaw(raw);
-    // The CRLF is collapsed, so the injected text appears inline in the To
-    // value rather than as a separate header line.
     expect(decoded).not.toMatch(/\r\nBcc:\s/);
     expect(decoded).toMatch(/^To: /m);
   });
@@ -140,8 +132,6 @@ describe("bodyToHtml", () => {
       "Here is [my calendar](https://example.com/book?a=1&b=2).",
     );
 
-    // marked emits the href with a raw & (valid HTML5); accept either form but
-    // never a double-escaped &amp;amp;
     expect(html).toMatch(
       /href="https:\/\/example\.com\/book\?a=1(&amp;|&)b=2"/,
     );
@@ -160,7 +150,6 @@ describe("bodyToHtml", () => {
   it("renders nested lists", () => {
     const md = `- Top\n  - Nested\n    - Deep`;
     const html = bodyToHtml(md);
-    // marked produces nested <ul> elements for nested lists
     expect(html.match(/<ul/g)?.length ?? 0).toBeGreaterThanOrEqual(1);
     expect(html).toContain("Top");
     expect(html).toContain("Nested");
@@ -192,7 +181,6 @@ describe("buildRawEmail — attachments", () => {
     expect(decoded).toContain("Content-Disposition: attachment");
     expect(decoded).toContain('filename="Q2-Report.pdf"');
     expect(decoded).toContain("Content-Transfer-Encoding: base64");
-    // base64 of "hello"
     expect(decoded).toContain(Buffer.from("hello").toString("base64"));
   });
 
@@ -208,25 +196,28 @@ describe("buildRawEmail — attachments", () => {
     expect(decoded).toContain("multipart/alternative");
   });
 
-  it("resolveComposeAttachments returns empty array for non-array input", async () => {
+  it("resolveComposeAttachments treats absent attachments as empty", async () => {
     expect(await resolveComposeAttachments(null)).toEqual([]);
     expect(await resolveComposeAttachments(undefined)).toEqual([]);
-    expect(await resolveComposeAttachments("not an array")).toEqual([]);
   });
 
-  it("resolveComposeAttachments skips entries without a filename", async () => {
-    expect(await resolveComposeAttachments([{ id: "x" }])).toEqual([]);
+  it("resolveComposeAttachments rejects unreadable attachment metadata", async () => {
+    await expect(resolveComposeAttachments("not an array")).rejects.toThrow(
+      "Attachments must be an array",
+    );
   });
 
-  it("resolveComposeAttachments skips path-traversal filenames", async () => {
-    // Should throw or skip — both paths (throw or skip) mean 0 resolved.
-    // The function skips entries with '/' or '..' in the filename check.
-    expect(
-      await resolveComposeAttachments([{ filename: "../etc/passwd" }]),
-    ).toEqual([]);
-    expect(
-      await resolveComposeAttachments([{ filename: "sub/file.pdf" }]),
-    ).toEqual([]);
+  it("resolveComposeAttachments throws instead of silently dropping entries without a filename", async () => {
+    await expect(resolveComposeAttachments([{ id: "x" }])).rejects.toThrow();
+  });
+
+  it("resolveComposeAttachments throws on path-traversal filenames", async () => {
+    await expect(
+      resolveComposeAttachments([{ filename: "../etc/passwd" }]),
+    ).rejects.toThrow();
+    await expect(
+      resolveComposeAttachments([{ filename: "sub/file.pdf" }]),
+    ).rejects.toThrow();
   });
 
   it("resolveComposeAttachments can hydrate Gmail-backed draft attachments", async () => {

@@ -1,10 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 import { builderFileUploadProvider } from "./builder.js";
 
-const resolveBuilderPrivateKeyMock = vi.hoisted(() => vi.fn());
+const resolveBuilderCredentialsDetailedMock = vi.hoisted(() => vi.fn());
+const resolveBuilderApiAuthorizationMock = vi.hoisted(() => vi.fn());
+const resolveBuilderRequestAuthorizationMock = vi.hoisted(() => vi.fn());
+
+vi.mock("../server/builder-api-auth.js", () => ({
+  resolveBuilderApiAuthorization: resolveBuilderApiAuthorizationMock,
+  resolveBuilderRequestAuthorization: resolveBuilderRequestAuthorizationMock,
+}));
 
 vi.mock("../server/credential-provider.js", () => ({
-  resolveBuilderPrivateKey: resolveBuilderPrivateKeyMock,
+  resolveBuilderCredentialsDetailed: resolveBuilderCredentialsDetailedMock,
 }));
 
 function jsonResponse(body: unknown, init?: { status?: number }): Response {
@@ -12,6 +20,7 @@ function jsonResponse(body: unknown, init?: { status?: number }): Response {
     ok: (init?.status ?? 200) < 400,
     status: init?.status ?? 200,
     statusText: "OK",
+    headers: new Headers(),
     json: async () => body,
     text: async () => JSON.stringify(body),
   } as unknown as Response;
@@ -37,7 +46,17 @@ describe("builderFileUploadProvider", () => {
     delete process.env.BUILDER_PUBLIC_APP_HOST;
     vi.clearAllMocks();
     vi.useFakeTimers();
-    resolveBuilderPrivateKeyMock.mockResolvedValue("bpk-secret");
+    resolveBuilderCredentialsDetailedMock.mockResolvedValue({
+      privateKey: "bpk-secret",
+      publicKey: "public-key",
+    });
+    resolveBuilderApiAuthorizationMock.mockResolvedValue("Bearer bpk-secret");
+    resolveBuilderRequestAuthorizationMock.mockResolvedValue({
+      token: "bpk-secret",
+      authorization: "Bearer bpk-secret",
+      source: "legacy",
+      legacyPublicKey: "public-key",
+    });
     fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
   });
@@ -56,11 +75,72 @@ describe("builderFileUploadProvider", () => {
     expect(builderFileUploadProvider.isConfigured()).toBe(true);
   });
 
-  it("throws when no private key resolves", async () => {
-    resolveBuilderPrivateKeyMock.mockResolvedValue(null);
+  it("deletes uploaded Builder assets by URL", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({}));
+
+    await expect(
+      builderFileUploadProvider.delete!({
+        url: "https://cdn.builder.io/api/v1/file/assets%2Fprivate.bin?token=x",
+      }),
+    ).resolves.toBe(true);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    const parsed = new URL(url.toString());
+    expect(parsed.pathname).toBe("/api/v1/assets/by-url");
+    expect(parsed.searchParams.get("apiKey")).toBe("public-key");
+    expect(parsed.searchParams.get("url")).toBe(
+      "https://cdn.builder.io/api/v1/file/assets%2Fprivate.bin",
+    );
+    expect(init).toMatchObject({
+      method: "DELETE",
+      headers: { Authorization: "Bearer bpk-secret" },
+    });
+  });
+
+  it("treats a missing Builder asset as already deleted", async () => {
+    fetchMock.mockResolvedValue(errorResponse(404));
+
+    await expect(
+      builderFileUploadProvider.delete!({
+        url: "https://cdn.builder.io/api/v1/file/assets%2Fmissing.bin",
+      }),
+    ).resolves.toBe(true);
+  });
+
+  it("deletes Builder assets with OAuth without legacy API key fields", async () => {
+    resolveBuilderRequestAuthorizationMock.mockResolvedValue({
+      token: "<OAUTH_TOKEN_EXAMPLE>",
+      authorization: "Bearer <OAUTH_TOKEN_EXAMPLE>",
+      source: "oauth",
+      oauthScope: "user",
+    });
+    fetchMock.mockResolvedValue(jsonResponse({}));
+
+    await expect(
+      builderFileUploadProvider.delete!({
+        url: "https://cdn.builder.io/api/v1/file/assets%2Fprivate.bin?token=x",
+      }),
+    ).resolves.toBe(true);
+
+    expect(resolveBuilderRequestAuthorizationMock).toHaveBeenCalledWith({
+      requiredScope: "builder:assets:write",
+    });
+    const [url, init] = fetchMock.mock.calls[0];
+    const parsed = new URL(url.toString());
+    expect(parsed.searchParams.has("apiKey")).toBe(false);
+    expect(init).toMatchObject({
+      method: "DELETE",
+      headers: { Authorization: "Bearer <OAUTH_TOKEN_EXAMPLE>" },
+    });
+  });
+
+  it("throws when no Builder credential resolves", async () => {
+    resolveBuilderApiAuthorizationMock.mockRejectedValue(
+      new Error("Builder.io is not connected."),
+    );
     await expect(
       builderFileUploadProvider.upload({ data: new Uint8Array([1]) }),
-    ).rejects.toThrow(/BUILDER_PRIVATE_KEY is not set/);
+    ).rejects.toThrow(/Builder\.io is not connected/);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -90,16 +170,391 @@ describe("builderFileUploadProvider", () => {
     expect(init.headers.Authorization).toBe("Bearer bpk-secret");
   });
 
-  it("strips media-type parameters from the Content-Type header", async () => {
+  it("strips media-type parameters from the legacy upload Content-Type header", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ url: "https://cdn/x" }));
 
     await builderFileUploadProvider.upload({
       data: new Uint8Array([1]),
-      mimeType: "video/webm;codecs=avc1,opus",
+      mimeType: "image/png;charset=utf-8",
     });
 
     const [, init] = fetchMock.mock.calls[0];
-    expect(init.headers["Content-Type"]).toBe("video/webm");
+    expect(init.headers["Content-Type"]).toBe("image/png");
+  });
+
+  it("passes only stableUrl through the legacy upload path when requested", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ url: "https://cdn/x" }));
+
+    await builderFileUploadProvider.upload({
+      data: new Uint8Array([1]),
+      mimeType: "image/png",
+      stableUrl: true,
+    });
+
+    const [url] = fetchMock.mock.calls[0];
+    const params = new URL(url.toString()).searchParams;
+    expect(params.get("stableUrl")).toBe("true");
+    expect(params.has("skipCompression")).toBe(false);
+    expect(params.has("skipCompressionWait")).toBe(false);
+  });
+
+  it("passes record=false through the legacy upload path for internal artifacts", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ url: "https://cdn/x" }));
+
+    await builderFileUploadProvider.upload({
+      data: new Uint8Array([1]),
+      mimeType: "image/png",
+      recordAsset: false,
+    });
+
+    const [url] = fetchMock.mock.calls[0];
+    expect(new URL(url.toString()).searchParams.get("record")).toBe("false");
+  });
+
+  it("routes video uploads through the signed URL path even when small", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          uploadUrl: "https://storage.example.com/upload",
+          assetId: "asset-1",
+          requiredHeaders: {
+            "Content-Type": "video/webm",
+            "x-goog-content-length-range": "0,3",
+          },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({}, { status: 200 }))
+      .mockResolvedValueOnce(
+        jsonResponse({ url: "https://cdn.builder.io/video", id: "asset-1" }),
+      );
+
+    const result = await builderFileUploadProvider.upload({
+      data: new Uint8Array([1, 2, 3]),
+      filename: "clip.webm",
+      mimeType: "video/webm;codecs=vp8,opus",
+    });
+
+    expect(result).toEqual({
+      url: "https://cdn.builder.io/video",
+      id: "asset-1",
+      provider: "builder",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const [signedUrl, signedInit] = fetchMock.mock.calls[0];
+    expect(new URL(signedUrl.toString()).pathname).toBe(
+      "/api/v1/upload/signed-url",
+    );
+    expect(JSON.parse(String(signedInit.body))).toMatchObject({
+      fileName: "clip.webm",
+      contentType: "video/webm",
+      size: 3,
+    });
+    const [putUrl, putInit] = fetchMock.mock.calls[1];
+    expect(putUrl).toBe("https://storage.example.com/upload");
+    expect(putInit.method).toBe("PUT");
+    expect(putInit.headers).toEqual({
+      "Content-Type": "video/webm",
+      "x-goog-content-length-range": "0,3",
+    });
+    expect(
+      new URL(fetchMock.mock.calls[2][0].toString()).searchParams.has(
+        "skipCompressionWait",
+      ),
+    ).toBe(false);
+    expect(
+      new URL(fetchMock.mock.calls[2][0].toString()).searchParams.has(
+        "skipCompression",
+      ),
+    ).toBe(false);
+  });
+
+  it("refreshes the access token and retries once when the signed-URL request gets 401", async () => {
+    resolveBuilderApiAuthorizationMock
+      .mockResolvedValueOnce("Bearer revoked-token")
+      .mockResolvedValueOnce("Bearer fresh-token");
+    fetchMock
+      .mockResolvedValueOnce(errorResponse(401, "Unauthorized"))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          uploadUrl: "https://storage.example.com/session",
+          assetId: "asset-2",
+          requiredHeaders: {},
+        }),
+      )
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        headers: new Headers({ location: "https://storage.example.com/s/1" }),
+        text: async () => "",
+      } as unknown as Response);
+
+    const session = await builderFileUploadProvider.resumable!.startSession(
+      "rec.webm",
+      "video/webm",
+      1024,
+    );
+
+    expect(session.sessionId).toBe("https://storage.example.com/s/1");
+    expect(resolveBuilderApiAuthorizationMock).toHaveBeenNthCalledWith(
+      2,
+      expect.any(String),
+      { forceRefresh: true },
+    );
+    expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe(
+      "Bearer revoked-token",
+    );
+    expect(fetchMock.mock.calls[1][1].headers.Authorization).toBe(
+      "Bearer fresh-token",
+    );
+  });
+
+  it("marks a 401 after a real refresh as rejected Builder credentials", async () => {
+    resolveBuilderApiAuthorizationMock
+      .mockResolvedValueOnce("Bearer revoked-token")
+      .mockResolvedValueOnce("Bearer also-refused");
+    fetchMock.mockResolvedValue(errorResponse(401, "Unauthorized"));
+
+    await expect(
+      builderFileUploadProvider.resumable!.startSession(
+        "rec.webm",
+        "video/webm",
+        1024,
+      ),
+    ).rejects.toMatchObject({
+      status: 401,
+      errorCode: "builder_credentials_rejected",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not resend the same token when the refresh could not change it", async () => {
+    fetchMock.mockResolvedValue(errorResponse(401, "Unauthorized"));
+
+    await expect(
+      builderFileUploadProvider.resumable!.startSession(
+        "rec.webm",
+        "video/webm",
+        1024,
+      ),
+    ).rejects.toMatchObject({ status: 401 });
+    expect(resolveBuilderApiAuthorizationMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks a rejected Builder key as a persistent authorization failure", async () => {
+    resolveBuilderCredentialsDetailedMock.mockResolvedValue({
+      privateKey: "btk-rejected-key",
+      publicKey: "public-key",
+    });
+    resolveBuilderApiAuthorizationMock.mockResolvedValue(
+      "Bearer btk-rejected-key",
+    );
+    fetchMock.mockResolvedValue(errorResponse(401, "Unauthorized"));
+
+    await expect(
+      builderFileUploadProvider.resumable!.startSession(
+        "rec.webm",
+        "video/webm",
+        1024,
+      ),
+    ).rejects.toMatchObject({
+      status: 401,
+      errorCode: "builder_credentials_rejected",
+    });
+    expect(resolveBuilderApiAuthorizationMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes and retries the small-file upload path on 401", async () => {
+    resolveBuilderApiAuthorizationMock
+      .mockResolvedValueOnce("Bearer revoked-token")
+      .mockResolvedValueOnce("Bearer fresh-token");
+    fetchMock
+      .mockResolvedValueOnce(errorResponse(401, "Unauthorized"))
+      .mockResolvedValueOnce(
+        jsonResponse({ url: "https://cdn.builder.io/abc", id: "abc" }),
+      );
+
+    const result = await builderFileUploadProvider.upload({
+      data: new Uint8Array([1, 2, 3]),
+      filename: "photo.png",
+      mimeType: "image/png",
+    });
+
+    expect(result.url).toBe("https://cdn.builder.io/abc");
+    expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe(
+      "Bearer revoked-token",
+    );
+    expect(fetchMock.mock.calls[1][1].headers.Authorization).toBe(
+      "Bearer fresh-token",
+    );
+  });
+
+  it("includes the target space when uploading with a personal access token", async () => {
+    resolveBuilderApiAuthorizationMock.mockResolvedValue(
+      "Bearer btk-agent-native",
+    );
+    resolveBuilderCredentialsDetailedMock.mockResolvedValue({
+      privateKey: "btk-agent-native",
+      publicKey: "space-agent-native",
+    });
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          uploadUrl: "https://storage.example.com/upload",
+          assetId: "asset-1",
+          requiredHeaders: {},
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({}))
+      .mockResolvedValueOnce(
+        jsonResponse({ url: "https://cdn.builder.io/video", id: "asset-1" }),
+      );
+
+    await builderFileUploadProvider.upload({
+      data: new Uint8Array([1, 2, 3]),
+      filename: "clip.webm",
+      mimeType: "video/webm",
+    });
+
+    expect(
+      new URL(fetchMock.mock.calls[0][0].toString()).searchParams.get("apiKey"),
+    ).toBe("space-agent-native");
+    expect(
+      new URL(fetchMock.mock.calls[2][0].toString()).searchParams.get("apiKey"),
+    ).toBe("space-agent-native");
+  });
+
+  it("rejects a credential scope mismatch instead of substituting another PAT", async () => {
+    resolveBuilderApiAuthorizationMock.mockResolvedValue("Bearer btk-user");
+    resolveBuilderCredentialsDetailedMock.mockResolvedValue({
+      privateKey: "btk-org",
+      publicKey: "space-org",
+    });
+
+    await expect(
+      builderFileUploadProvider.upload({
+        data: new Uint8Array([1]),
+        filename: "clip.webm",
+        mimeType: "video/webm",
+      }),
+    ).rejects.toThrow(
+      "Builder credential scope mismatch: the connection holding the upload space is not the one authorized for this request.",
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("propagates credential lookup failures instead of reporting a missing space", async () => {
+    const lookupError = new Error("secrets store unavailable");
+    resolveBuilderApiAuthorizationMock.mockResolvedValue(
+      "Bearer btk-agent-native",
+    );
+    resolveBuilderCredentialsDetailedMock.mockResolvedValue({
+      privateKey: "btk-agent-native",
+      publicKey: "space-agent-native",
+      lookupFailed: true,
+      cause: lookupError,
+    });
+
+    await expect(
+      builderFileUploadProvider.upload({
+        data: new Uint8Array([1]),
+        filename: "clip.webm",
+        mimeType: "video/webm",
+      }),
+    ).rejects.toBe(lookupError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("cancels a resumable session so a hosted retry can restart it", async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 499,
+      statusText: "Client Closed Request",
+      headers: new Headers(),
+      text: async () => "",
+    } as unknown as Response);
+
+    await expect(
+      builderFileUploadProvider.resumable!.abortSession!({
+        sessionId: "https://storage.googleapis.com/session",
+        meta: { assetId: "asset-1" },
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://storage.googleapis.com/session",
+      expect.objectContaining({
+        method: "DELETE",
+        headers: { "Content-Length": "0" },
+        body: expect.any(Uint8Array),
+      }),
+    );
+  });
+
+  it("passes only stableUrl through signed URL completion when requested", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          uploadUrl: "https://storage.example.com/upload",
+          assetId: "asset-1",
+          requiredHeaders: {
+            "Content-Type": "video/webm",
+            "x-goog-content-length-range": "0,3",
+          },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({}, { status: 200 }))
+      .mockResolvedValueOnce(
+        jsonResponse({ url: "https://cdn.builder.io/video", id: "asset-1" }),
+      );
+
+    await builderFileUploadProvider.upload({
+      data: new Uint8Array([1, 2, 3]),
+      filename: "clip.webm",
+      mimeType: "video/webm",
+      stableUrl: true,
+    });
+
+    const completeUrl = new URL(fetchMock.mock.calls[2][0].toString());
+    expect(completeUrl.pathname).toBe("/api/v1/upload/complete");
+    expect(completeUrl.searchParams.get("stableUrl")).toBe("true");
+    expect(completeUrl.searchParams.has("skipCompression")).toBe(false);
+    expect(completeUrl.searchParams.has("skipCompressionWait")).toBe(false);
+  });
+
+  it("passes record=false through signed URL completion for internal artifacts", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          uploadUrl: "https://storage.example.com/upload",
+          assetId: "asset-1",
+          requiredHeaders: {
+            "Content-Type": "video/webm",
+            "x-goog-content-length-range": "0,3",
+          },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({}, { status: 200 }))
+      .mockResolvedValueOnce(
+        jsonResponse({ url: "https://cdn.builder.io/video", id: "asset-1" }),
+      );
+
+    await builderFileUploadProvider.upload({
+      data: new Uint8Array([1, 2, 3]),
+      filename: "clip.webm",
+      mimeType: "video/webm",
+      recordAsset: false,
+    });
+
+    const [completeUrl, completeInit] = fetchMock.mock.calls[2];
+    expect(new URL(completeUrl.toString()).searchParams.get("record")).toBe(
+      "false",
+    );
+    expect(JSON.parse(String(completeInit.body))).toMatchObject({
+      assetId: "asset-1",
+      record: false,
+    });
   });
 
   it("defaults Content-Type to application/octet-stream when no mime given", async () => {
@@ -108,7 +563,6 @@ describe("builderFileUploadProvider", () => {
     await builderFileUploadProvider.upload({ data: new Uint8Array([1]) });
 
     const [url, init] = fetchMock.mock.calls[0];
-    // No filename -> no name search param.
     expect(new URL(url.toString()).searchParams.has("name")).toBe(false);
     expect(init.headers["Content-Type"]).toBe("application/octet-stream");
   });
@@ -133,7 +587,6 @@ describe("builderFileUploadProvider", () => {
     const promise = builderFileUploadProvider.upload({
       data: new Uint8Array([1]),
     });
-    // Advance past the first backoff delay (600ms) so the retry fires.
     await vi.advanceTimersByTimeAsync(600);
     const result = await promise;
 
@@ -166,11 +619,9 @@ describe("builderFileUploadProvider", () => {
       data: new Uint8Array([1]),
     });
     const expectation = expect(promise).rejects.toThrow(/\(503\): Unavailable/);
-    // Two backoff windows: 600ms then 1800ms.
     await vi.advanceTimersByTimeAsync(600);
     await vi.advanceTimersByTimeAsync(1800);
     await expectation;
-    // 1 initial + 2 retries = 3 attempts.
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
@@ -180,5 +631,50 @@ describe("builderFileUploadProvider", () => {
     await expect(
       builderFileUploadProvider.upload({ data: new Uint8Array([1]) }),
     ).rejects.toThrow(/returned no URL/);
+  });
+
+  it("passes only stableUrl through resumable completion options", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ url: "https://cdn.builder.io/video", id: "asset-1" }),
+    );
+
+    const url = await builderFileUploadProvider.resumable!.completeSession(
+      {
+        sessionId: "https://storage.example.com/session",
+        meta: { assetId: "asset-1" },
+      },
+      "clip.webm",
+      { stableUrl: true },
+    );
+
+    expect(url).toBe("https://cdn.builder.io/video");
+    const completeUrl = new URL(fetchMock.mock.calls[0][0].toString());
+    expect(completeUrl.pathname).toBe("/api/v1/upload/complete");
+    expect(completeUrl.searchParams.get("stableUrl")).toBe("true");
+    expect(completeUrl.searchParams.has("skipCompression")).toBe(false);
+    expect(completeUrl.searchParams.has("skipCompressionWait")).toBe(false);
+  });
+
+  it("passes record=false through resumable completion options", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ url: "https://cdn.builder.io/video", id: "asset-1" }),
+    );
+
+    await builderFileUploadProvider.resumable!.completeSession(
+      {
+        sessionId: "https://storage.example.com/session",
+        meta: { assetId: "asset-1" },
+      },
+      "clip.webm",
+      { recordAsset: false },
+    );
+
+    const [completeUrl, completeInit] = fetchMock.mock.calls[0];
+    expect(new URL(completeUrl.toString()).searchParams.get("record")).toBe(
+      "false",
+    );
+    expect(JSON.parse(String(completeInit.body))).toMatchObject({
+      record: false,
+    });
   });
 });

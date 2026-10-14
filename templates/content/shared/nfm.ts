@@ -1,49 +1,6 @@
-/**
- * Notion-Flavored Markdown (NFM) ⇄ ProseMirror JSON.
- *
- * This is the single, deterministic bridge between Notion's canonical
- * Notion-flavored Markdown (the exact bytes Notion's `/pages/{id}/markdown`
- * API emits and accepts, Notion-Version 2026-03-11) and the TipTap/ProseMirror
- * document used by the editor.
- *
- * Design goals (the whole reason this exists):
- *   1. Idempotency / no drift. `docToNfm(nfmToDoc(x)) === x` for every piece of
- *      canonical NFM `x`. A document authored in Notion, pulled, opened in the
- *      editor, and saved back with no edits produces byte-identical NFM — so
- *      pulling and pushing never mutates content.
- *   2. Lossless fidelity. Every Notion block/inline type round-trips, including
- *      quotes, toggle headings, block colors, tables (with header rows/columns
- *      and cell colors), equations, callouts, columns, synced blocks, mentions,
- *      and inline color/underline/background — matching the ground-truth spec at
- *      the `notion://docs/enhanced-markdown-spec` MCP resource.
- *   3. Shared. Pure functions with no editor/React/DOM dependency, usable by the
- *      server (pull canonicalization + content hashing) and the editor
- *      (`setContent(nfmToDoc(x))` / `docToNfm(editor.getJSON())`) alike.
- *
- * Canonical NFM form (what `docToNfm` emits):
- *   - One block per line; children indented one extra TAB. No blank separator
- *     lines (Notion strips them). Intentional blank blocks are `<empty-block/>`.
- *   - Block attributes as a trailing `{toggle="true" color="red"}` list.
- *   - Tables, toggles, callouts, columns, synced blocks, media, mentions use the
- *     HTML-ish tags from the spec. Tables are `<table>` HTML, never pipe tables.
- *   - Inline text backslash-escapes the spec's special characters outside code.
- *
- * Registry blocks (the dev-doc / OpenAPI library shared with plan) are encoded
- * INLINE as PascalCase MDX elements (`<Endpoint …/>`, `<Checklist …/>`). On READ
- * a registered tag becomes a `registryBlock` atom carrying the verbatim element
- * source in `__raw`; on WRITE it emits that `__raw` back (or re-serializes from
- * the editor's typed data). This module stays React-free — it only consults the
- * content registry's tag set (`@agent-native/core/blocks/server` config) to tell
- * a registered PascalCase block tag from a lowercase Notion container tag.
- *
- * Local-file content can also use repo-local MDX components. Unknown PascalCase
- * tags become `localMdxComponent` atoms that preserve their exact source while
- * exposing simple string props for the editor preview layer.
- */
+import { matchInlineMathAt } from "./inline-math.js";
+import { registryBlockSpecByTag } from "./nfm-registry.js";
 
-import { isRegistryBlockTag, registryBlockSpecByTag } from "./nfm-registry.js";
-
-// ── Shared PM JSON types ────────────────────────────────────────────
 export interface PMMark {
   type: string;
   attrs?: Record<string, any>;
@@ -60,7 +17,20 @@ export interface PMDoc {
   content: PMNode[];
 }
 
-// ── Colors (from the NFM spec) ──────────────────────────────────────
+export type NfmFidelityStatus =
+  | "preserved"
+  | "transformed"
+  | "unresolved"
+  | "failed";
+
+export interface NfmFidelityReport {
+  status: NfmFidelityStatus;
+  normalizedChanged: boolean;
+  conversions: Array<{ kind: string; count: number }>;
+  unresolved: Array<{ kind: string; count: number }>;
+  error?: string;
+}
+
 const BASE_COLORS = [
   "gray",
   "brown",
@@ -81,8 +51,6 @@ function isColor(value: string | null | undefined): value is string {
   return !!value && NFM_COLORS.has(value) && value !== "default";
 }
 
-// ── Inline escaping ─────────────────────────────────────────────────
-// The spec escapes these characters OUTSIDE code: \ * ~ ` $ [ ] < > { } | ^
 const ESCAPABLE = new Set("\\*~`$[]<>{}|^".split(""));
 
 export function escapeInlineText(text: string): string {
@@ -107,7 +75,28 @@ function unescapeInlineText(text: string): string {
   return out;
 }
 
-// ── Attribute helpers (for the HTML-ish tags) ───────────────────────
+const LEADING_BLOCK_MARKER = /^(#{1,6} |[-*+] |\d+[.)] |\[[ xX]\] )/;
+
+const DIVIDER_LOOKALIKE = /^(-{3,}|\*{3,}|_{3,})$/;
+
+function escapeLeadingBlockMarker(text: string): string {
+  if (LEADING_BLOCK_MARKER.test(text) || DIVIDER_LOOKALIKE.test(text.trim())) {
+    return "\\" + text;
+  }
+  return text;
+}
+
+function unescapeLeadingBlockMarker(text: string): string {
+  if (
+    text[0] === "\\" &&
+    (LEADING_BLOCK_MARKER.test(text.slice(1)) ||
+      DIVIDER_LOOKALIKE.test(text.slice(1).trim()))
+  ) {
+    return text.slice(1);
+  }
+  return text;
+}
+
 function escapeAttr(value: string): string {
   return String(value)
     .replace(/&/g, "&amp;")
@@ -147,7 +136,6 @@ function hasUnsupportedJsxProps(raw: string): boolean {
   );
 }
 
-// Trailing `{toggle="true" color="red"}` attribute list on a block line.
 function blockAttrSuffix(opts: {
   toggle?: boolean;
   color?: string | null;
@@ -157,7 +145,22 @@ function blockAttrSuffix(opts: {
   if (isColor(opts.color)) parts.push(`color="${opts.color}"`);
   return parts.length ? ` {${parts.join(" ")}}` : "";
 }
-// Strip + read a trailing `{...}` attribute list from a block line.
+function oddTrailingBackslashes(s: string): boolean {
+  return (s.match(/\\+$/)?.[0].length ?? 0) % 2 === 1;
+}
+
+function escapeTrailingBackslashRun(s: string): string {
+  const run = s.match(/\\+$/)?.[0];
+  if (!run) return s;
+  return s.slice(0, -run.length) + run + run;
+}
+
+function unescapeTrailingBackslashRun(s: string): string {
+  const run = s.match(/\\+$/)?.[0];
+  if (!run) return s;
+  return s.slice(0, -run.length) + "\\".repeat(run.length / 2);
+}
+
 function splitBlockAttrs(line: string): {
   text: string;
   toggle: boolean;
@@ -166,18 +169,15 @@ function splitBlockAttrs(line: string): {
   const m = line.match(/^(.*?)\s*\{([^{}]*)\}\s*$/);
   if (!m) return { text: line, toggle: false, color: null };
   const body = m[2];
+  if (oddTrailingBackslashes(m[1]) || oddTrailingBackslashes(body)) {
+    return { text: line, toggle: false, color: null };
+  }
   const toggle = /\btoggle\s*=\s*"true"/.test(body);
   const colorMatch = body.match(/\bcolor\s*=\s*"([^"]+)"/);
   const color = colorMatch && isColor(colorMatch[1]) ? colorMatch[1] : null;
-  // Only treat as an attribute list if it actually contained known attrs;
-  // otherwise it was literal braces (which would have been escaped anyway).
   if (!toggle && !color) return { text: line, toggle: false, color: null };
   return { text: m[1], toggle, color };
 }
-
-// ════════════════════════════════════════════════════════════════════
-// INLINE: serialize
-// ════════════════════════════════════════════════════════════════════
 
 function markOf(node: PMNode, type: string): PMMark | undefined {
   return node.marks?.find((m) => m.type === type);
@@ -193,7 +193,7 @@ function serializeInlineAtom(node: PMNode): string {
     attrs = {};
   }
   if (tagName === "math") {
-    return "$`" + (label || attrs.latex || "") + "`$";
+    return "$" + (label || attrs.latex || "") + "$";
   }
   const attrEntries = Object.entries(attrs).filter(([k]) => k !== "latex");
   const attrStr = serializeAttrs(attrEntries);
@@ -207,63 +207,118 @@ function serializeInline(nodes: PMNode[] | undefined): string {
   return nodes.map(serializeInlineNode).join("");
 }
 
-function serializeInlineNode(node: PMNode): string {
-  if (node.type === "hardBreak") return "<br>";
-  if (node.type === "notionInlineAtom") return serializeInlineAtom(node);
-  if (node.type !== "text") {
-    // Unknown inline node — best-effort textContent.
-    return node.text ? escapeInlineText(node.text) : "";
-  }
-
+function serializeInlineTextNode(
+  node: PMNode,
+  collectOffsets: boolean,
+): {
+  source: string;
+  textOffsets: number[] | null;
+} | null {
+  if (node.type !== "text") return null;
   const raw = node.text ?? "";
   const code = markOf(node, "code");
   let out: string;
+  let textOffsets: number[] | null = collectOffsets ? [0] : null;
   if (code) {
-    out = "`" + raw.replace(/\n/g, "<br>") + "`";
+    const codeText = raw.replace(/\n/g, "<br>");
+    const isAllSpaces = /^ *$/.test(codeText);
+    const longestRun = Math.max(
+      0,
+      ...(codeText.match(/`+/g) || []).map((r) => r.length),
+    );
+    const delim = "`".repeat(Math.max(1, longestRun + 1));
+    const needsPadding =
+      !isAllSpaces &&
+      (codeText.startsWith("`") ||
+        codeText.endsWith("`") ||
+        codeText.startsWith(" ") ||
+        codeText.endsWith(" "));
+    const body = needsPadding ? ` ${codeText} ` : codeText;
+    out = delim + body + delim;
+    if (textOffsets) {
+      let contentOffset = delim.length + (needsPadding ? 1 : 0);
+      textOffsets = [contentOffset];
+      for (let index = 0; index < raw.length; index += 1) {
+        contentOffset += raw[index] === "\n" ? "<br>".length : 1;
+        textOffsets.push(contentOffset);
+      }
+    }
   } else {
     out = escapeInlineText(raw);
+    if (textOffsets) {
+      let contentOffset = 0;
+      textOffsets = [contentOffset];
+      for (let index = 0; index < raw.length; index += 1) {
+        contentOffset += escapeInlineText(raw[index]!).length;
+        textOffsets.push(contentOffset);
+      }
+    }
   }
+
+  const wrap = (prefix: string, suffix: string) => {
+    out = prefix + out + suffix;
+    if (textOffsets)
+      textOffsets = textOffsets.map((offset) => prefix.length + offset);
+  };
 
   const bold = markOf(node, "bold");
   const italic = markOf(node, "italic");
   if (bold && italic) {
-    out = "***" + out + "***";
+    wrap("***", "***");
   } else {
-    if (markOf(node, "strike")) out = "~~" + out + "~~";
-    if (italic) out = "*" + out + "*";
-    if (bold) out = "**" + out + "**";
+    if (markOf(node, "strike")) wrap("~~", "~~");
+    if (italic) wrap("*", "*");
+    if (bold) wrap("**", "**");
   }
   if (!(bold && italic) && markOf(node, "strike") && (bold || italic)) {
     // strike already applied above; nothing to do
   }
-  // strike for the bold+italic branch
   if (bold && italic && markOf(node, "strike")) {
-    out = "~~" + out + "~~";
+    wrap("~~", "~~");
   }
 
   const span = markOf(node, "notionSpan");
-  if (span) {
-    const a = span.attrs || {};
+  const plainUnderline = !!markOf(node, "underline");
+  if (span || plainUnderline) {
+    const a = span?.attrs || {};
+    const underlined =
+      a.underline === "true" || a.underline === true || plainUnderline;
+    const foregroundColor =
+      isColor(a.color) && !a.color.endsWith("_bg") ? a.color : null;
+    const backgroundColor =
+      isColor(a.bgColor) && a.bgColor.endsWith("_bg") ? a.bgColor : null;
     const attrStr = serializeAttrs([
-      ["color", a.color || a.bgColor || null],
-      [
-        "underline",
-        a.underline === "true" || a.underline === true ? "true" : null,
-      ],
+      ["color", foregroundColor || backgroundColor],
+      ["bg_color", foregroundColor ? backgroundColor : null],
+      ["underline", underlined ? "true" : null],
     ]);
-    if (attrStr) out = `<span${attrStr}>${out}</span>`;
+    if (attrStr) wrap(`<span${attrStr}>`, "</span>");
   }
 
   const link = markOf(node, "link");
   if (link?.attrs?.href) {
-    out = `[${out}](${link.attrs.href})`;
+    wrap("[", `](${serializeUrlForParens(link.attrs.href)})`);
   }
-  return out;
+  return { source: out, textOffsets };
 }
 
-// ════════════════════════════════════════════════════════════════════
-// INLINE: parse
-// ════════════════════════════════════════════════════════════════════
+export function serializeInlineTextNodeWithOffsets(node: PMNode): {
+  source: string;
+  textOffsets: number[];
+} | null {
+  const serialized = serializeInlineTextNode(node, true);
+  return serialized?.textOffsets
+    ? { source: serialized.source, textOffsets: serialized.textOffsets }
+    : null;
+}
+
+export function serializeInlineNode(node: PMNode): string {
+  if (node.type === "hardBreak") return "<br>";
+  if (node.type === "notionInlineAtom") return serializeInlineAtom(node);
+  const textNode = serializeInlineTextNode(node, false);
+  if (textNode) return textNode.source;
+  return node.text ? escapeInlineText(node.text) : "";
+}
 
 function textNode(text: string, marks: PMMark[]): PMNode {
   return marks.length ? { type: "text", text, marks } : { type: "text", text };
@@ -278,16 +333,29 @@ function addMark(nodes: PMNode[], mark: PMMark): void {
   }
 }
 
-function mergeSpanMark(nodes: PMNode[], attrs: Record<string, string>): void {
+/** The `notionSpan` mark attrs read from an NFM `<span>` tag's attributes. */
+export function notionSpanAttrs(
+  attrs: Record<string, string>,
+): Record<string, any> {
   const color = attrs.color;
   const isBg = color ? color.endsWith("_bg") : false;
-  const spanAttrs: Record<string, any> = {
-    color: color && !isBg ? color : null,
-    bgColor: color && isBg ? color : null,
+  const explicitBackground = attrs.bg_color;
+  return {
+    color: isColor(color) && !isBg ? color : null,
+    bgColor:
+      isColor(explicitBackground) && explicitBackground.endsWith("_bg")
+        ? explicitBackground
+        : isColor(color) && isBg
+          ? color
+          : null,
     underline: attrs.underline === "true" ? "true" : null,
     href: attrs.href || null,
     attrsJson: "{}",
   };
+}
+
+function mergeSpanMark(nodes: PMNode[], attrs: Record<string, string>): void {
+  const spanAttrs = notionSpanAttrs(attrs);
   for (const n of nodes) {
     if (n.type === "text") {
       n.marks = n.marks || [];
@@ -298,7 +366,6 @@ function mergeSpanMark(nodes: PMNode[], attrs: Record<string, string>): void {
   }
 }
 
-// Find the index of the next unescaped occurrence of `token` starting at `from`.
 function findToken(s: string, token: string, from: number): number {
   for (let i = from; i <= s.length - token.length; i++) {
     if (s[i] === "\\") {
@@ -324,41 +391,60 @@ function parseInline(input: string): PMNode[] {
   while (i < input.length) {
     const ch = input[i];
 
-    // Escape
     if (ch === "\\" && i + 1 < input.length && ESCAPABLE.has(input[i + 1])) {
       buf += input[i + 1];
       i += 2;
       continue;
     }
 
-    // Inline math $`...`$
-    if (ch === "$" && input[i + 1] === "`") {
-      const close = input.indexOf("`$", i + 2);
-      if (close !== -1) {
-        flush();
-        const latex = input.slice(i + 2, close);
-        out.push({
-          type: "notionInlineAtom",
-          attrs: { tagName: "math", attrsJson: "{}", label: latex },
-        });
-        i = close + 2;
-        continue;
-      }
+    const inlineMath = ch === "$" ? matchInlineMathAt(input, i) : null;
+    if (inlineMath) {
+      flush();
+      out.push({
+        type: "notionInlineAtom",
+        attrs: {
+          tagName: "math",
+          attrsJson: "{}",
+          label: inlineMath.latex,
+        },
+      });
+      i = inlineMath.to;
+      continue;
     }
 
-    // Inline code `...`
     if (ch === "`") {
-      const close = input.indexOf("`", i + 1);
+      const openRun = /^`+/.exec(input.slice(i))?.[0].length ?? 0;
+      const delim = "`".repeat(openRun);
+      let searchFrom = i + openRun;
+      let close = -1;
+      while (searchFrom <= input.length - openRun) {
+        const idx = input.indexOf(delim, searchFrom);
+        if (idx === -1) break;
+        const runLen = /^`+/.exec(input.slice(idx))?.[0].length ?? 0;
+        if (runLen === openRun) {
+          close = idx;
+          break;
+        }
+        searchFrom = idx + runLen;
+      }
       if (close !== -1) {
         flush();
-        const codeText = input.slice(i + 1, close).replace(/<br\/?>/g, "\n");
+        let codeText = input
+          .slice(i + openRun, close)
+          .replace(/<br\/?>/g, "\n");
+        if (
+          codeText.startsWith(" ") &&
+          codeText.endsWith(" ") &&
+          codeText.trim().length > 0
+        ) {
+          codeText = codeText.slice(1, -1);
+        }
         out.push(textNode(codeText, [{ type: "code" }]));
-        i = close + 1;
+        i = close + openRun;
         continue;
       }
     }
 
-    // Hard break
     if (input.startsWith("<br/>", i) || input.startsWith("<br>", i)) {
       flush();
       out.push({ type: "hardBreak" });
@@ -366,7 +452,6 @@ function parseInline(input: string): PMNode[] {
       continue;
     }
 
-    // <span ...>...</span>
     if (input.startsWith("<span", i)) {
       const open = input.indexOf(">", i);
       const close = input.indexOf("</span>", open);
@@ -375,17 +460,15 @@ function parseInline(input: string): PMNode[] {
         const attrs = parseAttrs(input.slice(i + 5, open));
         const inner = parseInline(input.slice(open + 1, close));
         mergeSpanMark(inner, attrs);
-        out.push(...inner);
+        pushAll(out, inner);
         i = close + "</span>".length;
         continue;
       }
     }
 
-    // Inline mention / atom tags: <mention-*...> or <mention-*.../>
     if (input.startsWith("<mention-", i)) {
       const selfClose = input.indexOf("/>", i);
       const open = input.indexOf(">", i);
-      // self-closing form <mention-date .../>
       if (selfClose !== -1 && (open === -1 || selfClose <= open)) {
         flush();
         const tagMatch = input.slice(i).match(/^<(mention-[\w-]+)([^>]*?)\/>/);
@@ -406,7 +489,6 @@ function parseInline(input: string): PMNode[] {
       }
     }
 
-    // Bold+italic ***...***
     if (input.startsWith("***", i)) {
       const close = findToken(input, "***", i + 3);
       if (close !== -1) {
@@ -414,59 +496,55 @@ function parseInline(input: string): PMNode[] {
         const inner = parseInline(input.slice(i + 3, close));
         addMark(inner, { type: "bold" });
         addMark(inner, { type: "italic" });
-        out.push(...inner);
+        pushAll(out, inner);
         i = close + 3;
         continue;
       }
     }
 
-    // Bold **...**
     if (input.startsWith("**", i)) {
       const close = findToken(input, "**", i + 2);
       if (close !== -1) {
         flush();
         const inner = parseInline(input.slice(i + 2, close));
         addMark(inner, { type: "bold" });
-        out.push(...inner);
+        pushAll(out, inner);
         i = close + 2;
         continue;
       }
     }
 
-    // Strike ~~...~~
     if (input.startsWith("~~", i)) {
       const close = findToken(input, "~~", i + 2);
       if (close !== -1) {
         flush();
         const inner = parseInline(input.slice(i + 2, close));
         addMark(inner, { type: "strike" });
-        out.push(...inner);
+        pushAll(out, inner);
         i = close + 2;
         continue;
       }
     }
 
-    // Italic *...*
     if (ch === "*") {
       const close = findToken(input, "*", i + 1);
       if (close !== -1) {
         flush();
         const inner = parseInline(input.slice(i + 1, close));
         addMark(inner, { type: "italic" });
-        out.push(...inner);
+        pushAll(out, inner);
         i = close + 1;
         continue;
       }
     }
 
-    // Link [text](url)
     if (ch === "[") {
       const link = matchLink(input, i);
       if (link) {
         flush();
         const inner = parseInline(link.text);
         addMark(inner, { type: "link", attrs: { href: link.href } });
-        out.push(...inner);
+        pushAll(out, inner);
         i = link.end;
         continue;
       }
@@ -490,20 +568,14 @@ function makeInlineAtom(
     attrs: {
       tagName,
       attrsJson: JSON.stringify(attrs),
-      label: label.trim(),
+      label: unescapeAttr(label).trim(),
     },
   };
 }
 
-function matchLink(
-  s: string,
-  start: number,
-): { text: string; href: string; end: number } | null {
-  // Find matching unescaped ] then immediately ( ... )
+function findMatchingBracketClose(s: string, start: number): number {
   let depth = 0;
-  let i = start;
-  let closeBracket = -1;
-  for (; i < s.length; i++) {
+  for (let i = start; i < s.length; i++) {
     if (s[i] === "\\") {
       i++;
       continue;
@@ -511,56 +583,86 @@ function matchLink(
     if (s[i] === "[") depth++;
     else if (s[i] === "]") {
       depth--;
-      if (depth === 0) {
-        closeBracket = i;
-        break;
-      }
+      if (depth === 0) return i;
     }
   }
+  return -1;
+}
+
+function findMatchingParenClose(s: string, openParenIdx: number): number {
+  let depth = 0;
+  for (let i = openParenIdx; i < s.length; i++) {
+    if (s[i] === "\\") {
+      i++;
+      continue;
+    }
+    if (s[i] === "(") depth++;
+    else if (s[i] === ")") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function hasBalancedParens(url: string): boolean {
+  let depth = 0;
+  for (let i = 0; i < url.length; i++) {
+    if (url[i] === "(") depth++;
+    else if (url[i] === ")") {
+      depth--;
+      if (depth < 0) return false;
+    }
+  }
+  return depth === 0;
+}
+
+function serializeUrlForParens(url: string): string {
+  if (hasBalancedParens(url)) return url;
+  return url.replace(/[()]/g, (ch) => "\\" + ch);
+}
+
+function unescapeUrlParens(url: string): string {
+  return url.replace(/\\([()])/g, "$1");
+}
+
+function matchLink(
+  s: string,
+  start: number,
+): { text: string; href: string; end: number } | null {
+  const closeBracket = findMatchingBracketClose(s, start);
   if (closeBracket === -1 || s[closeBracket + 1] !== "(") return null;
-  const closeParen = s.indexOf(")", closeBracket + 2);
+  const closeParen = findMatchingParenClose(s, closeBracket + 1);
   if (closeParen === -1) return null;
   return {
     text: s.slice(start + 1, closeBracket),
-    href: s.slice(closeBracket + 2, closeParen),
+    href: unescapeUrlParens(s.slice(closeBracket + 2, closeParen)),
     end: closeParen + 1,
   };
 }
-
-// ════════════════════════════════════════════════════════════════════
-// BLOCK: serialize (docToNfm)
-// ════════════════════════════════════════════════════════════════════
 
 const TAB = "\t";
 function indentStr(n: number): string {
   return TAB.repeat(Math.max(0, n));
 }
 
-/**
- * Optional serialize-side context for registry blocks. When the editor has live
- * typed `data` for a `registryBlock` node (from the side-map), it supplies
- * `serializeRegistryBlock(blockId)` so an EDITED block re-serializes from its
- * current data. An UNTOUCHED block (server pull, content hashing, or any
- * block the context can't resolve) falls back to the node's preserved `__raw`,
- * keeping the round-trip byte-exact with no registry/React dependency.
- *
- * It is held in a module-scoped guard for the duration of the synchronous
- * `docToNfm` call rather than threaded through every serialize helper — JS is
- * single-threaded and `docToNfm` is synchronous and non-reentrant, so the guard
- * is set on entry and always cleared in `finally`.
- */
 export interface NfmSerializeContext {
-  /**
-   * Re-serialize a registry block to its exact MDX string from the editor's
-   * current typed `data`, or return `undefined`/`null` to fall back to `__raw`.
-   */
   serializeRegistryBlock?: (
     blockId: string,
     node: PMNode,
   ) => string | undefined | null;
 }
 
+/**
+ * Appends without spreading: `push(...items)` passes each item as an argument,
+ * and a long document has more blocks or lines than the stack holds.
+ */
+export function pushAll<T>(target: T[], items: readonly T[]) {
+  for (const item of items) target.push(item);
+}
+
 let activeSerializeContext: NfmSerializeContext | null = null;
+let suppressTerminalFillerTrim = false;
 
 export function docToNfm(
   doc: PMDoc | PMNode | null | undefined,
@@ -570,7 +672,7 @@ export function docToNfm(
   const previous = activeSerializeContext;
   activeSerializeContext = context ?? null;
   try {
-    const lines = serializeBlocks(content, 0);
+    const lines = serializeBlocks(content, 0, /* isTopLevel */ true);
     return lines.join("\n");
   } finally {
     activeSerializeContext = previous;
@@ -585,6 +687,7 @@ function isEmptyParagraphNode(node: PMNode | undefined): boolean {
 }
 
 function trimEditorTerminalFiller(blocks: PMNode[]): PMNode[] {
+  if (suppressTerminalFillerTrim) return blocks;
   if (blocks.length < 2) return blocks;
   const last = blocks[blocks.length - 1];
   const previous = blocks[blocks.length - 2];
@@ -594,17 +697,23 @@ function trimEditorTerminalFiller(blocks: PMNode[]): PMNode[] {
   return blocks.slice(0, -1);
 }
 
-function serializeBlocks(blocks: PMNode[], indent: number): string[] {
+function serializeBlocks(
+  blocks: PMNode[],
+  indent: number,
+  isTopLevel = false,
+): string[] {
   const out: string[] = [];
-  const serializableBlocks = trimEditorTerminalFiller(blocks);
+  const serializableBlocks = isTopLevel
+    ? trimEditorTerminalFiller(blocks)
+    : blocks;
   for (let i = 0; i < serializableBlocks.length; i++) {
     const block = serializableBlocks[i];
     if (block.type === "bulletList" || block.type === "orderedList") {
-      out.push(...serializeList(block, indent));
+      pushAll(out, serializeList(block, indent));
     } else if (block.type === "taskList") {
-      out.push(...serializeTaskList(block, indent));
+      pushAll(out, serializeTaskList(block, indent));
     } else {
-      out.push(...serializeBlock(block, indent));
+      pushAll(out, serializeBlock(block, indent));
     }
   }
   return out;
@@ -624,11 +733,13 @@ function serializeBlock(node: PMNode, indent: number): string[] {
       const inline = serializeInline(node.content);
       if (!inline) return [indentStr(ind) + "<empty-block/>"];
       return [
-        indentStr(ind) + inline + blockAttrSuffix({ color: node.attrs?.color }),
+        indentStr(ind) +
+          escapeLeadingBlockMarker(inline) +
+          blockAttrSuffix({ color: node.attrs?.color }),
       ];
     }
     case "heading": {
-      const level = Math.min(4, Math.max(1, Number(node.attrs?.level) || 1));
+      const level = Math.min(6, Math.max(1, Number(node.attrs?.level) || 1));
       const inline = serializeInline(node.content);
       return [
         indentStr(ind) +
@@ -644,7 +755,12 @@ function serializeBlock(node: PMNode, indent: number): string[] {
       const lang = (node.attrs?.language as string) || "";
       const text = (node.content || []).map((t) => t.text || "").join("");
       const body = text.split("\n").map((l) => indentStr(ind) + l);
-      return [indentStr(ind) + "```" + lang, ...body, indentStr(ind) + "```"];
+      const longestRun = Math.max(
+        0,
+        ...(text.match(/`+/g) || []).map((r) => r.length),
+      );
+      const fence = "`".repeat(Math.max(3, longestRun + 1));
+      return [indentStr(ind) + fence + lang, ...body, indentStr(ind) + fence];
     }
     case "blockquote":
       return serializeQuote(node, ind);
@@ -656,7 +772,7 @@ function serializeBlock(node: PMNode, indent: number): string[] {
       return serializeColumns(node, ind);
     case "notionColumn": {
       const out = [indentStr(ind) + "<column>"];
-      out.push(...serializeBlocks(node.content || [], ind + 1));
+      pushAll(out, serializeBlocks(node.content || [], ind + 1));
       out.push(indentStr(ind) + "</column>");
       return out;
     }
@@ -673,21 +789,16 @@ function serializeBlock(node: PMNode, indent: number): string[] {
       return serializeBlockAtom(node, ind);
     case "registryBlock":
       return serializeRegistryBlock(node, ind);
+    case "contentReference":
     case "localMdxComponent":
       return serializeRawSourceBlock(node, ind);
     default: {
-      // Unknown block: preserve its raw text if present so nothing is lost.
       const raw = serializeRawSourceBlock(node, ind);
       if (raw.length > 0) return raw;
       const inline = serializeInline(node.content);
       return inline ? [indentStr(ind) + inline] : [];
     }
   }
-}
-
-function serializeChildrenAfterFirst(node: PMNode, indent: number): string[] {
-  const children = (node.content || []).slice(1);
-  return serializeBlocks(children, indent);
 }
 
 function serializeQuote(node: PMNode, ind: number): string[] {
@@ -700,11 +811,10 @@ function serializeQuote(node: PMNode, ind: number): string[] {
       inline +
       blockAttrSuffix({ color: node.attrs?.color }),
   );
-  // Children (blocks after the text paragraph) are nested one tab deeper.
   const children = textPara
     ? (node.content || []).slice(1)
     : node.content || [];
-  out.push(...serializeBlocks(children, ind + 1));
+  pushAll(out, serializeBlocks(children, ind + 1));
   return out;
 }
 
@@ -718,16 +828,17 @@ function serializeToggle(node: PMNode, ind: number): string[] {
       indentStr(ind) +
         "#".repeat(headingLevel) +
         " " +
-        escapeInlineText(summary) +
+        escapeTrailingBackslashRun(summary) +
         blockAttrSuffix({ toggle: true, color }),
     );
-    out.push(...serializeBlocks(node.content || [], ind + 1));
+    pushAll(out, serializeBlocks(node.content || [], ind + 1));
     return out;
   }
   const attrStr = serializeAttrs([["color", isColor(color) ? color : null]]);
-  out.push(indentStr(ind) + `<details${attrStr}>`);
-  out.push(indentStr(ind) + `<summary>${escapeInlineText(summary)}</summary>`);
-  out.push(...serializeBlocks(node.content || [], ind + 1));
+  const openAttr = node.attrs?.open === true ? " open" : "";
+  out.push(indentStr(ind) + `<details${attrStr}${openAttr}>`);
+  out.push(indentStr(ind) + `<summary>${summary}</summary>`);
+  pushAll(out, serializeBlocks(node.content || [], ind + 1));
   out.push(indentStr(ind) + "</details>");
   return out;
 }
@@ -740,14 +851,14 @@ function serializeCallout(node: PMNode, ind: number): string[] {
     ["color", isColor(color) ? color : null],
   ]);
   const out = [indentStr(ind) + `<callout${attrStr}>`];
-  out.push(...serializeBlocks(node.content || [], ind + 1));
+  pushAll(out, serializeBlocks(node.content || [], ind + 1));
   out.push(indentStr(ind) + "</callout>");
   return out;
 }
 
 function serializeColumns(node: PMNode, ind: number): string[] {
   const out = [indentStr(ind) + "<columns>"];
-  out.push(...serializeBlocks(node.content || [], ind + 1));
+  pushAll(out, serializeBlocks(node.content || [], ind + 1));
   out.push(indentStr(ind) + "</columns>");
   return out;
 }
@@ -761,7 +872,7 @@ function serializeSynced(node: PMNode, ind: number): string[] {
     ["notice", node.attrs?.notice || null],
   ]);
   const out = [indentStr(ind) + `<${tag}${attrStr}>`];
-  out.push(...serializeBlocks(node.content || [], ind + 1));
+  pushAll(out, serializeBlocks(node.content || [], ind + 1));
   out.push(indentStr(ind) + `</${tag}>`);
   return out;
 }
@@ -771,11 +882,14 @@ function serializeImage(node: PMNode, ind: number): string[] {
   const alt = (node.attrs?.alt as string) || "";
   const color = node.attrs?.color;
   const suffix = isColor(color) ? ` {color="${color}"}` : "";
-  return [indentStr(ind) + `![${escapeInlineText(alt)}](${src})${suffix}`];
+  return [
+    indentStr(ind) +
+      `![${escapeInlineText(alt)}](${serializeUrlForParens(src)})${suffix}`,
+  ];
 }
 
 function serializeMedia(node: PMNode, ind: number): string[] {
-  const tag = node.type; // video | audio
+  const tag = node.type;
   const src = (node.attrs?.src as string) || "";
   const caption = (node.attrs?.title as string) || "";
   const color = node.attrs?.color;
@@ -790,6 +904,9 @@ function serializeMedia(node: PMNode, ind: number): string[] {
 }
 
 function serializeBlockAtom(node: PMNode, ind: number): string[] {
+  const raw = serializeRawSourceBlock(node, ind);
+  if (raw.length > 0) return raw;
+
   const tagName = (node.attrs?.tagName as string) || "unknown";
   const label = (node.attrs?.label as string) || "";
   let attrs: Record<string, string> = {};
@@ -819,21 +936,6 @@ function serializeBlockAtom(node: PMNode, ind: number): string[] {
   return [indentStr(ind) + `<${tagName}${attrStr}/>`];
 }
 
-/**
- * Serialize a `registryBlock` atom node back to its inline MDX element lines.
- *
- * Order of precedence:
- *   1. An EDITED block: the active serialize context resolves the node by its
- *      `blockId` to a fresh MDX string re-serialized from the editor's typed
- *      `data` (via core `serializeSpecBlock`).
- *   2. An UNTOUCHED block: emit the node's preserved `__raw` verbatim — the
- *      exact bytes captured on parse. This is the default path for server pull,
- *      content hashing, and any block the context can't (or chooses not to)
- *      re-serialize, so the round-trip stays byte-exact with no React/registry.
- *
- * Either way the resulting MDX is split on newlines and each line is indented to
- * the block's structural depth, exactly like every other block.
- */
 function serializeRegistryBlock(node: PMNode, ind: number): string[] {
   const blockId = (node.attrs?.blockId as string) || "";
   const fromContext =
@@ -869,7 +971,7 @@ function serializeList(node: PMNode, indent: number): string[] {
     const children = textPara
       ? (item.content || []).slice(1)
       : item.content || [];
-    out.push(...serializeBlocks(children, indent + 1));
+    pushAll(out, serializeBlocks(children, indent + 1));
     n++;
   }
   return out;
@@ -891,9 +993,47 @@ function serializeTaskList(node: PMNode, indent: number): string[] {
     const children = textPara
       ? (item.content || []).slice(1)
       : item.content || [];
-    out.push(...serializeBlocks(children, indent + 1));
+    pushAll(out, serializeBlocks(children, indent + 1));
   }
   return out;
+}
+
+function serializeCellInline(cell: PMNode): string {
+  const parts: string[] = [];
+  for (const child of cell.content || []) {
+    const part = serializeCellChildInline(child);
+    if (part) parts.push(part);
+  }
+  return parts.join("<br>");
+}
+
+function serializeCellChildInline(node: PMNode): string {
+  switch (node.type) {
+    case "paragraph":
+    case "heading":
+      return serializeInline(node.content);
+    case "bulletList":
+    case "orderedList":
+    case "taskList": {
+      const items: string[] = [];
+      for (const item of node.content || []) {
+        const textPara = firstParagraph(item);
+        const inline = textPara ? serializeInline(textPara.content) : "";
+        if (inline) items.push(inline);
+      }
+      return items.join("<br>");
+    }
+    case "blockquote": {
+      const parts: string[] = [];
+      for (const child of node.content || []) {
+        const part = serializeCellChildInline(child);
+        if (part) parts.push(part);
+      }
+      return parts.join("<br>");
+    }
+    default:
+      return serializeInline(node.content);
+  }
 }
 
 function serializeTable(node: PMNode, ind: number): string[] {
@@ -929,11 +1069,14 @@ function serializeTable(node: PMNode, ind: number): string[] {
     out.push(indentStr(ind) + `<tr${rowAttrStr}>`);
     for (const cell of row.content || []) {
       const cellColor = isColor(cell.attrs?.color) ? cell.attrs?.color : null;
-      // Cells hold inline rich text only; flatten the single paragraph.
-      const para =
-        cell.content?.find((c) => c.type === "paragraph") || cell.content?.[0];
-      const inline = para ? serializeInline(para.content) : "";
-      const cellAttrStr = serializeAttrs([["color", cellColor]]);
+      const inline = serializeCellInline(cell);
+      const cellAttrStr = serializeAttrs([
+        ["color", cellColor],
+        [
+          "align",
+          isTableAlignment(cell.attrs?.textAlign) ? cell.attrs.textAlign : null,
+        ],
+      ]);
       out.push(indentStr(ind) + `<td${cellAttrStr}>${inline}</td>`);
     }
     out.push(indentStr(ind) + "</tr>");
@@ -941,10 +1084,6 @@ function serializeTable(node: PMNode, ind: number): string[] {
   out.push(indentStr(ind) + "</table>");
   return out;
 }
-
-// ════════════════════════════════════════════════════════════════════
-// BLOCK: parse (nfmToDoc)
-// ════════════════════════════════════════════════════════════════════
 
 function leadingTabs(line: string): number {
   let n = 0;
@@ -997,7 +1136,13 @@ function parseBlockSequence(
     const dedent = raw.slice(ind);
     const rel = ind - baseIndent;
 
-    // Lists group consecutive items.
+    const pipeTable = parseGfmPipeTable(lines, i, ind, rel);
+    if (pipeTable) {
+      out.push(pipeTable.nodes[0]);
+      i = pipeTable.end;
+      continue;
+    }
+
     const listKind = listKindOf(dedent);
     if (listKind) {
       const res = parseList(lines, i, ind, listKind);
@@ -1007,11 +1152,240 @@ function parseBlockSequence(
     }
 
     const res = parseSingleBlock(lines, i, ind, rel);
-    if (res.nodes.length) out.push(...res.nodes);
+    pushAll(out, res.nodes);
     i = res.end;
   }
 
   return { nodes: out, end: i };
+}
+
+function parseDetailsBody(
+  lines: string[],
+  start: number,
+  end: number,
+  parentIndent: number,
+): PMNode[] {
+  const childIndent = parentIndent + 1;
+  const nestedContainers: Array<{ tagKey: string; closeTag: string }> = [];
+  let fence: { length: number; promoteBy: number } | undefined;
+  const sourceLines = lines.slice(start, end);
+  const hasMatchingClose = (from: number, tagKey: string): boolean => {
+    const closeTag = CONTAINER_CLOSE[tagKey];
+    let depth = 1;
+    let fenceLength = 0;
+    for (let i = from + 1; i < sourceLines.length; i++) {
+      const candidate = sourceLines[i].slice(leadingTabs(sourceLines[i]));
+      const fenceMatch = candidate.match(/^(`{3,})(.*)$/);
+      if (fenceLength) {
+        if (
+          fenceMatch &&
+          !fenceMatch[2].trim() &&
+          fenceMatch[1].length >= fenceLength
+        ) {
+          fenceLength = 0;
+        }
+        continue;
+      }
+      if (fenceMatch) {
+        fenceLength = fenceMatch[1].length;
+        continue;
+      }
+      if (matchContainerOpen(candidate) === tagKey) depth++;
+      if (candidate === closeTag && --depth === 0) return true;
+    }
+    return false;
+  };
+  const bodyLines = sourceLines.map((line, lineIndex) => {
+    const indent = leadingTabs(line);
+    const dedented = line.slice(indent);
+    if (fence) {
+      const requiredIndent = childIndent + nestedContainers.length;
+      const promoteBy =
+        fence.promoteBy > 0
+          ? fence.promoteBy
+          : Math.max(0, requiredIndent - indent);
+      const promoted = `${"\t".repeat(promoteBy)}${line}`;
+      const close = dedented.match(/^(`{3,})\s*$/);
+      if (close && close[1].length >= fence.length) fence = undefined;
+      return promoted;
+    }
+    if (nestedContainers[nestedContainers.length - 1]?.closeTag === dedented) {
+      nestedContainers.pop();
+    }
+    const detailsSummary =
+      nestedContainers[nestedContainers.length - 1]?.tagKey === "<details" &&
+      /^<summary>[\s\S]*<\/summary>\s*$/.test(dedented);
+    const requiredIndent =
+      childIndent + nestedContainers.length - (detailsSummary ? 1 : 0);
+    const open = dedented.match(/^(`{3,})(.*)$/);
+    if (open) {
+      const promoteBy = Math.max(0, requiredIndent - indent);
+      fence = { length: open[1].length, promoteBy };
+      return `${"\t".repeat(promoteBy)}${line}`;
+    }
+    if (!line.trim()) return line;
+    const tagKey = matchContainerOpen(dedented);
+    if (
+      tagKey &&
+      tagKey !== "<table" &&
+      tagKey !== "<meeting-notes>" &&
+      hasMatchingClose(lineIndex, tagKey)
+    ) {
+      nestedContainers.push({ tagKey, closeTag: CONTAINER_CLOSE[tagKey] });
+    }
+    if (indent >= requiredIndent) return line;
+    return `${"\t".repeat(requiredIndent - indent)}${line}`;
+  });
+  return parseBlockSequence(bodyLines, 0, childIndent).nodes;
+}
+
+function endsWithUnescapedPipe(value: string): boolean {
+  if (!value.endsWith("|")) return false;
+  let backslashes = 0;
+  for (let i = value.length - 2; i >= 0 && value[i] === "\\"; i--) {
+    backslashes++;
+  }
+  return backslashes % 2 === 0;
+}
+
+function hasMatchingBacktickRun(
+  value: string,
+  start: number,
+  expectedLength: number,
+): boolean {
+  for (let i = start; i < value.length; i++) {
+    if (value[i] === "\\") {
+      i++;
+      continue;
+    }
+    if (value[i] !== "`") continue;
+    let runLength = 1;
+    while (value[i + runLength] === "`") runLength++;
+    if (runLength === expectedLength) return true;
+    i += runLength - 1;
+  }
+  return false;
+}
+
+export function splitGfmPipeRow(line: string): string[] | null {
+  const value = line.trim();
+  if (!value) return null;
+
+  const cells: string[] = [];
+  let cell = "";
+  let codeFenceLength = 0;
+  let sawSeparator = false;
+
+  for (let i = 0; i < value.length; i++) {
+    const char = value[i];
+    if (char === "\\" && i + 1 < value.length) {
+      cell += char + value[++i];
+      continue;
+    }
+    if (char === "`") {
+      let runLength = 1;
+      while (value[i + runLength] === "`") runLength++;
+      if (
+        codeFenceLength === 0 &&
+        hasMatchingBacktickRun(value, i + runLength, runLength)
+      )
+        codeFenceLength = runLength;
+      else if (codeFenceLength === runLength) codeFenceLength = 0;
+      cell += "`".repeat(runLength);
+      i += runLength - 1;
+      continue;
+    }
+    if (char === "|" && codeFenceLength === 0) {
+      cells.push(cell.trim());
+      cell = "";
+      sawSeparator = true;
+      continue;
+    }
+    cell += char;
+  }
+  cells.push(cell.trim());
+
+  if (!sawSeparator) return null;
+  if (value.startsWith("|")) cells.shift();
+  if (endsWithUnescapedPipe(value)) cells.pop();
+  return cells;
+}
+
+function isGfmDelimiterCell(value: string): boolean {
+  return /^-{3,}$/.test(value.trim());
+}
+
+function isAlignedGfmDelimiterCell(value: string): boolean {
+  return /^:?-{3,}:?$/.test(value.trim()) && value.includes(":");
+}
+
+function isTableAlignment(
+  value: unknown,
+): value is "left" | "center" | "right" {
+  return value === "left" || value === "center" || value === "right";
+}
+
+function parseGfmPipeTable(
+  lines: string[],
+  start: number,
+  indent: number,
+  rel: number,
+): ParseResult | null {
+  if (start + 1 >= lines.length) return null;
+  if (leadingTabs(lines[start + 1]) !== indent) return null;
+
+  const header = splitGfmPipeRow(lines[start].slice(indent));
+  const delimiter = splitGfmPipeRow(lines[start + 1].slice(indent));
+  if (
+    !header ||
+    !delimiter ||
+    header.length === 0 ||
+    header.length !== delimiter.length ||
+    !delimiter.every(
+      (cell) => isGfmDelimiterCell(cell) || isAlignedGfmDelimiterCell(cell),
+    )
+  ) {
+    return null;
+  }
+
+  const rows = [header];
+  let end = start + 2;
+  while (end < lines.length) {
+    if (lines[end].trim() === "" || leadingTabs(lines[end]) !== indent) break;
+    if (/^ {0,3}#{1,6}(?:\s|$)/.test(lines[end].slice(indent))) break;
+    const row = splitGfmPipeRow(lines[end].slice(indent));
+    if (!row) break;
+    rows.push(row);
+    end++;
+  }
+
+  const columnCount = Math.max(header.length, ...rows.map((row) => row.length));
+  const alignments = delimiter.map((cell) => {
+    if (cell.startsWith(":") && cell.endsWith(":")) return "center";
+    if (cell.endsWith(":")) return "right";
+    if (cell.startsWith(":")) return "left";
+    return null;
+  });
+  const tableRows = rows.map((row, rowIndex) => ({
+    type: "tableRow",
+    attrs: { color: null },
+    content: Array.from({ length: columnCount }, (_, index) => ({
+      type: rowIndex === 0 ? "tableHeader" : "tableCell",
+      attrs: { color: null, textAlign: alignments[index] ?? null },
+      content: [{ type: "paragraph", content: parseInline(row[index] ?? "") }],
+    })),
+  }));
+  const attrs: Record<string, unknown> = {
+    headerRow: true,
+    headerColumn: false,
+    fitPageWidth: false,
+    colMeta: null,
+  };
+  if (rel > 0) attrs.indent = rel;
+  return {
+    nodes: [{ type: "table", attrs, content: tableRows }],
+    end,
+  };
 }
 
 type ListKind = "bullet" | "ordered" | "task";
@@ -1061,7 +1435,6 @@ function parseList(
     const para: PMNode = { type: "paragraph", content: parseInline(text) };
     if (isColor(color)) para.attrs = { color };
 
-    // Children: deeper-indented blocks belong to this item.
     const childRes = parseBlockSequence(lines, i + 1, indent + 1);
     const itemContent: PMNode[] = [para, ...childRes.nodes];
 
@@ -1102,12 +1475,10 @@ function parseSingleBlock(
     return node;
   };
 
-  // Empty block
   if (/^<empty-block\s*\/?>/.test(dedent)) {
     return { nodes: [withIndentAttr({ type: "paragraph" })], end: start + 1 };
   }
 
-  // Divider
   if (/^(---+|\*\*\*+|___+)$/.test(dedent.trim())) {
     return {
       nodes: [withIndentAttr({ type: "horizontalRule" })],
@@ -1115,16 +1486,22 @@ function parseSingleBlock(
     };
   }
 
-  // Code fence
-  if (/^```/.test(dedent)) {
-    const lang = dedent.slice(3).trim();
+  const fenceOpenMatch = dedent.match(/^(`{3,})(.*)$/);
+  if (fenceOpenMatch) {
+    const fenceLen = fenceOpenMatch[1].length;
+    const lang = fenceOpenMatch[2].trim();
     const body: string[] = [];
     let i = start + 1;
     for (; i < lines.length; i++) {
       const l = lines[i];
       const ld = l.slice(Math.min(indent, leadingTabs(l)));
-      if (/^```\s*$/.test(ld.trim()) && leadingTabs(l) >= indent) break;
-      // Strip exactly `indent` leading tabs (structural), keep the rest literal.
+      const closeMatch = ld.trim().match(/^(`{3,})\s*$/);
+      if (
+        closeMatch &&
+        closeMatch[1].length >= fenceLen &&
+        leadingTabs(l) >= indent
+      )
+        break;
       body.push(stripTabs(l, indent));
     }
     const node: PMNode = {
@@ -1135,7 +1512,6 @@ function parseSingleBlock(
     return { nodes: [withIndentAttr(node)], end: i + 1 };
   }
 
-  // Block equation $$ ... $$
   if (dedent.trim() === "$$") {
     const body: string[] = [];
     let i = start + 1;
@@ -1158,17 +1534,16 @@ function parseSingleBlock(
     return { nodes: [withIndentAttr(node)], end: i + 1 };
   }
 
-  // Heading (possibly a toggle heading)
   const headingMatch = dedent.match(/^(#{1,6})\s+(.*)$/);
   if (headingMatch) {
-    const level = Math.min(4, headingMatch[1].length);
+    const level = headingMatch[1].length;
     const { text, toggle, color } = splitBlockAttrs(headingMatch[2]);
     if (toggle) {
       const childRes = parseBlockSequence(lines, start + 1, indent + 1);
       const node: PMNode = {
         type: "notionToggle",
         attrs: {
-          summary: unescapeInlineText(text),
+          summary: unescapeTrailingBackslashRun(text),
           headingLevel: level,
           open: false,
           color: isColor(color) ? color : null,
@@ -1186,7 +1561,6 @@ function parseSingleBlock(
     return { nodes: [withIndentAttr(node)], end: start + 1 };
   }
 
-  // Quote
   if (/^> /.test(dedent) || dedent === ">") {
     const { text, color } = splitBlockAttrs(dedent.replace(/^>\s?/, ""));
     const textPara: PMNode = { type: "paragraph", content: parseInline(text) };
@@ -1199,21 +1573,22 @@ function parseSingleBlock(
     return { nodes: [withIndentAttr(node)], end: childRes.end };
   }
 
-  // Registry block (PascalCase MDX element: <Endpoint .../>, <Checklist .../>,
-  // <DataModel …>…</DataModel>, …). These are the dev-doc / OpenAPI library
-  // blocks shared with plan, encoded inline. They are recognized by the content
-  // registry's tag set; lowercase Notion container tags never match. The
-  // verbatim element source is preserved as `__raw` so an untouched block
-  // round-trips byte-exact without the registry/React; the editor hydrates typed
-  // `data` from `__raw` separately via `parseRegistryBlockData`.
+  const contentReferenceTag = matchContentReferenceOpen(dedent);
+  if (contentReferenceTag) {
+    return parseContentReference(
+      lines,
+      start,
+      indent,
+      rel,
+      contentReferenceTag,
+    );
+  }
+
   const registryTag = matchRegistryBlockOpen(dedent);
   if (registryTag) {
     return parseRegistryBlock(lines, start, indent, rel, registryTag);
   }
 
-  // Repo-local MDX component (PascalCase element not owned by the shared block
-  // registry). It remains source-of-truth MDX on disk, but can render through
-  // the local `components/*` preview bridge in the editor.
   const localMdxComponentTag = matchLocalMdxComponentOpen(dedent);
   if (localMdxComponentTag) {
     return parseLocalMdxComponent(
@@ -1225,32 +1600,40 @@ function parseSingleBlock(
     );
   }
 
-  // Container tags
   const containerTag = matchContainerOpen(dedent);
   if (containerTag) {
     return parseContainer(lines, start, indent, rel, containerTag);
   }
 
-  // Image ![alt](src)
-  const imageMatch = dedent.match(
-    /^!\[([^\]]*)\]\(([^)]*)\)\s*(\{[^}]*\})?\s*$/,
-  );
-  if (imageMatch) {
-    const colorMatch = imageMatch[3]?.match(/color="([^"]+)"/);
-    const node: PMNode = {
-      type: "image",
-      attrs: {
-        src: imageMatch[2],
-        alt: unescapeInlineText(imageMatch[1]),
-        ...(colorMatch && isColor(colorMatch[1])
-          ? { color: colorMatch[1] }
-          : {}),
-      },
-    };
-    return { nodes: [withIndentAttr(node)], end: start + 1 };
+  if (dedent.startsWith("![")) {
+    const altCloseBracket = findMatchingBracketClose(dedent, 1);
+    if (altCloseBracket !== -1 && dedent[altCloseBracket + 1] === "(") {
+      const srcCloseParen = findMatchingParenClose(dedent, altCloseBracket + 1);
+      if (srcCloseParen !== -1) {
+        const alt = dedent.slice(2, altCloseBracket);
+        const src = unescapeUrlParens(
+          dedent.slice(altCloseBracket + 2, srcCloseParen),
+        );
+        const rest = dedent.slice(srcCloseParen + 1);
+        const suffixMatch = rest.match(/^\s*(\{[^}]*\})?\s*$/);
+        if (suffixMatch) {
+          const colorMatch = suffixMatch[1]?.match(/color="([^"]+)"/);
+          const node: PMNode = {
+            type: "image",
+            attrs: {
+              src,
+              alt: unescapeInlineText(alt),
+              ...(colorMatch && isColor(colorMatch[1])
+                ? { color: colorMatch[1] }
+                : {}),
+            },
+          };
+          return { nodes: [withIndentAttr(node)], end: start + 1 };
+        }
+      }
+    }
   }
 
-  // Self-contained media / atom tags on one line: <video.../>, <page ...>..</page>, <x .../>
   const tagLine = dedent.match(
     /^<([a-zA-Z_][\w-]*)([^>]*?)(\/?)>(?:([\s\S]*?)<\/\1>)?\s*$/,
   );
@@ -1259,9 +1642,11 @@ function parseSingleBlock(
     if (node) return { nodes: [withIndentAttr(node)], end: start + 1 };
   }
 
-  // Plain paragraph
   const { text, color } = splitBlockAttrs(dedent);
-  const node: PMNode = { type: "paragraph", content: parseInline(text) };
+  const node: PMNode = {
+    type: "paragraph",
+    content: parseInline(unescapeLeadingBlockMarker(text)),
+  };
   if (isColor(color)) node.attrs = { color };
   return { nodes: [withIndentAttr(node)], end: start + 1 };
 }
@@ -1272,20 +1657,17 @@ function stripTabs(line: string, count: number): string {
   return line.slice(i);
 }
 
-/**
- * Match a REGISTERED registry-block open tag at the start of a dedented line and
- * return its tag name, or `null`. Only registry tags (`registryBlockSpecByTag`)
- * match, so lowercase Notion container/atom tags (`callout`, `details`, `table`,
- * `page`, `column`) and unknown tags fall through to their existing handling
- * untouched. This only inspects the FIRST line — the full element extent (which
- * may span multiple lines, e.g. `<Checklist items={[\n…\n]} />`) is resolved by
- * `parseRegistryBlock`'s scanner.
- */
 function matchRegistryBlockOpen(dedent: string): string | null {
   const m = dedent.match(/^<([A-Za-z_][\w-]*)(?:[\s/>]|$)/);
   if (!m) return null;
   const tag = m[1];
   return registryBlockSpecByTag(tag) ? tag : null;
+}
+
+function matchContentReferenceOpen(dedent: string): string | null {
+  return /^<ContentReference(?:[\s/>]|$)/.test(dedent)
+    ? "ContentReference"
+    : null;
 }
 
 function matchLocalMdxComponentOpen(dedent: string): string | null {
@@ -1295,18 +1677,11 @@ function matchLocalMdxComponentOpen(dedent: string): string | null {
   return registryBlockSpecByTag(tag) ? null : tag;
 }
 
-/**
- * Find the index (relative to the joined `text`) just past the opening tag's
- * terminating `>` — i.e. the first top-level `>` that is not inside a quoted
- * string or a `{…}`/`[…]` attribute expression. Returns the index of the char
- * after `>` and whether the tag self-closed (`/>`), or `null` if no terminator
- * is found in `text`.
- */
 function scanOpenTagEnd(
   text: string,
 ): { end: number; selfClosing: boolean } | null {
-  let depth = 0; // {} / [] nesting from attribute expressions
-  let quote: string | null = null; // active "…" or '…' string
+  let depth = 0;
+  let quote: string | null = null;
   for (let i = 1; i < text.length; i++) {
     const ch = text[i];
     if (quote) {
@@ -1331,24 +1706,6 @@ function scanOpenTagEnd(
   return null;
 }
 
-/**
- * Parse a registry block into a `registryBlock` atom node, capturing the
- * verbatim element source as `__raw` (with the structural `indent` tabs
- * stripped, so the serializer re-applies indentation like every other block).
- *
- * Handles every shape core's `serializeSpecBlock` emits:
- *   - single-line self-closing            `<Endpoint … />`
- *   - multi-line self-closing attr expr   `<Checklist items={[⏎ … ⏎]} />`
- *   - prose children                       `<Endpoint …>⏎⏎{body}⏎⏎</Endpoint>`
- * It scans the opening tag character-by-character (quote- and brace-aware) to
- * find its terminating `>`, then either stops (self-closing) or scans forward
- * for the matching `</Tag>`.
- *
- * Identity attrs (`blockType`, `blockId`, `title`, `summary`) are read off the
- * opening tag for the side-map/render layer; the typed `data` is NOT parsed here
- * (that is the editor's `parseRegistryBlockData`), keeping this hot path free of
- * the remark toolchain.
- */
 function parseRegistryBlock(
   lines: string[],
   start: number,
@@ -1362,12 +1719,8 @@ function parseRegistryBlock(
   };
   const closeTag = `</${tag}>`;
 
-  // Dedent every candidate line by the structural indent so `__raw` is
-  // indent-relative (the serializer re-applies the indent). The opening tag may
-  // span several lines, so join from `start` and scan for its terminating `>`.
   const dedented = lines.map((l) => stripTabs(l, indent));
 
-  // Walk forward to find the last line of the opening tag.
   let openEndLine = start;
   let selfClosing = false;
   {
@@ -1388,8 +1741,6 @@ function parseRegistryBlock(
   if (selfClosing) {
     end = openEndLine + 1;
   } else {
-    // Children-bearing element: scan for the matching close tag, tracking nested
-    // same-tag opens for safety.
     let depth = 1;
     let i = openEndLine + 1;
     for (; i < lines.length; i++) {
@@ -1422,6 +1773,48 @@ function parseRegistryBlock(
     },
   };
   return { nodes: [withIndentAttr(node)], end };
+}
+
+function parseContentReference(
+  lines: string[],
+  start: number,
+  indent: number,
+  rel: number,
+  _tag: string,
+): ParseResult {
+  const withIndentAttr = (node: PMNode): PMNode => {
+    if (rel > 0) node.attrs = { ...(node.attrs || {}), indent: rel };
+    return node;
+  };
+  const dedented = lines.map((l) => stripTabs(l, indent));
+
+  let openEndLine = start;
+  {
+    let joined = "";
+    for (let i = start; i < lines.length; i++) {
+      joined += (i === start ? "" : "\n") + dedented[i];
+      const res = scanOpenTagEnd(joined);
+      if (res) {
+        openEndLine = i;
+        break;
+      }
+      openEndLine = i;
+    }
+  }
+
+  const rawLines = dedented.slice(start, openEndLine + 1);
+  const raw = rawLines.join("\n");
+  const props = parseAttrs(raw);
+  const node: PMNode = {
+    type: "contentReference",
+    attrs: {
+      sourcePath:
+        props.sourcePath ?? props.path ?? props.source ?? props.href ?? "",
+      title: props.title ?? null,
+      __raw: raw,
+    },
+  };
+  return { nodes: [withIndentAttr(node)], end: openEndLine + 1 };
 }
 
 function parseLocalMdxComponent(
@@ -1502,10 +1895,8 @@ function extractLocalMdxComponentChildren(raw: string, tag: string): string {
 function matchContainerOpen(dedent: string): string | null {
   for (const key of Object.keys(CONTAINER_CLOSE)) {
     if (key.endsWith(">")) {
-      // Exact tag with no attributes: <columns>, <column>, <meeting-notes>.
       if (dedent === key) return key;
     } else {
-      // Tag that may carry attributes: <details ...>, <callout ...>, <table ...>.
       if (
         dedent === key + ">" ||
         dedent.startsWith(key + " ") ||
@@ -1532,7 +1923,6 @@ function parseContainer(
     return node;
   };
 
-  // Tables and meeting-notes are parsed as flat tag lines (not tab-indented children).
   if (tagKey === "<table") {
     return parseTable(lines, start, indent, withIndentAttr);
   }
@@ -1547,13 +1937,25 @@ function parseContainer(
     );
   }
 
-  // Find close line at the same indent.
   let i = start + 1;
   const childStart = i;
   let depth = 1;
+  let fence: { indent: number; length: number } | undefined;
   for (; i < lines.length; i++) {
     const li = leadingTabs(lines[i]);
     const ld = lines[i].slice(li);
+    if (fence) {
+      const close = ld.match(/^(`{3,})\s*$/);
+      if (close && close[1].length >= fence.length) {
+        fence = undefined;
+      }
+      continue;
+    }
+    const openFence = ld.match(/^(`{3,})(.*)$/);
+    if (openFence) {
+      fence = { indent: li, length: openFence[1].length };
+      continue;
+    }
     if (
       li === indent &&
       matchContainerOpen(ld) === tagKey &&
@@ -1566,10 +1968,14 @@ function parseContainer(
       if (depth === 0) break;
     }
   }
+  if (depth !== 0) {
+    const { text, color } = splitBlockAttrs(openLine);
+    const node: PMNode = { type: "paragraph", content: parseInline(text) };
+    if (isColor(color)) node.attrs = { color };
+    return { nodes: [withIndentAttr(node)], end: start + 1 };
+  }
   const closeIdx = i;
-  const innerEnd = closeIdx;
 
-  // <details> with a <summary> on the next line.
   if (tagKey === "<details") {
     const attrs = parseAttrs(openLine);
     let summary = "";
@@ -1577,20 +1983,19 @@ function parseContainer(
     const summaryLine = lines[childStart]?.slice(indent) ?? "";
     const sm = summaryLine.match(/^<summary>([\s\S]*?)<\/summary>\s*$/);
     if (sm) {
-      summary = unescapeInlineText(sm[1]);
+      summary = sm[1];
       bodyStart = childStart + 1;
     }
-    const childRes = parseBlockSequence(lines, bodyStart, indent + 1);
     const node: PMNode = {
       type: "notionToggle",
       attrs: {
         summary,
         headingLevel: null,
-        open: false,
+        open: attrs.open !== undefined || /(?:^|\s)open(?:\s|>)/.test(openLine),
         color: isColor(attrs.color) ? attrs.color : null,
         indent: 0,
       },
-      content: childRes.nodes,
+      content: parseDetailsBody(lines, bodyStart, closeIdx, indent),
     };
     return { nodes: [withIndentAttr(node)], end: closeIdx + 1 };
   }
@@ -1637,7 +2042,6 @@ function parseContainer(
     return { nodes: [withIndentAttr(node)], end: closeIdx + 1 };
   }
 
-  // Fallback: preserve raw.
   return parseRawContainer(
     lines,
     start,
@@ -1657,9 +2061,22 @@ function parseRawContainer(
   withIndentAttr: (n: PMNode) => PMNode,
 ): ParseResult {
   let i = start + 1;
+  let closed = false;
   for (; i < lines.length; i++) {
-    if (lines[i].slice(indent) === closeTag && leadingTabs(lines[i]) >= indent)
+    if (
+      lines[i].slice(indent) === closeTag &&
+      leadingTabs(lines[i]) >= indent
+    ) {
+      closed = true;
       break;
+    }
+  }
+  if (!closed) {
+    const openLine = lines[start].slice(indent);
+    const { text, color } = splitBlockAttrs(openLine);
+    const node: PMNode = { type: "paragraph", content: parseInline(text) };
+    if (isColor(color)) node.attrs = { color };
+    return { nodes: [withIndentAttr(node)], end: start + 1 };
   }
   const rawLines = lines.slice(start, i + 1).map((l) => stripTabs(l, indent));
   const node: PMNode = {
@@ -1688,11 +2105,13 @@ function parseTable(
   let i = start + 1;
   const colMeta: Array<{ color?: string; width?: string }> = [];
   const rows: PMNode[] = [];
+  let closed = false;
 
   for (; i < lines.length; i++) {
     const ld = lines[i].slice(Math.min(indent, leadingTabs(lines[i]))).trim();
     if (ld === "</table>") {
       i++;
+      closed = true;
       break;
     }
     if (ld === "<colgroup>") continue;
@@ -1706,7 +2125,6 @@ function parseTable(
     if (/^<tr/.test(ld)) {
       const rowAttrs = parseAttrs(ld);
       const cells: PMNode[] = [];
-      // consume cells until </tr>
       for (i++; i < lines.length; i++) {
         const cd = lines[i]
           .slice(Math.min(indent, leadingTabs(lines[i])))
@@ -1720,7 +2138,10 @@ function parseTable(
             (headerColumn && cells.length === 0);
           cells.push({
             type: isHeader ? "tableHeader" : "tableCell",
-            attrs: { color: isColor(ca.color) ? ca.color : null },
+            attrs: {
+              color: isColor(ca.color) ? ca.color : null,
+              textAlign: isTableAlignment(ca.align) ? ca.align : null,
+            },
             content: [
               { type: "paragraph", content: parseInline(cellMatch[2]) },
             ],
@@ -1733,6 +2154,14 @@ function parseTable(
         content: cells,
       });
     }
+  }
+
+  if (!closed) {
+    const openLine = lines[start].slice(indent);
+    const { text, color } = splitBlockAttrs(openLine);
+    const node: PMNode = { type: "paragraph", content: parseInline(text) };
+    if (isColor(color)) node.attrs = { color };
+    return { nodes: [withIndentAttr(node)], end: start + 1 };
   }
 
   const node: PMNode = {
@@ -1790,11 +2219,147 @@ function parseLeafTag(
   return null;
 }
 
-// ════════════════════════════════════════════════════════════════════
-// Public helpers
-// ════════════════════════════════════════════════════════════════════
-
-/** Canonicalize NFM into the exact stable form (Notion's emission form). */
 export function canonicalizeNfm(nfm: string | null | undefined): string {
-  return docToNfm(nfmToDoc(nfm ?? ""));
+  const previous = suppressTerminalFillerTrim;
+  suppressTerminalFillerTrim = true;
+  try {
+    return docToNfm(nfmToDoc(nfm ?? ""));
+  } finally {
+    suppressTerminalFillerTrim = previous;
+  }
+}
+
+function countLocalMdxNodes(
+  node: PMNode,
+  predicate: (node: PMNode) => boolean,
+): number {
+  let count = node.type === "localMdxComponent" && predicate(node) ? 1 : 0;
+  for (const child of node.content ?? []) {
+    count += countLocalMdxNodes(child, predicate);
+  }
+  return count;
+}
+
+function countGfmPipeTables(
+  source: string,
+  delimiterPredicate: (cells: string[]) => boolean,
+): number {
+  const lines = source.replace(/\r\n?/g, "\n").split("\n");
+  const fencedCodeLines = fencedCodeLineMask(lines);
+  let count = 0;
+  for (let i = 0; i + 1 < lines.length; i++) {
+    if (fencedCodeLines[i] || fencedCodeLines[i + 1]) continue;
+    const indent = leadingTabs(lines[i]);
+    if (leadingTabs(lines[i + 1]) !== indent) continue;
+    const header = splitGfmPipeRow(lines[i].slice(indent));
+    const delimiter = splitGfmPipeRow(lines[i + 1].slice(indent));
+    if (
+      header &&
+      delimiter &&
+      header.length > 0 &&
+      header.length === delimiter.length &&
+      delimiterPredicate(delimiter)
+    ) {
+      count++;
+      i++;
+    }
+  }
+  return count;
+}
+
+function fencedCodeLineMask(lines: string[]): boolean[] {
+  const mask = lines.map(() => false);
+  let fence: { indent: number; length: number } | undefined;
+  for (let index = 0; index < lines.length; index++) {
+    const indent = leadingTabs(lines[index]);
+    const dedented = lines[index].slice(indent);
+    if (fence) {
+      mask[index] = true;
+      const close = dedented.match(/^(`{3,})\s*$/);
+      if (indent >= fence.indent && close && close[1].length >= fence.length) {
+        fence = undefined;
+      }
+      continue;
+    }
+    const open = dedented.match(/^(`{3,})(.*)$/);
+    if (open) {
+      mask[index] = true;
+      fence = { indent, length: open[1].length };
+    }
+  }
+  return mask;
+}
+
+export function inspectNfmFidelity(
+  nfm: string | null | undefined,
+): NfmFidelityReport {
+  const source = nfm ?? "";
+  try {
+    const document = nfmToDoc(source);
+    const normalized = canonicalizeNfm(source);
+    const pipeTableCount = countGfmPipeTables(source, (cells) =>
+      cells.every(
+        (cell) => isGfmDelimiterCell(cell) || isAlignedGfmDelimiterCell(cell),
+      ),
+    );
+    const unsupportedMdxCount = countLocalMdxNodes(
+      document,
+      (node) => node.attrs?.unsupportedProps === true,
+    );
+
+    const conversions: NfmFidelityReport["conversions"] = [];
+    if (pipeTableCount > 0) {
+      conversions.push({
+        kind: "gfm-pipe-table-to-content-table",
+        count: pipeTableCount,
+      });
+    }
+    if (normalized !== source && conversions.length === 0) {
+      conversions.push({ kind: "canonicalized-nfm", count: 1 });
+    }
+
+    const unresolved: NfmFidelityReport["unresolved"] = [];
+    if (unsupportedMdxCount > 0) {
+      unresolved.push({
+        kind: "mdx-component-props-preserved-as-raw-source",
+        count: unsupportedMdxCount,
+      });
+    }
+
+    return {
+      status:
+        unresolved.length > 0
+          ? "unresolved"
+          : conversions.length > 0 || normalized !== source
+            ? "transformed"
+            : "preserved",
+      normalizedChanged: normalized !== source,
+      conversions,
+      unresolved,
+    };
+  } catch (error) {
+    return {
+      status: "failed",
+      normalizedChanged: false,
+      conversions: [],
+      unresolved: [],
+      error: error instanceof Error ? error.message : "Unreadable content",
+    };
+  }
+}
+
+export function collapseExactRepeatedNfm(
+  nfm: string,
+  options: { requiredText: string },
+): string {
+  if (!options.requiredText || !nfm.includes(options.requiredText)) return nfm;
+
+  const lines = nfm.split("\n");
+  if (lines.length < 2 || lines.length % 2 !== 0) return nfm;
+
+  const midpoint = lines.length / 2;
+  for (let index = 0; index < midpoint; index += 1) {
+    if (lines[index] !== lines[index + midpoint]) return nfm;
+  }
+  return lines.slice(0, midpoint).join("\n");
 }

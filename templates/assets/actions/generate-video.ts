@@ -1,39 +1,59 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { nanoid } from "nanoid";
-import { eq } from "drizzle-orm";
-import { assertAccess } from "@agent-native/core/sharing";
+import { defineAction } from "@agent-native/core/action";
+import type { ActionRunContext } from "@agent-native/core/action";
+import { resolveOrgIdForEmail } from "@agent-native/core/org";
 import {
   getRequestOrgId,
   getRequestUserEmail,
 } from "@agent-native/core/server/request-context";
+import { track } from "@agent-native/core/tracking";
+import { and, eq } from "drizzle-orm";
+import { nanoid } from "nanoid";
+import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import {
   DEFAULT_GENERATION_REFERENCE_LIMIT,
   selectReferences,
 } from "../server/lib/generation.js";
-import { getObject } from "../server/lib/storage.js";
 import { nowIso, parseJson, stringifyJson } from "../server/lib/json.js";
 import {
+  assertCanDraft,
+  assertCanUseAssets,
+  draftScopeForLibrary,
+} from "../server/lib/library-access.js";
+import { getObject } from "../server/lib/storage.js";
+import {
+  compileVideoPrompt,
+  prepareVideoGenerationProvider,
+  RetryableVideoGenerationError,
+  startVideoGeneration,
+  type PreparedVideoGenerationProvider,
+  type VideoReferenceImage,
+} from "../server/lib/video-generation.js";
+import {
+  completeVideoGenerationRun,
+  failVideoGenerationRun,
+} from "../server/lib/video-runs.js";
+import {
   IMAGE_CATEGORIES,
+  normalizeCallerAppId,
   VIDEO_ASPECT_RATIOS,
   VIDEO_MODELS,
   VIDEO_RESOLUTIONS,
   type StyleBrief,
 } from "../shared/api.js";
-import {
-  compileVideoPrompt,
-  startGeminiVideoGeneration,
-  type VideoReferenceImage,
-} from "../server/lib/video-generation.js";
-import { completeVideoGenerationRun } from "../server/lib/video-runs.js";
 import { serializeAsset, serializeGenerationRun } from "./_helpers.js";
 
 export default defineAction({
   description:
-    "Start an async Veo video generation run from an asset library. Poll the returned run with refresh-generation-run until it completes and creates a video asset.",
+    "Start an async Veo video generation run from a brand kit/library. Use a media-type @mention with refId video to choose this instead of image generation, and use a brand-kit @mention as libraryId. Poll the returned run with refresh-generation-run until it completes and creates a video asset.",
   schema: z.object({
-    libraryId: z.string(),
+    libraryId: z
+      .string()
+      .optional()
+      .describe(
+        "Brand kit/library ID. Pass the refId from a brand-kit @mention, or choose a kit from view-screen/list-libraries.",
+      ),
     folderId: z.string().min(1).nullable().optional(),
     collectionId: z.string().optional(),
     prompt: z.string().min(1),
@@ -65,8 +85,20 @@ export default defineAction({
     callerAppId: z.string().optional(),
     waitForCompletion: z.coerce.boolean().default(false),
   }),
-  run: async (args) => {
-    await assertAccess("asset-library", args.libraryId, "editor");
+  run: async (input, context?: ActionRunContext) => {
+    const libraryId = input.libraryId;
+    if (!libraryId) {
+      throw new Error(
+        "No brand kit selected. Tag a brand kit with @ or pass libraryId.",
+      );
+    }
+    const args = {
+      ...input,
+      libraryId,
+    };
+    const callerAppId = normalizeCallerAppId(args.callerAppId);
+    const draftAccess = await assertCanDraft(args.libraryId);
+    const draftScope = await draftScopeForLibrary(args.libraryId, draftAccess);
     const db = getDb();
     const [library] = await db
       .select()
@@ -108,6 +140,13 @@ export default defineAction({
       if (!sourceAsset.mimeType.startsWith("image/")) {
         throw new Error("sourceAssetId must refer to an image asset.");
       }
+      assertCanUseAssets(
+        draftScope,
+        args.libraryId,
+        draftAccess.role,
+        [sourceAsset],
+        "This video generation",
+      );
       sourceImage = {
         id: sourceAsset.id,
         mimeType: sourceAsset.mimeType,
@@ -123,6 +162,7 @@ export default defineAction({
     const references = sourceImage
       ? []
       : await selectReferences({
+          draftScope,
           libraryId: args.libraryId,
           collectionId: args.collectionId,
           categories: [args.category],
@@ -146,7 +186,10 @@ export default defineAction({
     const runId = nanoid();
     const now = nowIso();
     const ownerEmail = getRequestUserEmail() ?? null;
-    const orgId = getRequestOrgId() ?? null;
+    const orgId =
+      getRequestOrgId() ??
+      (ownerEmail ? await resolveOrgIdForEmail(ownerEmail) : null);
+    const identity = { userEmail: ownerEmail, orgId };
     const referenceAssetIds = sourceImage
       ? [sourceImage.id]
       : referenceImages.map((ref) => ref.id);
@@ -180,6 +223,10 @@ export default defineAction({
       },
       settingsUsed,
     };
+    const startingMetadata = stringifyJson({
+      ...baseMetadata,
+      providerStatus: "selecting",
+    });
     await db.insert(schema.assetGenerationRuns).values({
       id: runId,
       libraryId: args.libraryId,
@@ -198,82 +245,226 @@ export default defineAction({
       referenceAssetIds: stringifyJson(referenceAssetIds),
       status: "pending",
       source: args.source,
-      callerAppId: args.callerAppId ?? null,
+      callerAppId: callerAppId ?? null,
       ownerEmail,
       orgId,
-      metadata: stringifyJson(baseMetadata),
+      metadata: startingMetadata,
       createdAt: now,
     });
 
-    const operation = await startGeminiVideoGeneration({
-      model: args.model,
-      compiledPrompt,
-      aspectRatio: args.aspectRatio,
-      durationSeconds: args.durationSeconds,
-      resolution: args.resolution,
-      sourceImage,
-      referenceImages,
-      negativePrompt: args.negativePrompt,
-      enhancePrompt: args.enhancePrompt,
-      generateAudio: args.generateAudio,
-    });
+    let operation: Awaited<ReturnType<typeof startVideoGeneration>>;
+    let preparedProvider: PreparedVideoGenerationProvider | undefined;
+    let expectedRunStatus: "pending" | "processing" = "pending";
+    let expectedRunMetadata = startingMetadata;
+    try {
+      preparedProvider = await prepareVideoGenerationProvider(identity);
+      const providerMetadata = stringifyJson({
+        ...baseMetadata,
+        provider: preparedProvider.provider,
+        providerStatus: "starting",
+        startAttemptedAt: nowIso(),
+      });
+      const [startingRun] = await db
+        .update(schema.assetGenerationRuns)
+        .set({ status: "processing", error: null, metadata: providerMetadata })
+        .where(
+          and(
+            eq(schema.assetGenerationRuns.id, runId),
+            eq(schema.assetGenerationRuns.status, "pending"),
+            eq(schema.assetGenerationRuns.metadata, startingMetadata),
+          ),
+        )
+        .returning();
+      if (!startingRun) {
+        const [currentRun] = await db
+          .select()
+          .from(schema.assetGenerationRuns)
+          .where(eq(schema.assetGenerationRuns.id, runId))
+          .limit(1);
+        if (!currentRun) throw new Error("Video generation run disappeared.");
+        return {
+          run: serializeGenerationRun(currentRun),
+          artifactType: "video",
+          ...(draftAccess.canApprove ? {} : { draftPendingApproval: true }),
+        };
+      }
+      expectedRunStatus = "processing";
+      expectedRunMetadata = providerMetadata;
+
+      operation = await startVideoGeneration(
+        {
+          runId,
+          libraryId: args.libraryId,
+          callerAppId: callerAppId ?? undefined,
+          model: args.model,
+          compiledPrompt,
+          aspectRatio: args.aspectRatio,
+          durationSeconds: args.durationSeconds,
+          resolution: args.resolution,
+          sourceImage,
+          referenceImages,
+          negativePrompt: args.negativePrompt,
+          enhancePrompt: args.enhancePrompt,
+          generateAudio: args.generateAudio,
+        },
+        preparedProvider,
+      );
+    } catch (error) {
+      if (error instanceof RetryableVideoGenerationError) {
+        const provider = error.provider ?? preparedProvider?.provider;
+        const retryMetadata = provider
+          ? stringifyJson({
+              ...baseMetadata,
+              provider,
+              providerStatus: "retryable",
+              ...(provider === preparedProvider?.provider
+                ? { startAttemptedAt: nowIso() }
+                : {}),
+            })
+          : startingMetadata;
+        const [retryingRun] = await db
+          .update(schema.assetGenerationRuns)
+          .set({
+            status: "processing",
+            error: error.message,
+            metadata: retryMetadata,
+          })
+          .where(
+            and(
+              eq(schema.assetGenerationRuns.id, runId),
+              eq(schema.assetGenerationRuns.status, expectedRunStatus),
+              eq(schema.assetGenerationRuns.metadata, expectedRunMetadata),
+            ),
+          )
+          .returning();
+        if (retryingRun) {
+          return {
+            run: serializeGenerationRun(retryingRun),
+            artifactType: "video",
+            ...(draftAccess.canApprove ? {} : { draftPendingApproval: true }),
+          };
+        }
+        const [currentRun] = await db
+          .select()
+          .from(schema.assetGenerationRuns)
+          .where(eq(schema.assetGenerationRuns.id, runId))
+          .limit(1);
+        if (!currentRun) throw new Error("Video generation run disappeared.");
+        return {
+          run: serializeGenerationRun(currentRun),
+          artifactType: "video",
+          ...(draftAccess.canApprove ? {} : { draftPendingApproval: true }),
+        };
+      }
+      const failed = await failVideoGenerationRun(
+        runId,
+        error,
+        expectedRunMetadata,
+      );
+      if (!failed) {
+        const [currentRun] = await db
+          .select()
+          .from(schema.assetGenerationRuns)
+          .where(eq(schema.assetGenerationRuns.id, runId))
+          .limit(1);
+        if (!currentRun) throw new Error("Video generation run disappeared.");
+        return {
+          run: serializeGenerationRun(currentRun),
+          artifactType: "video",
+          ...(draftAccess.canApprove ? {} : { draftPendingApproval: true }),
+        };
+      }
+      throw error;
+    }
     const processingMetadata = {
       ...baseMetadata,
-      operationName: operation.operationName,
-      provider: "gemini",
+      ...(operation.provider === "builder"
+        ? { generationId: operation.generationId }
+        : { operationName: operation.operationName }),
+      provider: operation.provider,
       providerStatus: "processing",
       startedAt: nowIso(),
     };
-    const run = {
-      id: runId,
-      libraryId: args.libraryId,
-      collectionId: args.collectionId ?? null,
-      presetId: null,
-      sessionId: null,
-      prompt: args.prompt,
-      compiledPrompt,
-      mediaType: "video",
-      model: args.model,
-      aspectRatio: args.aspectRatio,
-      imageSize: args.resolution,
-      durationSeconds: args.durationSeconds,
-      resolution: args.resolution,
-      groundingMode: "off",
-      referenceAssetIds: stringifyJson(referenceAssetIds),
-      status: "processing",
-      error: null,
-      metadata: stringifyJson(processingMetadata),
-      createdAt: now,
-      completedAt: null,
-      source: args.source,
-      callerAppId: args.callerAppId ?? null,
-      ownerEmail,
-      orgId,
-    };
-    await db
+    const [run] = await db
       .update(schema.assetGenerationRuns)
-      .set({ status: "processing", metadata: run.metadata })
-      .where(eq(schema.assetGenerationRuns.id, runId));
+      .set({
+        status: "processing",
+        error: null,
+        metadata: stringifyJson(processingMetadata),
+      })
+      .where(
+        and(
+          eq(schema.assetGenerationRuns.id, runId),
+          eq(schema.assetGenerationRuns.status, "processing"),
+          eq(schema.assetGenerationRuns.metadata, expectedRunMetadata),
+        ),
+      )
+      .returning();
+    if (!run) {
+      const [currentRun] = await db
+        .select()
+        .from(schema.assetGenerationRuns)
+        .where(eq(schema.assetGenerationRuns.id, runId))
+        .limit(1);
+      if (!currentRun) throw new Error("Video generation run disappeared.");
+      return {
+        run: serializeGenerationRun(currentRun),
+        artifactType: "video",
+        ...(draftAccess.canApprove ? {} : { draftPendingApproval: true }),
+      };
+    }
 
+    track(
+      "generation_started",
+      {
+        app_name: "assets",
+        template_name: "assets",
+        output_id: runId,
+        output_type: "asset",
+        media_type: "video",
+        source_app: callerAppId,
+      },
+      context,
+    );
+
+    let responseRun: typeof schema.assetGenerationRuns.$inferSelect = run;
     if (args.waitForCompletion) {
       const completed = await completeVideoGenerationRun(run);
-      if (completed.status === "completed") {
+      responseRun = completed.run;
+      if (completed.status === "completed" && completed.completionClaimed) {
         const asset = serializeAsset(completed.asset);
+        track(
+          "media_generated",
+          {
+            app_name: "assets",
+            template_name: "assets",
+            output_id: completed.asset.id,
+            output_type: "asset",
+            media_type: "video",
+            library_id: args.libraryId,
+            source_app: callerAppId,
+          },
+          context,
+        );
         return {
           run: serializeGenerationRun(completed.run),
           asset,
           artifactType: "video",
           Artifacts: [`Video: ${asset.url} (ID: ${asset.id}, Run: ${runId})`],
+          ...(draftAccess.canApprove ? {} : { draftPendingApproval: true }),
         };
       }
     }
 
     return {
-      run: serializeGenerationRun(run),
-      operationName: operation.operationName,
+      run: serializeGenerationRun(responseRun),
+      ...(operation.provider === "gemini"
+        ? { operationName: operation.operationName }
+        : {}),
       artifactType: "video",
       message:
         "Video generation started. Call refresh-generation-run with this runId until status is completed.",
+      ...(draftAccess.canApprove ? {} : { draftPendingApproval: true }),
     };
   },
 });

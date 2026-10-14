@@ -1,26 +1,35 @@
-/**
- * See what the user is currently looking at on screen.
- *
- * Reads `navigation` application state and fetches the relevant context
- * (recording + transcript + comments if viewing a recording, folder contents
- * if on library, space list if on spaces, etc.). Returns a single JSON
- * snapshot the agent can reason over.
- *
- * Usage:
- *   pnpm action view-screen
- */
-
-import { defineAction } from "@agent-native/core";
-import { readAppState } from "@agent-native/core/application-state";
-import { and, asc, desc, eq, gte, isNotNull, isNull, lte } from "drizzle-orm";
-import { z } from "zod";
-import { getDb, schema } from "../server/db/index.js";
-import { accessFilter } from "@agent-native/core/sharing";
+import { defineAction } from "@agent-native/core/action";
+import {
+  readAppState,
+  readAppStateForCurrentTab,
+} from "@agent-native/core/application-state";
 import { getRequestUserEmail } from "@agent-native/core/server/request-context";
+import { accessFilter, resolveAccess } from "@agent-native/core/sharing";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gte,
+  isNotNull,
+  isNull,
+  lte,
+  not,
+  notInArray,
+} from "drizzle-orm";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
+import { agentRecordingAccessFilter } from "../server/lib/agent-recording-access.js";
+import { listingThumbnailUrl } from "../server/lib/player-thumbnail-url.js";
 import {
   getActiveOrganizationId,
+  ownerEmailMatches,
   parseSpaceIds,
 } from "../server/lib/recordings.js";
+import { hydrateCommentAuthorNames } from "../server/lib/user-identities.js";
+import { parseBrowserDiagnosticsRow } from "../shared/browser-diagnostics.js";
+import { buildTranscriptPreview } from "./lib/transcript-preview.js";
 
 interface NavigationState {
   view?: string;
@@ -39,7 +48,7 @@ function mapRecording(r: any) {
     id: r.id,
     title: r.title,
     description: r.description,
-    thumbnailUrl: r.thumbnailUrl,
+    thumbnailUrl: listingThumbnailUrl(r),
     durationMs: r.durationMs,
     status: r.status,
     visibility: r.visibility,
@@ -69,7 +78,12 @@ async function fetchRecording(id: string) {
     .where(
       and(
         eq(schema.recordings.id, id),
-        accessFilter(schema.recordings, schema.recordingShares),
+        agentRecordingAccessFilter(
+          schema.recordings,
+          schema.recordingShares,
+          schema.recordingViewers,
+          { agentOnly: true },
+        ),
       ),
     );
   return row ? mapRecording(row) : null;
@@ -104,30 +118,98 @@ async function fetchComments(recordingId: string) {
     .from(schema.recordingComments)
     .where(eq(schema.recordingComments.recordingId, recordingId))
     .orderBy(asc(schema.recordingComments.videoTimestampMs));
-  return rows.map((c) => ({
-    id: c.id,
-    threadId: c.threadId,
-    parentId: c.parentId,
-    authorEmail: c.authorEmail,
-    authorName: c.authorName,
-    content: c.content,
-    videoTimestampMs: c.videoTimestampMs,
-    resolved: Boolean(c.resolved),
-    createdAt: c.createdAt,
-  }));
+  return hydrateCommentAuthorNames(
+    rows.map((c) => ({
+      id: c.id,
+      threadId: c.threadId,
+      parentId: c.parentId,
+      authorEmail: c.authorEmail,
+      authorName: c.authorName,
+      content: c.content,
+      videoTimestampMs: c.videoTimestampMs,
+      resolved: Boolean(c.resolved),
+      createdAt: c.createdAt,
+    })),
+  );
 }
 
-async function fetchLibrary(folderId?: string) {
+async function fetchBrowserDiagnosticsSummary(recordingId: string) {
   const db = getDb();
+  const [row] = await db
+    .select()
+    .from(schema.recordingBrowserDiagnostics)
+    .where(eq(schema.recordingBrowserDiagnostics.recordingId, recordingId))
+    .limit(1);
+  return parseBrowserDiagnosticsRow(row)?.summary ?? null;
+}
+
+async function fetchBugReportSummary(recordingId: string) {
+  const access = await resolveAccess("recording", recordingId);
+  if (!access || !["owner", "admin", "editor"].includes(String(access.role))) {
+    return null;
+  }
+  const db = getDb();
+  const [row] = await db
+    .select()
+    .from(schema.recordingBugReports)
+    .where(eq(schema.recordingBugReports.recordingId, recordingId))
+    .limit(1);
+  if (!row) return null;
+  return {
+    projectId: row.projectId,
+    title: row.title,
+    severity: row.severity,
+    sourceUrl: row.sourceUrl,
+    pageTitle: row.pageTitle,
+    appVersion: row.appVersion,
+    environment: row.environment,
+    submittedAt: row.submittedAt,
+    note: "Bug report metadata only. Call get-recording-player-data for reporter fields and host metadata when you have editor access.",
+  };
+}
+
+async function fetchLibrary({
+  folderId,
+  shared = false,
+  organizationId,
+}: {
+  folderId?: string;
+  shared?: boolean;
+  organizationId?: string | null;
+}) {
+  const db = getDb();
+  const ownerEmail = getRequestUserEmail();
+  if (!ownerEmail) return [];
   const conditions = [
-    accessFilter(schema.recordings, schema.recordingShares),
+    agentRecordingAccessFilter(
+      schema.recordings,
+      schema.recordingShares,
+      schema.recordingViewers,
+      { agentOnly: true },
+    ),
     isNull(schema.recordings.archivedAt),
     isNull(schema.recordings.trashedAt),
   ];
+  if (shared) {
+    conditions.push(
+      not(ownerEmailMatches(schema.recordings.ownerEmail, ownerEmail)),
+    );
+  } else {
+    conditions.push(
+      ownerEmailMatches(schema.recordings.ownerEmail, ownerEmail),
+    );
+    if (organizationId) {
+      conditions.push(eq(schema.recordings.organizationId, organizationId));
+    }
+  }
+  const resolvedDb = await Promise.resolve(db);
+  const meetingRecordingIds = resolvedDb
+    .select({ id: schema.meetings.recordingId })
+    .from(schema.meetings)
+    .where(isNotNull(schema.meetings.recordingId));
+  conditions.push(notInArray(schema.recordings.id, meetingRecordingIds));
   if (folderId) {
     conditions.push(eq(schema.recordings.folderId, folderId));
-  } else {
-    conditions.push(isNull(schema.recordings.folderId));
   }
   const rows = await db
     .select()
@@ -140,7 +222,7 @@ async function fetchLibrary(folderId?: string) {
     title: r.title,
     durationMs: r.durationMs,
     status: r.status,
-    thumbnailUrl: r.thumbnailUrl,
+    thumbnailUrl: listingThumbnailUrl(r),
     folderId: r.folderId,
     updatedAt: r.updatedAt,
   }));
@@ -155,7 +237,7 @@ async function fetchFoldersForSpace(spaceId: string | null) {
     .from(schema.folders)
     .where(
       and(
-        eq(schema.folders.ownerEmail, ownerEmail),
+        ownerEmailMatches(schema.folders.ownerEmail, ownerEmail),
         spaceId
           ? eq(schema.folders.spaceId, spaceId)
           : isNull(schema.folders.spaceId),
@@ -171,8 +253,6 @@ async function fetchFoldersForSpace(spaceId: string | null) {
 }
 
 async function fetchSpaces(organizationId: string | null) {
-  // No active org -> don't leak cross-tenant spaces. The org switcher in the
-  // UI is responsible for prompting the user to choose an organization.
   if (!organizationId) return [];
   const db = getDb();
   const rows = await db
@@ -220,8 +300,6 @@ async function fetchUpcomingMeetings() {
     )
     .orderBy(asc(schema.meetings.scheduledStart))
     .limit(10);
-  // Pre-fetch participants for all upcoming meetings so the agent can see
-  // attendees without a follow-up call. Cheap: top 10 meetings.
   const ids = rows.map((m) => m.id);
   const participantsByMeeting = new Map<
     string,
@@ -336,6 +414,7 @@ async function fetchMeetingDetail(meetingId: string) {
       source: meeting.source,
       userNotesMd: meeting.userNotesMd,
       transcriptStatus: meeting.transcriptStatus,
+      shareTranscript: meeting.shareTranscript === true,
       summaryMd: meeting.summaryMd,
       bullets: safeJsonArray<{ text: string }>(meeting.bulletsJson),
     },
@@ -371,7 +450,6 @@ async function fetchRecentDictations() {
     durationMs: d.durationMs,
     source: d.source,
     targetApp: d.targetApp,
-    // First 200 chars only — the list view doesn't need the full body.
     preview: (d.fullText ?? "").slice(0, 200),
     hasCleanedText: Boolean(d.cleanedText),
   }));
@@ -401,27 +479,61 @@ async function fetchDictationDetail(dictationId: string) {
   };
 }
 
+async function addRecordingContext(
+  screen: Record<string, unknown>,
+  recordingId: string,
+) {
+  const recording = await fetchRecording(recordingId);
+  if (!recording) return;
+
+  const [transcript, comments, browserDiagnosticsSummary, bugReportSummary] =
+    await Promise.all([
+      fetchTranscript(recordingId),
+      fetchComments(recordingId),
+      fetchBrowserDiagnosticsSummary(recordingId),
+      fetchBugReportSummary(recordingId),
+    ]);
+  screen.recording = recording;
+  if (transcript) {
+    screen.transcript = buildTranscriptPreview({
+      recordingId: transcript.recordingId,
+      language: transcript.language,
+      status: transcript.status,
+      fullText: transcript.fullText,
+      segments: transcript.segments,
+    });
+  }
+  screen.comments = comments.slice(0, 50);
+  if (browserDiagnosticsSummary) {
+    screen.browserDiagnostics = {
+      summary: browserDiagnosticsSummary,
+      note: "Summary only. Call get-recording-player-data for full redacted diagnostics when you have editor access.",
+    };
+  }
+  if (bugReportSummary) screen.bugReport = bugReportSummary;
+}
+
 async function fetchShare(shareId: string) {
   const db = getDb();
-  const [row] = await db
+  const [share] = await db
     .select()
     .from(schema.recordingShares)
     .where(eq(schema.recordingShares.id, shareId));
-  return row ?? null;
+  return share ?? null;
 }
 
 export default defineAction({
   description:
-    "See what the user is currently looking at on screen. Returns the current navigation state plus relevant context (recording + transcript + comments on a recording page, folder contents on library, space list on spaces, etc.). Prefer reading the auto-included <current-screen> block — call this only when you need a refreshed snapshot.",
+    "See what the user is currently looking at on screen. Returns the current navigation state plus relevant context (recording + transcript + comments on a recording page, visible clips on library/shared-with-me, space list on spaces, etc.). Prefer reading the auto-included <current-screen> block — call this only when you need a refreshed snapshot.",
   schema: z.object({}),
   http: false,
   run: async () => {
-    const navigation = (await readAppState(
+    const navigation = (await readAppStateForCurrentTab(
       "navigation",
     )) as NavigationState | null;
-    const playerState = await readAppState("player-state");
+    const playerState = await readAppStateForCurrentTab("player-state");
     const editorDraft = await readAppState("editor-draft");
-    const selection = await readAppState("selection");
+    const selection = await readAppStateForCurrentTab("selection");
     const organizationId = await getActiveOrganizationId();
     const recordIntent = await readAppState("record-intent");
     const recordingSetup = await readAppState("recording-setup");
@@ -439,42 +551,15 @@ export default defineAction({
     switch (nav.view) {
       case "recording":
       case "insights": {
-        if (nav.recordingId) {
-          const recording = await fetchRecording(nav.recordingId);
-          if (recording) {
-            const [transcript, comments] = await Promise.all([
-              fetchTranscript(nav.recordingId),
-              fetchComments(nav.recordingId),
-            ]);
-            screen.recording = recording;
-            if (transcript) {
-              // Ambient snapshot only — embed a short fullText snippet and the
-              // segment count, NOT the entire transcript + every word-level
-              // segment. The full transcript can be tens of thousands of tokens
-              // and is injected into <current-screen> on EVERY message, which
-              // can blow the model's context window. The agent calls
-              // get-recording-player-data for the complete transcript/segments.
-              const segmentCount = Array.isArray(transcript.segments)
-                ? transcript.segments.length
-                : 0;
-              screen.transcript = {
-                recordingId: transcript.recordingId,
-                language: transcript.language,
-                status: transcript.status,
-                fullTextSnippet: (transcript.fullText ?? "").slice(0, 2000),
-                fullTextLength: (transcript.fullText ?? "").length,
-                segmentCount,
-                note: "Snippet only. Call get-recording-player-data for the full transcript and segments.",
-              };
-            }
-            screen.comments = comments.slice(0, 50);
-          }
-        }
+        if (nav.recordingId) await addRecordingContext(screen, nav.recordingId);
         break;
       }
       case "library": {
         const [recordings, folders] = await Promise.all([
-          fetchLibrary(nav.folderId),
+          fetchLibrary({
+            folderId: nav.folderId,
+            organizationId,
+          }),
           fetchFoldersForSpace(null),
         ]);
         screen.library = {
@@ -483,6 +568,17 @@ export default defineAction({
           count: recordings.length,
           recordings,
           folders,
+        };
+        break;
+      }
+      case "shared": {
+        const recordings = await fetchLibrary({
+          shared: true,
+          organizationId,
+        });
+        screen.shared = {
+          count: recordings.length,
+          recordings,
         };
         break;
       }
@@ -505,7 +601,10 @@ export default defineAction({
       case "embed": {
         if (nav.shareId) {
           const share = await fetchShare(nav.shareId);
-          if (share) screen.share = share;
+          if (share) {
+            screen.share = share;
+            await addRecordingContext(screen, share.resourceId);
+          }
         }
         break;
       }
@@ -536,6 +635,24 @@ export default defineAction({
       }
       case "record": {
         if (recordingSetup) screen.recordingSetup = recordingSetup;
+        break;
+      }
+      case "bug-report": {
+        screen.bugReportLauncher = {
+          active: true,
+          note: "Embedded launcher for starting a Clips bug-report recording.",
+        };
+        break;
+      }
+      case "bug-report-done": {
+        if (nav.recordingId) {
+          const [recording, bugReportSummary] = await Promise.all([
+            fetchRecording(nav.recordingId),
+            fetchBugReportSummary(nav.recordingId),
+          ]);
+          if (recording) screen.recording = recording;
+          if (bugReportSummary) screen.bugReport = bugReportSummary;
+        }
         break;
       }
       case "archive":

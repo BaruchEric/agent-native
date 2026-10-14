@@ -1,5 +1,6 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
+
 import { readDocFile, sanitizeDocSlug } from "./docs-files";
 
 export default defineAction({
@@ -9,6 +10,9 @@ export default defineAction({
     slug: z.string().describe("Doc page slug, e.g. 'getting-started'"),
   }),
   http: false,
+  requiresAuth: false,
+  readOnly: true,
+  publicAgent: { expose: true, readOnly: true, requiresAuth: false },
   run: async ({ slug }) => {
     const matter = (await import("gray-matter")).default;
     const sanitized = sanitizeDocSlug(slug);

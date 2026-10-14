@@ -1,19 +1,94 @@
-const EXTENSION_IFRAME_CSP_BASE =
-  "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';";
+// Import-free on purpose: this shell is also built in the browser
+// (ExtensionViewer, InlineExtensionFrame), so it must not import the
+// app-config store. Configured sources are resolved server-side in
+// ./iframe-csp.ts: the render route passes them in, and the client renderers
+// fetch them from EXTENSION_IFRAME_DISPLAY_SOURCES_PATH.
+import {
+  DEFAULT_EXTENSION_DISPLAY_SOURCES,
+  extensionDisplaySourcesError,
+} from "../app-config/extension-display-sources.js";
+import { buildSessionReplayIframeBootstrap } from "./session-replay-iframe.js";
+
+/**
+ * Builds the iframe CSP from the img-src / media-src lists.
+ *
+ * SECURITY: both lists are validated again here, at the point they are
+ * interpolated, rather than trusted because they came from app config. The
+ * resolved config is a cached, mutable object, and the client renderers pass
+ * lists fetched from the server, so neither is guaranteed to still be what the
+ * schema accepted. A list that fails validation throws instead of producing a
+ * policy with an injected directive.
+ */
+export function extensionIframeCspBase(
+  imageSources: readonly string[],
+  mediaSources: readonly string[],
+): string {
+  const imageError = extensionDisplaySourcesError(imageSources);
+  if (imageError) {
+    throw new TypeError(`Invalid extension iframe img-src: ${imageError}`);
+  }
+  const mediaError = extensionDisplaySourcesError(mediaSources);
+  if (mediaError) {
+    throw new TypeError(`Invalid extension iframe media-src: ${mediaError}`);
+  }
+  return `default-src 'none'; script-src 'self' https://cdn.jsdelivr.net 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src ${imageSources.join(" ")}; media-src ${mediaSources.join(" ")}; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';`;
+}
 
 export const EXTENSION_FRAME_ANCESTORS = [
   "'self'",
   "https://agent-native.com",
   "https://*.agent-native.com",
+  "https://agent-workspace.builder.io",
   "http://localhost:*",
   "http://127.0.0.1:*",
   "https://*.claudemcpcontent.com",
   "https://*.web-sandbox.oaiusercontent.com",
 ].join(" ");
 
-export const EXTENSION_IFRAME_CSP = `${EXTENSION_IFRAME_CSP_BASE} frame-ancestors ${EXTENSION_FRAME_ANCESTORS};`;
+// The two constants below are the policy an app gets before it configures
+// anything. `buildExtensionIframeCsp()` (server-only, ./iframe-csp.ts) resolves `extensions.iframeImageSources`
+// and `extensions.iframeMediaSources` and is what the render route sets, so a
+// deployment that widens img-src / media-src still gets the same
+// `connect-src 'self'` as one that does not. A remote image or media
+// origin is its own egress permission: the browser requests that URL.
+export const EXTENSION_IFRAME_CSP = `${extensionIframeCspBase(DEFAULT_EXTENSION_DISPLAY_SOURCES, DEFAULT_EXTENSION_DISPLAY_SOURCES)} frame-ancestors ${EXTENSION_FRAME_ANCESTORS};`;
 
-export const EXTENSION_IFRAME_META_CSP = EXTENSION_IFRAME_CSP_BASE;
+export const EXTENSION_IFRAME_META_CSP = extensionIframeCspBase(
+  DEFAULT_EXTENSION_DISPLAY_SOURCES,
+  DEFAULT_EXTENSION_DISPLAY_SOURCES,
+);
+
+/**
+ * Authenticated endpoint that returns the deployment's validated
+ * `{ imageSources, mediaSources }`, so the client-rendered `srcDoc` frames
+ * (`ExtensionViewer`, `InlineExtensionFrame`) can apply the same img-src /
+ * media-src policy as the server render route without importing app config.
+ */
+export const EXTENSION_IFRAME_DISPLAY_SOURCES_PATH =
+  "/_agent-native/extensions/iframe/display-sources";
+
+/**
+ * Builds the meta CSP for a client-rendered frame from the
+ * `EXTENSION_IFRAME_DISPLAY_SOURCES_PATH` response. Anything that is not a
+ * valid pair of source lists falls back to the default policy, which blocks
+ * every remote image and media source (fail closed).
+ */
+export function extensionIframeMetaCspFromDisplaySources(
+  value: unknown,
+): string {
+  if (typeof value !== "object" || value === null) {
+    return EXTENSION_IFRAME_META_CSP;
+  }
+  const { imageSources, mediaSources } = value as Record<string, unknown>;
+  try {
+    return extensionIframeCspBase(
+      imageSources as readonly string[],
+      mediaSources as readonly string[],
+    );
+  } catch {
+    return EXTENSION_IFRAME_META_CSP;
+  }
+}
 
 /**
  * SECURITY — EXTENSION CONTENT IS UNTRUSTED.
@@ -24,15 +99,24 @@ export const EXTENSION_IFRAME_META_CSP = EXTENSION_IFRAME_CSP_BASE;
  *
  *   1. The iframe MUST be rendered with a `sandbox` attribute that does NOT
  *      include `allow-same-origin`. The viewer (`ExtensionViewer.tsx`,
- *      `EmbeddedExtension.tsx`) sets `sandbox="allow-scripts allow-forms"` —
- *      and that is the only acceptable shape. Adding `allow-same-origin`
- *      would give the extension full DOM access to the parent window via
- *      cross-frame script.
+ *      `EmbeddedExtension.tsx`) normalizes the sandbox through
+ *      `normalizeAgentNativeExtensionSandbox()`, which permits scripts, forms,
+ *      popups, and downloads but strips `allow-same-origin`. Adding
+ *      `allow-same-origin` would give the extension full DOM access to the
+ *      parent window via cross-frame script.
  *
  *   2. Every reachable parent action must treat the postMessage payload as
  *      hostile. The bridge in `iframe-bridge.ts` enforces a path allowlist,
  *      header sanitization, and method allowlist; do not relax those gates
  *      for "convenience" in this file or any caller.
+ *
+ *   3. `connect-src` stays `'self'` and stays out of app config. Remote
+ *      images and media are `extensions.iframeImageSources` /
+ *      `iframeMediaSources`, which reach only `img-src` / `media-src`.
+ *      Each allowed remote origin is an explicit egress permission: the
+ *      browser sends the URL, and extension script can encode data into
+ *      it. API calls stay on the permission-gated host bridge. Token
+ *      validation still stops a value from appending another directive.
  *
  * For the trust model rationale, see audit 05-tools-sandbox.md (C1) and the
  * `extensions` skill. When in doubt, fail closed.
@@ -50,14 +134,11 @@ export const EXTENSION_IFRAME_META_CSP = EXTENSION_IFRAME_CSP_BASE;
  */
 
 export interface ExtensionRenderBinding {
-  /** Email of the user who authored / owns the extension. */
   authorEmail: string;
-  /** Email of the user currently viewing/running the extension. */
   viewerEmail: string;
-  /** True when viewer === author. */
   isAuthor: boolean;
   /**
-   * Resolved role for the viewer ("owner" | "admin" | "editor" | "viewer").
+   * Resolved role for the viewer ("owner" | "admin" | "editor" | "commenter" | "viewer").
    *
    * TODO(security, audit H4): the host-side bridge does not yet gate any
    * helper based on this value — every viewer gets the same powers as the
@@ -66,13 +147,8 @@ export interface ExtensionRenderBinding {
    * eventually require an explicit consent step before running a shared
    * extension, audit C1). For now this is metadata only.
    */
-  role: "owner" | "admin" | "editor" | "viewer";
-  /** Where the extension definition came from. Database extensions are the default. */
+  role: "owner" | "admin" | "editor" | "commenter" | "viewer";
   source?: "database" | "local-files";
-  /**
-   * Fine-grained helper permissions for local file extensions. Database-backed
-   * extensions keep using the role table in the parent bridge.
-   */
   permissions?: {
     appActions?: string[];
     extensionData?: boolean;
@@ -87,6 +163,7 @@ export function buildExtensionHtml(
   isDark: boolean,
   extensionId?: string,
   binding?: ExtensionRenderBinding,
+  metaCsp: string = EXTENSION_IFRAME_META_CSP,
 ): string {
   const extensionIdJson = JSON.stringify(extensionId ?? "");
   const extensionIdAttr = escapeHtmlAttribute(extensionId ?? "");
@@ -104,7 +181,7 @@ export function buildExtensionHtml(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta http-equiv="Content-Security-Policy" content="${EXTENSION_IFRAME_META_CSP}" />
+  <meta http-equiv="Content-Security-Policy" content="${metaCsp}" />
   ${binding && !binding.isAuthor ? `<meta name="agent-native-extension-author" content="${escapeHtmlAttribute(binding.authorEmail)}" />` : ""}
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -139,9 +216,14 @@ export function buildExtensionHtml(
       if (_extensionErrors.indexOf(message) !== -1) return;
       _extensionErrors.push(message);
       _extensionErrorDetails.push({ message: message, stack: stack || '' });
+      _renderErrorToast();
+    }
+
+    function _renderErrorToast() {
       var toast = document.getElementById('__extension-error-toast');
       if (!toast) return;
       var msg = document.getElementById('__extension-error-msg');
+      if (!msg || _extensionErrors.length === 0) return;
       if (_extensionErrors.length === 1) {
         msg.textContent = _extensionErrors[0];
       } else {
@@ -221,14 +303,26 @@ export function buildExtensionHtml(
   </style>
 	  <style>
 	    *, *::before, *::after { border-color: hsl(var(--border)); }
+	    /* Alpine only honours x-cloak when a stylesheet hides it, and extension
+	       content is a body snippet that cannot supply one. Without this, an
+	       x-cloak overlay paints over the whole extension until Alpine boots —
+	       and forever if it never does. */
+	    [x-cloak] { display: none !important; }
+	    html, body {
+	      /* Transparent so the iframe inherits the host surface (dashboard panel,
+	         sidebar, chat) instead of painting the browser's default white canvas.
+	         The dark class still flips the theme vars; content paints its own
+	         bg-background / bg-card surfaces. */
+	      background: transparent;
+	    }
 	    body {
 	      --agent-native-extension-padding: clamp(16px, 2vw, 24px);
 	      /* Legacy alias for pre-rename extension content (do not remove). */
 	      --agent-native-tool-padding: var(--agent-native-extension-padding);
 	      box-sizing: border-box;
+	      color: hsl(var(--foreground));
 	      font-family: 'Inter', sans-serif;
 	      margin: 0;
-	      min-height: 100vh;
 	      padding: var(--agent-native-extension-padding);
 	    }
 	    body:has(> [data-extension-layout="full-bleed"]),
@@ -398,13 +492,45 @@ export function buildExtensionHtml(
 	      }
 
 	      if (!res.ok) {
-	        var err = res.body || { error: res.statusText };
-	        throw new Error(err.error || 'Action failed: ' + res.status);
+	        var err = res.body || {};
+	        var rawError = typeof err === 'string' ? err : err.error;
+	        var message = (typeof rawError === 'string' && rawError.trim())
+	          ? rawError
+	          : (res.status === 404
+	            ? "Action '" + name + "' is not available over HTTP (404). It may be agent-only (http: false); expose it with an HTTP-mounted action to call it from an extension."
+	            : "Action '" + name + "' failed (" + (res.status || 'network error') + ")");
+	        throw new Error(message);
 	      }
 	      return res.body;
 	    }
 
-	    async function appFetch(path, options) {
+    var mcp = {
+      listTools: function(serverId) {
+        var params = serverId ? { serverId: String(serverId) } : {};
+        return appAction('list-mcp-tools', params);
+      },
+      callTool: function(serverId, toolName, args) {
+        if (!serverId || !toolName) {
+          return Promise.reject(new Error('MCP serverId and toolName are required'));
+        }
+        return appAction('call-mcp-tool', {
+          serverId: String(serverId),
+          toolName: String(toolName),
+          arguments: args || {},
+        });
+      },
+    };
+
+    var providerApi = {
+      catalog: function(params) {
+        return appAction('provider-api-catalog', params || {});
+      },
+      docs: function(params) {
+        return appAction('provider-api-docs', params || {});
+      },
+    };
+
+    async function appFetch(path, options) {
 	      options = options || {};
 	      var res = await hostRequest(path, {
 	        ...options,
@@ -418,6 +544,55 @@ export function buildExtensionHtml(
 	        throw new Error(err.error || 'Request failed: ' + res.status);
 	      }
 	      return res.body;
+	    }
+
+	    function sendToChat(message, options) {
+	      options = options || {};
+	      var text = typeof message === 'string' ? message : JSON.stringify(message);
+	      window.parent.postMessage({
+	        type: 'agent-native-send-to-chat',
+	        message: text,
+	        context: options.context,
+	        // Extension code can run polling and error handlers without a user
+	        // gesture; submitting is opt-in for an explicit user action.
+	        submit: options.submit === true,
+	        openSidebar: options.openSidebar !== false,
+	      }, '*');
+	      return { ok: true };
+	    }
+
+	    function inlineUiOutputKey() {
+	      var safeId = String(_extensionId || 'unknown').replace(/[^A-Za-z0-9_:-]/g, '') || 'unknown';
+	      return 'inline-ui:' + safeId + ':output';
+	    }
+
+	    async function outputToUi(value, options) {
+	      options = options || {};
+	      var key = inlineUiOutputKey();
+	      var payload = {
+	        value: value,
+	        updatedAt: new Date().toISOString(),
+	        extensionId: _extensionId,
+	        source: 'inline-ui',
+	      };
+	      if (options.label !== undefined) payload.label = options.label;
+	      if (options.context !== undefined) payload.context = options.context;
+	      if (options.meta !== undefined) payload.meta = options.meta;
+	      var output = await appFetch('/_agent-native/application-state/' + key, {
+	        method: 'PUT',
+	        headers: { 'X-Request-Source': 'inline-ui' },
+	        body: JSON.stringify(payload),
+	      });
+	      try {
+	        window.parent.postMessage({
+	          type: 'agent-native-ui-output',
+	          extensionId: _extensionId,
+	          key: key,
+	          value: value,
+	          output: output,
+	        }, '*');
+	      } catch (_) {}
+	      return { ok: true, key: key, output: output };
 	    }
 
     async function dbQuery(sql, args) {
@@ -514,6 +689,31 @@ export function buildExtensionHtml(
 	    var toolFetch = extensionFetch;
 	    var toolData = extensionData;
 	    var _toolId = _extensionId;
+	    window.agentNative = Object.assign(window.agentNative || {}, {
+	      extensionId: _extensionId,
+	      extensionBinding: _extensionBinding,
+	      appAction: appAction,
+	      appFetch: appFetch,
+	      dbQuery: dbQuery,
+	      dbExec: dbExec,
+	      extensionFetch: extensionFetch,
+	      extensionData: extensionData,
+	      data: extensionData,
+	      mcp: mcp,
+	      providerApi: providerApi,
+	      connectors: Object.assign({}, (window.agentNative && window.agentNative.connectors) || {}, {
+	        mcp: mcp,
+	        providerApi: providerApi,
+	      }),
+	      sendToChat: sendToChat,
+	      chat: Object.assign({}, (window.agentNative && window.agentNative.chat) || {}, {
+	        send: sendToChat,
+	      }),
+	      ui: Object.assign({}, (window.agentNative && window.agentNative.ui) || {}, {
+	        output: outputToUi,
+	      }),
+	    });
+	    window.sendToAgentChat = sendToChat;
 	  </script>
 	  <style>
 	    #__extension-error-toast {
@@ -567,30 +767,337 @@ export function buildExtensionHtml(
 	      });
 	    });
 
-	    // Auto-resize the iframe to its content when running in slot mode. The
-	    // host listens for agent-native-extension-resize and adjusts the iframe height.
-	    if (new URLSearchParams(location.search).get('slot')) {
-	      var _lastH = 0;
-	      var _reportHeight = function() {
-	        var h = Math.max(
-	          document.documentElement.scrollHeight,
-	          document.body ? document.body.scrollHeight : 0,
-	        );
-	        if (h !== _lastH) {
-	          _lastH = h;
-	          window.parent.postMessage({ type: 'agent-native-extension-resize', height: h }, '*');
+	    // Auto-resize iframe renders. Persisted extension slots include ?slot=;
+	    // transient inline chat UI uses srcdoc, so detect that by parent frame.
+	    // The host listens for agent-native-extension-resize and adjusts height.
+	    if (new URLSearchParams(location.search).get('slot') || window.parent !== window) {
+      var _ro = null;
+      var _positionedElements = new Set();
+      var _motionElements = new Set();
+      var _observedPositionedElements = new Set();
+	      var _isExcludedFromHeight = function(element, body) {
+	        if (!element) return false;
+	        if (window.getComputedStyle(element).position === 'fixed') return true;
+	        var current = element.parentElement;
+        while (current && current !== body) {
+	          var style = window.getComputedStyle(current);
+	          if (
+	            style.position === 'fixed' ||
+	            /^(?:auto|scroll|overlay|hidden|clip)$/.test(style.overflowY)
+	          ) return true;
+	          current = current.parentElement;
+	        }
+	        return false;
+	      };
+	      var _trackPositionedElement = function(element) {
+	        if (!element || element.nodeType !== 1 || _motionElements.has(element)) {
+	          return false;
+	        }
+	        _motionElements.add(element);
+	        return true;
+	      };
+      var _observePositioned = function() {
+        if (!document.body) return;
+        _positionedElements.clear();
+        _motionElements.forEach(function(element) {
+          if (!document.body.contains(element)) _motionElements.delete(element);
+        });
+        var _nextObservedPositionedElements = new Set();
+        if (_ro) {
+          _ro.observe(document.documentElement);
+          _ro.observe(document.body);
+        }
+        Array.prototype.forEach.call(document.body.querySelectorAll('*'), function(element) {
+	          var style = window.getComputedStyle(element);
+		          if (style.position !== 'static' || style.transform !== 'none') {
+		            _positionedElements.add(element);
+          }
+          if (_ro && style.position === 'absolute') {
+            _ro.observe(element);
+            _nextObservedPositionedElements.add(element);
+          }
+        });
+        if (_ro && typeof _ro.unobserve === 'function') {
+          _observedPositionedElements.forEach(function(element) {
+            if (!_nextObservedPositionedElements.has(element)) {
+              _ro.unobserve(element);
+            }
+          });
+        }
+        _observedPositionedElements = _nextObservedPositionedElements;
+	      };
+	      var _enqueueResizeWork = function(callback) {
+	        if (typeof window.requestAnimationFrame === 'function') {
+	          window.requestAnimationFrame(callback);
+	        } else {
+	          window.setTimeout(callback, 16);
 	        }
 	      };
-	      if (typeof ResizeObserver !== 'undefined') {
-	        var _ro = new ResizeObserver(_reportHeight);
-	        document.addEventListener('DOMContentLoaded', function() {
-	          _ro.observe(document.documentElement);
-	          if (document.body) _ro.observe(document.body);
+	      var _resizeWorkScheduled = false;
+	      var _positionObservationScheduled = false;
+	      var _positionMonitorScheduled = false;
+	      var _positionMonitorActive = false;
+	      var _activeCssMotionCount = 0;
+      // ponytail: cap polling for motion without a reliable completion signal.
+      var _positionMonitorFramesRemaining = 0;
+	      var _activeAnimations = function() {
+	        if (typeof document.getAnimations !== 'function') return null;
+	        var animations;
+	        try {
+	          animations = document.getAnimations();
+		          // coercion-ok: animation introspection can be unavailable; CSS events remain authoritative.
+		        } catch (_) {
+	          return null;
+	        }
+	        var active = [];
+	        for (var i = 0; i < animations.length; i++) {
+	          if (
+	            animations[i].playState === 'running' ||
+	            animations[i].playState === 'pending'
+	          ) {
+	            active.push(animations[i]);
+	          }
+	        }
+	        return active;
+	      };
+	      var _scheduleResizeWork = function() {
+	        if (_resizeWorkScheduled) return;
+	        _resizeWorkScheduled = true;
+	        _enqueueResizeWork(function() {
+	          _resizeWorkScheduled = false;
+	          _reportHeight();
 	        });
+	      };
+	      var _watchedAnimations = [];
+	      var _removeWatchedAnimation = function(animation) {
+	        var index = _watchedAnimations.indexOf(animation);
+	        if (index !== -1) _watchedAnimations.splice(index, 1);
+	      };
+	      var _watchAnimationCompletion = function(animation) {
+	        if (_watchedAnimations.indexOf(animation) !== -1) return false;
+	        _watchedAnimations.push(animation);
+	        try {
+	          var finished = animation.finished;
+          if (finished && typeof finished.then === 'function') {
+            finished.then(function() {
+              _removeWatchedAnimation(animation);
+              _reportHeight();
+              _motionElements.delete(animation.effect && animation.effect.target);
+              _scheduleResizeWork();
+            }, function() {
+              _removeWatchedAnimation(animation);
+              _reportHeight();
+              _motionElements.delete(animation.effect && animation.effect.target);
+              _scheduleResizeWork();
+            });
+	          }
+	        } catch (_) {
+	          _removeWatchedAnimation(animation);
+	        }
+	        return true;
+	      };
+	      var _schedulePositionObservation = function() {
+	        if (_positionObservationScheduled) return;
+	        _positionObservationScheduled = true;
+	        _enqueueResizeWork(function() {
+	          _positionObservationScheduled = false;
+	          _observePositioned();
+	        });
+	      };
+      var _schedulePositionMonitor = function() {
+        if (!_positionMonitorActive) return;
+        if (_positionMonitorScheduled) return;
+        _positionMonitorScheduled = true;
+        _enqueueResizeWork(function() {
+          _positionMonitorScheduled = false;
+          if (!_positionMonitorActive) return;
+          var body = document.body;
+          if (!body) return;
+          _reportHeight();
+          var animations = _activeAnimations();
+          var hasFiniteAnimation = false;
+          var hasIndefiniteAnimation =
+            animations === null || _activeCssMotionCount > 0;
+          if (animations) {
+            animations.forEach(function(animation) {
+              var effect = animation.effect;
+              _trackPositionedElement(effect && effect.target);
+              _watchAnimationCompletion(animation);
+              var timing =
+                effect && typeof effect.getComputedTiming === 'function'
+                  ? effect.getComputedTiming()
+                  : null;
+              if (timing && timing.endTime !== Infinity) {
+                hasFiniteAnimation = true;
+              } else {
+                hasIndefiniteAnimation = true;
+              }
+            });
+          }
+          if (hasFiniteAnimation || hasIndefiniteAnimation) {
+            _positionMonitorFramesRemaining -= 1;
+          }
+          if (
+            (hasFiniteAnimation || hasIndefiniteAnimation) &&
+            _positionMonitorFramesRemaining > 0
+          ) {
+            _schedulePositionMonitor();
+            return;
+          }
+          _positionMonitorActive = false;
+          if (!hasFiniteAnimation && !hasIndefiniteAnimation) {
+            _motionElements.clear();
+          }
+          _scheduleResizeWork();
+        });
+      };
+	      var _startPositionMonitor = function(event) {
+	        _trackPositionedElement(event && event.target);
+	        if (
+            event &&
+            (event.type === 'animationstart' ||
+              event.type === 'transitionrun')
+	        ) {
+	          _activeCssMotionCount += 1;
+	        }
+	        _positionMonitorActive = true;
+        _positionMonitorFramesRemaining = 120;
+        _schedulePositionObservation();
+	        _scheduleResizeWork();
+        _schedulePositionMonitor();
+        if (typeof _scheduleAnimationProbe === 'function') {
+          _scheduleAnimationProbe();
+        }
+      };
+	      var _startPositionMonitorIfActive = function() {
+	        var animations = _activeAnimations();
+	        if (animations && animations.length) {
+	          var newlyObserved = false;
+	          animations.forEach(function(animation) {
+	            var effect = animation.effect;
+            _trackPositionedElement(effect && effect.target);
+            if (_watchAnimationCompletion(animation)) newlyObserved = true;
+          });
+	          if (newlyObserved) _startPositionMonitor();
+          else if (_positionMonitorActive) _schedulePositionMonitor();
+        }
+      };
+      var _finishPositionMonitor = function(event) {
+        if (_activeCssMotionCount > 0) _activeCssMotionCount -= 1;
+	        var animations = _activeAnimations();
+	        if (animations) {
+	          animations.forEach(function(animation) {
+	            var effect = animation.effect;
+	            _trackPositionedElement(effect && effect.target);
+	          });
+	        }
+        _positionMonitorActive =
+          (animations && animations.length > 0) ||
+          (animations === null && _activeCssMotionCount > 0);
+        if (!_positionMonitorActive) {
+          _reportHeight();
+          _motionElements.clear();
+        }
+        _scheduleResizeWork();
+        if (_positionMonitorActive) _schedulePositionMonitor();
+      };
+      if (
+        typeof Element !== 'undefined' &&
+        typeof Element.prototype.animate === 'function'
+      ) {
+        var _nativeAnimate = Element.prototype.animate;
+        Element.prototype.animate = function() {
+          var animation = _nativeAnimate.apply(this, arguments);
+          _trackPositionedElement(this);
+          _watchAnimationCompletion(animation);
+          _startPositionMonitor();
+          return animation;
+        };
+      }
+      var _lastH = null;
+      var _measurePositionedContent = function(body, bodyTop) {
+        var bottom = 0;
+        var measure = function(element) {
+          if (!element || !body.contains(element) || _isExcludedFromHeight(element, body)) {
+            return;
+          }
+          bottom = Math.max(bottom, element.getBoundingClientRect().bottom - bodyTop);
+        };
+        _positionedElements.forEach(measure);
+        _motionElements.forEach(measure);
+        return bottom;
+      };
+      var _reportHeight = function() {
+        try {
+          var body = document.body;
+          if (!body) return;
+          var bodyRect = body.getBoundingClientRect();
+          var bodyStyle = window.getComputedStyle(body);
+          var paddingTop = parseFloat(bodyStyle.paddingTop) || 0;
+          var paddingBottom = parseFloat(bodyStyle.paddingBottom) || 0;
+          var contentBottom = Math.max(
+            paddingTop,
+            bodyRect.height - paddingBottom,
+            _measurePositionedContent(body, bodyRect.top),
+          );
+          var h = Math.ceil(contentBottom + paddingBottom);
+          if (h !== _lastH) {
+            _lastH = h;
+            window.parent.postMessage({ type: 'agent-native-extension-resize', height: h }, '*');
+          }
+          // coercion-ok: transient measurement failures are retried by later reports.
+        } catch (_) {}
+      };
+	      window.addEventListener('scroll', _scheduleResizeWork, true);
+	      window.addEventListener('resize', _scheduleResizeWork);
+	      document.addEventListener('animationstart', _startPositionMonitor, true);
+	      document.addEventListener('transitionrun', _startPositionMonitor, true);
+	      document.addEventListener('transitionstart', _startPositionMonitor, true);
+	      document.addEventListener('animationend', _finishPositionMonitor, true);
+	      document.addEventListener('animationcancel', _finishPositionMonitor, true);
+	      document.addEventListener('transitionend', _finishPositionMonitor, true);
+	      document.addEventListener('transitioncancel', _finishPositionMonitor, true);
+	      if (typeof ResizeObserver !== 'undefined') {
+	        _ro = new ResizeObserver(_scheduleResizeWork);
+		        document.addEventListener('DOMContentLoaded', function() {
+		          _observePositioned();
+		          _scheduleResizeWork();
+		          _startPositionMonitorIfActive();
+	          if (typeof MutationObserver !== 'undefined' && document.body) {
+	            new MutationObserver(function() {
+	              _schedulePositionObservation();
+	              _scheduleResizeWork();
+	              _startPositionMonitorIfActive();
+	            }).observe(document.body, {
+	              attributes: true,
+	              characterData: true,
+	              childList: true,
+	              subtree: true,
+	            });
+	          }
+	        });
+	      } else {
+	        setInterval(function() {
+	          _observePositioned();
+	          _reportHeight();
+	        }, 1000);
 	      }
 	      // Initial reports — Alpine takes a tick to render after DOMContentLoaded.
 	      setTimeout(_reportHeight, 50);
 	      setTimeout(_reportHeight, 250);
+	      var _animationProbeTimer = null;
+      var _scheduleAnimationProbe = function() {
+        if (_animationProbeTimer !== null) return;
+        _animationProbeTimer = window.setTimeout(function() {
+          _animationProbeTimer = null;
+          _startPositionMonitorIfActive();
+          var animations = _activeAnimations();
+          if ((animations && animations.length) || _positionMonitorActive) {
+            _scheduleAnimationProbe();
+          }
+        }, 250);
+      };
+	      if (typeof document.getAnimations === 'function') _scheduleAnimationProbe();
 	    }
 
 	    window.addEventListener('message', function(event) {
@@ -635,6 +1142,7 @@ export function buildExtensionHtml(
 	    });
 
 	    document.addEventListener('DOMContentLoaded', function() {
+	      _renderErrorToast();
 	      var fixBtn = document.getElementById('__extension-error-fix');
 	      if (fixBtn) {
 	        fixBtn.addEventListener('click', function() {
@@ -656,8 +1164,9 @@ export function buildExtensionHtml(
 	      }
 	    });
 	  </script>
+	${buildSessionReplayIframeBootstrap()}
 	</head>
-	<body${extensionId ? ` data-extension-id="${extensionIdAttr}" data-tool-id="${extensionIdAttr}"` : ""} class="bg-background text-foreground">
+	<body${extensionId ? ` data-extension-id="${extensionIdAttr}" data-tool-id="${extensionIdAttr}"` : ""} class="text-foreground">
 	${content}
 	<div id="__extension-error-toast">
 	  <div style="display:flex;align-items:flex-start;gap:8px;">

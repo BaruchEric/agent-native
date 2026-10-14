@@ -1,62 +1,334 @@
+import "../register-secrets.js";
+import { getOrgContext } from "@agent-native/core/org";
 import {
   createAgentChatPlugin,
+  buildDeepLink,
+  getRequestContext,
+  getRequestOrgId,
+  getRequestRunContext,
+  getRequestUserEmail,
   loadActionsFromStaticRegistry,
   type AgentLoopFinalResponseGuardContext,
 } from "@agent-native/core/server";
+
 import actionsRegistry from "../../.generated/actions-registry.js";
-import { getOrgContext } from "@agent-native/core/org";
+import { INITIAL_TOOL_NAMES } from "../lib/agent-chat-plan-mode";
 import {
-  listScopedSettingRecords,
-  resolveSettingsScope,
-} from "../lib/scoped-settings";
+  retrieveAnalyticsPromptReferences,
+  summarizeAnalyticsRun,
+} from "../lib/analytics-agent-context";
+import { ANALYTICS_MCP } from "../lib/analytics-mcp";
+import { enqueueAnalyticsMemoryCapture } from "../lib/analytics-memory-capture.js";
+import { credentialProviderConfigs } from "../lib/credential-keys";
+import { isProductionServerlessRuntime } from "../lib/production-serverless-runtime.js";
 import {
+  deriveGroundingActionNames,
+  draftClaimsAnalyticsMetrics,
+  draftRestatesPriorEvidence,
+  failedDataQueryAttemptMessage,
+  hasCatalogSearchAttempt,
+  hasDashboardConstructionAttempt,
   hasExplicitPartialDisclosure,
   hasFailedCorpusWorkflowEvidence,
   hasDataQueryAttempt,
   hasIncompleteDataEvidence,
+  isGenericNoDataFallback,
   isSafeNoDataAnalyticsResponse,
   hasOverstatedCoverageConfidenceClaim,
   looksLikeCoverageSensitiveAnalyticsRequest,
+  looksLikeDashboardConstructionRequest,
   looksLikeStrongCoverageClaim,
-  looksLikeAnalyticsDataRequest,
+  isNonDataTurn,
+  isTrivialTurn,
   needsCorpusWorkflowForCoverageSensitiveRequest,
   needsSourceRecordBodyWorkflowForCoverageSensitiveRequest,
+  registerGroundingActions,
+  stripInjectedAnalyticsGuardContext,
 } from "../lib/real-data-actions";
-import { renderDataDictionary } from "../lib/data-dictionary-context";
 
-const DATA_DICT_PREFIX = "data-dict-";
+const GROUNDING_ACTION_NAMES = deriveGroundingActionNames(actionsRegistry);
+registerGroundingActions(GROUNDING_ACTION_NAMES);
 
-const INITIAL_TOOL_NAMES = [
-  "view-screen",
-  "data-source-status",
-  "list-analyses",
-  "get-analysis",
-  "save-analysis",
+const ANALYTICS_BACKGROUND_RUN_SOFT_TIMEOUT_MS = 13 * 60_000;
+export const ANALYTICS_BACKGROUND_RUN_NO_PROGRESS_TIMEOUT_MS = 3 * 60_000;
+
+const DASHBOARD_EDIT_TOOLS = new Set([
+  "compose-dashboard",
+  "mutate-dashboard",
+  "rename-dashboard",
+  "reorder-dashboard-panels",
+  "restore-dashboard-revision",
+  "save-explorer-config",
+  "save-explorer-dashboard",
+  "save-sql-dashboard",
+  "update-dashboard",
+  "update-dashboard-demo",
+  "update-dashboard-summary",
+]);
+const ANALYSIS_EDIT_TOOLS = new Set([
   "rename-analysis",
-  "delete-analysis",
-  "generate-chart",
-  "bigquery",
-  "search-bigquery-schema",
-  "bigquery-table-info",
-  "provider-api-catalog",
-  "provider-api-docs",
-  "provider-api-request",
-  "provider-corpus-job",
-  "provider-corpus-jobs",
-  "query-staged-dataset",
-  "list-staged-datasets",
-  "delete-staged-dataset",
-  "account-deep-dive",
-  "hubspot-deals",
-  "hubspot-records",
-  "gong-calls",
-  "jira-search",
-  "slack-messages",
-  "sentry",
-  "list-data-dictionary",
-  "save-data-dictionary-entry",
-  "navigate",
+  "restore-analysis-revision",
+  "save-analysis",
+]);
+
+function eventRecord(entry: unknown): Record<string, unknown> | undefined {
+  if (!entry || typeof entry !== "object") return undefined;
+  const event = (entry as { event?: unknown }).event;
+  return event && typeof event === "object"
+    ? (event as Record<string, unknown>)
+    : undefined;
+}
+
+function inputForCompletedTool(
+  events: readonly unknown[],
+  index: number,
+  completed: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  if (completed.input && typeof completed.input === "object") {
+    return completed.input as Record<string, unknown>;
+  }
+  const id = typeof completed.id === "string" ? completed.id : undefined;
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    const candidate = eventRecord(events[cursor]);
+    if (
+      candidate?.type !== "tool_start" ||
+      candidate.tool !== completed.tool ||
+      (id && candidate.id !== id)
+    ) {
+      continue;
+    }
+    return candidate.input && typeof candidate.input === "object"
+      ? (candidate.input as Record<string, unknown>)
+      : undefined;
+  }
+  return undefined;
+}
+
+function analyticsToolTarget(
+  tool: string,
+  input: Record<string, unknown> | undefined,
+  scopeType: "dashboard" | "analysis",
+): unknown {
+  if (scopeType === "dashboard") {
+    if (
+      tool === "compose-dashboard" ||
+      tool === "mutate-dashboard" ||
+      tool === "reorder-dashboard-panels" ||
+      tool === "update-dashboard" ||
+      tool === "update-dashboard-demo" ||
+      tool === "update-dashboard-summary"
+    ) {
+      return input?.dashboardId ?? input?.id;
+    }
+    return input?.id ?? input?.dashboardId;
+  }
+  return input?.analysisId ?? input?.id;
+}
+
+function hasAnalyticsEdit(
+  run: { events: readonly unknown[] },
+  tools: ReadonlySet<string>,
+  scopeType: "dashboard" | "analysis",
+  scopeId: string,
+): boolean {
+  return run.events.some((entry, index) => {
+    const record = eventRecord(entry);
+    if (!record) return false;
+    const input = inputForCompletedTool(run.events, index, record);
+    return (
+      record.type === "tool_done" &&
+      record.completedSideEffect === true &&
+      record.isError !== true &&
+      typeof record.tool === "string" &&
+      tools.has(record.tool) &&
+      analyticsToolTarget(record.tool, input, scopeType) === scopeId
+    );
+  });
+}
+
+async function autosaveAnalyticsAfterAgentTurn(
+  scope: { type: string; id: string },
+  run: {
+    events: readonly unknown[];
+    threadId?: string;
+    runId?: string;
+    turnId?: string;
+  },
+): Promise<void> {
+  const email = getRequestUserEmail();
+  if (!email) return;
+  const ctx = { email, orgId: getRequestOrgId() || null };
+  if (
+    scope.type === "dashboard" &&
+    hasAnalyticsEdit(run, DASHBOARD_EDIT_TOOLS, "dashboard", scope.id)
+  ) {
+    const { createDashboardRevisionSnapshot } =
+      await import("../lib/dashboards-store.js");
+    await createDashboardRevisionSnapshot(scope.id, ctx, {
+      ...(run.threadId ? { threadId: run.threadId } : {}),
+      ...(run.runId ? { runId: run.runId } : {}),
+      ...(run.turnId ? { turnId: run.turnId } : {}),
+    });
+    return;
+  }
+  if (
+    scope.type === "analysis" &&
+    hasAnalyticsEdit(run, ANALYSIS_EDIT_TOOLS, "analysis", scope.id)
+  ) {
+    const { createAnalysisRevisionSnapshot } =
+      await import("../lib/dashboards-store.js");
+    await createAnalysisRevisionSnapshot(scope.id, ctx, {
+      ...(run.threadId ? { threadId: run.threadId } : {}),
+      ...(run.runId ? { runId: run.runId } : {}),
+      ...(run.turnId ? { turnId: run.turnId } : {}),
+    });
+  }
+}
+
+const ANALYTICS_DATA_SOURCES_LINK = buildDeepLink({
+  app: "analytics",
+  view: "data-sources",
+  to: "/data-sources",
+});
+
+const DASHBOARD_BUILD_PAUSE_PATTERN =
+  /\b(?:want me to|would you like me to|shall i|should i|can i|may i|do you want me to)\b[\s\S]{0,160}\b(?:proceed|continue|seed|populate|save|embed|finish|run|apply|create|build)\b/i;
+
+function hasSuccessfulExtensionCreation(
+  toolResults: AgentLoopFinalResponseGuardContext["toolResults"],
+): boolean {
+  return (toolResults ?? []).some(
+    (result) =>
+      !result.isError &&
+      String(result.name ?? "")
+        .trim()
+        .toLowerCase()
+        .replace(/[\s_]+/g, "-") === "create-extension",
+  );
+}
+
+function hasSuccessfulDashboardSave(
+  toolResults: AgentLoopFinalResponseGuardContext["toolResults"],
+): boolean {
+  const saveActions = new Set([
+    "update-dashboard",
+    "mutate-dashboard",
+    "compose-dashboard",
+    "update-extension",
+  ]);
+  return (toolResults ?? []).some((result) => {
+    if (result.isError) return false;
+    const name = String(result.name ?? "")
+      .trim()
+      .toLowerCase()
+      .replace(/[\s_]+/g, "-");
+    if (!saveActions.has(name)) return false;
+    if (result.receipt) return result.receipt.changed;
+    // mutate-dashboard reports every write through a receipt; none means a dry run.
+    if (name === "mutate-dashboard") return false;
+    const content = String(result.content ?? "").trim();
+    if (!content.startsWith("{")) return true;
+    try {
+      const parsed = JSON.parse(content) as Record<string, unknown>;
+      if (parsed.saved === false) return false;
+      if (name === "compose-dashboard" && parsed.changed === false) {
+        return false;
+      }
+      // coercion-ok: malformed structured action output fails closed below.
+    } catch {
+      return false;
+    }
+    return true;
+  });
+}
+
+function hasPartialDashboardBuild(
+  toolResults: AgentLoopFinalResponseGuardContext["toolResults"],
+): boolean {
+  const partialBuildActions = new Set([
+    "create-extension",
+    "extension-data-set",
+  ]);
+  return (toolResults ?? []).some((result) => {
+    if (result.isError) return false;
+    const name = String(result.name ?? "")
+      .trim()
+      .toLowerCase()
+      .replace(/[\s_]+/g, "-");
+    return partialBuildActions.has(name);
+  });
+}
+
+export const NON_ANALYTICS_FALLBACK_RETRY_MESSAGE =
+  "<non-analytics-retry>\nThe user's latest message is ordinary conversation. Reply to it directly and naturally. Never answer it with the no-grounded-data disclaimer.\n</non-analytics-retry>";
+
+export const NON_ANALYTICS_FALLBACK_FINAL_MESSAGE =
+  "I got stuck generating a reply to that message. Please try again or rephrase it.";
+
+export interface AnalyticsPromptRule {
+  id: string;
+  text: string;
+}
+
+/** The always-on Analytics prompt: hard invariants plus a router to the skills
+ *  that own each procedure. Procedures live in skills, not here; the baseline
+ *  budget spec counts this list. */
+export const ANALYTICS_PROMPT_RULES: readonly AnalyticsPromptRule[] = [
+  {
+    id: "real-data",
+    text: "REAL DATA — Present metrics, counts, trends, or source-record conclusions only from a live data-source query that ran this turn; a catalog or dictionary hit, `data-source-status`, `get-sql-dashboard`, and dry-run validation are not data queries. Never substitute a fabricated number for a failed query or unavailable provider; report the exact gap. Non-data tasks (greetings, general knowledge, math, writing, coding, workflow or settings help, conceptual planning) need no data call and never get the no-grounded-data fallback.",
+  },
+  {
+    id: "references",
+    text: 'REFERENCES — The system may preload bounded dictionary entries and saved dashboard panels in `<resource scope="analytics-catalog">`. They supply definitions and query examples, never current values. Approved entries are canonical, unreviewed human entries unverified, AI-generated unapproved entries suggestions. If nothing fits, call `find-data` once for ranked definitions, saved query examples, and generated source metadata. Call `search-bigquery-schema` next only when exact live columns or partition metadata are still needed. The words all, total, or exact do not by themselves make a question a corpus investigation.',
+  },
+  {
+    id: "failed-calls",
+    text: "FAILED CALLS — Correct invalid arguments once; never repeat an identical failed call. For credential, permission, quota, network, or repeated schema failures, stop using that source for the turn and surface the actual error rather than trying unrelated providers. `find-data` searches definitions, saved query examples, and generated source metadata together; `search-bigquery-schema` checks exact live warehouse metadata.",
+  },
+  {
+    id: "understand-the-ask",
+    text: 'UNDERSTAND THE ASK — The open dashboard and selected panel (`<current-screen>`, `selected-object`) are what "this", "that", and "it" mean. When a preloaded or catalog reference fits, keep its source and business logic and change only filters and window; prefer certified over favorite over unmarked. If an ambiguity would change the numbers, ask exactly one `ask-question` with a recommended default; otherwise pick the default and label it. Open a data answer per AGENTS.md "Data questions"; otherwise one line, "Reading this as: <metric definition>, <window>, <filters>, <source>"; open an edit with "Changing <panel title> on <dashboard>". A source the user names wins. Never ask the user for dataset, table, column, or SQL identifiers; look them up.',
+  },
+  {
+    id: "sources",
+    text:
+      "SOURCES — A provider the user names is authoritative for the turn: use its first-class query action, or `tool-search` for it when it is not loaded, instead of loading unrelated catalogs. `query-agent-native-analytics` is the always-available built-in first-party source (product events, signups, session recordings): never call it disconnected because an external provider is, and keep the event semantics of a first-party dashboard definition the catalog returns. When a live request needs an unavailable external provider, explain what is missing in context and link [Connect data sources](" +
+      ANALYTICS_DATA_SOURCES_LINK +
+      ") rather than a canned no-data sentence. Load provider API, corpus, staging, or code tools (`provider-api-request`, `provider-corpus-job`, `query-staged-dataset`, `run-code`) only for explicit cross-source work, exhaustive unstructured-record coverage, an absence claim the first-class action cannot support, or a durable export.",
+  },
+  {
+    id: "workspace-routing",
+    text: 'WORKSPACE ROUTING — Analytics owns first-party product usage, app/template events, agent-native signups, and conversions; when another app delegates one with `call-agent`, answer here from the built-in source and query catalog. Builder.io or AI credit spend, LLM usage by workspace member or month, and workspace app or Builder branch creation history are Dispatch-owned: your first call is `call-agent` with agent `dispatch`, action `list-dispatch-usage-metrics`, and input `{ sinceDays, scope: "workspace" }` (add `userEmail` only when the user narrows to one person), then read `monthlyByUser` and `workspaceAppCreationsByUserMonth`. Do not ask for a user export or BigQuery schema on that path. A request scoped to a named customer or account keeps that scope and uses the catalog, dictionary, schema, and one bounded query; never substitute workspace metrics, and resolve the account identity before attributing rows to it. Company knowledge, decisions, meeting context, and Slack context belong to the Brain app: `call-agent` with agent `brain` and a narrow natural-language question (Brain is not in `list-extensions`; do not use `provider-api-request` for it), and report its access or source errors verbatim.',
+  },
+  {
+    id: "dashboard-builds",
+    text: "DASHBOARD BUILDS — An explicit request to build, create, save, or adapt a dashboard authorizes every non-destructive in-app step to finish it in the same turn: query or scaffold, seed extension data, save, embed, navigate. Do not ask 'want me to proceed?' or stop at an empty shell; ask one question only when metric scope or grain changes the result, and pause for destructive changes or external side effects such as sending email or outreach. An approved action with concrete input runs exactly as given, and its dashboard id is authoritative: do not reinterpret an edit as a template clone.",
+  },
+  {
+    id: "skills",
+    text: 'SKILLS — Read the owning skill with `docs-search --slug "skill-<name>"` before the work: `dashboard-management` to create a dashboard or to move, reorder, lay out, or file panels (a small edit of one existing panel needs no skill: `get-sql-dashboard` with `panelIds`, then `mutate-dashboard`); `custom-blocks` for extension panels, which are a one-off exception to native panels; `account-health` for a named customer, QBR, or renewal; `incident-investigation` for a named user\'s sessions, errors, stuck runs, or replay evidence; `analysis-workspace` for CSV, XLSX, or file delivery. Deliver a CSV or file in chat with Download CSV on compact tables; for a durable export load `show-workspace-file`; never finish with only a path. Deferred tools load with one `tool-search` call: `update-dashboard`, `compose-dashboard`, `generate-chart`, `show-workspace-file`, `provider-api-request`.',
+  },
+  {
+    id: "acknowledgments",
+    text: "ACKNOWLEDGMENTS: Give at most one brief acknowledgment. Avoid stacked compliments; address the feedback directly.",
+  },
 ];
+
+export function analyticsExtraContext(): string {
+  return `<data-source-guidance>\n${ANALYTICS_PROMPT_RULES.map((rule) => rule.text).join("\n")}\n</data-source-guidance>`;
+}
+
+const SCHEMA_DETAILS_REQUEST_PATTERN =
+  /\b(?:could you|can you|would you|please\s+(?:provide|share|send|tell)|provide|share|send(?: me)?|tell me|i need(?: you to)?|what (?:is|are)|which)\b[\s\S]{0,260}\b(?:bigquery\s+)?(?:dataset(?: name)?s?|table(?: name)?s?|column(?: name)?s?|field(?: name)?s?|schema|sql query)\b/i;
+
+function looksLikeSchemaDetailsRequest(text: string): boolean {
+  return SCHEMA_DETAILS_REQUEST_PATTERN.test(
+    stripInjectedAnalyticsGuardContext(String(text ?? "")),
+  );
+}
+
+export { INITIAL_TOOL_NAMES } from "../lib/agent-chat-plan-mode";
 
 function latestUserText(
   messages: AgentLoopFinalResponseGuardContext["messages"],
@@ -73,13 +345,736 @@ function latestUserText(
   return "";
 }
 
-function realDataFinalGuard(context: AgentLoopFinalResponseGuardContext) {
+const UNVERIFIED_DRAFT_RETRY_INSTRUCTION =
+  ' If you cannot run a query, restate every number, count, or trend in the draft as explicitly unverified (prefix the sentence with "Unverified:") rather than asserting it.';
+
+function sourceStatusDescription(summary: DataSourceStatusSummary): string {
+  const healthyWorkspaceConnections = summary.workspaceConnectedSourceLabels;
+  const healthyLabels = new Set(healthyWorkspaceConnections);
+  const configuredWithoutHealthyGrant = summary.configuredSourceLabels.filter(
+    (label) => !healthyLabels.has(label),
+  );
+  const details = [
+    healthyWorkspaceConnections.length
+      ? `healthy workspace connections: ${healthyWorkspaceConnections.join(", ")}`
+      : "",
+    configuredWithoutHealthyGrant.length
+      ? `configured sources without a healthy workspace connection: ${configuredWithoutHealthyGrant.join(", ")}`
+      : "",
+  ].filter(Boolean);
+  return details.join("; ");
+}
+
+function exhaustedDraftPrefixFor({
+  toolResults,
+  setupMarkdown,
+  includeConnectOption,
+}: {
+  toolResults: AgentLoopFinalResponseGuardContext["toolResults"];
+  setupMarkdown: string;
+  includeConnectOption: boolean;
+}): string {
+  const sourceStatus = dataSourceStatusSummary(toolResults);
+  const sourceStatusDetails = sourceStatusDescription(sourceStatus);
+  const sourceStatusSentence = sourceStatusDetails
+    ? ` Data-source status reports ${sourceStatusDetails}; it does not verify a query result.`
+    : "";
+  const nextOptions = [
+    "ask me to query an existing dashboard (I'll search certified ones first)",
+    "narrow the question to one metric and time range",
+  ];
+  if (includeConnectOption) {
+    nextOptions.push(`connect the missing source: ${setupMarkdown}`);
+  }
+  return (
+    "Unverified — no live data query ran for this answer, so every figure and trend below is unconfirmed." +
+    sourceStatusSentence +
+    ` Next options: ${nextOptions.join(", ")}.`
+  );
+}
+
+function isRealUserTextMessage(message: {
+  role?: string;
+  content?: unknown;
+}): boolean {
+  if (message?.role !== "user" || !Array.isArray(message.content)) {
+    return false;
+  }
+  const parts = message.content as Array<{ type?: string }>;
+  return (
+    parts.some((part) => part?.type === "text") &&
+    !parts.some((part) => part?.type === "tool-result")
+  );
+}
+
+function priorTurnEvidence(
+  messages: AgentLoopFinalResponseGuardContext["messages"],
+): {
+  toolResults: Array<{ name?: string; isError?: boolean; content?: string }>;
+  text: string;
+} {
+  const collected: Array<{
+    name?: string;
+    isError?: boolean;
+    content?: string;
+  }> = [];
+  const textParts: string[] = [];
+  let turnBoundariesCrossed = 0;
+  for (let i = messages.length - 2; i >= 0; i--) {
+    const message = messages[i] as { role?: string; content?: unknown };
+    if (isRealUserTextMessage(message)) {
+      turnBoundariesCrossed += 1;
+      if (turnBoundariesCrossed >= 2) break;
+      continue;
+    }
+    if (!Array.isArray(message?.content)) continue;
+    for (const part of message.content as Array<{
+      type?: string;
+      text?: string;
+      input?: unknown;
+      toolName?: string;
+      isError?: boolean;
+      content?: string;
+    }>) {
+      if (part?.type === "text" && typeof part.text === "string") {
+        textParts.push(part.text);
+      } else if (part?.type === "tool-call") {
+        textParts.push(
+          typeof part.input === "string"
+            ? part.input
+            : JSON.stringify(part.input ?? ""),
+        );
+      } else if (part?.type === "tool-result") {
+        collected.push({
+          name: part.toolName,
+          isError: part.isError,
+          content: part.content,
+        });
+        textParts.push(String(part.content ?? ""));
+      }
+    }
+  }
+  return { toolResults: collected, text: textParts.join("\n") };
+}
+
+interface DataSourceStatusSummary {
+  checked: boolean;
+  configuredSourceLabels: string[];
+  workspaceConnectedSourceLabels: string[];
+  availableExternalSources: Array<{
+    aliases: string[];
+    configured: boolean | null;
+    workspaceGrantState?: string;
+    credentialsConfigured?: boolean | null;
+    label?: string;
+    setupLink?: string;
+  }>;
+  setupLink: string;
+}
+
+function inferRequiredCredentialsConfigured(
+  providerId: unknown,
+  record: Record<string, unknown>,
+  configured: boolean | null,
+  workspaceGrantState: string | undefined,
+): boolean | null {
+  if (typeof record.credentialsConfigured === "boolean") {
+    return record.credentialsConfigured;
+  }
+
+  const rawMissingRequiredKeys = record.missingRequiredKeys;
+  if (
+    Array.isArray(rawMissingRequiredKeys) &&
+    rawMissingRequiredKeys.every((key) => typeof key === "string")
+  ) {
+    return rawMissingRequiredKeys.length === 0;
+  }
+
+  const configuredKeys = Array.isArray(record.configuredKeys)
+    ? record.configuredKeys.filter(
+        (key): key is string => typeof key === "string",
+      )
+    : null;
+  if (configuredKeys && typeof providerId === "string") {
+    const providerConfig = credentialProviderConfigs.find(
+      (provider) => provider.provider === providerId,
+    );
+    if (providerConfig) {
+      const configuredKeySet = new Set(
+        configuredKeys.map((key) => key.trim().toUpperCase()),
+      );
+      const requiredMode = providerConfig.requiredMode ?? "all";
+      return requiredMode === "any"
+        ? providerConfig.requiredKeys.some((key) =>
+            configuredKeySet.has(key.toUpperCase()),
+          )
+        : providerConfig.requiredKeys.every((key) =>
+            configuredKeySet.has(key.toUpperCase()),
+          );
+    }
+  }
+
+  if (
+    workspaceGrantState === "granted" ||
+    workspaceGrantState === "connected"
+  ) {
+    return null;
+  }
+  return configured === true ? true : null;
+}
+
+const GENERIC_EXTERNAL_SOURCE_REQUEST_TERMS = /\b(warehouse|crm|payments?)\b/i;
+
+const EXTERNAL_SOURCE_PROVIDER_ALIASES = [
+  ...credentialProviderConfigs.map(({ provider, label }) => ({
+    terms:
+      provider === "builder" ? [label, "Builder content"] : [provider, label],
+    aliases: [provider, label],
+  })),
+  { terms: ["ga4"], aliases: ["ga4", "google analytics"] },
+  { terms: ["twitter/x", "x/twitter"], aliases: ["twitter", "x/twitter"] },
+];
+
+function looksLikeExternalSourceRequest(userText: string): boolean {
+  return (
+    GENERIC_EXTERNAL_SOURCE_REQUEST_TERMS.test(userText) ||
+    EXTERNAL_SOURCE_PROVIDER_ALIASES.some(({ terms }) =>
+      terms.some((term) => containsNormalizedPhrase(userText, term)),
+    )
+  );
+}
+
+function normalizeSourceLabel(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function containsNormalizedPhrase(text: string, phrase: string): boolean {
+  const normalizedText = normalizeSourceLabel(text);
+  const normalizedPhrase = normalizeSourceLabel(phrase);
+  return Boolean(
+    normalizedPhrase &&
+    (normalizedText === normalizedPhrase ||
+      normalizedText.startsWith(`${normalizedPhrase} `) ||
+      normalizedText.endsWith(` ${normalizedPhrase}`) ||
+      normalizedText.includes(` ${normalizedPhrase} `)),
+  );
+}
+
+function sourceAliasesOverlap(left: string[], right: string[]): boolean {
+  return left.some((leftAlias) =>
+    right.some((rightAlias) => {
+      const normalizedLeft = normalizeSourceLabel(leftAlias);
+      const normalizedRight = normalizeSourceLabel(rightAlias);
+      return (
+        normalizedLeft === normalizedRight ||
+        normalizedLeft.startsWith(`${normalizedRight} `) ||
+        normalizedLeft.endsWith(` ${normalizedRight}`) ||
+        normalizedLeft.includes(` ${normalizedRight} `) ||
+        normalizedRight.startsWith(`${normalizedLeft} `) ||
+        normalizedRight.endsWith(` ${normalizedLeft}`) ||
+        normalizedRight.includes(` ${normalizedLeft} `)
+      );
+    }),
+  );
+}
+
+function hasMissingRequestedExternalSource(
+  userText: string,
+  configuredSourceLabels: string[],
+  availableExternalSources: DataSourceStatusSummary["availableExternalSources"] = [],
+): boolean {
+  const configuredAliases = [
+    ...configuredSourceLabels.map((label) => [label]),
+    ...availableExternalSources
+      .filter(({ configured }) => configured === true)
+      .map(({ aliases }) => aliases),
+  ];
+  const sourceAliases = [
+    ...EXTERNAL_SOURCE_PROVIDER_ALIASES,
+    ...availableExternalSources.map(({ aliases }) => ({
+      terms: aliases,
+      aliases,
+    })),
+  ];
+  return sourceAliases
+    .filter(({ terms }) =>
+      terms.some((term) => containsNormalizedPhrase(userText, term)),
+    )
+    .some(({ aliases }) => {
+      const matchingStatuses = availableExternalSources.filter((source) =>
+        sourceAliasesOverlap(source.aliases, aliases),
+      );
+      if (
+        matchingStatuses.some(
+          (source) =>
+            source.workspaceGrantState === "granted" &&
+            source.credentialsConfigured !== true,
+        )
+      ) {
+        return true;
+      }
+      if (
+        matchingStatuses.some(
+          (source) =>
+            source.workspaceGrantState === "needs_grant" &&
+            source.credentialsConfigured === false,
+        )
+      ) {
+        return true;
+      }
+      if (
+        matchingStatuses.some(
+          ({ configured }) => configured === true || configured === null,
+        )
+      ) {
+        return false;
+      }
+      return !configuredAliases.some((configured) =>
+        sourceAliasesOverlap(configured, aliases),
+      );
+    });
+}
+
+function dataSourceStatusSummary(
+  toolResults: AgentLoopFinalResponseGuardContext["toolResults"],
+): DataSourceStatusSummary {
+  const configuredSourceLabels = new Set<string>();
+  const workspaceConnectedSourceLabels = new Set<string>();
+  const availableExternalSources = new Map<
+    string,
+    DataSourceStatusSummary["availableExternalSources"][number]
+  >();
+  let checked = false;
+  let setupLink = ANALYTICS_DATA_SOURCES_LINK;
+
+  const addAvailableExternalSource = (
+    provider: unknown,
+    label: unknown,
+    configured: boolean | null,
+    providerSetupLink?: unknown,
+    details?: {
+      workspaceGrantState?: string;
+      credentialsConfigured?: boolean | null;
+    },
+  ) => {
+    const aliases = [provider, label]
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const key = normalizeSourceLabel(aliases[0] ?? aliases[1] ?? "");
+    if (!key) return;
+    const existing = availableExternalSources.get(key);
+    if (existing) {
+      existing.configured =
+        existing.configured === true || configured === true
+          ? true
+          : existing.configured === null || configured === null
+            ? null
+            : false;
+      if (details?.workspaceGrantState) {
+        existing.workspaceGrantState = details.workspaceGrantState;
+      }
+      if (details?.credentialsConfigured !== undefined) {
+        // The compact configuredDataSources entry is only a hint: its `via`
+        // value can include optional credentials. The provider record carries
+        // the authoritative required-credential result and must be allowed to
+        // correct that inference in either direction.
+        existing.credentialsConfigured = details.credentialsConfigured;
+      }
+      existing.aliases = [...new Set([...existing.aliases, ...aliases])];
+      if (!existing.label && typeof label === "string" && label.trim()) {
+        existing.label = label.trim();
+      }
+      if (
+        !existing.setupLink &&
+        typeof providerSetupLink === "string" &&
+        providerSetupLink.trim()
+      ) {
+        existing.setupLink = providerSetupLink.trim();
+      }
+      return;
+    }
+    availableExternalSources.set(key, {
+      aliases,
+      configured,
+      ...(details?.workspaceGrantState
+        ? { workspaceGrantState: details.workspaceGrantState }
+        : {}),
+      ...(details?.credentialsConfigured !== undefined
+        ? { credentialsConfigured: details.credentialsConfigured }
+        : {}),
+      ...(typeof label === "string" && label.trim()
+        ? { label: label.trim() }
+        : {}),
+      ...(typeof providerSetupLink === "string" && providerSetupLink.trim()
+        ? { setupLink: providerSetupLink.trim() }
+        : {}),
+    });
+  };
+
+  for (const result of toolResults ?? []) {
+    const normalizedName = String(result.name ?? "")
+      .trim()
+      .toLowerCase()
+      .replace(/[\s_]+/g, "-");
+    if (normalizedName !== "data-source-status" || result.isError) continue;
+
+    let parsed: Record<string, unknown>;
+    try {
+      const value = JSON.parse(String(result.content ?? ""));
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        continue;
+      }
+      parsed = value as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+
+    const workspaceConnections =
+      parsed.workspaceConnections &&
+      typeof parsed.workspaceConnections === "object" &&
+      !Array.isArray(parsed.workspaceConnections)
+        ? (parsed.workspaceConnections as Record<string, unknown>)
+        : null;
+    if (!parsed.error && workspaceConnections?.available !== false) {
+      checked = true;
+    }
+
+    let foundSetupLink = false;
+    for (const candidate of [
+      parsed.dataSourcesSetupLink,
+      parsed.dataSourcesLink,
+      parsed.setupLink,
+    ]) {
+      const url =
+        typeof candidate === "string"
+          ? candidate
+          : candidate &&
+              typeof candidate === "object" &&
+              !Array.isArray(candidate)
+            ? (candidate as Record<string, unknown>).url
+            : undefined;
+      if (typeof url === "string" && url.trim()) {
+        setupLink = url.trim();
+        foundSetupLink = true;
+        break;
+      }
+    }
+    if (
+      !foundSetupLink &&
+      typeof parsed.settingsPath === "string" &&
+      parsed.settingsPath.trim()
+    ) {
+      setupLink = parsed.settingsPath.trim();
+    }
+
+    const compactSources = Array.isArray(parsed.configuredDataSources)
+      ? parsed.configuredDataSources
+      : [];
+    for (const source of compactSources) {
+      if (!source || typeof source !== "object" || Array.isArray(source)) {
+        continue;
+      }
+      const record = source as Record<string, unknown>;
+      const provider = (
+        typeof record.provider === "string"
+          ? record.provider
+          : (JSON.stringify(record.provider) ?? "")
+      )
+        .trim()
+        .toLowerCase();
+      const via = (
+        typeof record.via === "string"
+          ? record.via
+          : (JSON.stringify(record.via) ?? "")
+      )
+        .trim()
+        .toLowerCase();
+      if (provider === "first-party" || via === "built-in") continue;
+      const label = record.label ?? record.provider;
+      if (typeof label === "string" && label.trim()) {
+        configuredSourceLabels.add(label.trim());
+        if (via === "workspace" || via === "credentials-and-workspace") {
+          workspaceConnectedSourceLabels.add(label.trim());
+        }
+      }
+      const workspaceGrantState =
+        via === "workspace-grant" || via === "credentials-and-workspace-grant"
+          ? "granted"
+          : via === "workspace" || via === "credentials-and-workspace"
+            ? "connected"
+            : undefined;
+      // `credentials-and-workspace-grant` is not evidence that required keys
+      // are present: the compact summary can include optional-only keys.
+      // Leave required-credential readiness unknown until the provider detail
+      // supplies its explicit result (or enough required-key metadata).
+      const credentialsConfigured = via === "credentials" ? true : undefined;
+      addAvailableExternalSource(
+        record.provider,
+        label,
+        true,
+        record.setupLink,
+        { workspaceGrantState, credentialsConfigured },
+      );
+    }
+
+    const providers = Array.isArray(parsed.providers) ? parsed.providers : [];
+    for (const provider of providers) {
+      if (
+        !provider ||
+        typeof provider !== "object" ||
+        Array.isArray(provider)
+      ) {
+        continue;
+      }
+      const record = provider as Record<string, unknown>;
+      const providerId = (
+        typeof record.provider === "string"
+          ? record.provider
+          : (JSON.stringify(record.provider) ?? "")
+      )
+        .trim()
+        .toLowerCase();
+      if (providerId === "first-party") continue;
+      const label = record.label ?? record.provider;
+      const configured =
+        typeof record.configured === "boolean" ? record.configured : null;
+      const workspaceConnection =
+        record.workspaceConnection &&
+        typeof record.workspaceConnection === "object" &&
+        !Array.isArray(record.workspaceConnection)
+          ? (record.workspaceConnection as Record<string, unknown>)
+          : null;
+      const workspaceGrantState =
+        typeof workspaceConnection?.grantState === "string"
+          ? workspaceConnection.grantState
+          : undefined;
+      const credentialsConfigured = inferRequiredCredentialsConfigured(
+        record.provider,
+        record,
+        configured,
+        workspaceGrantState,
+      );
+      const requiredCredentialsMissingWithoutGrant =
+        workspaceGrantState === "needs_grant" &&
+        credentialsConfigured === false;
+      const effectiveConfigured = requiredCredentialsMissingWithoutGrant
+        ? false
+        : configured;
+      addAvailableExternalSource(
+        record.provider,
+        label,
+        effectiveConfigured,
+        record.setupLink,
+        { workspaceGrantState, credentialsConfigured },
+      );
+      if (
+        effectiveConfigured === true &&
+        typeof label === "string" &&
+        label.trim()
+      ) {
+        configuredSourceLabels.add(label.trim());
+      } else if (
+        effectiveConfigured === false &&
+        typeof label === "string" &&
+        label.trim()
+      ) {
+        configuredSourceLabels.delete(label.trim());
+      }
+      if (
+        workspaceConnection?.grantState === "connected" &&
+        typeof label === "string" &&
+        label.trim()
+      ) {
+        workspaceConnectedSourceLabels.add(label.trim());
+      }
+    }
+
+    const workspaceProviders = Array.isArray(workspaceConnections?.providers)
+      ? workspaceConnections.providers
+      : [];
+    for (const provider of workspaceProviders) {
+      if (
+        !provider ||
+        typeof provider !== "object" ||
+        Array.isArray(provider)
+      ) {
+        continue;
+      }
+      const record = provider as Record<string, unknown>;
+      const providerId = record.id ?? record.provider;
+      const label = record.label ?? providerId;
+      const grantState =
+        typeof record.grantState === "string" ? record.grantState : null;
+      const configured =
+        record.configured === true ||
+        grantState === "connected" ||
+        grantState === "granted"
+          ? true
+          : record.configured === false ||
+              grantState === "needs_grant" ||
+              grantState === "not_connected"
+            ? false
+            : null;
+      addAvailableExternalSource(providerId, label, configured, undefined, {
+        ...(grantState ? { workspaceGrantState: grantState } : {}),
+      });
+      if (configured && typeof label === "string" && label.trim()) {
+        configuredSourceLabels.add(label.trim());
+      }
+      if (
+        grantState === "connected" &&
+        typeof label === "string" &&
+        label.trim()
+      ) {
+        workspaceConnectedSourceLabels.add(label.trim());
+      }
+    }
+  }
+
+  return {
+    checked,
+    configuredSourceLabels: [...configuredSourceLabels],
+    workspaceConnectedSourceLabels: [...workspaceConnectedSourceLabels],
+    availableExternalSources: [...availableExternalSources.values()],
+    setupLink,
+  };
+}
+
+function requestedExternalSourceSetup(
+  userText: string,
+  summary: DataSourceStatusSummary,
+): { label: string; setupLink: string; kind: "connect" | "review" } | null {
+  let source:
+    | DataSourceStatusSummary["availableExternalSources"][number]
+    | undefined;
+  let kind: "connect" | "review" = "connect";
+  let bestMatchLength = -1;
+  for (const candidate of summary.availableExternalSources) {
+    const needsReview =
+      candidate.workspaceGrantState === "granted" &&
+      candidate.credentialsConfigured !== true;
+    const needsConnect =
+      candidate.workspaceGrantState === "needs_grant" &&
+      candidate.credentialsConfigured === false;
+    if (
+      (candidate.configured !== false && !needsReview && !needsConnect) ||
+      !candidate.setupLink
+    )
+      continue;
+    const matchLength = Math.max(
+      -1,
+      ...candidate.aliases
+        .filter((alias) => containsNormalizedPhrase(userText, alias))
+        .map((alias) => normalizeSourceLabel(alias).length),
+    );
+    if (matchLength > bestMatchLength) {
+      source = candidate;
+      kind = needsReview ? "review" : "connect";
+      bestMatchLength = matchLength;
+    }
+  }
+  if (!source?.setupLink) return null;
+  return {
+    label: source.label ?? source.aliases[0] ?? "data source",
+    setupLink: source.setupLink,
+    kind,
+  };
+}
+
+function includesDataSourcesLink(text: string, setupLink: string): boolean {
+  const normalizedSetupLink = setupLink.trim().replace(/&amp;/g, "&");
+  if (!normalizedSetupLink) return false;
+  const normalizedText = text.replace(/&amp;/g, "&");
+  const linkPattern = /\[[^\]]+\]\((<[^>]+>|[^\s)]+)(?:\s+["'][^)]*["'])?\)/g;
+  return [...normalizedText.matchAll(linkPattern)].some((match) => {
+    const destination = match[1]?.replace(/^<|>$/g, "");
+    return destination === normalizedSetupLink;
+  });
+}
+
+export function realDataFinalGuard(
+  context: AgentLoopFinalResponseGuardContext,
+) {
   if ((context as { executionMode?: string }).executionMode === "plan") {
     return null;
   }
-  const userText = latestUserText(context.messages ?? []);
-  if (!looksLikeAnalyticsDataRequest(userText)) return null;
+  const stableRequestText = (
+    context as AgentLoopFinalResponseGuardContext & { requestText?: string }
+  ).requestText;
+  const userText = stableRequestText ?? latestUserText(context.messages ?? []);
+  const dashboardConstructionRequest =
+    looksLikeDashboardConstructionRequest(userText);
+  // A turn that already ran catalog discovery is a data turn whatever the
+  // wording, so a draft that follows it without a query is still judged.
+  if (
+    isNonDataTurn(userText) &&
+    !hasCatalogSearchAttempt(context.toolResults) &&
+    !dashboardConstructionRequest
+  ) {
+    if (isGenericNoDataFallback(context.text)) {
+      return {
+        retryMessage: NON_ANALYTICS_FALLBACK_RETRY_MESSAGE,
+        fallbackMessage: NON_ANALYTICS_FALLBACK_FINAL_MESSAGE,
+        maxRetries: 2,
+      };
+    }
+    return null;
+  }
   const incompleteEvidence = hasIncompleteDataEvidence(context.toolResults);
+  const dataQueryAttempted = hasDataQueryAttempt(context.toolResults);
+  const sourceStatus = dataSourceStatusSummary(context.toolResults);
+  const sourceStatusDetails = sourceStatusDescription(sourceStatus);
+  const requestedSourceSetup = requestedExternalSourceSetup(
+    userText,
+    sourceStatus,
+  );
+  const setupLink = requestedSourceSetup?.setupLink ?? sourceStatus.setupLink;
+  const setupLabel = requestedSourceSetup
+    ? requestedSourceSetup.kind === "review"
+      ? `Review ${requestedSourceSetup.label} connection`
+      : `Connect ${requestedSourceSetup.label}`
+    : "Connect data sources";
+  const setupMarkdown = `[${setupLabel}](${setupLink})`;
+  const hasUnknownExternalSourceStatus =
+    sourceStatus.availableExternalSources.some(
+      ({ configured }) => configured === null,
+    );
+  const noConfiguredExternalSources =
+    sourceStatus.checked &&
+    sourceStatus.configuredSourceLabels.length === 0 &&
+    !hasUnknownExternalSourceStatus;
+  const externalSourceRequest = looksLikeExternalSourceRequest(userText);
+  const missingRequestedExternalSource = hasMissingRequestedExternalSource(
+    userText,
+    sourceStatus.configuredSourceLabels,
+    sourceStatus.availableExternalSources,
+  );
+  const hasUsableExternalSource = sourceStatus.availableExternalSources.some(
+    ({ workspaceGrantState, credentialsConfigured }) =>
+      credentialsConfigured === true || workspaceGrantState === "connected",
+  );
+  const noUsableExternalSources =
+    sourceStatus.checked &&
+    !hasUsableExternalSource &&
+    !hasUnknownExternalSourceStatus;
+  const firstPartySourceShouldBeTried =
+    noUsableExternalSources && !externalSourceRequest;
+  const needsDataSourceLink =
+    sourceStatus.checked &&
+    externalSourceRequest &&
+    (noConfiguredExternalSources || missingRequestedExternalSource);
+  const unavailableSourceGuidance =
+    requestedSourceSetup?.kind === "review"
+      ? `The requested ${requestedSourceSetup.label} source already has an Analytics workspace grant, but no healthy connection is active.${sourceStatusDetails ? ` Status reports ${sourceStatusDetails}.` : ""} Ask the user to review that existing connection and include this exact link: ${setupMarkdown}. Do not ask them to connect it again.`
+      : `The requested external source is not connected. Explain what is missing in the context of the user's question and include this exact markdown link: ${setupMarkdown}. Do not use the generic no-grounded-data fallback.`;
+  const unavailableSourceFallback =
+    requestedSourceSetup?.kind === "review"
+      ? `I can query ${requestedSourceSetup.label} once its existing workspace connection is healthy.${sourceStatusDetails ? ` Status reports ${sourceStatusDetails}.` : ""} ${setupMarkdown}`
+      : `I can help with that once the relevant source is connected. ${setupMarkdown}`;
   if (
     hasFailedCorpusWorkflowEvidence(context.toolResults) &&
     looksLikeCoverageSensitiveAnalyticsRequest(userText) &&
@@ -101,9 +1096,11 @@ function realDataFinalGuard(context: AgentLoopFinalResponseGuardContext) {
   ) {
     return {
       retryMessage:
-        "The user asked a coverage-sensitive provider question, but the draft only used bounded convenience data actions. Do not finalize an exhaustive, all-records, or absence-sensitive answer from shortcut actions alone. Use the broad provider API/MCP surface and a corpus workflow now: provider-api-catalog/provider-api-docs when needed, provider-corpus-job for durable paginated or batched corpus scans, provider-api-request with fetchAllPages/stageAs/saveToFile for the exact provider endpoint/filter/body/pagination, then run-code or query-staged-dataset to join, grep, classify, and aggregate. If full coverage is not possible in this turn, finalize with explicit partial-coverage wording, inspected counts, filters, and remaining gaps.",
+        "The user asked a coverage-sensitive provider question, but the draft only used bounded convenience data actions. Do not finalize an exhaustive, all-records, or absence-sensitive answer from shortcut actions alone. Use the broad provider API/MCP surface and a staged analysis workflow now: provider-api-catalog/provider-api-docs when needed; for Gong, use configured tracker results from /calls/extensive when they cover the term, otherwise use provider-api-request as raw ingestion with stageAs/saveToFile followed by query-staged-dataset or a Data Program; use provider-corpus-job for durable batched raw-transcript scans. Never loop per call from run-code or a delegated agent. For 500 or more Gong records, gong-calls is not the broad-search path. If full coverage is not possible in this turn, finalize with explicit partial-coverage wording, inspected counts, filters, and remaining gaps.",
       fallbackMessage:
-        "I can't make a confident coverage-sensitive provider claim from bounded shortcut actions alone. I need a provider API/corpus workflow, or I need to label the answer as partial with exact inspected counts and gaps.",
+        "I couldn't verify the full provider corpus after two search attempts. The bounded shortcuts did not report an exact inspected count, filter set, or remaining-gap size, so I won't present their absence claim as corpus-wide.",
+      maxRetries: 2,
+      expandToolSurface: true,
     };
   }
   if (
@@ -115,7 +1112,7 @@ function realDataFinalGuard(context: AgentLoopFinalResponseGuardContext) {
   ) {
     return {
       retryMessage:
-        "The user asked to search source-record body text such as transcripts, messages, tickets, issues, notes, documents, or conversation logs, but the draft's corpus evidence does not show that the requested body records were actually searched. A parent/container metadata scan, title search, summary search, or call/ticket/message list is not enough for an absence-sensitive body-text claim. Retry with the provider's raw body endpoint or native search for the requested record type, using provider-corpus-job batch-search/paginated-search, provider-api-request with staging, or run-code over staged raw records. Then report source path/body field, inspected record count, hit count, and gaps.",
+        "The user asked to search source-record body text such as transcripts, messages, tickets, issues, notes, documents, or conversation logs, but the draft's corpus evidence does not show that the requested body records were actually searched. A parent/container metadata scan, title search, summary search, or call/ticket/message list is not enough for an absence-sensitive body-text claim. Retry with the provider's native search, indexed tracker result, or raw body endpoint for the requested record type, using provider-corpus-job batch-search/paginated-search, provider-api-request with staging, or a Data Program/query over staged raw records. Then report source path/body field, inspected record count, hit count, and gaps.",
       fallbackMessage:
         "I can't make a confident source-record body-text claim because the corpus evidence does not show that the requested raw records were searched.",
     };
@@ -133,169 +1130,292 @@ function realDataFinalGuard(context: AgentLoopFinalResponseGuardContext) {
         "I can't make a confident exhaustive analytics claim yet because part of the source evidence was aborted, truncated, or still paginated. I need to recover the missing coverage or state the answer as partial with the inspected sample size.",
     };
   }
-  if (hasDataQueryAttempt(context.toolResults)) return null;
-  if (isSafeNoDataAnalyticsResponse(context.text)) return null;
+  if (
+    dashboardConstructionRequest &&
+    hasPartialDashboardBuild(context.toolResults) &&
+    !hasSuccessfulDashboardSave(context.toolResults) &&
+    DASHBOARD_BUILD_PAUSE_PATTERN.test(context.text)
+  ) {
+    return {
+      retryMessage:
+        "The user explicitly requested this dashboard or Custom Block. Continue the non-destructive build in this same turn: seed or refresh extension data when needed, save and embed the dashboard, and navigate to the result. Do not ask whether to proceed. Ask only about an ambiguous metric scope, a destructive change, or an external side effect such as sending email or outreach.",
+      fallbackMessage:
+        "I couldn't finish the requested dashboard build in this turn. Please retry and I'll continue from the saved artifact.",
+      maxRetries: 2,
+      expandToolSurface: true,
+    };
+  }
+  if (
+    hasSuccessfulDashboardSave(context.toolResults) &&
+    !draftClaimsAnalyticsMetrics(context.text)
+  ) {
+    return null;
+  }
+  if (
+    dashboardConstructionRequest &&
+    !draftClaimsAnalyticsMetrics(context.text)
+  ) {
+    if (
+      hasDashboardConstructionAttempt(context.toolResults) ||
+      hasSuccessfulExtensionCreation(context.toolResults) ||
+      isSafeNoDataAnalyticsResponse(context.text)
+    ) {
+      return null;
+    }
+    return {
+      retryMessage:
+        'This is a dashboard construction/template-clone request. First call `search-dashboard-references` with the named template terms. Inspect the matching result with `get-sql-dashboard` when `kind` is `sql` or `get-explorer-dashboard` when `kind` is `explorer`, using full config only when needed. If its panels are `chartType: "extension"`, use `get-extension` then `create-extension` to clone/adapt it, then `update-dashboard` to save the new dashboard. Do not invent SQL panels for an extension-backed template. Ask one clarifying filter question if needed. Only run a data-source query before presenting numbers or authoring invented SQL.',
+      fallbackMessage:
+        "I need to inspect the template dashboard (and its extension, if it uses one) before creating the new one. Tell me the template dashboard name, or confirm the org/account filter, and I'll clone it without inventing metrics.",
+      expandToolSurface: true,
+    };
+  }
+
+  const failedQueryMessage = failedDataQueryAttemptMessage(context.toolResults);
+  if (looksLikeSchemaDetailsRequest(context.text)) {
+    const failedQueryRecovery = failedQueryMessage
+      ? ` ${failedQueryMessage}`
+      : "";
+    return {
+      retryMessage:
+        "The draft asks the user to supply internal dataset, table, column, or SQL details. Do not ask the user for warehouse schema identifiers. Use the configured Analytics tools now: call `find-data` once with the user's metric/entity question, then call `search-bigquery-schema` only when exact live columns or partition metadata remain unknown, and run one authoritative `bigquery` query using the exact discovered references. For a named customer, verify identity and distinguish actual consumption from limits or changelog metadata. If the tools prove the source or metric is unavailable, state that exact evidence gap instead of asking the user to name internal tables." +
+        failedQueryRecovery,
+      fallbackMessage:
+        "I couldn't complete that lookup from the configured Analytics sources yet. Please retry and I'll inspect the catalog and warehouse schema directly rather than asking you to provide internal table names.",
+      maxRetries: 2,
+      expandToolSurface: true,
+    };
+  }
+  if (dataQueryAttempted) return null;
+  const draftMakesAnalyticsClaim =
+    draftClaimsAnalyticsMetrics(context.text) ||
+    isGenericNoDataFallback(context.text);
+  if (
+    firstPartySourceShouldBeTried &&
+    !failedQueryMessage &&
+    draftMakesAnalyticsClaim
+  ) {
+    return {
+      retryMessage:
+        "The user asked for live analytics, and the built-in first-party Analytics source is available even though no external provider is connected. Call `query-agent-native-analytics` for first-party product, usage, conversion, or observability data and answer from that result. If the request specifically names an external provider, explain what is missing and include the real Connect data sources link.",
+      fallbackMessage:
+        "I couldn't complete a grounded first-party Analytics query yet. Please retry and I'll use the built-in Analytics source before asking you to connect an external provider.",
+      maxRetries: 2,
+      expandToolSurface: true,
+      exhaustedDraftPrefix: exhaustedDraftPrefixFor({
+        toolResults: context.toolResults,
+        setupMarkdown,
+        includeConnectOption: false,
+      }),
+    };
+  }
+  if (isSafeNoDataAnalyticsResponse(context.text)) {
+    if (
+      needsDataSourceLink &&
+      !includesDataSourcesLink(context.text, setupLink)
+    ) {
+      return {
+        retryMessage: `The response correctly explains that the requested live data is unavailable, but it needs a contextual next step. ${unavailableSourceGuidance}`,
+        fallbackMessage: unavailableSourceFallback,
+        maxRetries: 2,
+      };
+    }
+    return null;
+  }
+  if (failedQueryMessage) {
+    if (
+      needsDataSourceLink &&
+      !includesDataSourcesLink(context.text, setupLink)
+    ) {
+      return {
+        retryMessage: `${failedQueryMessage} Explain which external source is missing and include this exact markdown link: ${setupMarkdown}.`,
+        fallbackMessage: `${failedQueryMessage} ${setupMarkdown}`,
+        maxRetries: 2,
+      };
+    }
+    return {
+      retryMessage: failedQueryMessage,
+      fallbackMessage: failedQueryMessage,
+    };
+  }
+
+  if (needsDataSourceLink) {
+    return {
+      retryMessage: unavailableSourceGuidance,
+      fallbackMessage: unavailableSourceFallback,
+      maxRetries: 2,
+      expandToolSurface: true,
+    };
+  }
+
+  const prior = priorTurnEvidence(context.messages ?? []);
+  if (
+    hasDataQueryAttempt(prior.toolResults) &&
+    draftRestatesPriorEvidence(context.text, prior)
+  ) {
+    return null;
+  }
+  if (!draftMakesAnalyticsClaim) return null;
+
+  const configuredSources = sourceStatus.configuredSourceLabels;
+  const configuredSourceGuidance = sourceStatusDetails
+    ? ` \`data-source-status\` reports ${sourceStatusDetails}. It checks configuration and workspace grants but does not run a source query. Treat configured credentials separately from healthy workspace connections; do not call a credential-only source connected or ask the user to reconnect before trying its query action.`
+    : "";
+  const catalogSearched = hasCatalogSearchAttempt(context.toolResults);
+  const exhaustedDraftPrefix = exhaustedDraftPrefixFor({
+    toolResults: context.toolResults,
+    setupMarkdown,
+    includeConnectOption: !catalogSearched,
+  });
+
+  if (catalogSearched) {
+    return {
+      retryMessage:
+        "You already ran data-reference discovery this turn. If it returned a usable dashboard or query, adapt and run it now and cite the dashboard; if not, inspect exact metadata with search-bigquery-schema or data-source-status, then run one bounded query." +
+        UNVERIFIED_DRAFT_RETRY_INSTRUCTION,
+      fallbackMessage:
+        "I searched the dashboard/query catalog but didn't finish a real source query. Please retry; I'll adapt a matching dashboard or query if one exists, or run the next discovery pass and query it directly.",
+      maxRetries: 2,
+      expandToolSurface: true,
+      exhaustedDraftPrefix,
+    };
+  }
 
   return {
     retryMessage:
-      "This looks like an analytics result request, but no real source query ran. If you are making data claims, run one relevant data-source action or connected provider MCP tool now and answer from that result. If the right response is a clarification, plan, or explicit unavailable/credentials-missing message with no metrics or source-record claims, finalize that directly instead.",
-    fallbackMessage:
-      "I can't provide a grounded analytics result yet because no real data-source query ran successfully. Tell me which source to use or connect the missing source, and I'll run it before giving numbers or source-record conclusions.",
+      "This looks like an analytics result request, but no real source query ran. If you are making data claims, run one relevant data-source action or connected provider MCP tool now and answer from that result." +
+      configuredSourceGuidance +
+      " If the right response is a clarification, plan, or explicit unavailable/credentials-missing message with no metrics or source-record claims, finalize that directly instead." +
+      UNVERIFIED_DRAFT_RETRY_INSTRUCTION,
+    fallbackMessage: configuredSources.length
+      ? `I found ${sourceStatusDetails}, but the status check did not run a source query. Please retry so I can test the relevant source before reporting results.`
+      : `I couldn't complete a grounded answer to that request. If the relevant provider isn't connected, [connect data sources](${ANALYTICS_DATA_SOURCES_LINK}) and I'll try again with real data.`,
+    maxRetries: 2,
+    expandToolSurface: true,
+    exhaustedDraftPrefix,
   };
+}
+
+export async function searchDashboardMentions(query: string, event?: any) {
+  if (!event) return [];
+  try {
+    const { getOrgContext } = await import("@agent-native/core/org");
+    const { listDashboardSummaries } =
+      await import("../lib/dashboards-store.js");
+    const ctx = await getOrgContext(event);
+    const rows = await listDashboardSummaries(
+      { email: ctx.email, orgId: ctx.orgId ?? null },
+      { kind: "sql", hidden: query ? "all" : "visible" },
+    );
+    const items = rows.map((dashboard) => ({
+      id: dashboard.id,
+      name: dashboard.name,
+    }));
+
+    const q = (query || "").toLowerCase().trim();
+    const filtered = q
+      ? items.filter(
+          (dashboard) =>
+            (dashboard.name || "").toLowerCase().includes(q) ||
+            dashboard.id.toLowerCase().includes(q),
+        )
+      : items;
+
+    return filtered.slice(0, 20).map((dashboard) => ({
+      id: `dashboard:${dashboard.id}`,
+      label: dashboard.name || "Untitled dashboard",
+      description: `/dashboards/${dashboard.id}`,
+      icon: "deck",
+      refType: "dashboard",
+      refId: dashboard.id,
+      refPath: `/dashboards/${dashboard.id}`,
+    }));
+  } catch (err) {
+    console.error("[analytics] Dashboard mention provider failed:", err);
+    return [];
+  }
 }
 
 export default createAgentChatPlugin({
   appId: "analytics",
+  onAgentTurnComplete: autosaveAnalyticsAfterAgentTurn,
+  onAgentRunComplete: async (_scope, run) => {
+    let memoryCaptureQueued = 0;
+    const owner = getRequestRunContext()?.owner ?? getRequestUserEmail();
+    if (owner && getRequestContext()?.isSyntheticTraffic !== true) {
+      try {
+        memoryCaptureQueued = Number(
+          await enqueueAnalyticsMemoryCapture({
+            owner,
+            orgId: getRequestOrgId() || null,
+            threadId: run.threadId,
+          }),
+        );
+      } catch (error) {
+        console.warn("[analytics-memory-capture] enqueue failed", {
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        });
+      }
+    }
+    const properties = summarizeAnalyticsRun({
+      events: run.events,
+      groundingActionNames: GROUNDING_ACTION_NAMES,
+      preloadedReferenceCount:
+        getRequestRunContext()?.analyticsJevPrefetch?.preloadedReferenceCount ??
+        0,
+      // Core merges this app's status with its own preload stages.
+      prefetchStatus:
+        getRequestRunContext()?.contextStatus?.prefetch ?? "unrecorded",
+    });
+    properties.memory_capture_queued = memoryCaptureQueued;
+    const { track } = await import("@agent-native/core/tracking");
+    await track("analytics_agent_run_outcome", properties);
+  },
+  prepareRequest: async ({
+    ownerEmail,
+    message,
+    requestContext,
+    contextPrefetchDeadlineAt,
+    dispatchToBackground,
+  }) => {
+    if (
+      !ownerEmail ||
+      dispatchToBackground ||
+      isTrivialTurn(message ?? requestContext)
+    ) {
+      return;
+    }
+    const { prefetchStatus, ...references } =
+      await retrieveAnalyticsPromptReferences({
+        request: requestContext,
+        email: ownerEmail,
+        orgId: getRequestOrgId() || null,
+        deadlineAt: contextPrefetchDeadlineAt,
+      });
+    // Core turns `timed_out` and `failed` into the model's context note.
+    return { ...references, status: prefetchStatus };
+  },
+  leanPrompt: isProductionServerlessRuntime(),
   actions: loadActionsFromStaticRegistry(actionsRegistry),
   initialToolNames: INITIAL_TOOL_NAMES,
+  corpusTools: "lazy",
   finalResponseGuard: realDataFinalGuard,
-  // Enable sandboxed JavaScript execution for analytics data processing.
-  // Code runs in an isolated Node.js child process with no access to app
-  // source, secrets, or DB. It can call provider-api-request, web-request,
-  // and Resources-backed workspace file helpers via the bridge.
-  //
-  // Operators deploying to trusted internal environments can set
-  // AGENT_PROD_CODE_EXECUTION=trusted to also enable bash/read/edit/write.
   codeExecution: { production: "sandboxed" },
+  extensionTools: true,
+  durableBackgroundRuns: true,
+  runSoftTimeoutMs: ANALYTICS_BACKGROUND_RUN_SOFT_TIMEOUT_MS,
+  runNoProgressTimeoutMs: ANALYTICS_BACKGROUND_RUN_NO_PROGRESS_TIMEOUT_MS,
+  mcp: ANALYTICS_MCP,
   resolveOrgId: async (event) => {
     const ctx = await getOrgContext(event);
     return ctx.orgId;
   },
-  extraContext: async (event) => {
-    // Always inject source guidance, even if the data-dictionary lookup throws.
-    // The generic template can ship provider actions without every deployment
-    // having credentials or workspace-specific schemas configured.
-    const sourceGuidance =
-      "<data-source-guidance>\n" +
-      "Apply real-data requirements only when presenting analytics results, source records, or derived metrics. Do not call data-source tools for workflow migration, recurring-job setup, UI/code fixes, settings help, conceptual planning, or other non-data tasks unless the user explicitly asks for data. " +
-      "SURFACE DIFFERENTIATION — You are the analytics assistant for definitions, deep-dive analysis, and action. For questions about what a metric, model, or table means, use the Data Dictionary and configured schema tools first. For trends, comparisons, anomalies, current data, or anything that requires querying live data, answer directly in chat with the relevant provider query, dashboard analysis, and inline charts when useful. " +
-      "DASHBOARD CREATION RULE — You may create dashboards, analyses, SQL panels, or other resources only when the user explicitly asks you to (e.g. 'build me a dashboard for...', 'create a new analysis', 'add a chart for...'). Never create any resource proactively during research, trend analysis, or answering questions. If you think a dashboard would be useful, suggest it and wait for explicit confirmation before creating anything. Never add new items to the sidebar or modify existing dashboards without an explicit user directive. " +
-      "Use configured data sources and actions only. Call `data-source-status` when you need to know which providers are connected, and treat provider actions as unavailable for analysis if they return missing credentials, permission, syntax, quota, or network errors. " +
-      "The built-in `demo` dashboard source is a demo-environment Prometheus source reserved for the Node Exporter demo. It must never satisfy REAL_DATA_REQUIRED or be cited as user analytics evidence unless the user explicitly asks to inspect the demo dashboard. " +
-      "When the user names a provider or tool such as Jira, Pylon, HubSpot, Gong, Slack, Sentry, GA4, or BigQuery, that named source is authoritative for the turn: use that provider's real tool/API surface, not a warehouse or different-provider substitute, unless the user explicitly asks for the copy/fallback. For bounded lookups where a first-class action fully models the requested source, object, filter, and pagination need, that shortcut is fine. For broad provider searches, cross-source joins, corpus-wide counts, exact cohort coverage, or any answer where absence matters, do not start and stop with shortcuts; use the broad provider API/MCP and corpus/code workflow as the primary path. " +
-      "Provider-specific actions are shortcuts, not limits. If a first-class action cannot express the exact endpoint, object type, filters, request body, pagination mode, API version, or corpus coverage needed, call `provider-api-catalog` and `provider-api-docs` as needed, then call `provider-api-request` against the provider's real HTTP API. Use this raw provider API escape hatch instead of weakening the analysis, broadening filters, sampling default pages, or claiming the integration cannot do something the underlying API can do. " +
-      "When one provider cohort becomes the input to a second provider search, join, or exhaustive corpus scan, stage the upstream cohort with `provider-api-request`/`stageAs` (or a native provider API/MCP bulk primitive) before the downstream search. Avoid starting such workflows with convenience list/search actions that return display-shaped pages or can time out before the corpus path is established. " +
-      'For broad unstructured provider records such as transcripts, messages, tickets, issues, notes, events, documents, or conversation logs, prefer `provider-corpus-job` so the scan has durable checkpoints, stored snippets, coverage counts, and provider quota pause/resume. Use mode="paginated-search" for any provider endpoint that already pages over the target records; use mode="batch-search" when a staged upstream cohort of ids/records must feed a second provider endpoint by `itemBodyPath` or `itemQueryParam`. Continue paused jobs until completed or quota_wait, then read results. Use `run-code` with `providerSearchAll`, `providerFetch`, `appAction`, `workspaceRead`, and Resources-backed workspace files for shorter reductions, joins, classification, and aggregation after the corpus path is established. Convenience actions are bounded shortcuts for common checks, not the ceiling for what the underlying provider API can answer. ' +
-      "When the user asks to search source-record body text, use the raw body endpoint or native provider search for that record type. Parent/container metadata such as call lists, titles, summaries, briefs, channel lists, ticket lists, or issue lists can discover scope but cannot support a complete body-text absence claim. " +
-      "For source-record mention searches, phrase searches, and absence checks across transcripts/messages/tickets/issues, prefer provider-side search, `provider-corpus-job`, staged corpus, `providerSearchAll`, or action-side search arguments that return counts, coverage, and snippets instead of loading raw full records into chat. Use full transcripts/messages only for selected evidence after the search narrows the corpus, and state whether the search covered every matching record or only a bounded sample. " +
-      "For complex provider questions, broad searches, corpus-wide counts, cross-source joins, or any answer where absence matters, prefer a corpus-first workflow: inspect the provider API, fetch every relevant page or an explicitly bounded cohort, stage large responses with `saveToFile`/`stageAs`/`fetchAllPages`, use `provider-corpus-job` for durable long-running searches, and use `run-code` with `providerSearchAll`, `providerFetch`, `appAction`, and Resources-backed workspace files to join, search, classify, and aggregate. Use `scratch/` for temporary staging and durable folder names only for files the user should keep. Do not infer no results from sampled records, default limits, truncated excerpts, or aborted calls. If full coverage is not possible in the turn, say exactly what was inspected and what remains uncovered. " +
-      'For HubSpot deal cohorts, structured `hubspot-deals` filters can enumerate a bounded cohort for direct deal-list answers: `product` for the `products` field, `pipeline` for pipeline label/id, `closedStatus` for won/lost/open/closed, and `closedDateFrom`/`closedDateTo` for close-date windows. The `query` argument is full-text deal search and is not proof that a specific property matched; do not use `query: "Publish"` when the user asked for products field = Publish. If the cohort feeds transcript/message/ticket search, a cross-source join, or exhaustive/absence-sensitive coverage, use `provider-api-request` with HubSpot search and `stageAs` for the cohort first, then continue with the provider API/corpus workflow. Report the returned filter values and cohort count in the methodology. ' +
-      "For named deal, account, renewal, churn-risk, or customer deep dives that need HubSpot and Gong context, `account-deep-dive` can provide a bounded evidence bundle. Use it when the user asks for a targeted entity deep dive, then use the broad provider API/corpus workflow for any requested exhaustive transcript/message/ticket search or absence claim. Do not answer a requested transcript deep dive from call metadata alone. " +
-      "When the user refers to the current analysis, this analysis, this project, or asks to spin off, adapt, modify, or reuse a saved analysis, call `view-screen` first and use the returned analysis details; if an analysis id or @mention is provided, call `get-analysis` before responding. " +
-      "If a provider action fails, stop using that provider for the turn, surface the actual error, and wait for the user to choose whether to fix SQL, use another source, or retry. Do not loop through more queries after a failed provider call. " +
-      "For ordinary ad-hoc, non-coverage-sensitive data questions, answer the explicit question after the first relevant successful query or bounded evidence batch instead of continuing into suggested follow-up investigations. " +
-      "If the user challenges coverage, asks why more records were not included, or asks for the updated answer, rerun the relevant source query or revise from the corrected cohort and provide the updated deliverable directly. Do not claim an analysis was revised unless the revised answer is included in the response or saved with `save-analysis`. " +
-      "Unstructured source records are valid analytics evidence: Pylon tickets, Jira issues, Gong calls/transcripts, Slack messages, and similar text records may be coded for themes, mention counts, sentiment, objections, and qualitative patterns as long as the answer states the inspected sample size and does not imply unsupported statistical certainty. " +
-      "For schema questions, prefer data-dictionary entries and configured warehouse schemas over assumptions; use `search-bigquery-schema` for BigQuery metadata before inventing datasets, tables, or columns. " +
-      "Before finalizing any analytics answer, make the evidence trail explicit enough to audit: answer the user's question, name the source(s), time window, sample size or row count, filters, join/match method, caveats/gaps, and recommended next action when useful. Never substitute fabricated numbers for a failed query or unavailable provider. It is fine to ask a clarifying question, provide a plan, or say exactly which source is unavailable as long as you do not present metrics or source-record conclusions without evidence.\n" +
-      "</data-source-guidance>";
-    const artifactGuidance =
-      "<analytics-artifact-guidance>\n" +
-      "Native Analytics dashboards and saved analyses are constrained artifacts: dashboards are JSON configs rendered by the built-in dashboard components, and analyses are Markdown reports with generated chart images plus structured resultData. " +
-      "If the user's requested dashboard, analysis surface, visualization, interaction model, custom layout, or bespoke workflow cannot be faithfully represented within those native components/config fields, do not hand-wave, force an approximate JSON dashboard, or route to source-code changes. In production mode, automatically create a sandboxed extension with `create-extension` instead, using Alpine.js HTML and the available app/data helpers. " +
-      "After creating the extension, briefly tell the user that the request needed bespoke UI/code beyond the native Analytics dashboard or analysis format, so you built it as an extension.\n" +
-      "</analytics-artifact-guidance>";
-
-    try {
-      const scope = await resolveSettingsScope(event);
-      const all = await listScopedSettingRecords(scope, DATA_DICT_PREFIX);
-      const entries = Object.values(all) as Array<Record<string, unknown>>;
-      const dict = renderDataDictionary(entries);
-      return dict
-        ? `${sourceGuidance}\n\n${artifactGuidance}\n\n${dict}`
-        : `${sourceGuidance}\n\n${artifactGuidance}`;
-    } catch (err) {
-      console.warn(
-        "[analytics] data dictionary context failed:",
-        err instanceof Error ? err.message : err,
-      );
-      return `${sourceGuidance}\n\n${artifactGuidance}`;
-    }
-  },
+  extraContext: analyticsExtraContext,
   mentionProviders: {
     dashboards: {
       label: "Dashboards",
       icon: "deck",
-      search: async (query: string, event?: any) => {
-        if (!event) return [];
-        try {
-          const { getOrgContext } = await import("@agent-native/core/org");
-          const { listDashboards } = await import("../lib/dashboards-store.js");
-          const ctx = await getOrgContext(event);
-          const rows = await listDashboards(
-            { email: ctx.email, orgId: ctx.orgId ?? null },
-            { kind: "sql", hidden: query ? "all" : "visible" },
-          );
-          const items = rows.map((d) => ({ id: d.id, name: d.title }));
-
-          const q = (query || "").toLowerCase().trim();
-          const filtered = q
-            ? items.filter(
-                (d) =>
-                  (d.name || "").toLowerCase().includes(q) ||
-                  d.id.toLowerCase().includes(q),
-              )
-            : items;
-
-          return filtered.slice(0, 20).map((d) => ({
-            id: `dashboard:${d.id}`,
-            label: d.name || "Untitled dashboard",
-            description: `/adhoc/${d.id}`,
-            icon: "deck",
-            refType: "dashboard",
-            refId: d.id,
-            refPath: `/adhoc/${d.id}`,
-          }));
-        } catch (err) {
-          console.error("[analytics] Dashboard mention provider failed:", err);
-          return [];
-        }
-      },
-    },
-    analyses: {
-      label: "Analyses",
-      icon: "document",
-      search: async (query: string, event?: any) => {
-        if (!event) return [];
-        try {
-          const { getOrgContext } = await import("@agent-native/core/org");
-          const { listAnalyses } = await import("../lib/dashboards-store.js");
-          const ctx = await getOrgContext(event);
-          const rows = await listAnalyses({
-            email: ctx.email,
-            orgId: ctx.orgId ?? null,
-          });
-          const q = (query || "").toLowerCase().trim();
-          const filtered = q
-            ? rows.filter(
-                (analysis) =>
-                  (analysis.name || "").toLowerCase().includes(q) ||
-                  (analysis.description || "").toLowerCase().includes(q) ||
-                  analysis.id.toLowerCase().includes(q),
-              )
-            : rows;
-
-          return filtered
-            .sort(
-              (a, b) =>
-                new Date(b.updatedAt).getTime() -
-                new Date(a.updatedAt).getTime(),
-            )
-            .slice(0, 20)
-            .map((analysis) => ({
-              id: `analysis:${analysis.id}`,
-              label: analysis.name || "Untitled analysis",
-              description: `/analyses/${analysis.id}`,
-              icon: "document",
-              refType: "analysis",
-              refId: analysis.id,
-              refPath: `/analyses/${analysis.id}`,
-            }));
-        } catch (err) {
-          console.error("[analytics] Analysis mention provider failed:", err);
-          return [];
-        }
-      },
+      search: searchDashboardMentions,
     },
   },
 });

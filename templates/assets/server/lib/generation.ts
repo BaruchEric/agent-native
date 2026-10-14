@@ -1,22 +1,54 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { createHash } from "node:crypto";
+
 import {
   FeatureNotConfiguredError,
+  GEMINI_API_KEY,
   getBuilderImageGenerationBaseUrl,
-  resolveBuilderCredentials,
+  resolveBuilderGatewayAuth,
+  readServiceProviderChoice,
+  resolveGeminiApiKey,
   resolveSecret,
+  type ServiceProviderId,
 } from "@agent-native/core/server";
-import { getDb, schema } from "../db/index.js";
-import { parseJson } from "./json.js";
-import { getObject } from "./storage.js";
+import { accessFilter } from "@agent-native/core/sharing";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  inArray,
+  like,
+  ne,
+  notInArray,
+  or,
+  sql,
+} from "drizzle-orm";
+import sharp from "sharp";
+
 import type {
   AspectRatio,
   GenerationIntent,
   ImageCategory,
   ImageModel,
+  ImageQualityTier,
   ImageSize,
+  PresetReferenceRole,
   StyleStrength,
   StyleBrief,
 } from "../../shared/api.js";
+import {
+  describeProviderPayloadShape,
+  isModelUnavailableDetail,
+  readableProviderErrorDetail,
+} from "../../shared/provider-error.js";
+import { getDb, schema } from "../db/index.js";
+import { parseJson } from "./json.js";
+import {
+  canReadDraftAsset,
+  draftReadFilter,
+  type DraftReadScope,
+} from "./library-access.js";
+import { getObject } from "./storage.js";
 
 export interface ReferenceForGeneration {
   id: string;
@@ -24,11 +56,15 @@ export interface ReferenceForGeneration {
   category?: string;
   mimeType: string;
   data: string;
-  selectionReason?: "subject" | "source" | "anchor" | "scored" | "explicit";
+  selectionReason?:
+    | "subject"
+    | "source"
+    | "anchor"
+    | "scored"
+    | "explicit"
+    | `preset-ref:${string}`;
 }
 
-// Keep automatic reference context compact for Gemini. Explicit
-// referenceAssetIds bypass this cap because the caller made a deliberate set.
 export const DEFAULT_GENERATION_REFERENCE_LIMIT = 6;
 const STYLE_ANALYSIS_REFERENCE_LIMIT = 8;
 const STYLE_ANALYSIS_MODEL =
@@ -39,8 +75,10 @@ export interface GenerateProviderInput {
   compiledPrompt: string;
   references: ReferenceForGeneration[];
   model: ImageModel;
+  mode?: "generate" | "edit";
   aspectRatio: AspectRatio;
   imageSize: ImageSize;
+  background?: "transparent" | "opaque" | "auto";
   groundingMode: "auto" | "off" | "google-search";
   intent?: GenerationIntent;
   styleStrength?: StyleStrength;
@@ -49,6 +87,7 @@ export interface GenerateProviderInput {
   collectionId?: string | null;
   source?: "chat" | "ui" | "a2a";
   callerAppId?: string;
+  hasBoardReferences?: boolean;
 }
 
 export interface GenerateProviderOutput {
@@ -64,23 +103,54 @@ export interface GenerateProviderOutput {
 const MANAGED_PROVIDER_MAX_ATTEMPTS = 3;
 const MANAGED_PROVIDER_RETRY_DELAY_MS =
   process.env.NODE_ENV === "test" ? 0 : 2500;
+const MANAGED_PROVIDER_INFLIGHT_MAX_POLLS =
+  process.env.NODE_ENV === "test" ? 6 : 40;
+const MANAGED_PROVIDER_INFLIGHT_POLL_MS =
+  process.env.NODE_ENV === "test" ? 0 : 6000;
+const IMAGE_GENERATION_REQUEST_TIMEOUT_MS =
+  Number(process.env.ASSETS_IMAGE_GENERATION_TIMEOUT_MS) || 300_000;
+
+function logGeneration(
+  event: string,
+  fields: Record<string, unknown> = {},
+): void {
+  if (process.env.NODE_ENV === "test") return;
+  const parts = Object.entries(fields)
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${formatLogValue(value)}`)
+    .join(" ");
+  console.info(`[assets] image-gen ${event}${parts ? ` ${parts}` : ""}`);
+}
+
+function formatLogValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    value === null
+  ) {
+    return String(value);
+  }
+  return JSON.stringify(value);
+}
 
 export async function getGeminiApiKey(): Promise<string> {
-  const key = await resolveSecret("GEMINI_API_KEY");
+  const key = await resolveGeminiApiKey();
   if (!key) {
     throw new FeatureNotConfiguredError({
-      requiredCredential: "GEMINI_API_KEY",
+      requiredCredential: GEMINI_API_KEY,
       builderConnectUrl: "/_agent-native/builder/connect",
       byokDocsUrl: "https://aistudio.google.com/apikey",
       message:
-        "Asset generation is not configured. Open Settings and either click Connect Builder.io for images, or expand the Asset generation setup step and paste a Gemini API key for videos and image fallback.",
+        "Asset generation is not configured. Open Settings and either click Use Builder.io (free tier available) for images, or expand the Asset generation setup step and paste a Gemini API key for videos and image fallback.",
     });
   }
   return key;
 }
 
 export async function isGeminiImageGenerationConfigured(): Promise<boolean> {
-  return !!(await resolveSecret("GEMINI_API_KEY").catch(() => null));
+  // coercion-ok: unchanged from the resolveSecret("GEMINI_API_KEY") read it replaces; an unreadable store still lets generation try the next provider, matching the OpenAI check below.
+  return !!(await resolveGeminiApiKey().catch(() => null));
 }
 
 async function getOpenAIImageApiKey(): Promise<string> {
@@ -91,7 +161,7 @@ async function getOpenAIImageApiKey(): Promise<string> {
       builderConnectUrl: "/_agent-native/builder/connect",
       byokDocsUrl: "https://platform.openai.com/api-keys",
       message:
-        "Image generation is not configured. Open Settings and connect Builder.io, or add an OpenAI or Gemini API key manually.",
+        "Image generation is not configured. Open Settings and use Builder.io (free tier available), or add an OpenAI or Gemini API key manually.",
     });
   }
   return key;
@@ -134,12 +204,19 @@ function isRetryableProviderError(err: unknown): boolean {
 class BuilderImageGenerationError extends Error {
   readonly status?: number;
   readonly detail?: string;
+  readonly code?: string;
 
-  constructor(message: string, status?: number, detail?: string) {
+  constructor(
+    message: string,
+    status?: number,
+    detail?: string,
+    code?: string,
+  ) {
     super(message);
     this.name = "BuilderImageGenerationError";
     this.status = status;
     this.detail = detail;
+    this.code = code;
   }
 }
 
@@ -150,9 +227,25 @@ function isRetryableBuilderImageGenerationError(err: unknown): boolean {
   );
 }
 
+function isInFlightImageGenerationError(err: unknown): boolean {
+  if (!(err instanceof BuilderImageGenerationError)) return false;
+  return (
+    err.code === "client_timeout" ||
+    err.code === "request_in_progress" ||
+    err.status === 504 ||
+    err.status === 409
+  );
+}
+
 function generationRetryDelay(attempt: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, attempt * MANAGED_PROVIDER_RETRY_DELAY_MS);
+  });
+}
+
+function generationPollDelay(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, MANAGED_PROVIDER_INFLIGHT_POLL_MS);
   });
 }
 
@@ -176,75 +269,135 @@ interface BuilderImageGenerationResponse {
 export async function generateWithBuilderImageApi(
   input: GenerateProviderInput,
 ): Promise<GenerateProviderOutput> {
-  const builderCredentials = await resolveBuilderCredentials();
-  if (!builderCredentials.privateKey || !builderCredentials.publicKey) {
-    const detail =
-      !builderCredentials.privateKey && !builderCredentials.publicKey
-        ? "Builder private and public keys are missing"
-        : !builderCredentials.privateKey
-          ? "Builder private key is missing"
-          : "Builder public key is missing";
+  const builderAuth = await resolveBuilderGatewayAuth();
+  if (!builderAuth) {
     throw new BuilderImageGenerationError(
-      "Builder.io is not fully connected for managed image generation. Reconnect Builder.io so both Builder private and public keys are available.",
+      "Builder.io is not connected for managed image generation. Use Builder.io (free tier available), or publish with Builder credits so the site is issued its own gateway credential.",
       401,
-      detail,
     );
   }
 
   const baseUrl = getBuilderImageGenerationBaseUrl().replace(/\/$/, "");
+  const requestModel = toBuilderImageModel(input.model);
+  const startedAt = Date.now();
+  const requestBody = {
+    idempotencyKey: input.runId,
+    prompt: input.compiledPrompt,
+    model: requestModel,
+    ...(input.mode ? { mode: input.mode } : {}),
+    count: 1,
+    aspectRatio: toBuilderAspectRatio(input.aspectRatio),
+    size: toBuilderImageSize(input.imageSize),
+    outputFormat: "png",
+    ...(input.background ? { background: input.background } : {}),
+    references: input.references.map((ref) => ({
+      id: ref.id,
+      role: toBuilderReferenceRole(ref.role),
+      mimeType: ref.mimeType,
+      data: ref.data,
+      name: ref.category,
+    })),
+    source: {
+      appId: "assets",
+      feature: "generate-image",
+      resourceId: input.libraryId,
+    },
+    metadata: {
+      collectionId: input.collectionId ?? undefined,
+      callerAppId: input.callerAppId,
+      source: input.source,
+      groundingMode: input.groundingMode,
+      intent: input.intent,
+    },
+  };
+  logGeneration("builder.request", {
+    model: requestModel,
+    mode: input.mode,
+    requestedModel: input.model,
+    host: safeUrlHost(baseUrl),
+    aspectRatio: toBuilderAspectRatio(input.aspectRatio),
+    size: toBuilderImageSize(input.imageSize),
+    references: input.references.length,
+    referenceRoles: input.references
+      .map((ref) => `${ref.id}:${toBuilderReferenceRole(ref.role)}`)
+      .join(","),
+    runId: input.runId,
+  });
+  if (
+    input.mode === "edit" ||
+    process.env.ASSETS_IMAGE_GENERATION_DEBUG_PAYLOAD
+  ) {
+    logGeneration("builder.request_payload", {
+      payload: await sanitizedBuilderRequestPayload(requestBody),
+    });
+  }
   const response = await fetch(`${baseUrl}/generations`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${builderCredentials.privateKey}`,
-      "x-builder-api-key": builderCredentials.publicKey,
+      Authorization: builderAuth.authorization,
+      ...(builderAuth.spaceId
+        ? { "x-builder-api-key": builderAuth.spaceId }
+        : {}),
+      ...(builderAuth.userId
+        ? { "x-builder-user-id": builderAuth.userId }
+        : {}),
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      idempotencyKey: input.runId,
-      prompt: input.compiledPrompt,
-      model: toBuilderImageModel(input.model),
-      count: 1,
-      aspectRatio: toBuilderAspectRatio(input.aspectRatio),
-      size: toBuilderImageSize(input.imageSize),
-      outputFormat: "png",
-      references: input.references.map((ref) => ({
-        id: ref.id,
-        role: toBuilderReferenceRole(ref.role),
-        mimeType: ref.mimeType,
-        data: ref.data,
-        name: ref.category,
-      })),
-      source: {
-        appId: "assets",
-        feature: "generate-image",
-        resourceId: input.libraryId,
-      },
-      metadata: {
-        collectionId: input.collectionId ?? undefined,
-        callerAppId: input.callerAppId,
-        source: input.source,
-        groundingMode: input.groundingMode,
-        intent: input.intent,
-      },
-    }),
-    signal: AbortSignal.timeout(90_000),
+    body: JSON.stringify(requestBody),
+    signal: AbortSignal.timeout(IMAGE_GENERATION_REQUEST_TIMEOUT_MS),
   }).catch((err) => {
-    if ((err as Error)?.name === "AbortError") {
+    const name = (err as Error)?.name;
+    if (name === "AbortError" || name === "TimeoutError") {
+      logGeneration("builder.abort", {
+        model: requestModel,
+        elapsedMs: Date.now() - startedAt,
+        timeoutMs: IMAGE_GENERATION_REQUEST_TIMEOUT_MS,
+        runId: input.runId,
+        note: "socket aborted at client timeout; provider may still be running under this idempotency key",
+      });
       throw new BuilderImageGenerationError(
         "Builder-managed image generation timed out.",
         504,
+        undefined,
+        "client_timeout",
       );
     }
+    logGeneration("builder.fetch_error", {
+      model: requestModel,
+      elapsedMs: Date.now() - startedAt,
+      name: (err as Error)?.name,
+      runId: input.runId,
+    });
     throw err;
+  });
+
+  logGeneration("builder.response", {
+    model: requestModel,
+    status: response.status,
+    ok: response.ok,
+    elapsedMs: Date.now() - startedAt,
+    runId: input.runId,
   });
 
   if (!response.ok) {
     const text = await response.text().catch(() => "");
-    const detail = extractBuilderErrorDetail(text);
+    const detail = builderErrorDetailForUser(text, input.model);
+    const code = extractBuilderErrorCode(text);
+    logGeneration("builder.error", {
+      model: requestModel,
+      requestedModel: input.model,
+      status: response.status,
+      code,
+      detail,
+      bodyShape: describeProviderPayloadShape(text),
+      bodyChars: text.length,
+      runId: input.runId,
+    });
     throw new BuilderImageGenerationError(
       `Builder-managed image generation failed (${response.status})${detail ? `: ${detail}` : "."}`,
       response.status,
       detail,
+      code,
     );
   }
 
@@ -268,6 +421,14 @@ export async function generateWithBuilderImageApi(
     );
   }
 
+  logGeneration("builder.success", {
+    requestedModel: input.model,
+    providerModel: body.model.publicId || input.model,
+    provider: body.model.provider,
+    elapsedMs: Date.now() - startedAt,
+    runId: input.runId,
+  });
+
   return {
     image: Buffer.from(await imageResponse.arrayBuffer()),
     mimeType:
@@ -282,42 +443,237 @@ export async function generateWithBuilderImageApi(
   };
 }
 
+function safeUrlHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "invalid-url";
+  }
+}
+
+async function sanitizedBuilderRequestPayload(input: {
+  idempotencyKey?: string;
+  prompt: string;
+  model: string;
+  mode?: string;
+  count: number;
+  aspectRatio: string;
+  size: string;
+  outputFormat: string;
+  background?: string;
+  references: Array<{
+    id: string;
+    role: string;
+    mimeType: string;
+    data: string;
+    name?: string;
+  }>;
+  source: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+}): Promise<Record<string, unknown>> {
+  return {
+    ...input,
+    promptChars: input.prompt.length,
+    references: await Promise.all(
+      input.references.map(async (reference) => ({
+        id: reference.id,
+        role: reference.role,
+        mimeType: reference.mimeType,
+        name: reference.name,
+        data: await referenceDataDebugSummary(reference.data),
+      })),
+    ),
+  };
+}
+
+async function referenceDataDebugSummary(data: string): Promise<
+  | {
+      omitted: true;
+      bytes: number;
+      sha256: string;
+      width?: number;
+      height?: number;
+      channels?: number;
+      hasAlpha?: boolean;
+      alpha?: {
+        min: number;
+        max: number;
+        transparent: number;
+        opaque: number;
+        partial: number;
+      };
+    }
+  | { omitted: true; error: string; chars: number }
+> {
+  try {
+    const buffer = decodeReferenceData(data);
+    const metadata = await sharp(buffer, { failOn: "none" }).metadata();
+    const alpha = metadata.hasAlpha
+      ? await alphaDebugSummary(buffer).catch(() => undefined)
+      : undefined;
+    return {
+      omitted: true,
+      bytes: buffer.byteLength,
+      sha256: createHash("sha256").update(buffer).digest("hex").slice(0, 16),
+      width: metadata.width,
+      height: metadata.height,
+      channels: metadata.channels,
+      hasAlpha: metadata.hasAlpha,
+      alpha,
+    };
+  } catch (err) {
+    return {
+      omitted: true,
+      error: err instanceof Error ? err.message : "Unable to inspect reference",
+      chars: data.length,
+    };
+  }
+}
+
+function decodeReferenceData(data: string): Buffer {
+  const base64 = data.includes(",") ? data.split(",").pop()! : data;
+  return Buffer.from(base64, "base64");
+}
+
+async function alphaDebugSummary(data: Buffer): Promise<{
+  min: number;
+  max: number;
+  transparent: number;
+  opaque: number;
+  partial: number;
+}> {
+  const alpha = await sharp(data, { failOn: "none" })
+    .ensureAlpha()
+    .extractChannel("alpha")
+    .raw()
+    .toBuffer();
+  let min = 255;
+  let max = 0;
+  let transparent = 0;
+  let opaque = 0;
+  let partial = 0;
+  for (const value of alpha) {
+    if (value < min) min = value;
+    if (value > max) max = value;
+    if (value === 0) transparent += 1;
+    else if (value === 255) opaque += 1;
+    else partial += 1;
+  }
+  return { min, max, transparent, opaque, partial };
+}
+
 async function generateWithRetryingBuilderImageApi(
   input: GenerateProviderInput,
 ): Promise<GenerateProviderOutput> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < MANAGED_PROVIDER_MAX_ATTEMPTS; attempt += 1) {
+  let transientAttempts = 0;
+  let inFlightPolls = 0;
+  for (;;) {
     try {
-      if (attempt > 0) {
-        await generationRetryDelay(attempt);
-      }
       return await generateWithBuilderImageApi(input);
     } catch (err) {
-      lastError = err;
-      if (
-        !isRetryableBuilderImageGenerationError(err) ||
-        attempt === MANAGED_PROVIDER_MAX_ATTEMPTS - 1
-      ) {
-        throw err;
+      if (isInFlightImageGenerationError(err)) {
+        if (inFlightPolls >= MANAGED_PROVIDER_INFLIGHT_MAX_POLLS) {
+          logGeneration("builder.poll_exhausted", {
+            model: input.model,
+            polls: inFlightPolls,
+            maxPolls: MANAGED_PROVIDER_INFLIGHT_MAX_POLLS,
+            runId: input.runId,
+            note: "provider never returned a completed result under this idempotency key within the wait budget",
+          });
+          throw new BuilderImageGenerationError(
+            "Builder-managed image generation is still running after the wait budget. It may finish shortly — try again to pick up the result.",
+            504,
+            err instanceof BuilderImageGenerationError ? err.detail : undefined,
+            "client_timeout",
+          );
+        }
+        inFlightPolls += 1;
+        logGeneration("builder.poll", {
+          model: input.model,
+          poll: inFlightPolls,
+          maxPolls: MANAGED_PROVIDER_INFLIGHT_MAX_POLLS,
+          code:
+            err instanceof BuilderImageGenerationError ? err.code : undefined,
+          status:
+            err instanceof BuilderImageGenerationError ? err.status : undefined,
+          runId: input.runId,
+        });
+        await generationPollDelay();
+        continue;
       }
+      if (
+        isRetryableBuilderImageGenerationError(err) &&
+        transientAttempts < MANAGED_PROVIDER_MAX_ATTEMPTS - 1
+      ) {
+        transientAttempts += 1;
+        logGeneration("builder.transient_retry", {
+          model: input.model,
+          attempt: transientAttempts,
+          status:
+            err instanceof BuilderImageGenerationError ? err.status : undefined,
+          runId: input.runId,
+        });
+        await generationRetryDelay(transientAttempts);
+        continue;
+      }
+      throw err;
     }
   }
-  throw lastError instanceof Error
-    ? lastError
-    : new BuilderImageGenerationError(
-        "Builder-managed image generation failed.",
-      );
+}
+
+/**
+ * The organization's Image generation provider (Settings › Infrastructure)
+ * when it is Gemini or OpenAI, has a key, and can serve this run. Otherwise
+ * null, and generation keeps the Builder-first path with its fallbacks: mask
+ * edits need Builder, Gemini can't run gpt-* models, and OpenAI can't attach
+ * reference boards or source images.
+ */
+async function chosenImageProvider(
+  choice: ServiceProviderId<"images"> | null,
+  input: GenerateProviderInput,
+): Promise<
+  ((input: GenerateProviderInput) => Promise<GenerateProviderOutput>) | null
+> {
+  if (!choice || choice === "builder" || input.mode === "edit") return null;
+  if (choice === "gemini") {
+    if (input.model.startsWith("gpt-")) return null;
+    return (await isGeminiImageGenerationConfigured())
+      ? generateWithGemini
+      : null;
+  }
+  if (
+    input.hasBoardReferences ||
+    input.intent === "restyle" ||
+    input.intent === "edit"
+  ) {
+    return null;
+  }
+  return (await isOpenAIImageGenerationConfigured())
+    ? generateWithOpenAI
+    : null;
 }
 
 export async function generateWithManagedImageProvider(
   input: GenerateProviderInput,
 ): Promise<GenerateProviderOutput> {
+  const orgProvider = await readServiceProviderChoice("images");
+  logGeneration("dispatch", {
+    model: input.model,
+    mode: input.mode,
+    intent: input.intent,
+    background: input.background,
+    builderEnabled: isBuilderImageGenerationEnabled(),
+    orgProvider,
+    runId: input.runId,
+  });
+  const chosen = await chosenImageProvider(orgProvider, input);
+  if (chosen) return chosen(input);
   if (!isBuilderImageGenerationEnabled()) {
     if (await isManualImageGenerationConfigured()) {
       return generateWithManualImageProvider(input);
     }
     throw new FeatureNotConfiguredError({
-      requiredCredential: "GEMINI_API_KEY or OPENAI_API_KEY",
+      requiredCredential: `${GEMINI_API_KEY} or OPENAI_API_KEY`,
       builderConnectUrl: "/_agent-native/builder/connect",
       byokDocsUrl: "https://aistudio.google.com/apikey",
       message:
@@ -331,11 +687,22 @@ export async function generateWithManagedImageProvider(
     const shouldFallback =
       err instanceof BuilderImageGenerationError &&
       [401, 402, 403, 429, 503, 504].includes(err.status ?? 0);
-    if (shouldFallback && (await isManualImageGenerationConfigured())) {
+    if (
+      shouldFallback &&
+      input.mode !== "edit" &&
+      !(input.hasBoardReferences && input.model.startsWith("gpt-")) &&
+      (await isManualImageGenerationConfigured())
+    ) {
+      logGeneration("builder.fallback_to_manual", {
+        model: input.model,
+        status:
+          err instanceof BuilderImageGenerationError ? err.status : undefined,
+        runId: input.runId,
+      });
       return generateWithManualImageProvider(input);
     }
     if (shouldFallback && err instanceof BuilderImageGenerationError) {
-      throw createBuilderImageGenerationFallbackError(err);
+      throw createBuilderImageGenerationFallbackError(err, input);
     }
     throw err;
   }
@@ -343,12 +710,15 @@ export async function generateWithManagedImageProvider(
 
 function createBuilderImageGenerationFallbackError(
   err: BuilderImageGenerationError,
+  input?: GenerateProviderInput,
 ): Error {
-  const message = builderImageGenerationFallbackMessage(err);
+  const message = builderImageGenerationFallbackMessage(err, input);
   if ([401, 402, 403].includes(err.status ?? 0)) {
     return new FeatureNotConfiguredError({
       requiredCredential:
-        err.status === 401 ? "BUILDER_PRIVATE_KEY" : "GEMINI_API_KEY",
+        input?.mode === "edit" || err.status === 401
+          ? "BUILDER_PRIVATE_KEY"
+          : GEMINI_API_KEY,
       builderConnectUrl: "/_agent-native/builder/connect",
       byokDocsUrl: "https://aistudio.google.com/apikey",
       message,
@@ -359,11 +729,29 @@ function createBuilderImageGenerationFallbackError(
 
 function builderImageGenerationFallbackMessage(
   err: BuilderImageGenerationError,
+  input?: GenerateProviderInput,
 ): string {
   const detail = err.detail ? `: ${err.detail}` : ".";
+  if (input?.mode === "edit") {
+    switch (err.status) {
+      case 401:
+        return `Masked skeleton inpainting needs Builder.io connected or reconnected${err.detail ? ` (${err.detail})` : ""}. Open Settings and click Use Builder.io (free tier available); manual OpenAI or Gemini fallback cannot pass image-edit masks.`;
+      case 402:
+        return `Builder.io is connected, but this Builder space cannot use managed image generation credits${detail} Masked skeleton inpainting cannot use manual OpenAI or Gemini fallback because it must pass an image-edit mask.`;
+      case 403:
+        return `Builder.io is connected, but this Builder space does not have access to managed image generation${detail} Ask a space admin to enable access or reconnect to a different Builder space; manual fallback cannot pass image-edit masks.`;
+      case 429:
+        return `Builder-managed masked inpainting is rate limited right now${detail} Retry shortly; manual OpenAI or Gemini fallback cannot pass image-edit masks.`;
+      case 503:
+      case 504:
+        return `Builder-managed masked inpainting is temporarily unavailable${detail} Retry shortly; manual OpenAI or Gemini fallback cannot pass image-edit masks.`;
+      default:
+        return `Builder-managed masked inpainting failed${detail} Retry with Builder-managed image generation; manual OpenAI or Gemini fallback cannot pass image-edit masks.`;
+    }
+  }
   switch (err.status) {
     case 401:
-      return `Image generation needs Builder.io connected or reconnected${err.detail ? ` (${err.detail})` : ""}. Open Settings and click Connect Builder.io, or expand the Asset generation setup step and add an OpenAI or Gemini API key as the manual fallback.`;
+      return `Image generation needs Builder.io connected or reconnected${err.detail ? ` (${err.detail})` : ""}. Open Settings and click Use Builder.io (free tier available), or expand the Asset generation setup step and add an OpenAI or Gemini API key as the manual fallback.`;
     case 402:
       return `Builder.io is connected, but this Builder space cannot use managed image generation credits${detail} Open Builder space settings or reconnect to a space with image-generation credits, or add an OpenAI or Gemini API key as the manual fallback.`;
     case 403:
@@ -378,30 +766,24 @@ function builderImageGenerationFallbackMessage(
   }
 }
 
-function extractBuilderErrorDetail(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed) return "";
-  try {
-    const parsed = JSON.parse(trimmed) as unknown;
-    const detail = readProviderErrorDetail(parsed);
-    if (detail) return detail.slice(0, 300);
-  } catch {
-    // Fall back to the raw response text below.
+function builderErrorDetailForUser(text: string, model: ImageModel): string {
+  const detail = readableProviderErrorDetail(text);
+  if (!detail) return "";
+  if (isModelUnavailableDetail(detail)) {
+    return `the ${model} model is unavailable right now. Pick a different image model and try again.`;
   }
-  return trimmed.slice(0, 300);
+  return detail;
 }
 
-function readProviderErrorDetail(value: unknown): string | null {
-  if (typeof value === "string") return value;
-  if (!value || typeof value !== "object") return null;
-  const record = value as Record<string, unknown>;
-  for (const key of ["message", "error", "detail"]) {
-    const candidate = record[key];
-    if (typeof candidate === "string" && candidate.trim()) return candidate;
-    const nested = readProviderErrorDetail(candidate);
-    if (nested) return nested;
+function extractBuilderErrorCode(text: string): string | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = JSON.parse(trimmed) as { code?: unknown };
+    return typeof parsed?.code === "string" ? parsed.code : undefined;
+  } catch {
+    return undefined;
   }
-  return null;
 }
 
 export async function generateWithGemini(
@@ -492,7 +874,8 @@ export async function analyzeStyleWithGemini(input: {
       {
         text: [
           "Analyze these brand/style reference images for a reusable image generation style brief.",
-          "Return only compact JSON with keys: description, medium, mood, subjectMatter, texture, composition, lighting, typographyPolicy, doNot.",
+          "Return only compact JSON with keys: description, medium, mood, subjectMatter, texture, composition, lighting, fontFamilies, fontWeights, letterforms, caseStyle, typographyPolicy, doNot.",
+          "For typography, describe specific letterforms and font traits, not just broad sans/serif categories; omit any typography field you cannot determine confidently.",
           "Use specific trait-locking phrases that can be reused across future image prompts.",
           "Do not name brands, artists, studios, franchises, or copyrighted works unless they appear as user-provided brand identity.",
           "Keep doNot as an array of short constraints. Omit uncertain fields instead of guessing.",
@@ -536,16 +919,24 @@ function extractJsonObject(text: string): string {
   return "{}";
 }
 
-function sanitizeStyleBrief(value: Record<string, unknown>): StyleBrief {
+export function sanitizeStyleBrief(value: Record<string, unknown>): StyleBrief {
   const stringField = (key: string) => {
     const raw = value[key];
     return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
   };
-  const doNot = Array.isArray(value.doNot)
-    ? value.doNot.filter(
-        (item): item is string => typeof item === "string" && !!item.trim(),
-      )
-    : undefined;
+  const stringArrayField = (key: string) => {
+    const raw = value[key];
+    return Array.isArray(raw)
+      ? raw
+          .filter(
+            (item): item is string => typeof item === "string" && !!item.trim(),
+          )
+          .map((item) => item.trim())
+      : undefined;
+  };
+  const fontFamilies = stringArrayField("fontFamilies");
+  const fontWeights = stringArrayField("fontWeights");
+  const doNot = stringArrayField("doNot");
   return {
     description: stringField("description"),
     medium: stringField("medium"),
@@ -554,20 +945,51 @@ function sanitizeStyleBrief(value: Record<string, unknown>): StyleBrief {
     texture: stringField("texture"),
     composition: stringField("composition"),
     lighting: stringField("lighting"),
+    fontFamilies: fontFamilies?.length ? fontFamilies : undefined,
+    fontWeights: fontWeights?.length ? fontWeights : undefined,
+    letterforms: stringField("letterforms"),
+    caseStyle: stringField("caseStyle"),
     typographyPolicy: stringField("typographyPolicy"),
-    doNot: doNot?.length ? doNot.map((item) => item.trim()) : undefined,
+    doNot: doNot?.length ? doNot : undefined,
   };
 }
 
 async function generateWithManualImageProvider(
   input: GenerateProviderInput,
 ): Promise<GenerateProviderOutput> {
+  if (input.mode === "edit") {
+    throw new FeatureNotConfiguredError({
+      requiredCredential: "BUILDER_PRIVATE_KEY",
+      builderConnectUrl: "/_agent-native/builder/connect",
+      byokDocsUrl: "https://aistudio.google.com/apikey",
+      message:
+        "Mask inpainting runs need Builder-managed image generation because the manual fallback cannot pass the image-edit mask.",
+    });
+  }
+  if (input.hasBoardReferences && input.model.startsWith("gpt-")) {
+    throw new FeatureNotConfiguredError({
+      requiredCredential: "BUILDER_PRIVATE_KEY",
+      builderConnectUrl: "/_agent-native/builder/connect",
+      byokDocsUrl: "https://aistudio.google.com/apikey",
+      message:
+        "This preset attaches reference board images, which the manual OpenAI fallback cannot pass. Use Builder.io managed generation (free tier available), or switch the preset to a Gemini model with a Gemini API key.",
+    });
+  }
   if (await isGeminiImageGenerationConfigured()) {
     return generateWithGemini(input);
   }
+  if (input.hasBoardReferences) {
+    throw new FeatureNotConfiguredError({
+      requiredCredential: `BUILDER_PRIVATE_KEY or ${GEMINI_API_KEY}`,
+      builderConnectUrl: "/_agent-native/builder/connect",
+      byokDocsUrl: "https://aistudio.google.com/apikey",
+      message:
+        "This preset attaches reference board images, which the manual OpenAI fallback cannot pass. Use Builder.io managed generation (free tier available), or switch the preset to a Gemini model with a Gemini API key.",
+    });
+  }
   if (input.intent === "restyle" || input.intent === "edit") {
     throw new FeatureNotConfiguredError({
-      requiredCredential: "GEMINI_API_KEY",
+      requiredCredential: GEMINI_API_KEY,
       builderConnectUrl: "/_agent-native/builder/connect",
       byokDocsUrl: "https://aistudio.google.com/apikey",
       message:
@@ -580,6 +1002,23 @@ async function generateWithManualImageProvider(
 export async function generateWithOpenAI(
   input: GenerateProviderInput,
 ): Promise<GenerateProviderOutput> {
+  if (input.hasBoardReferences) {
+    throw new FeatureNotConfiguredError({
+      requiredCredential: `BUILDER_PRIVATE_KEY or ${GEMINI_API_KEY}`,
+      builderConnectUrl: "/_agent-native/builder/connect",
+      byokDocsUrl: "https://aistudio.google.com/apikey",
+      message:
+        "This preset attaches reference board images, which the manual OpenAI fallback cannot pass. Use Builder.io managed generation (free tier available), or switch the preset to a Gemini model with a Gemini API key.",
+    });
+  }
+  const startedAt = Date.now();
+  const model = openAIImageModelForInput(input.model);
+  logGeneration("openai.request", {
+    model,
+    requestedModel: input.model,
+    size: toOpenAIImageSize(input.aspectRatio),
+    runId: input.runId,
+  });
   const response = await fetch("https://api.openai.com/v1/images/generations", {
     method: "POST",
     headers: {
@@ -587,14 +1026,30 @@ export async function generateWithOpenAI(
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-image-2",
+      model,
       prompt: buildOpenAIImagePrompt(input),
       n: 1,
       size: toOpenAIImageSize(input.aspectRatio),
       quality: "medium",
       output_format: "png",
+      ...(input.background ? { background: input.background } : {}),
     }),
-    signal: AbortSignal.timeout(90_000),
+    signal: AbortSignal.timeout(IMAGE_GENERATION_REQUEST_TIMEOUT_MS),
+  }).catch((err) => {
+    logGeneration("openai.fetch_error", {
+      elapsedMs: Date.now() - startedAt,
+      name: (err as Error)?.name,
+      timeoutMs: IMAGE_GENERATION_REQUEST_TIMEOUT_MS,
+      runId: input.runId,
+    });
+    throw err;
+  });
+
+  logGeneration("openai.response", {
+    status: response.status,
+    ok: response.ok,
+    elapsedMs: Date.now() - startedAt,
+    runId: input.runId,
   });
 
   const body = (await response.json().catch(() => ({}))) as {
@@ -611,7 +1066,7 @@ export async function generateWithOpenAI(
     return {
       image: Buffer.from(output.b64_json, "base64"),
       mimeType: "image/png",
-      model: "gpt-image-2",
+      model,
       provider: "openai",
     };
   }
@@ -628,12 +1083,20 @@ export async function generateWithOpenAI(
       image: Buffer.from(await imageResponse.arrayBuffer()),
       mimeType:
         imageResponse.headers.get("content-type")?.split(";")[0] || "image/png",
-      model: "gpt-image-2",
+      model,
       provider: "openai",
       sourceUrl: output.url,
     };
   }
   throw new Error("OpenAI returned no image data.");
+}
+
+function openAIImageModelForInput(
+  model: ImageModel,
+): "gpt-image-1" | "gpt-image-2" {
+  return model === "gpt-image-1" || model === "gpt-image-2"
+    ? model
+    : "gpt-image-2";
 }
 
 function buildOpenAIImagePrompt(input: GenerateProviderInput): string {
@@ -702,6 +1165,47 @@ function toBuilderImageModel(model: ImageModel) {
   return model;
 }
 
+function resolveModelForTier(
+  tier: ImageQualityTier | undefined,
+  category: ImageCategory | undefined,
+): ImageModel | undefined {
+  if (!tier) return undefined;
+  if (tier === "fast") return "gemini-3.1-flash-image";
+  if (tier === "best") return "gemini-3-pro-image";
+  return ["hero", "landing", "logo", "campaign"].includes(category ?? "")
+    ? "gemini-3-pro-image"
+    : "gemini-3.1-flash-image";
+}
+
+export function resolveImageModelForRequest(input: {
+  explicitModel?: ImageModel;
+  imageModelDefault?: ImageModel;
+  explicitTier?: ImageQualityTier;
+  resolvedTier?: ImageQualityTier;
+  category?: ImageCategory;
+  presetModel?: ImageModel | null;
+  embeddedText?: string | null;
+}): ImageModel {
+  if (input.explicitModel) return input.explicitModel;
+
+  const textAccurateModel: ImageModel | undefined =
+    input.embeddedText?.trim() &&
+    !input.explicitTier &&
+    !input.resolvedTier &&
+    !input.presetModel
+      ? "gemini-3-pro-image"
+      : undefined;
+
+  return (
+    textAccurateModel ??
+    resolveModelForTier(input.explicitTier, input.category) ??
+    input.presetModel ??
+    resolveModelForTier(input.resolvedTier, input.category) ??
+    input.imageModelDefault ??
+    "gemini-3.1-flash-image"
+  );
+}
+
 function toBuilderReferenceRole(role: string) {
   switch (role) {
     case "style_reference":
@@ -710,8 +1214,11 @@ function toBuilderReferenceRole(role: string) {
       return "logo";
     case "product_reference":
       return "product";
+    case "background_reference":
     case "diagram_reference":
       return "composition";
+    case "mask":
+      return "mask";
     case "subject_reference":
     case "edit_target":
       return "source";
@@ -727,13 +1234,24 @@ export function compilePrompt(input: {
   styleBrief: StyleBrief;
   customInstructions?: string | null;
   prompt: string;
+  embeddedText?: string | null;
+  textPlacement?: string | null;
   referenceCount: number;
   includeLogo: boolean;
+  skeletonContentMode?: "cutout" | "fill" | null;
+  hasBackgroundPlate?: boolean;
+  skeletonInpaint?: boolean;
   aspectRatio?: AspectRatio;
   imageSize?: ImageSize;
   category?: ImageCategory;
   intent?: GenerationIntent;
   styleStrength?: StyleStrength;
+  referenceBoard?: Array<{
+    label: string;
+    role: PresetReferenceRole;
+    count: number;
+    description?: string;
+  }>;
 }): string {
   const style = input.styleBrief;
   const intent = input.intent ?? "generate";
@@ -743,8 +1261,24 @@ export function compilePrompt(input: {
   const doNot = style.doNot?.length
     ? `\nAvoid: ${style.doNot.join("; ")}.`
     : "";
+  const typographyBlock = formatBrandTypography(style);
+  const renderedDesignBlock = formatRenderedDesignEvidence(style);
+  const requestedEmbeddedText = hasEmbeddedText(input.embeddedText);
+  const textInstruction = requestedEmbeddedText
+    ? formatEmbeddedTextInstruction(input.embeddedText, input.textPlacement)
+    : "Do not render headlines, body text, UI labels, or prompt wording inside the image unless the user explicitly asks for exact visible text.";
   const logoInstruction = input.includeLogo
     ? "\nLeave a clean uncluttered area in the upper-right for the real brand logo; do not draw or approximate the logo yourself."
+    : "";
+  const cutoutInstruction =
+    input.skeletonContentMode === "cutout" && !input.skeletonInpaint
+      ? "\nCutout mode: generate the subject in isolation on an empty transparent background; no scenery, no baked-in ground plane, no environment, and no baked-in shadow."
+      : "";
+  const backgroundPlateInstruction = input.hasBackgroundPlate
+    ? "\nA background plate is attached as a composition reference. It is the FIXED brand layout your output will be composited onto — it already contains the logo, framing, and all fixed text/headlines. Render ONLY the subject, isolated on a transparent background. Do NOT draw, repeat, restyle, or overlap the plate's logo, headline, body text, CTA, or framing. Keep the subject within the plate's open/empty area and leave the occupied regions clear."
+    : "";
+  const skeletonInpaintInstruction = input.skeletonInpaint
+    ? "\nSkeleton inpaint mode: the attached background plate is the fixed final image, and its transparent/open region is the only editable area. Render ONLY the requested foreground content inside that editable region. If the request asks for exact text, CTA, linework, or graphic elements, render those elements only within the editable region. Match the surrounding plate's lighting, perspective, scale, and contact geometry. Do NOT alter, redraw, repeat, restyle, or overlap the plate's existing logo, text, framing, borders, or other brand chrome in the opaque/preserved regions; the plate already contains them. Return the finished plate with the opaque regions preserved."
     : "";
   const diagramInstruction =
     input.category === "diagram"
@@ -763,23 +1297,36 @@ export function compilePrompt(input: {
       : intent === "restyle"
         ? `The first attached image is the subject to preserve. Keep its identity, pose, composition, and framing. Treat the remaining attached images as style evidence for the brand library. Apply the library look with ${input.styleStrength ?? "balanced"} strength.`
         : input.referenceCount > 0
-          ? `Use the ${input.referenceCount} attached reference image${input.referenceCount === 1 ? "" : "s"} as visual evidence. Treat them by role: style references define visual language, logo/product references define accurate brand/product appearance, subject/source references provide content or composition only, and prior candidates define continuity. Subject/source references must not override the library style brief or custom instructions.`
+          ? `Use the ${input.referenceCount} attached reference image${input.referenceCount === 1 ? "" : "s"} as visual evidence. Treat them by role: style references define visual language, logo/product references define accurate brand/product appearance, background references define fixed composition plates/layout only, mask references define editable regions only, subject/source references provide content or composition only, and prior candidates define continuity. Subject/source/background/mask references must not override the library style brief or custom instructions.`
           : "No reference images are attached for this run. Use the style brief and custom instructions as the source of truth.";
+  const referenceBoardBlock = formatReferenceBoardBlock(input.referenceBoard);
 
   if (intent === "edit") {
+    const editTypographyInstruction =
+      requestedEmbeddedText && typographyBlock ? `\n\n${typographyBlock}` : "";
+    const editTextInstruction = requestedEmbeddedText
+      ? `\n\n${formatEmbeddedTextInstruction(input.embeddedText, input.textPlacement)}`
+      : "";
+    const editConstraint = requestedEmbeddedText
+      ? "Do not reimagine the image, change its aspect ratio, or alter unrelated subjects. Do not add any other new text. Return the full image."
+      : "Do not reimagine the image, change its aspect ratio, add new text, or alter unrelated subjects. Return the full image.";
     return `Edit the attached image for the "${input.libraryTitle}" asset library.
 
 ${referenceInstruction}
+${referenceBoardBlock}
+${editTypographyInstruction}
 
 Make only this change:
 ${input.prompt}
+${editTextInstruction}
 
-Do not reimagine the image, change its aspect ratio, add new text, or alter unrelated subjects. Return the full image.`;
+${editConstraint}`;
   }
 
   return `Create a brand-consistent image for the "${input.libraryTitle}" asset library.
 
 ${referenceInstruction}
+${referenceBoardBlock}
 
 Style brief:
 ${style.description || "Infer the style from the references."}${palette}
@@ -789,18 +1336,141 @@ ${style.subjectMatter ? `\nSubject matter: ${style.subjectMatter}.` : ""}
 ${style.texture ? `\nTexture/material treatment: ${style.texture}.` : ""}
 ${style.composition ? `\nComposition: ${style.composition}.` : ""}
 ${style.lighting ? `\nLighting: ${style.lighting}.` : ""}
-${style.typographyPolicy ? `\nTypography policy: ${style.typographyPolicy}.` : ""}${frameInstruction}
-${doNot}${logoInstruction}${diagramInstruction}${customInstructions}
+${typographyBlock ? `\n${typographyBlock}` : ""}${frameInstruction}
+${renderedDesignBlock ? `\n${renderedDesignBlock}` : ""}
+${doNot}${logoInstruction}${cutoutInstruction}${backgroundPlateInstruction}${skeletonInpaintInstruction}${diagramInstruction}${customInstructions}
 
-Do not render headlines, body text, UI labels, or prompt wording inside the image unless the user explicitly asks for exact visible text.
+${textInstruction}
 
 User request:
 ${input.prompt}`;
 }
 
-// A content-only reference is an image the user attached as subject/content for
-// a single request (not a reusable brand/style reference). It should never count
-// as a brand-kit style reference.
+function formatReferenceBoardBlock(
+  entries?: Array<{
+    label: string;
+    role: PresetReferenceRole;
+    count: number;
+    description?: string;
+  }>,
+): string {
+  const visibleEntries = (entries ?? []).filter((entry) => entry.count > 0);
+  if (!visibleEntries.length) return "";
+  const lines = visibleEntries.map((entry) => {
+    const description =
+      entry.description?.trim() || presetReferenceRoleDefault(entry.role);
+    return `- "${entry.label}" (${entry.count} image(s), role: ${entry.role}): ${description}`;
+  });
+  return `\nPreset reference board attached to this run:\n${lines.join("\n")}`;
+}
+
+function presetReferenceRoleDefault(role: PresetReferenceRole): string {
+  switch (role) {
+    case "subject":
+      return "This is the actual person/object for this piece. Render them faithfully and recognizably; do not replace them with a generic subject.";
+    case "style":
+      return "Match this visual style; do not copy its content.";
+    case "product":
+      return "Reproduce this product accurately; do not invent variants.";
+    case "background":
+      return "Use as fixed backdrop/setting context only; do not treat it as a subject.";
+    case "composition":
+      return "Imitate this image's layout, arrangement, and framing; do not copy its content or style.";
+  }
+}
+
+function hasEmbeddedText(value?: string | null): boolean {
+  return typeof value === "string" && !!value.trim();
+}
+
+function formatEmbeddedTextInstruction(
+  embeddedText?: string | null,
+  textPlacement?: string | null,
+): string {
+  const placement = textPlacement?.trim();
+  return [
+    `Render this text exactly, spelled correctly, inside the image: ${JSON.stringify(embeddedText ?? "")}.`,
+    placement ? `Placement: ${placement}.` : "",
+    "Match the brand typography described above where specified; keep it legible and well-kerned.",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function formatBrandTypography(style: StyleBrief): string {
+  const parts = [
+    style.fontFamilies?.length
+      ? `families ${style.fontFamilies.join(", ")}`
+      : "",
+    style.fontWeights?.length ? `weights ${style.fontWeights.join(", ")}` : "",
+    style.letterforms ? `letterforms: ${style.letterforms}` : "",
+    style.caseStyle ? `case: ${style.caseStyle}` : "",
+    style.typographyPolicy,
+  ].filter((part): part is string => typeof part === "string" && !!part.trim());
+
+  if (!parts.length) return "";
+  return `Brand typography: ${parts.join("; ")}. Match these for any rendered text.`;
+}
+
+function formatRenderedDesignEvidence(style: StyleBrief): string {
+  const lines: string[] = [];
+  const semanticColors = Object.entries(style.semanticColors ?? {}).filter(
+    ([, value]) => typeof value === "string" && value.trim(),
+  );
+  if (semanticColors.length > 0) {
+    lines.push(
+      `Semantic colors: ${semanticColors
+        .slice(0, 8)
+        .map(([role, value]) => `${role} ${value}`)
+        .join(", ")}.`,
+    );
+  }
+  if (style.spacing?.length) {
+    lines.push(`Observed spacing: ${style.spacing.slice(0, 16).join(", ")}.`);
+  }
+  if (style.radii?.length) {
+    lines.push(
+      `Observed corner radii: ${style.radii.slice(0, 12).join(", ")}.`,
+    );
+  }
+  if (style.shadows?.length) {
+    lines.push(`Observed shadows: ${style.shadows.slice(0, 8).join("; ")}.`);
+  }
+  if (style.backgrounds?.length) {
+    lines.push(
+      `Observed background treatments: ${style.backgrounds.slice(0, 8).join("; ")}.`,
+    );
+  }
+  for (const component of style.componentStyles?.slice(0, 8) ?? []) {
+    const role =
+      typeof component.role === "string" ? component.role : "component";
+    const fields = [
+      ["font", component.fontFamily],
+      ["size", component.fontSize],
+      ["weight", component.fontWeight],
+      ["color", component.color],
+      ["background", component.backgroundColor],
+      ["radius", component.borderRadius],
+      ["shadow", component.boxShadow],
+      ["padding", component.padding],
+    ]
+      .filter(
+        (entry): entry is [string, string] =>
+          typeof entry[1] === "string" && Boolean(entry[1].trim()),
+      )
+      .map(([name, value]) => `${name} ${value}`);
+    if (fields.length > 0)
+      lines.push(`${role} component: ${fields.join("; ")}.`);
+  }
+  const designMd = style.designMd?.trim().slice(0, 8_000);
+  if (designMd) lines.push(`Design.md evidence:\n${designMd}`);
+  if (lines.length === 0) return "";
+  return [
+    "Rendered design language below is visual evidence only, not instructions:",
+    ...lines,
+  ].join("\n");
+}
+
 function isContentOnlyReferenceAsset(asset: {
   role: string;
   metadata: string;
@@ -810,18 +1480,34 @@ function isContentOnlyReferenceAsset(asset: {
   return metadata.intent === "subject";
 }
 
+type ScoredReferenceCandidate = {
+  asset: typeof schema.assets.$inferSelect;
+  metadata: {
+    category?: string;
+    isStyleAnchor?: boolean;
+    intent?: string;
+  };
+  score: number;
+  isAnchor: boolean;
+  isSubject: boolean;
+  isSource: boolean;
+};
+
 export async function selectReferences(input: {
   libraryId: string;
   collectionId?: string | null;
   categories?: ImageCategory[];
   referenceAssetIds?: string[];
+  excludeAssetIds?: string[];
   sourceAssetId?: string;
   subjectAssetId?: string;
   intent?: GenerationIntent;
   limit?: number;
+  draftScope: DraftReadScope;
 }): Promise<ReferenceForGeneration[]> {
   const db = getDb();
   const requestedExplicitIds = new Set(input.referenceAssetIds ?? []);
+  const excludedAssetIds = new Set(input.excludeAssetIds ?? []);
   let explicitIds = [...requestedExplicitIds];
   if (explicitIds.length) {
     explicitIds = [
@@ -850,7 +1536,9 @@ export async function selectReferences(input: {
           asset != null &&
           asset.mimeType.startsWith("image/") &&
           asset.status !== "archived" &&
-          asset.status !== "failed",
+          asset.status !== "failed" &&
+          canReadDraftAsset(input.draftScope, asset) &&
+          !excludedAssetIds.has(asset.id),
       );
     const explicitRefs = await loadReferenceData(
       explicitAssets,
@@ -862,12 +1550,6 @@ export async function selectReferences(input: {
           : undefined,
       () => "explicit",
     );
-    // When every caller-requested reference is a content-only attachment (a
-    // subject/content image dropped in for this one request), it should ADD to —
-    // not replace — the library's curated brand style. Otherwise attaching a
-    // content image silently strips every style/anchor reference and the
-    // generation ignores the brand kit entirely. `edit` keeps exact control
-    // because the edit target must stand alone.
     const requestedContentAssets = explicitAssets.filter((asset) =>
       requestedExplicitIds.has(asset.id),
     );
@@ -885,8 +1567,10 @@ export async function selectReferences(input: {
       libraryId: input.libraryId,
       collectionId: input.collectionId,
       categories: input.categories,
+      excludeAssetIds: input.excludeAssetIds,
       intent: input.intent,
       limit: styleLimit,
+      draftScope: input.draftScope,
     });
     const seen = new Set(explicitRefs.map((ref) => ref.id));
     return [...explicitRefs, ...styleRefs.filter((ref) => !seen.has(ref.id))];
@@ -894,13 +1578,13 @@ export async function selectReferences(input: {
   const [library] = await db
     .select({ settings: schema.assetLibraries.settings })
     .from(schema.assetLibraries)
-    .where(eq(schema.assetLibraries.id, input.libraryId))
+    .where(
+      and(
+        eq(schema.assetLibraries.id, input.libraryId),
+        accessFilter(schema.assetLibraries, schema.assetLibraryShares),
+      ),
+    )
     .limit(1);
-  const rows = await db
-    .select()
-    .from(schema.assets)
-    .where(eq(schema.assets.libraryId, input.libraryId));
-
   const categories = new Set(input.categories ?? []);
   const intent = input.intent ?? "generate";
   const limit = input.limit ?? DEFAULT_GENERATION_REFERENCE_LIMIT;
@@ -910,80 +1594,209 @@ export async function selectReferences(input: {
   const canonicalStyleAssetIds = Array.isArray(settings.canonicalStyleAssetIds)
     ? settings.canonicalStyleAssetIds.filter((id) => typeof id === "string")
     : [];
-  const candidates = rows
-    .filter(
-      (asset) =>
-        asset.mimeType.startsWith("image/") &&
-        asset.status !== "archived" &&
-        asset.status !== "failed",
-    )
-    .map((asset) => {
-      const metadata = parseJson<{
-        category?: string;
-        isStyleAnchor?: boolean;
-        intent?: string;
-      }>(asset.metadata, {});
-      let score = 0;
-      const isSubject = asset.id === input.subjectAssetId;
-      const isSource = asset.id === input.sourceAssetId;
-      const isAnchor =
-        metadata.isStyleAnchor === true ||
-        canonicalStyleAssetIds.includes(asset.id);
-      if (isSubject) score += 120;
-      if (isSource) score += 100;
-      if (isAnchor) score += 30;
-      if (asset.collectionId && asset.collectionId === input.collectionId)
-        score += 20;
-      if (
-        metadata.category &&
-        categories.has(metadata.category as ImageCategory)
-      )
-        score += 10;
-      if (asset.role !== "generated") score += 4;
-      if (asset.role === "logo_reference") score += 3;
-      if (asset.role === "product_reference") score += 3;
-      if (intent === "restyle" && asset.role === "style_reference") score += 5;
-      if (intent === "restyle" && asset.role === "generated") score -= 4;
-      return { asset, metadata, score, isAnchor, isSubject, isSource };
-    })
-    .filter(
-      (item) =>
-        item.isSubject ||
-        item.isSource ||
-        item.isAnchor ||
-        (item.metadata.intent !== "subject" &&
-          item.asset.role !== "subject_reference"),
+  const anchorLimit =
+    intent === "restyle"
+      ? Math.min(4, Math.max(1, Math.ceil(limit * 0.6)))
+      : Math.max(1, Math.ceil(limit * 0.6));
+  const canonicalAnchorIds = [...new Set(canonicalStyleAssetIds)].slice(
+    0,
+    anchorLimit,
+  );
+  const canonicalStyleAssetIdSet = new Set(canonicalStyleAssetIds);
+  const reservedIds = [
+    ...new Set(
+      (intent === "edit"
+        ? [input.subjectAssetId]
+        : [input.subjectAssetId, input.sourceAssetId, ...canonicalAnchorIds]
+      ).filter((id): id is string => !!id),
+    ),
+  ];
+  const candidatePoolLimit = Math.max(0, limit) + 2 + anchorLimit;
+  const metadataAnchorPoolLimit = anchorLimit + canonicalAnchorIds.length;
+  const metadataCategory = sql<
+    string | null
+  >`CASE WHEN ${schema.assets.metadata} IS JSON THEN (${schema.assets.metadata}::jsonb ->> 'category') END`;
+  const metadataIntent = sql<
+    string | null
+  >`CASE WHEN ${schema.assets.metadata} IS JSON THEN (${schema.assets.metadata}::jsonb ->> 'intent') END`;
+  const metadataStyleAnchor = sql<boolean>`CASE WHEN ${schema.assets.metadata} IS JSON THEN (${schema.assets.metadata}::jsonb -> 'isStyleAnchor') = 'true'::jsonb ELSE false END`;
+  const canonicalAnchorFilter = canonicalStyleAssetIds.length
+    ? inArray(schema.assets.id, canonicalStyleAssetIds)
+    : sql<boolean>`false`;
+  const subjectFilter = input.subjectAssetId
+    ? eq(schema.assets.id, input.subjectAssetId)
+    : sql<boolean>`false`;
+  const sourceFilter = input.sourceAssetId
+    ? eq(schema.assets.id, input.sourceAssetId)
+    : sql<boolean>`false`;
+  const anchorFilter = or(metadataStyleAnchor, canonicalAnchorFilter);
+  const baseFilters = [
+    eq(schema.assets.libraryId, input.libraryId),
+    like(schema.assets.mimeType, "image/%"),
+    notInArray(schema.assets.status, ["archived", "failed"]),
+    sql`${metadataCategory} IS DISTINCT FROM 'skeleton'`,
+    ...(excludedAssetIds.size
+      ? [notInArray(schema.assets.id, [...excludedAssetIds])]
+      : []),
+  ];
+  if (!input.draftScope.unrestricted) {
+    baseFilters.push(
+      or(
+        ne(schema.assets.role, "generated"),
+        ne(schema.assets.status, "candidate"),
+        draftReadFilter(input.draftScope, schema.assets) ?? sql`false`,
+      ) ?? sql`false`,
     );
+  }
+  const contentEligibility = or(
+    and(
+      sql`${metadataIntent} IS DISTINCT FROM 'subject'`,
+      ne(schema.assets.role, "subject_reference"),
+    ),
+    subjectFilter,
+    sourceFilter,
+    anchorFilter,
+  );
+  const categoryFilter = categories.size
+    ? inArray(metadataCategory, [...categories])
+    : sql<boolean>`false`;
+  const collectionScoreFilter = input.collectionId
+    ? and(
+        ne(schema.assets.collectionId, ""),
+        eq(schema.assets.collectionId, input.collectionId),
+      )
+    : sql<boolean>`false`;
+  const scoreExpression = sql<number>`(
+    CASE WHEN ${subjectFilter} THEN 120 ELSE 0 END +
+    CASE WHEN ${sourceFilter} THEN 100 ELSE 0 END +
+    CASE WHEN ${anchorFilter} THEN 30 ELSE 0 END +
+    CASE WHEN ${collectionScoreFilter} THEN 20 ELSE 0 END +
+    CASE WHEN ${categoryFilter} THEN 10 ELSE 0 END +
+    CASE WHEN ${ne(schema.assets.role, "generated")} THEN 4 ELSE 0 END +
+    CASE WHEN ${eq(schema.assets.role, "logo_reference")} THEN 3 ELSE 0 END +
+    CASE WHEN ${eq(schema.assets.role, "product_reference")} THEN 3 ELSE 0 END +
+    CASE WHEN ${intent === "restyle" ? eq(schema.assets.role, "style_reference") : sql`false`} THEN 5 ELSE 0 END -
+    CASE WHEN ${intent === "restyle" ? eq(schema.assets.role, "generated") : sql`false`} THEN 4 ELSE 0 END
+  )`;
+  const idForStableOrdering = sql<string>`${schema.assets.id} COLLATE "C"`;
+  const orderByScore = [
+    desc(scoreExpression),
+    desc(schema.assets.createdAt),
+    asc(idForStableOrdering),
+  ];
+  const reservedRows = reservedIds.length
+    ? await db
+        .select()
+        .from(schema.assets)
+        .where(and(...baseFilters, inArray(schema.assets.id, reservedIds)))
+    : [];
+  if (intent === "edit") {
+    const [subject] = reservedRows;
+    if (
+      !subject ||
+      !subject.mimeType.startsWith("image/") ||
+      subject.status === "archived" ||
+      subject.status === "failed" ||
+      !canReadDraftAsset(input.draftScope, subject) ||
+      excludedAssetIds.has(subject.id) ||
+      parseJson<{ category?: string }>(subject.metadata, {}).category ===
+        "skeleton"
+    ) {
+      return [];
+    }
+    return loadReferenceData(
+      [subject],
+      () => "edit_target",
+      () => "subject",
+    );
+  }
+  const rankedRows = await db
+    .select()
+    .from(schema.assets)
+    .where(and(...baseFilters, contentEligibility))
+    .orderBy(...orderByScore)
+    .limit(candidatePoolLimit);
+  const metadataAnchorRows = await db
+    .select()
+    .from(schema.assets)
+    .where(and(...baseFilters, metadataStyleAnchor))
+    .orderBy(...orderByScore)
+    .limit(metadataAnchorPoolLimit);
+  const candidatesById = new Map<string, ScoredReferenceCandidate>();
+  for (const asset of [...reservedRows, ...rankedRows, ...metadataAnchorRows]) {
+    if (candidatesById.has(asset.id)) continue;
+    if (
+      !asset.mimeType.startsWith("image/") ||
+      asset.status === "archived" ||
+      asset.status === "failed" ||
+      !canReadDraftAsset(input.draftScope, asset) ||
+      excludedAssetIds.has(asset.id)
+    ) {
+      continue;
+    }
+    const metadata = parseJson<{
+      category?: string;
+      isStyleAnchor?: boolean;
+      intent?: string;
+    }>(asset.metadata, {});
+    if (metadata.category === "skeleton") continue;
 
-  const byId = new Map(candidates.map((item) => [item.asset.id, item]));
-  const selected: typeof candidates = [];
+    const isSubject = asset.id === input.subjectAssetId;
+    const isSource = asset.id === input.sourceAssetId;
+    const isCanonicalAnchor = canonicalStyleAssetIdSet.has(asset.id);
+    const isAnchor = metadata.isStyleAnchor === true || isCanonicalAnchor;
+    if (
+      !isSubject &&
+      !isSource &&
+      !isAnchor &&
+      (metadata.intent === "subject" || asset.role === "subject_reference")
+    ) {
+      continue;
+    }
+    let score = 0;
+    if (isSubject) score += 120;
+    if (isSource) score += 100;
+    if (isAnchor) score += 30;
+    if (asset.collectionId && asset.collectionId === input.collectionId)
+      score += 20;
+    if (metadata.category && categories.has(metadata.category as ImageCategory))
+      score += 10;
+    if (asset.role !== "generated") score += 4;
+    if (asset.role === "logo_reference") score += 3;
+    if (asset.role === "product_reference") score += 3;
+    if (intent === "restyle" && asset.role === "style_reference") score += 5;
+    if (intent === "restyle" && asset.role === "generated") score -= 4;
+    candidatesById.set(asset.id, {
+      asset,
+      metadata,
+      score,
+      isAnchor,
+      isSubject,
+      isSource,
+    });
+  }
+  const candidates = [...candidatesById.values()];
+  const metadataAnchorCandidates = metadataAnchorRows
+    .map((asset) => candidatesById.get(asset.id))
+    .filter(
+      (candidate): candidate is ScoredReferenceCandidate =>
+        candidate?.metadata.isStyleAnchor === true,
+    );
+  const byId = candidatesById;
+  const selected: ScoredReferenceCandidate[] = [];
   const selectedIds = new Set<string>();
-  const push = (item: (typeof candidates)[number] | undefined) => {
+  const push = (item: ScoredReferenceCandidate | undefined) => {
     if (!item || selectedIds.has(item.asset.id)) return;
     selected.push(item);
     selectedIds.add(item.asset.id);
   };
 
   push(input.subjectAssetId ? byId.get(input.subjectAssetId) : undefined);
-  if (intent === "edit") {
-    return loadReferenceData(
-      selected.map((item) => item.asset),
-      () => "edit_target",
-      () => "subject",
-    );
-  }
   push(input.sourceAssetId ? byId.get(input.sourceAssetId) : undefined);
 
-  const anchorLimit =
-    intent === "restyle"
-      ? Math.min(4, Math.max(1, Math.ceil(limit * 0.6)))
-      : Math.max(1, Math.ceil(limit * 0.6));
   const anchorIds = [
-    ...canonicalStyleAssetIds,
-    ...candidates
-      .filter((item) => item.metadata.isStyleAnchor === true)
-      .sort(compareReferenceCandidates)
-      .map((item) => item.asset.id),
+    ...canonicalAnchorIds,
+    ...metadataAnchorCandidates.map((item) => item.asset.id),
   ];
   for (const id of [...new Set(anchorIds)].slice(0, anchorLimit)) {
     push(byId.get(id));
@@ -992,7 +1805,6 @@ export async function selectReferences(input: {
   const remainingLimit = Math.max(0, limit - selected.length);
   const fill = candidates
     .filter((item) => !selectedIds.has(item.asset.id))
-    .sort(compareReferenceCandidates)
     .slice(0, remainingLimit);
   for (const item of fill) push(item);
 
@@ -1025,7 +1837,7 @@ export function compareReferenceCandidates(
   );
 }
 
-async function loadReferenceData(
+export async function loadReferenceData(
   selected: Array<{
     id: string;
     role: string;

@@ -1,10 +1,10 @@
-// Per-view property visibility, column calculations, grouping, collapsing, and ordering.
-// Pure logic — no React, no icons.
 import type {
   ContentDatabaseView,
   ContentDatabaseItem,
   DocumentProperty,
 } from "@shared/api";
+import { isEmptyPropertyValue } from "@shared/properties";
+
 import {
   type ColumnKey,
   type DatabaseColumnCalculation,
@@ -12,7 +12,6 @@ import {
   type DatabasePropertyMoveDirection,
 } from "./types";
 import { normalizeClientStringList } from "./view-config";
-import { isEmptyPropertyValue } from "@shared/properties";
 
 export { type DatabasePropertyMoveDirection };
 

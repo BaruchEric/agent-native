@@ -1,11 +1,6 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
-import { nanoid } from "nanoid";
-import { eq } from "drizzle-orm";
-import { assertAccess } from "@agent-native/core/sharing";
-import { getDb, schema } from "../server/db/index.js";
-import { nowIso, stringifyJson } from "../server/lib/json.js";
-import { serializeGenerationPreset } from "./_helpers.js";
+
 import {
   ASPECT_RATIOS,
   GENERATION_PRESET_REFERENCE_POLICIES,
@@ -13,10 +8,12 @@ import {
   IMAGE_MODELS,
   IMAGE_SIZES,
 } from "../shared/api.js";
+import { generationPresetSettingsSchema } from "./_generation-preset-settings.js";
+import createTemplate from "./create-template.js";
 
 export default defineAction({
   description:
-    "Create a reusable deliverable preset for an asset library. Use presets for social images, blog heroes, diagrams, and other repeatable output formats.",
+    "Deprecated — use create-template. Create a reusable deliverable preset for an asset library.",
   schema: z.object({
     libraryId: z.string(),
     collectionId: z.string().nullable().optional(),
@@ -31,42 +28,14 @@ export default defineAction({
     referencePolicy: z
       .enum(GENERATION_PRESET_REFERENCE_POLICIES)
       .default("auto"),
-    settings: z.record(z.string(), z.unknown()).optional(),
+    includeLogo: z.coerce
+      .boolean()
+      .optional()
+      .describe(
+        "When true, images generated with this preset composite the library's canonical logo (no-op if the library has no canonical logo).",
+      ),
+    settings: generationPresetSettingsSchema.optional(),
     sortOrder: z.coerce.number().optional(),
   }),
-  run: async (args) => {
-    await assertAccess("asset-library", args.libraryId, "editor");
-    if (args.collectionId) {
-      const [collection] = await getDb()
-        .select()
-        .from(schema.assetCollections)
-        .where(eq(schema.assetCollections.id, args.collectionId))
-        .limit(1);
-      if (!collection || collection.libraryId !== args.libraryId) {
-        throw new Error("Collection does not belong to this asset library.");
-      }
-    }
-    const now = nowIso();
-    const row = {
-      id: nanoid(),
-      libraryId: args.libraryId,
-      collectionId: args.collectionId ?? null,
-      title: args.title,
-      description: args.description ?? null,
-      category: args.category,
-      mediaType: "image",
-      promptTemplate: args.promptTemplate ?? null,
-      aspectRatio: args.aspectRatio,
-      imageSize: args.imageSize,
-      model: args.model,
-      textPolicy: args.textPolicy,
-      referencePolicy: args.referencePolicy,
-      settings: stringifyJson(args.settings ?? {}),
-      sortOrder: args.sortOrder ?? 100,
-      createdAt: now,
-      updatedAt: now,
-    };
-    await getDb().insert(schema.assetGenerationPresets).values(row);
-    return serializeGenerationPreset(row);
-  },
+  run: async (args) => createTemplate.run(args),
 });

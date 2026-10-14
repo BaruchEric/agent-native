@@ -1,8 +1,11 @@
+import { useActionQuery } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router";
-import { useActionQuery } from "@agent-native/core/client";
 import { toast } from "sonner";
+
 import { useAuth } from "@/components/auth/AuthProvider";
+import { subscribeProviderCorpusJobSync } from "@/lib/provider-corpus-job-sync";
 
 type ProviderCorpusJobStatus =
   | "running"
@@ -28,6 +31,8 @@ type ProviderCorpusJobEntry = {
     totalHits: number;
     storedHits: number;
     truncatedHits: boolean;
+    paginationComplete: boolean;
+    paginationStopReason: string | null;
   };
   error: string | null;
   nextResumeAt: string | null;
@@ -40,21 +45,38 @@ type ProviderCorpusJobsResponse = {
 
 const STORAGE_KEY = "analytics.providerCorpusJobNotifier.seen.v1";
 const RECENT_WINDOW_MS = 24 * 60 * 60 * 1_000;
+const ACTIVE_JOB_POLL_MS = 15_000;
+
+export function providerCorpusJobsRefetchInterval(query: {
+  state: { data?: unknown };
+}): number | false {
+  const jobs = (query.state.data as ProviderCorpusJobsResponse | undefined)
+    ?.jobs;
+  return jobs?.some((entry) => entry.job.status === "running")
+    ? ACTIVE_JOB_POLL_MS
+    : false;
+}
 
 export function ProviderCorpusJobNotifier() {
   const { auth, isLoading } = useAuth();
+  const t = useT();
   const navigate = useNavigate();
   const seenRef = useRef<Record<string, string> | null>(null);
-  const { data } = useActionQuery(
+  const { data, refetch } = useActionQuery(
     "provider-corpus-jobs",
     { operation: "list", limit: 20 },
     {
       enabled: Boolean(auth) && !isLoading,
-      refetchInterval: 15_000,
-      refetchIntervalInBackground: true,
+      refetchInterval: providerCorpusJobsRefetchInterval,
+      refetchIntervalInBackground: false,
       retry: false,
     },
   );
+
+  useEffect(() => {
+    if (!auth || isLoading) return;
+    return subscribeProviderCorpusJobSync(() => void refetch());
+  }, [auth, isLoading, refetch]);
 
   useEffect(() => {
     const jobs = (data as ProviderCorpusJobsResponse | undefined)?.jobs ?? [];
@@ -69,13 +91,13 @@ export function ProviderCorpusJobNotifier() {
       const key = notificationKey(entry);
       if (seen[entry.job.id] === key) continue;
 
-      showJobToast(entry, () => navigate("/ask"));
+      showJobToast(entry, () => navigate("/ask"), t);
       seen[entry.job.id] = key;
       changed = true;
     }
 
     if (changed) writeSeenJobs(seen);
-  }, [data, navigate]);
+  }, [data, navigate, t]);
 
   return null;
 }
@@ -97,26 +119,45 @@ function notificationKey(entry: ProviderCorpusJobEntry): string {
     entry.coverage.itemsProcessed,
     entry.coverage.totalHits,
     entry.coverage.storedHits,
+    entry.coverage.paginationComplete,
+    entry.coverage.paginationStopReason ?? "",
     entry.nextResumeAt ?? "",
     entry.error ?? "",
   ].join(":");
 }
 
-function showJobToast(entry: ProviderCorpusJobEntry, openAsk: () => void) {
-  const title =
-    entry.job.status === "completed"
-      ? "Provider corpus job completed"
+export function providerCorpusJobIsIncomplete(
+  entry: ProviderCorpusJobEntry,
+): boolean {
+  return (
+    entry.job.status === "completed" &&
+    entry.coverage.paginationComplete === false
+  );
+}
+
+function showJobToast(
+  entry: ProviderCorpusJobEntry,
+  openAsk: () => void, // i18n-ignore TypeScript helper signature
+  t: ReturnType<typeof useT>, // i18n-ignore TypeScript helper type
+) {
+  const incomplete = providerCorpusJobIsIncomplete(entry);
+  const title = incomplete
+    ? t("providerCorpusNotifier.incomplete")
+    : entry.job.status === "completed"
+      ? t("providerCorpusNotifier.completed")
       : entry.job.status === "quota_wait"
-        ? "Provider corpus job waiting for quota"
-        : "Provider corpus job failed";
+        ? t("providerCorpusNotifier.quotaWait")
+        : t("providerCorpusNotifier.failed");
   const description = [
     `${entry.job.name} (${entry.job.provider})`,
-    coverageSummary(entry),
+    coverageSummary(entry, t),
     entry.nextResumeAt
-      ? `Resume after ${formatDateTime(entry.nextResumeAt)}`
+      ? t("providerCorpusNotifier.resumeAfter", {
+          date: formatDateTime(entry.nextResumeAt),
+        })
       : "",
     entry.error ?? "",
-    `Job ${entry.job.id}`,
+    t("providerCorpusNotifier.jobId", { id: entry.job.id }),
   ]
     .filter(Boolean)
     .join(" · ");
@@ -125,12 +166,12 @@ function showJobToast(entry: ProviderCorpusJobEntry, openAsk: () => void) {
     description,
     duration: entry.job.status === "completed" ? 14_000 : 20_000,
     action: {
-      label: "Open Ask",
+      label: t("providerCorpusNotifier.openAsk"),
       onClick: openAsk,
     },
   };
 
-  if (entry.job.status === "failed") {
+  if (entry.job.status === "failed" || incomplete) {
     toast.error(title, options);
   } else if (entry.job.status === "completed") {
     toast.success(title, options);
@@ -139,15 +180,32 @@ function showJobToast(entry: ProviderCorpusJobEntry, openAsk: () => void) {
   }
 }
 
-function coverageSummary(entry: ProviderCorpusJobEntry): string {
+function coverageSummary(
+  entry: ProviderCorpusJobEntry,
+  t: ReturnType<typeof useT>, // i18n-ignore TypeScript helper type
+): string {
   const units =
     entry.coverage.batchesProcessed > 0
-      ? `${entry.coverage.batchesProcessed} batches`
-      : `${entry.coverage.pagesProcessed} pages`;
+      ? t("providerCorpusNotifier.batches", {
+          count: entry.coverage.batchesProcessed,
+        })
+      : t("providerCorpusNotifier.pages", {
+          count: entry.coverage.pagesProcessed,
+        });
   const hits = entry.coverage.truncatedHits
-    ? `${entry.coverage.storedHits}/${entry.coverage.totalHits} hits stored`
-    : `${entry.coverage.totalHits} hits`;
-  return `${entry.coverage.itemsProcessed} items, ${entry.coverage.matchedItems} matched, ${hits}, ${units}`;
+    ? t("providerCorpusNotifier.truncatedHits", {
+        stored: entry.coverage.storedHits,
+        total: entry.coverage.totalHits,
+      })
+    : t("providerCorpusNotifier.hits", {
+        count: entry.coverage.totalHits,
+      });
+  return t("providerCorpusNotifier.coverageSummary", {
+    items: entry.coverage.itemsProcessed,
+    matched: entry.coverage.matchedItems,
+    hits,
+    units,
+  });
 }
 
 function formatDateTime(value: string): string {

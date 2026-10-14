@@ -1,13 +1,6 @@
-/**
- * Upload a still-frame thumbnail for a recording. Called by the video player
- * once the owner loads the first frame of their clip — we capture the frame
- * client-side, POST the bytes here, push them through the framework
- * `uploadFile`, and store the resulting URL in `recordings.thumbnail_url`.
- *
- * Route: POST /api/recordings/:recordingId/thumbnail
- * Body: raw JPEG (or PNG) bytes. Content-Type: image/jpeg | image/png.
- */
-
+import { runWithRequestContext } from "@agent-native/core/server";
+import { isImageRecording } from "@shared/recording-kind";
+import { and, eq } from "drizzle-orm";
 import {
   defineEventHandler,
   getRouterParam,
@@ -17,13 +10,15 @@ import {
   setResponseStatus,
   type H3Event,
 } from "h3";
-import { and, eq } from "drizzle-orm";
-import { getDb, schema } from "../../../../db/index.js";
-import { getEventOwnerContext } from "../../../../lib/recordings.js";
-import { runWithRequestContext } from "@agent-native/core/server";
-import { writeAppState } from "@agent-native/core/application-state";
-import { uploadFile } from "@agent-native/core/file-upload";
+
 import { parseEdits } from "../../../../../app/lib/timestamp-mapping.js";
+import { getDb, schema } from "../../../../db/index.js";
+import { ensureRecordingThumbnail } from "../../../../lib/ensure-recording-thumbnail.js";
+import {
+  getEventOwnerContext,
+  ownerEmailMatches,
+} from "../../../../lib/recordings.js";
+import { requiresConfiguredVideoStorage } from "../../../../lib/video-storage.js";
 
 const MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024;
 
@@ -79,12 +74,13 @@ export default defineEventHandler(async (event: H3Event) => {
         ownerEmail: schema.recordings.ownerEmail,
         thumbnailUrl: schema.recordings.thumbnailUrl,
         editsJson: schema.recordings.editsJson,
+        kind: schema.recordings.kind,
       })
       .from(schema.recordings)
       .where(
         and(
           eq(schema.recordings.id, recordingId),
-          eq(schema.recordings.ownerEmail, ownerEmail),
+          ownerEmailMatches(schema.recordings.ownerEmail, ownerEmail),
         ),
       );
 
@@ -95,6 +91,13 @@ export default defineEventHandler(async (event: H3Event) => {
       });
       setResponseStatus(event, 404);
       return { error: "Recording not found" };
+    }
+
+    // A screenshot's thumbnail is the picture viewers are served; replacing
+    // it here would swap what they see outside the editor and its burn.
+    if (isImageRecording(existing)) {
+      setResponseStatus(event, 409);
+      return { error: "A screenshot uses its own picture as its thumbnail." };
     }
 
     const replaceMode = getQuery(event).replace;
@@ -141,8 +144,6 @@ export default defineEventHandler(async (event: H3Event) => {
       setResponseStatus(event, 400);
       return { error: "Only JPEG and PNG thumbnails are allowed" };
     }
-    const ext = mimeType === "image/png" ? "png" : "jpg";
-
     const bytes: Uint8Array =
       raw instanceof Uint8Array ? raw : new Uint8Array(raw as ArrayBuffer);
     if (!hasExpectedThumbnailSignature(mimeType, bytes)) {
@@ -150,55 +151,48 @@ export default defineEventHandler(async (event: H3Event) => {
       return { error: "Thumbnail bytes do not match Content-Type" };
     }
 
-    // Try the configured file-upload provider first (Builder.io or a
-    // user-registered one). In dev / solo mode no provider is usually
-    // configured and `uploadFile()` returns `null` — in that case we fall
-    // back to a base64 `data:` URL inline in the `recordings.thumbnail_url`
-    // column. It's not glamorous but it unblocks the library grid
-    // immediately and mirrors what `set-thumbnail` does.
-    const uploaded = await uploadFile({
-      data: bytes,
-      mimeType,
-      filename: `thumb-${recordingId}.${ext}`,
+    const result = await ensureRecordingThumbnail({
+      recordingId,
       ownerEmail,
+      thumbnailBytes: bytes,
+      thumbnailMimeType: mimeType,
+      allowInlineFallback: !requiresConfiguredVideoStorage(),
+      replaceNonEditorThumbnail: replaceAutoThumbnail,
     });
 
-    let url: string;
-    if (uploaded?.url) {
-      url = uploaded.url;
-      console.log("[thumbnail] uploaded via provider", {
+    if (result.status === "skipped-upload-failed") {
+      setResponseStatus(event, 503);
+      return {
+        ok: false,
         recordingId,
-        provider: uploaded.provider,
-        bytes: bytes.byteLength,
-      });
-    } else {
-      const base64 = Buffer.from(bytes).toString("base64");
-      url = `data:${mimeType};base64,${base64}`;
-      console.log(
-        "[thumbnail] no provider configured, stored inline data URL",
-        {
-          recordingId,
-          bytes: bytes.byteLength,
-        },
-      );
+        error: result.detail ?? "Thumbnail upload failed",
+      };
+    }
+    if (result.status === "skipped-lease") {
+      return {
+        ok: true,
+        recordingId,
+        skipped: true,
+        reason: result.status,
+      };
+    }
+    if (result.status === "already-set") {
+      return {
+        ok: true,
+        recordingId,
+        thumbnailUrl: result.thumbnailUrl,
+        skipped: true,
+      };
+    }
+    if (!result.thumbnailUrl) {
+      setResponseStatus(event, 409);
+      return {
+        ok: false,
+        recordingId,
+        error: result.detail ?? "Recording thumbnail could not be saved",
+      };
     }
 
-    await db
-      .update(schema.recordings)
-      .set({
-        thumbnailUrl: url,
-        updatedAt: new Date().toISOString(),
-      })
-      .where(eq(schema.recordings.id, recordingId));
-
-    await writeAppState("refresh-signal", { ts: Date.now() });
-
-    console.log("[thumbnail] saved", {
-      recordingId,
-      inline: !uploaded?.url,
-      urlPrefix: url.slice(0, 40),
-    });
-
-    return { ok: true, recordingId, thumbnailUrl: url };
+    return { ok: true, recordingId, thumbnailUrl: result.thumbnailUrl };
   });
 });

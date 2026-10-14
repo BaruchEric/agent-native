@@ -1,6 +1,10 @@
 import * as vscode from "vscode";
 
-import { buildConnectCommand, ConnectScope } from "./connect";
+import {
+  buildConnectCommand,
+  buildDesignConnectCommand,
+  ConnectScope,
+} from "./connect";
 import { DEFAULT_APP_URL, normalizeOpenUrl, titleForUrl } from "./links";
 
 type OpenResult = {
@@ -9,8 +13,8 @@ type OpenResult = {
 };
 
 let currentPanel: vscode.WebviewPanel | undefined;
-let currentUrl: string | undefined;
 let lastOpenedUrl: string | undefined;
+const DESIGN_APP_URL = "https://design.agent-native.com";
 
 export function activate(context: vscode.ExtensionContext): void {
   const controller = new AgentNativeController(context);
@@ -31,6 +35,11 @@ export function activate(context: vscode.ExtensionContext): void {
       "agentNative.connectWorkspace",
       (appUrl?: string, scope?: ConnectScope) =>
         controller.connectWorkspace(appUrl, scope),
+    ),
+    vscode.commands.registerCommand(
+      "agentNative.openDesignCanvas",
+      (devServerUrl?: string, port?: number) =>
+        controller.openDesignCanvas(devServerUrl, port),
     ),
     vscode.commands.registerCommand(
       "agentNative._getLastOpenedUrl",
@@ -58,8 +67,8 @@ class AgentNativeController {
     const raw =
       input ??
       (await vscode.window.showInputBox({
-        title: "Open Agent Native URL",
-        prompt: "Paste an Agent Native app or handoff URL.",
+        title: "Open Agent-Native URL",
+        prompt: "Paste an Agent-Native app or handoff URL.",
         value: DEFAULT_APP_URL,
       }));
     if (!raw) return undefined;
@@ -67,7 +76,7 @@ class AgentNativeController {
     const normalized = normalizeOpenUrl(raw);
     if (!normalized) {
       await vscode.window.showErrorMessage(
-        "Agent Native can open http(s) app URLs or vscode://builder.agent-native/open links.",
+        "Agent-Native can open http(s) app URLs or vscode://builder.agent-native/open links.",
       );
       return undefined;
     }
@@ -86,9 +95,9 @@ class AgentNativeController {
     const appUrl =
       input ??
       (await vscode.window.showInputBox({
-        title: "Connect Workspace to Agent Native MCP",
+        title: "Connect Workspace to Agent-Native MCP",
         prompt:
-          "Agent Native app URL to connect to VS Code / GitHub Copilot MCP.",
+          "Agent-Native app URL to connect to VS Code / GitHub Copilot MCP.",
         value: DEFAULT_APP_URL,
       }));
     if (!appUrl) return undefined;
@@ -96,7 +105,7 @@ class AgentNativeController {
     const normalized = normalizeOpenUrl(appUrl);
     if (!normalized) {
       await vscode.window.showErrorMessage(
-        "Enter an http(s) Agent Native app URL.",
+        "Enter an http(s) Agent-Native app URL.",
       );
       return undefined;
     }
@@ -110,15 +119,58 @@ class AgentNativeController {
     if (!scope) return undefined;
 
     const command = buildConnectCommand({ appUrl: normalized, scope });
-    const terminal = vscode.window.createTerminal("Agent Native MCP");
+    const terminal = vscode.window.createTerminal("Agent-Native MCP");
     terminal.show();
     terminal.sendText(command);
     return command;
   }
 
+  async openDesignCanvas(
+    input?: string,
+    bridgePortInput?: number,
+  ): Promise<string | undefined> {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+      await vscode.window.showErrorMessage(
+        "Open a workspace folder before starting the Design Canvas bridge.",
+      );
+      return undefined;
+    }
+
+    const devServerUrl =
+      input ??
+      (await vscode.window.showInputBox({
+        title: "Open Design Canvas",
+        prompt: "URL of the running local app to edit visually.",
+        value: "http://localhost:5173",
+      }));
+    if (!devServerUrl) return undefined;
+
+    const normalized = normalizeOpenUrl(devServerUrl);
+    if (!normalized) {
+      await vscode.window.showErrorMessage(
+        "Enter an http(s) local dev server URL.",
+      );
+      return undefined;
+    }
+
+    const command = buildDesignConnectCommand({
+      devServerUrl: normalized,
+      rootPath: workspaceFolder.uri.fsPath,
+      port: bridgePortInput,
+    });
+    const terminal = vscode.window.createTerminal("Agent-Native Design");
+    terminal.show();
+    terminal.sendText(command);
+    this.openWebview(DESIGN_APP_URL);
+    await vscode.window.showInformationMessage(
+      "Agent-Native Design bridge is starting. Design is opening in a side panel; choose Localhost to connect.",
+    );
+    return command;
+  }
+
   private openWebview(url: string): OpenResult {
     const title = titleForUrl(url);
-    currentUrl = url;
     lastOpenedUrl = url;
 
     if (!currentPanel) {
@@ -134,7 +186,6 @@ class AgentNativeController {
       currentPanel.onDidDispose(
         () => {
           currentPanel = undefined;
-          currentUrl = undefined;
         },
         null,
         this.context.subscriptions,

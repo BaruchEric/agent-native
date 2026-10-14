@@ -1,5 +1,5 @@
-import { useEffect, useRef } from "react";
 import type { CalendarEvent } from "@shared/api";
+import { useEffect, useRef } from "react";
 
 const STORAGE_KEY = "calendar:meeting-start-notifications:sent";
 const LOOKAHEAD_MS = 2 * 60 * 1000;
@@ -9,6 +9,16 @@ const MAX_SENT_KEYS = 200;
 
 function supportsNotifications() {
   return typeof window !== "undefined" && "Notification" in window;
+}
+
+export function getMeetingStartNotificationPermission(): NotificationPermission | null {
+  return supportsNotifications() ? Notification.permission : null;
+}
+
+export async function requestMeetingStartNotificationPermission(): Promise<NotificationPermission | null> {
+  const permission = getMeetingStartNotificationPermission();
+  if (permission !== "default") return permission;
+  return Notification.requestPermission();
 }
 
 function loadSentKeys(): string[] {

@@ -1,13 +1,28 @@
-import { useState, useEffect, useRef, useMemo } from "react";
-import { useSearchParams } from "react-router";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useChatModels } from "@agent-native/core/client/agent-chat";
 import {
-  agentNativePath,
+  callAction,
   useActionMutation,
-  useChatModels,
   useChangeVersions,
-} from "@agent-native/core/client";
-import { appApiPath } from "@agent-native/core/client";
+} from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import {
+  SettingsGroup,
+  SettingsRow,
+  SettingsTabsPage,
+  useAgentSettingsTabs,
+  type SettingsAppArea,
+} from "@agent-native/toolkit/app/settings";
+import {
+  mailSettingsRedirect,
+  mailSettingsSectionFromPath,
+  type MailSettingsAreaId,
+} from "@shared/settings-navigation";
+import type {
+  Alias,
+  AutomationAction,
+  AutomationRule,
+  UserSettings,
+} from "@shared/types";
 import {
   IconUsers,
   IconPlus,
@@ -17,18 +32,20 @@ import {
   IconBolt,
   IconX,
   IconChartBar,
-  IconCircleCheck,
-  IconCircleX,
-  IconClock,
-  IconPlayerPlay,
   IconSignature,
+  IconPhoto,
   IconFilter,
-  IconInfoCircle,
+  IconMessage2,
 } from "@tabler/icons-react";
-import { cn } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Skeleton } from "@/components/ui/skeleton";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState, useEffect, useRef, useMemo } from "react";
+import { Navigate, useLocation, useSearchParams } from "react-router";
+import { toast } from "sonner";
+
+import { AiFilterSection } from "@/components/settings/AiFilterSection";
+import { GmailFiltersSection } from "@/components/settings/GmailFiltersSection";
+import "@/components/settings/slack-channel-extension";
+import { SnippetsSection } from "@/components/settings/SnippetsSection";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -39,6 +56,8 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -46,15 +65,20 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   useAliases,
   useCreateAlias,
   useUpdateAlias,
   useDeleteAlias,
 } from "@/hooks/use-aliases";
-import { useNavigationState } from "@/hooks/use-navigation-state";
 import {
   useAutomations,
   useCreateAutomation,
@@ -62,22 +86,11 @@ import {
   useDeleteAutomation,
 } from "@/hooks/use-automations";
 import { useSettings, useUpdateSettings } from "@/hooks/use-emails";
-import type {
-  Alias,
-  AutomationAction,
-  AutomationRule,
-  UserSettings,
-} from "@shared/types";
-import { TeamPage } from "@agent-native/core/client/org";
-import { toast } from "sonner";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import { GmailFiltersSection } from "@/components/settings/GmailFiltersSection";
+import { useNavigationState } from "@/hooks/use-navigation-state";
+import { openFilePicker, uploadFile } from "@/lib/upload";
+import { cn } from "@/lib/utils";
 
-// ─── Alias Edit Row ───────────────────────────────────────────────────────────
+import changelog from "../../CHANGELOG.md?raw";
 
 function AliasEditRow({
   alias,
@@ -90,6 +103,7 @@ function AliasEditRow({
   onCancel: () => void;
   isPending?: boolean;
 }) {
+  const t = useT();
   const [name, setName] = useState(alias?.name ?? "");
   const [emailsText, setEmailsText] = useState(alias?.emails.join("\n") ?? "");
 
@@ -106,19 +120,19 @@ function AliasEditRow({
     <div className="rounded-lg border border-indigo-500/30 bg-indigo-500/5 p-4 space-y-3">
       <div>
         <label className="block text-[11px] font-medium text-muted-foreground uppercase tracking-wider mb-1.5">
-          Alias name
+          {t("settings.aliasName")}
         </label>
         <Input
           autoFocus
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="e.g. Design team"
+          placeholder={t("settings.aliasNamePlaceholder")}
           className="px-3 py-1.5 text-[13px] placeholder:text-muted-foreground/40"
         />
       </div>
       <div>
         <label className="block text-[11px] font-medium text-muted-foreground uppercase tracking-wider mb-1.5">
-          Recipients (one email per line)
+          {t("settings.recipientsOnePerLine")}
         </label>
         <Textarea
           value={emailsText}
@@ -135,17 +149,15 @@ function AliasEditRow({
           size="sm"
         >
           {isPending && <IconLoader2 className="h-3.5 w-3.5 animate-spin" />}
-          Save
+          {t("settings.save")}
         </Button>
         <Button variant="ghost" size="sm" onClick={onCancel}>
-          Cancel
+          {t("settings.cancel")}
         </Button>
       </div>
     </div>
   );
 }
-
-// ─── Alias Row ────────────────────────────────────────────────────────────────
 
 function AliasRow({
   alias,
@@ -158,6 +170,7 @@ function AliasRow({
   onEdit: () => void;
   onCancelEdit: () => void;
 }) {
+  const t = useT();
   const updateAlias = useUpdateAlias();
   const deleteAlias = useDeleteAlias();
   const rowRef = useRef<HTMLDivElement>(null);
@@ -206,15 +219,26 @@ function AliasRow({
       >
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-0.5">
-            <span className="text-[13px] font-semibold text-foreground">
+            <span
+              data-an-mask
+              className="text-[13px] font-semibold text-foreground"
+            >
               {alias.name}
             </span>
             <span className="rounded-full bg-indigo-500/15 px-2 py-0.5 text-[11px] font-medium text-indigo-300">
               {alias.emails.length}{" "}
-              {alias.emails.length === 1 ? "person" : "people"}
+              {t(
+                alias.emails.length === 1
+                  ? "settings.personSingular"
+                  : "settings.peoplePlural",
+                { count: alias.emails.length },
+              )}
             </span>
           </div>
-          <p className="text-[12px] text-muted-foreground truncate">
+          <p
+            data-an-mask
+            className="text-[12px] text-muted-foreground truncate"
+          >
             {alias.emails.join(", ")}
           </p>
         </div>
@@ -230,7 +254,7 @@ function AliasRow({
                 <IconPencil className="h-3.5 w-3.5" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Edit alias</TooltipContent>
+            <TooltipContent>{t("settings.editAlias")}</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
@@ -248,7 +272,7 @@ function AliasRow({
                 )}
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Delete alias</TooltipContent>
+            <TooltipContent>{t("settings.deleteAlias")}</TooltipContent>
           </Tooltip>
         </div>
       </div>
@@ -256,15 +280,15 @@ function AliasRow({
       <AlertDialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete alias</AlertDialogTitle>
-            <AlertDialogDescription>
-              Delete alias "{alias.name}"? This cannot be undone.
+            <AlertDialogTitle>{t("settings.deleteAlias")}</AlertDialogTitle>
+            <AlertDialogDescription data-an-mask>
+              {t("settings.deleteAliasDescription", { name: alias.name })}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogCancel>{t("settings.cancel")}</AlertDialogCancel>
             <AlertDialogAction onClick={confirmDelete}>
-              Delete
+              {t("settings.delete")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -273,23 +297,20 @@ function AliasRow({
   );
 }
 
-// ─── Aliases Section ──────────────────────────────────────────────────────────
-
 function AliasesSection() {
+  const t = useT();
   const { data: aliases = [], isLoading } = useAliases();
   const createAlias = useCreateAlias();
   const [searchParams, setSearchParams] = useSearchParams();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [showNewForm, setShowNewForm] = useState(false);
 
-  // Handle ?alias=<id> query param — open that alias in edit mode
   const aliasParam = searchParams.get("alias");
   useEffect(() => {
     if (aliasParam && aliases.length > 0) {
       const exists = aliases.find((a) => a.id === aliasParam);
       if (exists) {
         setEditingId(aliasParam);
-        // Clear the param so it doesn't re-trigger on every render
         setSearchParams((prev) => {
           const next = new URLSearchParams(prev);
           next.delete("alias");
@@ -308,30 +329,26 @@ function AliasesSection() {
     );
   };
 
+  const newAliasButton = (
+    <Button
+      size="sm"
+      onClick={() => {
+        setShowNewForm(true);
+        setEditingId(null);
+      }}
+    >
+      <IconPlus className="h-3.5 w-3.5" />
+      {t("settings.newAlias")}
+    </Button>
+  );
+
   return (
-    <div className="flex-1 p-4 sm:p-8 overflow-y-auto">
+    <div>
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <h2 className="text-[16px] font-semibold text-foreground">Aliases</h2>
-          <p className="text-[13px] text-muted-foreground mt-0.5">
-            Address groups you can use when composing emails.
-          </p>
-        </div>
-        <Button
-          size="sm"
-          onClick={() => {
-            setShowNewForm(true);
-            setEditingId(null);
-          }}
-        >
-          <IconPlus className="h-3.5 w-3.5" />
-          New alias
-        </Button>
-      </div>
+      <div className="mb-4 flex justify-end">{newAliasButton}</div>
 
       {/* Content */}
-      <div className="max-w-2xl space-y-2">
+      <div className="space-y-2">
         {/* New alias form at top */}
         {showNewForm && (
           <AliasEditRow
@@ -362,7 +379,7 @@ function AliasesSection() {
           <div className="rounded-lg border border-border/20 bg-card/50 py-12 text-center">
             <IconUsers className="h-8 w-8 text-muted-foreground/20 mx-auto mb-3" />
             <p className="text-[13px] text-muted-foreground/50">
-              No aliases yet. Create one to get started.
+              {t("settings.noAliases")}
             </p>
           </div>
         )}
@@ -385,26 +402,28 @@ function AliasesSection() {
   );
 }
 
-// ─── Action Badge ─────────────────────────────────────────────────────────────
-
 function ActionBadge({ action }: { action: AutomationAction }) {
+  const t = useT();
   const label =
-    action.type === "label" ? `label: ${action.labelName}` : action.type;
+    action.type === "label"
+      ? `label: ${action.labelName}`
+      : action.type === "notify"
+        ? t("settings.notify")
+        : action.type;
   return (
-    <span className="inline-flex items-center rounded-full bg-indigo-500/15 px-2 py-0.5 text-[11px] font-medium text-indigo-300">
+    <span className="inline-flex items-center rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
       {label}
     </span>
   );
 }
 
-// ─── Action Builder ───────────────────────────────────────────────────────────
-
 const ACTION_TYPES = [
-  { value: "label", label: "Apply label" },
-  { value: "archive", label: "Archive" },
-  { value: "mark_read", label: "Mark as read" },
-  { value: "star", label: "Star" },
-  { value: "trash", label: "Trash" },
+  { value: "notify", labelKey: "settings.notify" },
+  { value: "label", labelKey: "settings.applyLabel" },
+  { value: "archive", labelKey: "settings.archive" },
+  { value: "mark_read", labelKey: "settings.markRead" },
+  { value: "star", labelKey: "settings.star" },
+  { value: "trash", labelKey: "settings.trash" },
 ] as const;
 
 function ActionBuilder({
@@ -414,6 +433,7 @@ function ActionBuilder({
   actions: AutomationAction[];
   onChange: (actions: AutomationAction[]) => void;
 }) {
+  const t = useT();
   const addAction = () => {
     onChange([...actions, { type: "label", labelName: "" }]);
   };
@@ -443,13 +463,13 @@ function ActionBuilder({
               }
             }}
           >
-            <SelectTrigger className="h-8 w-[140px] text-[13px]">
+            <SelectTrigger size="sm" className="w-[140px] text-[13px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {ACTION_TYPES.map((t) => (
-                <SelectItem key={t.value} value={t.value}>
-                  {t.label}
+              {ACTION_TYPES.map((actionType) => (
+                <SelectItem key={actionType.value} value={actionType.value}>
+                  {t(actionType.labelKey)}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -457,12 +477,13 @@ function ActionBuilder({
 
           {action.type === "label" && (
             <Input
+              size="sm"
               value={action.labelName}
               onChange={(e) =>
                 updateAction(idx, { type: "label", labelName: e.target.value })
               }
-              placeholder="Label name"
-              className="flex-1 h-8 px-2 text-[13px] placeholder:text-muted-foreground/40"
+              placeholder={t("settings.labelName")}
+              className="flex-1 px-2 text-[13px] placeholder:text-muted-foreground/40"
             />
           )}
 
@@ -476,15 +497,13 @@ function ActionBuilder({
       ))}
       <button
         onClick={addAction}
-        className="text-[12px] text-indigo-400 hover:text-indigo-300"
+        className="text-[12px] text-muted-foreground hover:text-foreground transition-colors"
       >
-        + Add action
+        {t("settings.addAction")}
       </button>
     </div>
   );
 }
-
-// ─── Automation Edit Row ──────────────────────────────────────────────────────
 
 function AutomationEditRow({
   rule,
@@ -501,6 +520,7 @@ function AutomationEditRow({
   onCancel: () => void;
   isPending?: boolean;
 }) {
+  const t = useT();
   const [name, setName] = useState(rule?.name ?? "");
   const [condition, setCondition] = useState(rule?.condition ?? "");
   const [actions, setActions] = useState<AutomationAction[]>(
@@ -509,7 +529,6 @@ function AutomationEditRow({
 
   const handleSave = () => {
     if (!name.trim() || !condition.trim() || actions.length === 0) return;
-    // Validate label actions have names
     const valid = actions.every(
       (a) => a.type !== "label" || (a.type === "label" && a.labelName.trim()),
     );
@@ -518,36 +537,34 @@ function AutomationEditRow({
   };
 
   return (
-    <div className="rounded-lg border border-indigo-500/30 bg-indigo-500/5 p-4 space-y-3">
+    <div className="rounded-lg border border-border/40 bg-muted/20 p-4 space-y-3">
       <div>
         <label className="block text-[11px] font-medium text-muted-foreground uppercase tracking-wider mb-1.5">
-          Rule name
+          {t("settings.ruleName")}
         </label>
         <Input
           autoFocus
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="e.g. Auto-label newsletters"
+          placeholder={t("settings.ruleNamePlaceholder")}
           className="px-3 py-1.5 text-[13px] placeholder:text-muted-foreground/40"
         />
       </div>
       <div>
         <label className="block text-[11px] font-medium text-muted-foreground uppercase tracking-wider mb-1.5">
-          Condition (natural language)
+          {t("settings.conditionNaturalLanguage")}
         </label>
         <Textarea
           value={condition}
           onChange={(e) => setCondition(e.target.value)}
-          placeholder={
-            'e.g. "from a newsletter or marketing mailing list"\n"from alice@example.com"\n"subject contains invoice or receipt"'
-          }
+          placeholder={t("settings.conditionPlaceholder")}
           rows={3}
           className="px-3 py-1.5 text-[13px] placeholder:text-muted-foreground/40 resize-none"
         />
       </div>
       <div>
         <label className="block text-[11px] font-medium text-muted-foreground uppercase tracking-wider mb-1.5">
-          Actions
+          {t("settings.actions")}
         </label>
         <ActionBuilder actions={actions} onChange={setActions} />
       </div>
@@ -563,17 +580,15 @@ function AutomationEditRow({
           size="sm"
         >
           {isPending && <IconLoader2 className="h-3.5 w-3.5 animate-spin" />}
-          Save
+          {t("settings.save")}
         </Button>
         <Button variant="ghost" size="sm" onClick={onCancel}>
-          Cancel
+          {t("settings.cancel")}
         </Button>
       </div>
     </div>
   );
 }
-
-// ─── Automation Row ───────────────────────────────────────────────────────────
 
 function AutomationRow({
   rule,
@@ -586,6 +601,7 @@ function AutomationRow({
   onEdit: () => void;
   onCancelEdit: () => void;
 }) {
+  const t = useT();
   const updateAutomation = useUpdateAutomation();
   const deleteAutomation = useDeleteAutomation();
   const rowRef = useRef<HTMLDivElement>(null);
@@ -630,11 +646,7 @@ function AutomationRow({
       className="flex items-start gap-3 rounded-lg border border-border/30 bg-card px-4 py-3 group hover:border-border/60"
     >
       <div className="pt-0.5">
-        <Switch
-          checked={rule.enabled}
-          onCheckedChange={handleToggle}
-          className="scale-90"
-        />
+        <Switch checked={rule.enabled} onCheckedChange={handleToggle} />
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-0.5">
@@ -673,7 +685,7 @@ function AutomationRow({
               <IconPencil className="h-3.5 w-3.5" />
             </Button>
           </TooltipTrigger>
-          <TooltipContent>Edit rule</TooltipContent>
+          <TooltipContent>{t("settings.editRule")}</TooltipContent>
         </Tooltip>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -691,155 +703,21 @@ function AutomationRow({
               )}
             </Button>
           </TooltipTrigger>
-          <TooltipContent>Delete rule</TooltipContent>
+          <TooltipContent>{t("settings.deleteRule")}</TooltipContent>
         </Tooltip>
       </div>
     </div>
   );
 }
 
-// ─── Framework Triggers Subsection ──────────────────────────────────────────
-
-interface FrameworkTrigger {
-  id: string;
-  name: string;
-  triggerType: string;
-  event?: string;
-  condition?: string;
-  mode: string;
-  domain?: string;
-  enabled: boolean;
-  lastStatus?: string;
-  lastRun?: string;
-  lastError?: string;
-  body: string;
-}
-
-function TriggersSubsection() {
-  const { data: triggers = [], isLoading } = useQuery<FrameworkTrigger[]>({
-    queryKey: ["framework-triggers-mail"],
-    queryFn: async () => {
-      const res = await fetch(agentNativePath("/_agent-native/automations"));
-      if (!res.ok) return [];
-      const all: FrameworkTrigger[] = await res.json();
-      // Filter to mail domain triggers only (event-based)
-      return all.filter(
-        (t) =>
-          t.domain === "mail" ||
-          (t.triggerType === "event" && t.event && t.event.startsWith("mail.")),
-      );
-    },
-    staleTime: 30_000,
-  });
-
-  if (isLoading) {
-    return (
-      <div className="space-y-2">
-        <Skeleton className="h-14 w-full" />
-        <Skeleton className="h-14 w-full" />
-      </div>
-    );
-  }
-
-  if (triggers.length === 0) {
-    return (
-      <div className="rounded-lg border border-border/20 bg-card/50 py-8 text-center">
-        <IconPlayerPlay className="h-6 w-6 text-muted-foreground/20 mx-auto mb-2" />
-        <p className="text-[12px] text-muted-foreground/50">
-          No event-triggered automations for mail yet.
-        </p>
-        <p className="text-[11px] text-muted-foreground/30 max-w-xs mx-auto mt-1">
-          Ask the agent to create an automation like "when I receive an email
-          from my boss, star it and notify me."
-        </p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-2">
-      {triggers.map((t) => {
-        const StatusIcon =
-          t.lastStatus === "success"
-            ? IconCircleCheck
-            : t.lastStatus === "error"
-              ? IconCircleX
-              : t.lastStatus === "running"
-                ? IconLoader2
-                : IconClock;
-        const statusColor =
-          t.lastStatus === "success"
-            ? "text-green-400"
-            : t.lastStatus === "error"
-              ? "text-red-400"
-              : t.lastStatus === "running"
-                ? "text-yellow-400 animate-spin"
-                : "text-muted-foreground/40";
-
-        return (
-          <div
-            key={t.id}
-            className="flex items-start gap-3 rounded-lg border border-border/30 bg-card px-4 py-3"
-          >
-            <div className="pt-0.5">
-              <StatusIcon className={cn("h-4 w-4", statusColor)} />
-            </div>
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2 mb-0.5">
-                <span
-                  className={cn(
-                    "text-[13px] font-semibold",
-                    t.enabled ? "text-foreground" : "text-muted-foreground/50",
-                  )}
-                >
-                  {t.name}
-                </span>
-                {!t.enabled && (
-                  <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground/50">
-                    disabled
-                  </span>
-                )}
-              </div>
-              {t.event && (
-                <p className="text-[11px] text-muted-foreground/60 mb-0.5">
-                  on{" "}
-                  <code className="rounded bg-muted px-1 py-0.5 text-[10px]">
-                    {t.event}
-                  </code>
-                  {t.condition && (
-                    <span>
-                      {" "}
-                      when <em>"{t.condition}"</em>
-                    </span>
-                  )}
-                </p>
-              )}
-              <p className="text-[12px] text-muted-foreground line-clamp-2">
-                {t.body}
-              </p>
-              {t.lastRun && (
-                <p className="text-[10px] text-muted-foreground/40 mt-1">
-                  Last run:{" "}
-                  {new Date(t.lastRun).toLocaleString(undefined, {
-                    dateStyle: "short",
-                    timeStyle: "short",
-                  })}
-                  {t.lastError && (
-                    <span className="text-red-400"> — {t.lastError}</span>
-                  )}
-                </p>
-              )}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-// ─── Automations Section ─────────────────────────────────────────────────────
+type AutomationSettings = {
+  engine?: string;
+  model?: string;
+  allowAutomationSends: boolean;
+};
 
 function AutomationsSection() {
+  const t = useT();
   const { data: rules = [], isLoading } = useAutomations();
   const createAutomation = useCreateAutomation();
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -863,21 +741,26 @@ function AutomationsSection() {
     );
   }, [availableModels]);
 
-  // Refetch on any settings write or agent action so agent-driven changes
-  // (e.g. update-automation-settings) show up without a manual refresh.
   const settingsSync = useChangeVersions(["settings", "action"]);
-  const { data: autoSettings } = useQuery({
+  const { data: autoSettings } = useQuery<AutomationSettings>({
     queryKey: ["automation-settings", settingsSync],
-    queryFn: async () => {
-      const res = await fetch(appApiPath("/api/automations/settings"));
-      if (!res.ok) return { engine: "anthropic", model: defaultModel };
-      return res.json();
+    queryFn: async (): Promise<AutomationSettings> => {
+      try {
+        return await callAction(
+          "get-automation-settings",
+          {},
+          { method: "GET" },
+        );
+      } catch {
+        return { model: defaultModel, allowAutomationSends: false };
+      }
     },
     staleTime: 30_000,
     placeholderData: (prev) => prev,
   });
 
   const queryClient = useQueryClient();
+  const [isSavingAutomationSends, setIsSavingAutomationSends] = useState(false);
   const selectedModel = autoSettings?.model || defaultModel;
   const selectedEngine =
     autoSettings?.engine ||
@@ -890,16 +773,57 @@ function AutomationsSection() {
     )?.value ||
     modelOptions[0]?.value ||
     "loading";
+  const automationRules = rules.filter((rule) => rule.kind !== "ai-filter");
 
   const handleModelChange = async (value: string) => {
     const [engine, model] = value.split("::");
     if (!engine || !model) return;
-    queryClient.setQueryData(["automation-settings"], { engine, model });
-    await fetch(appApiPath("/api/automations/settings"), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ engine, model }),
-    });
+    queryClient.setQueriesData<AutomationSettings>(
+      { queryKey: ["automation-settings"] },
+      (current) =>
+        current
+          ? { ...current, engine, model }
+          : { engine, model, allowAutomationSends: false },
+    );
+    await callAction(
+      "update-automation-settings",
+      { engine, model },
+      { method: "PUT" },
+    );
+  };
+
+  const handleAutomationSendsChange = async (enabled: boolean) => {
+    if (!autoSettings || isSavingAutomationSends) return;
+    const previous = autoSettings.allowAutomationSends;
+    queryClient.setQueriesData<AutomationSettings>(
+      { queryKey: ["automation-settings"] },
+      (current) =>
+        current ? { ...current, allowAutomationSends: enabled } : current,
+    );
+    setIsSavingAutomationSends(true);
+    try {
+      await callAction(
+        "update-automation-settings",
+        { allowAutomationSends: enabled },
+        { method: "PUT" },
+      );
+    } catch (error) {
+      queryClient.setQueriesData<AutomationSettings>(
+        { queryKey: ["automation-settings"] },
+        (current) =>
+          current ? { ...current, allowAutomationSends: previous } : current,
+      );
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t("settings.automationSendSettingSaveFailed"),
+      );
+    } finally {
+      setIsSavingAutomationSends(false);
+      await queryClient.invalidateQueries({
+        queryKey: ["automation-settings"],
+      });
+    }
   };
 
   const handleCreate = (data: {
@@ -912,136 +836,149 @@ function AutomationsSection() {
     });
   };
 
-  return (
-    <div className="flex-1 p-4 sm:p-8 overflow-y-auto">
-      {/* Header */}
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <h2 className="text-[16px] font-semibold text-foreground">
-            Automations
-          </h2>
-          <p className="text-[13px] text-muted-foreground mt-0.5">
-            Rules that automatically process new inbox emails using AI.
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <Select
-            value={selectedValue}
-            onValueChange={handleModelChange}
-            disabled={modelOptions.length === 0}
+  const modelSelect = (
+    <Select
+      value={selectedValue}
+      onValueChange={handleModelChange}
+      disabled={modelOptions.length === 0}
+    >
+      <SelectTrigger
+        size="sm"
+        className="w-[260px] text-xs"
+        aria-label={t("settings.rulesModel")}
+      >
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {modelOptions.length === 0 ? (
+          <SelectItem value="loading" disabled className="text-xs">
+            {t("settings.loadingModels")}
+          </SelectItem>
+        ) : (
+          modelOptions.map((m) => (
+            <SelectItem key={m.value} value={m.value} className="text-xs">
+              {m.label}
+            </SelectItem>
+          ))
+        )}
+      </SelectContent>
+    </Select>
+  );
+
+  const newRuleButton = (
+    <Button
+      size="sm"
+      onClick={() => {
+        setShowNewForm(true);
+        setEditingId(null);
+      }}
+    >
+      <IconPlus className="h-3.5 w-3.5" />
+      {t("settings.newRule")}
+    </Button>
+  );
+
+  const ruleList = (
+    <div className="space-y-2">
+      {/* New rule form */}
+      {showNewForm && (
+        <AutomationEditRow
+          onSave={handleCreate}
+          onCancel={() => setShowNewForm(false)}
+          isPending={createAutomation.isPending}
+        />
+      )}
+
+      {/* Loading state */}
+      {isLoading &&
+        Array.from({ length: 4 }).map((_, i) => (
+          <div
+            key={i}
+            className="flex items-center gap-3 rounded-lg border border-border/20 bg-card/50 p-3"
           >
-            <SelectTrigger className="w-[260px] h-8 text-xs">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {modelOptions.length === 0 ? (
-                <SelectItem value="loading" disabled className="text-xs">
-                  Loading models
-                </SelectItem>
-              ) : (
-                modelOptions.map((m) => (
-                  <SelectItem key={m.value} value={m.value} className="text-xs">
-                    {m.label}
-                  </SelectItem>
-                ))
-              )}
-            </SelectContent>
-          </Select>
-        </div>
-        <Button
-          size="sm"
-          onClick={() => {
-            setShowNewForm(true);
-            setEditingId(null);
-          }}
-        >
-          <IconPlus className="h-3.5 w-3.5" />
-          New rule
-        </Button>
-      </div>
-
-      {/* Content */}
-      <div className="max-w-2xl space-y-2">
-        {/* New rule form */}
-        {showNewForm && (
-          <AutomationEditRow
-            onSave={handleCreate}
-            onCancel={() => setShowNewForm(false)}
-            isPending={createAutomation.isPending}
-          />
-        )}
-
-        {/* Loading state */}
-        {isLoading &&
-          Array.from({ length: 4 }).map((_, i) => (
-            <div
-              key={i}
-              className="flex items-center gap-3 rounded-lg border border-border/20 bg-card/50 p-3"
-            >
-              <Skeleton className="h-8 w-8 rounded-md" />
-              <div className="flex-1 space-y-1.5">
-                <Skeleton className="h-3 w-40" />
-                <Skeleton className="h-3 w-56" />
-              </div>
-              <Skeleton className="h-5 w-9 rounded-full" />
+            <Skeleton className="h-8 w-8 rounded-md" />
+            <div className="flex-1 space-y-1.5">
+              <Skeleton className="h-3 w-40" />
+              <Skeleton className="h-3 w-56" />
             </div>
-          ))}
-
-        {/* Empty state */}
-        {!isLoading && rules.length === 0 && !showNewForm && (
-          <div className="rounded-lg border border-border/20 bg-card/50 py-12 text-center">
-            <IconBolt className="h-8 w-8 text-muted-foreground/20 mx-auto mb-3" />
-            <p className="text-[13px] text-muted-foreground/50 mb-1">
-              No automation rules yet.
-            </p>
-            <p className="text-[12px] text-muted-foreground/30 max-w-sm mx-auto">
-              Create rules to auto-label emails, archive newsletters, star
-              important messages, and more. You can also ask the AI agent to set
-              these up for you.
-            </p>
+            <Skeleton className="h-5 w-9 rounded-full" />
           </div>
-        )}
-
-        {/* Rule list */}
-        {rules.map((rule) => (
-          <AutomationRow
-            key={rule.id}
-            rule={rule}
-            isEditing={editingId === rule.id}
-            onEdit={() => {
-              setEditingId(rule.id);
-              setShowNewForm(false);
-            }}
-            onCancelEdit={() => setEditingId(null)}
-          />
         ))}
-      </div>
 
-      {/* Event-triggered automations (framework-level triggers) */}
-      <div className="max-w-2xl mt-10">
-        <div className="mb-4">
-          <h3 className="text-[14px] font-semibold text-foreground">
-            Event Triggers
-          </h3>
-          <p className="text-[12px] text-muted-foreground mt-0.5">
-            Automations that fire when mail events occur (e.g. new email
-            received). Managed by the agent.
+      {/* Empty state */}
+      {!isLoading && automationRules.length === 0 && !showNewForm && (
+        <div className="rounded-lg border border-border/20 bg-card/50 py-12 text-center">
+          <IconBolt className="h-8 w-8 text-muted-foreground/20 mx-auto mb-3" />
+          <p className="text-[13px] text-muted-foreground/50 mb-1">
+            {t("settings.noAutomationRules")}
+          </p>
+          <p className="text-[12px] text-muted-foreground/30 max-w-sm mx-auto">
+            {t("settings.noAutomationRulesDescription")}
           </p>
         </div>
-        <TriggersSubsection />
+      )}
+
+      {/* Rule list */}
+      {automationRules.map((rule) => (
+        <AutomationRow
+          key={rule.id}
+          rule={rule}
+          isEditing={editingId === rule.id}
+          onEdit={() => {
+            setEditingId(rule.id);
+            setShowNewForm(false);
+          }}
+          onCancelEdit={() => setEditingId(null)}
+        />
+      ))}
+    </div>
+  );
+
+  // Settings lists event-triggered automations on the core Automations page,
+  // so this area holds only Mail's inbox rules.
+  return (
+    <div className="flex flex-col gap-8">
+      <SettingsGroup id="rules-settings">
+        <SettingsRow
+          id="rules-model"
+          label={t("settings.rulesModel")}
+          description={t("settings.rulesModelDescription")}
+          control={modelSelect}
+        />
+        <SettingsRow
+          id="allow-automation-sends"
+          label={t("settings.allowAutomationSends")}
+          description={t("settings.allowAutomationSendsDescription")}
+          control={
+            autoSettings ? (
+              <Switch
+                aria-label={t("settings.allowAutomationSends")}
+                checked={autoSettings.allowAutomationSends}
+                disabled={isSavingAutomationSends}
+                onCheckedChange={handleAutomationSendsChange}
+              />
+            ) : (
+              <Skeleton className="h-5 w-9 rounded-full" />
+            )
+          }
+        />
+      </SettingsGroup>
+      <div className="flex flex-col gap-4">
+        <div className="flex justify-end">{newRuleButton}</div>
+        {ruleList}
       </div>
     </div>
   );
 }
 
-// ─── Drafting Section ────────────────────────────────────────────────────────
-
 function DraftingSection() {
+  const t = useT();
   const { data: settings, isLoading } = useSettings();
   const updateSettings = useUpdateSettings();
   const queryClient = useQueryClient();
   const [signature, setSignature] = useState("");
   const [writingStyle, setWritingStyle] = useState("");
+  const signatureSelectionRef = useRef({ start: 0, end: 0 });
   const importSignature = useActionMutation("import-gmail-signature", {
     onSuccess: (result) => {
       setSignature(result.signature);
@@ -1049,16 +986,16 @@ function DraftingSection() {
         prev ? { ...prev, signature: result.signature } : prev,
       );
       if (result.imported) {
-        toast(`Imported signature from ${result.account}.`);
+        toast(t("settings.importedSignature", { account: result.account }));
       } else {
-        toast(`No Gmail signature found for ${result.account}.`);
+        toast(t("settings.noGmailSignature", { account: result.account }));
       }
     },
     onError: (error) =>
       toast.error(
         error instanceof Error
           ? error.message
-          : "Failed to import Gmail signature.",
+          : t("settings.importSignatureFailed"),
       ),
   });
 
@@ -1073,6 +1010,49 @@ function DraftingSection() {
   const isDirty =
     signature !== savedSignature || writingStyle !== savedWritingStyle;
 
+  const insertSignatureImage = async (
+    file: File,
+    start: number,
+    end: number,
+  ) => {
+    try {
+      const result = await uploadFile(file);
+      const markdown = `![${file.name.replace(/\.[^.]+$/, "")}](${result.url})`;
+      setSignature(
+        (current) =>
+          `${current.slice(0, start)}${markdown}${current.slice(end)}`,
+      );
+    } catch {
+      toast.error(t("settings.signatureImageUploadFailed"));
+    }
+  };
+
+  const handleSignaturePaste = (
+    event: React.ClipboardEvent<HTMLTextAreaElement>,
+  ) => {
+    const image = Array.from(event.clipboardData.items)
+      .find((item) => item.kind === "file" && item.type.startsWith("image/"))
+      ?.getAsFile();
+    if (!image) return;
+    event.preventDefault();
+    const target = event.currentTarget;
+    void insertSignatureImage(
+      image,
+      target.selectionStart,
+      target.selectionEnd,
+    );
+  };
+
+  const handleSignatureImage = async () => {
+    const file = await openFilePicker("image/*");
+    if (!file) return;
+    await insertSignatureImage(
+      file,
+      signatureSelectionRef.current.start,
+      signatureSelectionRef.current.end,
+    );
+  };
+
   const handleSave = () => {
     updateSettings.mutate(
       {
@@ -1080,141 +1060,203 @@ function DraftingSection() {
         writingStyle: writingStyle.trim(),
       },
       {
-        onSuccess: () => toast("Drafting settings saved."),
+        onSuccess: () => toast(t("settings.draftingSettingsSaved")),
         onError: (error) =>
           toast.error(
             error instanceof Error
               ? error.message
-              : "Failed to save drafting settings.",
+              : t("settings.draftingSettingsSaveFailed"),
           ),
       },
     );
   };
 
-  return (
-    <div className="flex-1 overflow-y-auto p-4 sm:p-8">
-      <div className="mb-6">
-        <h2 className="text-[16px] font-semibold text-foreground">Drafting</h2>
-        <p className="mt-0.5 text-[13px] text-muted-foreground">
-          Preferences used when composing and generating email drafts.
-        </p>
-      </div>
-
-      <div className="max-w-2xl space-y-4">
-        {isLoading ? (
-          <>
-            <Skeleton className="h-36 w-full" />
-            <Skeleton className="h-32 w-full" />
-          </>
-        ) : (
-          <>
-            <div className="rounded-lg border border-border/20 bg-card/50 p-4">
-              <div className="mb-1.5 flex items-center justify-between gap-3">
-                <label className="block text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                  Signature
-                </label>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="h-6 px-2 text-[11px]"
-                  onClick={() => importSignature.mutate({})}
-                  disabled={importSignature.isPending}
-                >
-                  {importSignature.isPending && (
-                    <IconLoader2 className="h-3 w-3 animate-spin" />
-                  )}
-                  Import from Gmail
-                </Button>
-              </div>
-              <Textarea
-                value={signature}
-                onChange={(event) => setSignature(event.target.value)}
-                placeholder={"Best,\nSteve"}
-                rows={5}
-                className="resize-none px-3 py-2 text-[13px] placeholder:text-muted-foreground/40"
-              />
-              <p className="mt-2 text-[12px] text-muted-foreground">
-                Added to new drafts before quoted reply history. Markdown links
-                and images are supported.
-              </p>
-            </div>
-
-            <div className="rounded-lg border border-border/20 bg-card/50 p-4">
-              <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                Writing style
-              </label>
-              <Textarea
-                value={writingStyle}
-                onChange={(event) => setWritingStyle(event.target.value)}
-                placeholder="Short, specific, warm. Avoid formal filler."
-                rows={4}
-                className="resize-none px-3 py-2 text-[13px] placeholder:text-muted-foreground/40"
-              />
-            </div>
-
-            <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                onClick={handleSave}
-                disabled={!isDirty || updateSettings.isPending}
-              >
-                {updateSettings.isPending && (
-                  <IconLoader2 className="h-3.5 w-3.5 animate-spin" />
-                )}
-                Save drafting settings
-              </Button>
-              {isDirty && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    setSignature(savedSignature);
-                    setWritingStyle(savedWritingStyle);
-                  }}
-                >
-                  Reset
-                </Button>
-              )}
-            </div>
-          </>
+  const autocompleteSwitch = (
+    <Switch
+      id="mail-autocomplete-setting"
+      aria-label={t("settings.autocomplete")}
+      checked={settings?.autocompleteEnabled ?? false}
+      onCheckedChange={(checked) =>
+        updateSettings.mutate(
+          { autocompleteEnabled: checked },
+          {
+            onError: (error) =>
+              toast.error(
+                error instanceof Error
+                  ? error.message
+                  : t("settings.autocompleteSaveFailed"),
+              ),
+          },
+        )
+      }
+      disabled={updateSettings.isPending}
+    />
+  );
+  const sendAndMarkDoneSwitch = (
+    <Switch
+      id="mail-send-and-mark-done-setting"
+      aria-label={t("settings.sendAndMarkDone")}
+      checked={settings?.sendAndArchive ?? false}
+      onCheckedChange={(checked) =>
+        updateSettings.mutate(
+          { sendAndArchive: checked },
+          {
+            onError: () =>
+              toast.error(t("settings.draftingSettingsSaveFailed")),
+          },
+        )
+      }
+      disabled={updateSettings.isPending}
+    />
+  );
+  const importSignatureButton = (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      className="h-6 px-2 text-[11px]"
+      onClick={() => importSignature.mutate({})}
+      disabled={importSignature.isPending}
+    >
+      {importSignature.isPending && (
+        <IconLoader2 className="h-3 w-3 animate-spin" />
+      )}
+      {t("settings.importFromGmail")}
+    </Button>
+  );
+  const signatureImageButton = (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      className="h-6 px-2 text-[11px]"
+      onClick={() => void handleSignatureImage()}
+    >
+      <IconPhoto className="h-3 w-3" />
+      {t("settings.addSignatureImage")}
+    </Button>
+  );
+  const signatureInput = (
+    <Textarea
+      value={signature}
+      aria-label={t("settings.signature")}
+      onChange={(event) => setSignature(event.target.value)}
+      onPaste={handleSignaturePaste}
+      onSelect={(event) => {
+        signatureSelectionRef.current = {
+          start: event.currentTarget.selectionStart,
+          end: event.currentTarget.selectionEnd,
+        };
+      }}
+      placeholder={"Best,\nSteve"}
+      rows={5}
+      className="resize-none px-3 py-2 text-[13px] placeholder:text-muted-foreground/40"
+    />
+  );
+  const writingStyleInput = (
+    <Textarea
+      value={writingStyle}
+      aria-label={t("settings.writingStyle")}
+      onChange={(event) => setWritingStyle(event.target.value)}
+      placeholder={t("settings.writingStylePlaceholder")}
+      rows={4}
+      className="resize-none px-3 py-2 text-[13px] placeholder:text-muted-foreground/40"
+    />
+  );
+  const saveButtons = (
+    <div className="flex items-center gap-2">
+      <Button
+        size="sm"
+        onClick={handleSave}
+        disabled={!isDirty || updateSettings.isPending}
+      >
+        {updateSettings.isPending && (
+          <IconLoader2 className="h-3.5 w-3.5 animate-spin" />
         )}
+        {t("settings.saveDraftingSettings")}
+      </Button>
+      {isDirty && (
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => {
+            setSignature(savedSignature);
+            setWritingStyle(savedWritingStyle);
+          }}
+        >
+          {t("settings.reset")}
+        </Button>
+      )}
+    </div>
+  );
+
+  if (isLoading) return <SettingsRowsSkeleton groups={[2, 2]} />;
+  return (
+    <div className="flex flex-col gap-8">
+      <SettingsGroup id="composing">
+        <SettingsRow
+          id="autocomplete"
+          label={t("settings.autocomplete")}
+          control={autocompleteSwitch}
+        />
+        <SettingsRow
+          id="send-and-mark-done"
+          label={t("settings.sendAndMarkDone")}
+          control={sendAndMarkDoneSwitch}
+        />
+      </SettingsGroup>
+      <div className="flex flex-col gap-4">
+        <SettingsGroup id="signature-and-style">
+          <SettingsRow
+            id="signature"
+            label={t("settings.signature")}
+            description={t("settings.signatureHelp")}
+            control={importSignatureButton}
+          >
+            <div className="flex flex-col gap-2">
+              {signatureInput}
+              <div>{signatureImageButton}</div>
+            </div>
+          </SettingsRow>
+          <SettingsRow id="writing-style" label={t("settings.writingStyle")}>
+            {writingStyleInput}
+          </SettingsRow>
+        </SettingsGroup>
+        {saveButtons}
       </div>
     </div>
   );
 }
 
-function TrackingRow({
-  title,
-  description,
-  checked,
-  disabled,
-  onCheckedChange,
-}: {
-  title: string;
-  description: string;
-  checked: boolean;
-  disabled?: boolean;
-  onCheckedChange: (value: boolean) => void;
-}) {
+/** Layout-matching placeholder for areas built from `SettingsGroup` rows. */
+function SettingsRowsSkeleton({ groups }: { groups: readonly number[] }) {
   return (
-    <div className="flex items-start justify-between gap-4 rounded-lg border border-border/20 bg-card/50 px-4 py-3">
-      <div className="min-w-0">
-        <div className="text-[13px] font-semibold text-foreground">{title}</div>
-        <p className="text-[12px] text-muted-foreground mt-0.5">
-          {description}
-        </p>
-      </div>
-      <Switch
-        checked={checked}
-        disabled={disabled}
-        onCheckedChange={onCheckedChange}
-      />
+    <div className="flex flex-col gap-8">
+      {groups.map((rows, group) => (
+        <div
+          key={group}
+          className="divide-y divide-border/60 overflow-hidden rounded-xl border border-border/70 bg-card"
+        >
+          {Array.from({ length: rows }).map((_, row) => (
+            <div
+              key={row}
+              className="flex items-center justify-between gap-4 px-5 py-4 sm:px-6"
+            >
+              <div className="flex-1 space-y-2">
+                <Skeleton className="h-3.5 w-40" />
+                <Skeleton className="h-3 w-64 max-w-full" />
+              </div>
+              <Skeleton className="h-5 w-9 rounded-full" />
+            </div>
+          ))}
+        </div>
+      ))}
     </div>
   );
 }
 
 function TrackingSection() {
+  const t = useT();
   const { data: settings, isLoading } = useSettings();
   const updateSettings = useUpdateSettings();
 
@@ -1226,256 +1268,189 @@ function TrackingSection() {
     });
   };
 
+  if (isLoading) return <SettingsRowsSkeleton groups={[2]} />;
   return (
-    <div className="flex-1 p-4 sm:p-8 overflow-y-auto">
-      <div className="mb-6">
-        <h2 className="text-[16px] font-semibold text-foreground">Tracking</h2>
-        <p className="text-[13px] text-muted-foreground mt-0.5">
-          Know when recipients open your sent emails and click links. Stats
-          appear under each sent message.
-        </p>
-      </div>
-
-      <div className="max-w-2xl space-y-2">
-        {isLoading ? (
-          <>
-            <Skeleton className="h-16 w-full" />
-            <Skeleton className="h-16 w-full" />
-          </>
-        ) : (
-          <>
-            <TrackingRow
-              title="Track email opens"
-              description="Inject a 1×1 pixel into outgoing emails so you can see when recipients open them."
-              checked={tracking.opens}
-              onCheckedChange={(v) => update({ opens: v })}
-            />
-            <TrackingRow
-              title="Track link clicks"
-              description="Rewrite external links in outgoing emails to count when recipients click them."
-              checked={tracking.clicks}
-              onCheckedChange={(v) => update({ clicks: v })}
-            />
-          </>
-        )}
-      </div>
-    </div>
+    <SettingsGroup id="tracking-settings">
+      <SettingsRow
+        id="track-opens"
+        label={t("settings.trackEmailOpens")}
+        description={t("settings.trackEmailOpensDescription")}
+        control={
+          <Switch
+            aria-label={t("settings.trackEmailOpens")}
+            checked={tracking.opens}
+            onCheckedChange={(v) => update({ opens: v })}
+          />
+        }
+      />
+      <SettingsRow
+        id="track-clicks"
+        label={t("settings.trackLinkClicks")}
+        description={t("settings.trackLinkClicksDescription")}
+        control={
+          <Switch
+            aria-label={t("settings.trackLinkClicks")}
+            checked={tracking.clicks}
+            onCheckedChange={(v) => update({ clicks: v })}
+          />
+        }
+      />
+    </SettingsGroup>
   );
 }
 
-// ─── Slack Intake Section ───────────────────────────────────────────────────
+type MailSettingsAppArea = SettingsAppArea & { id: MailSettingsAreaId };
 
-type SlackStatus = {
-  enabled: boolean;
-  configured: boolean;
-  webhookUrl?: string;
-  error?: string;
-};
-
-function SlackIntakeSection() {
-  const queryClient = useQueryClient();
-  const { data, isLoading } = useQuery<SlackStatus>({
-    queryKey: ["integration-status", "slack"],
-    queryFn: async () => {
-      const res = await fetch(
-        agentNativePath("/_agent-native/integrations/slack/status"),
-      );
-      if (!res.ok) throw new Error("Failed to load Slack status");
-      return res.json();
-    },
-    retry: false,
-  });
-
-  const toggle = useMutation({
-    mutationFn: async (enabled: boolean) => {
-      const res = await fetch(
-        agentNativePath(
-          `/_agent-native/integrations/slack/${enabled ? "enable" : "disable"}`,
-        ),
-        { method: "POST" },
-      );
-      if (!res.ok) throw new Error("Failed to update Slack intake");
-      return res.json();
-    },
-    onSuccess: () =>
-      queryClient.invalidateQueries({
-        queryKey: ["integration-status", "slack"],
-      }),
-  });
-  const slackStatusDescription = data?.configured
-    ? "Slack credentials are configured."
-    : "Add SLACK_BOT_TOKEN and SLACK_SIGNING_SECRET to enable Slack intake.";
-
-  return (
-    <div className="flex-1 overflow-y-auto p-4 sm:p-8">
-      <div className="mb-6">
-        <h2 className="text-[16px] font-semibold text-foreground">
-          Slack Intake
-        </h2>
-        <p className="mt-0.5 text-[13px] text-muted-foreground">
-          Let organization members queue email drafts from Slack.
-        </p>
-      </div>
-
-      <div className="max-w-2xl space-y-3">
-        {isLoading ? (
-          <>
-            <Skeleton className="h-16 w-full" />
-            <Skeleton className="h-10 w-full" />
-          </>
-        ) : (
-          <>
-            <div className="flex items-center justify-between gap-4 rounded-lg border border-border/20 bg-card/50 px-4 py-3">
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
-                  {data?.configured ? (
-                    <IconCircleCheck className="h-4 w-4 text-green-400" />
-                  ) : (
-                    <IconCircleX className="h-4 w-4 text-red-400" />
-                  )}
-                  <span className="text-[13px] font-semibold text-foreground">
-                    {data?.enabled ? "Enabled" : "Disabled"}
-                  </span>
-                </div>
-                <p className="mt-0.5 text-[12px] text-muted-foreground">
-                  {slackStatusDescription}
-                </p>
-                {data?.configured && data?.error && (
-                  <p className="mt-1 text-[11px] text-red-400">{data.error}</p>
-                )}
-              </div>
-              <Button
-                size="sm"
-                disabled={!data?.configured || toggle.isPending}
-                onClick={() => toggle.mutate(!data?.enabled)}
-              >
-                {toggle.isPending && (
-                  <IconLoader2 className="h-3.5 w-3.5 animate-spin" />
-                )}
-                {data?.enabled ? "Disable" : "Enable"}
-              </Button>
-            </div>
-            {data?.configured && data?.webhookUrl && (
-              <div>
-                <label className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                  Slack POST endpoint
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <IconInfoCircle className="h-3.5 w-3.5" />
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      Use in Slack Event Subscriptions. Browser GET may show Not
-                      Found.
-                    </TooltipContent>
-                  </Tooltip>
-                </label>
-                <Input readOnly value={data.webhookUrl} className="font-mono" />
-              </div>
-            )}
-          </>
-        )}
-      </div>
-    </div>
+/** Mail's areas: tabs on Mail › General. */
+function useMailSettingsAreas(): MailSettingsAppArea[] {
+  const t = useT();
+  return useMemo<MailSettingsAppArea[]>(
+    () => [
+      {
+        id: "drafting",
+        label: t("settings.drafting"),
+        icon: IconSignature,
+        keywords: "signature writing style compose reply draft",
+        searchEntries: [
+          {
+            id: "mail-autocomplete",
+            label: t("settings.autocomplete"),
+            keywords: "autocomplete suggestions compose",
+            hash: "autocomplete",
+          },
+          {
+            id: "mail-send-and-mark-done",
+            label: t("settings.sendAndMarkDone"),
+            keywords: "send archive mark done",
+            hash: "send-and-mark-done",
+          },
+          {
+            id: "mail-signature",
+            label: t("settings.signature"),
+            keywords: "signature sign off gmail import image",
+            hash: "signature",
+          },
+          {
+            id: "mail-writing-style",
+            label: t("settings.writingStyle"),
+            keywords: "writing style tone voice",
+            hash: "writing-style",
+          },
+        ],
+        content: <DraftingSection />,
+      },
+      {
+        id: "snippets",
+        label: t("settings.snippets"),
+        icon: IconMessage2,
+        keywords: "snippets templates canned responses shortcuts",
+        content: <SnippetsSection />,
+      },
+      {
+        id: "rules",
+        label: t("settings.rules"),
+        icon: IconBolt,
+        keywords: "rules inbox automations triggers labels archive star",
+        searchEntries: [
+          {
+            id: "mail-rules-model",
+            label: t("settings.rulesModel"),
+            keywords: "model llm rules automations",
+            hash: "rules-model",
+          },
+          {
+            id: "mail-allow-automation-sends",
+            label: t("settings.allowAutomationSends"),
+            keywords: "send automatically rules automations",
+            hash: "allow-automation-sends",
+          },
+        ],
+        content: <AutomationsSection />,
+      },
+      {
+        id: "ai-filter",
+        label: t("settings.aiFilter"),
+        icon: IconFilter,
+        keywords:
+          "ai filter spam auto label unwanted mail suggestions feedback",
+        content: <AiFilterSection />,
+      },
+      {
+        id: "gmail-filters",
+        label: t("settings.gmailFilters"),
+        icon: IconFilter,
+        keywords: "gmail filters import rules",
+        content: <GmailFiltersSection />,
+      },
+      {
+        id: "aliases",
+        label: t("settings.aliases"),
+        icon: IconUsers,
+        keywords: "aliases groups distribution lists recipients",
+        content: <AliasesSection />,
+      },
+      {
+        id: "tracking",
+        label: t("settings.tracking"),
+        icon: IconChartBar,
+        keywords: "tracking opens clicks pixel analytics",
+        searchEntries: [
+          {
+            id: "mail-track-opens",
+            label: t("settings.trackEmailOpens"),
+            keywords: "tracking opens pixel read receipts",
+            hash: "track-opens",
+          },
+          {
+            id: "mail-track-clicks",
+            label: t("settings.trackLinkClicks"),
+            keywords: "tracking clicks links",
+            hash: "track-clicks",
+          },
+        ],
+        content: <TrackingSection />,
+      },
+    ],
+    [t],
   );
 }
 
-// ─── Settings Page ────────────────────────────────────────────────────────────
-
-type SettingsSection =
-  | "drafting"
-  | "automations"
-  | "gmail-filters"
-  | "aliases"
-  | "tracking"
-  | "slack"
-  | "team";
-
-const navItems: {
-  id: SettingsSection;
-  label: string;
-  icon: React.ComponentType<{ className?: string }>;
-}[] = [
-  { id: "drafting", label: "Drafting", icon: IconSignature },
-  { id: "automations", label: "Automations", icon: IconBolt },
-  { id: "gmail-filters", label: "Gmail Filters", icon: IconFilter },
-  { id: "aliases", label: "Aliases", icon: IconUsers },
-  { id: "tracking", label: "Tracking", icon: IconChartBar },
-  { id: "slack", label: "Slack", icon: IconBolt },
-  { id: "team", label: "Team", icon: IconUsers },
-];
-
-function isSettingsSection(value: string | null): value is SettingsSection {
-  return navItems.some((item) => item.id === value);
-}
-
+/**
+ * Mail › General with Mail's areas as tabs. Language is on Account ›
+ * Preferences, members on Organization › Members, and Slack draft requests
+ * on Channels › Slack (see `slack-channel-extension`).
+ */
 export function SettingsPage() {
-  const [searchParams, setSearchParams] = useSearchParams();
+  const agentSettingsTabs = useAgentSettingsTabs();
+  const appAreas = useMailSettingsAreas();
+  const [searchParams] = useSearchParams();
+  const { pathname } = useLocation();
   const navState = useNavigationState();
-  const [activeSection, setActiveSection] =
-    useState<SettingsSection>("drafting");
+  const section = mailSettingsSectionFromPath(pathname);
 
   useEffect(() => {
-    const section = searchParams.get("section");
-    if (!isSettingsSection(section)) return;
-    setActiveSection(section);
-    setSearchParams((prev) => {
-      const next = new URLSearchParams(prev);
-      next.delete("section");
-      return next;
-    });
-  }, [searchParams, setSearchParams]);
+    navState.sync({ view: "settings", settingsSection: section });
+  }, [section]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    navState.sync({ view: "settings", settingsSection: activeSection });
-  }, [activeSection]); // eslint-disable-line react-hooks/exhaustive-deps
+  const redirect = mailSettingsRedirect(searchParams.get("section"));
+  if (redirect) {
+    const rest = new URLSearchParams(searchParams);
+    rest.delete("section");
+    const search = rest.toString();
+    return (
+      <Navigate
+        to={{ pathname: redirect, search: search ? `?${search}` : "" }}
+        replace
+      />
+    );
+  }
 
   return (
-    <div className="flex flex-1 flex-col sm:flex-row overflow-hidden">
-      {/* Top tabs on mobile, left sidebar on desktop */}
-      <div className="sm:w-[200px] shrink-0 sm:border-r border-b sm:border-b-0 border-border/30 bg-muted/50 dark:bg-[hsl(220,6%,5%)] sm:p-3 flex sm:flex-col gap-0.5 overflow-x-auto">
-        <p className="hidden sm:block px-2 py-1.5 text-[10px] font-medium text-muted-foreground/40 uppercase tracking-wider mb-1">
-          Settings
-        </p>
-        {navItems.map((item) => {
-          const Icon = item.icon;
-          const isActive = activeSection === item.id;
-          return (
-            <button
-              key={item.id}
-              onClick={() => setActiveSection(item.id)}
-              className={cn(
-                "flex items-center gap-2.5 sm:w-full rounded-md px-3 sm:px-2.5 py-2.5 sm:py-2 text-[13px] transition-colors text-left whitespace-nowrap",
-                isActive
-                  ? "bg-indigo-500/15 text-indigo-300 font-medium"
-                  : "text-muted-foreground hover:text-foreground hover:bg-accent/50",
-              )}
-            >
-              <Icon
-                className={cn(
-                  "h-4 w-4 shrink-0",
-                  isActive ? "text-indigo-400" : "text-muted-foreground/60",
-                )}
-              />
-              {item.label}
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Right content panel */}
-      <div className="flex flex-1 overflow-hidden bg-background">
-        {activeSection === "drafting" && <DraftingSection />}
-        {activeSection === "automations" && <AutomationsSection />}
-        {activeSection === "gmail-filters" && <GmailFiltersSection />}
-        {activeSection === "aliases" && <AliasesSection />}
-        {activeSection === "tracking" && <TrackingSection />}
-        {activeSection === "slack" && <SlackIntakeSection />}
-        {activeSection === "team" && (
-          <div className="flex-1 overflow-y-auto">
-            <TeamPage createOrgDescription="Set up a team to share email automations and settings with your colleagues." />
-          </div>
-        )}
-      </div>
-    </div>
+    <SettingsTabsPage
+      className="flex-1"
+      extraTabs={agentSettingsTabs}
+      appAreas={appAreas}
+      whatsNewMarkdown={changelog}
+    />
   );
 }

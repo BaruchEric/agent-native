@@ -1,19 +1,33 @@
+import { markAgentChatHomeHandoff } from "@agent-native/core/client/agent-chat";
+import { useT } from "@agent-native/core/client/i18n";
+import { AgentChatHome } from "@agent-native/toolkit/app/chat";
 import { useEffect } from "react";
-import {
-  AgentChatHome,
-  markAgentChatHomeHandoff,
-} from "@agent-native/core/client";
+import { useNavigate } from "react-router";
+
 import { LocalCodebasePicker } from "@/components/plan/LocalCodebasePicker";
+import { planChatThreadPath } from "@/lib/chat-route";
 import { schedulePlanRoutePrewarm } from "@/lib/route-prewarm";
 
-const PLAN_CHAT_SUGGESTIONS = [
-  "What shipped in the last week?",
-  "What does the new checkout UI look like?",
-  "When did the auth API change?",
-  "What is the shape of the billing API?",
-];
+export function PlanChatHydrateFallback() {
+  const t = useT();
+  return (
+    <div className="flex h-full min-h-0 bg-background px-4 py-4">
+      <div className="mx-auto flex w-full max-w-3xl items-center justify-center">
+        <h1 className="text-center text-3xl font-semibold tracking-normal text-foreground sm:text-4xl">
+          {t("chat.heading")}
+        </h1>
+      </div>
+    </div>
+  );
+}
 
-export function PlanChatPage() {
+export function PlanChatPage({
+  threadId = null,
+}: {
+  threadId?: string | null;
+}) {
+  const t = useT();
+  const navigate = useNavigate();
   useEffect(() => {
     function handleChatRunning(event: Event) {
       const detail = (event as CustomEvent).detail;
@@ -34,28 +48,31 @@ export function PlanChatPage() {
       contentClassName="max-w-5xl"
       surfaceClassName="border-0 bg-transparent shadow-none"
       storageKey="plans"
-      restoreActiveThread={false}
+      threadUrlSync={{
+        routeThreadId: threadId,
+        getPath: planChatThreadPath,
+        navigate,
+      }}
       showHeader={false}
       showTabBar={false}
       dynamicSuggestions={false}
-      suggestions={PLAN_CHAT_SUGGESTIONS}
-      emptyStateText="Ask Plan"
+      suggestions={[
+        t("chat.suggestionShipped"),
+        t("chat.suggestionUi"),
+        t("chat.suggestionAuth"),
+        t("chat.suggestionApi"),
+      ]}
+      emptyStateText={t("chat.emptyState")}
       emptyStateDisplay="hidden"
       centerComposerWhenEmpty
       composerLayoutVariant="hero"
       composerAreaClassName="plan-chat-composer-area"
-      composerPlaceholder="Ask what shipped, what changed, or what the current code shows..."
-      composerSlot={
+      composerPlaceholder={t("chat.placeholder")}
+      homeIntroSlot={
         <div className="mx-auto flex w-full max-w-3xl flex-col items-center gap-4 text-center">
-          <div className="space-y-2">
-            <h1 className="text-3xl font-semibold tracking-normal text-foreground sm:text-4xl">
-              Ask Plan
-            </h1>
-            <p className="mx-auto max-w-2xl text-sm leading-6 text-muted-foreground">
-              Search merged PR recaps, inspect visual blocks, and publish code
-              answers as diagrams, wireframes, API specs, and data models.
-            </p>
-          </div>
+          <h1 className="text-3xl font-semibold tracking-normal text-foreground sm:text-4xl">
+            {t("chat.heading")}
+          </h1>
           <LocalCodebasePicker />
         </div>
       }

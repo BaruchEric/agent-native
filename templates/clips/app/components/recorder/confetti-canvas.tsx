@@ -1,7 +1,6 @@
 import { useEffect, useImperativeHandle, useRef, forwardRef } from "react";
 
 export interface ConfettiHandle {
-  /** Fire a new confetti burst. */
   burst: (opts?: { count?: number; origin?: { x: number; y: number } }) => void;
 }
 
@@ -34,6 +33,7 @@ export const ConfettiCanvas = forwardRef<ConfettiHandle>(
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const particlesRef = useRef<Particle[]>([]);
     const rafRef = useRef<number | null>(null);
+    const startTickRef = useRef<() => void>(() => {});
 
     useEffect(() => {
       const canvas = canvasRef.current;
@@ -93,9 +93,20 @@ export const ConfettiCanvas = forwardRef<ConfettiHandle>(
           live.push(p);
         }
         particlesRef.current = live;
+
+        if (live.length === 0) {
+          rafRef.current = null;
+          return;
+        }
         rafRef.current = window.requestAnimationFrame(tick);
       }
-      rafRef.current = window.requestAnimationFrame(tick);
+
+      startTickRef.current = () => {
+        if (rafRef.current !== null) return;
+        lastTs = performance.now();
+        rafRef.current = window.requestAnimationFrame(tick);
+      };
+
       return () => {
         if (rafRef.current !== null)
           window.cancelAnimationFrame(rafRef.current);
@@ -129,6 +140,7 @@ export const ConfettiCanvas = forwardRef<ConfettiHandle>(
             life: 1.6 + Math.random() * 0.6,
           });
         }
+        startTickRef.current();
       },
     }));
 

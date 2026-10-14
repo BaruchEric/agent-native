@@ -1,14 +1,5 @@
 import { toast } from "sonner";
 
-/**
- * Shared image action helpers for plan image surfaces (the editor node view, the
- * read-only markdown reader, and structured image blocks). These are pure
- * browser helpers — they fetch the image bytes client-side so download/copy work
- * for cross-origin hosted images and `data:` URLs alike, with graceful fallbacks
- * when the Clipboard/Blob APIs are unavailable.
- */
-
-/** Derive a sensible download filename from the alt text or the URL path. */
 export function imageDownloadName(src: string, alt: string): string {
   const cleanAlt = alt.trim().replace(/[^a-z0-9._-]+/gi, "-");
   if (cleanAlt) return cleanAlt.toLowerCase();
@@ -24,8 +15,11 @@ export function imageDownloadName(src: string, alt: string): string {
   return "image";
 }
 
-/** Download the image to disk, falling back to opening it in a new tab. */
-export async function downloadImage(src: string, alt: string): Promise<void> {
+export async function downloadImage(
+  src: string,
+  alt: string,
+  messages: ImageActionMessages = defaultImageActionMessages,
+): Promise<void> {
   const filename = imageDownloadName(src, alt);
 
   try {
@@ -40,7 +34,7 @@ export async function downloadImage(src: string, alt: string): Promise<void> {
     anchor.click();
     anchor.remove();
     URL.revokeObjectURL(url);
-    toast.success("Image download started.");
+    toast.success(messages.downloadStarted);
   } catch {
     const anchor = document.createElement("a");
     anchor.href = src;
@@ -50,11 +44,10 @@ export async function downloadImage(src: string, alt: string): Promise<void> {
     document.body.append(anchor);
     anchor.click();
     anchor.remove();
-    toast.info("Opened image in a new tab.");
+    toast.info(messages.openedNewTab);
   }
 }
 
-/** Re-encode a blob as PNG so the clipboard accepts it when the source type is unsupported. */
 async function blobToPng(blob: Blob): Promise<Blob> {
   const bitmap = await createImageBitmap(blob);
   const canvas = document.createElement("canvas");
@@ -75,8 +68,10 @@ async function blobToPng(blob: Blob): Promise<Blob> {
   return pngBlob;
 }
 
-/** Copy the rendered image to the clipboard, falling back to copying its URL. */
-export async function copyImage(src: string): Promise<void> {
+export async function copyImage(
+  src: string,
+  messages: ImageActionMessages = defaultImageActionMessages,
+): Promise<void> {
   try {
     if (!navigator.clipboard || typeof ClipboardItem === "undefined") {
       throw new Error("Image clipboard unavailable");
@@ -98,13 +93,28 @@ export async function copyImage(src: string): Promise<void> {
     await navigator.clipboard.write([
       new ClipboardItem({ [imageType]: imageBlob }),
     ]);
-    toast.success("Image copied.");
+    toast.success(messages.imageCopied);
   } catch {
     try {
       await navigator.clipboard.writeText(src);
-      toast.info("Copied image URL.");
+      toast.info(messages.copiedUrl);
     } catch {
-      toast.error("Could not copy image.");
+      toast.error(messages.copyFailed);
     }
   }
 }
+export type ImageActionMessages = {
+  downloadStarted: string;
+  openedNewTab: string;
+  imageCopied: string;
+  copiedUrl: string;
+  copyFailed: string;
+};
+
+const defaultImageActionMessages: ImageActionMessages = {
+  downloadStarted: "Image download started.",
+  openedNewTab: "Opened image in a new tab.",
+  imageCopied: "Image copied.",
+  copiedUrl: "Copied image URL.",
+  copyFailed: "Could not copy image.",
+};

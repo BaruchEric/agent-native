@@ -1,15 +1,10 @@
-/**
- * Update a dictation's text or metadata. Used by the Dictate tab UI to
- * promote `cleanedText` into `fullText` ("Replace original with cleaned"),
- * inline-edit raw text, or change the source label after the fact.
- */
-
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { assertAccess } from "@agent-native/core/sharing";
+import { eq } from "drizzle-orm";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
 
 export default defineAction({
   description:
@@ -19,7 +14,15 @@ export default defineAction({
     fullText: z.string().optional(),
     cleanedText: z.string().nullable().optional(),
     source: z
-      .enum(["fn-hold", "cmd-shift-space", "manual", "other", "fn", "custom"])
+      .enum([
+        "fn-hold",
+        "cmd-shift-space",
+        "manual",
+        "mobile",
+        "other",
+        "fn",
+        "custom",
+      ])
       .optional(),
     targetApp: z.string().nullable().optional(),
   }),

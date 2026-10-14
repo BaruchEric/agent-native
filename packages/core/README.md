@@ -1,269 +1,286 @@
+<picture>
+  <source
+    media="(prefers-color-scheme: dark)"
+    srcset="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F5476444e54ee4a958966c90caca468e3"
+  />
+  <source
+    media="(prefers-color-scheme: light)"
+    srcset="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F7628600bc10a4940b78f42c5df7628b0"
+  />
+  <img
+    alt="Agent-Native: The agentic application framework"
+    src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F7628600bc10a4940b78f42c5df7628b0"
+  />
+</picture>
+
 # Agent-Native
 
-### Agentic applications you own.
+Agent-Native is an open-source TypeScript framework for building agents that pair autonomous work with a purpose-built UI. Define each capability once as an [action](https://agent-native.com/docs/actions-overview?utm_source=npm&utm_medium=referral&utm_content=core-readme): the agent uses it as a tool, and the UI calls it from code.
 
-Don't choose between rich user interfaces and autonomous agents. Every Agent-Native app is both.
-
-## Agents and UIs — Fully Connected
-
-The agent and the UI are equal citizens of the same system. Every action works both ways — click it or ask for it.
-
-![Agents and UIs fully connected](https://cdn.builder.io/api/v1/file/assets%2FYJIGb4i01jvw0SRdL5Bt%2Fadc1e9e9368e4a8cb1b4dbb5aae5aaa2)
-
-- **Everything syncs** — Agent and UI share one database and one state. Changes from either side show up instantly on the other.
-- **Real-time multiplayer** — Humans and agents collaborate in the same document simultaneously: CRDT merging, live presence (cursors, selection rings, who's on which slide), and the agent as a first-class peer editor. Works on any SQL database and any host, including serverless.
-- **Context-aware** — The agent knows what you're looking at. Select text, hit Cmd+I, and tell it what to do.
-- **Per-user workspace** — Skills, memory, instructions, sub-agents, and MCP servers — SQL-backed, customizable per user. Claude-Code-level flexibility, SaaS-grade economics.
-- **Agents call agents** — Tag another agent from any app. They discover each other over A2A and take action across your stack.
-- **Reusable integrations** — Connect a provider once in Dispatch, keep secret values in the vault, then grant apps like Brain, Analytics, Mail, and Dispatch access to the shared account metadata and credential refs.
-- **Apps that improve themselves** — Your apps get better on their own. The agent can add features, fix bugs, and refine the UI over time.
-- **Any database, any host** — Any SQL database Drizzle supports. Any hosting target Nitro supports. No lock-in.
-- **Any AI agent** — Claude Code, Codex, Cursor, Pi, OpenCode, GitHub Copilot / VS Code, or Builder.io. Use whichever agent you prefer.
-
-## Try it with a skill
-
-Don't want to scaffold a whole app yet? Add agent-native superpowers to a coding agent you already use — Claude Code, Codex, Cursor, Pi, OpenCode, GitHub Copilot / VS Code, and similar agents — with one command:
+## Quick start
 
 ```bash
-npx @agent-native/core@latest skills add visual-plan
+npx --yes @agent-native/core@latest create my-agent --standalone --template chat
 ```
 
-It installs the skills, writes shared `.agents` skill folders for agents that support them, registers the hosted MCP connector for supported local clients, and signs in the selected client(s) in one step. You get two slash commands that upgrade how your agent plans and reports its work:
+Follow the [getting started guide](https://agent-native.com/docs/getting-started?utm_source=npm&utm_medium=referral&utm_content=core-readme) for a full intro to the framework.
 
-- **`/visual-plan`** — before the agent writes code, it opens a structured, reviewable plan document instead of a wall of text: inline diagrams, UI wireframes and prototypes, file-by-file implementation maps, and annotations you can comment on and approve.
-- **`/visual-recap`** — after changes land, it turns a PR or git diff into a high-altitude visual recap: schema, API, and file changes rendered as grounded before/after blocks with a shareable review link, instead of scrolling a raw diff.
+## Why build agents with UIs?
 
-See the **[Skills Guide](https://agent-native.com/docs/skills-guide#app-backed-skills)** for more skills and local installs.
+Coding agents work with more than a text box. Their environment provides context, tools, files, tests, and previews that make their capabilities and results visible.
 
-## Templates
+Knowledge work needs that same kind of environment. A UI shows what an agent can do and gives people familiar ways to inspect, edit, approve, and share its work.
 
-Start from a complete, production-grade SaaS app — cloneable, not scaffolded. Each one replaces tools you're paying for, except you own everything and can customize it however you want. Not demos; products.
+## How Agent-Native works
+
+- **[Shared actions](https://agent-native.com/docs/actions-overview?utm_source=npm&utm_medium=referral&utm_content=core-readme).** The agent calls each capability as a tool, and the UI calls it from code. Both paths use the same validation, permissions, and implementation.
+- **[Shared data](https://agent-native.com/docs/server-database?utm_source=npm&utm_medium=referral&utm_content=core-readme).** Work done by the agent appears in the UI, and work done in the UI is available to the agent.
+- **[Shared application state](https://agent-native.com/docs/context-awareness?utm_source=npm&utm_medium=referral&utm_content=core-readme).** The agent receives relevant UI state, such as the current page, selected record, or active view.
+
+The agent does not click through the UI. It works through the same action layer as the UI.
+
+### Example: a shared action
+
+Create `actions/hello.ts`:
+
+```ts
+import { defineAction } from "@agent-native/core/action";
+import { z } from "zod";
+
+// One action powers every app surface: UI, agent, HTTP, MCP, A2A, and CLI.
+export default defineAction({
+  description: "Return a friendly greeting.",
+  schema: z.object({
+    name: z.string().default("world").describe("Name to greet"),
+  }),
+  http: { method: "GET" },
+  run: async ({ name }) => {
+    return { message: `Hello, ${name}!` };
+  },
+});
+```
+
+The agent receives `hello` as a tool. React calls the same function with `useActionQuery("hello", { name: "Alex" })`. Agent-Native also exposes it through HTTP, MCP, A2A, and the CLI.
+
+## Included
+
+- **[Agent chat](https://agent-native.com/docs/agent-surfaces?utm_source=npm&utm_medium=referral&utm_content=core-readme):** Let people delegate work, ask questions, and review results in the same UI.
+- **[Authentication and permissions](https://agent-native.com/docs/authentication?utm_source=npm&utm_medium=referral&utm_content=core-readme):** Control who can access and change shared work.
+- **[Skills and memory](https://agent-native.com/docs/agent-resources?utm_source=npm&utm_medium=referral&utm_content=core-readme):** Give agents reusable expertise and persistent context.
+- **[Automations](https://agent-native.com/docs/automations?utm_source=npm&utm_medium=referral&utm_content=core-readme):** Run agent work on schedules or events.
+- **[Agent teams](https://agent-native.com/docs/agent-teams?utm_source=npm&utm_medium=referral&utm_content=core-readme):** Delegate work to specialist agents in the same workspace or across connected agents.
+- **[PostgreSQL backend](https://agent-native.com/docs/server-database?utm_source=npm&utm_medium=referral&utm_content=core-readme):** Use PostgreSQL in production and PGlite for local development on any Nitro-compatible host.
+
+### Example: edit a running app visually
+
+Use `/visual-edit` in Claude Code to edit a running app on a canvas instead of
+prompting for each small UI nudge. Compare live pages together, then ask Claude
+to apply the chosen edits to your source. For example:
+
+```text
+/visual-edit the onboarding flow, plus home at every breakpoint
+```
+
+Review the onboarding screens alongside Home at desktop, tablet, and mobile
+sizes, adjust a button's color or spacing directly, then ask Claude to apply the
+pending edits to your source. See the [Visual Edit guide](./skills/visual-edit/README.md)
+for the full walkthrough and sharing details.
+
+Bring your LLM, SQL database, tools, and infrastructure. Everything you build stays yours.
+
+See Agent-Native in action:
+
+https://github.com/user-attachments/assets/ef51644b-6506-46d8-8083-0af7b7e5b65c
+
+<br />
+
+## Open-source agents
+
+Start from one of these agents or use it as an example for your own.
+
+<br />
 
 <table>
 <tr>
 <td width="33%" align="center" valign="top">
 
-**Mail**
-
-<a href="https://agent-native.com/templates/mail"><img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F6f49a81c404d4242b33317491eac7575?format=webp&width=800" alt="Mail template" width="100%" /></a>
-
-**Agent-Native Mail, Superhuman**
-
-Superhuman-style email client with keyboard shortcuts, AI triage, and a fully customizable inbox you own.
-
-</td>
-<td width="33%" align="center" valign="top">
-
-**Calendar**
-
-<a href="https://agent-native.com/templates/calendar"><img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2Ffb6c3b483ca24ab3b6c3a758aeceef4c?format=webp&width=800" alt="Calendar template" width="100%" /></a>
-
-**Agent-Native Google Calendar, Calendly**
-
-Manage events, sync with Google Calendar, and share a public booking page with AI scheduling.
-
-</td>
-<td width="33%" align="center" valign="top">
-
-**Plans**
-
-<a href="https://agent-native.com/templates/plan"><img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2Fb6f4213ac7cc42eeb10c12e8ccda8936?format=webp&width=800" alt="Plans template" width="100%" /></a>
-
-**Visual plan mode for coding agents**
-
-Install `/visual-plan` and `/visual-recap` so your coding agent can plan before it builds and recap changes after they land — high-level code reviews with diagrams, wireframes, annotations, and review links.
-
-</td>
-</tr>
-<tr>
-<td width="33%" align="center" valign="top">
-
-**Content**
-
-<a href="https://agent-native.com/templates/content"><img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F89bcfc6106304bfbaf8ec8a7ccd721eb?format=webp&width=800" alt="Content template" width="100%" /></a>
-
-**Agent-Native Notion, Google Docs**
-
-Write and organize content with an agent that knows your brand and publishing workflow.
-
-</td>
-<td width="33%" align="center" valign="top">
-
-**Slides**
-
-<a href="https://agent-native.com/templates/slides"><img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F2c09b451d40c4a74a89a38d69170c2d8?format=webp&width=800" alt="Slides template" width="100%" /></a>
-
-**Agent-Native Google Slides, Pitch**
-
-Generate and edit React-based presentations via prompt or point-and-click.
-
-</td>
-<td width="33%" align="center" valign="top">
-
-**Video**
-
-<a href="https://agent-native.com/templates/video"><img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F6b8bfcc18a1d4c47a491da3b2d4148a4?format=webp&width=800" alt="Video template" width="100%" /></a>
-
-**Agent-Native video editing**
-
-Create and edit Remotion video compositions with agent assistance.
-
-</td>
-</tr>
-<tr>
-<td width="33%" align="center" valign="top">
-
-**Analytics**
-
-<a href="https://agent-native.com/templates/analytics"><img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F4933a80cc3134d7e874631f688be828a?format=webp&width=800" alt="Analytics template" width="100%" /></a>
-
-**Agent-Native Amplitude, Mixpanel**
-
-Connect analytics data sources, prompt for real charts, and build reusable dashboards. Shared workspace connections can provide provider credentials, while Analytics still owns metrics, source-of-truth choices, and saved analyses.
-
-</td>
-<td width="33%" align="center" valign="top">
+<br />
 
 **Clips**
 
-<a href="https://agent-native.com/templates/clips"><img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F678be5a501a14ab8a508e5f7bc92c468?format=webp&width=800" alt="Clips template" width="100%" /></a>
+<a href="https://agent-native.com/apps/clips/?utm_source=npm&utm_medium=referral&utm_content=core-readme">
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F4dc9c87b9a224132855e1cb68cd89f9e?format=webp&width=800">
+<img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F462fdb643d5d403a8c54540c5c3292f6?format=webp&width=800" alt="Clips app screenshot" width="100%">
+</picture>
+</a>
 
-**Agent-Native Loom**
+Record and understand meetings, screens, and voice notes.
 
-Record your screen with auto-transcripts, shareable links, and an agent that summarizes, captions, and edits clips on demand.
+<br />
 
 </td>
 <td width="33%" align="center" valign="top">
+
+<br />
 
 **Design**
 
-<a href="https://agent-native.com/templates/design"><img src="https://cdn.builder.io/api/v1/image/assets%2F348da13fcd8b414c87de9066196f7266%2F961bedb713a94463b834c1f2f4643bcf?format=webp&width=800" alt="Design template" width="100%" /></a>
+<a href="https://agent-native.com/apps/design/?utm_source=npm&utm_medium=referral&utm_content=core-readme">
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F072f66a3e360464fb48617670ceee46f?format=webp&width=800">
+<img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2Fc9f693f170294bde8ebc733cff368af9?format=webp&width=800" alt="Design app screenshot" width="100%">
+</picture>
+</a>
 
-**Agent-Native Figma, Canva**
+Generate and refine interactive designs.
 
-Create and edit visual designs by prompt or by hand, with the agent as your co-designer.
+<br />
+
+</td>
+<td width="33%" align="center" valign="top">
+
+<br />
+
+**Slides**
+
+<a href="https://agent-native.com/apps/slides/?utm_source=npm&utm_medium=referral&utm_content=core-readme">
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F710f5b7586cc41deaa0e6f8de658a499?format=webp&width=800">
+<img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F6223a64717a04931a6f509696019f48b?format=webp&width=800" alt="Slides app screenshot" width="100%">
+</picture>
+</a>
+
+Create and edit on-brand presentations.
+
+<br />
 
 </td>
 </tr>
 <tr>
 <td width="33%" align="center" valign="top">
 
-**Dispatch**
+<br />
 
-<a href="https://agent-native.com/templates/dispatch"><img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F104b3ad8d1dc461aa33ab9bff37a4482?format=webp&width=800" alt="Dispatch template" width="100%" /></a>
+**Analytics**
 
-**Mission control for agent-native apps**
+<a href="https://agent-native.com/apps/analytics/?utm_source=npm&utm_medium=referral&utm_content=core-readme">
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2Fba632b39758d448594f7e5d2403e5d0f?format=webp&width=800">
+<img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F976ea93771b64b9e8c1b3eb12e606e07?format=webp&width=800" alt="Analytics app screenshot" width="100%">
+</picture>
+</a>
 
-Message, manage, and delegate to agents from Slack, Telegram, or the web. Dispatch is also the control plane for vault secrets, reusable provider connections, app grants, routing, memory, and approvals.
+Ask questions of your data and build dashboards.
 
-</td>
-<td width="33%" align="center" valign="top">
-
-**Forms**
-
-<a href="https://agent-native.com/templates/forms"><img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F190c3fabd51f4c1bba5aa4e091ad4e9b?format=webp&width=800" alt="Forms template" width="100%" /></a>
-
-**Agent-Native Typeform**
-
-Generate forms from a prompt, branch logic with the agent, and own every response in your own database.
+<br />
 
 </td>
 <td width="33%" align="center" valign="top">
 
-**Brain**
+<br />
 
-<a href="https://agent-native.com/templates/brain"><img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F9c9fe3b5b9494e33803cd3f494cba356?format=webp&width=800" alt="Brain template" width="100%" /></a>
+**Calendar**
 
-**Agent-Native company memory**
+<a href="https://agent-native.com/apps/calendar/?utm_source=npm&utm_medium=referral&utm_content=core-readme">
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F91d4c18d256b49e6bca24c23ce90a4f2?format=webp&width=800">
+<img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F8d9d48bb2f1d498f9601ac28c64edd4c?format=webp&width=800" alt="Calendar app screenshot" width="100%">
+</picture>
+</a>
 
-Ask questions over cited company knowledge from approved Slack, meetings, transcripts, GitHub, and decisions.
+Find time, schedule events, and manage bookings.
+
+<br />
+
+</td>
+<td width="33%" align="center" valign="top">
+
+<br />
+
+**Mail**
+
+<a href="https://agent-native.com/apps/mail/?utm_source=npm&utm_medium=referral&utm_content=core-readme">
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F216aaef9859144ffa3eb9498fa1132da?format=webp&width=800">
+<img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F064aee3ec5cd44879b9c186f63a6d6f4?format=webp&width=800" alt="Mail app screenshot" width="100%">
+</picture>
+</a>
+
+Prioritize email, draft replies, and follow up.
+
+<br />
 
 </td>
 </tr>
 <tr>
 <td width="33%" align="center" valign="top">
+
+<br />
 
 **Assets**
 
-<a href="https://agent-native.com/templates/assets"><img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F769092170a14474f998cbca47384f891?format=webp&width=800" alt="Assets template" width="100%" /></a>
+<a href="https://agent-native.com/apps/assets/?utm_source=npm&utm_medium=referral&utm_content=core-readme">
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2Fde445dd867744e9bac5d3e5d04c903b2?format=webp&width=800">
+<img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2Fac5701f0871f4edbb06fa9cdb12b166e?format=webp&width=800" alt="Assets app screenshot" width="100%">
+</picture>
+</a>
 
-**Agent-Native asset library**
+Create and organize on-brand media.
 
-Upload, organize, search, and generate on-brand image and video assets that other apps can reuse.
+<br />
+
+</td>
+<td width="33%" align="center" valign="top">
+
+<br />
+
+**Content**
+
+<a href="https://agent-native.com/apps/content/?utm_source=npm&utm_medium=referral&utm_content=core-readme">
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2Fa9f30380b03b4fd1a7d2ab371ddfd798?format=webp&width=800">
+<img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F979f792c79834470a513a9d9b733dd84?format=webp&width=800" alt="Content app screenshot" width="100%">
+</picture>
+</a>
+
+Draft, organize, and publish content.
+
+<br />
+
+</td>
+<td width="33%" align="center" valign="top">
+
+<br />
+
+**Plans**
+
+<a href="https://agent-native.com/apps/plan/?utm_source=npm&utm_medium=referral&utm_content=core-readme">
+<picture>
+<source media="(prefers-color-scheme: dark)" srcset="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2Fe89439e917044fc9ac9663737e35bf1f?format=webp&width=800">
+<img src="https://cdn.builder.io/api/v1/image/assets%2FYJIGb4i01jvw0SRdL5Bt%2F98427229c8c84c30afee56172503c294?format=webp&width=800" alt="Plans app screenshot" width="100%">
+</picture>
+</a>
+
+Create and review visual plans with diagrams, wireframes, and prototypes.
+
+<br />
 
 </td>
 </tr>
 </table>
 
-Every template is a complete cloneable SaaS — fork it, customize it with the agent, own it. Try them with example data before connecting your own sources.
+Explore the [full app gallery](https://agent-native.com/apps?utm_source=npm&utm_medium=referral&utm_content=core-readme), or start with the [framework guide](https://agent-native.com/docs/getting-started?utm_source=npm&utm_medium=referral&utm_content=core-readme).
 
-## Quick Start
+## Documentation and community
 
-```bash
-npx @agent-native/core@latest create my-platform
-cd my-platform
-pnpm install
-pnpm dev
-```
+- Read the [documentation](https://agent-native.com/docs?utm_source=npm&utm_medium=referral&utm_content=core-readme).
+- Join [Discord](https://discord.gg/qm82StQ2NC) to ask questions, share what you're building, and get help.
 
-The CLI shows a multi-select picker so you can include as many templates as you want in one workspace. Pick Mail + Calendar + Forms and you get all three apps wired up and sharing auth in one go. Or browse the **[template gallery](https://agent-native.com/templates)** for live demos.
+## Contributing
 
-Want a single app, no monorepo? Use `--standalone`:
-
-```bash
-npx @agent-native/core@latest create my-app --standalone --template mail
-```
-
-## Workspaces (Monorepo)
-
-A workspace is the default shape of an agent-native project. Every app sits under `apps/`, and `packages/shared/` is available for the small amount of code, instructions, skills, or branding that should truly apply to every app.
-
-```
-my-platform/
-├── package.json                   # declares `agent-native.workspaceCore`
-├── pnpm-workspace.yaml
-├── .env                           # shared secrets: ANTHROPIC_API_KEY, BUILDER_PRIVATE_KEY, A2A_SECRET, ...
-├── packages/
-│   └── shared/                    # optional shared custom code
-└── apps/
-    ├── mail/
-    ├── calendar/
-    └── forms/
-```
-
-Add another app later:
-
-```bash
-npx @agent-native/core@latest add-app notes --template content
-```
-
-Deploy every app behind one origin:
-
-```bash
-npx @agent-native/core@latest deploy
-# https://your-agents.com/mail/*       → mail
-# https://your-agents.com/calendar/*   → calendar
-# https://your-agents.com/forms/*      → forms
-```
-
-Same-origin deploy means a **shared login session** across every app and **zero-config cross-app A2A** — tag `@mail` from the calendar's agent chat and it just works (no JWT signing, no CORS). Full details at **[agent-native.com/docs/multi-app-workspace](https://agent-native.com/docs/multi-app-workspace)**.
-
-## The Best of Both Worlds
-
-|                   | SaaS Tools         | Raw AI Agents           | Internal Tools             | Agent-Native            |
-| ----------------- | ------------------ | ----------------------- | -------------------------- | ----------------------- |
-| **UI**            | Polished but rigid | None                    | Mixed quality              | Full UI, fork & go      |
-| **AI**            | Bolted on          | Powerful                | Shallowly connected        | Agent-first, integrated |
-| **Customization** | Can't              | Instructions and skills | Full, but high maintenance | Agent modifies the app  |
-| **Ownership**     | Rented             | Somewhat yours          | You own the code           | You own the code        |
-
-## Community
-
-Join the **[Discord](https://discord.gg/qm82StQ2NC)** to ask questions, share what you're building, and get help.
-
-## Docs
-
-Full documentation at **[agent-native.com](https://agent-native.com)**.
+Working on this repository itself? See [DEVELOPMENT.md](./DEVELOPMENT.md) for local setup, workspace structure, and guard scripts.
 
 ## License
 

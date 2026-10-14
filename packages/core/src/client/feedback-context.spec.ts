@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 
 import { beforeEach, describe, expect, it } from "vitest";
+
 import { getFeedbackClientContext } from "./feedback-context.js";
 
 describe("getFeedbackClientContext", () => {
@@ -53,6 +54,20 @@ describe("getFeedbackClientContext", () => {
     expect(context.pageUrl).toBe(
       "http://localhost:3000/inbox?token=%3Credacted%3E&utm=ok#section",
     );
+    expect(context.clientSurface).toBe("web");
+  });
+
+  it("detects the Tauri desktop surface from the injected global", () => {
+    (
+      window as unknown as { __TAURI_INTERNALS__?: unknown }
+    ).__TAURI_INTERNALS__ = {};
+    try {
+      const context = getFeedbackClientContext();
+      expect(context.clientSurface).toBe("tauri");
+    } finally {
+      delete (window as unknown as { __TAURI_INTERNALS__?: unknown })
+        .__TAURI_INTERNALS__;
+    }
   });
 
   it("dedupes chat session ids", () => {
@@ -69,5 +84,23 @@ describe("getFeedbackClientContext", () => {
     const context = getFeedbackClientContext({ chatSessionId: "same-thread" });
 
     expect(context.chatSessionIds).toEqual(["same-thread"]);
+  });
+
+  it("uses an explicit message run id over the currently active run", () => {
+    sessionStorage.setItem(
+      "agent-chat-active-run",
+      JSON.stringify({
+        threadId: "same-thread",
+        runId: "active-run",
+        lastSeq: 1,
+      }),
+    );
+
+    const context = getFeedbackClientContext({
+      chatSessionId: "same-thread",
+      activeRunId: "message-run",
+    });
+
+    expect(context.activeRunId).toBe("message-run");
   });
 });

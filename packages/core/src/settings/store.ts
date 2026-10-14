@@ -1,66 +1,210 @@
-import { EventEmitter } from "events";
-import { getDbExec, isPostgres, intType } from "../db/client.js";
+import type { EventEmitter } from "node:events";
+
+import { getDbExec, type DbExec } from "../db/client.js";
+import { ensureIndexExists, ensureTableExists } from "../db/ddl-guard.js";
+import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import { widenIntColumnsToBigInt } from "../db/widen-columns.js";
+import { captureError } from "../server/capture-error.js";
+import { getRequestContext } from "../server/request-context.js";
+import { assertNoInlineImageBytes } from "../shared/inline-bytes.js";
+import { createEventEmitter } from "../shared/optional-node-builtins.js";
 
 let _initPromise: Promise<void> | undefined;
 
-const _emitter = new EventEmitter();
+const _requestSettingsCache = new WeakMap<object, Map<string, string | null>>();
 
-export function getSettingsEmitter(): EventEmitter {
+function requestSettingsCache(): Map<string, string | null> | null {
+  const ctx = getRequestContext();
+  if (!ctx || typeof ctx !== "object") return null;
+  let cache = _requestSettingsCache.get(ctx);
+  if (!cache) {
+    cache = new Map();
+    _requestSettingsCache.set(ctx, cache);
+  }
+  return cache;
+}
+
+let _emitter: EventEmitter | undefined;
+
+function settingsEmitter(): EventEmitter {
+  if (!_emitter) _emitter = createEventEmitter();
   return _emitter;
 }
 
-function settingsTable(): string {
-  return isPostgres() ? "public.settings" : "settings";
+export function getSettingsEmitter(): EventEmitter {
+  return settingsEmitter();
 }
 
-async function ensureTable(): Promise<void> {
+function settingsTable(): string {
+  return "public.settings";
+}
+
+export async function ensureTable(): Promise<void> {
   if (!_initPromise) {
-    _initPromise = (async () => {
-      const client = getDbExec();
+    const _initPromiseWithRequestDbPoolScope = (async () => {
       const table = settingsTable();
-      await client.execute(`
+      const createSql = `
         CREATE TABLE IF NOT EXISTS ${table} (
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL,
-          updated_at ${intType()} NOT NULL
+          updated_at BIGINT NOT NULL
         )
-      `);
-      // Index for the poll watermark query: `SELECT MAX(updated_at) FROM settings`.
-      // MAX on an indexed column avoids a full-table scan on every poll cycle.
-      // IF NOT EXISTS makes it idempotent on existing databases.
-      try {
-        await client.execute(
-          `CREATE INDEX IF NOT EXISTS settings_updated_at_idx ON ${table} (updated_at)`,
-        );
-      } catch {
-        // Index already exists or the dialect rejected a duplicate.
-      }
+      `;
+
+      await ensureTableExists("settings", createSql);
+      await widenIntColumnsToBigInt("settings", ["updated_at"]);
+      await ensureIndexExists(
+        "settings_updated_at_idx",
+        `CREATE INDEX IF NOT EXISTS settings_updated_at_idx ON ${table} (updated_at)`,
+      );
     })().catch((err) => {
-      // Retry init on the next call after a failed startup.
       _initPromise = undefined;
       throw err;
     });
+    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
   }
   return _initPromise;
 }
 
+export interface StoreReadOptions {
+  /** Skip the per-request snapshot when a cross-request race must be checked. */
+  bypassCache?: boolean;
+  transaction?: DbExec;
+}
+
 export async function getSetting(
   key: string,
+  options?: StoreReadOptions,
 ): Promise<Record<string, unknown> | null> {
-  await ensureTable();
-  const client = getDbExec();
+  const cache = options?.transaction ? null : requestSettingsCache();
+  if (!options?.bypassCache && cache?.has(key)) {
+    const cached = cache.get(key);
+    return cached == null ? null : JSON.parse(cached);
+  }
+  if (!options?.transaction) await ensureTable();
+  const client = options?.transaction ?? getDbExec();
   const table = settingsTable();
   const { rows } = await client.execute({
     sql: `SELECT value FROM ${table} WHERE key = ?`,
     args: [key],
   });
-  if (rows.length === 0) return null;
-  return JSON.parse(rows[0].value as string);
+  const raw = rows.length === 0 ? null : (rows[0].value as string);
+  if (!options?.bypassCache) cache?.set(key, raw);
+  return raw == null ? null : JSON.parse(raw);
+}
+
+const SETTINGS_IN_LIST_CHUNK_SIZE = 500;
+
+function parseSettingValue(
+  key: string,
+  raw: string,
+): Record<string, unknown> | null {
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    captureError(error, {
+      tags: { source: "settings", op: "getSettings" },
+      extra: { key },
+    });
+    return null;
+  }
+}
+
+export async function getSettings(
+  keys: readonly string[],
+  options?: StoreReadOptions,
+): Promise<Map<string, Record<string, unknown> | null>> {
+  const uniqueKeys = [...new Set(keys)];
+  const result = new Map<string, Record<string, unknown> | null>();
+  if (uniqueKeys.length === 0) return result;
+
+  const cache = options?.transaction ? null : requestSettingsCache();
+  const misses: string[] = [];
+  for (const key of uniqueKeys) {
+    if (!options?.bypassCache && cache?.has(key)) {
+      const cached = cache.get(key);
+      result.set(key, cached == null ? null : parseSettingValue(key, cached));
+    } else {
+      misses.push(key);
+    }
+  }
+  if (misses.length === 0) return result;
+
+  if (!options?.transaction) await ensureTable();
+  const client = options?.transaction ?? getDbExec();
+  const table = settingsTable();
+  const rawByKey = new Map<string, string>();
+  for (let i = 0; i < misses.length; i += SETTINGS_IN_LIST_CHUNK_SIZE) {
+    const chunk = misses.slice(i, i + SETTINGS_IN_LIST_CHUNK_SIZE);
+    const placeholders = chunk.map(() => "?").join(", ");
+    const { rows } = await client.execute({
+      sql: `SELECT key, value FROM ${table} WHERE key IN (${placeholders})`,
+      args: chunk,
+    });
+    for (const row of rows) {
+      rawByKey.set(row.key as string, row.value as string);
+    }
+  }
+  for (const key of misses) {
+    const raw = rawByKey.get(key) ?? null;
+    if (!options?.bypassCache) cache?.set(key, raw);
+    result.set(key, raw == null ? null : parseSettingValue(key, raw));
+  }
+  return result;
 }
 
 export interface StoreWriteOptions {
-  /** Tag identifying who initiated this write (e.g. a tab ID). */
   requestSource?: string;
+}
+
+const SETTINGS_MUTATION_ATTEMPTS = 25;
+
+export async function mutateSetting(
+  key: string,
+  updater: (
+    current: Record<string, unknown> | null,
+  ) => Record<string, unknown> | Promise<Record<string, unknown>>,
+  options?: StoreWriteOptions,
+): Promise<Record<string, unknown>> {
+  await ensureTable();
+  const client = getDbExec();
+  const table = settingsTable();
+  for (let attempt = 0; attempt < SETTINGS_MUTATION_ATTEMPTS; attempt += 1) {
+    const snapshot = await client.execute({
+      sql: `SELECT value FROM ${table} WHERE key = ?`,
+      args: [key],
+    });
+    const raw =
+      snapshot.rows.length === 0 ? null : (snapshot.rows[0]?.value as string);
+    const current = raw == null ? null : JSON.parse(raw);
+    const next = await updater(current);
+    assertNoInlineImageBytes(next, `setting "${key}"`);
+    const nextRaw = JSON.stringify(next);
+    // An unchanged value is not a write: it would bump updated_at and publish
+    // a settings event that makes every open page refetch for nothing.
+    if (raw !== null && nextRaw === raw) return JSON.parse(raw);
+    const timestamp = Date.now();
+    const result =
+      raw == null
+        ? await client.execute({
+            sql: `INSERT INTO ${table} (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO NOTHING`,
+            args: [key, nextRaw, timestamp],
+          })
+        : await client.execute({
+            sql: `UPDATE ${table} SET value = ?, updated_at = ? WHERE key = ? AND value = ?`,
+            args: [nextRaw, timestamp, key, raw],
+          });
+    if (result.rowsAffected === 0) continue;
+    requestSettingsCache()?.set(key, nextRaw);
+    settingsEmitter().emit("settings", {
+      source: "settings",
+      type: "change",
+      key,
+      ...(options?.requestSource && { requestSource: options.requestSource }),
+    });
+    return JSON.parse(nextRaw);
+  }
+  throw new Error(`Setting ${key} changed too many times; retry the mutation.`);
 }
 
 export async function putSetting(
@@ -68,16 +212,17 @@ export async function putSetting(
   value: Record<string, unknown>,
   options?: StoreWriteOptions,
 ): Promise<void> {
+  assertNoInlineImageBytes(value, `setting "${key}"`);
+  const serialized = JSON.stringify(value);
   await ensureTable();
   const client = getDbExec();
   const table = settingsTable();
   await client.execute({
-    sql: isPostgres()
-      ? `INSERT INTO ${table} (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at`
-      : `INSERT OR REPLACE INTO ${table} (key, value, updated_at) VALUES (?, ?, ?)`,
-    args: [key, JSON.stringify(value), Date.now()],
+    sql: `INSERT INTO ${table} (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at`,
+    args: [key, serialized, Date.now()],
   });
-  _emitter.emit("settings", {
+  requestSettingsCache()?.set(key, serialized);
+  settingsEmitter().emit("settings", {
     source: "settings",
     type: "change",
     key,
@@ -96,8 +241,9 @@ export async function deleteSetting(
     sql: `DELETE FROM ${table} WHERE key = ?`,
     args: [key],
   });
+  requestSettingsCache()?.set(key, null);
   if (result.rowsAffected > 0) {
-    _emitter.emit("settings", {
+    settingsEmitter().emit("settings", {
       source: "settings",
       type: "delete",
       key,
@@ -108,16 +254,75 @@ export async function deleteSetting(
   return false;
 }
 
-export async function getAllSettings(): Promise<
-  Record<string, Record<string, unknown>>
-> {
+export async function deleteSettingIfValue(
+  key: string,
+  expected: Record<string, unknown>,
+  options?: StoreWriteOptions,
+): Promise<boolean> {
   await ensureTable();
   const client = getDbExec();
   const table = settingsTable();
-  const { rows } = await client.execute(`SELECT key, value FROM ${table}`);
-  const result: Record<string, Record<string, unknown>> = {};
-  for (const row of rows) {
-    result[row.key as string] = JSON.parse(row.value as string);
+  const result = await client.execute({
+    sql: `DELETE FROM ${table} WHERE key = ? AND value = ?`,
+    args: [key, JSON.stringify(expected)],
+  });
+  if (result.rowsAffected === 0) return false;
+
+  requestSettingsCache()?.set(key, null);
+  settingsEmitter().emit("settings", {
+    source: "settings",
+    type: "delete",
+    key,
+    ...(options?.requestSource && { requestSource: options.requestSource }),
+  });
+  return true;
+}
+
+export async function deleteSettingsByPrefix(
+  prefix: string,
+  options?: StoreWriteOptions,
+): Promise<number> {
+  await ensureTable();
+  const client = getDbExec();
+  const table = settingsTable();
+  const escaped = prefix.replace(/[!%_]/g, (c) => `!${c}`);
+  const result = await client.execute({
+    sql: `DELETE FROM ${table} WHERE key LIKE ? ESCAPE '!'`,
+    args: [`${escaped}%`],
+  });
+  requestSettingsCache()?.clear();
+  if (result.rowsAffected > 0) {
+    settingsEmitter().emit("settings", {
+      source: "settings",
+      type: "delete",
+      key: prefix,
+      ...(options?.requestSource && { requestSource: options.requestSource }),
+    });
   }
-  return result;
+  return result.rowsAffected;
+}
+
+export async function listSettingsByPrefix(
+  prefix: string,
+  options?: { limit?: number },
+): Promise<Array<{ key: string; value: Record<string, unknown> }>> {
+  await ensureTable();
+  const client = getDbExec();
+  const table = settingsTable();
+  const escaped = prefix.replace(/[!%_]/g, (c) => `!${c}`);
+  const limit = options?.limit;
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0)) {
+    throw new RangeError(
+      "Settings prefix limit must be a non-negative integer.",
+    );
+  }
+  const { rows } = await client.execute({
+    sql: `SELECT key, value FROM ${table} WHERE key LIKE ? ESCAPE '!'
+      ${limit === undefined ? "" : "ORDER BY key ASC LIMIT ?"}`,
+    args: limit === undefined ? [`${escaped}%`] : [`${escaped}%`, limit],
+  });
+  return rows.map((row) => ({
+    key: String(row.key),
+    value: JSON.parse(String(row.value)) as Record<string, unknown>,
+  }));
 }

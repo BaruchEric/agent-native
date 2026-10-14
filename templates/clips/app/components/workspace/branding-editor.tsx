@@ -1,22 +1,41 @@
-import { useState } from "react";
+import { appApiPath } from "@agent-native/core/client/api-path";
+import { useActionMutation } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { FileStorageSetupPopover } from "@agent-native/toolkit/app/chat/FileStorageSetupPopover";
 import { IconPalette, IconPhoto } from "@tabler/icons-react";
-import { appBasePath, useActionMutation } from "@agent-native/core/client";
 import { useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { useVideoStorageStatus } from "@/hooks/use-video-storage-status";
+import { organizationLogoUrl } from "@/lib/organization-logo";
+
+export type RecordingVisibility = "private" | "org" | "public";
 
 interface BrandingEditorProps {
   organizationId: string;
   initialName: string;
   initialBrandColor: string;
   initialBrandLogoUrl: string | null;
+  initialDefaultVisibility?: RecordingVisibility;
   disabled?: boolean;
 }
 
-const PRESETS = [
+const DEFAULT_VISIBILITY: RecordingVisibility = "public";
+
+/** Brand colors offered as swatches; these are data, not theme colors. */
+export const BRAND_COLOR_PRESETS = [
   "#18181B",
   "#22C55E",
   "#F97316",
@@ -26,22 +45,41 @@ const PRESETS = [
   "#111827",
 ];
 
-async function uploadLogo(file: File): Promise<string> {
+export async function uploadLogo(
+  file: File,
+  organizationId: string,
+): Promise<string> {
   const body = await file.arrayBuffer();
-  const res = await fetch(
-    `${appBasePath()}/api/media?filename=${encodeURIComponent(file.name)}`,
-    {
-      method: "POST",
-      body,
-      headers: { "Content-Type": file.type || "application/octet-stream" },
-    },
-  );
+  const query = new URLSearchParams({
+    organizationId,
+    filename: file.name,
+  });
+  const res = await fetch(appApiPath(`/api/media?${query}`), {
+    method: "POST",
+    body,
+    headers: { "Content-Type": file.type || "application/octet-stream" },
+  });
   if (!res.ok) {
-    throw new Error(`Upload failed (${res.status})`);
+    const responseText = await res.text();
+    let errorMessage: string | undefined;
+    try {
+      const body: unknown = JSON.parse(responseText);
+      if (
+        typeof body === "object" &&
+        body !== null &&
+        "error" in body &&
+        typeof body.error === "string"
+      ) {
+        errorMessage = body.error;
+      }
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+    }
+    throw new Error(errorMessage ?? `Upload failed (${res.status})`);
   }
-  const json = (await res.json()) as { url?: string };
-  if (!json.url) throw new Error("Upload returned no URL");
-  return json.url;
+  const json = (await res.json()) as { reference?: string };
+  if (!json.reference) throw new Error("Upload returned no reference");
+  return json.reference;
 }
 
 export function BrandingEditor({
@@ -49,15 +87,77 @@ export function BrandingEditor({
   initialName,
   initialBrandColor,
   initialBrandLogoUrl,
+  initialDefaultVisibility = DEFAULT_VISIBILITY,
   disabled,
 }: BrandingEditorProps) {
+  const t = useT();
+  const {
+    data: storageData,
+    isError: storageStatusError,
+    refetch: refreshStorageStatus,
+  } = useVideoStorageStatus();
+  const storageConfigured =
+    storageData?.configured === true && !storageStatusError;
+  const logoUploadInputRef = useRef<HTMLInputElement>(null);
+  const pendingLogoFileRef = useRef<File | null>(null);
+  const [fileStoragePromptOpen, setFileStoragePromptOpen] = useState(false);
   const [name, setName] = useState(initialName);
   const [brandColor, setBrandColor] = useState(initialBrandColor);
   const [brandLogoUrl, setBrandLogoUrl] = useState<string | null>(
     initialBrandLogoUrl,
   );
+  const [defaultVisibility, setDefaultVisibility] =
+    useState<RecordingVisibility>(initialDefaultVisibility);
   const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [uploadPreviewUrl, setUploadPreviewUrl] = useState<string | null>(null);
+
+  const promptForStorage = useCallback(async () => {
+    if (storageData?.configured === false && !storageStatusError) {
+      setFileStoragePromptOpen(true);
+      return;
+    }
+    try {
+      const result = await refreshStorageStatus();
+      if (result.isError || typeof result.data?.configured !== "boolean") {
+        setFileStoragePromptOpen(true);
+      } else if (!result.data.configured) {
+        setFileStoragePromptOpen(true);
+      }
+    } catch {
+      setFileStoragePromptOpen(true);
+    }
+  }, [refreshStorageStatus, storageData?.configured, storageStatusError, t]);
+
+  useEffect(
+    () => () => {
+      if (uploadPreviewUrl) URL.revokeObjectURL(uploadPreviewUrl);
+    },
+    [uploadPreviewUrl],
+  );
+
+  const [savedState, setSavedState] = useState({
+    name: initialName,
+    brandColor: initialBrandColor,
+    brandLogoUrl: initialBrandLogoUrl,
+    defaultVisibility: initialDefaultVisibility,
+  });
+
+  useEffect(() => {
+    setDefaultVisibility(initialDefaultVisibility);
+    setSavedState((current) => ({
+      ...current,
+      defaultVisibility: initialDefaultVisibility,
+    }));
+  }, [initialDefaultVisibility]);
+
+  const isDirty =
+    name !== savedState.name ||
+    brandColor !== savedState.brandColor ||
+    brandLogoUrl !== savedState.brandLogoUrl ||
+    defaultVisibility !== savedState.defaultVisibility;
+  const logoUrl =
+    uploadPreviewUrl ?? organizationLogoUrl(brandLogoUrl, organizationId);
 
   const qc = useQueryClient();
   const save = useActionMutation<
@@ -67,25 +167,79 @@ export function BrandingEditor({
       name?: string;
       brandColor?: string;
       brandLogoUrl?: string | null;
+      defaultVisibility?: RecordingVisibility;
     }
   >("set-organization-branding");
 
-  async function handleFile(file: File) {
-    if (!file.type.startsWith("image/")) {
-      toast.error("Please upload an image file.");
+  const handleFile = useCallback(
+    async (file: File) => {
+      if (!file.type.startsWith("image/")) {
+        toast.error(t("brandingEditor.uploadImageFile"));
+        return;
+      }
+      if (!storageConfigured) {
+        pendingLogoFileRef.current = file;
+        await promptForStorage();
+        return;
+      }
+      pendingLogoFileRef.current = null;
+      setUploadPreviewUrl(URL.createObjectURL(file));
+      try {
+        setUploading(true);
+        const reference = await uploadLogo(file, organizationId);
+        setBrandLogoUrl(reference);
+        toast.success(t("brandingEditor.logoUploaded"));
+      } catch (err) {
+        setUploadPreviewUrl(null);
+        const storageSetupRequired =
+          err instanceof Error &&
+          err.message.includes("No object storage is connected");
+        if (storageSetupRequired) {
+          const result = await refreshStorageStatus();
+          if (result.isError || typeof result.data?.configured !== "boolean") {
+            toast.error(t("recordingPage.tryAgainMoment"));
+          } else if (!result.data.configured) {
+            pendingLogoFileRef.current = file;
+            setFileStoragePromptOpen(true);
+          } else {
+            toast.error(
+              err instanceof Error
+                ? err.message
+                : t("brandingEditor.uploadFailed"),
+            );
+          }
+          return;
+        }
+        toast.error(
+          err instanceof Error ? err.message : t("brandingEditor.uploadFailed"),
+        );
+      } finally {
+        setUploading(false);
+      }
+    },
+    [
+      organizationId,
+      promptForStorage,
+      refreshStorageStatus,
+      storageConfigured,
+      t,
+    ],
+  );
+
+  useEffect(() => {
+    if (!storageConfigured) {
+      if (storageData?.configured === false && pendingLogoFileRef.current) {
+        setFileStoragePromptOpen(true);
+      }
       return;
     }
-    try {
-      setUploading(true);
-      const url = await uploadLogo(file);
-      setBrandLogoUrl(url);
-      toast.success("Logo uploaded");
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Upload failed");
-    } finally {
-      setUploading(false);
+    setFileStoragePromptOpen(false);
+    const pending = pendingLogoFileRef.current;
+    if (pending) {
+      pendingLogoFileRef.current = null;
+      void handleFile(pending);
     }
-  }
+  }, [handleFile, storageConfigured, storageData?.configured]);
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
@@ -95,13 +249,18 @@ export function BrandingEditor({
         name: name.trim() || undefined,
         brandColor,
         brandLogoUrl,
+        defaultVisibility,
       });
-      toast.success("Branding updated");
-      qc.invalidateQueries({
+      setSavedState({ name, brandColor, brandLogoUrl, defaultVisibility });
+      setUploadPreviewUrl(null);
+      toast.success(t("brandingEditor.brandingUpdated"));
+      void qc.invalidateQueries({
         queryKey: ["action", "list-organization-state"],
       });
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to save");
+      toast.error(
+        err instanceof Error ? err.message : t("brandingEditor.saveFailed"),
+      );
     }
   }
 
@@ -110,13 +269,31 @@ export function BrandingEditor({
       <CardHeader>
         <CardTitle className="text-base flex items-center gap-2">
           <IconPalette className="size-4 text-primary" />
-          Branding
+          {t("brandingEditor.title")}
         </CardTitle>
       </CardHeader>
       <CardContent>
+        <FileStorageSetupPopover
+          open={fileStoragePromptOpen}
+          onOpenChange={(open, reason) => {
+            if (!open && reason === "dismiss") {
+              pendingLogoFileRef.current = null;
+            }
+            setFileStoragePromptOpen(open);
+          }}
+          onConnected={() => void refreshStorageStatus()}
+          {...(!storageData || storageStatusError
+            ? {
+                status: "unavailable" as const,
+                onRetry: () => void refreshStorageStatus(),
+              }
+            : { status: "missing" as const })}
+        />
         <form onSubmit={handleSave} className="space-y-5">
           <div className="space-y-1.5">
-            <Label htmlFor="ws-name">Organization name</Label>
+            <Label htmlFor="ws-name">
+              {t("brandingEditor.organizationName")}
+            </Label>
             <Input
               id="ws-name"
               value={name}
@@ -126,15 +303,15 @@ export function BrandingEditor({
           </div>
 
           <div className="space-y-1.5">
-            <Label>Brand color</Label>
-            <div className="flex items-center gap-2">
+            <Label>{t("brandingEditor.brandColor")}</Label>
+            <div className="flex flex-wrap items-center gap-2">
               <input
                 type="color"
                 value={brandColor}
                 onChange={(e) => setBrandColor(e.target.value)}
                 disabled={disabled}
                 className="h-9 w-16 rounded-md border border-input bg-background p-1 cursor-pointer"
-                aria-label="Brand color picker"
+                aria-label={t("brandingEditor.brandColorPicker")}
               />
               <Input
                 value={brandColor}
@@ -142,15 +319,15 @@ export function BrandingEditor({
                 disabled={disabled}
                 className="max-w-[120px] tabular-nums uppercase"
               />
-              <div className="flex items-center gap-1 ml-2">
-                {PRESETS.map((c) => (
+              <div className="flex items-center gap-1 ms-2">
+                {BRAND_COLOR_PRESETS.map((c) => (
                   <button
                     key={c}
                     type="button"
                     className="h-6 w-6 rounded-full border border-input"
                     style={{ background: c }}
                     onClick={() => setBrandColor(c)}
-                    aria-label={`Use ${c}`}
+                    aria-label={t("brandingEditor.useColor", { color: c })}
                     disabled={disabled}
                   />
                 ))}
@@ -159,33 +336,36 @@ export function BrandingEditor({
           </div>
 
           <div className="space-y-1.5">
-            <Label>Logo</Label>
+            <Label>{t("brandingEditor.logo")}</Label>
+            <p className="text-xs text-muted-foreground">
+              {t("brandingEditor.logoUsage")}
+            </p>
             <div
               className={`rounded-md border border-dashed p-4 flex items-center gap-4 ${
                 dragging ? "bg-primary/5 border-primary" : ""
               }`}
               onDragOver={(e) => {
                 e.preventDefault();
-                setDragging(true);
+                if (!disabled) setDragging(true);
               }}
               onDragLeave={() => setDragging(false)}
               onDrop={(e) => {
                 e.preventDefault();
                 setDragging(false);
                 const file = e.dataTransfer.files?.[0];
-                if (file) handleFile(file);
+                if (file && !disabled) void handleFile(file);
               }}
             >
               <div
                 className="h-14 w-14 rounded-md flex items-center justify-center border bg-muted/30"
                 style={{
-                  background: brandLogoUrl ? undefined : brandColor + "20",
+                  background: logoUrl ? undefined : brandColor + "20",
                 }}
               >
-                {brandLogoUrl ? (
+                {logoUrl ? (
                   <img
-                    src={brandLogoUrl}
-                    alt="Logo preview"
+                    src={logoUrl}
+                    alt={t("brandingEditor.logoPreview")}
                     className="max-h-12 max-w-12 object-contain"
                   />
                 ) : (
@@ -195,25 +375,37 @@ export function BrandingEditor({
               <div className="flex-1 min-w-0">
                 <div className="text-sm text-muted-foreground">
                   {brandLogoUrl
-                    ? "Drop a new image to replace"
-                    : "Drop a PNG / JPG / SVG here"}
+                    ? t("brandingEditor.dropReplace")
+                    : t("brandingEditor.dropHere")}
                 </div>
                 <div className="flex items-center gap-2 mt-2">
-                  <Label
-                    htmlFor="logo-upload"
-                    className="inline-flex items-center rounded-md border border-input bg-background px-3 py-1.5 text-sm cursor-pointer hover:bg-accent"
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={disabled || uploading}
+                    onClick={() => {
+                      if (!storageConfigured) {
+                        void promptForStorage();
+                        return;
+                      }
+                      logoUploadInputRef.current?.click();
+                    }}
                   >
-                    {uploading ? "Uploading…" : "Choose file"}
-                  </Label>
+                    {uploading
+                      ? t("brandingEditor.uploading")
+                      : t("brandingEditor.chooseFile")}
+                  </Button>
                   <input
+                    ref={logoUploadInputRef}
                     id="logo-upload"
                     type="file"
                     accept="image/*"
                     className="sr-only"
-                    disabled={disabled || uploading}
+                    disabled={disabled || uploading || !storageConfigured}
                     onChange={(e) => {
                       const file = e.target.files?.[0];
-                      if (file) handleFile(file);
+                      if (file) void handleFile(file);
                     }}
                   />
                   {brandLogoUrl ? (
@@ -221,10 +413,13 @@ export function BrandingEditor({
                       type="button"
                       variant="ghost"
                       size="sm"
-                      onClick={() => setBrandLogoUrl(null)}
+                      onClick={() => {
+                        setBrandLogoUrl(null);
+                        setUploadPreviewUrl(null);
+                      }}
                       disabled={disabled}
                     >
-                      Remove
+                      {t("brandingEditor.remove")}
                     </Button>
                   ) : null}
                 </div>
@@ -232,17 +427,48 @@ export function BrandingEditor({
             </div>
           </div>
 
+          <div className="space-y-1.5">
+            <Label htmlFor="default-visibility">
+              {t("brandingEditor.defaultVisibility")}
+            </Label>
+            <Select
+              value={defaultVisibility}
+              onValueChange={(value) =>
+                setDefaultVisibility(value as RecordingVisibility)
+              }
+              disabled={disabled}
+            >
+              <SelectTrigger id="default-visibility">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="public">
+                  {t("playerSettings.visibilityPublic")}
+                </SelectItem>
+                <SelectItem value="org">
+                  {t("playerSettings.visibilityOrg")}
+                </SelectItem>
+                <SelectItem value="private">
+                  {t("playerSettings.visibilityPrivate")}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              {t("brandingEditor.defaultVisibilityDescription")}
+            </p>
+          </div>
+
           <div className="rounded-md border p-4">
             <div className="text-xs uppercase tracking-wide text-muted-foreground mb-2">
-              Preview
+              {t("brandingEditor.preview")}
             </div>
             <div
               className="rounded-md p-3 flex items-center gap-3 text-white"
               style={{ background: brandColor }}
             >
-              {brandLogoUrl ? (
+              {logoUrl ? (
                 <img
-                  src={brandLogoUrl}
+                  src={logoUrl}
                   alt=""
                   className="h-8 w-8 rounded bg-white/90 object-contain p-1"
                 />
@@ -255,18 +481,40 @@ export function BrandingEditor({
                 </div>
               )}
               <div className="font-medium truncate">
-                {name || "Organization"}
+                {name || t("brandingEditor.organizationFallback")}
               </div>
+            </div>
+            <div className="text-xs uppercase tracking-wide text-muted-foreground mt-4 mb-2">
+              {t("brandingEditor.emailHeaderPreview")}
+            </div>
+            <div className="rounded-md border border-[#27272a] bg-[#0a0a0c] p-4 flex items-center justify-center gap-2">
+              {logoUrl ? (
+                <img src={logoUrl} alt="" className="h-7 w-7 object-contain" />
+              ) : (
+                <div
+                  className="h-7 w-7 rounded bg-white/90 flex items-center justify-center font-semibold text-[12px]"
+                  style={{ color: brandColor }}
+                >
+                  {name.slice(0, 1).toUpperCase() || "C"}
+                </div>
+              )}
+              <span className="font-semibold text-[#fafafa] truncate">
+                {name || t("brandingEditor.organizationFallback")}
+              </span>
             </div>
           </div>
 
           <div className="flex justify-end">
             <Button
               type="submit"
-              disabled={disabled || save.isPending}
-              className="bg-primary hover:bg-primary/90 text-primary-foreground"
+              variant={isDirty ? "default" : "secondary"}
+              disabled={disabled || save.isPending || !isDirty}
             >
-              {save.isPending ? "Saving…" : "Save"}
+              {save.isPending
+                ? t("brandingEditor.saving")
+                : isDirty
+                  ? t("brandingEditor.save")
+                  : t("brandingEditor.saved")}
             </Button>
           </div>
         </form>

@@ -1,20 +1,28 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { useSearchParams } from "react-router";
-import { useActionMutation, useActionQuery } from "@agent-native/core/client";
+import {
+  useActionMutation,
+  useActionQuery,
+} from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { ShareButton } from "@agent-native/toolkit/app/sharing";
+import { VisibilityBadge } from "@agent-native/toolkit/sharing";
 import {
   IconAlertTriangle,
   IconArchive,
   IconBrandGithub,
   IconBrandSlack,
+  IconBrandZoom,
   IconChecks,
+  IconChevronDown,
   IconCircleCheck,
   IconCircleDashed,
   IconClock,
+  IconCopy,
   IconDatabaseImport,
   IconDotsVertical,
   IconExternalLink,
   IconFileSearch,
   IconFileText,
+  IconFolderOpen,
   IconLoader2,
   IconNotes,
   IconPlayerPlay,
@@ -27,32 +35,31 @@ import {
   IconWebhook,
 } from "@tabler/icons-react";
 import {
-  type BrainConnectionProvider,
-  type BrainHealthResponse,
-  type BrainCaptureReviewStatus,
-  type BrainCaptureReviewItem,
-  type EnqueueCapturesDistillationResponse,
-  type CapturesResponse,
-  type BrainSource,
-  type BrainWorkspaceConnectionGrantState,
-  type BrainWorkspaceConnectionStatus,
-  type BrainWorkspaceCredentialRef,
-  type ConnectionProvidersResponse,
-  type SourcesResponse,
-  formatPercent,
-  sourceAutoSync,
-  sourceDescription,
-  sourceEnabled,
-  sourceHealth,
-  sourceLastSync,
-  sourceName,
-  sourceRetryAfter,
-  sourceReviewRequired,
-  sourceType,
-} from "@/lib/brain";
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type ReactNode,
+} from "react";
+import { useSearchParams } from "react-router";
+
+import {
+  EmptyActionState,
+  LoadingRows,
+  PageHeader,
+  StatusBadge,
+} from "@/components/brain/Surface";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -61,6 +68,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { afterBodyPointerUnlock } from "@/components/ui/pointer-lock";
 import { Progress } from "@/components/ui/progress";
 import {
   Select,
@@ -80,14 +88,66 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  EmptyActionState,
-  LoadingRows,
-  PageHeader,
-  StatusBadge,
-} from "@/components/brain/Surface";
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
+  type BrainConnectionProvider,
+  type BrainHealthResponse,
+  type BrainCaptureReviewStatus,
+  type BrainCaptureReviewItem,
+  type EnqueueCapturesDistillationResponse,
+  type CapturesResponse,
+  type CreateSourceResponse,
+  type BrainSource,
+  type MarkdownImportResponse,
+  type BrainWorkspaceConnectionGrantState,
+  type BrainWorkspaceConnectionStatus,
+  type BrainWorkspaceCredentialRef,
+  type ConnectionProvidersResponse,
+  type SourcesResponse,
+  formatPercent,
+  sourceAutoSync,
+  sourceDescription,
+  sourceEnabled,
+  sourceHealth,
+  sourceLastSync,
+  sourceName,
+  sourceRetryAfter,
+  sourceType,
+} from "@/lib/brain";
+import {
+  dispatchIntegrationsHref,
+  getDispatchHref,
+} from "@/lib/dispatch-links";
+import {
+  createOneTimeIngestHandoff,
+  type OneTimeIngestHandoff,
+} from "@/lib/ingest-handoff";
+import { cn } from "@/lib/utils";
 
-type Provider = "manual" | "generic" | "clips" | "slack" | "granola" | "github";
+import {
+  sourceListValues,
+  validateGitHubRepoInput,
+  validateSlackChannelInput,
+  type SourceConfigIssue,
+} from "../../shared/source-config-validation";
+import {
+  invalidZoomMeetingIds,
+  zoomFilterLines,
+} from "../../shared/zoom-meeting-filter";
+
+type Provider =
+  | "manual"
+  | "generic"
+  | "clips"
+  | "slack"
+  | "granola"
+  | "github"
+  | "zoom";
 type CaptureStatusFilter = BrainCaptureReviewStatus | "all";
+type BrainT = ReturnType<typeof useT>;
 
 interface SourceFormState {
   title: string;
@@ -96,6 +156,9 @@ interface SourceFormState {
   historyLimit: string;
   granolaPageSize: string;
   granolaUpdatedAfter: string;
+  zoomMeetingIds: string;
+  zoomLookbackDays: string;
+  zoomConfigExtras: Record<string, unknown>;
   githubRepos: string;
   githubLimit: string;
   githubState: "open" | "closed" | "all";
@@ -105,7 +168,7 @@ interface SourceFormState {
   pollMinutes: string;
   sourceKey: string;
   autoSync: boolean;
-  reviewRequired: boolean;
+  includePublicChannels: boolean;
 }
 
 const providers: Array<{
@@ -125,6 +188,12 @@ const providers: Array<{
     label: "Granola",
     detail: "Enterprise API Team-space notes",
     icon: IconNotes,
+  },
+  {
+    value: "zoom",
+    label: "Zoom",
+    detail: "Cloud-recording transcripts from chosen meetings",
+    icon: IconBrandZoom,
   },
   {
     value: "github",
@@ -152,32 +221,42 @@ const providers: Array<{
   },
 ];
 
-function defaultTitle(provider: Provider) {
+function defaultTitle(provider: Provider, t?: ReturnType<typeof useT>) {
   switch (provider) {
     case "slack":
-      return "Slack knowledge channels";
+      return t?.("sources.defaultTitle.slack") ?? "Slack knowledge channels";
     case "granola":
-      return "Granola team notes";
+      return t?.("sources.defaultTitle.granola") ?? "Granola team notes";
+    case "zoom":
+      return t?.("sources.defaultTitle.zoom") ?? "Zoom meeting transcripts";
     case "github":
-      return "GitHub product repos";
+      return t?.("sources.defaultTitle.github") ?? "GitHub product repos";
     case "clips":
-      return "Clips exports";
+      return t?.("sources.defaultTitle.clips") ?? "Clips exports";
     case "generic":
-      return "Generic transcript webhook";
+      return (
+        t?.("sources.defaultTitle.generic") ?? "Generic transcript webhook"
+      );
     case "manual":
     default:
-      return "Manual imports";
+      return t?.("sources.defaultTitle.manual") ?? "Manual imports";
   }
 }
 
-function defaultForm(provider: Provider): SourceFormState {
+function defaultForm(
+  provider: Provider,
+  t?: ReturnType<typeof useT>,
+): SourceFormState {
   return {
-    title: defaultTitle(provider),
+    title: defaultTitle(provider, t),
     provider,
     channelRefs: "",
     historyLimit: "15",
     granolaPageSize: "10",
     granolaUpdatedAfter: "",
+    zoomMeetingIds: "",
+    zoomLookbackDays: "7",
+    zoomConfigExtras: {},
     githubRepos: "",
     githubLimit: "25",
     githubState: "all",
@@ -187,8 +266,32 @@ function defaultForm(provider: Provider): SourceFormState {
     pollMinutes: "60",
     sourceKey: provider === "generic" || provider === "clips" ? provider : "",
     autoSync:
-      provider === "slack" || provider === "granola" || provider === "github",
-    reviewRequired: true,
+      provider === "slack" ||
+      provider === "granola" ||
+      provider === "github" ||
+      provider === "zoom",
+    includePublicChannels: false,
+  };
+}
+
+function zoomConfigFromSource(config: Record<string, unknown>) {
+  const zoom =
+    config.zoom &&
+    typeof config.zoom === "object" &&
+    !Array.isArray(config.zoom)
+      ? (config.zoom as Record<string, unknown>)
+      : {};
+  const { meetingIds, lookbackDays, ...extras } = zoom;
+  // Title matching and summary import were removed; saving drops their keys.
+  delete extras.meetingTopics;
+  delete extras.includeSummaries;
+  return {
+    zoomMeetingIds: listValue(meetingIds),
+    zoomLookbackDays:
+      typeof lookbackDays === "number" || typeof lookbackDays === "string"
+        ? String(lookbackDays)
+        : "7",
+    zoomConfigExtras: extras,
   };
 }
 
@@ -217,6 +320,7 @@ function formFromSource(source: BrainSource): SourceFormState {
         : "10",
     granolaUpdatedAfter:
       typeof config.updatedAfter === "string" ? config.updatedAfter : "",
+    ...zoomConfigFromSource(config),
     githubRepos: listValue(config.repositories ?? config.repos),
     githubLimit:
       typeof config.limit === "number" || typeof config.limit === "string"
@@ -239,15 +343,16 @@ function formFromSource(source: BrainSource): SourceFormState {
         : "60",
     sourceKey: "",
     autoSync: sourceAutoSync(source),
-    reviewRequired: sourceReviewRequired(source),
+    includePublicChannels: config.includePublicChannels === true,
   };
 }
 
 function splitLines(value: string) {
-  return value
-    .split(/[\n,]/g)
-    .map((item) => item.trim().replace(/^#/, ""))
-    .filter(Boolean);
+  return sourceListValues(value);
+}
+
+function issueEntryList(issues: readonly SourceConfigIssue[]) {
+  return issues.map((issue) => `"${issue.value}"`).join(", ");
 }
 
 function numberValue(
@@ -263,19 +368,26 @@ function numberValue(
 
 function buildConfig(form: SourceFormState) {
   const config: Record<string, unknown> = {
-    reviewRequired: form.reviewRequired,
     autoSync: form.autoSync,
     pollMinutes: numberValue(form.pollMinutes, 60, 5, 1440),
   };
   if (form.provider === "slack") {
     config.channelIds = splitLines(form.channelRefs);
-    config.historyLimit = numberValue(form.historyLimit, 15, 1, 15);
+    config.historyLimit = numberValue(form.historyLimit, 15, 1, 30);
+    config.includePublicChannels = form.includePublicChannels;
   }
   if (form.provider === "granola") {
     config.pageSize = numberValue(form.granolaPageSize, 10, 1, 30);
     if (form.granolaUpdatedAfter.trim()) {
       config.updatedAfter = form.granolaUpdatedAfter.trim();
     }
+  }
+  if (form.provider === "zoom") {
+    config.zoom = {
+      ...form.zoomConfigExtras,
+      meetingIds: zoomFilterLines(form.zoomMeetingIds),
+      lookbackDays: numberValue(form.zoomLookbackDays, 7, 1, 30),
+    };
   }
   if (form.provider === "github") {
     config.repositories = splitLines(form.githubRepos);
@@ -307,15 +419,21 @@ function shortDate(value?: string | null) {
   });
 }
 
-function syncDetail(source: BrainSource) {
+function syncDetail(source: BrainSource, t: BrainT) {
   const retry = sourceRetryAfter(source);
-  if (retry) return `Retry after ${shortDate(retry) ?? retry}`;
+  if (retry)
+    return t("sources.retryAfter", { date: shortDate(retry) ?? retry });
   if (source.lastError) return source.lastError;
   if (source.latestRun?.status === "error") {
-    return source.latestRun.error ?? "Last sync failed";
+    return source.latestRun.error ?? t("sources.lastSyncFailed");
   }
-  if (source.nextSyncAt) return `Next ${shortDate(source.nextSyncAt)}`;
-  return sourceAutoSync(source) ? "Waiting for first sync" : "Manual sync";
+  if (source.nextSyncAt)
+    return t("sources.nextSync", {
+      date: shortDate(source.nextSyncAt) ?? source.nextSyncAt,
+    });
+  return sourceAutoSync(source)
+    ? t("sources.waitingForFirstSync")
+    : t("sources.manualSync");
 }
 
 const captureStatusOptions: CaptureStatusFilter[] = [
@@ -326,43 +444,44 @@ const captureStatusOptions: CaptureStatusFilter[] = [
   "all",
 ];
 
-function captureStatusLabel(status: CaptureStatusFilter) {
+function captureStatusLabel(status: CaptureStatusFilter, t: BrainT) {
   switch (status) {
     case "queued":
-      return "Queued";
+      return t("sources.captureStatus.queued");
     case "distilling":
-      return "Distilling";
+      return t("sources.captureStatus.distilling");
     case "distilled":
-      return "Distilled";
+      return t("sources.captureStatus.distilled");
     case "ignored":
-      return "Ignored";
+      return t("sources.captureStatus.ignored");
     case "all":
     default:
-      return "All captures";
+      return t("sources.captureStatus.all");
   }
 }
 
-function queueStatusLabel(status: string) {
+function queueStatusLabel(status: string, t: BrainT) {
   switch (status) {
     case "processing":
-      return "Processing";
+      return t("sources.queueStatus.processing");
     case "done":
-      return "Done";
+      return t("sources.queueStatus.done");
     case "failed":
-      return "Failed";
+      return t("sources.queueStatus.failed");
     case "queued":
     default:
-      return "Queued";
+      return t("sources.queueStatus.queued");
   }
 }
 
 function queueActionLabel(
   queue: NonNullable<CapturesResponse["captures"]>[number]["distillationQueue"],
+  t: BrainT,
 ) {
-  if (!queue) return "Queue distill";
-  if (queue.status === "failed") return "Retry distill";
-  if (queue.status === "done") return "Distilled";
-  return "Queued";
+  if (!queue) return t("sources.queueDistill");
+  if (queue.status === "failed") return t("sources.retryDistill");
+  if (queue.status === "done") return t("sources.captureStatus.distilled");
+  return t("sources.queueStatus.queued");
 }
 
 function captureCanQueue(capture: BrainCaptureReviewItem) {
@@ -376,28 +495,24 @@ function isSourceProvider(providerId: string): providerId is Provider {
   return providers.some((provider) => provider.value === providerId);
 }
 
-function dispatchIntegrationsHref(providerId: string) {
-  const params = new URLSearchParams({ provider: providerId, appId: "brain" });
-  return `/dispatch/integrations?${params.toString()}`;
-}
-
-function grantStateLabel(state: BrainWorkspaceConnectionGrantState) {
+function grantStateLabel(state: BrainWorkspaceConnectionGrantState, t: BrainT) {
   switch (state) {
     case "connected":
-      return "Connected";
+      return t("sources.grantState.connected");
     case "granted":
-      return "Granted";
+      return t("sources.grantState.granted");
     case "needs_grant":
-      return "Needs grant";
+      return t("sources.grantState.needsGrant");
     case "not_connected":
     default:
-      return "Not connected";
+      return t("sources.grantState.notConnected");
   }
 }
 
 function grantStateDetail(
   provider: BrainConnectionProvider,
   state: BrainWorkspaceConnectionGrantState,
+  t: BrainT,
 ) {
   const workspace = provider.workspaceConnection;
   if (workspace?.grantAvailabilityMessage) {
@@ -406,20 +521,22 @@ function grantStateDetail(
   const sourceCount = provider.configuredSourceCount.toLocaleString();
   switch (state) {
     case "connected":
-      return `${workspace?.activeConnectionCount ?? 0} active connection${
-        workspace?.activeConnectionCount === 1 ? "" : "s"
-      } granted to Brain`;
+      return t("sources.grantDetail.connected", {
+        count: (workspace?.activeConnectionCount ?? 0).toLocaleString(),
+      });
     case "granted":
-      return `Brain can access ${
-        workspace?.grantedConnectionCount ?? 0
-      } connection${workspace?.grantedConnectionCount === 1 ? "" : "s"}`;
+      return t("sources.grantDetail.granted", {
+        count: (workspace?.grantedConnectionCount ?? 0).toLocaleString(),
+      });
     case "needs_grant":
-      return "Connection exists in Dispatch; grant Brain access to reuse it";
+      return t("sources.grantDetail.needsGrant");
     case "not_connected":
     default:
       return provider.hasConfiguredSources
-        ? `${sourceCount} source${sourceCount === "1" ? "" : "s"} configured with scoped credentials`
-        : "No shared workspace connection yet";
+        ? t("sources.grantDetail.configuredSources", {
+            count: sourceCount,
+          })
+        : t("sources.grantDetail.noSharedConnection");
   }
 }
 
@@ -447,20 +564,20 @@ function readinessToneClass(tone: ReadinessTone) {
   }
 }
 
-function providerHealthLabel(provider: BrainConnectionProvider) {
+function providerHealthLabel(provider: BrainConnectionProvider, t: BrainT) {
   switch (provider.providerHealth?.status) {
     case "ready":
-      return "Ready";
+      return t("sources.providerHealth.ready");
     case "needs_grant":
-      return "Grant needed";
+      return t("sources.providerHealth.grantNeeded");
     case "unhealthy":
-      return "Needs repair";
+      return t("sources.providerHealth.needsRepair");
     case "missing_credentials":
-      return "Missing keys";
+      return t("sources.providerHealth.missingKeys");
     case "unsupported":
-      return "Metadata only";
+      return t("sources.providerHealth.metadataOnly");
     default:
-      return "Unknown";
+      return t("sources.providerHealth.unknown");
   }
 }
 
@@ -497,17 +614,20 @@ type BrainWorkspaceSummaryConnection = NonNullable<
   BrainConnectionProvider["workspaceConnection"]
 >["connections"][number];
 
-function appAccessLabel(access: BrainWorkspaceSummaryConnection["appAccess"]) {
+function appAccessLabel(
+  access: BrainWorkspaceSummaryConnection["appAccess"],
+  t: BrainT,
+) {
   switch (access?.mode) {
     case "all-apps":
-      return "All apps";
+      return t("sources.appAccess.allApps");
     case "allowed-app":
-      return "Brain allow-list";
+      return t("sources.appAccess.brainAllowList");
     case "explicit-grant":
-      return "Brain grant";
+      return t("sources.appAccess.brainGrant");
     case "unavailable":
     default:
-      return "Needs Brain grant";
+      return t("sources.appAccess.needsBrainGrant");
   }
 }
 
@@ -517,19 +637,22 @@ function appAccessClass(access: BrainWorkspaceSummaryConnection["appAccess"]) {
     : grantStateClass("needs_grant");
 }
 
-function workspaceStatusLabel(status: BrainWorkspaceConnectionStatus) {
+function workspaceStatusLabel(
+  status: BrainWorkspaceConnectionStatus,
+  t: BrainT,
+) {
   switch (status) {
     case "connected":
-      return "Connected";
+      return t("sources.workspaceStatus.connected");
     case "checking":
-      return "Checking";
+      return t("sources.workspaceStatus.checking");
     case "needs_reauth":
-      return "Needs reauth";
+      return t("sources.workspaceStatus.needsReauth");
     case "error":
-      return "Error";
+      return t("sources.workspaceStatus.error");
     case "disabled":
     default:
-      return "Disabled";
+      return t("sources.workspaceStatus.disabled");
   }
 }
 
@@ -622,59 +745,55 @@ function scopedCredentialCount(provider: BrainConnectionProvider) {
   );
 }
 
-function countLabel(count: number, singular: string, plural = `${singular}s`) {
-  return `${count.toLocaleString()} ${count === 1 ? singular : plural}`;
-}
-
 function sharedConnectionReadiness(
   provider: BrainConnectionProvider,
+  t: BrainT,
 ): ProviderReadinessItem {
   const workspace = provider.workspaceConnection;
   if (!workspace) {
     return {
-      label: "Shared connection",
-      value: "Checking",
-      detail: "Workspace connection status has not loaded yet.",
+      label: t("sources.sharedConnection"),
+      value: t("sources.workspaceStatus.checking"),
+      detail: t("sources.readiness.workspaceNotLoaded"),
       tone: "muted",
       icon: IconCircleDashed,
     };
   }
   if (workspace.hasActiveWorkspaceConnection) {
     return {
-      label: "Shared connection",
-      value: "Connected",
-      detail: `${countLabel(
-        workspace.activeConnectionCount,
-        "active connection",
-      )} can provide credential refs.`,
+      label: t("sources.sharedConnection"),
+      value: t("sources.workspaceStatus.connected"),
+      detail: t("sources.readiness.activeConnections", {
+        count: workspace.activeConnectionCount.toLocaleString(),
+      }),
       tone: "ready",
       icon: IconCircleCheck,
     };
   }
   if (workspace.hasGrantedWorkspaceConnection) {
     return {
-      label: "Shared connection",
-      value: "Repair",
-      detail: "Brain has a grant, but the provider connection needs attention.",
+      label: t("sources.sharedConnection"),
+      value: t("sources.readiness.repair"),
+      detail: t("sources.readiness.grantNeedsAttention"),
       tone: "attention",
       icon: IconAlertTriangle,
     };
   }
   if (workspace.hasWorkspaceConnection) {
     return {
-      label: "Shared connection",
-      value: "Grantable",
-      detail: "A workspace connection exists and can be granted to Brain.",
+      label: t("sources.sharedConnection"),
+      value: t("sources.readiness.grantable"),
+      detail: t("sources.readiness.workspaceConnectionGrantable"),
       tone: "attention",
       icon: IconShieldCheck,
     };
   }
   return {
-    label: "Shared connection",
-    value: "Not connected",
+    label: t("sources.sharedConnection"),
+    value: t("sources.grantState.notConnected"),
     detail: scopedCredentialCount(provider)
-      ? "Brain can still use scoped local credential refs."
-      : "Add a reusable provider connection in Dispatch.",
+      ? t("sources.readiness.scopedLocalCredentialRefs")
+      : t("sources.readiness.addReusableConnection"),
     tone: "muted",
     icon: IconCircleDashed,
   };
@@ -682,36 +801,42 @@ function sharedConnectionReadiness(
 
 function appGrantReadiness(
   provider: BrainConnectionProvider,
+  t: BrainT,
 ): ProviderReadinessItem {
   const workspace = provider.workspaceConnection;
   const grantState = workspace?.grantState ?? "not_connected";
   if (grantState === "connected" || grantState === "granted") {
     return {
-      label: "Brain app grant",
-      value: grantState === "connected" ? "Granted" : "Granted, repair",
+      label: t("sources.brainAppGrant"),
+      value:
+        grantState === "connected"
+          ? t("sources.grantState.granted")
+          : t("sources.readiness.grantedRepair"),
       detail:
         grantState === "connected"
-          ? "Brain can use the shared workspace connection."
-          : "Access is granted, but the connection is not active yet.",
+          ? t("sources.readiness.brainCanUseSharedConnection")
+          : t("sources.readiness.accessGrantedConnectionInactive"),
       tone: grantState === "connected" ? "ready" : "attention",
       icon: grantStateIcon(grantState),
     };
   }
   if (grantState === "needs_grant") {
     return {
-      label: "Brain app grant",
-      value: "Needed",
-      detail: "Grant the existing provider connection to the Brain app.",
+      label: t("sources.brainAppGrant"),
+      value: t("sources.readiness.needed"),
+      detail: t("sources.readiness.grantExistingConnection"),
       tone: "attention",
       icon: IconAlertTriangle,
     };
   }
   return {
-    label: "Brain app grant",
-    value: scopedCredentialCount(provider) ? "Not needed" : "No grant",
+    label: t("sources.brainAppGrant"),
+    value: scopedCredentialCount(provider)
+      ? t("sources.readiness.notNeeded")
+      : t("sources.readiness.noGrant"),
     detail: scopedCredentialCount(provider)
-      ? "Scoped Brain credentials are already available."
-      : "A grant appears after a workspace provider connection exists.",
+      ? t("sources.readiness.scopedCredentialsAvailable")
+      : t("sources.readiness.grantAppearsAfterConnection"),
     tone: "muted",
     icon: IconCircleDashed,
   };
@@ -719,22 +844,23 @@ function appGrantReadiness(
 
 function credentialPathReadiness(
   provider: BrainConnectionProvider,
+  t: BrainT,
 ): ProviderReadinessItem {
   const health = provider.credentialHealth;
   if (!health) {
     return {
-      label: "Credential path",
-      value: "Checking",
-      detail: "Credential availability has not loaded yet.",
+      label: t("sources.credentialPath"),
+      value: t("sources.workspaceStatus.checking"),
+      detail: t("sources.readiness.credentialNotLoaded"),
       tone: "muted",
       icon: IconCircleDashed,
     };
   }
   if (health.status === "not_required") {
     return {
-      label: "Credential path",
-      value: "Not required",
-      detail: "This provider does not require a credential key.",
+      label: t("sources.credentialPath"),
+      value: t("sources.notRequired"),
+      detail: t("sources.readiness.noCredentialKeyRequired"),
       tone: "ready",
       icon: IconCircleCheck,
     };
@@ -743,46 +869,46 @@ function credentialPathReadiness(
   const available = availableCredentialDetails(provider)[0];
   if (available?.provenance?.source === "workspace_connection") {
     return {
-      label: "Credential path",
-      value: "Shared",
-      detail: "Using workspace credential refs; values stay hidden.",
+      label: t("sources.credentialPath"),
+      value: t("sources.readiness.shared"),
+      detail: t("sources.readiness.usingWorkspaceCredentialRefs"),
       tone: "ready",
       icon: IconShieldCheck,
     };
   }
   if (available?.provenance?.source === "brain_local") {
     return {
-      label: "Credential path",
-      value: "Brain-local",
-      detail: "Scoped Brain credential refs are configured.",
+      label: t("sources.credentialPath"),
+      value: t("sources.readiness.brainLocal"),
+      detail: t("sources.readiness.scopedCredentialRefsConfigured"),
       tone: "ready",
       icon: IconShieldCheck,
     };
   }
   if (available?.provenance?.source === "registered_secret") {
     return {
-      label: "Credential path",
-      value: "Vault",
-      detail: "A registered credential ref is available in the vault.",
+      label: t("sources.credentialPath"),
+      value: t("sources.readiness.vault"),
+      detail: t("sources.readiness.registeredCredentialRefAvailable"),
       tone: "ready",
       icon: IconShieldCheck,
     };
   }
   if (health.available) {
     return {
-      label: "Credential path",
-      value: "Available",
-      detail: "Required credential refs are available without exposing values.",
+      label: t("sources.credentialPath"),
+      value: t("sources.readiness.available"),
+      detail: t("sources.readiness.requiredCredentialRefsAvailable"),
       tone: "ready",
       icon: IconShieldCheck,
     };
   }
   return {
-    label: "Credential path",
-    value: "Missing",
+    label: t("sources.credentialPath"),
+    value: t("sources.readiness.missing"),
     detail:
       health.missingMessages[0] ??
-      "Add a shared provider connection or scoped Brain credential.",
+      t("sources.readiness.addSharedOrScopedCredential"),
     tone: "danger",
     icon: IconAlertTriangle,
   };
@@ -790,135 +916,136 @@ function credentialPathReadiness(
 
 function providerConnectionReadiness(
   provider: BrainConnectionProvider,
+  t: BrainT,
 ): ProviderReadinessItem {
   const workspace = provider.workspaceConnection;
   const health = provider.providerHealth?.status;
   if (!provider.sourceProviderSupported) {
     return {
-      label: "Provider connection",
-      value: "Metadata only",
-      detail: "Brain source setup is not implemented for this provider.",
+      label: t("sources.providerConnection"),
+      value: t("sources.providerHealth.metadataOnly"),
+      detail: t("sources.readiness.sourceSetupNotImplemented"),
       tone: "muted",
       icon: IconCircleDashed,
     };
   }
   if (health === "ready") {
     return {
-      label: "Provider connection",
-      value: "Ready",
+      label: t("sources.providerConnection"),
+      value: t("sources.providerHealth.ready"),
       detail: workspace?.hasActiveWorkspaceConnection
-        ? "Ready through a shared workspace connection."
+        ? t("sources.readiness.readyThroughSharedConnection")
         : scopedCredentialCount(provider)
-          ? "Ready through scoped Brain credential refs."
-          : "Ready for source setup.",
+          ? t("sources.readiness.readyThroughScopedRefs")
+          : t("sources.readiness.readyForSourceSetup"),
       tone: "ready",
       icon: IconCircleCheck,
     };
   }
   if (health === "needs_grant") {
     return {
-      label: "Provider connection",
-      value: "Needs grant",
-      detail: "The provider is connected, but Brain needs app access.",
+      label: t("sources.providerConnection"),
+      value: t("sources.providerHealth.grantNeeded"),
+      detail: t("sources.readiness.providerNeedsAppAccess"),
       tone: "attention",
       icon: IconAlertTriangle,
     };
   }
   if (health === "unhealthy") {
     return {
-      label: "Provider connection",
-      value: "Repair",
-      detail: "Reauthorize or repair the shared provider connection.",
+      label: t("sources.providerConnection"),
+      value: t("sources.readiness.repair"),
+      detail: t("sources.readiness.reauthorizeProviderConnection"),
       tone: "attention",
       icon: IconAlertTriangle,
     };
   }
   if (health === "missing_credentials" && !workspace?.hasWorkspaceConnection) {
     return {
-      label: "Provider connection",
-      value: "Connect provider",
-      detail: "Add a shared connection or configure scoped Brain credentials.",
+      label: t("sources.providerConnection"),
+      value: t("sources.connectProvider"),
+      detail: t("sources.readiness.addSharedOrScopedCredential"),
       tone: "danger",
       icon: IconAlertTriangle,
     };
   }
   return {
-    label: "Provider connection",
-    value: providerHealthLabel(provider),
+    label: t("sources.providerConnection"),
+    value: providerHealthLabel(provider, t),
     detail:
       provider.providerHealth?.message ??
-      "Provider readiness could not be determined.",
+      t("sources.readiness.providerUnknown"),
     tone: health === "missing_credentials" ? "danger" : "muted",
     icon:
       health === "missing_credentials" ? IconAlertTriangle : IconCircleDashed,
   };
 }
 
-function providerReadinessItems(provider: BrainConnectionProvider) {
+function providerReadinessItems(provider: BrainConnectionProvider, t: BrainT) {
   return [
-    sharedConnectionReadiness(provider),
-    appGrantReadiness(provider),
-    providerConnectionReadiness(provider),
-    credentialPathReadiness(provider),
+    sharedConnectionReadiness(provider, t),
+    appGrantReadiness(provider, t),
+    providerConnectionReadiness(provider, t),
+    credentialPathReadiness(provider, t),
   ];
 }
 
 function providerReadinessCallout(
   provider: BrainConnectionProvider,
+  t: BrainT,
 ): ProviderReadinessItem & { title: string } {
   const workspace = provider.workspaceConnection;
   if (!provider.sourceProviderSupported) {
     return {
-      ...providerConnectionReadiness(provider),
-      title: "Connection metadata only",
+      ...providerConnectionReadiness(provider, t),
+      title: t("sources.connectionMetadataOnly"),
     };
   }
   if (workspace?.hasActiveWorkspaceConnection) {
     return {
-      label: "Readiness",
-      value: "Shared",
-      title: "Shared workspace connection ready",
-      detail: "Brain can reuse the provider connection without showing values.",
+      label: t("sources.readinessLabel"),
+      value: t("sources.readiness.shared"),
+      title: t("sources.sharedWorkspaceConnectionReady"),
+      detail: t("sources.readiness.reuseProviderConnection"),
       tone: "ready",
       icon: IconCircleCheck,
     };
   }
   if (workspace?.grantState === "needs_grant") {
     return {
-      label: "Readiness",
-      value: "Grant needed",
-      title: "Grant Brain access",
-      detail:
-        "A workspace provider connection exists; approve Brain to use it.",
+      label: t("sources.readinessLabel"),
+      value: t("sources.providerHealth.grantNeeded"),
+      title: t("sources.grantBrainAccess"),
+      detail: t("sources.readiness.approveBrainAccess"),
       tone: "attention",
       icon: IconAlertTriangle,
     };
   }
   if (scopedCredentialCount(provider)) {
     return {
-      label: "Readiness",
-      value: "Local",
-      title: "Scoped credentials ready",
-      detail: "Brain has local credential refs available; values stay hidden.",
+      label: t("sources.readinessLabel"),
+      value: t("sources.readiness.local"),
+      title: t("sources.scopedCredentialsReady"),
+      detail: t("sources.readiness.localCredentialRefsAvailable"),
       tone: "ready",
       icon: IconShieldCheck,
     };
   }
   if (provider.credentialHealth?.status === "not_required") {
     return {
-      label: "Readiness",
-      value: "Ready",
-      title: "No credential required",
-      detail: "This provider can be configured without a credential key.",
+      label: t("sources.readinessLabel"),
+      value: t("sources.providerHealth.ready"),
+      title: t("sources.noCredentialRequired"),
+      detail: t("sources.readiness.providerNoCredential"),
       tone: "ready",
       icon: IconCircleCheck,
     };
   }
   return {
-    label: "Readiness",
-    value: "Connect",
-    title: "Connect the provider",
-    detail: "Add a shared provider connection or scoped Brain credential.",
+    label: t("sources.readinessLabel"),
+    value: t("sources.readiness.connect"),
+    title: t("sources.connectTheProvider"),
+    detail: t("sources.readiness.addSharedOrScopedCredential"),
     tone: "danger",
     icon: IconAlertTriangle,
   };
@@ -957,27 +1084,28 @@ function provenanceLabel(
       BrainConnectionProvider["credentialHealth"]
     >["details"][number]["provenance"]
   >,
+  t: BrainT,
 ) {
   switch (provenance.source) {
     case "workspace_connection":
       return [
-        provenance.connectionLabel ?? "Workspace connection",
+        provenance.connectionLabel ?? t("sources.workspaceConnection"),
         provenance.appAccessMode === "explicit-grant"
-          ? "explicit Brain grant"
+          ? t("sources.provenance.explicitBrainGrant")
           : provenance.appAccessMode === "all-apps"
-            ? "all apps"
+            ? t("sources.appAccess.allApps")
             : provenance.appAccessMode === "allowed-app"
-              ? "Brain allow-list"
+              ? t("sources.appAccess.brainAllowList")
               : null,
       ]
         .filter(Boolean)
         .join(" - ");
     case "brain_local":
-      return "Brain-local credential";
+      return t("sources.provenance.brainLocalCredential");
     case "registered_secret":
-      return "Credential vault";
+      return t("sources.provenance.credentialVault");
     default:
-      return "Credential source";
+      return t("sources.provenance.credentialSource");
   }
 }
 
@@ -985,13 +1113,16 @@ function ProviderCatalog({
   providers: connectionProviders,
   loading,
   workspaceError,
+  dispatchHref,
   onAddSource,
 }: {
   providers: BrainConnectionProvider[];
   loading: boolean;
   workspaceError?: string | null;
+  dispatchHref: string;
   onAddSource: (provider: Provider) => void;
 }) {
+  const t = useT();
   const [expandedProviderId, setExpandedProviderId] = useState<string | null>(
     null,
   );
@@ -1002,17 +1133,20 @@ function ProviderCatalog({
         <div>
           <div className="flex items-center gap-2">
             <IconDatabaseImport className="size-4 text-muted-foreground" />
-            <h2 className="text-sm font-medium">Connection providers</h2>
+            <h2 className="text-sm font-medium">
+              {t("sources.connectionProviders")}
+            </h2>
           </div>
           <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
-            Reuse workspace integrations, grant Brain access, or add Brain-local
-            sources without exposing credential values.
+            {t("sources.connectionProvidersDescription")}
           </p>
         </div>
         <Badge variant="outline" className="w-fit max-w-full">
           {loading
-            ? "Loading"
-            : `${connectionProviders.length.toLocaleString()} providers`}
+            ? t("sources.loading")
+            : t("sources.providerCount", {
+                count: connectionProviders.length.toLocaleString(),
+              })}
         </Badge>
       </div>
 
@@ -1020,11 +1154,11 @@ function ProviderCatalog({
         <div className="rounded-md border border-border bg-card p-4 text-sm text-muted-foreground">
           <div className="flex items-center gap-2">
             <IconLoader2 className="size-4 animate-spin" />
-            Loading provider catalog...
+            {t("sources.loadingProviderCatalog")}
           </div>
         </div>
       ) : connectionProviders.length ? (
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        <div className="brain-provider-catalog-grid grid gap-3">
           {connectionProviders.map((provider) => {
             const workspace = provider.workspaceConnection;
             const grantState = workspace?.grantState ?? "not_connected";
@@ -1048,9 +1182,18 @@ function ProviderCatalog({
               ? sourceProviderIcon(sourceProvider)
               : IconDatabaseImport;
             const expanded = expandedProviderId === provider.id;
-            const readinessCallout = providerReadinessCallout(provider);
+            const readinessCallout = providerReadinessCallout(provider, t);
             const ReadinessIcon = readinessCallout.icon;
-            const readinessItems = providerReadinessItems(provider);
+            const readinessItems = providerReadinessItems(provider, t);
+            const providerNeedsSetup =
+              provider.configured !== true &&
+              provider.rawProviderApi?.available === true &&
+              (provider.providerHealth?.status === "needs_grant" ||
+                provider.providerHealth?.status === "unhealthy" ||
+                provider.providerHealth?.status === "missing_credentials");
+            const providerSetupHref =
+              provider.setupLink ??
+              dispatchIntegrationsHref(provider.id, dispatchHref);
             return (
               <div
                 key={provider.id}
@@ -1066,7 +1209,7 @@ function ProviderCatalog({
                       <p className="mt-1 text-xs text-muted-foreground">
                         {provider.hasConfiguredSources
                           ? `${provider.configuredSourceCount.toLocaleString()} configured`
-                          : "No Brain sources yet"}
+                          : t("sources.noBrainSourcesYet")}
                       </p>
                     </div>
                   </div>
@@ -1074,20 +1217,20 @@ function ProviderCatalog({
                     variant="outline"
                     className={`${grantStateClass(grantState)} w-fit max-w-full`}
                   >
-                    <GrantIcon className="mr-1 size-3" />
-                    {grantStateLabel(grantState)}
+                    <GrantIcon className="me-1 size-3" />
+                    {grantStateLabel(grantState, t)}
                   </Badge>
                   <Badge
                     variant="outline"
                     className={`${providerHealthClass(provider)} w-fit max-w-full`}
                   >
-                    {providerHealthLabel(provider)}
+                    {providerHealthLabel(provider, t)}
                   </Badge>
                 </div>
 
                 <p className="text-xs leading-5 text-muted-foreground">
                   {provider.providerHealth?.message ??
-                    grantStateDetail(provider, grantState)}
+                    grantStateDetail(provider, grantState, t)}
                 </p>
 
                 <div className="rounded-md border border-border bg-muted/25 p-3">
@@ -1130,10 +1273,10 @@ function ProviderCatalog({
                     <div className="grid gap-2">
                       <div className="flex items-center justify-between gap-2">
                         <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                          Connection readiness
+                          {t("sources.connectionReadiness")}
                         </p>
                         <span className="truncate text-xs text-muted-foreground">
-                          Values hidden
+                          {t("sources.valuesHidden")}
                         </span>
                       </div>
                       <div className="grid gap-2 sm:grid-cols-2">
@@ -1148,8 +1291,8 @@ function ProviderCatalog({
                     <div>
                       <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                         {credentialRefs.length
-                          ? "Credential refs"
-                          : "Catalog keys"}
+                          ? t("sources.credentialRefs")
+                          : t("sources.catalogKeys")}
                       </p>
                       <div className="mt-2 flex flex-wrap gap-1.5">
                         {credentialBadges.length ? (
@@ -1160,7 +1303,7 @@ function ProviderCatalog({
                           ))
                         ) : (
                           <span className="text-xs text-muted-foreground">
-                            No credential keys required
+                            {t("sources.noCredentialKeysRequired")}
                           </span>
                         )}
                       </div>
@@ -1174,23 +1317,12 @@ function ProviderCatalog({
                       <div className="grid gap-2 rounded-md border border-border bg-card p-3">
                         <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
                           <IconBrandSlack className="size-4" />
-                          Slack setup guide
+                          {t("sources.slackSetupGuide")}
                         </div>
                         <div className="grid gap-1 text-xs leading-5 text-muted-foreground">
-                          <p>
-                            Allow-list approved channel IDs such as C0123456789,
-                            or channel names like #product when name resolution
-                            is acceptable.
-                          </p>
-                          <p>
-                            Minimum scopes are channels:read and
-                            channels:history. Add groups:read and groups:history
-                            for private channels.
-                          </p>
-                          <p>
-                            Invite the Slack app to private channels before
-                            syncing. DMs and MPIMs stay excluded.
-                          </p>
+                          <p>{t("sources.slackSetupAllowList")}</p>
+                          <p>{t("sources.slackSetupScopes")}</p>
+                          <p>{t("sources.slackSetupPrivateChannels")}</p>
                         </div>
                       </div>
                     ) : null}
@@ -1203,7 +1335,7 @@ function ProviderCatalog({
                               {credential.required ? (
                                 <span className="text-muted-foreground">
                                   {" "}
-                                  required
+                                  {t("sources.required")}
                                 </span>
                               ) : null}
                             </p>
@@ -1219,7 +1351,7 @@ function ProviderCatalog({
                     {provider.credentialHealth?.details.length ? (
                       <div className="grid gap-2">
                         <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                          Credential provenance
+                          {t("sources.credentialProvenance")}
                         </p>
                         {provider.credentialHealth.details.map((detail) => (
                           <div
@@ -1236,12 +1368,14 @@ function ProviderCatalog({
                                     : readinessToneClass("danger")
                                 }
                               >
-                                {detail.available ? "Available" : "Missing"}
+                                {detail.available
+                                  ? t("sources.readiness.available")
+                                  : t("sources.readiness.missing")}
                               </Badge>
                             </div>
                             <p className="mt-1 text-xs leading-5 text-muted-foreground">
                               {detail.provenance
-                                ? provenanceLabel(detail.provenance)
+                                ? provenanceLabel(detail.provenance, t)
                                 : detail.missingMessage}
                             </p>
                           </div>
@@ -1251,7 +1385,7 @@ function ProviderCatalog({
                     {workspace?.connections.length ? (
                       <div className="grid gap-2">
                         <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                          Workspace connections
+                          {t("sources.workspaceConnections")}
                         </p>
                         {workspace.connections.map((connection) => {
                           const refs = [
@@ -1281,7 +1415,7 @@ function ProviderCatalog({
                                       connection.status,
                                     )}
                                   >
-                                    {workspaceStatusLabel(connection.status)}
+                                    {workspaceStatusLabel(connection.status, t)}
                                   </Badge>
                                   <Badge
                                     variant="outline"
@@ -1289,7 +1423,7 @@ function ProviderCatalog({
                                       connection.appAccess,
                                     )}
                                   >
-                                    {appAccessLabel(connection.appAccess)}
+                                    {appAccessLabel(connection.appAccess, t)}
                                   </Badge>
                                 </div>
                               </div>
@@ -1306,7 +1440,7 @@ function ProviderCatalog({
                                 </div>
                               ) : (
                                 <p className="text-xs text-muted-foreground">
-                                  No credential refs on this connection
+                                  {t("sources.noCredentialRefs")}
                                 </p>
                               )}
                               {connection.lastError ? (
@@ -1320,15 +1454,13 @@ function ProviderCatalog({
                       </div>
                     ) : (
                       <p className="text-xs leading-5 text-muted-foreground">
-                        No shared workspace connection has been registered for
-                        this provider yet.
+                        {t("sources.noSharedWorkspaceConnection")}
                       </p>
                     )}
-                    {!provider.sourceProviderSupported ? (
+                    {!provider.sourceProviderSupported &&
+                    provider.rawProviderApi?.available !== true ? (
                       <p className="text-xs leading-5 text-muted-foreground">
-                        Brain can reuse this connection metadata, but source
-                        setup for this provider has not been added to this
-                        template yet.
+                        {t("sources.connectionMetadataOnlyDetail")}
                       </p>
                     ) : null}
                   </div>
@@ -1346,13 +1478,19 @@ function ProviderCatalog({
                     }
                   >
                     <IconSettings2 className="size-4" />
-                    {expanded ? "Hide details" : "Details"}
+                    {expanded ? t("sources.hideDetails") : t("sources.details")}
                   </Button>
-                  {grantState === "needs_grant" ? (
+                  {grantState === "needs_grant" || providerNeedsSetup ? (
                     <Button size="sm" variant="outline" asChild>
-                      <a href={dispatchIntegrationsHref(provider.id)}>
+                      <a
+                        href={providerSetupHref}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
                         <IconExternalLink className="size-4" />
-                        Grant in Dispatch
+                        {grantState === "needs_grant"
+                          ? t("sources.grantInDispatch")
+                          : t("sources.connectProvider")}
                       </a>
                     </Button>
                   ) : null}
@@ -1363,7 +1501,7 @@ function ProviderCatalog({
                       onClick={() => onAddSource(sourceProvider)}
                     >
                       <IconDatabaseImport className="size-4" />
-                      Add source
+                      {t("sources.addSource")}
                     </Button>
                   ) : null}
                 </div>
@@ -1373,12 +1511,12 @@ function ProviderCatalog({
         </div>
       ) : (
         <div className="rounded-md border border-border bg-card p-4 text-sm text-muted-foreground">
-          No Brain connection providers are available from the shared catalog.
+          {t("sources.noConnectionProviders")}
         </div>
       )}
       {workspaceError ? (
         <div className="rounded-md border border-border bg-card p-4 text-sm text-muted-foreground">
-          Workspace integration status is unavailable: {workspaceError}
+          {t("sources.workspaceStatusUnavailable", { error: workspaceError })}
         </div>
       ) : null}
     </section>
@@ -1392,6 +1530,7 @@ function BrainHealthStrip({
   health?: BrainHealthResponse;
   loading: boolean;
 }) {
+  const t = useT();
   const attention =
     (health?.sources.needsSetup ?? 0) +
     (health?.sources.needsSync ?? 0) +
@@ -1406,39 +1545,47 @@ function BrainHealthStrip({
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <IconReportAnalytics className="size-4 text-muted-foreground" />
-            <h2 className="text-sm font-medium">Brain health</h2>
+            <h2 className="text-sm font-medium">{t("sources.brainHealth")}</h2>
             {loading ? (
               <Badge variant="outline" className="gap-1.5">
                 <IconLoader2 className="size-3 animate-spin" />
-                Checking
+                {t("sources.workspaceStatus.checking")}
               </Badge>
             ) : null}
           </div>
           <p className="mt-1 text-sm leading-6 text-muted-foreground">
-            {nextStep ??
-              "Sources, review queue, and retrieval checks are ready for normal use."}
+            {nextStep ?? t("sources.healthReady")}
           </p>
         </div>
         <div className="grid gap-2 sm:grid-flow-col sm:auto-cols-max">
           <Badge variant="outline" className="justify-center gap-1.5">
             <IconCircleCheck className="size-3" />
-            {health?.sources.healthy ?? 0}/{health?.sources.total ?? 0} healthy
+            {t("sources.healthHealthy", {
+              healthy: (health?.sources.healthy ?? 0).toLocaleString(),
+              total: (health?.sources.total ?? 0).toLocaleString(),
+            })}
           </Badge>
           {attention ? (
             <Badge variant="outline" className="justify-center gap-1.5">
               <IconAlertTriangle className="size-3" />
-              {attention} attention
+              {t("sources.healthAttention", {
+                count: attention.toLocaleString(),
+              })}
             </Badge>
           ) : null}
           <Badge variant="outline" className="justify-center gap-1.5">
             <IconClock className="size-3" />
             {health?.sources.lastSyncedAt
-              ? `Last sync ${shortDate(health.sources.lastSyncedAt)}`
-              : "No sync yet"}
+              ? t("sources.lastSyncWithDate", {
+                  date: shortDate(health.sources.lastSyncedAt),
+                })
+              : t("sources.noSyncYet")}
           </Badge>
           {lastEval ? (
             <Badge variant="outline" className="justify-center gap-1.5">
-              Eval {Math.round(lastEval.score * 100)}%
+              {t("sources.evalScore", {
+                score: Math.round(lastEval.score * 100).toLocaleString(),
+              })}
             </Badge>
           ) : null}
         </div>
@@ -1458,19 +1605,257 @@ function SourceFact({ label, value }: { label: string; value: ReactNode }) {
   );
 }
 
+function ingestSourceKey(source: BrainSource) {
+  const sourceKey = source.config?.sourceKey;
+  return typeof sourceKey === "string" && sourceKey.trim()
+    ? sourceKey.trim()
+    : null;
+}
+
+type MarkdownFileSelection = {
+  path: string;
+  file: File;
+};
+
+function isMarkdownFilePath(path: string) {
+  return /\.(?:md|markdown)$/i.test(path);
+}
+
+function actionErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function MarkdownImportDialog({
+  source,
+  open,
+  onOpenChange,
+  onComplete,
+}: {
+  source: BrainSource | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onComplete: () => void;
+}) {
+  const t = useT();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [files, setFiles] = useState<MarkdownFileSelection[]>([]);
+  const [skippedFileCount, setSkippedFileCount] = useState(0);
+  const [result, setResult] = useState<MarkdownImportResponse | null>(null);
+  const [readError, setReadError] = useState<string | null>(null);
+  const importMarkdownFiles = useActionMutation<
+    MarkdownImportResponse,
+    {
+      sourceId: string;
+      files: Array<{ path: string; content: string }>;
+      enqueueDistillation: boolean;
+    }
+  >("import-markdown-files" as any);
+
+  useEffect(() => {
+    if (!open) {
+      setFiles([]);
+      setSkippedFileCount(0);
+      setResult(null);
+      setReadError(null);
+    }
+  }, [open]);
+
+  function handleFileSelection(event: ChangeEvent<HTMLInputElement>) {
+    const selected = Array.from(event.currentTarget.files ?? []);
+    const byPath = new Map<string, MarkdownFileSelection>();
+    for (const file of selected) {
+      const path = file.webkitRelativePath || file.name;
+      if (isMarkdownFilePath(path)) byPath.set(path, { path, file });
+    }
+    setFiles(Array.from(byPath.values()));
+    setSkippedFileCount(selected.length - byPath.size);
+    setResult(null);
+    setReadError(null);
+    event.currentTarget.value = "";
+  }
+
+  async function submitImport() {
+    if (!source || !files.length) return;
+    setReadError(null);
+    try {
+      const payload = await Promise.all(
+        files.map(async ({ path, file }) => ({
+          path,
+          content: await file.text(),
+        })),
+      );
+      const nextResult = await importMarkdownFiles.mutateAsync({
+        sourceId: source.id,
+        files: payload,
+        enqueueDistillation: true,
+      });
+      setResult(nextResult);
+      onComplete();
+    } catch (error) {
+      setReadError(actionErrorMessage(error));
+    }
+  }
+
+  const resultIssues =
+    result?.files.filter((file) => file.status !== "imported") ?? [];
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      {source ? (
+        <DialogContent className="max-w-2xl gap-5">
+          <DialogHeader>
+            <DialogTitle>
+              {t("sources.manualImportTitle", { source: sourceName(source) })}
+            </DialogTitle>
+            <DialogDescription>
+              {t("sources.manualImportDescription")}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="grid gap-4">
+            <input
+              ref={inputRef}
+              type="file"
+              multiple
+              className="sr-only"
+              onChange={handleFileSelection}
+              {...({
+                webkitdirectory: "",
+                directory: "",
+              } as { webkitdirectory: string; directory: string })}
+            />
+            <div className="flex flex-col gap-3 rounded-md border border-border bg-muted/25 p-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
+                <p className="text-sm font-medium">
+                  {files.length
+                    ? t("sources.manualImportFilesSelected", {
+                        count: files.length.toLocaleString(),
+                      })
+                    : t("sources.manualImportNoFiles")}
+                </p>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  {t("sources.manualImportFileLimit")}
+                </p>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                className="shrink-0"
+                onClick={() => inputRef.current?.click()}
+              >
+                <IconFolderOpen className="size-4" />
+                {t("sources.chooseMarkdownFolder")}
+              </Button>
+            </div>
+
+            {skippedFileCount ? (
+              <p className="text-xs leading-5 text-muted-foreground">
+                {t("sources.manualImportSkippedFiles", {
+                  count: skippedFileCount.toLocaleString(),
+                })}
+              </p>
+            ) : null}
+
+            {files.length ? (
+              <div className="grid max-h-48 gap-1 overflow-y-auto rounded-md border border-border p-3 text-xs text-muted-foreground">
+                {files.slice(0, 20).map(({ path }) => (
+                  <p key={path} className="truncate font-mono">
+                    {path}
+                  </p>
+                ))}
+                {files.length > 20 ? (
+                  <p>
+                    {t("sources.manualImportMoreFiles", {
+                      count: (files.length - 20).toLocaleString(),
+                    })}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+
+            {result ? (
+              <div className="grid gap-2 rounded-md border border-border bg-muted/25 p-3 text-sm">
+                <p className="font-medium">
+                  {t("sources.manualImportResult", {
+                    imported: result.summary.imported.toLocaleString(),
+                    queued: result.summary.queued.toLocaleString(),
+                    failed: result.summary.failed.toLocaleString(),
+                    blocked: result.summary.blocked.toLocaleString(),
+                  })}
+                </p>
+                {resultIssues.length ? (
+                  <div className="grid gap-1 text-xs leading-5 text-muted-foreground">
+                    {resultIssues.slice(0, 5).map((file) => (
+                      <p key={file.path}>
+                        <span className="font-mono">{file.path}</span>:{" "}
+                        {file.error ?? t("sources.manualImportBlocked")}
+                      </p>
+                    ))}
+                    {resultIssues.length > 5 ? (
+                      <p>
+                        {t("sources.manualImportMoreIssues", {
+                          count: (resultIssues.length - 5).toLocaleString(),
+                        })}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            {readError ? (
+              <p className="text-sm leading-6 text-destructive">{readError}</p>
+            ) : null}
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+            >
+              {t("sources.cancel")}
+            </Button>
+            <Button
+              type="button"
+              disabled={!files.length || importMarkdownFiles.isPending}
+              onClick={() => void submitImport()}
+            >
+              {importMarkdownFiles.isPending ? (
+                <IconLoader2 className="size-4 animate-spin" />
+              ) : (
+                <IconFolderOpen className="size-4" />
+              )}
+              {t("sources.importMarkdownFiles")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      ) : null}
+    </Dialog>
+  );
+}
+
 function SourceListItem({
   source,
   syncPending,
   onReview,
+  onRotateIngestToken,
   onSync,
   onTune,
+  onImportMarkdown,
+  onArchive,
 }: {
   source: BrainSource;
   syncPending: boolean;
   onReview: () => void;
+  onRotateIngestToken?: () => void;
   onSync: () => void;
   onTune: () => void;
+  onImportMarkdown?: () => void;
+  onArchive?: () => void;
 }) {
+  const t = useT();
+  const [expanded, setExpanded] = useState(false);
   const Icon = sourceProviderIcon(source.provider);
   const retry = sourceRetryAfter(source);
   const hasSyncNotice = Boolean(
@@ -1481,112 +1866,227 @@ function SourceListItem({
     : null;
   const coverage =
     typeof source.coverage === "number" ? formatPercent(source.coverage) : null;
+  const captureCount = (source.recordCount ?? 0).toLocaleString();
+  const lastSync = shortDate(sourceLastSync(source)) ?? t("sources.never");
 
   return (
-    <Card className="overflow-hidden shadow-none">
-      <CardContent className="p-4">
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(20rem,auto)_auto] xl:items-center">
-          <div className="flex min-w-0 items-start gap-3">
-            <span className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-md border border-border bg-muted/35">
-              <Icon className="size-4 text-muted-foreground" />
+    <div className="group bg-card transition-colors hover:bg-muted/20">
+      <div className="flex min-w-0 items-center gap-3 px-4 py-3 sm:px-5">
+        <span className="flex size-8 shrink-0 items-center justify-center rounded-md border border-border bg-muted/35">
+          <Icon className="size-4 text-muted-foreground" />
+        </span>
+
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <h2 className="truncate text-sm font-medium text-foreground sm:text-[0.9375rem]">
+              {sourceName(source)}
+            </h2>
+            <StatusBadge status={sourceHealth(source)} />
+            <VisibilityBadge visibility={source.visibility} />
+          </div>
+          <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
+            <span className="capitalize">{sourceType(source)}</span>
+            <span aria-hidden="true">·</span>
+            <span>
+              {captureCount} {t("sources.captures").toLocaleLowerCase()}
             </span>
-            <div className="min-w-0">
-              <div className="flex min-w-0 flex-wrap items-center gap-2">
-                <h2 className="truncate text-base font-medium text-foreground">
-                  {sourceName(source)}
-                </h2>
-                <StatusBadge status={sourceHealth(source)} />
-              </div>
-              <div className="mt-1 flex flex-wrap items-center gap-2">
-                <Badge variant="outline" className="max-w-full capitalize">
-                  {sourceType(source)}
-                </Badge>
-                {nextSync ? (
-                  <span className="text-xs text-muted-foreground">
-                    Next sync {nextSync}
+            <span aria-hidden="true">·</span>
+            <span className="truncate">
+              {t("sources.lastSyncWithDate", { date: lastSync })}
+            </span>
+            {hasSyncNotice ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    className="ms-1 inline-flex size-4 items-center justify-center text-destructive"
+                    aria-label={t("sources.actionFailedTitle")}
+                  >
+                    <IconAlertTriangle className="size-3.5" />
                   </span>
-                ) : null}
-              </div>
-              <p className="mt-2 line-clamp-2 text-sm leading-6 text-muted-foreground">
-                {sourceDescription(source)}
-              </p>
-            </div>
-          </div>
-
-          <div
-            className={
-              coverage
-                ? "grid grid-cols-2 gap-4 sm:grid-cols-3 xl:min-w-80"
-                : "grid grid-cols-2 gap-4 xl:min-w-64"
-            }
-          >
-            <SourceFact
-              label="Captures"
-              value={(source.recordCount ?? 0).toLocaleString()}
-            />
-            <SourceFact
-              label="Last sync"
-              value={shortDate(sourceLastSync(source)) ?? "Never"}
-            />
-            {coverage ? <SourceFact label="Coverage" value={coverage} /> : null}
-          </div>
-
-          <div className="flex items-center justify-end gap-2">
-            <Button size="sm" variant="outline" onClick={onReview}>
-              <IconFileSearch className="size-4" />
-              Captures
-            </Button>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="size-9"
-                  aria-label={`More actions for ${sourceName(source)}`}
-                >
-                  <IconDotsVertical className="size-4" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-40">
-                <DropdownMenuItem disabled={syncPending} onSelect={onSync}>
-                  <IconRefresh className="size-4" />
-                  Sync now
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={onTune}>
-                  <IconSettings2 className="size-4" />
-                  Tune source
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {t("sources.actionFailedTitle")}
+                </TooltipContent>
+              </Tooltip>
+            ) : null}
           </div>
         </div>
 
-        {coverage ? (
-          <Progress
-            value={(source.coverage ?? 0) * 100}
-            className="mt-4 h-1.5 bg-muted"
-          />
-        ) : null}
+        <div className="flex shrink-0 items-center gap-0.5">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                onClick={onReview}
+                aria-label={`${t("sources.captures")}: ${sourceName(source)}`}
+              >
+                <IconFileSearch className="size-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t("sources.captures")}</TooltipContent>
+          </Tooltip>
 
-        {hasSyncNotice ? (
-          <div className="mt-3 flex gap-2 rounded-md border border-border bg-muted/25 px-3 py-2 text-sm">
-            <IconAlertTriangle className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-            <p className="min-w-0 truncate text-muted-foreground">
-              {syncDetail(source)}
-            </p>
+          <ShareButton
+            resourceType="brain-source"
+            resourceId={source.id}
+            allowedRoles={["viewer", "editor", "admin"]}
+            resourceTitle={sourceName(source)}
+            triggerClassName="h-8 px-2"
+          />
+
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                aria-label={t("sources.moreActionsFor", {
+                  source: sourceName(source),
+                })}
+              >
+                <IconDotsVertical className="size-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-40">
+              <DropdownMenuItem disabled={syncPending} onSelect={onSync}>
+                <IconRefresh className="size-4" />
+                {t("sources.syncNow")}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={onTune}>
+                <IconSettings2 className="size-4" />
+                {t("sources.tuneSource")}
+              </DropdownMenuItem>
+              {onRotateIngestToken ? (
+                <DropdownMenuItem onSelect={onRotateIngestToken}>
+                  <IconRefresh className="size-4" />
+                  {t("sources.rotateIngestToken")}
+                </DropdownMenuItem>
+              ) : null}
+              {source.provider === "manual" && onImportMarkdown ? (
+                <DropdownMenuItem onSelect={onImportMarkdown}>
+                  <IconFolderOpen className="size-4" />
+                  {t("sources.importMarkdownFiles")}
+                </DropdownMenuItem>
+              ) : null}
+              {onArchive ? (
+                <DropdownMenuItem
+                  className="text-destructive focus:text-destructive"
+                  onSelect={onArchive}
+                >
+                  <IconArchive className="size-4" />
+                  {t("sources.archiveSource")}
+                </DropdownMenuItem>
+              ) : null}
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                onClick={() => setExpanded((value) => !value)}
+                aria-expanded={expanded}
+                aria-label={
+                  expanded ? t("sources.hideDetails") : t("sources.details")
+                }
+              >
+                <IconChevronDown
+                  className={cn(
+                    "size-4 transition-transform duration-200 ease-out",
+                    expanded && "rotate-180",
+                  )}
+                />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {expanded ? t("sources.hideDetails") : t("sources.details")}
+            </TooltipContent>
+          </Tooltip>
+        </div>
+      </div>
+
+      {expanded ? (
+        <div className="border-t border-border/70 px-4 pb-4 pt-3 sm:px-5">
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
+            <div className="min-w-0">
+              <p className="max-w-3xl text-sm leading-6 text-muted-foreground">
+                {sourceDescription(source)}
+              </p>
+              {source.provider === "manual" && onImportMarkdown ? (
+                <div className="mt-3 flex flex-col gap-3 rounded-md border border-border bg-muted/25 p-3 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-sm leading-6 text-muted-foreground">
+                    {t("sources.manualImportDescription")}
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="shrink-0"
+                    onClick={onImportMarkdown}
+                  >
+                    <IconFolderOpen className="size-4" />
+                    {t("sources.importMarkdownFiles")}
+                  </Button>
+                </div>
+              ) : null}
+              {hasSyncNotice ? (
+                <div className="mt-3 flex gap-2 rounded-md border border-destructive/20 bg-destructive/5 px-3 py-2 text-sm">
+                  <IconAlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
+                  <p className="min-w-0 text-muted-foreground">
+                    {syncDetail(source, t)}
+                  </p>
+                </div>
+              ) : null}
+            </div>
+
+            <div
+              className={cn(
+                "grid grid-cols-2 gap-x-6 gap-y-3 lg:min-w-64",
+                coverage && "lg:grid-cols-3 lg:min-w-80",
+              )}
+            >
+              <SourceFact label={t("sources.captures")} value={captureCount} />
+              <SourceFact label={t("sources.lastSync")} value={lastSync} />
+              {coverage ? (
+                <SourceFact label={t("sources.coverage")} value={coverage} />
+              ) : null}
+            </div>
           </div>
-        ) : null}
-      </CardContent>
-    </Card>
+
+          {coverage ? (
+            <Progress
+              value={(source.coverage ?? 0) * 100}
+              className="mt-4 h-1.5 bg-muted"
+            />
+          ) : null}
+
+          {nextSync ? (
+            <p className="mt-3 text-xs text-muted-foreground">
+              {t("sources.nextSync", { date: nextSync })}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
 export default function SourcesRoute() {
+  const t = useT();
+  const dispatchHref = getDispatchHref();
   const [params, setParams] = useSearchParams();
   const type = params.get("type") ?? "all";
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [setupOpen, setSetupOpen] = useState(false);
+  const [ingestHandoff, setIngestHandoff] =
+    useState<OneTimeIngestHandoff | null>(null);
+  const [copiedHandoffField, setCopiedHandoffField] = useState<string | null>(
+    null,
+  );
   const [editingSource, setEditingSource] = useState<BrainSource | null>(null);
+  const [markdownImportSource, setMarkdownImportSource] =
+    useState<BrainSource | null>(null);
+  const [archiveSource, setArchiveSource] = useState<BrainSource | null>(null);
   const [reviewSource, setReviewSource] = useState<BrainSource | null>(null);
   const [captureStatus, setCaptureStatus] =
     useState<CaptureStatusFilter>("queued");
@@ -1596,7 +2096,9 @@ export default function SourcesRoute() {
   );
   const [bulkResult, setBulkResult] =
     useState<EnqueueCapturesDistillationResponse | null>(null);
-  const [form, setForm] = useState<SourceFormState>(() => defaultForm("slack"));
+  const [form, setForm] = useState<SourceFormState>(() =>
+    defaultForm("slack", t),
+  );
 
   const sourcesQuery = useActionQuery<SourcesResponse>(
     "list-sources" as any,
@@ -1623,15 +2125,22 @@ export default function SourcesRoute() {
     }
   >("update-source" as any);
   const createSource = useActionMutation<
-    unknown,
+    CreateSourceResponse,
     {
       title: string;
       provider: Provider;
-      visibility: "org";
+      visibility: "private" | "org";
       config: Record<string, unknown>;
       sourceKey?: string;
     }
   >("create-source" as any);
+  const deleteSource = useActionMutation<unknown, { id: string }>(
+    "delete-source" as any,
+  );
+  const rotateSourceIngestToken = useActionMutation<
+    CreateSourceResponse,
+    { sourceId: string }
+  >("rotate-source-ingest-token" as any);
   const syncSource = useActionMutation<unknown, { sourceId: string }>(
     "sync-source" as any,
   );
@@ -1680,6 +2189,42 @@ export default function SourcesRoute() {
   const selectedWorkspaceConnection = formWorkspaceConnections.find(
     (connection) => connection.id === form.workspaceConnectionId,
   );
+  const slackChannelIssues =
+    form.provider === "slack"
+      ? validateSlackChannelInput(form.channelRefs)
+      : [];
+  const slackDirectMessageIssues = slackChannelIssues.filter(
+    (issue) => issue.code === "slack_direct_message",
+  );
+  const slackFormatIssues = slackChannelIssues.filter(
+    (issue) => issue.code !== "slack_direct_message",
+  );
+  const githubRepoIssues =
+    form.provider === "github" ? validateGitHubRepoInput(form.githubRepos) : [];
+  const zoomMeetingIdIssues =
+    form.provider === "zoom" ? invalidZoomMeetingIds(form.zoomMeetingIds) : [];
+  const zoomMeetingIdsMissing =
+    form.provider === "zoom" &&
+    zoomFilterLines(form.zoomMeetingIds).length === 0;
+  // Undefined until the provider list loads; only a confirmed non-admin locks.
+  const canManageZoom = connectionProvidersQuery.data?.canManageZoom;
+  const zoomSettingsLocked =
+    form.provider === "zoom" && canManageZoom === false;
+  const selectableProviders = providers.filter(
+    (provider) =>
+      provider.value !== "zoom" ||
+      canManageZoom === true ||
+      (!!editingSource && form.provider === "zoom"),
+  );
+  const formConfigInvalid =
+    slackChannelIssues.length > 0 ||
+    githubRepoIssues.length > 0 ||
+    zoomMeetingIdIssues.length > 0 ||
+    zoomMeetingIdsMissing;
+  const formMissingCredentialKeys =
+    formProviderMetadata?.credentialHealth?.status === "missing"
+      ? formProviderMetadata.credentialHealth.missingCredentialKeys
+      : [];
   const captures = capturesQuery.data?.captures ?? [];
   const queueableCaptures = captures.filter(captureCanQueue);
   const queueableCaptureIds = new Set(
@@ -1729,6 +2274,7 @@ export default function SourcesRoute() {
       provider ??
       (type === "slack" ||
       type === "granola" ||
+      type === "zoom" ||
       type === "github" ||
       type === "clips" ||
       type === "manual" ||
@@ -1736,7 +2282,7 @@ export default function SourcesRoute() {
         ? (type as Provider)
         : "slack");
     setEditingSource(null);
-    setForm(defaultForm(selected));
+    setForm(defaultForm(selected, t));
     setSetupOpen(true);
   }
 
@@ -1769,26 +2315,73 @@ export default function SourcesRoute() {
     setForm((current) => ({ ...current, ...patch }));
   }
 
-  function submitSource() {
+  function closeIngestHandoff() {
+    setIngestHandoff(null);
+    setCopiedHandoffField(null);
+  }
+
+  async function copyIngestHandoffValue(value: string, field: string) {
+    await navigator.clipboard.writeText(value);
+    setCopiedHandoffField(field);
+  }
+
+  async function submitSource() {
+    if (formConfigInvalid) return;
     const config = buildConfig(form);
     if (editingSource) {
-      updateSource.mutate({
+      await updateSource.mutateAsync({
         id: editingSource.id,
-        title: form.title.trim() || defaultTitle(form.provider),
-        status:
-          form.autoSync || sourceEnabled(editingSource) ? "active" : "paused",
-        config,
+        title: form.title.trim() || defaultTitle(form.provider, t),
+        status: zoomSettingsLocked
+          ? undefined
+          : form.autoSync || sourceEnabled(editingSource)
+            ? "active"
+            : "paused",
+        config: zoomSettingsLocked ? undefined : config,
       });
     } else {
-      createSource.mutate({
-        title: form.title.trim() || defaultTitle(form.provider),
+      const result = await createSource.mutateAsync({
+        title: form.title.trim() || defaultTitle(form.provider, t),
         provider: form.provider,
-        visibility: "org",
+        visibility: "private",
         config,
         sourceKey: form.sourceKey.trim() || undefined,
       });
+      const handoff = createOneTimeIngestHandoff({
+        origin: window.location.origin,
+        provider: form.provider,
+        result,
+        sourceKey: form.sourceKey,
+      });
+      setSetupOpen(false);
+      if (handoff) {
+        afterBodyPointerUnlock(() => setIngestHandoff(handoff));
+      }
+      return;
     }
     setSetupOpen(false);
+  }
+
+  async function confirmArchiveSource() {
+    if (!archiveSource) return;
+    await deleteSource.mutateAsync({ id: archiveSource.id });
+    if (reviewSource?.id === archiveSource.id) closeCaptureReview();
+    setArchiveSource(null);
+  }
+
+  async function rotateIngestToken(source: BrainSource) {
+    const sourceKey = ingestSourceKey(source);
+    if (!sourceKey) return;
+    const result = await rotateSourceIngestToken.mutateAsync({
+      sourceId: source.id,
+    });
+    const handoff = createOneTimeIngestHandoff({
+      origin: window.location.origin,
+      provider: source.provider ?? "",
+      result,
+      sourceKey,
+    });
+    if (handoff) setIngestHandoff(handoff);
   }
 
   function toggleCaptureSelection(captureId: string, checked: boolean) {
@@ -1825,9 +2418,7 @@ export default function SourcesRoute() {
   return (
     <div className="min-h-full bg-muted/20">
       <PageHeader
-        eyebrow="Sources"
-        title="Source configuration"
-        description="Connect approved places Brain can learn from, then sync and review them as needed."
+        title={t("sources.title")}
         actions={
           <div className="grid w-full gap-2 sm:w-auto sm:grid-flow-col sm:auto-cols-max sm:justify-end">
             <Button
@@ -1836,7 +2427,7 @@ export default function SourcesRoute() {
               onClick={() => setAdvancedOpen(true)}
             >
               <IconSettings2 className="size-4" />
-              Advanced
+              {t("sources.advanced")}
             </Button>
             <Button
               size="sm"
@@ -1844,7 +2435,7 @@ export default function SourcesRoute() {
               onClick={() => openCreate()}
             >
               <IconDatabaseImport className="size-4" />
-              Add source
+              {t("sources.addSource")}
             </Button>
           </div>
         }
@@ -1856,21 +2447,34 @@ export default function SourcesRoute() {
             <LoadingRows rows={3} />
           </div>
         ) : visibleSources.length ? (
-          visibleSources.map((source) => (
-            <SourceListItem
-              key={source.id}
-              source={source}
-              syncPending={syncSource.isPending}
-              onReview={() => openCaptureReview(source)}
-              onSync={() => syncSource.mutate({ sourceId: source.id })}
-              onTune={() => openEdit(source)}
-            />
-          ))
+          <div className="overflow-hidden rounded-lg border border-border bg-card divide-y divide-border">
+            {visibleSources.map((source) => (
+              <SourceListItem
+                key={source.id}
+                source={source}
+                syncPending={
+                  syncSource.isPending || rotateSourceIngestToken.isPending
+                }
+                onReview={() => openCaptureReview(source)}
+                onRotateIngestToken={
+                  (source.provider === "clips" ||
+                    source.provider === "generic") &&
+                  ingestSourceKey(source)
+                    ? () => void rotateIngestToken(source)
+                    : undefined
+                }
+                onSync={() => syncSource.mutate({ sourceId: source.id })}
+                onTune={() => afterBodyPointerUnlock(() => openEdit(source))}
+                onImportMarkdown={() => setMarkdownImportSource(source)}
+                onArchive={() => setArchiveSource(source)}
+              />
+            ))}
+          </div>
         ) : (
           <div>
             <EmptyActionState
-              title="Connect Brain's first source"
-              detail="Add an approved Slack channel, Granola Team-space source, GitHub repo, Clips export, manual import, or signed webhook."
+              title={t("sources.emptyTitle")}
+              detail={t("sources.emptyDetail")}
             />
           </div>
         )}
@@ -1879,13 +2483,15 @@ export default function SourcesRoute() {
         connectionProvidersQuery.isError ||
         updateSource.isError ||
         createSource.isError ||
+        rotateSourceIngestToken.isError ||
         syncSource.isError ||
         syncDueSources.isError ||
-        enqueueCapturesDistillation.isError ? (
+        enqueueCapturesDistillation.isError ||
+        deleteSource.isError ? (
           <div>
             <EmptyActionState
-              title="Source action failed"
-              detail="Check source credentials, channel allow-lists, and the latest sync error."
+              title={t("sources.actionFailedTitle")}
+              detail={t("sources.actionFailedDetail")}
             />
           </div>
         ) : null}
@@ -1894,10 +2500,9 @@ export default function SourcesRoute() {
       <Sheet open={advancedOpen} onOpenChange={setAdvancedOpen}>
         <SheetContent className="w-full overflow-y-auto sm:max-w-3xl">
           <SheetHeader>
-            <SheetTitle>Advanced source controls</SheetTitle>
+            <SheetTitle>{t("sources.advancedTitle")}</SheetTitle>
             <SheetDescription>
-              Filter sources, check connection readiness, and run maintenance
-              syncs when the normal source list is not enough.
+              {t("sources.advancedDescription")}
             </SheetDescription>
           </SheetHeader>
 
@@ -1905,15 +2510,19 @@ export default function SourcesRoute() {
             <section className="grid gap-3 rounded-md border border-border bg-card p-4">
               <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
                 <div className="grid gap-2">
-                  <Label htmlFor="source-type-filter">Source type</Label>
+                  <Label htmlFor="source-type-filter">
+                    {t("sources.sourceType")}
+                  </Label>
                   <Select value={type} onValueChange={updateType}>
                     <SelectTrigger id="source-type-filter">
-                      <SelectValue placeholder="Source type" />
+                      <SelectValue placeholder={t("sources.sourceType")} />
                     </SelectTrigger>
                     <SelectContent>
                       {sourceTypes.map((sourceType) => (
                         <SelectItem key={sourceType} value={sourceType}>
-                          {sourceType === "all" ? "All sources" : sourceType}
+                          {sourceType === "all"
+                            ? t("sources.allSources")
+                            : sourceType}
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -1926,7 +2535,7 @@ export default function SourcesRoute() {
                   onClick={() => syncDueSources.mutate({ limit: 5 })}
                 >
                   <IconPlayerPlay className="size-4" />
-                  Run due syncs
+                  {t("sources.runDueSyncs")}
                 </Button>
               </div>
             </section>
@@ -1939,13 +2548,14 @@ export default function SourcesRoute() {
             <ProviderCatalog
               providers={connectionProviders}
               loading={connectionProvidersQuery.isLoading}
+              dispatchHref={dispatchHref}
               workspaceError={
                 connectionProvidersQuery.data?.workspaceConnections?.error ??
                 null
               }
               onAddSource={(provider) => {
                 setAdvancedOpen(false);
-                openCreate(provider);
+                afterBodyPointerUnlock(() => openCreate(provider));
               }}
             />
           </div>
@@ -1960,18 +2570,22 @@ export default function SourcesRoute() {
       >
         <SheetContent className="w-full overflow-y-auto sm:max-w-2xl">
           <SheetHeader>
-            <SheetTitle>Review raw captures</SheetTitle>
+            <SheetTitle>{t("sources.reviewRawCaptures")}</SheetTitle>
             <SheetDescription>
               {reviewSource
-                ? `${sourceName(reviewSource)} inventory. Raw bodies stay hidden unless a reviewer enables previews.`
-                : "Review imported raw material before distillation."}
+                ? t("sources.captureInventoryDescription", {
+                    source: sourceName(reviewSource),
+                  })
+                : t("sources.reviewRawCapturesDescription")}
             </SheetDescription>
           </SheetHeader>
 
           <div className="mt-6 grid gap-4">
             <div className="grid gap-3 rounded-md border border-border bg-muted/25 p-3 sm:grid-cols-[1fr_auto] sm:items-center">
               <div className="grid gap-2 sm:max-w-56">
-                <Label htmlFor="capture-status-filter">Status</Label>
+                <Label htmlFor="capture-status-filter">
+                  {t("sources.status")}
+                </Label>
                 <Select
                   value={captureStatus}
                   onValueChange={(value) => {
@@ -1986,7 +2600,7 @@ export default function SourcesRoute() {
                   <SelectContent>
                     {captureStatusOptions.map((status) => (
                       <SelectItem key={status} value={status}>
-                        {captureStatusLabel(status)}
+                        {captureStatusLabel(status, t)}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -1994,9 +2608,9 @@ export default function SourcesRoute() {
               </div>
               <label className="flex items-center justify-between gap-3 text-sm">
                 <span>
-                  Previews
+                  {t("sources.previews")}
                   <span className="block text-xs text-muted-foreground">
-                    Show short snippets for intentional review
+                    {t("sources.previewsDescription")}
                   </span>
                 </span>
                 <Switch
@@ -2010,10 +2624,11 @@ export default function SourcesRoute() {
               <div className="grid gap-3 rounded-md border border-border bg-card p-3">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
-                    <p className="text-sm font-medium">Batch distillation</p>
+                    <p className="text-sm font-medium">
+                      {t("sources.batchDistillation")}
+                    </p>
                     <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                      Select queueable captures and hand them to the Brain
-                      distillation worker together.
+                      {t("sources.batchDistillationDescription")}
                     </p>
                   </div>
                   <div className="grid gap-2 sm:flex sm:flex-wrap sm:justify-end">
@@ -2024,7 +2639,9 @@ export default function SourcesRoute() {
                       onClick={toggleAllQueueableCaptures}
                     >
                       <IconChecks className="size-4" />
-                      {allQueueableSelected ? "Unselect all" : "Select all"}
+                      {allQueueableSelected
+                        ? t("sources.unselectAll")
+                        : t("sources.selectAll")}
                     </Button>
                     <Button
                       size="sm"
@@ -2037,9 +2654,9 @@ export default function SourcesRoute() {
                       {enqueueCapturesDistillation.isPending ? (
                         <IconLoader2 className="size-4 animate-spin" />
                       ) : (
-                        <IconSend className="size-4" />
+                        <IconSend className="size-4 rtl:-scale-x-100" />
                       )}
-                      Queue selected
+                      {t("sources.queueSelected")}
                     </Button>
                     {selectedCaptureIds.size ? (
                       <Button
@@ -2047,25 +2664,31 @@ export default function SourcesRoute() {
                         variant="ghost"
                         onClick={() => setSelectedCaptureIds(new Set())}
                       >
-                        Clear
+                        {t("sources.clear")}
                       </Button>
                     ) : null}
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
                   <Badge variant="outline">
-                    {selectedQueueableIds.length.toLocaleString()} selected
+                    {t("sources.selectedCount", {
+                      count: selectedQueueableIds.length.toLocaleString(),
+                    })}
                   </Badge>
                   <Badge variant="outline">
-                    {queueableCaptures.length.toLocaleString()} queueable
+                    {t("sources.queueableCount", {
+                      count: queueableCaptures.length.toLocaleString(),
+                    })}
                   </Badge>
                   {bulkResult ? (
                     <Badge
                       variant={bulkResult.errors ? "destructive" : "secondary"}
                     >
-                      {bulkResult.queued.toLocaleString()} queued,{" "}
-                      {bulkResult.existing.toLocaleString()} existing,{" "}
-                      {bulkResult.errors.toLocaleString()} errors
+                      {t("sources.bulkResult", {
+                        queued: bulkResult.queued.toLocaleString(),
+                        existing: bulkResult.existing.toLocaleString(),
+                        errors: bulkResult.errors.toLocaleString(),
+                      })}
                     </Badge>
                   ) : null}
                 </div>
@@ -2076,8 +2699,8 @@ export default function SourcesRoute() {
               <LoadingRows rows={3} />
             ) : capturesQuery.isError ? (
               <EmptyActionState
-                title="Capture inventory failed"
-                detail="Check source access and try again."
+                title={t("sources.captureInventoryFailedTitle")}
+                detail={t("sources.captureInventoryFailedDetail")}
               />
             ) : (capturesQuery.data?.captures ?? []).length ? (
               <div className="grid gap-3">
@@ -2104,7 +2727,9 @@ export default function SourcesRoute() {
                             className="mt-1 size-4 shrink-0 rounded border-border accent-primary disabled:cursor-not-allowed disabled:opacity-50"
                             checked={selected}
                             disabled={!canQueue || isMutating}
-                            aria-label={`Select ${capture.title}`}
+                            aria-label={t("sources.selectCapture", {
+                              title: capture.title,
+                            })}
                             onChange={(event) =>
                               toggleCaptureSelection(
                                 capture.id,
@@ -2130,8 +2755,7 @@ export default function SourcesRoute() {
                               </p>
                             ) : (
                               <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                                Raw content hidden. Enable previews or open the
-                                source only when review requires context.
+                                {t("sources.rawContentHidden")}
                               </p>
                             )}
                             {queue ? (
@@ -2144,20 +2768,20 @@ export default function SourcesRoute() {
                                         : "outline"
                                     }
                                   >
-                                    Distillation{" "}
-                                    {queueStatusLabel(queue.status)}
+                                    {t("sources.distillation")}{" "}
+                                    {queueStatusLabel(queue.status, t)}
                                   </Badge>
                                   {queue.attempts ? (
                                     <span>
                                       {queue.attempts}{" "}
                                       {queue.attempts === 1
-                                        ? "attempt"
-                                        : "attempts"}
+                                        ? t("sources.attempt")
+                                        : t("sources.attempts")}
                                     </span>
                                   ) : null}
                                   {queue.runAfter ? (
                                     <span>
-                                      Next check{" "}
+                                      {t("sources.nextCheck")}{" "}
                                       {shortDate(queue.runAfter) ??
                                         queue.runAfter}
                                     </span>
@@ -2167,9 +2791,7 @@ export default function SourcesRoute() {
                                   <p className="mt-2">{queue.error}</p>
                                 ) : queueIsActive ? (
                                   <p className="mt-2">
-                                    Waiting for the Brain distillation worker to
-                                    write knowledge or send this capture to
-                                    review.
+                                    {t("sources.waitingForWorker")}
                                   </p>
                                 ) : null}
                               </div>
@@ -2187,7 +2809,7 @@ export default function SourcesRoute() {
                               rel="noreferrer"
                             >
                               <IconExternalLink className="size-4" />
-                              Source
+                              {t("sources.source")}
                             </a>
                           </Button>
                         ) : null}
@@ -2202,12 +2824,14 @@ export default function SourcesRoute() {
                             })
                           }
                         >
-                          {enqueueDistillation.isPending ? (
+                          {enqueueDistillation.isPending &&
+                          enqueueDistillation.variables?.captureId ===
+                            capture.id ? (
                             <IconLoader2 className="size-4 animate-spin" />
                           ) : (
-                            <IconSend className="size-4" />
+                            <IconSend className="size-4 rtl:-scale-x-100" />
                           )}
-                          {queueActionLabel(queue)}
+                          {queueActionLabel(queue, t)}
                         </Button>
                         <Button
                           size="sm"
@@ -2221,7 +2845,7 @@ export default function SourcesRoute() {
                           }
                         >
                           <IconArchive className="size-4" />
-                          Ignore
+                          {t("sources.ignore")}
                         </Button>
                       </div>
                     </div>
@@ -2230,30 +2854,152 @@ export default function SourcesRoute() {
               </div>
             ) : (
               <EmptyActionState
-                title="No captures match this view"
-                detail="Try another status, run a source sync, or import a transcript."
+                title={t("sources.noCapturesTitle")}
+                detail={t("sources.noCapturesDetail")}
               />
             )}
           </div>
         </SheetContent>
       </Sheet>
 
+      <MarkdownImportDialog
+        source={markdownImportSource}
+        open={Boolean(markdownImportSource)}
+        onOpenChange={(open) => {
+          if (!open) setMarkdownImportSource(null);
+        }}
+        onComplete={() => {
+          void sourcesQuery.refetch();
+          void healthQuery.refetch();
+        }}
+      />
+
+      <Dialog
+        open={Boolean(archiveSource)}
+        onOpenChange={(open) => {
+          if (!open && !deleteSource.isPending) setArchiveSource(null);
+        }}
+      >
+        {archiveSource ? (
+          <DialogContent className="max-w-md gap-5">
+            <DialogHeader>
+              <DialogTitle>{t("sources.archiveSourceTitle")}</DialogTitle>
+              <DialogDescription>
+                {t("sources.archiveSourceDescription", {
+                  source: sourceName(archiveSource),
+                })}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={deleteSource.isPending}
+                onClick={() => setArchiveSource(null)}
+              >
+                {t("sources.cancel")}
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                disabled={deleteSource.isPending}
+                onClick={() => void confirmArchiveSource()}
+              >
+                {deleteSource.isPending ? (
+                  <IconLoader2 className="size-4 animate-spin" />
+                ) : (
+                  <IconArchive className="size-4" />
+                )}
+                {t("sources.archiveSource")}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        ) : null}
+      </Dialog>
+
+      <Dialog
+        open={Boolean(ingestHandoff)}
+        onOpenChange={(open) => {
+          if (!open) closeIngestHandoff();
+        }}
+      >
+        {ingestHandoff ? (
+          <DialogContent className="max-w-xl gap-5">
+            <DialogHeader>
+              <DialogTitle>
+                {t("sources.connectIngestSource", {
+                  source: ingestHandoff.source.title,
+                })}
+              </DialogTitle>
+              <DialogDescription>
+                {t("sources.ingestHandoffDescription")}
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="grid gap-4">
+              {[
+                [t("sources.endpoint"), ingestHandoff.endpoint, "endpoint"],
+                [t("sources.sourceKey"), ingestHandoff.sourceKey, "source-key"],
+                [
+                  t("sources.ingestToken"),
+                  ingestHandoff.ingestToken,
+                  "ingest-token",
+                ],
+              ].map(([label, value, field]) => (
+                <div key={field} className="grid gap-2">
+                  <Label htmlFor={`ingest-handoff-${field}`}>{label}</Label>
+                  <div className="flex gap-2">
+                    <Input
+                      id={`ingest-handoff-${field}`}
+                      value={value}
+                      readOnly
+                      className="min-w-0 font-mono text-xs"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="shrink-0"
+                      onClick={() => void copyIngestHandoffValue(value, field)}
+                    >
+                      {copiedHandoffField === field ? (
+                        <IconChecks className="size-4" />
+                      ) : (
+                        <IconCopy className="size-4" />
+                      )}
+                      {copiedHandoffField === field
+                        ? t("sources.copied")
+                        : t("sources.copy")}
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="rounded-md border border-border bg-muted/25 p-3 text-sm leading-6 text-muted-foreground">
+              {t("sources.ingestTokenSecurity")}
+            </div>
+
+            <DialogFooter>
+              <Button type="button" onClick={closeIngestHandoff}>
+                {t("sources.ingestHandoffSaved")}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        ) : null}
+      </Dialog>
+
       <Sheet open={setupOpen} onOpenChange={setSetupOpen}>
         <SheetContent className="w-full overflow-y-auto sm:max-w-xl">
           <SheetHeader>
             <SheetTitle>
-              {editingSource ? "Tune source" : "Add source"}
+              {editingSource ? t("sources.tuneSource") : t("sources.addSource")}
             </SheetTitle>
-            <SheetDescription>
-              Configure what Brain may ingest. Credentials stay in the workspace
-              credential store; this form only saves allow-lists, cursors, and
-              review rules.
-            </SheetDescription>
+            <SheetDescription>{t("sources.setupDescription")}</SheetDescription>
           </SheetHeader>
 
           <div className="mt-6 grid gap-5">
             <div className="grid gap-2">
-              <Label htmlFor="source-title">Name</Label>
+              <Label htmlFor="source-title">{t("sources.name")}</Label>
               <Input
                 id="source-title"
                 value={form.title}
@@ -2262,7 +3008,7 @@ export default function SourcesRoute() {
             </div>
 
             <div className="grid gap-2">
-              <Label>Provider</Label>
+              <Label>{t("sources.provider")}</Label>
               <Select
                 value={form.provider}
                 disabled={!!editingSource}
@@ -2270,8 +3016,8 @@ export default function SourcesRoute() {
                   setForm((current) => ({
                     ...defaultForm(provider as Provider),
                     title:
-                      current.title === defaultTitle(current.provider)
-                        ? defaultTitle(provider as Provider)
+                      current.title === defaultTitle(current.provider, t)
+                        ? defaultTitle(provider as Provider, t)
                         : current.title,
                     workspaceConnectionId: "",
                   }))
@@ -2281,7 +3027,7 @@ export default function SourcesRoute() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {providers.map((provider) => (
+                  {selectableProviders.map((provider) => (
                     <SelectItem key={provider.value} value={provider.value}>
                       {provider.label}
                     </SelectItem>
@@ -2290,10 +3036,21 @@ export default function SourcesRoute() {
               </Select>
             </div>
 
+            {formMissingCredentialKeys.length > 0 ? (
+              <p className="flex items-start gap-2 rounded-md border border-destructive/25 bg-destructive/10 p-3 text-xs leading-5 text-destructive">
+                <IconAlertTriangle className="mt-0.5 size-4 shrink-0" />
+                <span>
+                  {t("sources.missingProviderCredential", {
+                    keys: formMissingCredentialKeys.join(", "),
+                  })}
+                </span>
+              </p>
+            ) : null}
+
             {supportsWorkspaceConnectionBinding(form.provider) && (
               <div className="grid gap-2">
                 <Label htmlFor="workspace-connection">
-                  Workspace connection
+                  {t("sources.workspaceConnection")}
                 </Label>
                 <Select
                   value={form.workspaceConnectionId || "__automatic__"}
@@ -2311,7 +3068,7 @@ export default function SourcesRoute() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="__automatic__">
-                      Automatic credential selection
+                      {t("sources.automaticCredentialSelection")}
                     </SelectItem>
                     {formWorkspaceConnections.map((connection) => (
                       <SelectItem key={connection.id} value={connection.id}>
@@ -2325,56 +3082,108 @@ export default function SourcesRoute() {
                 </Select>
                 <p className="text-xs leading-5 text-muted-foreground">
                   {selectedWorkspaceConnection
-                    ? `This source is bound to ${selectedWorkspaceConnection.label}; sync will not fall back to another shared connection.`
+                    ? t("sources.boundConnectionDescription", {
+                        connection: selectedWorkspaceConnection.label,
+                      })
                     : formWorkspaceConnections.length
-                      ? "Pick a granted connection to pin this source, or leave automatic to use the existing credential fallback."
-                      : "Grant a workspace connection to Brain in Dispatch before pinning this source."}
+                      ? t("sources.pickGrantedConnection")
+                      : t("sources.grantConnectionBeforePinning")}
                 </p>
               </div>
             )}
 
             {form.provider === "slack" && (
               <div className="grid gap-4 rounded-md border border-border p-4">
+                <div className="grid gap-3 rounded-md border border-border bg-muted/20 p-3 text-xs leading-5 text-muted-foreground">
+                  <p>
+                    <span className="font-medium text-foreground">
+                      {t("sources.slackDiscoveryMode")}
+                    </span>{" "}
+                    — {t("sources.slackDiscoveryModeDescription")}
+                  </p>
+                  <p>{t("sources.slackExclusions")}</p>
+                  <p>{t("sources.slackManualInvite")}</p>
+                  <p>{t("sources.sensitivityPreviewDescription")}</p>
+                </div>
                 <div className="rounded-md border border-border bg-muted/25 p-3">
                   <div className="flex items-center gap-2 text-sm font-medium">
                     <IconShieldCheck className="size-4 text-muted-foreground" />
-                    Slack access rules
+                    {t("sources.slackAccessRules")}
                   </div>
                   <div className="mt-2 grid gap-1 text-xs leading-5 text-muted-foreground">
-                    <p>
-                      Use one approved channel ID or #name per line. IDs are
-                      safest for pilots; names are resolved before validation.
-                    </p>
-                    <p>
-                      Slack access should support auth.test,
-                      conversations.info/history, and chat.getPermalink. Add
-                      private-channel access when piloting private channels.
-                    </p>
+                    <p>{t("sources.slackAccessRuleIds")}</p>
+                    <p>{t("sources.slackAccessRuleScopes")}</p>
                   </div>
                 </div>
                 <div className="grid gap-2">
-                  <Label htmlFor="slack-channels">Allowed channels</Label>
+                  <Label htmlFor="slack-channels">
+                    {t("sources.allowedChannels")}
+                  </Label>
                   <Textarea
                     id="slack-channels"
                     value={form.channelRefs}
                     onChange={(event) =>
                       updateForm({ channelRefs: event.target.value })
                     }
+                    aria-invalid={slackChannelIssues.length > 0}
+                    aria-describedby={
+                      slackChannelIssues.length > 0
+                        ? "slack-channels-error"
+                        : undefined
+                    }
                     placeholder={"C0123456789\n#product\n#launches"}
                   />
+                  {slackChannelIssues.length > 0 ? (
+                    <div
+                      id="slack-channels-error"
+                      className="grid gap-1 text-xs leading-5 text-destructive"
+                    >
+                      {slackDirectMessageIssues.length > 0 ? (
+                        <p>
+                          {t("sources.invalidSlackDirectMessages", {
+                            entries: issueEntryList(slackDirectMessageIssues),
+                          })}
+                        </p>
+                      ) : null}
+                      {slackFormatIssues.length > 0 ? (
+                        <p>
+                          {t("sources.invalidAllowedChannels", {
+                            entries: issueEntryList(slackFormatIssues),
+                          })}
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
                   <p className="text-xs leading-5 text-muted-foreground">
-                    Brain verifies the allow-list, rejects DMs/MPIMs, and never
-                    stores credential values in source config.
+                    {t("sources.allowedChannelsDescription")}
                   </p>
                 </div>
+                <label className="flex items-center justify-between gap-4 rounded-md border border-border bg-muted/20 p-3">
+                  <span>
+                    <span className="block text-sm font-medium">
+                      {t("sources.includePublicChannels")}
+                    </span>
+                    <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                      {t("sources.includePublicChannelsDescription")}
+                    </span>
+                  </span>
+                  <Switch
+                    checked={form.includePublicChannels}
+                    onCheckedChange={(includePublicChannels) =>
+                      updateForm({ includePublicChannels })
+                    }
+                  />
+                </label>
                 <div className="grid gap-2 sm:grid-cols-2">
                   <div className="grid gap-2">
-                    <Label htmlFor="history-limit">Messages per page</Label>
+                    <Label htmlFor="history-limit">
+                      {t("sources.messagesPerPage")}
+                    </Label>
                     <Input
                       id="history-limit"
                       type="number"
                       min={1}
-                      max={15}
+                      max={30}
                       value={form.historyLimit}
                       onChange={(event) =>
                         updateForm({ historyLimit: event.target.value })
@@ -2382,7 +3191,9 @@ export default function SourcesRoute() {
                     />
                   </div>
                   <div className="grid gap-2">
-                    <Label htmlFor="poll-minutes">Poll minutes</Label>
+                    <Label htmlFor="poll-minutes">
+                      {t("sources.pollMinutes")}
+                    </Label>
                     <Input
                       id="poll-minutes"
                       type="number"
@@ -2402,7 +3213,9 @@ export default function SourcesRoute() {
               <div className="grid gap-4 rounded-md border border-border p-4">
                 <div className="grid gap-2 sm:grid-cols-2">
                   <div className="grid gap-2">
-                    <Label htmlFor="granola-page-size">Page size</Label>
+                    <Label htmlFor="granola-page-size">
+                      {t("sources.pageSize")}
+                    </Label>
                     <Input
                       id="granola-page-size"
                       type="number"
@@ -2415,7 +3228,9 @@ export default function SourcesRoute() {
                     />
                   </div>
                   <div className="grid gap-2">
-                    <Label htmlFor="granola-poll-minutes">Poll minutes</Label>
+                    <Label htmlFor="granola-poll-minutes">
+                      {t("sources.pollMinutes")}
+                    </Label>
                     <Input
                       id="granola-poll-minutes"
                       type="number"
@@ -2430,7 +3245,7 @@ export default function SourcesRoute() {
                 </div>
                 <div className="grid gap-2">
                   <Label htmlFor="granola-updated-after">
-                    Initial updated-after
+                    {t("sources.initialUpdatedAfter")}
                   </Label>
                   <Input
                     id="granola-updated-after"
@@ -2441,33 +3256,131 @@ export default function SourcesRoute() {
                     placeholder="2026-05-01T00:00:00.000Z"
                   />
                   <p className="text-xs leading-5 text-muted-foreground">
-                    Granola Enterprise API returns Team-space notes; private
-                    notes are outside the API scope.
+                    {t("sources.granolaDescription")}
                   </p>
                 </div>
+              </div>
+            )}
+
+            {form.provider === "zoom" && (
+              <div className="grid gap-4 rounded-md border border-border p-4">
+                {zoomSettingsLocked ? (
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    {t("sources.zoomAdminOnly")}
+                  </p>
+                ) : null}
+                <div className="grid gap-2">
+                  <Label htmlFor="zoom-meeting-ids">
+                    {t("sources.zoomMeetingIds")}
+                  </Label>
+                  <Textarea
+                    id="zoom-meeting-ids"
+                    disabled={zoomSettingsLocked}
+                    value={form.zoomMeetingIds}
+                    onChange={(event) =>
+                      updateForm({ zoomMeetingIds: event.target.value })
+                    }
+                    aria-invalid={zoomMeetingIdIssues.length > 0}
+                    aria-describedby={
+                      zoomMeetingIdIssues.length > 0
+                        ? "zoom-meeting-ids-error"
+                        : undefined
+                    }
+                    placeholder={"123 4567 8901\n98765432101"}
+                  />
+                  {zoomMeetingIdIssues.length > 0 ? (
+                    <p
+                      id="zoom-meeting-ids-error"
+                      className="text-xs leading-5 text-destructive"
+                    >
+                      {t("sources.invalidZoomMeetingIds", {
+                        entries: zoomMeetingIdIssues
+                          .map((entry) => `"${entry}"`)
+                          .join(", "),
+                      })}
+                    </p>
+                  ) : null}
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    {t("sources.zoomMeetingIdsDescription")}
+                  </p>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <div className="grid gap-2">
+                    <Label htmlFor="zoom-lookback-days">
+                      {t("sources.zoomLookbackDays")}
+                    </Label>
+                    <Input
+                      id="zoom-lookback-days"
+                      disabled={zoomSettingsLocked}
+                      type="number"
+                      min={1}
+                      max={30}
+                      value={form.zoomLookbackDays}
+                      onChange={(event) =>
+                        updateForm({ zoomLookbackDays: event.target.value })
+                      }
+                    />
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="zoom-poll-minutes">
+                      {t("sources.pollMinutes")}
+                    </Label>
+                    <Input
+                      id="zoom-poll-minutes"
+                      disabled={zoomSettingsLocked}
+                      type="number"
+                      min={5}
+                      max={1440}
+                      value={form.pollMinutes}
+                      onChange={(event) =>
+                        updateForm({ pollMinutes: event.target.value })
+                      }
+                    />
+                  </div>
+                </div>
+                <p className="text-xs leading-5 text-muted-foreground">
+                  {t("sources.zoomDescription")}
+                </p>
               </div>
             )}
 
             {form.provider === "github" && (
               <div className="grid gap-4 rounded-md border border-border p-4">
                 <div className="grid gap-2">
-                  <Label htmlFor="github-repos">Approved repositories</Label>
+                  <Label htmlFor="github-repos">
+                    {t("sources.approvedRepositories")}
+                  </Label>
                   <Textarea
                     id="github-repos"
                     value={form.githubRepos}
                     onChange={(event) =>
                       updateForm({ githubRepos: event.target.value })
                     }
+                    aria-invalid={githubRepoIssues.length > 0}
+                    aria-describedby={
+                      githubRepoIssues.length > 0
+                        ? "github-repos-error"
+                        : undefined
+                    }
                     placeholder={"owner/repo\nhttps://github.com/owner/repo"}
                   />
+                  {githubRepoIssues.length > 0 ? (
+                    <p
+                      id="github-repos-error"
+                      className="text-xs leading-5 text-destructive"
+                    >
+                      {t("sources.invalidGithubRepositories", {
+                        entries: issueEntryList(githubRepoIssues),
+                      })}
+                    </p>
+                  ) : null}
                   <p className="text-xs leading-5 text-muted-foreground">
-                    Brain imports bounded issue and pull request context from
-                    these repositories using the workspace GitHub credential.
+                    {t("sources.githubRepositoriesDescription")}
                   </p>
                 </div>
                 <div className="grid gap-2 sm:grid-cols-3">
                   <div className="grid gap-2">
-                    <Label htmlFor="github-state">State</Label>
+                    <Label htmlFor="github-state">{t("sources.state")}</Label>
                     <Select
                       value={form.githubState}
                       onValueChange={(githubState) =>
@@ -2481,14 +3394,20 @@ export default function SourcesRoute() {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="all">All</SelectItem>
-                        <SelectItem value="open">Open</SelectItem>
-                        <SelectItem value="closed">Closed</SelectItem>
+                        <SelectItem value="all">{t("sources.all")}</SelectItem>
+                        <SelectItem value="open">
+                          {t("sources.open")}
+                        </SelectItem>
+                        <SelectItem value="closed">
+                          {t("sources.closed")}
+                        </SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
                   <div className="grid gap-2">
-                    <Label htmlFor="github-limit">Items per repo</Label>
+                    <Label htmlFor="github-limit">
+                      {t("sources.itemsPerRepo")}
+                    </Label>
                     <Input
                       id="github-limit"
                       type="number"
@@ -2501,7 +3420,9 @@ export default function SourcesRoute() {
                     />
                   </div>
                   <div className="grid gap-2">
-                    <Label htmlFor="github-poll-minutes">Poll minutes</Label>
+                    <Label htmlFor="github-poll-minutes">
+                      {t("sources.pollMinutes")}
+                    </Label>
                     <Input
                       id="github-poll-minutes"
                       type="number"
@@ -2516,7 +3437,7 @@ export default function SourcesRoute() {
                 </div>
                 <div className="grid gap-3 rounded-md bg-muted/25 p-3">
                   <label className="flex items-center justify-between gap-3 text-sm">
-                    <span>Include issues</span>
+                    <span>{t("sources.includeIssues")}</span>
                     <Switch
                       checked={form.githubIncludeIssues}
                       onCheckedChange={(githubIncludeIssues) =>
@@ -2525,7 +3446,7 @@ export default function SourcesRoute() {
                     />
                   </label>
                   <label className="flex items-center justify-between gap-3 text-sm">
-                    <span>Include pull requests</span>
+                    <span>{t("sources.includePullRequests")}</span>
                     <Switch
                       checked={form.githubIncludePullRequests}
                       onCheckedChange={(githubIncludePullRequests) =>
@@ -2540,7 +3461,9 @@ export default function SourcesRoute() {
             {(form.provider === "generic" || form.provider === "clips") && (
               <div className="grid gap-4 rounded-md border border-border p-4">
                 <div className="grid gap-2">
-                  <Label htmlFor="source-key">Webhook source key</Label>
+                  <Label htmlFor="source-key">
+                    {t("sources.webhookSourceKey")}
+                  </Label>
                   <Input
                     id="source-key"
                     value={form.sourceKey}
@@ -2550,8 +3473,7 @@ export default function SourcesRoute() {
                     placeholder={form.provider}
                   />
                   <p className="text-xs leading-5 text-muted-foreground">
-                    New sources receive a one-time ingest token. Existing
-                    sources keep their token unless rotated separately.
+                    {t("sources.webhookSourceKeyDescription")}
                   </p>
                 </div>
               </div>
@@ -2560,28 +3482,15 @@ export default function SourcesRoute() {
             <div className="grid gap-3 rounded-md border border-border bg-muted/25 p-4">
               <label className="flex items-center justify-between gap-3 text-sm">
                 <span>
-                  Auto-sync
+                  {t("sources.autoSync")}
                   <span className="block text-xs text-muted-foreground">
-                    Background polling uses this source when due
+                    {t("sources.autoSyncDescription")}
                   </span>
                 </span>
                 <Switch
+                  disabled={zoomSettingsLocked}
                   checked={form.autoSync}
                   onCheckedChange={(autoSync) => updateForm({ autoSync })}
-                />
-              </label>
-              <label className="flex items-center justify-between gap-3 text-sm">
-                <span>
-                  Review required
-                  <span className="block text-xs text-muted-foreground">
-                    Queue extracted knowledge before approval
-                  </span>
-                </span>
-                <Switch
-                  checked={form.reviewRequired}
-                  onCheckedChange={(reviewRequired) =>
-                    updateForm({ reviewRequired })
-                  }
                 />
               </label>
             </div>
@@ -2593,7 +3502,7 @@ export default function SourcesRoute() {
               className="w-full sm:w-auto"
               onClick={() => setSetupOpen(false)}
             >
-              Cancel
+              {t("sources.cancel")}
             </Button>
             <Button
               className="w-full sm:w-auto"
@@ -2601,10 +3510,13 @@ export default function SourcesRoute() {
               disabled={
                 createSource.isPending ||
                 updateSource.isPending ||
+                formConfigInvalid ||
                 !form.title.trim()
               }
             >
-              {editingSource ? "Save source" : "Create source"}
+              {editingSource
+                ? t("sources.saveSource")
+                : t("sources.createSource")}
             </Button>
           </SheetFooter>
         </SheetContent>

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+
 import type { ActionTool } from "../../agent/types.js";
 import { parseArgs } from "../utils.js";
 
@@ -40,14 +41,12 @@ function listDir(
     return;
   }
 
-  // Sort: directories first, then files, alphabetical within each
   entries.sort((a, b) => {
     if (a.isDirectory() && !b.isDirectory()) return -1;
     if (!a.isDirectory() && b.isDirectory()) return 1;
     return a.name.localeCompare(b.name);
   });
 
-  // Skip common non-useful directories
   const skip = new Set([
     "node_modules",
     ".git",

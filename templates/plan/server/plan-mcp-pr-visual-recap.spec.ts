@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+
+import { describe, expect, it } from "vitest";
 
 const PR_VISUAL_RECAP_MCP_TOOLS = [
   "get-plan-blocks",
@@ -29,7 +30,7 @@ describe("Plan MCP PR visual recap catalog", () => {
 
     expect(mcpPluginSource).toContain("mountMCP");
     expect(mcpPluginSource).toContain("PLAN_CONNECTOR_CATALOG");
-    expect(agentChatSource).toContain("disableMcp: true");
+    expect(agentChatSource).toContain("enabled: false");
 
     for (const tool of PR_VISUAL_RECAP_MCP_TOOLS) {
       expect(connectorCatalogSource).toContain(`"${tool}"`);

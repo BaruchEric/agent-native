@@ -2,6 +2,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const targetName = process.argv[2];
 const repoRoot = process.cwd();
@@ -21,7 +22,7 @@ const retiredTargets = new Set([
   "workbench",
 ]);
 
-const globalPaths = [
+export const globalPaths = [
   ".nvmrc",
   "package.json",
   "pnpm-lock.yaml",
@@ -29,13 +30,140 @@ const globalPaths = [
   "scripts/netlify-ignore-build.mjs",
 ];
 
-if (!targetName) {
-  console.error("[netlify-ignore] Missing template/package name argument.");
-  process.exit(1);
+export const VERSION_PACKAGES_SUBJECT_RE = /^chore:\s*version packages\b/i;
+
+const isMainModule =
+  Boolean(process.argv[1]) &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMainModule) {
+  main();
 }
 
-if (retiredTargets.has(targetName)) {
-  console.log(`[netlify-ignore] Skipping retired Netlify site: ${targetName}.`);
+function main() {
+  if (!targetName) {
+    console.error("[netlify-ignore] Missing template/package name argument.");
+    process.exit(1);
+  }
+
+  if (retiredTargets.has(targetName)) {
+    console.log(
+      `[netlify-ignore] Skipping retired Netlify site: ${targetName}.`,
+    );
+    process.exit(0);
+  }
+
+  const packages = workspacePackages();
+  const target = targetPackage(packages, targetName);
+
+  if (!target) {
+    console.error(`[netlify-ignore] Unknown template/package: ${targetName}`);
+    process.exit(1);
+  }
+
+  const watchedPaths = watchedPathsForTarget(packages, target);
+  const commitRef = process.env.COMMIT_REF;
+
+  if (commitExists(commitRef) && isVersionPackagesRelease(commitRef)) {
+    const cachedRef = process.env.CACHED_COMMIT_REF;
+
+    if (!isTrustworthyCachedAncestor(cachedRef, commitRef)) {
+      console.log(
+        `[netlify-ignore] Build required for ${target.pkg.name}: version-packages release ${commitRef.slice(
+          0,
+          8,
+        )} has no trustworthy cached production ancestor.`,
+      );
+      process.exit(1);
+    }
+
+    const queuedTouch = newerNonVersionPackagesTouch(
+      cachedRef,
+      commitRef,
+      watchedPaths,
+    );
+
+    if (queuedTouch === null) {
+      process.exit(1);
+    }
+
+    if (queuedTouch) {
+      console.log(
+        `[netlify-ignore] Build required for ${target.pkg.name}: version-packages release ${commitRef.slice(
+          0,
+          8,
+        )} follows deployable commit ${queuedTouch.commit.slice(
+          0,
+          8,
+        )}, which changes ${queuedTouch.file}.`,
+      );
+      process.exit(1);
+    }
+
+    console.log(
+      `[netlify-ignore] Skipping ${target.pkg.name}: version-packages release commit ${commitRef.slice(
+        0,
+        8,
+      )} has no queued deployable changes for this target.`,
+    );
+    process.exit(0);
+  }
+
+  const files = changedFiles();
+
+  if (!files) {
+    process.exit(1);
+  }
+
+  const matchedFile = files.find((file) =>
+    watchedPaths.some((watchedPath) => pathMatches(file, watchedPath)),
+  );
+
+  const supersedingMain = commitExists(commitRef)
+    ? supersedingProductionMainCommit(commitRef)
+    : null;
+
+  if (matchedFile) {
+    if (supersedingMain) {
+      const newerTouch = newerNonVersionPackagesTouch(
+        commitRef,
+        supersedingMain,
+        watchedPaths,
+      );
+      if (newerTouch === null) {
+        process.exit(1);
+      }
+
+      if (newerTouch) {
+        console.log(
+          `[netlify-ignore] Skipping ${target.pkg.name}: production commit ${commitRef.slice(
+            0,
+            8,
+          )} was superseded by ${newerTouch.commit.slice(
+            0,
+            8,
+          )}, which also changes ${newerTouch.file}.`,
+        );
+        process.exit(0);
+      }
+
+      console.log(
+        `[netlify-ignore] Build still required for ${target.pkg.name}: ${matchedFile} changed, and newer origin/main commits do not change this target.`,
+      );
+      process.exit(1);
+    }
+
+    console.log(
+      `[netlify-ignore] Build required for ${target.pkg.name}: ${matchedFile} changed.`,
+    );
+    process.exit(1);
+  }
+
+  console.log(
+    `[netlify-ignore] Skipping ${target.pkg.name}: no changes in ${watchedPaths.join(
+      ", ",
+    )}.`,
+  );
   process.exit(0);
 }
 
@@ -66,6 +194,7 @@ function workspacePackages() {
   for (const dir of [
     ...packageDirsUnder("packages"),
     ...packageDirsUnder("templates"),
+    ...packageDirsUnder("community-templates"),
   ]) {
     const pkg = readJson(`${dir}/package.json`);
 
@@ -86,18 +215,20 @@ function dependencyNames(pkg) {
   ].flatMap((deps) => (deps ? Object.keys(deps) : []));
 }
 
-function targetPackage(packages) {
-  if (packages.has(targetName)) {
-    return packages.get(targetName);
+function targetPackage(packages, name) {
+  if (packages.has(name)) {
+    return packages.get(name);
   }
 
-  const templateDir = `templates/${targetName}`;
-  const match = [...packages.values()].find(({ dir }) => dir === templateDir);
+  const templateDirs = [`templates/${name}`, `community-templates/${name}`];
+  const match = [...packages.values()].find(({ dir }) =>
+    templateDirs.includes(dir),
+  );
 
   return match ?? null;
 }
 
-function watchedPathsForTarget(packages, target) {
+export function watchedPathsForTarget(packages, target) {
   const watched = new Set(globalPaths);
   const queue = [target];
   const seen = new Set();
@@ -154,12 +285,148 @@ function isAncestor(ancestorRef, descendantRef) {
   }
 }
 
+export function isTrustworthyCachedAncestor(cachedRef, commitRef, opts = {}) {
+  const { commitExistsFn = commitExists, isAncestorFn = isAncestor } = opts;
+
+  return (
+    Boolean(cachedRef) &&
+    cachedRef !== commitRef &&
+    commitExistsFn(cachedRef) &&
+    isAncestorFn(cachedRef, commitRef)
+  );
+}
+
 function firstParent(ref) {
   try {
     return git(["rev-parse", `${ref}^1`]);
   } catch {
     return null;
   }
+}
+
+function commitSubject(ref) {
+  try {
+    return git(["log", "-1", "--format=%s", ref]);
+  } catch {
+    return "";
+  }
+}
+
+export function isVersionPackagesSubject(subject) {
+  return VERSION_PACKAGES_SUBJECT_RE.test(subject);
+}
+
+function isVersionPackagesRelease(ref) {
+  return isVersionPackagesSubject(commitSubject(ref));
+}
+
+function isProductionBuild() {
+  const context = process.env.CONTEXT || process.env.NETLIFY_CONTEXT || "";
+
+  if (context) {
+    return context === "production";
+  }
+
+  return process.env.PULL_REQUEST !== "true" && process.env.BRANCH === "main";
+}
+
+function remoteMainRef() {
+  try {
+    return git(["rev-parse", "origin/main^{commit}"]);
+  } catch {
+    return null;
+  }
+}
+
+function supersedingProductionMainCommit(ref) {
+  if (!isProductionBuild()) {
+    return null;
+  }
+
+  const latestMain = remoteMainRef();
+  if (!latestMain || latestMain === ref) {
+    return null;
+  }
+
+  return isAncestor(ref, latestMain) ? latestMain : null;
+}
+
+function changedFilesBetween(baseRef, headRef) {
+  try {
+    return git(["diff", "--name-only", baseRef, headRef])
+      .split("\n")
+      .map((file) => normalizePath(file.trim()))
+      .filter(Boolean);
+  } catch (error) {
+    console.log(
+      `[netlify-ignore] Build required: git diff failed (${error.message}).`,
+    );
+    return null;
+  }
+}
+
+function listCommitsBetween(baseRef, headRef) {
+  try {
+    return git(["rev-list", "--reverse", `${baseRef}..${headRef}`])
+      .split("\n")
+      .filter(Boolean);
+  } catch (error) {
+    console.log(
+      `[netlify-ignore] Build required: git rev-list failed (${error.message}).`,
+    );
+    return null;
+  }
+}
+
+export function findSupersedingTouch(opts) {
+  const {
+    commits,
+    isVersionPackages,
+    filesForCommit,
+    watchedPaths,
+    pathMatchesFn = pathMatches,
+  } = opts;
+
+  for (const sha of commits) {
+    if (isVersionPackages(sha)) {
+      continue;
+    }
+
+    const files = filesForCommit(sha);
+    if (files === null) {
+      return null;
+    }
+
+    const matchedFile = files.find((file) =>
+      watchedPaths.some((watchedPath) => pathMatchesFn(file, watchedPath)),
+    );
+
+    if (matchedFile) {
+      return { commit: sha, file: matchedFile };
+    }
+  }
+
+  return false;
+}
+
+function newerNonVersionPackagesTouch(baseRef, headRef, watchedPaths) {
+  const commits = listCommitsBetween(baseRef, headRef);
+  if (!commits) {
+    return null;
+  }
+
+  return findSupersedingTouch({
+    commits,
+    isVersionPackages: isVersionPackagesRelease,
+    filesForCommit: (sha) => {
+      const parent = firstParent(sha);
+      if (!parent) {
+        return null;
+      }
+      return changedFilesBetween(parent, sha);
+    },
+    watchedPaths,
+  });
 }
 
 function changedFiles() {
@@ -173,16 +440,6 @@ function changedFiles() {
     return null;
   }
 
-  // Pick the base commit to diff against. Normally that's CACHED_COMMIT_REF
-  // (the last commit Netlify built for this site). BUT Netlify shares the build
-  // cache across deploy contexts: after a PR's deploy-preview builds, the
-  // production deploy of the squash-merge commit inherits CACHED_COMMIT_REF =
-  // the preview head. That commit has an identical tree to the merge commit, so
-  // the diff comes back empty and the site is wrongly skipped ("no content
-  // change") even though the change really did land on main. Detect that case —
-  // the cached ref is missing or is NOT an ancestor of the commit being built —
-  // and diff against the commit's first parent instead (the true previous state
-  // on this branch), so per-site change detection stays correct on production.
   let baseRef = cachedRef;
   if (!commitExists(cachedRef) || !isAncestor(cachedRef, commitRef)) {
     const parent = firstParent(commitRef);
@@ -198,52 +455,9 @@ function changedFiles() {
     baseRef = parent;
   }
 
-  try {
-    return git(["diff", "--name-only", baseRef, commitRef])
-      .split("\n")
-      .map((file) => normalizePath(file.trim()))
-      .filter(Boolean);
-  } catch (error) {
-    console.log(
-      `[netlify-ignore] Build required: git diff failed (${error.message}).`,
-    );
-    return null;
-  }
+  return changedFilesBetween(baseRef, commitRef);
 }
 
-function pathMatches(filePath, watchedPath) {
+export function pathMatches(filePath, watchedPath) {
   return filePath === watchedPath || filePath.startsWith(`${watchedPath}/`);
 }
-
-const packages = workspacePackages();
-const target = targetPackage(packages);
-
-if (!target) {
-  console.error(`[netlify-ignore] Unknown template/package: ${targetName}`);
-  process.exit(1);
-}
-
-const watchedPaths = watchedPathsForTarget(packages, target);
-const files = changedFiles();
-
-if (!files) {
-  process.exit(1);
-}
-
-const matchedFile = files.find((file) =>
-  watchedPaths.some((watchedPath) => pathMatches(file, watchedPath)),
-);
-
-if (matchedFile) {
-  console.log(
-    `[netlify-ignore] Build required for ${target.pkg.name}: ${matchedFile} changed.`,
-  );
-  process.exit(1);
-}
-
-console.log(
-  `[netlify-ignore] Skipping ${target.pkg.name}: no changes in ${watchedPaths.join(
-    ", ",
-  )}.`,
-);
-process.exit(0);

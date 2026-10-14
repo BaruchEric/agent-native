@@ -1,3 +1,5 @@
+import { verifyShortLivedToken } from "@agent-native/core/server";
+import { eq } from "drizzle-orm";
 import {
   defineEventHandler,
   getQuery,
@@ -6,8 +8,7 @@ import {
   setResponseStatus,
   type H3Event,
 } from "h3";
-import { eq } from "drizzle-orm";
-import { verifyShortLivedToken } from "@agent-native/core/server";
+
 import { getDb, schema } from "../../../db/index.js";
 import {
   buildDesignHandoffMarkdown,
@@ -51,9 +52,6 @@ export default defineEventHandler(async (event: H3Event) => {
     .limit(1);
   if (!design) return notFound(event);
 
-  // Build from the shared snapshot so the bundle reflects the design's
-  // current state: live editor (collab) content plus the user's applied
-  // visual tweaks resolved into the HTML :root.
   const snapshot = await buildDesignSnapshot(id, design.data);
   if (snapshot.files.length === 0) return notFound(event);
 

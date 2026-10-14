@@ -1,11 +1,14 @@
-import { defineAction } from "@agent-native/core";
-import { and, eq, isNull, sql } from "drizzle-orm";
-import { z } from "zod";
-import { getDb, schema } from "../server/db/index.js";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
+import { and, eq, isNull, sql } from "drizzle-orm";
+import { createError } from "h3";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
 import {
   getCurrentOwnerEmail,
   nanoid,
+  ownerEmailMatches,
   requireOrganizationAccess,
 } from "../server/lib/recordings.js";
 
@@ -63,20 +66,28 @@ export default defineAction({
           : isNull(schema.folders.spaceId),
       ];
       if (!args.spaceId) {
-        parentWhereClauses.push(eq(schema.folders.ownerEmail, ownerEmail));
+        parentWhereClauses.push(
+          ownerEmailMatches(schema.folders.ownerEmail, ownerEmail),
+        );
       }
       const [parent] = await db
         .select({ id: schema.folders.id, spaceId: schema.folders.spaceId })
         .from(schema.folders)
         .where(and(...parentWhereClauses))
         .limit(1);
-      if (!parent) throw new Error(`Parent folder not found: ${args.parentId}`);
+      if (!parent) {
+        throw createError({
+          statusCode: 404,
+          statusMessage: `Parent folder not found: ${args.parentId}`,
+        });
+      }
     }
 
-    // Next position within siblings
     const whereClauses = [eq(schema.folders.organizationId, organizationId)];
     if (!args.spaceId) {
-      whereClauses.push(eq(schema.folders.ownerEmail, ownerEmail));
+      whereClauses.push(
+        ownerEmailMatches(schema.folders.ownerEmail, ownerEmail),
+      );
     }
     whereClauses.push(
       args.spaceId

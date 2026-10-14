@@ -1,21 +1,9 @@
-/**
- * Frame Protocol — typed message definitions for frame communication.
- *
- * Any frame implementation (local dev frame, Builder.io cloud, Electron)
- * must support these message types. Communication happens via postMessage
- * between the app iframe and the parent frame.
- */
-
 import type {
   AgentChatContextMutationOptions,
   AgentChatContextRemoveOptions,
   AgentChatContextSetOptions,
   AgentChatMessage,
 } from "./agent-chat.js";
-
-// ---------------------------------------------------------------------------
-// Messages FROM app TO frame
-// ---------------------------------------------------------------------------
 
 export interface AppReadyMessage {
   type: "agentNative.appReady";
@@ -57,7 +45,16 @@ export interface DevModeChangeMessage {
 
 export interface ToggleSidebarMessage {
   type: "agentNative.toggleSidebar";
-  data?: { open?: boolean };
+  data?: { open?: boolean; focus?: boolean };
+}
+
+export interface PerAppChatSidebarStateMessage {
+  type: "agentNative.perAppChatState";
+  data: { open: boolean; hosted: boolean };
+}
+
+export interface PerAppChatSidebarStateRequestMessage {
+  type: "agentNative.perAppChatStateRequest";
 }
 
 export interface EnterStyleEditingMessage {
@@ -74,18 +71,18 @@ export interface ExitSelectionModeMessage {
   type: "agentNative.exitSelectionMode";
 }
 
-/**
- * Sent both ways: the app announces it has entered/exited presentation mode
- * (so the frame can hide its chrome), and an outer frame can push the app
- * into presentation mode (so the app's sidebar hides).
- */
 export interface PresentationModeMessage {
   type: "agentNative.presentationMode";
   data: { active: boolean };
 }
 
+export interface DesignCloseMessage {
+  type: "design:close";
+}
+
 export type AppToFrameMessage =
   | AppReadyMessage
+  | AuthStateMessage
   | SubmitChatMessage
   | SetChatContextMessage
   | RemoveChatContextMessage
@@ -94,14 +91,12 @@ export type AppToFrameMessage =
   | SetEnvVarsMessage
   | DevModeChangeMessage
   | ToggleSidebarMessage
+  | PerAppChatSidebarStateRequestMessage
   | EnterStyleEditingMessage
   | EnterTextEditingMessage
   | ExitSelectionModeMessage
-  | PresentationModeMessage;
-
-// ---------------------------------------------------------------------------
-// Messages FROM frame TO app
-// ---------------------------------------------------------------------------
+  | PresentationModeMessage
+  | DesignCloseMessage;
 
 export interface FrameOriginMessage {
   type: "agentNative.frameOrigin";
@@ -110,12 +105,21 @@ export interface FrameOriginMessage {
 
 export interface ChatRunningMessage {
   type: "agentNative.chatRunning";
-  detail: { isRunning: boolean; tabId?: string };
+  detail: {
+    isRunning: boolean;
+    tabId?: string;
+    reason?: "stopped" | "failed";
+  };
 }
 
 export interface UserInfoMessage {
   type: "agentNative.userInfo";
   data: { name?: string; email?: string };
+}
+
+export interface AuthStateMessage {
+  type: "agentNative.authState";
+  data: { status: "authenticated" | "unauthenticated" };
 }
 
 export interface CodeCompleteMessage {
@@ -127,14 +131,21 @@ export interface CodeCompleteMessage {
 export interface SidebarModeMessage {
   type: "agentNative.sidebarMode";
   data: {
-    /** "code" hides the app's sidebar (frame controls it); "app" defers to the app. */
     mode: "code" | "app";
-    /** When mode === "app", which panel the app should show. */
     appMode?: "cli" | "resources" | "chat";
-    /** Frame-controlled sidebar width to sync into the app. */
     width?: number;
-    /** Whether the app's sidebar should be open. */
     open?: boolean;
+    wide?: boolean;
+    placeholderWidth?: number;
+  };
+}
+
+export interface DesignInitMessage {
+  type: "design:init";
+  data: {
+    previewUrl: string;
+    themeVars?: Record<string, string>;
+    context?: { projectId?: string; branchId?: string; orgId?: string };
   };
 }
 
@@ -142,12 +153,10 @@ export type FrameToAppMessage =
   | FrameOriginMessage
   | ChatRunningMessage
   | UserInfoMessage
+  | PerAppChatSidebarStateMessage
   | CodeCompleteMessage
   | SidebarModeMessage
-  | PresentationModeMessage;
-
-// ---------------------------------------------------------------------------
-// All message types
-// ---------------------------------------------------------------------------
+  | PresentationModeMessage
+  | DesignInitMessage;
 
 export type FrameMessage = AppToFrameMessage | FrameToAppMessage;

@@ -1,13 +1,6 @@
-/**
- * Read another workspace content database as a federation source. Its rows
- * become source entries whose `sourceValues` are keyed by stable property id,
- * and its property definitions become the source's field summaries. This is the real-data
- * counterpart to the Builder read client for the "local tables as a source"
- * feature.
- */
-
 import { assertAccess } from "@agent-native/core/sharing";
 import { eq } from "drizzle-orm";
+
 import { getDb, schema } from "../server/db/index.js";
 import type {
   BuilderCmsModelFieldSummary,

@@ -11,8 +11,8 @@ function normalizeUrl(raw: string): string {
 
 function configuredBaseUrl(): string | undefined {
   const candidates = [
-    process.env.APP_URL,
     process.env.WORKSPACE_GATEWAY_URL,
+    process.env.APP_URL,
     process.env.URL,
     process.env.DEPLOY_URL,
     process.env.BETTER_AUTH_URL,
@@ -38,6 +38,23 @@ export function getDeckUrl(deckId: string): string {
   return `${getSlidesAppUrl()}/deck/${deckId}`;
 }
 
-export function getExportUrl(filename: string): string {
-  return `${getSlidesAppUrl()}/api/exports/${filename}`;
+export function getExportUrl(
+  filename: string,
+  options?: {
+    deckId?: string;
+    includeNotes?: boolean;
+    exportRevision?: string;
+  },
+): string {
+  const url = new URL(
+    `${getSlidesAppUrl()}/api/exports/${encodeURIComponent(filename)}`,
+  );
+  if (options?.deckId) url.searchParams.set("deckId", options.deckId);
+  if (options?.includeNotes !== undefined) {
+    url.searchParams.set("includeNotes", String(options.includeNotes));
+  }
+  if (options?.exportRevision) {
+    url.searchParams.set("exportRevision", options.exportRevision);
+  }
+  return url.toString();
 }

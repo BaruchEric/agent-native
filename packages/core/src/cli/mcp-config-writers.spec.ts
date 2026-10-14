@@ -1,16 +1,21 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  buildCodexHttpBlock,
+  buildCodexLocalBlock,
   buildHttpMcpEntry,
   buildLocalMcpEntryForClient,
   canonicalUrl,
+  codexHasBlock,
   hasJsonMcpEntry,
   hasJsonMcpEntryForClient,
   removeCodexSameUrlDuplicates,
   removeJsonSameUrlDuplicates,
+  writeCodexBlock,
   writeHttpEntryForClient,
   writeJsonMcpEntry,
 } from "./mcp-config-writers.js";
@@ -33,10 +38,6 @@ function tmpDir(): string {
   return root;
 }
 
-// ---------------------------------------------------------------------------
-// writeJsonMcpEntry
-// ---------------------------------------------------------------------------
-
 describe("writeJsonMcpEntry", () => {
   it("creates a fresh file when the target does not exist", () => {
     const dir = tmpDir();
@@ -58,7 +59,6 @@ describe("writeJsonMcpEntry", () => {
     const dir = tmpDir();
     const file = path.join(dir, "claude.json");
 
-    // Simulate existing Claude Code state
     fs.writeFileSync(
       file,
       JSON.stringify(
@@ -81,10 +81,8 @@ describe("writeJsonMcpEntry", () => {
     });
 
     const written = JSON.parse(fs.readFileSync(file, "utf-8"));
-    // Pre-existing state must survive
     expect(written.projects).toEqual({ "/foo/bar": { name: "bar" } });
     expect(written.numStartups).toBe(42);
-    // Old and new entries both present
     expect(written.mcpServers["old-server"]).toEqual({
       type: "http",
       url: "https://old.com",
@@ -116,8 +114,39 @@ describe("writeJsonMcpEntry", () => {
       writeJsonMcpEntry(file, "srv", { type: "http", url: "https://x.com" }),
     ).toThrow(/Cannot parse JSON config file/);
 
-    // File must be untouched
     expect(fs.readFileSync(file, "utf-8")).toBe(corruptContent);
+  });
+
+  it("throws and preserves an existing config when reading it is denied", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "claude.json");
+    const original =
+      '{"projects":{"/work":{"name":"work"}},"mcpServers":{"old":{"url":"https://old.example.com/mcp"}}}\n';
+    fs.writeFileSync(file, original, "utf-8");
+    const denied = Object.assign(new Error("EACCES: permission denied"), {
+      code: "EACCES",
+    });
+    const read = vi.spyOn(fs, "readFileSync").mockImplementationOnce(() => {
+      throw denied;
+    });
+
+    let thrown: Error | null = null;
+    try {
+      writeJsonMcpEntry(file, "new", {
+        type: "http",
+        url: "https://new.example.com/mcp",
+      });
+    } catch (error) {
+      thrown = error as Error;
+    } finally {
+      read.mockRestore();
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown!.message).toContain("Cannot read MCP config file");
+    expect(thrown!.message).toContain(file);
+    expect(thrown!.message).toContain("has not been modified");
+    expect(fs.readFileSync(file, "utf-8")).toBe(original);
   });
 
   it("error message includes the file path and actionable guidance", () => {
@@ -157,10 +186,6 @@ describe("writeJsonMcpEntry", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// hasJsonMcpEntry
-// ---------------------------------------------------------------------------
-
 describe("hasJsonMcpEntry", () => {
   it("returns false for a missing file", () => {
     expect(hasJsonMcpEntry("/nonexistent/path.json", "srv")).toBe(false);
@@ -178,18 +203,12 @@ describe("hasJsonMcpEntry", () => {
     try {
       result = hasJsonMcpEntry(file, "srv");
     } catch {
-      // throwing is also acceptable
       result = null;
     }
-    // file untouched
     expect(fs.readFileSync(file, "utf-8")).toBe("{bad}");
     if (result !== null) expect(result).toBe(false);
   });
 });
-
-// ---------------------------------------------------------------------------
-// writeHttpEntryForClient — claude-code project scope (local .mcp.json)
-// ---------------------------------------------------------------------------
 
 describe("writeHttpEntryForClient", () => {
   it("writes a project-scope claude-code entry to .mcp.json", () => {
@@ -325,6 +344,20 @@ describe("writeHttpEntryForClient", () => {
 });
 
 describe("buildLocalMcpEntryForClient", () => {
+  it("can configure a resolvable npx command for a self-installing MCP", () => {
+    expect(
+      buildLocalMcpEntryForClient(
+        "claude-code",
+        ["-y", "@agent-native/core@latest", "mcp", "screen-memory"],
+        {},
+        "npx",
+      ),
+    ).toEqual({
+      command: "npx",
+      args: ["-y", "@agent-native/core@latest", "mcp", "screen-memory"],
+    });
+  });
+
   it("uses the OpenCode local command-array shape", () => {
     expect(
       buildLocalMcpEntryForClient("opencode", ["mcp", "serve"], {
@@ -352,10 +385,6 @@ describe("buildLocalMcpEntryForClient", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// buildHttpMcpEntry
-// ---------------------------------------------------------------------------
-
 describe("buildHttpMcpEntry", () => {
   it("includes Authorization header when a token is supplied", () => {
     const entry = buildHttpMcpEntry("https://x.com", "tok_123");
@@ -382,10 +411,6 @@ describe("buildHttpMcpEntry", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// canonicalUrl
-// ---------------------------------------------------------------------------
-
 describe("canonicalUrl", () => {
   it("strips trailing slash", () => {
     expect(canonicalUrl("https://x.com/mcp/")).toBe("https://x.com/mcp");
@@ -397,15 +422,20 @@ describe("canonicalUrl", () => {
     );
   });
 
+  it("canonicalizes legacy MCP URLs, including app base paths", () => {
+    expect(canonicalUrl("https://x.com/_agent-native/mcp")).toBe(
+      "https://x.com/mcp",
+    );
+    expect(canonicalUrl("https://x.com/mail/_agent-native/mcp/")).toBe(
+      "https://x.com/mail/mcp",
+    );
+  });
+
   it("returns undefined for invalid URLs", () => {
     expect(canonicalUrl("not-a-url")).toBeUndefined();
     expect(canonicalUrl(undefined)).toBeUndefined();
   });
 });
-
-// ---------------------------------------------------------------------------
-// removeJsonSameUrlDuplicates
-// ---------------------------------------------------------------------------
 
 describe("removeJsonSameUrlDuplicates", () => {
   it("removes entries whose URL matches the canonical URL, preserving keepName", () => {
@@ -481,7 +511,6 @@ describe("removeJsonSameUrlDuplicates", () => {
     );
 
     expect(removed).toEqual([]);
-    // File should not be rewritten unnecessarily (content unchanged modulo parse).
     const cfg = JSON.parse(fs.readFileSync(file, "utf-8"));
     expect(Object.keys(cfg.mcpServers)).toEqual(["plan"]);
   });
@@ -525,10 +554,6 @@ describe("removeJsonSameUrlDuplicates", () => {
     expect(removed).toEqual(["old-alias"]);
   });
 });
-
-// ---------------------------------------------------------------------------
-// removeCodexSameUrlDuplicates
-// ---------------------------------------------------------------------------
 
 describe("removeCodexSameUrlDuplicates", () => {
   it("removes Codex TOML blocks whose url matches, preserving keepName", () => {
@@ -589,5 +614,291 @@ describe("removeCodexSameUrlDuplicates", () => {
       "plan",
     );
     expect(removed).toEqual([]);
+  });
+
+  it("removes the full footprint (table + sub-tables) of a same-url alias", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    fs.writeFileSync(
+      file,
+      [
+        '[mcp_servers."plan"]',
+        'url = "https://plan.agent-native.com/_agent-native/mcp"',
+        "",
+        '[mcp_servers."agent-native-plans"]',
+        'url = "https://plan.agent-native.com/_agent-native/mcp"',
+        "",
+        '[mcp_servers."agent-native-plans".http_headers]',
+        'Authorization = "Bearer stale-token"',
+        "",
+        "[mcp_servers.other]",
+        'url = "https://other.example.com/mcp"',
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    const removed = removeCodexSameUrlDuplicates(
+      file,
+      "https://plan.agent-native.com/_agent-native/mcp",
+      "plan",
+    );
+
+    expect(removed).toEqual(["agent-native-plans"]);
+    const content = fs.readFileSync(file, "utf-8");
+    expect(content).not.toContain("agent-native-plans");
+    expect(content).not.toContain("stale-token");
+    expect(content).toContain('[mcp_servers."plan"]');
+    expect(content).toContain("[mcp_servers.other]");
+  });
+});
+
+describe("writeCodexBlock", () => {
+  const PLAN_URL = "https://plan.agent-native.com/_agent-native/mcp";
+
+  it("removes a stale standalone sub-table so a re-install never duplicates a key", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    fs.writeFileSync(
+      file,
+      [
+        'model = "gpt-5.5"',
+        "",
+        "[mcp_servers.plan.http_headers]",
+        'Authorization = "Bearer OLD-token"',
+        "",
+        '[mcp_servers."plan"]',
+        `url = "${PLAN_URL}"`,
+        'http_headers = { "Authorization" = "Bearer OLD-token" }',
+        "",
+        "[mcp_servers.other]",
+        'url = "https://other.example.com/mcp"',
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    writeCodexBlock(
+      file,
+      "plan",
+      buildCodexHttpBlock("plan", PLAN_URL, "NEW-token"),
+    );
+
+    const content = fs.readFileSync(file, "utf-8");
+    expect(content).not.toContain("[mcp_servers.plan.http_headers]");
+    expect(content).not.toContain("OLD-token");
+    expect(content.match(/\[mcp_servers\."plan"\]/g)).toHaveLength(1);
+    expect(content.match(/http_headers = \{/g)).toHaveLength(1);
+    expect(content).toContain("NEW-token");
+    expect(content).toContain("[mcp_servers.other]");
+    expect(content).toContain('model = "gpt-5.5"');
+  });
+
+  it("collapses a server's own sub-tables (e.g. env) on rewrite", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    fs.writeFileSync(
+      file,
+      [
+        "[mcp_servers.node_repl]",
+        'command = "node_repl"',
+        "",
+        "[mcp_servers.node_repl.env]",
+        'FOO = "old"',
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    writeCodexBlock(
+      file,
+      "node_repl",
+      buildCodexLocalBlock("node_repl", ["mcp"], { FOO: "new" }),
+    );
+
+    const content = fs.readFileSync(file, "utf-8");
+    expect(content).not.toContain("[mcp_servers.node_repl.env]");
+    expect(content).not.toContain('FOO = "old"');
+    expect(content.match(/\[mcp_servers\."node_repl"\]/g)).toHaveLength(1);
+  });
+
+  it("treats table headers with trailing comments as table boundaries", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    fs.writeFileSync(
+      file,
+      [
+        '[mcp_servers."plan"] # installed by hand',
+        `url = "${PLAN_URL}"`,
+        "",
+        "[mcp_servers.other] # keep this neighbor",
+        'url = "https://other.example.com/mcp"',
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    writeCodexBlock(
+      file,
+      "plan",
+      buildCodexHttpBlock("plan", PLAN_URL, "NEW-token"),
+    );
+
+    const content = fs.readFileSync(file, "utf-8");
+    expect(content.match(/\[mcp_servers\."plan"\]/g)).toHaveLength(1);
+    expect(content).toContain("NEW-token");
+    expect(content).not.toContain("installed by hand");
+    expect(content).toContain("[mcp_servers.other] # keep this neighbor");
+    expect(content).toContain('url = "https://other.example.com/mcp"');
+  });
+
+  it("repeated writes are idempotent (no accumulation)", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    writeCodexBlock(file, "plan", buildCodexHttpBlock("plan", PLAN_URL, "tok"));
+    const afterFirst = fs.readFileSync(file, "utf-8");
+    writeCodexBlock(file, "plan", buildCodexHttpBlock("plan", PLAN_URL, "tok"));
+    const afterSecond = fs.readFileSync(file, "utf-8");
+    expect(afterSecond).toBe(afterFirst);
+    expect(afterSecond.match(/\[mcp_servers\."plan"\]/g)).toHaveLength(1);
+  });
+
+  it("escapes control characters so a name or value stays inside its TOML string", () => {
+    const block = buildCodexHttpBlock(
+      'plan"\n[mcp_servers.evil]',
+      PLAN_URL,
+      undefined,
+      { "X-Note": "one\ntwo\tthree\u0001" },
+    );
+    expect(block).toBe(
+      [
+        '[mcp_servers."plan\\"\\n[mcp_servers.evil]"]',
+        `url = "${PLAN_URL}"`,
+        'http_headers = { "X-Note" = "one\\ntwo\\tthree\\u0001" }',
+        "",
+      ].join("\n"),
+    );
+  });
+
+  it("rewrites an entry whose name needs escapes instead of appending another", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    const name = "plan\nlocal";
+    writeCodexBlock(file, name, buildCodexHttpBlock(name, PLAN_URL, "old"));
+    writeCodexBlock(file, name, buildCodexHttpBlock(name, PLAN_URL, "new"));
+
+    const content = fs.readFileSync(file, "utf-8");
+    expect(content.match(/\[mcp_servers\."plan\\nlocal"\]/g)).toHaveLength(1);
+    expect(content).not.toContain("old");
+    expect(codexHasBlock(file, name)).toBe(true);
+  });
+
+  it("does not corrupt a neighbouring multi-line value when removing a block", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    const okBlock = [
+      '[mcp_servers."open-knowledge"]',
+      'command = "/bin/sh"',
+      'args = ["-l", "-c", """',
+      '[ -f "$BUNDLE" ] && exec "$BUNDLE" mcp',
+      'exit 127"""]',
+      "",
+    ].join("\n");
+    fs.writeFileSync(
+      file,
+      ['[mcp_servers."plan"]', `url = "${PLAN_URL}"`, "", okBlock].join("\n"),
+      "utf-8",
+    );
+
+    writeCodexBlock(file, "plan", null);
+
+    const content = fs.readFileSync(file, "utf-8");
+    expect(content).not.toContain('[mcp_servers."plan"]');
+    expect(content).toContain('[mcp_servers."open-knowledge"]');
+    expect(content).toContain('[ -f "$BUNDLE" ] && exec "$BUNDLE" mcp');
+    expect(content).toContain('exit 127"""]');
+  });
+
+  it("removing a non-existent block is a no-op", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    fs.writeFileSync(file, 'model = "gpt-5.5"\n', "utf-8");
+    writeCodexBlock(file, "plan", null);
+    expect(fs.readFileSync(file, "utf-8")).toBe('model = "gpt-5.5"\n');
+  });
+
+  it("throws and preserves an existing config when reading it is denied", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    const original =
+      'model = "gpt-5.5"\n\n[mcp_servers.existing]\ncommand = "existing"\n';
+    fs.writeFileSync(file, original, "utf-8");
+    const denied = Object.assign(new Error("EACCES: permission denied"), {
+      code: "EACCES",
+    });
+    const read = vi.spyOn(fs, "readFileSync").mockImplementationOnce(() => {
+      throw denied;
+    });
+
+    let thrown: Error | null = null;
+    try {
+      writeCodexBlock(
+        file,
+        "plan",
+        buildCodexHttpBlock("plan", PLAN_URL, "token"),
+      );
+    } catch (error) {
+      thrown = error as Error;
+    } finally {
+      read.mockRestore();
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown!.message).toContain("Cannot read MCP config file");
+    expect(thrown!.message).toContain(file);
+    expect(thrown!.message).toContain("has not been modified");
+    expect(fs.readFileSync(file, "utf-8")).toBe(original);
+  });
+});
+
+describe("codexHasBlock", () => {
+  it("detects a server present only via a sub-table", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    fs.writeFileSync(
+      file,
+      [
+        "[mcp_servers.plan.http_headers]",
+        'Authorization = "Bearer x"',
+        "",
+      ].join("\n"),
+      "utf-8",
+    );
+    expect(codexHasBlock(file, "plan")).toBe(true);
+    expect(codexHasBlock(file, "other")).toBe(false);
+  });
+
+  it("throws instead of reporting an unreadable config as absent", () => {
+    const dir = tmpDir();
+    const file = path.join(dir, "config.toml");
+    fs.writeFileSync(file, '[mcp_servers.plan]\ncommand = "plan"\n', "utf-8");
+    const denied = Object.assign(new Error("EACCES: permission denied"), {
+      code: "EACCES",
+    });
+    const read = vi.spyOn(fs, "readFileSync").mockImplementationOnce(() => {
+      throw denied;
+    });
+
+    let thrown: Error | null = null;
+    try {
+      codexHasBlock(file, "plan");
+    } catch (error) {
+      thrown = error as Error;
+    } finally {
+      read.mockRestore();
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown!.message).toContain("Cannot read MCP config file");
   });
 });

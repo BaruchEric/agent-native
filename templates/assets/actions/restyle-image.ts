@@ -1,7 +1,11 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
+import type { ActionRunContext } from "@agent-native/core/action";
 import { z } from "zod";
-import generateImage from "./generate-image.js";
-import { getAssetOrThrow } from "./_helpers.js";
+
+import {
+  ASSETS_VARIATION_GRID_RENDERER,
+  projectAssetVariationResult,
+} from "../shared/action-ui.js";
 import {
   ASPECT_RATIOS,
   IMAGE_MODELS,
@@ -9,10 +13,18 @@ import {
   IMAGE_SIZES,
   STYLE_STRENGTHS,
 } from "../shared/api.js";
+import { getAssetOrThrow } from "./_helpers.js";
+import generateImage from "./generate-image.js";
+import { resolveLiveBatchContinuation } from "./variant-slots.js";
 
 export default defineAction({
   description:
     "Restyle an existing image with its library's brand look. Preserves the subject image while using the library's deterministic style anchors and references.",
+  chatUI: {
+    renderer: ASSETS_VARIATION_GRID_RENDERER,
+    when: (args, result) => projectAssetVariationResult(args, result) !== null,
+    projectResult: projectAssetVariationResult,
+  },
   schema: z.object({
     subjectAssetId: z.string(),
     prompt: z
@@ -34,31 +46,42 @@ export default defineAction({
       .describe(
         "Set by A2A callers (e.g. 'slides', 'design') so audit logs can filter by app.",
       ),
+    contextModeOverride: z.literal("off").optional(),
   }),
   parallelSafe: true,
-  run: async (args) => {
+  run: async (args, context?: ActionRunContext) => {
     const subject = await getAssetOrThrow(args.subjectAssetId);
     const prompt =
       args.prompt?.trim() ||
       "Apply this library's brand style to the subject image while preserving the subject, pose, composition, and framing.";
-    return generateImage.run({
+    const continuation = await resolveLiveBatchContinuation({
+      threadId: context?.threadId,
       libraryId: subject.libraryId,
-      collectionId: subject.collectionId ?? undefined,
-      presetId: args.presetId,
-      sessionId: args.sessionId,
-      prompt,
-      aspectRatio: (args.aspectRatio ?? subject.aspectRatio ?? "16:9") as any,
-      imageSize: (args.imageSize ?? subject.imageSize ?? "2K") as any,
-      model: args.model,
-      tier: args.tier,
-      intent: "restyle",
-      styleStrength: args.styleStrength,
-      includeLogo: false,
-      groundingMode: "auto",
-      subjectAssetId: subject.id,
-      slotId: args.slotId,
-      source: args.source,
-      callerAppId: args.callerAppId,
     });
+    return generateImage.run(
+      {
+        libraryId: subject.libraryId,
+        collectionId:
+          subject.collectionId ?? continuation?.collectionId ?? undefined,
+        presetId: args.presetId ?? continuation?.presetId ?? undefined,
+        sessionId: args.sessionId ?? continuation?.sessionId ?? undefined,
+        prompt,
+        aspectRatio: (args.aspectRatio ?? subject.aspectRatio ?? "16:9") as any,
+        imageSize: (args.imageSize ?? subject.imageSize ?? "2K") as any,
+        model: args.model,
+        tier: args.tier,
+        intent: "restyle",
+        styleStrength: args.styleStrength,
+        includeLogo: false,
+        groundingMode: "auto",
+        subjectAssetId: subject.id,
+        slotId: args.slotId,
+        variantBatchId: continuation?.variantBatchId,
+        source: args.source,
+        callerAppId: args.callerAppId,
+        contextModeOverride: args.contextModeOverride,
+      },
+      context,
+    );
   },
 });

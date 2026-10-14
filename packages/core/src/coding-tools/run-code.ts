@@ -32,18 +32,63 @@
 import crypto from "node:crypto";
 import http from "node:http";
 
-import type { ActionEntry } from "../agent/production-agent.js";
+import { createRunner, RunError, type HostFunctions } from "run";
+
 import type { ActionRunContext } from "../action.js";
-import { getSandboxAdapter } from "./sandbox/index.js";
+import type { ActionEntry } from "../agent/production-agent.js";
+import { parseServiceIdentityEmail } from "../org/service-identity.js";
+import {
+  getRequestContext,
+  getRequestRunContext,
+  getRequestUserEmail,
+  runWithRequestContext,
+} from "../server/request-context.js";
+import {
+  failExpiredSandboxExecution,
+  getSandboxExecutionForOwner,
+  type SandboxExecutionRow,
+} from "./sandbox/executions-store.js";
+import {
+  BACKGROUND_DEFAULT_TIMEOUT_MS,
+  BACKGROUND_MAX_TIMEOUT_MS,
+  SANDBOX_EXECUTION_REDRIVE_AFTER_MS,
+  driveSandboxExecution,
+  enqueueSandboxExecution,
+  getSandboxAdapter,
+  isQueuedSandboxAdapter,
+  registerSandboxExecutionRunner,
+  resolveExecutionSandboxAdapter,
+} from "./sandbox/index.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 600_000;
 const DEFAULT_MAX_OUTPUT_CHARS = 50_000;
 const MAX_OUTPUT_CHARS = 200_000;
-/** Hard cap on bridge request bodies so sandboxed code can't exhaust parent memory. */
+const TOOL_ORCHESTRATION_DEFAULT_MAX_CALLS = 32;
+const TOOL_ORCHESTRATION_MAX_CALLS = 128;
+const TOOL_ORCHESTRATION_MAX_PROVIDER_PAGES = 20;
 const BRIDGE_MAX_BODY_BYTES = 10 * 1024 * 1024;
+const RUN_MAX_CONSOLE_OUTPUT_BYTES = 512 * 1024;
+const RUN_MAX_RESULT_BYTES = 2 * 1024 * 1024;
+const RUN_MAX_SOURCE_BYTES = 256 * 1024;
 
-/** Tools callable via the sandbox bridge by default. */
+const runEvaluator = createRunner({
+  limits: {
+    memoryLimitBytes: 64 * 1024 * 1024,
+    maxStackSizeBytes: 2 * 1024 * 1024,
+    maxResultBytes: RUN_MAX_RESULT_BYTES,
+    maxConsoleOutputBytes: RUN_MAX_CONSOLE_OUTPUT_BYTES,
+    maxSourceBytes: RUN_MAX_SOURCE_BYTES,
+    maxHostFunctionArgumentsBytes: 1 * 1024 * 1024,
+    maxHostFunctionOutputBytes: 4 * 1024 * 1024,
+    maxBridgeRequests: 256,
+    maxInFlightBridgeRequests: 32,
+  },
+});
+
+export type SandboxCodeMode = "run-code" | "tool-orchestration";
+export type SandboxCodeEvaluator = "node" | "run";
+
 const DEFAULT_BRIDGE_TOOLS = new Set([
   "provider-api-request",
   "provider-api-docs",
@@ -53,37 +98,50 @@ const DEFAULT_BRIDGE_TOOLS = new Set([
 ]);
 
 export interface RunCodeOptions {
-  /**
-   * Extra tool names (beyond the default set) that the sandbox bridge will
-   * forward to the registered action registry.
-   */
   bridgeTools?: string[];
+  evaluator?: SandboxCodeEvaluator;
 }
 
-/**
- * Create a `run-code` ActionEntry.
- *
- * @param getActions  Supplier that returns the current action registry (called
- *                    at invocation time so updates are reflected).
- * @param opts        Optional configuration.
- */
 export function createRunCodeEntry(
   getActions: () => Record<string, ActionEntry>,
   opts: RunCodeOptions = {},
 ): ActionEntry {
   const extraBridgeTools = new Set(opts.bridgeTools ?? []);
+  const evaluator = opts.evaluator ?? "node";
+
+  registerSandboxExecutionRunner({
+    execute: ({ code, timeoutMs, context }) =>
+      executeSandboxCode({
+        code,
+        timeoutMs,
+        getActions,
+        extraBridgeTools,
+        context,
+        evaluator,
+      }),
+  });
+
+  const runtimeDescription =
+    evaluator === "run"
+      ? "The production evaluator is a hardened QuickJS runtime: it has no Node modules, filesystem, environment, network, timers, or imports; authenticated access is available only through the approved globals."
+      : "The sandbox runs with a scrubbed environment (no secrets) and, where the Node permission model is available, no filesystem access outside its own temp dir, no child processes, and no workers. Authenticated calls must go through the provided globals; direct network requests carry no credentials. Note: isolation is process-level (env scrub + Node permission model), not an OS-level container — outbound network from sandbox code is not blocked.";
+  const codeDescription =
+    evaluator === "run"
+      ? "JavaScript source to execute. Top-level await and return are allowed; Node ESM imports are not available. Required unless polling with executionId."
+      : "JavaScript source to execute. ESM syntax, top-level await allowed. Required unless polling with executionId.";
 
   return {
     readOnly: true,
-    // Allow a generous per-call timeout so large data-processing jobs don't hit
-    // the agent-loop's default 60 s cap.
+    allowInPlanMode: false,
     timeoutMs: MAX_TIMEOUT_MS,
     maxResultChars: MAX_OUTPUT_CHARS,
     tool: {
       description: [
-        "Execute JavaScript (Node.js, ESM, top-level await supported) in an isolated sandbox.",
+        evaluator === "run"
+          ? "Execute JavaScript (top-level await and return supported) in a hardened isolated QuickJS sandbox."
+          : "Execute JavaScript (Node.js, ESM, top-level await supported) in an isolated sandbox.",
         "Use this to fetch, join, aggregate, and reduce large datasets, returning only printed output to the conversation.",
-        "The sandbox runs with a scrubbed environment (no secrets) and, where the Node permission model is available, no filesystem access outside its own temp dir, no child processes, and no workers. Authenticated calls must go through the provided globals; direct network requests carry no credentials. Note: isolation is process-level (env scrub + Node permission model), not an OS-level container — outbound network from sandbox code is not blocked.",
+        runtimeDescription,
         "Available globals:",
         "  - `appAction(name, args?)` — call any registered agent-exposed read-only app action/tool and get its parsed result.",
         "    Use this to loop over app data readers and compose multi-source analyses without forcing every intermediate result into chat.",
@@ -106,36 +164,46 @@ export function createRunCodeEntry(
         "  - `workspaceList(prefix?)` — list workspace files, returns [{ path, sizeBytes, contentType, updatedAt }].",
         "Print results with `console.log()`; only stdout+stderr are returned.",
         "Timeout defaults to 120 s (max 600 s). Output is truncated to 50 000 chars by default (max 200 000).",
+        'For LONG compute — big cross-source joins, corpus-wide sweeps, scripts that could exceed ~30 s, or anything at risk of dying with the current chat run — pass `background: true`. That enqueues a durable execution and returns `{ executionId, status: "queued" }` immediately; the code runs out-of-band with a generous budget (default 10 min) and its result survives run timeouts. Continue other work, then poll with `get-code-execution` when that dedicated tool is available; legacy hosts can call run-code again with just `{ executionId }`. Keep quick scripts in the default foreground mode.',
       ].join(" "),
       parameters: {
         type: "object",
         properties: {
           code: {
             type: "string",
-            description:
-              "JavaScript source to execute. ESM syntax, top-level await allowed.",
+            description: codeDescription,
           },
           timeoutMs: {
             type: "number",
-            description: `Execution timeout in milliseconds. Default: ${DEFAULT_TIMEOUT_MS}. Max: ${MAX_TIMEOUT_MS}.`,
+            description: `Execution timeout in milliseconds. Foreground default: ${DEFAULT_TIMEOUT_MS} (max ${MAX_TIMEOUT_MS}). With background: true the default is ${BACKGROUND_DEFAULT_TIMEOUT_MS} (max ${BACKGROUND_MAX_TIMEOUT_MS}).`,
           },
           maxOutputChars: {
             type: "number",
             description: `Maximum combined stdout+stderr characters to return. Default: ${DEFAULT_MAX_OUTPUT_CHARS}. Max: ${MAX_OUTPUT_CHARS}.`,
           },
+          background: {
+            type: "boolean",
+            description:
+              'Run as a durable background execution: returns { executionId, status: "queued" } immediately and the code executes out-of-band, surviving chat-run timeouts. Use for long compute (large joins, multi-page provider sweeps, heavy analysis). Poll with get-code-execution when available.',
+          },
+          executionId: {
+            type: "string",
+            description:
+              "Legacy polling fallback for hosts without get-code-execution: pass the executionId alone (no code) to get status and output.",
+          },
         },
-        required: ["code"],
+        required: [],
       },
     },
     run: async (args: Record<string, string>, context?: ActionRunContext) => {
+      const requestedExecutionId =
+        typeof args.executionId === "string" ? args.executionId.trim() : "";
+      if (requestedExecutionId) {
+        return describeSandboxExecutionForOwner(requestedExecutionId, context);
+      }
+
       const code = typeof args.code === "string" ? args.code : "";
       if (!code.trim()) return "Error: code is required.";
-
-      const requestedTimeout = Number(args.timeoutMs);
-      const timeoutMs =
-        Number.isFinite(requestedTimeout) && requestedTimeout > 0
-          ? Math.min(requestedTimeout, MAX_TIMEOUT_MS)
-          : DEFAULT_TIMEOUT_MS;
 
       const requestedMaxOutput = Number(args.maxOutputChars);
       const maxOutputChars =
@@ -143,85 +211,421 @@ export function createRunCodeEntry(
           ? Math.min(requestedMaxOutput, MAX_OUTPUT_CHARS)
           : DEFAULT_MAX_OUTPUT_CHARS;
 
-      const actions = getActions();
-      const bridgeToken = crypto.randomBytes(32).toString("hex");
-
-      // Start bridge server — resolves once the server is listening.
-      const {
-        bridgePort,
-        getUsedTools,
-        cleanup: cleanupBridge,
-      } = await startBridgeServer(
-        bridgeToken,
-        actions,
-        context,
-        DEFAULT_BRIDGE_TOOLS,
-        extraBridgeTools,
-      );
-
-      try {
-        // Build scrubbed env — only safe POSIX vars, no secrets. The adapter
-        // points TMPDIR/TEMP/TMP at the sandbox's own temp dir.
-        const safeEnv: Record<string, string> = {};
-        for (const key of [
-          "PATH",
-          "HOME",
-          "TMPDIR",
-          "TEMP",
-          "TMP",
-          "LANG",
-          "LC_ALL",
-        ]) {
-          if (process.env[key]) safeEnv[key] = process.env[key]!;
-        }
-
-        // Delegate execution to the active sandbox adapter (local child process
-        // by default; remote/durable adapters can be registered via
-        // ./sandbox). The bridge, env scrub, module, and output formatting stay
-        // in the parent regardless of adapter.
-        const { stdout, stderr, exitCode, timedOut } =
-          await getSandboxAdapter().run({
-            moduleSource: buildSandboxModule(code, bridgePort, bridgeToken),
-            env: safeEnv,
-            timeoutMs,
-            bridgePort,
-          });
-
-        const combined =
-          [
-            stdout ? `stdout:\n${stdout}` : "",
-            stderr ? `stderr:\n${stderr}` : "",
-          ]
-            .filter(Boolean)
-            .join("\n\n") || "(no output)";
-
-        const lines: string[] = [];
-        if (timedOut) lines.push(`timedOut: true (${timeoutMs}ms)`);
-        if (exitCode !== 0 && exitCode !== null)
-          lines.push(`exitCode: ${exitCode}`);
-        const usedTools = getUsedTools();
-        if (usedTools.length)
-          lines.push(`bridgeToolsUsed: ${usedTools.join(", ")}`);
-        lines.push(combined);
-
-        const full = lines.join("\n\n");
-        if (full.length > maxOutputChars) {
-          const truncated = full.slice(0, maxOutputChars);
-          return `${truncated}\n\n...[truncated ${(full.length - maxOutputChars).toLocaleString()} chars]`;
-        }
-        return full;
-      } finally {
-        // The active sandbox adapter owns its own temp-file cleanup; the parent
-        // only tears down the bridge server here.
-        cleanupBridge();
+      const backgroundRequested =
+        (args.background as unknown) === true ||
+        (typeof args.background === "string" &&
+          args.background.trim().toLowerCase() === "true");
+      if (backgroundRequested || isQueuedSandboxAdapter(getSandboxAdapter())) {
+        return enqueueBackgroundRunCode({
+          code,
+          requestedTimeoutMs: Number(args.timeoutMs),
+          maxOutputChars,
+          context,
+          getActions,
+        });
       }
+
+      const requestedTimeout = Number(args.timeoutMs);
+      const timeoutMs =
+        Number.isFinite(requestedTimeout) && requestedTimeout > 0
+          ? Math.min(requestedTimeout, MAX_TIMEOUT_MS)
+          : DEFAULT_TIMEOUT_MS;
+
+      const { stdout, stderr, exitCode, timedOut, bridgeToolsUsed } =
+        await executeSandboxCode({
+          code,
+          timeoutMs,
+          getActions,
+          extraBridgeTools,
+          context,
+          evaluator,
+        });
+
+      const combined =
+        [stdout ? `stdout:\n${stdout}` : "", stderr ? `stderr:\n${stderr}` : ""]
+          .filter(Boolean)
+          .join("\n\n") || "(no output)";
+
+      const lines: string[] = [];
+      if (timedOut) lines.push(`timedOut: true (${timeoutMs}ms)`);
+      if (exitCode !== 0 && exitCode !== null)
+        lines.push(`exitCode: ${exitCode}`);
+      if (bridgeToolsUsed.length)
+        lines.push(`bridgeToolsUsed: ${bridgeToolsUsed.join(", ")}`);
+      lines.push(combined);
+
+      const full = lines.join("\n\n");
+      if (full.length > maxOutputChars) {
+        const truncated = full.slice(0, maxOutputChars);
+        return `${truncated}\n\n...[truncated ${(full.length - maxOutputChars).toLocaleString()} chars]`;
+      }
+      return full;
     },
   };
 }
 
-// ---------------------------------------------------------------------------
-// Bridge server
-// ---------------------------------------------------------------------------
+export interface ExecuteSandboxCodeOptions {
+  code: string;
+  timeoutMs: number;
+  getActions: () => Record<string, ActionEntry>;
+  extraBridgeTools?: Set<string>;
+  mode?: SandboxCodeMode;
+  maxToolCalls?: number;
+  context?: ActionRunContext;
+  evaluator?: SandboxCodeEvaluator;
+}
+
+export interface ExecuteSandboxCodeResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  bridgeToolsUsed: string[];
+}
+
+export async function executeSandboxCode(
+  options: ExecuteSandboxCodeOptions,
+): Promise<ExecuteSandboxCodeResult> {
+  const actions = options.getActions();
+  const mode = options.mode ?? "run-code";
+  const evaluator = options.evaluator ?? "node";
+
+  if (evaluator === "run") {
+    const bridge = createBridgeInvoker({
+      actions,
+      context: options.context,
+      defaultTools: DEFAULT_BRIDGE_TOOLS,
+      extraTools: options.extraBridgeTools ?? new Set(),
+      mode,
+      maxToolCalls: options.maxToolCalls,
+    });
+    return executeRunSandboxCode({
+      code: options.code,
+      timeoutMs: options.timeoutMs,
+      mode,
+      bridge,
+    });
+  }
+
+  const bridgeToken = crypto.randomBytes(32).toString("hex");
+
+  const {
+    bridgePort,
+    getUsedTools,
+    cleanup: cleanupBridge,
+  } = await startBridgeServer(
+    bridgeToken,
+    actions,
+    options.context,
+    DEFAULT_BRIDGE_TOOLS,
+    options.extraBridgeTools ?? new Set(),
+    mode,
+    options.maxToolCalls,
+  );
+
+  try {
+    const safeEnv: Record<string, string> = {};
+    for (const key of [
+      "PATH",
+      "HOME",
+      "TMPDIR",
+      "TEMP",
+      "TMP",
+      "LANG",
+      "LC_ALL",
+    ]) {
+      if (process.env[key]) safeEnv[key] = process.env[key]!;
+    }
+
+    const { stdout, stderr, exitCode, timedOut } =
+      await resolveExecutionSandboxAdapter().run({
+        moduleSource: buildSandboxModule(
+          options.code,
+          bridgePort,
+          bridgeToken,
+          mode,
+          evaluator,
+        ),
+        env: safeEnv,
+        timeoutMs: options.timeoutMs,
+        bridgePort,
+      });
+
+    return {
+      stdout,
+      stderr,
+      exitCode,
+      timedOut,
+      bridgeToolsUsed: getUsedTools(),
+    };
+  } finally {
+    cleanupBridge();
+  }
+}
+
+function structuredRunCodeError(payload: {
+  code: string;
+  message: string;
+  guidance: string;
+  executionId?: string;
+}): string {
+  return JSON.stringify(
+    {
+      ...(payload.executionId ? { executionId: payload.executionId } : {}),
+      status: "error",
+      error: { code: payload.code, message: payload.message },
+      guidance: payload.guidance,
+    },
+    null,
+    2,
+  );
+}
+
+function resolveExecutionOwner(context?: ActionRunContext): string | undefined {
+  return context?.userEmail ?? getRequestUserEmail();
+}
+
+function pollHintFor(executionId: string, hasGetTool: boolean): string {
+  return hasGetTool
+    ? `\`get-code-execution\` with {"executionId": "${executionId}"}`
+    : `\`run-code\` with {"executionId": "${executionId}"} and no code`;
+}
+
+async function enqueueBackgroundRunCode(input: {
+  code: string;
+  requestedTimeoutMs: number;
+  maxOutputChars: number;
+  context?: ActionRunContext;
+  getActions: () => Record<string, ActionEntry>;
+}): Promise<string> {
+  const owner = resolveExecutionOwner(input.context);
+  if (!owner) {
+    return structuredRunCodeError({
+      code: "identity_required",
+      message:
+        "Background execution requires an authenticated owner identity; none was resolved for this call.",
+      guidance:
+        "Run the code in the foreground instead (omit background), or retry from an authenticated agent run.",
+    });
+  }
+
+  const timeoutMs =
+    Number.isFinite(input.requestedTimeoutMs) && input.requestedTimeoutMs > 0
+      ? Math.min(input.requestedTimeoutMs, BACKGROUND_MAX_TIMEOUT_MS)
+      : BACKGROUND_DEFAULT_TIMEOUT_MS;
+
+  const { execution, driveNote } = await enqueueSandboxExecution({
+    code: input.code,
+    timeoutMs,
+    maxOutputChars: input.maxOutputChars,
+    owner,
+    orgId: input.context?.orgId ?? null,
+    threadId: input.context?.threadId ?? null,
+    allowedActionNames: getRequestRunContext()?.allowedActionNames,
+  });
+
+  const hasGetTool = Boolean(input.getActions()["get-code-execution"]);
+  return JSON.stringify(
+    {
+      executionId: execution.id,
+      status: "queued",
+      timeoutMs,
+      guidance:
+        `Queued for durable background execution — it keeps running even if this chat run is cut off, and the result stays available afterwards. ` +
+        `Do NOT wait idle: continue other useful work now, then check progress by calling ${pollHintFor(execution.id, hasGetTool)}. ` +
+        `Poll after finishing your other steps, then every ~15-30 seconds — not in a tight loop. ` +
+        `If the result reports failed or timed_out, split the computation into smaller chunks or persist intermediate progress with workspaceWrite and re-run.`,
+      ...(driveNote ? { note: driveNote } : {}),
+    },
+    null,
+    2,
+  );
+}
+
+async function describeSandboxExecutionForOwner(
+  executionId: string,
+  context?: ActionRunContext,
+): Promise<string> {
+  const owner = resolveExecutionOwner(context);
+  if (!owner) {
+    return structuredRunCodeError({
+      executionId,
+      code: "identity_required",
+      message:
+        "Cannot look up a background execution without an authenticated owner identity.",
+      guidance:
+        "Background executions are scoped to the user who started them. Retry from an authenticated agent run.",
+    });
+  }
+
+  let row = await getSandboxExecutionForOwner(executionId, owner);
+  if (!row) {
+    return structuredRunCodeError({
+      executionId,
+      code: "execution_not_found",
+      message: `No background execution "${executionId}" exists for this user.`,
+      guidance:
+        "Check the executionId — it must come from a prior run-code call with background: true made by this same user.",
+    });
+  }
+
+  const now = Date.now();
+  const pollGuidance =
+    `Still in progress. Do not wait idle — continue other useful work, then poll again in ~15-30 seconds by calling ` +
+    `${pollHintFor(executionId, false)}.`;
+
+  if (row.status === "queued") {
+    if (now - row.updatedAt >= SANDBOX_EXECUTION_REDRIVE_AFTER_MS) {
+      try {
+        await driveSandboxExecution(row.id);
+      } catch {
+        // Best-effort; the sweep retries.
+      }
+    }
+    return JSON.stringify(
+      {
+        executionId,
+        status: "queued",
+        attemptCount: row.attemptCount,
+        queuedForMs: now - row.createdAt,
+        guidance: pollGuidance,
+      },
+      null,
+      2,
+    );
+  }
+
+  if (row.status === "running") {
+    const leaseExpired =
+      row.leaseExpiresAt !== null && row.leaseExpiresAt < now;
+    if (!leaseExpired) {
+      return JSON.stringify(
+        {
+          executionId,
+          status: "running",
+          attemptCount: row.attemptCount,
+          runningForMs: now - (row.startedAt ?? row.createdAt),
+          guidance: pollGuidance,
+        },
+        null,
+        2,
+      );
+    }
+    if (row.attemptCount < row.maxAttempts) {
+      try {
+        await driveSandboxExecution(row.id);
+      } catch {
+        // Best-effort; the sweep retries.
+      }
+      return JSON.stringify(
+        {
+          executionId,
+          status: "running",
+          attemptCount: row.attemptCount,
+          note: `The previous executor stopped heartbeating (its environment was likely terminated); a retry has been dispatched (attempt ${row.attemptCount + 1} of ${row.maxAttempts}).`,
+          guidance: pollGuidance,
+        },
+        null,
+        2,
+      );
+    }
+    await failExpiredSandboxExecution(
+      row.id,
+      `Executor lease expired after ${row.attemptCount} attempt(s); the execution environment was likely terminated before the code finished. Split the computation into smaller chunks or persist intermediate results (e.g. workspaceWrite) and run again.`,
+      now,
+    );
+    row = (await getSandboxExecutionForOwner(executionId, owner)) ?? row;
+  }
+
+  return formatTerminalSandboxExecution(row);
+}
+
+function formatTerminalSandboxExecution(row: SandboxExecutionRow): string {
+  const durationMs =
+    row.startedAt !== null && row.finishedAt !== null
+      ? Math.max(0, row.finishedAt - row.startedAt)
+      : undefined;
+  const guidance =
+    row.status === "timed_out"
+      ? `The execution exceeded its ${row.timeoutMs}ms background budget and was terminated. Reduce the work per run, or persist intermediate results with workspaceWrite and continue in a follow-up background execution.`
+      : row.status === "failed"
+        ? "The execution failed. Inspect error/stderr, fix the code, and re-run (use background: true again for long compute). If the executor was lost repeatedly, split the computation into smaller chunks or persist intermediate results with workspaceWrite."
+        : undefined;
+
+  const header = JSON.stringify(
+    {
+      executionId: row.id,
+      status: row.status,
+      exitCode: row.exitCode,
+      ...(row.timedOut ? { timedOut: true } : {}),
+      attemptCount: row.attemptCount,
+      ...(durationMs !== undefined ? { durationMs } : {}),
+      ...(row.error ? { error: row.error } : {}),
+      ...(row.bridgeToolsUsed.length
+        ? { bridgeToolsUsed: row.bridgeToolsUsed }
+        : {}),
+      ...(guidance ? { guidance } : {}),
+    },
+    null,
+    2,
+  );
+
+  const combined =
+    [
+      row.stdout
+        ? `stdout:\n${row.stdout}${row.stdoutTruncated ? "\n...[stored stdout truncated]" : ""}`
+        : "",
+      row.stderr
+        ? `stderr:\n${row.stderr}${row.stderrTruncated ? "\n...[stored stderr truncated]" : ""}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n") || "(no output)";
+
+  const full = `${header}\n\n${combined}`;
+  const maxChars =
+    row.maxOutputChars > 0 ? row.maxOutputChars : MAX_OUTPUT_CHARS;
+  if (full.length > maxChars) {
+    const truncated = full.slice(0, maxChars);
+    return `${truncated}\n\n...[truncated ${(full.length - maxChars).toLocaleString()} chars]`;
+  }
+  return full;
+}
+
+export function createGetCodeExecutionEntry(): ActionEntry {
+  return {
+    readOnly: true,
+    dedupe: false,
+    tool: {
+      description:
+        "Check a background run-code execution: returns its status (queued | running | succeeded | failed | timed_out) and, once finished, its stdout/stderr output. Executions are scoped to the user who started them. While one is queued or running, continue other useful work and poll every ~15-30 seconds instead of busy-waiting.",
+      parameters: {
+        type: "object",
+        properties: {
+          executionId: {
+            type: "string",
+            description:
+              "The executionId returned by run-code with background: true.",
+          },
+        },
+        required: ["executionId"],
+      },
+    },
+    run: async (args: Record<string, string>, context?: ActionRunContext) => {
+      const executionId =
+        typeof args.executionId === "string" ? args.executionId.trim() : "";
+      if (!executionId) {
+        return structuredRunCodeError({
+          code: "execution_id_required",
+          message: "executionId is required.",
+          guidance:
+            "Pass the executionId returned by a prior run-code call with background: true.",
+        });
+      }
+      return describeSandboxExecutionForOwner(executionId, context);
+    },
+  };
+}
 
 interface BridgeResult {
   server: http.Server;
@@ -230,14 +634,193 @@ interface BridgeResult {
   cleanup: () => void;
 }
 
+interface BridgeInvoker {
+  invoke: (toolName: string, args: Record<string, unknown>) => Promise<string>;
+  getUsedTools: () => string[];
+}
+
+interface BridgeInvokerOptions {
+  actions: Record<string, ActionEntry>;
+  context: ActionRunContext | undefined;
+  defaultTools: Set<string>;
+  extraTools: Set<string>;
+  mode: SandboxCodeMode;
+  maxToolCalls: number | undefined;
+}
+
+class BridgeInvocationError extends Error {
+  constructor(
+    readonly statusCode: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "BridgeInvocationError";
+  }
+}
+
+function createBridgeInvoker(options: BridgeInvokerOptions): BridgeInvoker {
+  const usedTools = new Set<string>();
+  const callBudget =
+    options.mode === "tool-orchestration"
+      ? {
+          count: 0,
+          max: normalizeToolCallBudget(options.maxToolCalls),
+        }
+      : undefined;
+
+  const invoke = async (
+    toolName: string,
+    args: Record<string, unknown>,
+  ): Promise<string> => {
+    const entry = options.actions[toolName];
+    if (!entry) {
+      throw new BridgeInvocationError(
+        404,
+        `Tool "${toolName}" is not registered.`,
+      );
+    }
+
+    const isReadOnlyAction =
+      entry.readOnly === true &&
+      entry.agentTool !== false &&
+      entry.uiOnly !== true &&
+      entry.toolCallable !== false &&
+      isCallableWithoutApproval(entry);
+    const childArgs =
+      options.mode === "tool-orchestration"
+        ? boundToolOrchestrationArgs(toolName, args)
+        : args;
+
+    if (options.mode === "tool-orchestration") {
+      if (callBudget && callBudget.count >= callBudget.max) {
+        throw new BridgeInvocationError(
+          429,
+          `Tool-orchestration child-call budget exceeded (${callBudget.max}). Aggregate the current results or increase maxToolCalls within its limit.`,
+        );
+      }
+      if (!isAllowedToolOrchestrationCall(toolName, childArgs, entry)) {
+        throw new BridgeInvocationError(
+          403,
+          `Tool "${toolName}" is not permitted by tool-orchestration. Only read-only tools and GET/HEAD provider or web reads without staging or saving files are allowed; call mutating tools directly.`,
+        );
+      }
+    } else {
+      if (!isCallableWithoutApproval(entry)) {
+        throw new BridgeInvocationError(
+          403,
+          `Tool "${toolName}" requires approval and cannot be called from sandbox code. Call it directly as a native tool.`,
+        );
+      }
+      if (
+        !options.defaultTools.has(toolName) &&
+        !options.extraTools.has(toolName) &&
+        !isReadOnlyAction
+      ) {
+        const isMutatingAction =
+          entry.agentTool !== false &&
+          entry.uiOnly !== true &&
+          entry.readOnly !== true;
+        throw new BridgeInvocationError(
+          403,
+          isMutatingAction
+            ? `Tool "${toolName}" is a mutating action and cannot be called from run-code (appAction only exposes read-only actions). Call "${toolName}" directly as a native tool. For large content bodies, stage the content and pass "contentFromAttachment" instead of an inline string rather than routing it through run-code.`
+            : `Tool "${toolName}" is not an agent-exposed read-only action or sandbox bridge allowlisted tool.`,
+        );
+      }
+    }
+
+    if (callBudget) callBudget.count += 1;
+    usedTools.add(toolName);
+    let servicePrincipalRefusedError:
+      | typeof import("../org/service-principal-guard.js").ServicePrincipalRefusedError
+      | undefined;
+    try {
+      const context = options.context;
+      if (context && parseServiceIdentityEmail(context.userEmail)) {
+        const guard = await import("../org/service-principal-guard.js");
+        servicePrincipalRefusedError = guard.ServicePrincipalRefusedError;
+        await guard.enforceServicePrincipalActionGrant({
+          email: context.userEmail,
+          orgId: context.orgId,
+          actionName: toolName,
+          caller: context.caller,
+        });
+      }
+      // Name the child, not `run-code`: a service principal's grant is checked
+      // against the action actually being run.
+      const run = () =>
+        entry.run(
+          childArgs,
+          options.context && { ...options.context, actionName: toolName },
+        );
+      const result =
+        options.context?.credentialScope === "org"
+          ? await runWithRequestContext(
+              {
+                ...getRequestContext(),
+                ...(options.context.userEmail
+                  ? { userEmail: options.context.userEmail }
+                  : {}),
+                orgId: options.context.orgId ?? undefined,
+                credentialScope: "org",
+              },
+              run,
+            )
+          : await run();
+      return formatBridgeResult(result);
+    } catch (error) {
+      if (error instanceof BridgeInvocationError) throw error;
+      if (
+        servicePrincipalRefusedError &&
+        error instanceof servicePrincipalRefusedError
+      ) {
+        throw new BridgeInvocationError(error.statusCode, error.message);
+      }
+      throw new BridgeInvocationError(
+        500,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  };
+
+  return {
+    invoke,
+    getUsedTools: () => Array.from(usedTools).sort(),
+  };
+}
+
+function formatBridgeResult(result: unknown): string {
+  if (typeof result === "string") return result;
+  const serialized = JSON.stringify(result, null, 2);
+  return serialized === undefined ? String(result) : serialized;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.getPrototypeOf(value) === Object.prototype
+  );
+}
+
 async function startBridgeServer(
   token: string,
   actions: Record<string, ActionEntry>,
   context: ActionRunContext | undefined,
   defaultTools: Set<string>,
   extraTools: Set<string>,
+  mode: SandboxCodeMode,
+  maxToolCalls: number | undefined,
 ): Promise<BridgeResult> {
-  const usedTools = new Set<string>();
+  const bridge = createBridgeInvoker({
+    actions,
+    context,
+    defaultTools,
+    extraTools,
+    mode,
+    maxToolCalls,
+  });
   const server = http.createServer((req, res) => {
     if (req.method !== "POST" || req.url !== "/tool") {
       res.writeHead(404);
@@ -269,15 +852,7 @@ async function startBridgeServer(
     });
     req.on("end", () => {
       if (rejected) return;
-      handleBridgeRequest(
-        body,
-        actions,
-        context,
-        defaultTools,
-        extraTools,
-        usedTools,
-        res,
-      );
+      handleBridgeRequest(body, bridge.invoke, res);
     });
     req.on("error", () => {
       res.writeHead(500);
@@ -302,24 +877,26 @@ async function startBridgeServer(
   return {
     server,
     bridgePort,
-    getUsedTools: () => Array.from(usedTools).sort(),
+    getUsedTools: bridge.getUsedTools,
     cleanup,
   };
 }
 
 function handleBridgeRequest(
   rawBody: string,
-  actions: Record<string, ActionEntry>,
-  context: ActionRunContext | undefined,
-  defaultTools: Set<string>,
-  extraTools: Set<string>,
-  usedTools: Set<string>,
+  invoke: BridgeInvoker["invoke"],
   res: http.ServerResponse,
 ): void {
-  let parsed: { tool?: string; args?: Record<string, string> };
+  let parsed: unknown;
   try {
     parsed = JSON.parse(rawBody);
   } catch {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Invalid JSON body" }));
+    return;
+  }
+
+  if (!isPlainRecord(parsed)) {
     res.writeHead(400, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Invalid JSON body" }));
     return;
@@ -332,67 +909,344 @@ function handleBridgeRequest(
     return;
   }
 
-  // Enforce allowlist.
-  const entry = actions[toolName];
-  const isReadOnlyAction =
-    entry?.readOnly === true &&
-    entry.agentTool !== false &&
-    entry.toolCallable !== false;
-  if (
-    !defaultTools.has(toolName) &&
-    !extraTools.has(toolName) &&
-    !isReadOnlyAction
-  ) {
-    res.writeHead(403, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        error: `Tool "${toolName}" is not an agent-exposed read-only action or sandbox bridge allowlisted tool.`,
-      }),
-    );
+  const toolArgs =
+    parsed.args === undefined
+      ? {}
+      : isPlainRecord(parsed.args)
+        ? parsed.args
+        : null;
+  if (!toolArgs) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Tool args must be a JSON object" }));
     return;
   }
 
-  if (!entry) {
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: `Tool "${toolName}" is not registered.` }));
-    return;
-  }
-
-  const toolArgs = parsed.args ?? {};
-  usedTools.add(toolName);
-  // Run the tool with the parent request context so auth/org/owner resolution
-  // works exactly as it does in the normal agent loop.
-  entry
-    .run(toolArgs, context)
-    .then((result: unknown) => {
-      const body =
-        typeof result === "string" ? result : JSON.stringify(result, null, 2);
+  void invoke(toolName, toolArgs)
+    .then((body) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ result: body }));
     })
-    .catch((err: unknown) => {
-      const message = err instanceof Error ? err.message : String(err);
-      res.writeHead(500, { "Content-Type": "application/json" });
+    .catch((error: unknown) => {
+      const statusCode =
+        error instanceof BridgeInvocationError ? error.statusCode : 500;
+      const message = error instanceof Error ? error.message : String(error);
+      res.writeHead(statusCode, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: message }));
     });
 }
 
-// ---------------------------------------------------------------------------
-// Sandbox module template
-// ---------------------------------------------------------------------------
+interface RunBridgeResponse {
+  ok: boolean;
+  result?: string;
+  error?: string;
+}
 
-/**
- * Wrap the user's code in an ESM module that:
- *  1. Defines `providerFetch`, `providerRequest`, `providerFetchAll`,
- *     `providerSearchAll`, and `webFetch` helpers via the bridge.
- *  2. Runs the user's code as top-level await in an async IIFE.
- */
+async function executeRunSandboxCode(input: {
+  code: string;
+  timeoutMs: number;
+  mode: SandboxCodeMode;
+  bridge: BridgeInvoker;
+}): Promise<ExecuteSandboxCodeResult> {
+  const hostFunctions = {
+    bridge: {
+      call: async (...args: unknown[]): Promise<RunBridgeResponse> => {
+        const toolName = args[0];
+        const toolArgs = args[1];
+        if (typeof toolName !== "string" || !toolName.trim()) {
+          return { ok: false, error: "Missing tool name" };
+        }
+        if (toolArgs !== undefined && !isPlainRecord(toolArgs)) {
+          return { ok: false, error: "Tool args must be a JSON object" };
+        }
+        try {
+          return {
+            ok: true,
+            result: await input.bridge.invoke(
+              toolName.trim(),
+              (toolArgs as Record<string, unknown> | undefined) ?? {},
+            ),
+          };
+        } catch (error) {
+          return {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      },
+    },
+  } as HostFunctions;
+
+  try {
+    const result = await runEvaluator.run({
+      source: buildSandboxModule(input.code, 0, "", input.mode, "run"),
+      hostFunctions,
+      limits: { timeoutMs: input.timeoutMs },
+    });
+
+    if (result.status !== "completed") {
+      return {
+        stdout: "",
+        stderr: "Run was interrupted before it completed.",
+        exitCode: 1,
+        timedOut: false,
+        bridgeToolsUsed: input.bridge.getUsedTools(),
+      };
+    }
+
+    const value = result.value as { stdout?: unknown; stderr?: unknown };
+    if (typeof value?.stdout !== "string" || typeof value.stderr !== "string") {
+      return {
+        stdout: "",
+        stderr: "Run returned an invalid output envelope.",
+        exitCode: 1,
+        timedOut: false,
+        bridgeToolsUsed: input.bridge.getUsedTools(),
+      };
+    }
+    return {
+      stdout: value.stdout,
+      stderr: value.stderr,
+      exitCode: 0,
+      timedOut: false,
+      bridgeToolsUsed: input.bridge.getUsedTools(),
+    };
+  } catch (error) {
+    const timedOut = RunError.isInstance(error) && error.code === "RUN_TIMEOUT";
+    return {
+      stdout: "",
+      stderr: formatRunError(error),
+      exitCode: 1,
+      timedOut,
+      bridgeToolsUsed: input.bridge.getUsedTools(),
+    };
+  }
+}
+
+function formatRunError(error: unknown): string {
+  if (RunError.isInstance(error)) return `${error.code}: ${error.message}`;
+  return error instanceof Error ? error.message : String(error);
+}
+
+function normalizeToolCallBudget(value: number | undefined): number {
+  if (!Number.isFinite(value) || !value || value <= 0) {
+    return TOOL_ORCHESTRATION_DEFAULT_MAX_CALLS;
+  }
+  return Math.min(Math.floor(value), TOOL_ORCHESTRATION_MAX_CALLS);
+}
+
+function isAllowedToolOrchestrationCall(
+  toolName: string,
+  args: Record<string, unknown>,
+  entry: ActionEntry,
+): boolean {
+  if (toolName === "workspace-files") {
+    return isCallableWithoutApproval(entry) && isReadOnlyWorkspaceRequest(args);
+  }
+  if (toolName === "provider-api-request") {
+    return isReadOnlyProviderApiRequest(args, entry);
+  }
+  return isReadOnlyOrchestrationAction(args, entry);
+}
+
+function isCallableWithoutApproval(entry: ActionEntry): boolean {
+  return entry.needsApproval === undefined || entry.needsApproval === false;
+}
+
+function isReadOnlyWorkspaceRequest(args: Record<string, unknown>): boolean {
+  const action = typeof args.action === "string" ? args.action : "";
+  return action === "read" || action === "list" || action === "grep";
+}
+
+function isReadOnlyProviderApiRequest(
+  args: Record<string, unknown>,
+  entry: ActionEntry,
+): boolean {
+  if (
+    !entry.tool ||
+    !isCallableWithoutApproval(entry) ||
+    entry.agentTool === false ||
+    entry.uiOnly === true ||
+    entry.allowInPlanMode === false
+  ) {
+    return false;
+  }
+  const method = String(args.method ?? "GET").toUpperCase();
+  return (
+    (method === "GET" || method === "HEAD") &&
+    args.stageAs == null &&
+    args.saveToFile == null
+  );
+}
+
+function isReadOnlyOrchestrationAction(
+  args: Record<string, unknown>,
+  entry: ActionEntry,
+): boolean {
+  if (
+    !entry.tool ||
+    !isCallableWithoutApproval(entry) ||
+    entry.agentTool === false ||
+    entry.uiOnly === true ||
+    entry.toolCallable === false ||
+    entry.allowInPlanMode === false
+  ) {
+    return false;
+  }
+
+  const planMode = entry.planMode;
+  if (!planMode) return entry.readOnly === true;
+
+  const input = args as any;
+  if (
+    planMode.allowedProperties &&
+    Object.keys(args).some((key) => !planMode.allowedProperties!.includes(key))
+  ) {
+    return false;
+  }
+  if (
+    planMode.omittedProperties?.some((key) =>
+      Object.prototype.hasOwnProperty.call(args, key),
+    )
+  ) {
+    return false;
+  }
+  if (
+    Object.entries(planMode.allowedValues ?? {}).some(([key, allowed]) => {
+      const value = args[key];
+      return (
+        value !== null &&
+        value !== undefined &&
+        (typeof value !== "string" || !allowed.includes(value))
+      );
+    })
+  ) {
+    return false;
+  }
+
+  try {
+    const effect =
+      typeof planMode.effect === "function"
+        ? planMode.effect(input)
+        : planMode.effect;
+    return effect === "read";
+  } catch (error) {
+    console.warn(
+      "[run-code] tool-orchestration read-only policy classifier failed closed:",
+      error instanceof Error ? error.message : String(error),
+    );
+    return false;
+  }
+}
+
+function boundToolOrchestrationArgs(
+  toolName: string,
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  if (toolName !== "provider-api-request") return args;
+  const fetchAllPages = args.fetchAllPages;
+  if (
+    !fetchAllPages ||
+    typeof fetchAllPages !== "object" ||
+    Array.isArray(fetchAllPages)
+  ) {
+    return args;
+  }
+
+  const requestedMaxPages = Number(
+    (fetchAllPages as Record<string, unknown>).maxPages,
+  );
+  const maxPages =
+    Number.isInteger(requestedMaxPages) && requestedMaxPages > 0
+      ? Math.min(
+          Math.floor(requestedMaxPages),
+          TOOL_ORCHESTRATION_MAX_PROVIDER_PAGES,
+        )
+      : TOOL_ORCHESTRATION_MAX_PROVIDER_PAGES;
+
+  return {
+    ...args,
+    fetchAllPages: {
+      ...(fetchAllPages as Record<string, unknown>),
+      maxPages,
+    },
+  };
+}
+
 function buildSandboxModule(
   userCode: string,
   bridgePort: number,
   bridgeToken: string,
+  mode: SandboxCodeMode = "run-code",
+  evaluator: SandboxCodeEvaluator = "node",
 ): string {
-  return `
+  const orchestrationHelpers =
+    mode === "tool-orchestration"
+      ? `
+/**
+ * Search the live registry for read-only or conditionally read-only tools, then call one
+ * of the returned names with toolCall(). The parent host enforces the same
+ * policy again, so this is discovery guidance rather than an authorization
+ * boundary.
+ */
+async function toolSearch(query = "", options = {}) {
+  const rawResult = await _bridgeCall("tool-search", {
+    ...(query ? { query } : {}),
+    ...(options.limit !== undefined ? { limit: options.limit } : {}),
+    includeSchemas: true,
+    readOnlyOnly: true,
+  });
+  return _parseBridgeResult(rawResult);
+}
+
+async function toolCall(name, args = {}) {
+  return _parseBridgeResult(await _bridgeCall(name, args));
+}
+`
+      : "";
+  const workspaceMutationHelpers =
+    mode === "run-code"
+      ? `
+/**
+ * Write (create or overwrite) a workspace file. Use \`scratch/...\` for
+ * temporary staging files.
+ * \`content\` must be a string. Returns metadata
+ * { resourceId, path, contentType, sizeBytes, updatedAt }.
+ */
+async function workspaceWrite(path, content, contentType = "text/plain") {
+  const rawResult = await _bridgeCall("workspace-files", {
+    action: "write",
+    path,
+    content: typeof content === "string" ? content : JSON.stringify(content),
+    contentType,
+  });
+  try { return typeof rawResult === "string" ? JSON.parse(rawResult) : rawResult; } catch { return rawResult; }
+}
+
+/**
+ * Append text to a workspace file (creates if absent).
+ */
+async function workspaceAppend(path, content) {
+  const rawResult = await _bridgeCall("workspace-files", {
+    action: "append",
+    path,
+    content: typeof content === "string" ? content : JSON.stringify(content),
+  });
+  try { return typeof rawResult === "string" ? JSON.parse(rawResult) : rawResult; } catch { return rawResult; }
+}
+`
+      : "";
+  const bridgeSetup =
+    evaluator === "run"
+      ? `
+async function _bridgeCall(tool, args) {
+  const response = await bridge.call(tool, args);
+  if (!response || response.ok !== true) {
+    throw new Error(response?.error || "Bridge call failed");
+  }
+  return response.result;
+}
+`
+      : `
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 
@@ -434,6 +1288,68 @@ async function _bridgeCall(tool, args) {
     req.end(body);
   });
 }
+`;
+  const runOutputPrelude =
+    evaluator === "run"
+      ? `
+let __runStdout = "";
+let __runStderr = "";
+let __runOutputTruncated = false;
+function __runFormat(value) {
+  if (typeof value === "string") return value;
+  if (typeof value === "undefined") return "undefined";
+  if (typeof value === "bigint") return String(value) + "n";
+  try {
+    const json = JSON.stringify(value);
+    return json === undefined ? String(value) : json;
+  } catch {
+    return String(value);
+  }
+}
+function __runWrite(stream, args) {
+  const text = args.map(__runFormat).join(" ") + "\\n";
+  const current = stream === "stderr" ? __runStderr : __runStdout;
+  const remaining = ${RUN_MAX_CONSOLE_OUTPUT_BYTES} - current.length;
+  if (remaining <= 0) {
+    __runOutputTruncated = true;
+    return;
+  }
+  const next = text.slice(0, remaining);
+  if (stream === "stderr") __runStderr += next;
+  else __runStdout += next;
+  if (next.length < text.length) __runOutputTruncated = true;
+}
+const __runConsole = Object.freeze({
+  log: (...args) => __runWrite("stdout", args),
+  info: (...args) => __runWrite("stdout", args),
+  debug: (...args) => __runWrite("stdout", args),
+  warn: (...args) => __runWrite("stderr", args),
+  error: (...args) => __runWrite("stderr", args),
+});
+const console = __runConsole;
+globalThis.console = __runConsole;
+`
+      : "";
+  const userExecution =
+    evaluator === "run"
+      ? `
+await (async () => {
+${userCode}
+})();
+return { stdout: __runStdout, stderr: __runStderr };
+`
+      : `
+// Run user code
+(async () => {
+${userCode}
+})().catch((err) => {
+  console.error("Unhandled error:", err?.message ?? String(err));
+  process.exit(1);
+});
+`;
+  return `
+${bridgeSetup}
+${runOutputPrelude}
 
 function _parseBridgeResult(rawResult) {
   if (typeof rawResult !== "string") return rawResult;
@@ -447,6 +1363,8 @@ function _parseBridgeResult(rawResult) {
 async function appAction(name, args = {}) {
   return _parseBridgeResult(await _bridgeCall(name, args));
 }
+
+${orchestrationHelpers}
 
 async function providerRequest(provider, apiPath, init = {}) {
   const method = (init.method || "GET").toUpperCase();
@@ -1128,12 +2046,52 @@ async function webRead(url, init = {}) {
 /**
  * Read a Resources-backed workspace file by path. Returns the file content as
  * a string, or null if not found.
- * Supports optional offset and maxChars for paging large files.
+ *
+ * By default this returns the WHOLE file: the underlying store caps a single
+ * read at 100k chars, so this auto-pages across chunks and concatenates them,
+ * so callers never get a silently truncated body. Pass an explicit \`offset\`
+ * or \`maxChars\` to take manual control of a single page instead.
  */
 async function workspaceRead(path, opts = {}) {
-  const parsed = await workspaceReadMeta(path, opts);
-  if (parsed && parsed.ok === false) return null;
-  return parsed && typeof parsed.content === "string" ? parsed.content : null;
+  // Explicit paging requested → single read, caller owns the window.
+  if (opts.offset !== undefined || opts.maxChars !== undefined) {
+    const parsed = await workspaceReadMeta(path, opts);
+    if (parsed && parsed.ok === false) return null;
+    return parsed && typeof parsed.content === "string" ? parsed.content : null;
+  }
+  // Default → assemble the full file by paging until the store reports no more.
+  let offset = 0;
+  let out = "";
+  let found = false;
+  let complete = false;
+  // Bounded loop (files cap at 2 MB / 100k-char reads) so a misbehaving store
+  // can never spin forever.
+  for (let i = 0; i < 512; i++) {
+    const parsed = await workspaceReadMeta(path, { offset, maxChars: 100000 });
+    // A failed/missing page aborts. If it failed before the first page we never
+    // found the file (return null below); if it failed part-way through a
+    // truncated read, complete stays false and we return null rather than a
+    // silently truncated body.
+    if (!parsed || parsed.ok === false) break;
+    found = true;
+    const chunk = typeof parsed.content === "string" ? parsed.content : "";
+    out += chunk;
+    if (!parsed.truncated) {
+      complete = true;
+      break;
+    }
+    const next =
+      typeof parsed.nextOffset === "number"
+        ? parsed.nextOffset
+        : offset + chunk.length;
+    if (next <= offset) break; // no forward progress; stop rather than loop
+    offset = next;
+  }
+  if (!found) return null;
+  // Only hand back a body we know is whole. A truncated read followed by a
+  // failed/stalled page would otherwise corrupt a large clone with a partial
+  // prefix and no error signal.
+  return complete ? out : null;
 }
 
 /**
@@ -1150,32 +2108,7 @@ async function workspaceReadMeta(path, opts = {}) {
   return _parseBridgeResult(rawResult);
 }
 
-/**
- * Write (create or overwrite) a workspace file. Use \`scratch/...\` for
- * temporary staging files.
- * \`content\` must be a string. Returns metadata { path, sizeBytes, updatedAt }.
- */
-async function workspaceWrite(path, content, contentType = "text/plain") {
-  const rawResult = await _bridgeCall("workspace-files", {
-    action: "write",
-    path,
-    content: typeof content === "string" ? content : JSON.stringify(content),
-    contentType,
-  });
-  try { return typeof rawResult === "string" ? JSON.parse(rawResult) : rawResult; } catch { return rawResult; }
-}
-
-/**
- * Append text to a workspace file (creates if absent).
- */
-async function workspaceAppend(path, content) {
-  const rawResult = await _bridgeCall("workspace-files", {
-    action: "append",
-    path,
-    content: typeof content === "string" ? content : JSON.stringify(content),
-  });
-  try { return typeof rawResult === "string" ? JSON.parse(rawResult) : rawResult; } catch { return rawResult; }
-}
+${workspaceMutationHelpers}
 
 /**
  * List workspace files, optionally filtered by path prefix.
@@ -1192,12 +2125,6 @@ async function workspaceList(prefix) {
   throw new Error("workspaceList: unexpected result shape: " + JSON.stringify(parsed).slice(0, 200));
 }
 
-// Run user code
-(async () => {
-${userCode}
-})().catch((err) => {
-  console.error("Unhandled error:", err?.message ?? String(err));
-  process.exit(1);
-});
+${userExecution}
 `;
 }

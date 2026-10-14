@@ -1,8 +1,9 @@
-import { useCallback, useState } from "react";
+import { useActionMutation } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { IconDotsVertical, IconDownload, IconTrash } from "@tabler/icons-react";
+import { useCallback, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
-import { IconDots, IconTrash } from "@tabler/icons-react";
-import { useActionMutation } from "@agent-native/core/client";
-import { Button } from "@/components/ui/button";
+
 import {
   AlertDialog,
   AlertDialogAction,
@@ -13,10 +14,12 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
@@ -25,21 +28,45 @@ interface DeleteRecordingMenuProps {
   onDeleted?: () => void;
 }
 
-export function DeleteRecordingMenu({
+interface RecordingOptionsMenuProps extends DeleteRecordingMenuProps {
+  children?: ReactNode;
+  canDelete?: boolean;
+  canDownload?: boolean;
+  downloadPending?: boolean;
+  downloadLabel?: string;
+  downloadingLabel?: string;
+  onDownload?: () => void;
+}
+
+export function RecordingOptionsMenu({
+  children,
   recordingId,
   onDeleted,
-}: DeleteRecordingMenuProps) {
+  canDelete = true,
+  canDownload = false,
+  downloadPending = false,
+  downloadLabel,
+  downloadingLabel,
+  onDownload,
+}: RecordingOptionsMenuProps) {
+  const t = useT();
   const [open, setOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const deletedWhileOpenRef = useRef(false);
+  const pendingDeleteConfirmRef = useRef(false);
+  const showDownload = canDownload && Boolean(onDownload);
+  const showDelete = canDelete;
+  const showCustomItems = Boolean(children);
   const trashRecording = useActionMutation<any, { id: string }>(
     "trash-recording",
     {
       onSuccess: () => {
-        toast.success("Clip moved to trash");
+        toast.success(t("deleteRecordingMenu.movedToTrash"));
+        deletedWhileOpenRef.current = true;
         setOpen(false);
-        onDeleted?.();
       },
       onError: (err: any) =>
-        toast.error(err?.message ?? "Failed to delete clip"),
+        toast.error(err?.message ?? t("deleteRecordingMenu.deleteFailed")),
     },
   );
 
@@ -48,6 +75,13 @@ export function DeleteRecordingMenu({
     trashRecording.mutate({ id: recordingId });
   }, [recordingId, trashRecording]);
 
+  const handleDownload = useCallback(() => {
+    setMenuOpen(false);
+    onDownload?.();
+  }, [onDownload]);
+
+  if (!showCustomItems && !showDownload && !showDelete) return null;
+
   return (
     <AlertDialog
       open={open}
@@ -55,54 +89,103 @@ export function DeleteRecordingMenu({
         if (!trashRecording.isPending) setOpen(nextOpen);
       }}
     >
-      <DropdownMenu>
+      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
         <DropdownMenuTrigger asChild>
           <Button
             variant="ghost"
-            size="icon"
-            className="shrink-0"
-            aria-label="Clip options"
+            size="icon-sm"
+            className="order-last shrink-0"
+            aria-label={t("deleteRecordingMenu.clipOptions")}
           >
-            <IconDots className="h-4 w-4" />
+            <IconDotsVertical className="h-4 w-4" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-44">
-          <DropdownMenuItem
-            onSelect={(event) => {
+        <DropdownMenuContent
+          align="end"
+          className={
+            showCustomItems
+              ? "w-64 max-h-[var(--radix-dropdown-menu-content-available-height)] overflow-x-hidden overflow-y-auto"
+              : "w-44"
+          }
+          onCloseAutoFocus={(event) => {
+            if (pendingDeleteConfirmRef.current) {
               event.preventDefault();
+              pendingDeleteConfirmRef.current = false;
               setOpen(true);
-            }}
-            className="text-destructive focus:text-destructive"
-          >
-            <IconTrash className="mr-2 h-4 w-4" />
-            Delete
-          </DropdownMenuItem>
+            }
+          }}
+        >
+          {children}
+          {showCustomItems && (showDownload || showDelete) ? (
+            <DropdownMenuSeparator />
+          ) : null}
+          {showDownload ? (
+            <DropdownMenuItem
+              onSelect={handleDownload}
+              disabled={downloadPending}
+            >
+              <IconDownload className="me-2 h-4 w-4" />
+              {downloadPending
+                ? (downloadingLabel ?? t("sharePage.downloading"))
+                : (downloadLabel ?? t("recordRoute.downloadRecording"))}
+            </DropdownMenuItem>
+          ) : null}
+          {showDownload && showDelete ? <DropdownMenuSeparator /> : null}
+          {showDelete ? (
+            <DropdownMenuItem
+              onSelect={(event) => {
+                event.preventDefault();
+                pendingDeleteConfirmRef.current = true;
+                setMenuOpen(false);
+              }}
+              className="text-destructive focus:text-destructive"
+            >
+              <IconTrash className="me-2 h-4 w-4" />
+              {t("deleteRecordingMenu.delete")}
+            </DropdownMenuItem>
+          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>Move this clip to trash?</AlertDialogTitle>
-          <AlertDialogDescription>
-            This removes the clip from your library. You can restore it from
-            Trash or delete it forever later.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel disabled={trashRecording.isPending}>
-            Cancel
-          </AlertDialogCancel>
-          <AlertDialogAction
-            disabled={trashRecording.isPending}
-            onClick={(event) => {
-              event.preventDefault();
-              handleTrashRecording();
-            }}
-            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-          >
-            {trashRecording.isPending ? "Deleting..." : "Move to trash"}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
+      {showDelete ? (
+        <AlertDialogContent
+          onCloseAutoFocus={(event) => {
+            if (!deletedWhileOpenRef.current) return;
+            deletedWhileOpenRef.current = false;
+            event.preventDefault();
+            onDeleted?.();
+          }}
+        >
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t("deleteRecordingMenu.moveTitle")}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("deleteRecordingMenu.moveDescription")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={trashRecording.isPending}>
+              {t("common.cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              disabled={trashRecording.isPending}
+              onClick={(event) => {
+                event.preventDefault();
+                handleTrashRecording();
+              }}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {trashRecording.isPending
+                ? t("deleteRecordingMenu.deleting")
+                : t("deleteRecordingMenu.moveToTrash")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      ) : null}
     </AlertDialog>
   );
+}
+
+export function DeleteRecordingMenu(props: DeleteRecordingMenuProps) {
+  return <RecordingOptionsMenu {...props} canDelete />;
 }

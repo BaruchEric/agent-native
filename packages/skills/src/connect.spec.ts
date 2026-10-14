@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { McpDescriptor, registerMcpServer } from "./connect.js";
@@ -15,7 +16,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  // Restore the real home dir so no test pollutes the developer's machine.
   if (savedHome === undefined) delete process.env.HOME;
   else process.env.HOME = savedHome;
   if (savedCodexHome === undefined) delete process.env.CODEX_HOME;
@@ -31,7 +31,6 @@ function tmpDir() {
   return root;
 }
 
-/** Point both $HOME and $CODEX_HOME at temp dirs so writes are hermetic. */
 function isolateHome() {
   const home = tmpDir();
   const codexHome = path.join(home, ".codex");
@@ -40,7 +39,6 @@ function isolateHome() {
   return { home, codexHome };
 }
 
-/** A fetch mock that returns scripted JSON responses keyed by URL substring. */
 function mockFetch(
   handlers: { match: string; status?: number; json: unknown }[],
 ): typeof fetch {
@@ -62,6 +60,62 @@ function mockFetch(
 const noSleep = async () => {};
 
 describe("registerMcpServer", () => {
+  it("normalizes a legacy MCP URL without losing its app base path", async () => {
+    const { codexHome } = isolateHome();
+    const baseDir = tmpDir();
+    const requested: string[] = [];
+    const fetchImpl = (async (url: string) => {
+      requested.push(String(url));
+      if (String(url).endsWith("/device/start")) {
+        return {
+          status: 200,
+          ok: true,
+          json: async () => ({
+            device_code: "dev-legacy",
+            user_code: "ABCD-EFGH",
+            verification_uri: "https://example.com/mail/mcp/connect",
+            verification_uri_complete:
+              "https://example.com/mail/mcp/connect?code=ABCD-EFGH",
+            interval: 1,
+            expires_in: 600,
+          }),
+        } as Response;
+      }
+      return {
+        status: 200,
+        ok: true,
+        json: async () => ({
+          status: "approved",
+          token: "legacy-token",
+          mcpUrl: "https://example.com/mail/_agent-native/mcp",
+          serverName: "mail",
+        }),
+      } as Response;
+    }) as unknown as typeof fetch;
+
+    const result = await registerMcpServer({
+      descriptor: {
+        serverName: "mail",
+        mcpUrl: "https://example.com/mail/_agent-native/mcp",
+        authMode: "device",
+      },
+      clients: ["codex"],
+      scope: "user",
+      baseDir,
+      interactive: true,
+      deps: { fetchImpl, sleep: noSleep, now: () => 0 },
+    });
+
+    expect(requested).toEqual([
+      "https://example.com/mail/mcp/connect/device/start",
+      "https://example.com/mail/mcp/connect/device/poll",
+    ]);
+    expect(
+      fs.readFileSync(path.join(codexHome, "config.toml"), "utf-8"),
+    ).toContain('url = "https://example.com/mail/mcp"');
+    expect(result.authenticated).toBe(true);
+  });
+
   it("writes URL-only OAuth entries for serverName + aliases, no Authorization", async () => {
     const { home } = isolateHome();
     const baseDir = tmpDir();
@@ -81,7 +135,6 @@ describe("registerMcpServer", () => {
       interactive: true,
     });
 
-    // claude-code @ user scope → ~/.claude.json
     const claudeJson = JSON.parse(
       fs.readFileSync(path.join(home, ".claude.json"), "utf-8"),
     );
@@ -89,12 +142,12 @@ describe("registerMcpServer", () => {
     const alias = claudeJson.mcpServers["agent-native-plans"];
     expect(main).toMatchObject({
       type: "http",
-      url: "https://plan.agent-native.com/_agent-native/mcp",
+      url: "https://plan.agent-native.com/mcp",
     });
     expect(main.headers).toBeUndefined();
     expect(alias).toMatchObject({
       type: "http",
-      url: "https://plan.agent-native.com/_agent-native/mcp",
+      url: "https://plan.agent-native.com/mcp",
     });
     expect(alias.headers).toBeUndefined();
 
@@ -126,7 +179,7 @@ describe("registerMcpServer", () => {
       fs.readFileSync(path.join(baseDir, ".cursor", "mcp.json"), "utf-8"),
     );
     expect(cursorConfig.mcpServers.plan).toEqual({
-      url: "https://plan.agent-native.com/_agent-native/mcp",
+      url: "https://plan.agent-native.com/mcp",
     });
 
     const opencodeConfig = JSON.parse(
@@ -134,7 +187,7 @@ describe("registerMcpServer", () => {
     );
     expect(opencodeConfig.mcp.plan).toEqual({
       type: "remote",
-      url: "https://plan.agent-native.com/_agent-native/mcp",
+      url: "https://plan.agent-native.com/mcp",
       enabled: true,
     });
 
@@ -143,7 +196,7 @@ describe("registerMcpServer", () => {
     );
     expect(copilotConfig.servers.plan).toEqual({
       type: "http",
-      url: "https://plan.agent-native.com/_agent-native/mcp",
+      url: "https://plan.agent-native.com/mcp",
     });
 
     expect(result.authenticated).toBe(false);
@@ -197,9 +250,7 @@ describe("registerMcpServer", () => {
 
     const toml = fs.readFileSync(path.join(codexHome, "config.toml"), "utf-8");
     expect(toml).toContain('[mcp_servers."plan"]');
-    expect(toml).toContain(
-      'url = "https://plan.agent-native.com/_agent-native/mcp"',
-    );
+    expect(toml).toContain('url = "https://plan.agent-native.com/mcp"');
     expect(toml).toContain("Bearer minted-bearer-token");
     expect(result.authenticated).toBe(true);
   });
@@ -380,7 +431,6 @@ describe("registerMcpServer", () => {
       hostedUrl: "https://xray.agent-native.com",
     };
 
-    // Pass a fetch that throws — proves authMode "none" never hits the network.
     const fetchImpl = (async () => {
       throw new Error("network must not be called for authMode none");
     }) as unknown as typeof fetch;
@@ -400,7 +450,7 @@ describe("registerMcpServer", () => {
     const entry = claudeJson.mcpServers["agent-native-context-xray"];
     expect(entry).toMatchObject({
       type: "http",
-      url: "https://xray.agent-native.com/_agent-native/mcp",
+      url: "https://xray.agent-native.com/mcp",
     });
     expect(entry.headers).toBeUndefined();
 
@@ -465,10 +515,7 @@ describe("registerMcpServer", () => {
 
   it("collects errors instead of throwing when a single key write fails", async () => {
     const { home } = isolateHome();
-    // Point baseDir at a file so project-scope writes would fail — but user
-    // scope here writes to ~/.claude.json, so use an unwritable codex home.
     const baseDir = tmpDir();
-    // Make CODEX_HOME a path whose parent is a file → mkdir fails.
     const blocker = path.join(home, "blocker");
     fs.writeFileSync(blocker, "x", "utf-8");
     process.env.CODEX_HOME = path.join(blocker, "nested");
@@ -488,12 +535,10 @@ describe("registerMcpServer", () => {
       interactive: false,
     });
 
-    // claude-code succeeded.
     const claudeJson = JSON.parse(
       fs.readFileSync(path.join(home, ".claude.json"), "utf-8"),
     );
     expect(claudeJson.mcpServers["agent-native-x"]).toBeDefined();
-    // codex failed but did not throw — surfaced in guidance.
     expect(result.guidance.join("\n")).toMatch(/Could not write .*codex/);
     expect(result.written.some((w) => w.client === "claude-code")).toBe(true);
   });

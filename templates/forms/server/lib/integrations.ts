@@ -1,31 +1,24 @@
 import {
-  isBlockedToolUrl,
-  ssrfSafeToolFetch,
-} from "@agent-native/core/tools/url-safety";
+  deliverJsonWebhook,
+  escapeSlackMrkdwn,
+  isWebhookUrlAllowed,
+} from "@agent-native/core/integrations";
+
+import { publicSubmitterEmail } from "../../shared/submitter-email.js";
 import type {
   FormIntegration,
   FormField,
+  FormFileValue,
   FormSettings,
   IntegrationType,
 } from "../../shared/types.js";
+import { isFormFileValue, isSafeFormFileUrl } from "./file-upload-policy.js";
 
-// ---------------------------------------------------------------------------
-// Save-time validation
-// ---------------------------------------------------------------------------
-
-/**
- * Validate every integration URL on a FormSettings object before persistence.
- *
- * Rejects non-http(s) schemes, private IPs, cloud-metadata endpoints, and
- * known DNS-rebinding suffixes by routing each URL through `isBlockedToolUrl`.
- * Throws on the first violation so the form-author sees the reason
- * immediately. Defense-in-depth — `fireIntegrations` re-checks at fire time.
- */
 export function assertIntegrationUrlsAllowed(settings: FormSettings): void {
   const list = settings.integrations ?? [];
   for (const integration of list) {
     if (!integration.url) continue;
-    if (isBlockedToolUrl(integration.url)) {
+    if (!isWebhookUrlAllowed(integration.url)) {
       throw new Error(
         `Integration "${integration.name || integration.type}" URL is not allowed (private/internal/non-http(s) URL).`,
       );
@@ -40,29 +33,102 @@ interface SubmissionPayload {
   fields: FormField[];
   data: Record<string, unknown>;
   submittedAt: string;
-  /** Email of the submitter, when known (claimed by the client, not verified). */
   submitterEmail?: string | null;
-  /** Agent chat thread/session ids claimed by the client, when available. */
   chatSessionIds?: string[];
-  /** Active agent run id claimed by the client, when available. */
   activeRunId?: string | null;
-  /** Page URL where the feedback was submitted, when available. */
   pageUrl?: string | null;
+  clientSurface?: string | null;
 }
 
-// ---------------------------------------------------------------------------
-// Format helpers
-// ---------------------------------------------------------------------------
+export interface IntegrationDeliverySnapshot {
+  id: string;
+  type: IntegrationType;
+  name: string;
+  url: string;
+  payload: unknown;
+}
 
-/** Build a flat label→value object from field definitions and submission data */
+function clientSurfaceLabel(surface: string): string {
+  switch (surface) {
+    case "electron":
+      return "Desktop (Electron)";
+    case "tauri":
+      return "Desktop (Tauri)";
+    case "web":
+      return "Web";
+    default:
+      return surface;
+  }
+}
+
+function appLabelFromUrl(pageUrl: string): string | null {
+  try {
+    const { hostname } = new URL(pageUrl);
+    const match = hostname.match(/^([a-z0-9-]+)\.agent-native\.com$/i);
+    const sub = match?.[1];
+    if (!sub || sub === "www") return null;
+    return sub
+      .split("-")
+      .map((part) => (part ? part[0].toUpperCase() + part.slice(1) : part))
+      .join(" ");
+  } catch {
+    return null;
+  }
+}
+
+function pageLabelFromUrl(pageUrl: string): string {
+  let label = pageUrl;
+  try {
+    const url = new URL(pageUrl);
+    label = `${url.hostname}${url.pathname}`.replace(/\/$/, "") || url.hostname;
+  } catch {
+    // fall back to the raw string below
+  }
+  if (label.length > 80) label = `${label.slice(0, 79)}…`;
+  return escapeSlackMrkdwn(label);
+}
+
+function isStoredFileReference(value: unknown): value is FormFileValue {
+  return isFormFileValue(value) && isSafeFormFileUrl(value.url);
+}
+
+function formatIntegrationValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.map(formatIntegrationValue).join(", ");
+  }
+  if (isStoredFileReference(value)) {
+    return `${value.name} (${value.url})`;
+  }
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") {
+    return JSON.stringify(value);
+  }
+  return String(value);
+}
+
+function formatSlackValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.map(formatSlackValue).join(", ");
+  }
+  if (isStoredFileReference(value)) {
+    return `<${escapeSlackMrkdwn(value.url)}|${escapeSlackMrkdwn(value.name)}>`;
+  }
+  return escapeSlackMrkdwn(formatIntegrationValue(value));
+}
+
 function formatFields(
   fields: FormField[],
   data: Record<string, unknown>,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
+  const usedLabels = new Set<string>();
   for (const field of fields) {
     if (data[field.id] !== undefined) {
-      out[field.label] = data[field.id];
+      const label = field.label.trim() || field.id;
+      let key = label;
+      if (usedLabels.has(key)) key = `${label} (${field.id})`;
+      usedLabels.add(key);
+      out[key] = formatIntegrationValue(data[field.id]);
     }
   }
   return out;
@@ -79,27 +145,33 @@ function formatDebugContext(submission: SubmissionPayload): string[] {
     );
   }
   if (submission.activeRunId) {
-    lines.push(`Run: \`${submission.activeRunId}\``);
+    lines.push(`Request ID: \`${submission.activeRunId}\``);
   }
   if (submission.pageUrl) {
-    lines.push(`Page: <${submission.pageUrl}|open>`);
+    const appLabel = appLabelFromUrl(submission.pageUrl);
+    if (appLabel) lines.push(`App: ${appLabel}`);
+    lines.push(
+      `Page: <${submission.pageUrl}|${pageLabelFromUrl(submission.pageUrl)}>`,
+    );
+  }
+  if (submission.clientSurface) {
+    lines.push(`Source: ${clientSurfaceLabel(submission.clientSurface)}`);
   }
   return lines;
 }
 
-/** Slack Block Kit message */
-function buildSlackPayload(submission: SubmissionPayload) {
+export function buildSlackPayload(submission: SubmissionPayload) {
+  const submitterEmail = publicSubmitterEmail(submission.submitterEmail);
   const fieldLines = submission.fields
     .filter((f) => submission.data[f.id] !== undefined)
     .map((f) => {
       const val = submission.data[f.id];
-      const display = Array.isArray(val) ? val.join(", ") : String(val);
-      return `*${f.label}:* ${display}`;
+      return `*${escapeSlackMrkdwn(f.label)}:* ${formatSlackValue(val)}`;
     });
 
   const tsContext = `Submitted <!date^${Math.floor(new Date(submission.submittedAt).getTime() / 1000)}^{date_short_pretty} at {time}|${submission.submittedAt}>`;
-  const contextText = submission.submitterEmail
-    ? `${tsContext} by *${submission.submitterEmail}*`
+  const contextText = submitterEmail
+    ? `${tsContext} by *${submitterEmail}*`
     : tsContext;
   const debugContext = formatDebugContext(submission);
 
@@ -133,19 +205,19 @@ function buildSlackPayload(submission: SubmissionPayload) {
   };
 }
 
-/** Discord webhook embed */
 function buildDiscordPayload(submission: SubmissionPayload) {
+  const submitterEmail = publicSubmitterEmail(submission.submitterEmail);
   const discordFields = submission.fields
     .filter((f) => submission.data[f.id] !== undefined)
     .map((f) => {
       const val = submission.data[f.id];
-      const display = Array.isArray(val) ? val.join(", ") : String(val);
+      const display = formatIntegrationValue(val);
       return { name: f.label, value: display, inline: true };
     });
-  if (submission.submitterEmail) {
+  if (submitterEmail) {
     discordFields.push({
       name: "Submitted by",
-      value: submission.submitterEmail,
+      value: submitterEmail,
       inline: true,
     });
   }
@@ -170,6 +242,13 @@ function buildDiscordPayload(submission: SubmissionPayload) {
       inline: false,
     });
   }
+  if (submission.clientSurface) {
+    discordFields.push({
+      name: "Source",
+      value: clientSurfaceLabel(submission.clientSurface),
+      inline: true,
+    });
+  }
 
   return {
     embeds: [
@@ -183,20 +262,23 @@ function buildDiscordPayload(submission: SubmissionPayload) {
   };
 }
 
-/** Google Sheets (Apps Script web app) — flat key/value pairs */
-function buildGoogleSheetsPayload(submission: SubmissionPayload) {
+export function buildGoogleSheetsPayload(submission: SubmissionPayload) {
   return {
+    event: "form_submission",
+    eventVersion: 1,
+    formId: submission.formId,
     formTitle: submission.formTitle,
+    responseId: submission.responseId,
     submittedAt: submission.submittedAt,
-    submitterEmail: submission.submitterEmail ?? "",
+    submitterEmail: publicSubmitterEmail(submission.submitterEmail) ?? "",
     chatSessionIds: (submission.chatSessionIds ?? []).join(", "),
     activeRunId: submission.activeRunId ?? "",
     pageUrl: submission.pageUrl ?? "",
+    clientSurface: submission.clientSurface ?? "",
     ...formatFields(submission.fields, submission.data),
   };
 }
 
-/** Generic webhook — full structured payload */
 function buildWebhookPayload(submission: SubmissionPayload) {
   return {
     event: "form_submission",
@@ -204,10 +286,11 @@ function buildWebhookPayload(submission: SubmissionPayload) {
     formTitle: submission.formTitle,
     responseId: submission.responseId,
     submittedAt: submission.submittedAt,
-    submitterEmail: submission.submitterEmail ?? null,
+    submitterEmail: publicSubmitterEmail(submission.submitterEmail),
     chatSessionIds: submission.chatSessionIds ?? [],
     activeRunId: submission.activeRunId ?? null,
     pageUrl: submission.pageUrl ?? null,
+    clientSurface: submission.clientSurface ?? null,
     data: formatFields(submission.fields, submission.data),
     rawData: submission.data,
   };
@@ -223,57 +306,110 @@ const payloadBuilders: Record<
   webhook: buildWebhookPayload,
 };
 
-// ---------------------------------------------------------------------------
-// Fire integrations
-// ---------------------------------------------------------------------------
+export function buildIntegrationDeliverySnapshot(
+  integration: FormIntegration,
+  submission: SubmissionPayload,
+): IntegrationDeliverySnapshot {
+  const buildPayload = payloadBuilders[integration.type] ?? buildWebhookPayload;
+  return {
+    id: integration.id,
+    type: integration.type,
+    name: integration.name,
+    url: integration.url,
+    payload: buildPayload(submission),
+  };
+}
 
-/** Fire all enabled integrations for a submission. Never throws. */
+export function buildIntegrationDeliverySnapshots(
+  integrations: FormIntegration[],
+  submission: SubmissionPayload,
+): IntegrationDeliverySnapshot[] {
+  return integrations
+    .filter((integration) => integration.enabled && integration.url)
+    .map((integration) =>
+      buildIntegrationDeliverySnapshot(integration, submission),
+    );
+}
+
+export async function deliverIntegrationDelivery(
+  snapshot: IntegrationDeliverySnapshot,
+  idempotencyKey?: string,
+): Promise<void> {
+  if (!isWebhookUrlAllowed(snapshot.url)) {
+    throw new Error("blocked URL");
+  }
+  const result = await deliverJsonWebhook({
+    url: snapshot.url,
+    payload: snapshot.payload,
+    ...(idempotencyKey
+      ? { headers: { "Idempotency-Key": idempotencyKey } }
+      : {}),
+  });
+  if (result.ok) return;
+  if (result.blocked) throw new Error("blocked URL");
+  throw new Error(
+    result.status
+      ? `destination returned ${result.status}`
+      : "destination request failed",
+  );
+}
+
+export type DeliveryStatus = "pending" | "succeeded" | "failed";
+export type DeliveryStatuses = Record<string, DeliveryStatus>;
+
+export function integrationDeliveryKey(integrationId: string): string {
+  return `integration:${integrationId}`;
+}
+
+interface FireIntegrationsOptions {
+  deliveryStatus?: Readonly<DeliveryStatuses>;
+  onStatusChange?: (
+    destination: string,
+    status: DeliveryStatus,
+  ) => Promise<void> | void;
+}
+
 export async function fireIntegrations(
   integrations: FormIntegration[],
   submission: SubmissionPayload,
-): Promise<void> {
+  options: FireIntegrationsOptions = {},
+): Promise<DeliveryStatuses> {
   const enabled = integrations.filter((i) => i.enabled && i.url);
-  if (enabled.length === 0) return;
+  const statuses: DeliveryStatuses = { ...(options.deliveryStatus ?? {}) };
+  if (enabled.length === 0) return statuses;
 
-  await Promise.allSettled(
+  const results = await Promise.allSettled(
     enabled.map(async (integration) => {
-      // SSRF guard — a form-author can persist any URL in their integration
-      // config. Anonymous submissions then trigger a server-side POST. Block
-      // private IPs, cloud-metadata endpoints, and non-http(s) schemes
-      // before the fetch fires.
-      if (isBlockedToolUrl(integration.url)) {
+      const destination = integrationDeliveryKey(integration.id);
+      if (options.deliveryStatus?.[destination] === "succeeded") return;
+
+      let status: DeliveryStatus = "failed";
+      if (!isWebhookUrlAllowed(integration.url)) {
         console.warn(
           `[integrations] ${integration.type} "${integration.name}" rejected: blocked URL`,
         );
-        return;
-      }
-
-      const buildPayload =
-        payloadBuilders[integration.type] ?? buildWebhookPayload;
-      const payload = buildPayload(submission);
-
-      try {
-        const res = await ssrfSafeToolFetch(
-          integration.url,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-            signal: AbortSignal.timeout(10_000),
-          },
-          { maxRedirects: 3 },
-        );
-        if (!res.ok) {
+      } else {
+        try {
+          await deliverIntegrationDelivery(
+            buildIntegrationDeliverySnapshot(integration, submission),
+          );
+          status = "succeeded";
+        } catch (err) {
           console.warn(
-            `[integrations] ${integration.type} "${integration.name}" returned ${res.status}`,
+            `[integrations] ${integration.type} "${integration.name}" failed:`,
+            err,
           );
         }
-      } catch (err) {
-        console.warn(
-          `[integrations] ${integration.type} "${integration.name}" failed:`,
-          err,
-        );
       }
+
+      statuses[destination] = status;
+      await options.onStatusChange?.(destination, status);
     }),
   );
+
+  const rejected = results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (rejected) throw rejected.reason;
+  return statuses;
 }

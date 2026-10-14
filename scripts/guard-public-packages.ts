@@ -2,24 +2,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { NPM_PUBLISH_PACKAGE_NAMES } from "./public-package-names.ts";
+
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
 );
 
-const npmPublishAllowlist = new Set([
-  "@agent-native/core",
-  "@agent-native/dispatch",
-  "@agent-native/pinpoint",
-  "@agent-native/scheduling",
-  "@agent-native/skills",
-]);
+const npmPublishAllowlist = new Set(NPM_PUBLISH_PACKAGE_NAMES);
 
-// Packages that are NOT published to npm and therefore exempt from the
-// publish-readiness checks below. Apps are private. Workspace-only libraries are
-// consumed through `workspace:` and must stay ignored by changesets until npm
-// trusted publishing is configured for them.
 const workspaceOnlyPackageAllowlist = new Set([
+  "@agent-native/agent-browser-extension",
+  "@agent-native/agent-chrome-extension",
+  "@agent-native/browser-control-extension-core",
   "@agent-native/desktop-app",
   "@agent-native/docs",
   "@agent-native/frame",
@@ -40,6 +35,7 @@ type PackageJson = {
   };
   main?: string;
   types?: string;
+  files?: string[];
   bin?: string | Record<string, string>;
   exports?: unknown;
   scripts?: Record<string, string>;
@@ -66,6 +62,68 @@ function readIgnoredPackages(): Set<string> {
 const ignoredPackages = readIgnoredPackages();
 const packagesDir = path.join(repoRoot, "packages");
 const failures: string[] = [];
+
+const ASSET_IMPORT_RE = /["'](\.{1,2}\/[^"']+)\?(?:raw|url|inline)["']/g;
+
+function listSourceFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === "node_modules") continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...listSourceFiles(full));
+    } else if (
+      /\.tsx?$/.test(entry.name) &&
+      !/\.(spec|test)\.tsx?$/.test(entry.name)
+    ) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+// dist mirrors src depth, so a `?raw` import escaping the shipped `files`
+// resolves inside the monorepo but fails for npm consumers.
+function unpublishedAssetImportFailures(
+  pkgName: string,
+  pkgDir: string,
+  files: string[] | undefined,
+): string[] {
+  const srcDir = path.join(pkgDir, "src");
+  if (!files || !fs.existsSync(srcDir)) return [];
+  const coveredBy = (target: string, entry: string) => {
+    const pattern = entry.replace(/^\.?\//, "").replace(/\/$/, "");
+    return (
+      target === pattern ||
+      target.startsWith(`${pattern}/`) ||
+      path.matchesGlob(target, pattern) ||
+      path.matchesGlob(target, `${pattern}/**`)
+    );
+  };
+  const included = files.filter((entry) => !entry.startsWith("!"));
+  const excluded = files
+    .filter((entry) => entry.startsWith("!"))
+    .map((entry) => entry.slice(1));
+  const result: string[] = [];
+  for (const file of listSourceFiles(srcDir)) {
+    const source = fs.readFileSync(file, "utf8");
+    for (const match of source.matchAll(ASSET_IMPORT_RE)) {
+      const target = path
+        .relative(pkgDir, path.resolve(path.dirname(file), match[1]))
+        .split(path.sep)
+        .join("/");
+      const shipped =
+        included.some((entry) => coveredBy(target, entry)) &&
+        !excluded.some((entry) => coveredBy(target, entry));
+      if (!shipped) {
+        result.push(
+          `${pkgName} ${path.relative(pkgDir, file)} imports ${target}, which is not in package.json "files" and will be missing from the npm tarball`,
+        );
+      }
+    }
+  }
+  return result;
+}
 
 function readWorkspacePackageNames(): Set<string> {
   const names = new Set<string>();
@@ -104,7 +162,7 @@ function dependencyProtocolFailures(
   if (!dependencies) return [];
   return Object.entries(dependencies)
     .filter(([dep, version]) => {
-      if (/^catalog:/.test(version)) return true;
+      if (/^catalog:/.test(version)) return false;
       if (/^workspace:/.test(version)) {
         return !npmPublishAllowlist.has(dep);
       }
@@ -123,13 +181,17 @@ function localWorkspaceDependencyFailures(
 ): string[] {
   if (!dependencies) return [];
   return Object.entries(dependencies)
-    .filter(
-      ([dep, version]) =>
-        workspacePackageNames.has(dep) && version !== "workspace:*",
-    )
+    .filter(([dep, version]) => {
+      if (!workspacePackageNames.has(dep)) return false;
+      if (version === "workspace:*") return false;
+      if (version === "workspace:^" && npmPublishAllowlist.has(dep)) {
+        return false;
+      }
+      return true;
+    })
     .map(
       ([dep, version]) =>
-        `${pkgName} ${field}.${dep} must stay workspace:* in source, not ${version}; pnpm pack rewrites it for npm publishing`,
+        `${pkgName} ${field}.${dep} must stay workspace:* (or workspace:^ for published deps) in source, not ${version}; pnpm pack rewrites it for npm publishing`,
     );
 }
 
@@ -220,6 +282,14 @@ for (const entry of fs.readdirSync(packagesDir, { withFileTypes: true })) {
   ) {
     failures.push(`${pkg.name} exports dist files but has no build script`);
   }
+
+  failures.push(
+    ...unpublishedAssetImportFailures(
+      pkg.name,
+      path.join(packagesDir, entry.name),
+      pkg.files,
+    ),
+  );
 
   failures.push(
     ...dependencyProtocolFailures(pkg.name, "dependencies", pkg.dependencies),

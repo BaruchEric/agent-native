@@ -1,11 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+
 import { agentNativePath } from "../api-path.js";
 import type { McpServerScope } from "./use-mcp-servers.js";
 
 export type BuiltinCapabilityId =
   | "browser-chrome-devtools"
   | "browser-playwright"
-  | "computer-use";
+  | "computer-use"
+  | "screen-memory";
 
 export interface BuiltinCapability {
   id: BuiltinCapabilityId;
@@ -41,14 +43,19 @@ export interface BuiltinCapabilitiesList {
   };
 }
 
-const ENDPOINT = agentNativePath("/_agent-native/mcp/builtin");
+function builtinCapabilitiesEndpoint(): string {
+  return agentNativePath("/_agent-native/mcp/builtin");
+}
+
 export const BUILTIN_CAPABILITIES_KEY = ["mcp-builtin-capabilities"] as const;
 
 export function useBuiltinCapabilities() {
   return useQuery<BuiltinCapabilitiesList>({
     queryKey: BUILTIN_CAPABILITIES_KEY,
     queryFn: async () => {
-      const res = await fetch(ENDPOINT, { credentials: "include" });
+      const res = await fetch(builtinCapabilitiesEndpoint(), {
+        credentials: "include",
+      });
       if (!res.ok) throw new Error(`Failed to load (${res.status})`);
       return (await res.json()) as BuiltinCapabilitiesList;
     },
@@ -64,7 +71,7 @@ export function useToggleBuiltinCapability() {
       scope: McpServerScope;
       enabled: boolean;
     }) => {
-      const res = await fetch(ENDPOINT, {
+      const res = await fetch(builtinCapabilitiesEndpoint(), {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
@@ -80,8 +87,8 @@ export function useToggleBuiltinCapability() {
       return body;
     },
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: BUILTIN_CAPABILITIES_KEY });
-      qc.invalidateQueries({ queryKey: ["mcp-servers"] });
+      void qc.invalidateQueries({ queryKey: BUILTIN_CAPABILITIES_KEY });
+      void qc.invalidateQueries({ queryKey: ["mcp-servers"] });
     },
   });
 }
@@ -102,7 +109,8 @@ export function parseMcpBuiltinVirtualId(
   if (
     capabilityId !== "browser-chrome-devtools" &&
     capabilityId !== "browser-playwright" &&
-    capabilityId !== "computer-use"
+    capabilityId !== "computer-use" &&
+    capabilityId !== "screen-memory"
   ) {
     return null;
   }

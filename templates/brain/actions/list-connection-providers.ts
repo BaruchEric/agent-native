@@ -1,23 +1,33 @@
-import { defineAction } from "@agent-native/core";
-import { getCredentialContext } from "@agent-native/core/server";
+import { defineAction } from "@agent-native/core/action";
 import {
   isProviderApiId,
   listProviderApiCatalog,
 } from "@agent-native/core/provider-api";
+import { getCredentialContext } from "@agent-native/core/server";
+import {
+  findWorkspaceDispatchAgent,
+  getBuiltinAgents,
+} from "@agent-native/core/server/agent-discovery";
+import {
+  getRequestOrgId,
+  getRequestUserEmail,
+} from "@agent-native/core/server/request-context";
+import { accessFilter } from "@agent-native/core/sharing";
 import {
   listWorkspaceConnectionProviderCatalogForApp,
   type WorkspaceConnectionProviderCatalogForApp,
   type WorkspaceConnectionProviderCatalogForAppItem,
   type WorkspaceConnectionProviderAppSummary,
 } from "@agent-native/core/workspace-connections";
-import { accessFilter } from "@agent-native/core/sharing";
 import { and, ne } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import {
   inspectSourceCredentialAvailability,
   type SourceCredentialAvailability,
 } from "../server/lib/source-credentials.js";
+import { isBrainAdmin } from "../server/lib/zoom-governance.js";
 
 const APP_ID = "brain";
 
@@ -27,11 +37,151 @@ const SUPPORTED_SOURCE_PROVIDERS = new Set([
   "slack",
   "granola",
   "github",
+  "zoom",
 ]);
 
-async function credentialHealthForProvider(
-  provider: WorkspaceConnectionProviderCatalogForAppItem,
-): Promise<{
+type CatalogProvider = Omit<
+  WorkspaceConnectionProviderCatalogForAppItem,
+  "id" | "readiness"
+> & {
+  id: string;
+};
+
+// The shared workspace connection catalog has no Zoom provider, so Brain
+// lists it from its own registered secrets. There is no shared connection to
+// grant, which is why the summary is always "not_connected" and the setup link
+// is omitted rather than pointing Dispatch at a provider it does not know.
+const BRAIN_LOCAL_PROVIDERS: readonly Omit<
+  CatalogProvider,
+  "workspaceConnection"
+>[] = [
+  {
+    id: "zoom",
+    label: "Zoom",
+    description:
+      "Cloud-recording meeting transcripts through a Zoom Server-to-Server OAuth app.",
+    credentialKeys: [
+      { key: "ZOOM_ACCOUNT_ID", label: "Zoom Account ID", required: true },
+      { key: "ZOOM_CLIENT_ID", label: "Zoom Client ID", required: true },
+      {
+        key: "ZOOM_CLIENT_SECRET",
+        label: "Zoom Client Secret",
+        required: true,
+      },
+    ],
+    capabilities: ["import", "meetings"],
+    recommendedTemplateUses: ["brain"],
+  },
+];
+
+function brainLocalProvider(
+  provider: (typeof BRAIN_LOCAL_PROVIDERS)[number],
+): CatalogProvider {
+  const workspaceConnection: WorkspaceConnectionProviderAppSummary = {
+    appId: APP_ID,
+    provider: provider.id,
+    grantState: "not_connected",
+    grantAvailability: "not_connected",
+    grantAvailabilityMessage: `${provider.label} has no shared workspace connection; add its keys in Brain Settings > API keys.`,
+    connectionCount: 0,
+    grantedConnectionCount: 0,
+    activeConnectionCount: 0,
+    ungrantedConnectionCount: 0,
+    unhealthyGrantedConnectionCount: 0,
+    explicitGrantCount: 0,
+    credentialRefCount: 0,
+    hasWorkspaceConnection: false,
+    hasGrantedWorkspaceConnection: false,
+    hasActiveWorkspaceConnection: false,
+    lastUsedAt: null,
+    statuses: [],
+    connections: [],
+  };
+  return { ...provider, workspaceConnection };
+}
+
+function providersWithBrainLocal(
+  catalogProviders: readonly WorkspaceConnectionProviderCatalogForAppItem[],
+): CatalogProvider[] {
+  const ids = new Set<string>(catalogProviders.map((provider) => provider.id));
+  return [
+    ...catalogProviders,
+    ...BRAIN_LOCAL_PROVIDERS.filter((provider) => !ids.has(provider.id)).map(
+      brainLocalProvider,
+    ),
+  ];
+}
+
+async function dispatchBaseHref(): Promise<string | undefined> {
+  const workspaceDispatch = await findWorkspaceDispatchAgent();
+  if (workspaceDispatch?.url) return workspaceDispatch.url;
+
+  return getBuiltinAgents(APP_ID).find((agent) => agent.id === "dispatch")?.url;
+}
+
+function dispatchIntegrationsHref(
+  providerId: string,
+  dispatchHref: string | undefined,
+): string | undefined {
+  const params = new URLSearchParams({
+    provider: providerId,
+    appId: APP_ID,
+    returnTo: "ask",
+  });
+  if (!dispatchHref) return undefined;
+  const base = dispatchHref
+    .replace(/\/(?:overview|apps)\/?$/, "")
+    .replace(/\/$/, "");
+  const path = `settings/integrations?${params.toString()}`;
+  try {
+    return new URL(path, `${base}/`).toString();
+  } catch {
+    return `${base}/${path}`;
+  }
+}
+
+function providerApiConfigured({
+  credentialHealth,
+  providerApi,
+  workspace,
+}: {
+  credentialHealth: Awaited<ReturnType<typeof credentialHealthForProvider>>;
+  providerApi: ReturnType<typeof listProviderApiCatalog>[number] | null;
+  workspace: WorkspaceConnectionProviderAppSummary;
+}): boolean | null {
+  if (!providerApi) return null;
+  if (workspace.hasActiveWorkspaceConnection) return true;
+  if (providerApi.auth === "none") return true;
+
+  const availableKeys = new Set(
+    credentialHealth.details
+      .filter((detail) => detail.available)
+      .map((detail) => detail.key),
+  );
+
+  if (providerApi.id === "jira") {
+    return ["JIRA_BASE_URL", "JIRA_USER_EMAIL", "JIRA_API_TOKEN"].every((key) =>
+      availableKeys.has(key),
+    );
+  }
+
+  if (
+    providerApi.auth.startsWith("oauth-bearer:") &&
+    !providerApi.auth.includes("-or-")
+  ) {
+    return false;
+  }
+  if (providerApi.credentialKeys.length === 0) return false;
+  if (
+    providerApi.auth.includes("-or-api-key-header:") ||
+    providerApi.auth.includes("-or-bearer-key:")
+  ) {
+    return providerApi.credentialKeys.some((key) => availableKeys.has(key));
+  }
+  return providerApi.credentialKeys.every((key) => availableKeys.has(key));
+}
+
+async function credentialHealthForProvider(provider: CatalogProvider): Promise<{
   status: "available" | "missing" | "not_required" | "unavailable";
   available: boolean;
   requiredKeyCount: number;
@@ -99,14 +249,48 @@ async function credentialHealthForProvider(
 
 function providerHealthForProvider({
   credentialHealth,
+  providerApi,
+  providerApiIsConfigured,
   sourceProviderSupported,
   workspace,
 }: {
   credentialHealth: Awaited<ReturnType<typeof credentialHealthForProvider>>;
+  providerApi: ReturnType<typeof listProviderApiCatalog>[number] | null;
+  providerApiIsConfigured: boolean | null;
   sourceProviderSupported: boolean;
   workspace: WorkspaceConnectionProviderAppSummary;
 }) {
+  if (providerApi && providerApiIsConfigured === false) {
+    if (workspace.grantState === "needs_grant") {
+      return {
+        status: "needs_grant" as const,
+        message: workspace.grantAvailabilityMessage,
+      };
+    }
+    if (
+      workspace.hasGrantedWorkspaceConnection &&
+      !workspace.hasActiveWorkspaceConnection
+    ) {
+      return {
+        status: "unhealthy" as const,
+        message:
+          "Brain has a grant, but the shared connection needs reauth or repair.",
+      };
+    }
+    return {
+      status: "missing_credentials" as const,
+      message:
+        "Connect this provider before Brain makes an on-demand API request.",
+    };
+  }
   if (!sourceProviderSupported) {
+    if (providerApi) {
+      return {
+        status: "ready" as const,
+        message:
+          "Authenticated provider API access is ready for on-demand Brain queries.",
+      };
+    }
     return {
       status: "unsupported" as const,
       message:
@@ -174,12 +358,12 @@ async function listWorkspaceConnectionsForCatalog(): Promise<{
 
 export default defineAction({
   description:
-    "List reusable connection provider metadata relevant to Brain sources, including workspace connection grants for the Brain app.",
+    "Check reusable Brain source and provider API readiness before using a provider. Each provider reports whether authenticated access is configured and includes an absolute Dispatch setupLink when shared setup is needed. When a requested provider is unavailable, explain the missing connection and return its setupLink instead of attempting provider-api-request; if the user is not a workspace admin, mention that a personal MCP connection may be available in chat.",
   schema: z.object({}),
   http: { method: "GET" },
   readOnly: true,
   run: async () => {
-    const [sourceRows, workspace] = await Promise.all([
+    const [sourceRows, workspace, canManageZoom] = await Promise.all([
       getDb()
         .select({ provider: schema.brainSources.provider })
         .from(schema.brainSources)
@@ -190,14 +374,23 @@ export default defineAction({
           ),
         ),
       listWorkspaceConnectionsForCatalog(),
+      isBrainAdmin(getRequestUserEmail(), getRequestOrgId()),
     ]);
     const sourceCounts = new Map<string, number>();
     for (const row of sourceRows) {
       sourceCounts.set(row.provider, (sourceCounts.get(row.provider) ?? 0) + 1);
     }
 
+    const dispatchHref = await dispatchBaseHref();
+    const catalogProviders = workspace.catalog?.providers ?? [];
+    const catalogProviderIds = new Set<string>(
+      catalogProviders.map((provider) => provider.id),
+    );
+    const visibleProviders = providersWithBrainLocal(catalogProviders).filter(
+      (provider) => canManageZoom || provider.id !== "zoom",
+    );
     const providers = await Promise.all(
-      (workspace.catalog?.providers ?? []).map(async (provider) => {
+      visibleProviders.map(async (provider) => {
         const configuredSourceCount = sourceCounts.get(provider.id) ?? 0;
         const sourceProviderSupported = SUPPORTED_SOURCE_PROVIDERS.has(
           provider.id,
@@ -205,8 +398,13 @@ export default defineAction({
         const workspaceConnection = provider.workspaceConnection;
         const credentialHealth = await credentialHealthForProvider(provider);
         const providerApi = isProviderApiId(provider.id)
-          ? listProviderApiCatalog(provider.id)[0]
+          ? (listProviderApiCatalog(provider.id)[0] ?? null)
           : null;
+        const providerApiIsConfigured = providerApiConfigured({
+          credentialHealth,
+          providerApi,
+          workspace: workspaceConnection,
+        });
         return {
           id: provider.id,
           label: provider.label,
@@ -221,9 +419,17 @@ export default defineAction({
           configuredSourceCount,
           hasConfiguredSources: configuredSourceCount > 0,
           sourceProviderSupported,
+          configured:
+            providerApiIsConfigured ??
+            (sourceProviderSupported ? credentialHealth.available : null),
+          setupLink: catalogProviderIds.has(provider.id)
+            ? dispatchIntegrationsHref(provider.id, dispatchHref)
+            : undefined,
           credentialHealth,
           providerHealth: providerHealthForProvider({
             credentialHealth,
+            providerApi,
+            providerApiIsConfigured,
             sourceProviderSupported,
             workspace: workspaceConnection,
           }),
@@ -256,6 +462,7 @@ export default defineAction({
     return {
       count: providers.length,
       appId: APP_ID,
+      canManageZoom,
       workspaceConnections: {
         appId: APP_ID,
         available: !workspace.error,

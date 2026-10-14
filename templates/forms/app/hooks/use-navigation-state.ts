@@ -1,9 +1,7 @@
-import {
-  appBasePath,
-  markAgentChatHomeHandoff,
-  useAgentRouteState,
-} from "@agent-native/core/client";
-import { useLocation } from "react-router";
+import { appBasePath } from "@agent-native/core/client/api-path";
+import { useAgentRouteState } from "@agent-native/core/client/navigation";
+
+import { isFormsAskPath } from "@/lib/chat-route";
 import {
   formsRoutePath,
   normalizeFormBuilderTab,
@@ -54,8 +52,6 @@ function routerPath(path: string): string {
   const basePath = appBasePath();
   if (!basePath) return path;
   let result = path;
-  // React Router is already scoped to the app basename. Strip mounted URLs so
-  // navigate() receives router-local paths and does not duplicate the prefix.
   for (let i = 0; i < 4; i += 1) {
     if (result === basePath) return "/";
     if (result.startsWith(`${basePath}/`)) {
@@ -75,16 +71,14 @@ function routerPath(path: string): string {
 }
 
 export function useNavigationState() {
-  const location = useLocation();
-
   useAgentRouteState<NavigationState, NavigateCommand>({
     browserTabId: TAB_ID,
     requestSource: TAB_ID,
     getNavigationState: ({ pathname, searchParams }) => {
       const state: NavigationState = { view: "forms" };
 
-      if (pathname === "/") {
-        state.view = "home";
+      if (pathname === "/home" || isFormsAskPath(pathname)) {
+        state.view = "ask";
       } else if (pathname.startsWith("/forms")) {
         const formMatch = pathname.match(/\/forms\/([^/]+)/);
         if (formMatch) {
@@ -108,7 +102,7 @@ export function useNavigationState() {
       } else if (pathname.startsWith("/f/")) {
         state.view = "public-form";
       } else if (pathname.startsWith("/team")) {
-        state.view = "team";
+        state.view = "settings";
       } else if (pathname.startsWith("/extensions")) {
         state.view = "extensions";
       } else if (pathname.startsWith("/form-preview")) {
@@ -120,20 +114,9 @@ export function useNavigationState() {
     getCommandPath: (cmd) => {
       return formsNavigateCommandPath(cmd);
     },
-    refetchInterval: 500,
-    // The agent fires navigate commands mid-response, while chat tokens are
-    // still streaming. React Router wraps navigate() in React.startTransition
-    // by default, and the high-frequency streaming re-renders starve that
-    // transition — so the URL would not change until the stream finished (and
-    // sometimes not at all). Keep command navigation plain and synchronous:
-    // route correctness matters more than the chat morph here, and view
-    // transitions can leave the old home chat visible while the new route loads.
     navigateOptions: { flushSync: true, replace: true },
     onNavigate: (_command, path) => {
       void prewarmFormsRoutePath(path);
-      if (location.pathname === "/" && path !== "/") {
-        markAgentChatHomeHandoff("forms");
-      }
     },
   });
 }

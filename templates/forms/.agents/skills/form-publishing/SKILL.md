@@ -51,7 +51,7 @@ Public form submissions can be protected with Cloudflare Turnstile (opt-in). Thi
 
 ## Branding
 
-Public forms display a "Built with Agent Native" badge by default. This can be configured in the form settings.
+Public forms display a "Built with Agent-Native" badge by default. This can be configured in the form settings.
 
 ## Form Settings
 
@@ -62,7 +62,11 @@ Each form has a `settings` JSON object:
   "submitText": "Submit",
   "successMessage": "Thank you! Your response has been recorded.",
   "redirectUrl": null,
+  "completionMode": "message",
+  "completionRefreshSeconds": 5,
   "showProgressBar": false,
+  "emailOnNewResponses": false,
+  "anonymous": false,
   "integrations": []
 }
 ```
@@ -72,8 +76,25 @@ Each form has a `settings` JSON object:
 | `submitText`       | string  | Custom submit button text                  |
 | `successMessage`   | string  | Message shown after successful submission  |
 | `redirectUrl`      | string  | URL to redirect to after submission        |
+| `completionMode`   | string  | `message`, `redirect`, `message_then_refresh`, or `refresh` |
+| `completionRefreshSeconds` | number | Delay before refreshing for `message_then_refresh` (1–3600) |
 | `showProgressBar`  | boolean | Show progress bar for multi-section forms  |
-| `integrations`     | array   | Webhook/Slack/Discord notification configs |
+| `emailOnNewResponses` | boolean | Email the form owner's account when someone submits a response |
+| `anonymous`        | boolean | Suppress IP, submitter identity, chat/run ids, page URL, and client-surface metadata for every response |
+| `integrations`     | array   | Webhook/Slack/Discord/Google Sheets notification configs |
+
+`emailOnNewResponses` sends through the configured email provider
+(`RESEND_API_KEY` / `SENDGRID_API_KEY`). A submission still succeeds when
+delivery fails, so check server logs when a notification never arrives.
+
+For a genuinely anonymous form, set `anonymous: true` when creating the form.
+Do not describe an ordinary published form as anonymous: published forms accept
+public responses, but only anonymous mode suppresses identifying and source
+metadata.
+
+Unset `completionMode` keeps legacy behavior: forms with a `redirectUrl` redirect
+and all other forms show the success message. A redirect with an invalid URL
+falls back to the success message.
 
 ## Integration Types
 
@@ -82,9 +103,15 @@ Forms can notify external services on submission:
 | Type            | Description                     |
 | --------------- | ------------------------------- |
 | `webhook`       | POST JSON to any URL            |
-| `slack`         | Send to a Slack channel         |
+| `slack`         | Send to a Slack channel through an Incoming Webhook URL |
 | `discord`       | Send to a Discord webhook       |
-| `google-sheets` | Append row to a Google Sheet    |
+| `google-sheets` | Send response JSON to a deployed Apps Script `/exec` URL |
+
+These are outbound form destinations configured in the form builder's
+**Integrations** tab. They are separate from the managed Slack/Messaging
+connection. Google Sheets Apps Script handlers should parse
+`JSON.parse(e.postData.contents)`; a spreadsheet URL or `/dev` URL will not
+receive submissions.
 
 ## Related Skills
 

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+
 import {
   WORKSPACE_CONNECTION_PROVIDERS,
   getWorkspaceConnectionProvider,
@@ -6,6 +7,7 @@ import {
   listWorkspaceConnectionProviders,
   listWorkspaceConnectionProvidersForCapability,
   listWorkspaceConnectionProvidersForTemplate,
+  mergeWorkspaceConnectionProviders,
   workspaceConnectionProviderSupports,
 } from "./catalog.js";
 
@@ -16,14 +18,117 @@ describe("workspace connection provider catalog", () => {
     ).toEqual([
       "slack",
       "github",
+      "figma",
       "notion",
       "gmail",
+      "google_calendar",
+      "bigquery",
       "google_drive",
+      "google_docs",
+      "google_sheets",
+      "google_slides",
       "hubspot",
+      "salesforce",
+      "jira",
+      "sentry",
       "granola",
       "clips",
+      "sigma",
+      "dbt",
+      "anthropic-managed-agents",
       "generic",
     ]);
+  });
+
+  it("publishes least-privilege OAuth metadata for creative context providers", () => {
+    expect(getWorkspaceConnectionProvider("figma")?.oauth).toMatchObject({
+      provider: "figma",
+      refreshUrl: "https://api.figma.com/v1/oauth/token",
+      scopes: expect.arrayContaining([
+        "file_content:read",
+        "file_metadata:read",
+        "projects:read",
+      ]),
+    });
+    expect(
+      getWorkspaceConnectionProvider("google_drive")?.oauth?.scopes,
+    ).toEqual(
+      expect.arrayContaining([
+        "openid",
+        "email",
+        "profile",
+        "https://www.googleapis.com/auth/drive.file",
+      ]),
+    );
+    expect(getWorkspaceConnectionProvider("bigquery")?.oauth?.scopes).toEqual(
+      expect.arrayContaining([
+        "openid",
+        "email",
+        "profile",
+        "https://www.googleapis.com/auth/bigquery",
+      ]),
+    );
+    expect(
+      getWorkspaceConnectionProvider("google_sheets")?.oauth?.scopes,
+    ).toEqual([
+      "openid",
+      "email",
+      "profile",
+      "https://www.googleapis.com/auth/drive.file",
+    ]);
+    expect(
+      getWorkspaceConnectionProvider("google_sheets")?.oauth?.provider,
+    ).toBe("google_sheets");
+    expect(getWorkspaceConnectionProvider("gmail")?.oauth?.scopes).toEqual(
+      expect.arrayContaining([
+        "openid",
+        "email",
+        "profile",
+        "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/contacts.readonly",
+        "https://www.googleapis.com/auth/contacts.other.readonly",
+      ]),
+    );
+    expect(
+      getWorkspaceConnectionProvider("google_calendar")?.oauth?.scopes,
+    ).toEqual(
+      expect.arrayContaining([
+        "openid",
+        "email",
+        "profile",
+        "https://www.googleapis.com/auth/calendar.events",
+      ]),
+    );
+    expect(getWorkspaceConnectionProvider("github")?.oauth).toMatchObject({
+      provider: "github",
+      authorizationUrl: "https://github.com/login/oauth/authorize",
+      scopes: expect.arrayContaining(["repo", "read:user", "user:email"]),
+    });
+    expect(getWorkspaceConnectionProvider("hubspot")?.oauth).toMatchObject({
+      provider: "hubspot",
+      tokenUrl: "https://api.hubapi.com/oauth/v3/token",
+      scopes: expect.arrayContaining([
+        "crm.objects.contacts.read",
+        "crm.objects.deals.read",
+      ]),
+    });
+    expect(getWorkspaceConnectionProvider("salesforce")?.oauth).toMatchObject({
+      provider: "salesforce",
+      authorizationUrl:
+        "https://login.salesforce.com/services/oauth2/authorize",
+      tokenUrl: "https://login.salesforce.com/services/oauth2/token",
+      scopes: expect.arrayContaining(["api", "refresh_token", "id"]),
+    });
+    expect(getWorkspaceConnectionProvider("sentry")?.oauth).toMatchObject({
+      provider: "sentry",
+      tokenUrl: "https://sentry.io/oauth/token/",
+      scopes: expect.arrayContaining(["org:read", "project:read"]),
+    });
+    expect(getWorkspaceConnectionProvider("jira")?.oauth).toMatchObject({
+      authorizationUrl: "https://auth.atlassian.com/authorize",
+      tokenUrl: "https://auth.atlassian.com/oauth/token",
+      scopes: expect.arrayContaining(["read:jira-work", "offline_access"]),
+    });
   });
 
   it("looks up providers and narrows provider ids", () => {
@@ -36,12 +141,70 @@ describe("workspace connection provider catalog", () => {
     });
   });
 
+  it("registers Sigma API credentials as an Analytics workspace connection", () => {
+    expect(getWorkspaceConnectionProvider("sigma")).toMatchObject({
+      id: "sigma",
+      recommendedTemplateUses: ["analytics"],
+      credentialKeys: [
+        { key: "SIGMA_CLIENT_ID", required: true },
+        { key: "SIGMA_CLIENT_SECRET", required: true },
+        { key: "SIGMA_BASE_URL", required: false },
+      ],
+    });
+    expect(
+      listWorkspaceConnectionProvidersForTemplate("analytics").map(
+        (provider) => provider.id,
+      ),
+    ).toContain("sigma");
+    expect(getWorkspaceConnectionProvider("sigma")?.oauth).toBeUndefined();
+  });
+
+  it("registers dbt's token and non-secret Semantic Layer connection settings", () => {
+    expect(getWorkspaceConnectionProvider("dbt")).toMatchObject({
+      id: "dbt",
+      recommendedTemplateUses: ["analytics"],
+      credentialKeys: [{ key: "DBT_SEMANTIC_LAYER_TOKEN", required: false }],
+      configurationFields: [
+        {
+          key: "semanticLayerBaseUrl",
+          required: true,
+        },
+        {
+          key: "semanticLayerEnvironmentId",
+          required: true,
+        },
+      ],
+    });
+    expect(
+      listWorkspaceConnectionProvidersForTemplate("analytics").map(
+        (provider) => provider.id,
+      ),
+    ).toContain("dbt");
+  });
+
+  it("replaces one provider definition without dropping the rest", () => {
+    const slack = getWorkspaceConnectionProvider("slack")!;
+    const merged = mergeWorkspaceConnectionProviders([
+      { ...slack, label: "Acme Slack" },
+    ]);
+
+    expect(merged).toHaveLength(WORKSPACE_CONNECTION_PROVIDERS.length);
+    expect(merged.find(({ id }) => id === "slack")?.label).toBe("Acme Slack");
+    expect(merged.find(({ id }) => id === "github")?.label).toBe("GitHub");
+  });
+
   it("filters providers by template use and capability", () => {
     expect(
       listWorkspaceConnectionProvidersForTemplate("mail").map(
         (provider) => provider.id,
       ),
     ).toEqual(expect.arrayContaining(["gmail", "hubspot"]));
+
+    expect(
+      listWorkspaceConnectionProvidersForTemplate("crm").map(
+        (provider) => provider.id,
+      ),
+    ).toEqual(expect.arrayContaining(["hubspot", "salesforce"]));
 
     expect(
       listWorkspaceConnectionProvidersForCapability("meetings").map(
@@ -54,7 +217,13 @@ describe("workspace connection provider catalog", () => {
         templateUse: "brain",
         capability: "code",
       }).map((provider) => provider.id),
-    ).toEqual(["github"]);
+    ).toEqual(["github", "jira", "anthropic-managed-agents"]);
+
+    expect(
+      listWorkspaceConnectionProvidersForTemplate("factory").map(
+        (provider) => provider.id,
+      ),
+    ).toEqual(expect.arrayContaining(["slack", "github", "sentry"]));
   });
 
   it("checks provider capabilities without exposing credential values", () => {

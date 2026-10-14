@@ -16,13 +16,6 @@
   --wf-ink: var(--plan-text, hsl(var(--foreground)));
   --wf-muted: var(--plan-muted, hsl(var(--muted-foreground)));
   --wf-line: var(--plan-line, hsl(var(--border)));
-  /* Hand-drawn sketch stroke. Separate from --wf-ink (text) so the rough.js
-     overlay can run a touch softer than the body text — most important in dark
-     mode, where near-white text ink as a stroke makes harsh, eye-straining
-     borders. In light mode it matches the ink. */
-  /* Sketch stroke = a soft gray a step more pronounced than the hairline
-     --wf-line, so rough (broken) strokes still read clearly. Gentle, not hard
-     ink; text stays the dark --wf-ink above. */
   --wf-sketch: var(--plan-muted-line, hsl(var(--border)));
   --wf-paper: var(--plan-document, hsl(var(--background)));
   --wf-card: var(--plan-block, hsl(var(--card)));
@@ -100,7 +93,6 @@
   min-width: 0;
 }
 
-/* Bare semantic elements get the wireframe look from tokens. */
 .plan-html-frame:not([data-render-mode="design"]) h1 {
   font-size: 22px;
   font-weight: 700;
@@ -165,9 +157,6 @@
   font: inherit;
   font-weight: 700;
   color: var(--wf-ink);
-  /* Opaque paper fill (not transparent) so a floating / overlapping button —
-     a FAB, a sticky toolbar action like "+ Add habit" — never shows the
-     content behind it through its body. */
   background: var(--wf-paper);
   border: 1.4px solid var(--wf-line);
   border-radius: var(--wf-radius);
@@ -225,6 +214,10 @@
   border-radius: var(--wf-radius);
   padding: 12px;
 }
+.plan-html-frame[data-style="sketchy"]:not([data-render-mode="design"])
+  :is(.wf-card, .wf-box) {
+  border-color: color-mix(in srgb, var(--wf-line) 72%, transparent);
+}
 .plan-html-frame:not([data-render-mode="design"]) .wf-pill,
 .plan-html-frame:not([data-render-mode="design"]) .wf-chip {
   display: inline-flex;
@@ -241,14 +234,18 @@
   background: var(--wf-accent-soft);
 }
 
-/* Once rough has drawn, hide the crisp borders so there's no doubling. Pills
-   keep their rounded crisp border (the rough overlay rounds them too). */
 .plan-html-frame[data-rough-ready]
-  :is(button, input, textarea, select, .wf-card, .wf-box, hr, [data-rough]) {
+  :is(
+    button,
+    input,
+    textarea,
+    select,
+    hr,
+    [data-rough]:not([data-rough="none"])
+  ) {
   border-color: transparent !important;
 }
 
-/* Skeleton register: neutral textless geometry. */
 .plan-html-frame[data-skeleton="true"] {
   --wf-ink: var(--plan-muted-line, hsl(var(--border)));
   --wf-muted: var(--plan-muted-line, hsl(var(--border)));
@@ -256,18 +253,25 @@
   --wf-card: var(--plan-block, hsl(var(--card)));
   --wf-accent: var(--plan-muted-line, hsl(var(--border)));
   --wf-accent-soft: var(--plan-block, hsl(var(--card)));
+  background-image: linear-gradient(
+    100deg,
+    transparent 30%,
+    hsl(var(--foreground) / 0.043) 50%,
+    transparent 70%
+  );
+  background-position: 150% 0;
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.6s linear infinite;
 }
 .plan-html-frame[data-skeleton="true"] * {
   color: transparent !important;
 }
 
-/*
- * Inline architecture/code diagrams.
- *
- * These are document-local HTML/SVG fragments, not top-canvas wireframes. They
- * share the wireframe sketch preference so the same viewer toggle can switch
- * authored diagrams between crisp and hand-drawn presentation.
- */
+@media (prefers-reduced-motion: reduce) {
+  .plan-html-frame[data-skeleton="true"] {
+    animation: none;
+  }
+}
 
 .plan-diagram-shell {
   position: relative;
@@ -279,6 +283,7 @@
   --wf-muted: var(--plan-muted, hsl(var(--muted-foreground)));
   --wf-line: var(--plan-line, hsl(var(--border)));
   --wf-sketch: var(--plan-muted-line, hsl(var(--border)));
+  --wf-diagram-line: var(--wf-line);
   --wf-paper: var(--plan-document, hsl(var(--background)));
   --wf-card: var(--plan-block, hsl(var(--card)));
   --wf-accent: hsl(var(--ring));
@@ -293,7 +298,7 @@
   --wf-font: var(--wf-font-clean);
 
   position: relative;
-  overflow: hidden;
+  overflow: auto;
   width: 100%;
   border: 0;
   border-radius: 10px;
@@ -302,6 +307,24 @@
   font-family: var(--wf-font);
   font-size: 14px;
   line-height: 1.4;
+}
+
+.plan-diagram-frame[data-frame="show"] {
+  border: 1px solid var(--wf-diagram-line);
+  padding: 10px;
+}
+
+.plan-diagram-frame[data-frame="show"][data-rough-ready] {
+  border-color: transparent;
+}
+
+.plan-diagram-frame[data-frame="hide"] {
+  border: 0;
+  background: transparent;
+}
+
+.plan-diagram-frame[data-theme="dark"] {
+  --wf-diagram-line: color-mix(in srgb, var(--wf-sketch) 72%, var(--wf-line));
 }
 
 .plan-diagram-frame[data-style="sketchy"] {
@@ -319,12 +342,15 @@
 .plan-diagram-frame-content {
   width: 100%;
   padding: 8px 0;
+  direction: inherit;
+}
+
+.plan-diagram-frame[data-frame="show"] .plan-diagram-frame-content {
+  padding: 0;
 }
 
 .plan-diagram-frame-content
-  > :is(.diagram-panel, .diagram-card, .diagram-box):not([data-rough]):not(
-    [data-diagram-frame]
-  ) {
+  > .diagram-panel:not([data-rough]):not([data-diagram-frame]) {
   --rough-skip: 1;
   background: transparent;
   border-color: transparent;
@@ -365,7 +391,8 @@
 
 .plan-diagram-frame
   :is(.diagram-panel, .diagram-card, .diagram-node, .diagram-box) {
-  border: 1.25px solid var(--wf-line);
+  --rough-stroke: var(--wf-diagram-line);
+  border: 1.25px solid var(--wf-diagram-line);
   border-radius: var(--wf-radius);
   background: var(--wf-card);
 }
@@ -380,13 +407,51 @@
     [class*="panel"],
     [class*="box"]
   ) {
-  border-color: var(--wf-line) !important;
+  --rough-stroke: var(--wf-diagram-line);
+  border-color: var(--wf-diagram-line) !important;
   background: var(--wf-card) !important;
   color: var(--wf-ink) !important;
 }
 
-.plan-diagram-frame :is(.diagram-node, .diagram-box, .diagram-card) {
+.plan-diagram-frame
+  :is(
+    .diagram-panel,
+    .diagram-card,
+    .diagram-node,
+    .diagram-box,
+    [class*="card"],
+    [class*="panel"],
+    [class*="box"]
+  ) {
   max-width: 100%;
+  overflow-wrap: anywhere !important;
+  word-break: break-word;
+  white-space: normal !important;
+}
+
+.plan-diagram-frame
+  :is(
+    .diagram-panel,
+    .diagram-card,
+    .diagram-node,
+    .diagram-box,
+    [class*="card"],
+    [class*="panel"],
+    [class*="box"]
+  )
+  :is(h1, h2, h3, p, small, strong, span, li) {
+  max-width: 100%;
+  overflow-wrap: anywhere !important;
+  word-break: break-word;
+  white-space: normal !important;
+}
+
+.plan-diagram-frame :is(.diagram-node, .diagram-box, [class*="box"]) {
+  padding: 8px 12px;
+}
+.plan-diagram-frame
+  :is(.diagram-card, .diagram-panel, [class*="card"], [class*="panel"]) {
+  padding: 14px 16px;
 }
 
 .plan-diagram-frame :is(.diagram-node, .diagram-box, .diagram-card) small {
@@ -400,7 +465,8 @@
 
 .plan-diagram-frame
   :is(.diagram-pill, [class*="pill"], [class*="badge"], [class*="chip"]) {
-  border-color: var(--wf-line) !important;
+  --rough-stroke: var(--wf-diagram-line);
+  border-color: var(--wf-diagram-line) !important;
   background: var(--wf-paper) !important;
   color: var(--wf-ink) !important;
 }
@@ -430,17 +496,35 @@
 }
 
 .plan-diagram-frame[data-style="sketchy"] :is(.diagram-node, .diagram-box) {
-  padding-inline: 7px;
+  padding-inline: 12px;
 }
 
-.plan-diagram-frame .diagram-pill {
+.plan-diagram-frame
+  :is(.diagram-pill, [class*="pill"], [class*="badge"], [class*="chip"]) {
   display: inline-flex;
   align-items: center;
-  border: 1px solid var(--wf-line);
+  justify-content: center;
+  flex-wrap: wrap;
+  width: fit-content;
+  max-width: 100%;
+  border: 1px solid var(--wf-diagram-line);
   border-radius: 999px;
-  padding: 2px 8px;
+  padding: 3px 11px;
   color: var(--wf-ink);
   background: var(--wf-paper);
+  overflow-wrap: anywhere !important;
+  text-align: center;
+  white-space: normal !important;
+  word-break: break-word;
+}
+
+.plan-diagram-frame
+  :is(.diagram-pill, [class*="pill"], [class*="badge"], [class*="chip"])
+  > * {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere !important;
+  white-space: normal !important;
 }
 
 .plan-diagram-frame :is(.diagram-accent, .diagram-pill.accent) {
@@ -478,5 +562,15 @@
     [data-rough],
     hr
   ) {
+  border-color: color-mix(
+    in srgb,
+    var(--wf-diagram-line) 54%,
+    transparent
+  ) !important;
+}
+
+.plan-diagram-frame[data-rough-ready]
+  .plan-diagram-frame-content
+  > .diagram-panel:not([data-rough]):not([data-diagram-frame]) {
   border-color: transparent !important;
 }

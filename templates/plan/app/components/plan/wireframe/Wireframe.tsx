@@ -1,3 +1,18 @@
+import { useT } from "@agent-native/core/client/i18n";
+import {
+  sanitizeDiagramHtml,
+  sanitizeWireframeCss,
+  sanitizeWireframeHtml,
+  scopeDesignCss,
+} from "@agent-native/toolkit/app/blocks";
+import type {
+  PlanDiagramBlock,
+  PlanLegacyWireframeBlock,
+  PlanWireframeBlock,
+  PlanWireframeSurface,
+} from "@shared/plan-content";
+import { IconPencil } from "@tabler/icons-react";
+import { useTheme } from "next-themes";
 import {
   type MouseEvent,
   type ReactNode,
@@ -8,16 +23,9 @@ import {
   useRef,
   useState,
 } from "react";
-import { IconPencil } from "@tabler/icons-react";
-import { useTheme } from "next-themes";
+
 import { cn } from "@/lib/utils";
-import type {
-  PlanDiagramBlock,
-  PlanLegacyWireframeBlock,
-  PlanWireframeBlock,
-  PlanWireframeSurface,
-} from "@shared/plan-content";
-import { LegacyRegionWireframe } from "./LegacyRegionWireframe";
+
 import {
   HTML_ROUGH_SELECTOR,
   KitConfigContext,
@@ -25,36 +33,15 @@ import {
   Screen,
   renderNodes,
 } from "./kit";
-import { toggleWireframeStyle, useWireframeStyle } from "./use-wireframe-style";
-import {
-  sanitizeDiagramHtml,
-  sanitizeWireframeCss,
-  sanitizeWireframeHtml,
-  scopeDesignCss,
-} from "./sanitize-html";
+import { LegacyRegionWireframe } from "./LegacyRegionWireframe";
 import {
   RUNTIME_SENTINEL_ATTR,
   mountPrototypeRuntime,
 } from "./prototype-runtime";
+import { toggleWireframeStyle, useWireframeStyle } from "./use-wireframe-style";
 import { renderWireframeIconHtml } from "./wireframe-icons";
-import "./html-artboard.css";
 
-/**
- * Wireframe renderer.
- *
- * PRIMARY PATH — an HTML mockup (`data.html`). The model writes a plain semantic
- * HTML screen; the renderer owns the surface footprint/aspect, the dark/light
- * theme, the hand-drawn font, and the rough.js sketch overlay. Everything is
- * laid out by the model's own (real) HTML/CSS, so there is no geometry to place.
- *
- * KIT PATH — declarative kit tree (`data.screen`). Kept for older plans; the
- * shared kit owns flex layout, fonts, spacing, and the same rough overlay.
- *
- * LEGACY PATH — coordinate region fallback for the oldest imported plans.
- *
- * All three paths share one frame shell (surface-locked aspect, theme, rough
- * overlay, clean-mode crisp frame) via `ArtboardFrame`.
- */
+import "./html-artboard.css";
 
 type SurfacePreset = {
   width: number;
@@ -117,10 +104,12 @@ export function Wireframe({
   selectedDesignElementKey?: string | null;
   onDesignElementSelect?: (selection: DesignElementSelection) => void;
 }) {
+  const showFrame = "frame" in data && data.frame === "hide" ? false : true;
   if (isHtmlData(data)) {
     return (
       <HtmlArtboard
         data={data}
+        showFrame={showFrame}
         compact={compact}
         canvasSize={canvasSize}
         canvasWidth={canvasWidth}
@@ -136,6 +125,7 @@ export function Wireframe({
     return (
       <KitWireframe
         data={data}
+        showFrame={showFrame}
         compact={compact}
         canvasSize={canvasSize}
         canvasWidth={canvasWidth}
@@ -151,10 +141,6 @@ export function Wireframe({
   );
 }
 
-/* -------------------------------------------------------------------------- */
-/* Shared frame shell: surface-locked aspect + theme + rough overlay.         */
-/* -------------------------------------------------------------------------- */
-
 function ArtboardFrame({
   surface,
   compact,
@@ -163,6 +149,7 @@ function ArtboardFrame({
   skeleton,
   renderMode,
   roughOverlay = true,
+  showFrame = true,
   selector,
   caption,
   render,
@@ -174,6 +161,7 @@ function ArtboardFrame({
   skeleton?: boolean;
   renderMode?: "wireframe" | "design";
   roughOverlay?: boolean;
+  showFrame?: boolean;
   selector: string;
   caption?: string;
   render: (ctx: {
@@ -185,7 +173,7 @@ function ArtboardFrame({
   const fitRef = useRef<HTMLDivElement>(null);
   const { resolvedTheme } = useTheme();
   const theme: "light" | "dark" = resolvedTheme === "dark" ? "dark" : "light";
-  const style = useWireframeStyle();
+  const preferredStyle = useWireframeStyle();
   const preset = SURFACE_PRESETS[surface] ?? SURFACE_PRESETS.desktop;
   const height = canvasSize ?? preset.height;
   const width = canvasWidth ?? preset.width;
@@ -193,14 +181,12 @@ function ArtboardFrame({
   const maxFrameWidth = compact ? preset.width * baseScale : width;
   const [fitScale, setFitScale] = useState(baseScale);
   const designMode = renderMode === "design";
+  const style = designMode ? "clean" : preferredStyle;
   const sketchy = !designMode && style === "sketchy" && !skeleton;
   const roughEnabled = sketchy && roughOverlay;
   const paper = designMode
     ? "hsl(var(--background))"
     : "var(--plan-document, hsl(var(--background)))";
-  // Frame border for clean + skeleton modes (sketchy draws its frame via the
-  // rough overlay). Soft, matching --wf-line — not hard ink. Skeleton uses its
-  // own neutral fill so the loader frame still reads as a frame.
   const frameBorder = skeleton
     ? "var(--plan-placeholder-line, var(--plan-line, hsl(var(--border))))"
     : "var(--plan-line, hsl(var(--border)))";
@@ -234,6 +220,7 @@ function ArtboardFrame({
       }}
     >
       <div
+        className="group/wireframe-artboard relative"
         style={{
           width: "100%",
           maxWidth: maxFrameWidth,
@@ -243,7 +230,9 @@ function ArtboardFrame({
       >
         <div
           ref={ref}
-          className="group/wireframe-artboard plan-kit-artboard relative"
+          className="plan-kit-artboard relative"
+          data-rough-scope="wireframe"
+          data-frame={showFrame ? "show" : "hide"}
           style={{
             width,
             height,
@@ -267,7 +256,7 @@ function ArtboardFrame({
               are never cut, and a skeleton frame still reads as a frame). Sketchy
               mode gets its frame from the rough overlay unless the caller needs
               all borders to stay in the normal scrolling DOM. */}
-          {!roughEnabled && (
+          {!roughEnabled && showFrame && (
             <div
               className="pointer-events-none absolute inset-0"
               style={{
@@ -279,11 +268,12 @@ function ArtboardFrame({
           <RoughOverlay
             scopeRef={ref}
             enabled={roughEnabled}
+            drawFrame={showFrame}
             frameRadius={preset.radius}
             selector={selector}
           />
-          {!designMode && !skeleton && <WireframeStyleToggleButton />}
         </div>
+        {!designMode && !skeleton && <WireframeStyleToggleButton />}
       </div>
       {caption && (
         <p className="mt-2 text-center text-xs text-plan-muted">{caption}</p>
@@ -302,13 +292,15 @@ function WireframeStyleToggleButton() {
     <button
       type="button"
       data-plan-interactive
+      data-rough="none"
+      data-wireframe-style-toggle
       aria-label={description}
       title={description}
       onClick={(event) => {
         event.stopPropagation();
         toggleWireframeStyle();
       }}
-      className="absolute right-2 top-2 z-30 inline-flex h-7 items-center gap-1 rounded-md border border-border/60 bg-background/90 px-2 text-xs font-medium text-muted-foreground opacity-0 shadow-sm backdrop-blur transition-[color,opacity] hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring group-hover/wireframe-artboard:opacity-100"
+      className="absolute right-2 top-2 z-30 inline-flex h-7 items-center gap-1 rounded-md border border-border/60 bg-background px-2 text-xs font-medium text-muted-foreground opacity-0 shadow-sm transition-[color,opacity] hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring group-hover/wireframe-artboard:opacity-100"
     >
       <IconPencil className="size-3.5" aria-hidden="true" />
       <span>{label}</span>
@@ -316,12 +308,9 @@ function WireframeStyleToggleButton() {
   );
 }
 
-/* -------------------------------------------------------------------------- */
-/* HTML artboard — model-authored HTML, themed + roughened by the renderer.   */
-/* -------------------------------------------------------------------------- */
-
 function HtmlArtboard({
   data,
+  showFrame,
   compact,
   canvasSize,
   canvasWidth,
@@ -332,6 +321,7 @@ function HtmlArtboard({
   onDesignElementSelect,
 }: {
   data: PlanWireframeBlock["data"];
+  showFrame: boolean;
   compact?: boolean;
   canvasSize?: number;
   canvasWidth?: number;
@@ -341,15 +331,17 @@ function HtmlArtboard({
   selectedDesignElementKey?: string | null;
   onDesignElementSelect?: (selection: DesignElementSelection) => void;
 }) {
-  // Sanitize model-authored HTML at the render point (defense-in-depth against
-  // stored XSS) — see sanitize-html.ts. Memoized so it only re-runs when the
-  // html changes, not on every theme/zoom re-render.
-  const safeHtml = useMemo(
-    () => renderWireframeIconHtml(sanitizeWireframeHtml(data.html)),
-    [data.html],
-  );
   const renderMode = data.renderMode ?? "wireframe";
   const designMode = renderMode === "design";
+  const safeHtml = useMemo(
+    () =>
+      renderWireframeIconHtml(
+        sanitizeWireframeHtml(data.html, {
+          preserveThemeClasses: designMode,
+        }),
+      ),
+    [data.html, designMode],
+  );
   const scopeId = useId().replace(/[^a-zA-Z0-9_-]/g, "");
   const scopeSelector = `[data-plan-design-scope="${scopeId}"]`;
   const scopedCss = useMemo(() => {
@@ -465,14 +457,16 @@ function HtmlArtboard({
       skeleton={data.skeleton}
       renderMode={renderMode}
       roughOverlay={!interactive}
+      showFrame={showFrame}
       selector={HTML_ROUGH_SELECTOR}
       caption={data.caption}
       render={({ theme, style }) => (
         <div
           ref={htmlRef}
-          className="plan-html-frame"
+          className={cn("plan-html-frame", data.skeleton && "skeleton-shimmer")}
           data-theme={theme}
           data-style={style}
+          data-frame={showFrame ? "show" : "hide"}
           data-render-mode={renderMode}
           data-plan-design-scope={scopeId}
           data-skeleton={data.skeleton ? "true" : undefined}
@@ -518,11 +512,13 @@ export function KitWireframePreview({
 
 function KitWireframe({
   data,
+  showFrame = data.frame !== "hide",
   compact,
   canvasSize,
   canvasWidth,
 }: {
   data: PlanWireframeBlock["data"];
+  showFrame?: boolean;
   compact?: boolean;
   canvasSize?: number;
   canvasWidth?: number;
@@ -534,6 +530,8 @@ function KitWireframe({
       canvasSize={canvasSize}
       canvasWidth={canvasWidth}
       skeleton={data.skeleton}
+      renderMode={data.renderMode}
+      showFrame={showFrame}
       selector="[data-rough]"
       caption={data.caption}
       render={({ theme, style }) => (
@@ -560,10 +558,6 @@ function renderKitScreen(
   );
 }
 
-/* -------------------------------------------------------------------------- */
-/* SketchDiagram — document + canvas import it from this module               */
-/* -------------------------------------------------------------------------- */
-
 const DIAGRAM_ROUGH_SELECTOR =
   "[data-rough],.diagram-panel,.diagram-node,.diagram-box,.diagram-pill,.diagram-card,[class*='card'],[class*='box'],[class*='panel'],[class*='pill'],[class*='chip'],[class*='badge'],hr";
 
@@ -574,6 +568,8 @@ export function SketchDiagram({
   data: PlanDiagramBlock["data"];
   compact?: boolean;
 }) {
+  const t = useT();
+  const showFrame = data.frame !== "hide";
   if (data.html?.trim()) {
     return <HtmlDiagram data={data} compact={compact} />;
   }
@@ -585,6 +581,7 @@ export function SketchDiagram({
         data={data}
         compact={compact}
         markerId={markerId}
+        showFrame={showFrame}
       />
     );
   }
@@ -594,12 +591,19 @@ export function SketchDiagram({
   if (nodes.length === 0) {
     return (
       <div className="rounded-[12px] border border-plan-line bg-plan-block p-4 text-sm text-plan-muted">
-        Diagram content is empty.
+        {t("plansPage.wireframe.emptyDiagram")}
       </div>
     );
   }
   return (
-    <div className="plan-sketch rounded-[16px] border border-plan-line bg-plan-wireframe p-5">
+    <div
+      className={cn(
+        "plan-sketch",
+        showFrame
+          ? "rounded-[16px] border border-plan-line bg-plan-wireframe p-5"
+          : "p-0",
+      )}
+    >
       <div
         className={cn(
           "flex gap-3 overflow-x-auto pb-2",
@@ -670,6 +674,7 @@ function HtmlDiagram({
   const { resolvedTheme } = useTheme();
   const theme: "light" | "dark" = resolvedTheme === "dark" ? "dark" : "light";
   const style = useWireframeStyle();
+  const showFrame = data.frame !== "hide";
   const scopeId = useId().replace(/[^a-zA-Z0-9_-]/g, "");
   const scopeSelector = `[data-plan-diagram-scope="${scopeId}"]`;
   const safeHtml = useMemo(() => sanitizeDiagramHtml(data.html), [data.html]);
@@ -687,6 +692,7 @@ function HtmlDiagram({
         className="plan-diagram-frame"
         data-theme={theme}
         data-style={style}
+        data-frame={showFrame ? "show" : "hide"}
         data-plan-diagram-scope={scopeId}
       >
         {scopedCss && <style>{scopedCss}</style>}
@@ -698,7 +704,7 @@ function HtmlDiagram({
       <RoughOverlay
         scopeRef={ref}
         enabled={style === "sketchy"}
-        drawFrame={false}
+        drawFrame={showFrame}
         selector={DIAGRAM_ROUGH_SELECTOR}
       />
       {data.caption && !compact && (
@@ -712,10 +718,12 @@ function PositionedSketchDiagram({
   data,
   compact,
   markerId,
+  showFrame,
 }: {
   data: PlanDiagramBlock["data"];
   compact?: boolean;
   markerId: string;
+  showFrame: boolean;
 }) {
   const nodes = (data.nodes ?? []).map((node) => ({
     ...node,
@@ -729,7 +737,14 @@ function PositionedSketchDiagram({
   const canvasHeight = compact ? 280 : 430;
 
   return (
-    <div className="plan-sketch rounded-[16px] border border-plan-line bg-plan-wireframe p-5">
+    <div
+      className={cn(
+        "plan-sketch",
+        showFrame
+          ? "rounded-[16px] border border-plan-line bg-plan-wireframe p-5"
+          : "p-0",
+      )}
+    >
       <div
         className="relative overflow-hidden rounded-xl border border-plan-line bg-plan-document"
         style={{ minHeight: canvasHeight }}

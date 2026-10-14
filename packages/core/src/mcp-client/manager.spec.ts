@@ -1,13 +1,17 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import * as jose from "jose";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+import {
+  MCP_APP_EXTENSION_ID,
+  MCP_APP_MIME_TYPE,
+  type ActionRunContext,
+} from "../action.js";
+import { runWithRequestContext } from "../server/request-context.js";
 import {
   McpClientManager,
   parseMcpToolName,
   MCP_TOOL_PREFIX,
 } from "./manager.js";
-import { MCP_APP_EXTENSION_ID, MCP_APP_MIME_TYPE } from "../action.js";
-
-// Fake MCP Client + StdioClientTransport. These stand in for the real
-// @modelcontextprotocol/sdk exports via vi.mock below.
 
 type FakeTool = {
   name: string;
@@ -28,9 +32,49 @@ const serverFixtures: Record<
   }
 > = {};
 const fakeClients: FakeClient[] = [];
+const httpCallHeaders: Array<Record<string, string>> = [];
+const originalFetch = globalThis.fetch;
+const originalOrgDirectoryUrl = process.env.AGENT_NATIVE_ORG_DIRECTORY_URL;
+const originalConnectTimeout =
+  process.env.AGENT_NATIVE_MCP_CLIENT_CONNECT_TIMEOUT_MS;
+const FIRST_A2A_SIGNING_TIMEOUT_MS = 15_000;
+const orgContextMocks = vi.hoisted(() => ({
+  getOrgDomain: vi.fn(),
+  getOrgA2ASecret: vi.fn(),
+}));
+
+vi.mock("../org/context.js", () => orgContextMocks);
+
+function decodeJwtPayload(token: string): Record<string, unknown> {
+  const [, payload] = token.split(".");
+  return JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+}
+
+function headersFromUnknown(value: unknown): Record<string, string> {
+  if (!value) return {};
+  if (typeof Headers !== "undefined" && value instanceof Headers) {
+    return Object.fromEntries(value.entries());
+  }
+  if (Array.isArray(value)) {
+    return Object.fromEntries(
+      value
+        .filter((entry) => Array.isArray(entry) && entry.length >= 2)
+        .map(([key, headerValue]) => [String(key), String(headerValue)]),
+    );
+  }
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(
+        ([key, headerValue]) => [key, String(headerValue)],
+      ),
+    );
+  }
+  return {};
+}
 
 class FakeClient {
   onerror?: (error: unknown) => void;
+  negotiatedProtocolVersion?: string;
   private transport: FakeTransport | null = null;
   constructor(
     public info: any,
@@ -40,6 +84,15 @@ class FakeClient {
   }
   async connect(transport: FakeTransport) {
     this.transport = transport;
+    if (transport instanceof FakeHttp) {
+      transport.sessionId = `session-${fakeClients.indexOf(this)}`;
+    }
+  }
+  getTransport() {
+    return this.transport;
+  }
+  getNegotiatedProtocolVersion() {
+    return this.negotiatedProtocolVersion;
   }
   async listTools() {
     const spec = serverFixtures[this.transport!.key];
@@ -48,11 +101,17 @@ class FakeClient {
   async callTool({ name, arguments: args }: { name: string; arguments: any }) {
     const spec = serverFixtures[this.transport!.key];
     if (!spec) throw new Error(`No fixture for ${this.transport!.key}`);
+    if (this.transport instanceof FakeHttp) {
+      await this.transport.recordRequestHeaders();
+    }
     return spec.callImpl(name, args);
   }
   async readResource({ uri }: { uri: string }) {
     const spec = serverFixtures[this.transport!.key];
     if (!spec?.readResourceImpl) throw new Error("resources/read unsupported");
+    if (this.transport instanceof FakeHttp) {
+      await this.transport.recordRequestHeaders();
+    }
     return spec.readResourceImpl(uri);
   }
   async close() {
@@ -75,9 +134,29 @@ class FakeStdio {
 
 class FakeHttp {
   key: string;
+  sessionId?: string;
   onerror?: (error: unknown) => void;
-  constructor(url: URL) {
+  requestInit?: Record<string, unknown>;
+  fetchImpl?: (input: unknown, init?: unknown) => Promise<unknown>;
+  constructor(
+    private url: URL,
+    opts?: {
+      requestInit?: Record<string, unknown>;
+      fetch?: (input: unknown, init?: unknown) => Promise<unknown>;
+    },
+  ) {
     this.key = `http ${url.toString()}`;
+    this.requestInit = opts?.requestInit;
+    this.fetchImpl = opts?.fetch;
+  }
+  async recordRequestHeaders() {
+    if (this.fetchImpl) {
+      await this.fetchImpl(this.url, {
+        headers: this.requestInit?.headers,
+      });
+      return;
+    }
+    httpCallHeaders.push(headersFromUnknown(this.requestInit?.headers));
   }
   closed = false;
   close() {
@@ -85,16 +164,13 @@ class FakeHttp {
   }
 }
 
-vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
+vi.doMock("@modelcontextprotocol/client", () => ({
   Client: FakeClient,
-}));
-
-vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => ({
-  StdioClientTransport: FakeStdio,
-}));
-
-vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
   StreamableHTTPClientTransport: FakeHttp,
+}));
+
+vi.doMock("@modelcontextprotocol/client/stdio", () => ({
+  StdioClientTransport: FakeStdio,
 }));
 
 describe("parseMcpToolName", () => {
@@ -118,6 +194,52 @@ describe("McpClientManager", () => {
   beforeEach(() => {
     for (const k of Object.keys(serverFixtures)) delete serverFixtures[k];
     fakeClients.length = 0;
+    httpCallHeaders.length = 0;
+    orgContextMocks.getOrgDomain.mockReset().mockResolvedValue(null);
+    orgContextMocks.getOrgA2ASecret.mockReset().mockResolvedValue(null);
+    delete process.env.A2A_SECRET;
+    delete process.env.AGENT_NATIVE_MCP_CLIENT_CONNECT_TIMEOUT_MS;
+    process.env.AGENT_NATIVE_ORG_DIRECTORY_URL =
+      "https://directory.example.com";
+    globalThis.fetch = vi.fn(async (_input, init) => {
+      if (String(_input).includes("/_agent-native/org/apps")) {
+        return new Response(
+          JSON.stringify({
+            apps: [
+              {
+                id: "assets",
+                name: "Assets",
+                url: "https://assets.example.com",
+                a2aUrl: "https://assets.example.com",
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      }
+      httpCallHeaders.push(
+        headersFromUnknown((init as { headers?: unknown })?.headers),
+      );
+      return new Response(null, { status: 204 });
+    }) as any;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    if (originalOrgDirectoryUrl === undefined) {
+      delete process.env.AGENT_NATIVE_ORG_DIRECTORY_URL;
+    } else {
+      process.env.AGENT_NATIVE_ORG_DIRECTORY_URL = originalOrgDirectoryUrl;
+    }
+    if (originalConnectTimeout === undefined) {
+      delete process.env.AGENT_NATIVE_MCP_CLIENT_CONNECT_TIMEOUT_MS;
+    } else {
+      process.env.AGENT_NATIVE_MCP_CLIENT_CONNECT_TIMEOUT_MS =
+        originalConnectTimeout;
+    }
   });
 
   it("is disabled when config is null", async () => {
@@ -172,6 +294,9 @@ describe("McpClientManager", () => {
       [MCP_APP_EXTENSION_ID]: {
         mimeTypes: [MCP_APP_MIME_TYPE],
       },
+    });
+    expect(fakeClients[0]?.capabilities.versionNegotiation).toEqual({
+      mode: "auto",
     });
   });
 
@@ -282,6 +407,437 @@ describe("McpClientManager", () => {
     ]);
   });
 
+  it("enforces configured authorization before calling the remote tool", async () => {
+    const callImpl = vi.fn(() => ({
+      content: [{ type: "text", text: "updated" }],
+    }));
+    serverFixtures["secured-bin"] = {
+      tools: [{ name: "mutate" }],
+      callImpl,
+    };
+    let allowed = false;
+    const authorize = vi.fn(async () => allowed);
+    const mgr = new McpClientManager({
+      servers: { secured: { command: "secured-bin" } },
+    });
+    mgr.setToolAuthorizationResolver(() => authorize);
+    await mgr.start();
+    const args = { recordId: "record-1" };
+    const context = {
+      caller: "frontend",
+      userEmail: "owner@example.com",
+      orgId: "org-1",
+    } satisfies ActionRunContext;
+
+    await expect(
+      mgr.callTool("mcp__secured__mutate", args, { context }),
+    ).rejects.toMatchObject({
+      name: "ForbiddenError",
+      statusCode: 403,
+      message: "Not authorized",
+    });
+    expect(authorize).toHaveBeenCalledWith(args, context);
+    expect(callImpl).not.toHaveBeenCalled();
+
+    allowed = true;
+    await expect(
+      mgr.callTool("mcp__secured__mutate", args, { context }),
+    ).resolves.toEqual({ content: [{ type: "text", text: "updated" }] });
+    expect(authorize).toHaveBeenCalledTimes(2);
+    expect(callImpl).toHaveBeenCalledWith("mutate", args);
+  });
+
+  it("keeps a call's own authorization when the manager resolver has no policy", async () => {
+    const callImpl = vi.fn(() => ({ content: [] }));
+    serverFixtures["secured-bin"] = {
+      tools: [{ name: "mutate" }],
+      callImpl,
+    };
+    const mgr = new McpClientManager({
+      servers: { secured: { command: "secured-bin" } },
+    });
+    mgr.setToolAuthorizationResolver(() => undefined);
+    await mgr.start();
+
+    await expect(
+      mgr.callTool(
+        "mcp__secured__mutate",
+        {},
+        { authorize: async () => false },
+      ),
+    ).rejects.toMatchObject({ name: "ForbiddenError", statusCode: 403 });
+    expect(callImpl).not.toHaveBeenCalled();
+  });
+
+  it("does not call a stale server after asynchronous authorization", async () => {
+    const staleCall = vi.fn(() => ({
+      content: [{ type: "text", text: "stale" }],
+    }));
+    const replacementCall = vi.fn(() => ({
+      content: [{ type: "text", text: "replacement" }],
+    }));
+    serverFixtures["stale-bin"] = {
+      tools: [{ name: "mutate" }],
+      callImpl: staleCall,
+    };
+    serverFixtures["replacement-bin"] = {
+      tools: [{ name: "mutate" }],
+      callImpl: replacementCall,
+    };
+    let authorizationStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      authorizationStarted = resolve;
+    });
+    let resolveAuthorization!: (allowed: boolean) => void;
+    const authorize = vi.fn(async () => {
+      authorizationStarted();
+      return new Promise<boolean>((resolve) => {
+        resolveAuthorization = resolve;
+      });
+    });
+    const mgr = new McpClientManager({
+      servers: { secured: { command: "stale-bin" } },
+    });
+    mgr.setToolAuthorizationResolver(() => authorize);
+    await mgr.start();
+
+    const call = mgr.callTool("mcp__secured__mutate", {});
+    await started;
+    await mgr.reconfigure({
+      servers: { secured: { command: "replacement-bin" } },
+    });
+    resolveAuthorization(true);
+
+    await expect(call).rejects.toThrow(
+      'MCP server "secured" changed while authorizing tool "mutate"',
+    );
+    expect(staleCall).not.toHaveBeenCalled();
+    expect(replacementCall).not.toHaveBeenCalled();
+  });
+
+  it("reconnects once and replays concurrent calls after an HTTP session expires", async () => {
+    let calls = 0;
+    serverFixtures["http https://example.com/mcp"] = {
+      tools: [{ name: "ping" }],
+      callImpl: () => {
+        calls += 1;
+        if (calls <= 2) {
+          throw Object.assign(new Error("session expired"), { status: 404 });
+        }
+        return { content: [{ type: "text", text: "pong" }] };
+      },
+    };
+    const mgr = new McpClientManager({
+      servers: { remote: { type: "http", url: "https://example.com/mcp" } },
+    });
+    await mgr.start();
+    const staleTransport = fakeClients[0]!.getTransport() as FakeHttp;
+
+    const results = await Promise.all([
+      mgr.callTool("mcp__remote__ping", {}),
+      mgr.callTool("mcp__remote__ping", {}),
+    ]);
+
+    expect(results).toEqual([
+      { content: [{ type: "text", text: "pong" }] },
+      { content: [{ type: "text", text: "pong" }] },
+    ]);
+    expect(calls).toBe(4);
+    expect(fakeClients).toHaveLength(2);
+    expect(staleTransport.closed).toBe(true);
+  });
+
+  it("waits for pending HTTP calls before closing an expired transport", async () => {
+    let calls = 0;
+    let releaseSecond!: () => void;
+    let secondStarted!: () => void;
+    const secondCallStarted = new Promise<void>((resolve) => {
+      secondStarted = resolve;
+    });
+    serverFixtures["http https://example.com/mcp"] = {
+      tools: [{ name: "ping" }],
+      callImpl: async () => {
+        calls += 1;
+        if (calls === 1) {
+          throw Object.assign(new Error("session expired"), { status: 404 });
+        }
+        if (calls === 2) {
+          await new Promise<void>((resolve) => {
+            releaseSecond = resolve;
+            secondStarted();
+          });
+          if ((fakeClients[0]?.getTransport() as FakeHttp).closed) {
+            throw new Error("request aborted by stale transport close");
+          }
+          throw Object.assign(new Error("session expired"), { status: 404 });
+        }
+        return { content: [{ type: "text", text: "pong" }] };
+      },
+    };
+    const mgr = new McpClientManager({
+      servers: { remote: { type: "http", url: "https://example.com/mcp" } },
+    });
+    await mgr.start();
+    const staleTransport = fakeClients[0]!.getTransport() as FakeHttp;
+
+    const first = mgr.callTool("mcp__remote__ping", {});
+    const second = mgr.callTool("mcp__remote__ping", {});
+    await secondCallStarted;
+    releaseSecond();
+
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { content: [{ type: "text", text: "pong" }] },
+      { content: [{ type: "text", text: "pong" }] },
+    ]);
+    expect(calls).toBe(4);
+    expect(fakeClients).toHaveLength(2);
+    expect(staleTransport.closed).toBe(true);
+  });
+
+  it("reconnects and replays ui resources after an HTTP session expires", async () => {
+    let reads = 0;
+    serverFixtures["http https://example.com/mcp"] = {
+      tools: [{ name: "show" }],
+      callImpl: () => ({ content: [] }),
+      readResourceImpl: (uri) => {
+        reads += 1;
+        if (reads === 1) {
+          throw Object.assign(new Error("session expired"), { status: 404 });
+        }
+        return { contents: [{ uri, text: "<p>hi</p>" }] };
+      },
+    };
+    const mgr = new McpClientManager({
+      servers: { remote: { type: "http", url: "https://example.com/mcp" } },
+    });
+    await mgr.start();
+    const staleTransport = fakeClients[0]!.getTransport() as FakeHttp;
+
+    await expect(
+      mgr.readResource("remote", "ui://remote/show"),
+    ).resolves.toEqual({
+      contents: [{ uri: "ui://remote/show", text: "<p>hi</p>" }],
+    });
+
+    expect(reads).toBe(2);
+    expect(fakeClients).toHaveLength(2);
+    expect(staleTransport.closed).toBe(true);
+  });
+
+  it("re-authorizes a call before replaying it after an HTTP session expires", async () => {
+    let calls = 0;
+    serverFixtures["http https://example.com/mcp"] = {
+      tools: [{ name: "mutate" }],
+      callImpl: () => {
+        calls += 1;
+        if (calls === 1) {
+          throw Object.assign(new Error("session expired"), { status: 404 });
+        }
+        return { content: [{ type: "text", text: "updated" }] };
+      },
+    };
+    const authorize = vi.fn(async () => true);
+    const mgr = new McpClientManager({
+      servers: { remote: { type: "http", url: "https://example.com/mcp" } },
+    });
+    mgr.setToolAuthorizationResolver(() => authorize);
+    await mgr.start();
+
+    await expect(
+      mgr.callTool("mcp__remote__mutate", { recordId: "record-1" }),
+    ).resolves.toEqual({ content: [{ type: "text", text: "updated" }] });
+    expect(authorize).toHaveBeenCalledTimes(2);
+    expect(calls).toBe(2);
+    expect(fakeClients).toHaveLength(2);
+  });
+
+  it("does not replay an expired-session call after authorization is revoked", async () => {
+    let calls = 0;
+    serverFixtures["http https://example.com/mcp"] = {
+      tools: [{ name: "mutate" }],
+      callImpl: () => {
+        calls += 1;
+        throw Object.assign(new Error("session expired"), { status: 404 });
+      },
+    };
+    let allowed = true;
+    const authorize = vi.fn(async () => {
+      const verdict = allowed;
+      allowed = false;
+      return verdict;
+    });
+    const mgr = new McpClientManager({
+      servers: { remote: { type: "http", url: "https://example.com/mcp" } },
+    });
+    mgr.setToolAuthorizationResolver(() => authorize);
+    await mgr.start();
+
+    await expect(
+      mgr.callTool("mcp__remote__mutate", { recordId: "record-1" }),
+    ).rejects.toMatchObject({ name: "ForbiddenError", statusCode: 403 });
+    expect(authorize).toHaveBeenCalledTimes(2);
+    expect(calls).toBe(1);
+  });
+
+  it(
+    "injects per-request identity only for trusted org-scoped first-party HTTP servers",
+    async () => {
+      process.env.A2A_SECRET = "test-a2a-secret";
+      orgContextMocks.getOrgDomain.mockResolvedValue("acme.com");
+      serverFixtures["http https://assets.example.com/_agent-native/mcp"] = {
+        tools: [{ name: "generate-asset" }],
+        callImpl: () => ({ content: [{ type: "text", text: "ok" }] }),
+      };
+      serverFixtures["http https://third-party.example.com/mcp"] = {
+        tools: [{ name: "search" }],
+        callImpl: () => ({ content: [{ type: "text", text: "ok" }] }),
+      };
+      const mgr = new McpClientManager({
+        servers: {
+          "org_org-123_assets": {
+            type: "http",
+            url: "https://assets.example.com/_agent-native/mcp",
+            headers: { Authorization: "Bearer static-service-token" },
+            firstParty: true,
+            firstPartyOrgId: "org-123",
+          },
+          "org_org-123_zapier": {
+            type: "http",
+            url: "https://third-party.example.com/mcp",
+            headers: { Authorization: "Bearer third-party-token" },
+          },
+        },
+      });
+      await mgr.start();
+
+      await runWithRequestContext(
+        { userEmail: "alice@example.com", orgId: "org-123" },
+        async () => {
+          await mgr.callTool("mcp__org_org-123_assets__generate-asset", {});
+          await mgr.callTool("mcp__org_org-123_zapier__search", {});
+        },
+      );
+
+      expect(httpCallHeaders).toHaveLength(2);
+      expect(httpCallHeaders[0].Authorization).toMatch(/^Bearer /);
+      expect(httpCallHeaders[0].Authorization).not.toBe(
+        "Bearer static-service-token",
+      );
+      const firstPartyPayload = decodeJwtPayload(
+        httpCallHeaders[0].Authorization.replace(/^Bearer\s+/i, ""),
+      );
+      expect(firstPartyPayload.sub).toBe("alice@example.com");
+      expect(firstPartyPayload.org_id).toBeUndefined();
+      expect(firstPartyPayload.aud).toBe("https://assets.example.com/mcp");
+      expect(httpCallHeaders[0]["x-agent-native-mcp-inline-apps"]).toBe("1");
+      expect(httpCallHeaders[1].Authorization).toBe("Bearer third-party-token");
+      expect(
+        httpCallHeaders[1]["x-agent-native-mcp-inline-apps"],
+      ).toBeUndefined();
+      const assetsTransport = fakeClients[0]!.getTransport() as FakeHttp;
+      expect(
+        headersFromUnknown(assetsTransport.requestInit?.headers).Authorization,
+      ).toBeUndefined();
+    },
+    FIRST_A2A_SIGNING_TIMEOUT_MS,
+  );
+
+  it("does not mint a first-party identity token when the org domain is unavailable", async () => {
+    process.env.A2A_SECRET = "test-a2a-secret";
+    orgContextMocks.getOrgDomain.mockResolvedValue(null);
+    serverFixtures["http https://assets.example.com/_agent-native/mcp"] = {
+      tools: [{ name: "generate-asset" }],
+      callImpl: () => ({ content: [{ type: "text", text: "ok" }] }),
+    };
+    const mgr = new McpClientManager({
+      servers: {
+        "org_org-no-domain_assets": {
+          type: "http",
+          url: "https://assets.example.com/_agent-native/mcp",
+          headers: { Authorization: "Bearer static-service-token" },
+          firstParty: true,
+          firstPartyOrgId: "org-no-domain",
+        },
+      },
+    });
+    await mgr.start();
+
+    await runWithRequestContext(
+      { userEmail: "alice@example.com", orgId: "org-no-domain" },
+      () => mgr.callTool("mcp__org_org-no-domain_assets__generate-asset", {}),
+    );
+
+    expect(httpCallHeaders[0]?.Authorization).toBeUndefined();
+    expect(httpCallHeaders[0]?.["x-agent-native-mcp-inline-apps"]).toBe("1");
+  });
+
+  it("does not inject identity into user-scoped first-party HTTP servers", async () => {
+    process.env.A2A_SECRET = "test-a2a-secret";
+    serverFixtures["http https://assets.example.com/_agent-native/mcp"] = {
+      tools: [{ name: "generate-asset" }],
+      callImpl: () => ({ content: [{ type: "text", text: "ok" }] }),
+    };
+    const mgr = new McpClientManager({
+      servers: {
+        user_abcdef1234_assets: {
+          type: "http",
+          url: "https://assets.example.com/_agent-native/mcp",
+          headers: { Authorization: "Bearer static-user-token" },
+          firstParty: true,
+        },
+      },
+    });
+    await mgr.start();
+
+    await runWithRequestContext(
+      { userEmail: "alice@example.com", orgId: "org-123" },
+      () => mgr.callTool("mcp__user_abcdef1234_assets__generate-asset", {}),
+    );
+
+    expect(httpCallHeaders[0].Authorization).toBe("Bearer static-user-token");
+  });
+
+  it("mints a first-party org service identity without request context", async () => {
+    process.env.A2A_SECRET = "test-a2a-secret";
+    orgContextMocks.getOrgDomain.mockResolvedValue("builder.io");
+    orgContextMocks.getOrgA2ASecret.mockResolvedValue("org-a2a-secret");
+    serverFixtures["http https://assets.example.com/_agent-native/mcp"] = {
+      tools: [{ name: "generate-asset" }],
+      callImpl: () => ({ content: [{ type: "text", text: "ok" }] }),
+    };
+    const mgr = new McpClientManager({
+      servers: {
+        "org_org-signing-test_assets": {
+          type: "http",
+          url: "https://assets.example.com/_agent-native/mcp",
+          firstParty: true,
+          firstPartyOrgId: "org-signing-test",
+        },
+      },
+    });
+    await mgr.start();
+
+    const assetsTransport = fakeClients[0]!.getTransport() as FakeHttp;
+    await assetsTransport.recordRequestHeaders();
+
+    const authorization = httpCallHeaders[0].Authorization;
+    expect(authorization).toMatch(/^Bearer /);
+    const token = authorization.replace(/^Bearer\s+/i, "");
+    const { payload } = await jose.jwtVerify(
+      token,
+      new TextEncoder().encode("org-a2a-secret"),
+    );
+    await expect(
+      jose.jwtVerify(token, new TextEncoder().encode("test-a2a-secret")),
+    ).rejects.toThrow();
+    expect(payload.sub).toBeUndefined();
+    expect(payload.org_domain).toBe("builder.io");
+    expect(payload.org_id).toBeUndefined();
+    expect(payload.scope).toBe("mcp-connect");
+    expect(payload.agent_native_first_party_mcp).toBe(true);
+    expect(payload.aud).toBe("https://assets.example.com/mcp");
+  });
+
   it("throws a clear error for unknown server prefixes", async () => {
     const mgr = new McpClientManager({
       servers: { a: { command: "a-bin" } },
@@ -304,14 +860,11 @@ describe("McpClientManager", () => {
   });
 
   it("reports errors for servers that fail to connect", async () => {
-    // No fixture for "bad-bin" → listTools returns empty. We simulate a crash
-    // by overriding connect on the fake client for this one run.
     serverFixtures["good-bin"] = {
       tools: [{ name: "ok" }],
       callImpl: () => ({ content: [{ type: "text", text: "ok" }] }),
     };
 
-    // Patch FakeClient.connect to throw for "boom-bin".
     const origConnect = FakeClient.prototype.connect;
     FakeClient.prototype.connect = async function (transport: FakeStdio) {
       if (transport.key === "boom-bin") throw new Error("spawn failed");
@@ -332,6 +885,133 @@ describe("McpClientManager", () => {
       const status = mgr.getStatus();
       expect(status.errors.broken).toContain("spawn failed");
       expect(status.totalTools).toBe(1);
+    } finally {
+      FakeClient.prototype.connect = origConnect;
+    }
+  });
+
+  it("hydrates an initially empty manager through reconfigure", async () => {
+    serverFixtures["late-bin"] = {
+      tools: [{ name: "late_tool" }],
+      callImpl: () => ({ content: [{ type: "text", text: "ok" }] }),
+    };
+    const manager = new McpClientManager(null);
+    const changed = vi.fn();
+    manager.onChange(changed);
+
+    const result = await manager.reconfigure({
+      servers: { late: { command: "late-bin" } },
+    });
+
+    expect(result.added).toEqual(["late"]);
+    expect(manager.connectedServers).toEqual(["late"]);
+    expect(manager.getTools().map((tool) => tool.name)).toEqual([
+      "mcp__late__late_tool",
+    ]);
+    expect(changed).toHaveBeenCalledOnce();
+  });
+
+  it("does not replay an expired request onto a reconfigured server", async () => {
+    serverFixtures["http https://old.example.com/mcp"] = {
+      tools: [{ name: "ping" }],
+      callImpl: () => {
+        throw Object.assign(new Error("session expired"), { status: 404 });
+      },
+    };
+    serverFixtures["http https://new.example.com/mcp"] = {
+      tools: [{ name: "ping" }],
+      callImpl: () => ({ content: [{ type: "text", text: "new" }] }),
+    };
+    const mgr = new McpClientManager({
+      servers: {
+        remote: { type: "http", url: "https://old.example.com/mcp" },
+      },
+    });
+    await mgr.start();
+
+    const request = mgr.callTool("mcp__remote__ping", {});
+    await mgr.reconfigure({
+      servers: {
+        remote: { type: "http", url: "https://new.example.com/mcp" },
+      },
+    });
+
+    await expect(request).rejects.toMatchObject({ status: 404 });
+    expect(fakeClients).toHaveLength(2);
+    expect(mgr.connectedServers).toEqual(["remote"]);
+  });
+
+  it("does not resurrect a manager when stop races session reconnect", async () => {
+    serverFixtures["http https://example.com/mcp"] = {
+      tools: [{ name: "ping" }],
+      callImpl: () => {
+        throw Object.assign(new Error("session expired"), { status: 404 });
+      },
+    };
+    const mgr = new McpClientManager({
+      servers: { remote: { type: "http", url: "https://example.com/mcp" } },
+    });
+    await mgr.start();
+    const staleTransport = fakeClients[0]!.getTransport() as FakeHttp;
+    let releaseClose!: () => void;
+    let closeStarted!: () => void;
+    const closeStartedPromise = new Promise<void>((resolve) => {
+      closeStarted = resolve;
+    });
+    const closeGate = new Promise<void>((resolve) => {
+      releaseClose = resolve;
+    });
+    staleTransport.close = async () => {
+      staleTransport.closed = true;
+      closeStarted();
+      await closeGate;
+    };
+
+    const request = mgr.callTool("mcp__remote__ping", {});
+    await closeStartedPromise;
+    const stop = mgr.stop();
+    releaseClose();
+
+    await Promise.all([stop, request.catch(() => undefined)]);
+    expect(mgr.connectedServers).toEqual([]);
+    expect(mgr.getTools()).toEqual([]);
+  });
+
+  it("retries unchanged servers left in an error state on reconfigure", async () => {
+    serverFixtures["flaky-bin"] = {
+      tools: [{ name: "ok" }],
+      callImpl: () => ({ content: [{ type: "text", text: "ok" }] }),
+    };
+    const origConnect = FakeClient.prototype.connect;
+    let failNextConnect = true;
+    FakeClient.prototype.connect = async function (transport: FakeStdio) {
+      if (transport.key === "flaky-bin" && failNextConnect) {
+        failNextConnect = false;
+        throw new Error("temporary handshake failure");
+      }
+      return origConnect.call(this, transport);
+    };
+
+    try {
+      const config = {
+        servers: {
+          flaky: { command: "flaky-bin" },
+        },
+      };
+      const mgr = new McpClientManager(config);
+      await mgr.start();
+
+      expect(mgr.connectedServers).toEqual([]);
+      expect(mgr.getStatus().errors.flaky).toContain(
+        "temporary handshake failure",
+      );
+
+      const summary = await mgr.reconfigure(config);
+
+      expect(summary.reconnected).toEqual(["flaky"]);
+      expect(summary.unchanged).toEqual([]);
+      expect(mgr.connectedServers).toEqual(["flaky"]);
+      expect(mgr.getStatus().errors).toEqual({});
     } finally {
       FakeClient.prototype.connect = origConnect;
     }
@@ -367,15 +1047,49 @@ describe("McpClientManager", () => {
     }
   });
 
+  it("times out stalled MCP handshakes so startup can continue", async () => {
+    vi.useFakeTimers();
+    process.env.AGENT_NATIVE_MCP_CLIENT_CONNECT_TIMEOUT_MS = "25";
+    const origConnect = FakeClient.prototype.connect;
+    FakeClient.prototype.connect = async function (transport: FakeTransport) {
+      if (transport.key === "http https://stalled.example.com/mcp") {
+        await origConnect.call(this, transport);
+        await new Promise(() => {
+          // Intentionally never resolves.
+        });
+      }
+      return origConnect.call(this, transport);
+    };
+
+    try {
+      serverFixtures["good-bin"] = {
+        tools: [{ name: "ok" }],
+        callImpl: () => ({ content: [] }),
+      };
+      const mgr = new McpClientManager({
+        servers: {
+          stalled: { type: "http", url: "https://stalled.example.com/mcp" },
+          good: { command: "good-bin" },
+        },
+      });
+      const start = mgr.start();
+      await vi.advanceTimersByTimeAsync(25);
+      await start;
+
+      expect(mgr.connectedServers).toEqual(["good"]);
+      expect(mgr.getStatus().errors.stalled).toBe(
+        "Could not reach that MCP server. Check the URL and make sure it is publicly reachable from this app.",
+      );
+      expect(
+        (fakeClients[0]?.getTransport() as FakeHttp | undefined)?.closed,
+      ).toBe(true);
+    } finally {
+      FakeClient.prototype.connect = origConnect;
+      vi.useRealTimers();
+    }
+  });
+
   it("attaches transport.onerror before connect so SDK transport errors don't leak as unhandled rejections", async () => {
-    // The MCP SDK's StreamableHTTPClientTransport has fire-and-forget code
-    // paths (initial SSE stream open, scheduled reconnects) that route
-    // errors through `this.onerror?.(...)`. On AWS Lambda the long-lived
-    // socket gets reaped ~60s after the function returns, surfacing as a
-    // `socket hang up` unhandled rejection — see `processStream()` in
-    // @modelcontextprotocol/sdk/client/streamableHttp.js. The manager must
-    // attach a transport.onerror handler BEFORE client.connect() so those
-    // errors are captured even when Client's wiring hasn't run yet.
     const seenOnError: Array<((error: unknown) => void) | undefined> = [];
     const origConnect = FakeClient.prototype.connect;
     FakeClient.prototype.connect = async function (transport: FakeTransport) {
@@ -398,11 +1112,107 @@ describe("McpClientManager", () => {
       expect(seenOnError).toHaveLength(1);
       expect(typeof seenOnError[0]).toBe("function");
 
-      // Calling the handler with a synthetic socket error must not throw —
-      // the no-op recorder swallows transport errors during connect so the
-      // SDK's `this.onerror?.(error); throw error;` pattern can't fire an
-      // unhandled rejection before Client.connect() wires its own handler.
       expect(() => seenOnError[0]?.(new Error("socket hang up"))).not.toThrow();
+      expect(mgr.getStatus().errors.remote).toBeTruthy();
+      expect(mgr.connectedServers).toEqual([]);
+    } finally {
+      FakeClient.prototype.connect = origConnect;
+    }
+  });
+
+  it("keeps HTTP 400 handshake errors fatal without a negotiated protocol version", async () => {
+    const origConnect = FakeClient.prototype.connect;
+    FakeClient.prototype.connect = async function (transport: FakeTransport) {
+      transport.onerror?.(
+        Object.assign(new Error("Unsupported protocol version"), {
+          status: 400,
+        }),
+      );
+      return origConnect.call(this, transport);
+    };
+
+    try {
+      serverFixtures["http https://example.com/mcp"] = {
+        tools: [{ name: "ping" }],
+        callImpl: () => ({ content: [] }),
+      };
+      const mgr = new McpClientManager({
+        servers: {
+          remote: { type: "http", url: "https://example.com/mcp" },
+        },
+      });
+      await mgr.start();
+
+      expect(mgr.getStatus().errors.remote).toBeTruthy();
+      expect(mgr.connectedServers).toEqual([]);
+    } finally {
+      FakeClient.prototype.connect = origConnect;
+    }
+  });
+
+  it("keeps HTTP servers connected when auto negotiation falls back after a 400 probe", async () => {
+    const origConnect = FakeClient.prototype.connect;
+    FakeClient.prototype.connect = async function (transport: FakeTransport) {
+      this.negotiatedProtocolVersion = "2025-11-25";
+      transport.onerror?.(
+        Object.assign(new Error("Unsupported protocol version"), {
+          status: 400,
+        }),
+      );
+      return origConnect.call(this, transport);
+    };
+
+    try {
+      serverFixtures["http https://example.com/mcp"] = {
+        tools: [{ name: "ping" }],
+        callImpl: () => ({ content: [] }),
+      };
+      const mgr = new McpClientManager({
+        servers: {
+          remote: { type: "http", url: "https://example.com/mcp" },
+        },
+      });
+      await mgr.start();
+
+      expect(mgr.connectedServers).toEqual(["remote"]);
+      expect(mgr.getStatus().errors.remote).toBeUndefined();
+      expect(mgr.getTools().map((tool) => tool.name)).toEqual([
+        "mcp__remote__ping",
+      ]);
+    } finally {
+      FakeClient.prototype.connect = origConnect;
+    }
+  });
+
+  it("keeps later transport failures fatal after a 400 negotiation probe", async () => {
+    const origConnect = FakeClient.prototype.connect;
+    FakeClient.prototype.connect = async function (transport: FakeTransport) {
+      this.negotiatedProtocolVersion = "2025-11-25";
+      transport.onerror?.(
+        Object.assign(new Error("Unsupported protocol version"), {
+          status: 400,
+        }),
+      );
+      transport.onerror?.(
+        Object.assign(new Error("Server unavailable"), { status: 503 }),
+      );
+      return origConnect.call(this, transport);
+    };
+
+    try {
+      serverFixtures["http https://example.com/mcp"] = {
+        tools: [{ name: "ping" }],
+        callImpl: () => ({ content: [] }),
+      };
+      const mgr = new McpClientManager({
+        servers: {
+          remote: { type: "http", url: "https://example.com/mcp" },
+        },
+      });
+      await mgr.start();
+
+      expect(mgr.getStatus().errors.remote).toBeTruthy();
+      expect(mgr.connectedServers).toEqual([]);
     } finally {
       FakeClient.prototype.connect = origConnect;
     }

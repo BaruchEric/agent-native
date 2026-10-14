@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 const packageRoot = path.resolve(
@@ -38,19 +39,47 @@ describe("dispatch Tailwind styles", () => {
       '@import "@agent-native/dispatch/styles/dispatch.css";',
     );
   });
-});
 
-describe("dispatch route shells", () => {
-  it("re-exports the index route redirects from the Dispatch template", () => {
-    const indexRoute = fs.readFileSync(
-      path.join(repoRoot, "templates/dispatch/app/routes/_index.tsx"),
+  it("keeps the full-page composer on the shared wide width contract", () => {
+    const stylesheet = fs.readFileSync(
+      path.join(packageRoot, "src/styles/dispatch.css"),
       "utf-8",
     );
 
-    expect(indexRoute).toContain("loader");
-    expect(indexRoute).toContain("clientLoader");
-    expect(indexRoute).toContain("HydrateFallback");
-    expect(indexRoute).toContain("@agent-native/dispatch/routes/pages/_index");
+    expect(stylesheet).toMatch(
+      /\.dispatch-chat-panel\.agentkit-chat\[data-empty=\\?"true\\?"\]\[data-empty-composer-placement=\\?"center\\?"\][\s\S]*?\.agent-composer-area \{[\s\S]*?max-width: min\(750px, 100%\);/,
+    );
+  });
+
+  it("scopes migrated full-page chat styles to the AgentKit root", () => {
+    const surfaces = [
+      ["templates/analytics/app/global.css", "analytics-chat-panel"],
+      ["templates/assets/app/global.css", "assets-create-chat-panel"],
+      ["templates/brain/app/global.css", "brain-chat-panel"],
+      ["templates/crm/app/global.css", "crm-chat-panel"],
+      ["templates/forms/app/global.css", "forms-ask-chat-panel"],
+    ] as const;
+
+    for (const [file, surfaceClass] of surfaces) {
+      const stylesheet = fs.readFileSync(path.join(repoRoot, file), "utf-8");
+      expect(stylesheet).toContain(
+        `.${surfaceClass}.agentkit-chat[data-empty="true"][data-empty-composer-placement="center"]`,
+      );
+    }
+  });
+});
+
+describe("dispatch route shells", () => {
+  it("re-exports the private home redirect from the Dispatch template", () => {
+    const homeRoute = fs.readFileSync(
+      path.join(repoRoot, "templates/dispatch/app/routes/home.tsx"),
+      "utf-8",
+    );
+
+    expect(homeRoute).toContain("loader");
+    expect(homeRoute).toContain("clientLoader");
+    expect(homeRoute).toContain("HydrateFallback");
+    expect(homeRoute).toContain("@agent-native/dispatch/routes/pages/_index");
   });
 
   it("re-exports the chat route from the Dispatch template", () => {
@@ -60,5 +89,16 @@ describe("dispatch route shells", () => {
     );
 
     expect(chatRoute).toContain("@agent-native/dispatch/routes/pages/chat");
+  });
+
+  it("re-exports the operations console from the Dispatch template", () => {
+    const operationsRoute = fs.readFileSync(
+      path.join(repoRoot, "templates/dispatch/app/routes/operations.tsx"),
+      "utf-8",
+    );
+
+    expect(operationsRoute).toContain(
+      "@agent-native/dispatch/routes/pages/operations",
+    );
   });
 });

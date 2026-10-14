@@ -1,3 +1,5 @@
+import * as PopoverPrimitive from "@radix-ui/react-popover";
+import { IconCheck } from "@tabler/icons-react";
 import {
   useCallback,
   useEffect,
@@ -5,8 +7,6 @@ import {
   useState,
   type FormEvent,
 } from "react";
-import * as PopoverPrimitive from "@radix-ui/react-popover";
-import { IconCheck } from "@tabler/icons-react";
 
 const DEFAULT_FEEDBACK_URL =
   "https://forms.agent-native.com/f/agent-native-feedback/_16ewV";
@@ -190,7 +190,8 @@ export function FeedbackButton({ submitterEmail }: FeedbackButtonProps) {
               value={value}
               onChange={(e) => setValue(e.target.value)}
               onKeyDown={(e) => {
-                if ((e.metaKey || e.ctrlKey) && e.key === "Enter") submit();
+                if ((e.metaKey || e.ctrlKey) && e.key === "Enter")
+                  void submit();
               }}
               placeholder={DEFAULT_PLACEHOLDER}
               rows={5}

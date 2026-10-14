@@ -1,20 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { createPlanUndoStack } from "./usePlanUndoStack";
 import type { PlanBlock } from "@shared/plan-content";
+import { describe, expect, it } from "vitest";
 
-/**
- * Unit contract for the unified plan-editor undo/redo engine.
- *
- * The engine is the single cmd+z authority over the authoritative `blocks[]`
- * tree (PM history is disabled in the plan editor), so it must cover the exact
- * families the verified root-cause analysis found broken:
- *   • block OPTION/CONFIG edits (the headline bug — these never produced a
- *     ProseMirror transaction, so PM history could never see them);
- *   • drag REORDER / cross-region structural moves;
- *   • inline TEXT edits, with Notion-style coalescing so a typing burst is ONE
- *     undo step (and so it never silently no-ops after an autosave reconcile);
- * and that external/agent baseline changes (reset) clear the local stack.
- */
+import { createPlanUndoStack } from "./usePlanUndoStack";
 
 const rich = (id: string, markdown: string): PlanBlock =>
   ({ id, type: "rich-text", data: { markdown } }) as PlanBlock;
@@ -27,11 +14,6 @@ const columns = (
   cols: Array<{ id: string; blocks: PlanBlock[] }>,
 ): PlanBlock => ({ id, type: "columns", data: { columns: cols } }) as PlanBlock;
 
-/**
- * Simulate the plan editor's commit choke point: every user edit records the
- * pre-edit tree then advances `current`. `restore` (undo/redo) writes `current`
- * back — the analog of the real editor's setContent + setBlocks repaint.
- */
 function makeHarness(
   initial: PlanBlock[],
   now: () => number,
@@ -50,9 +32,13 @@ function makeHarness(
     stack.record(current, next);
     current = next;
   };
+  const external = (next: PlanBlock[]) => {
+    current = JSON.parse(JSON.stringify(next)) as PlanBlock[];
+  };
   return {
     stack,
     commit,
+    external,
     get: () => current,
   };
 }
@@ -83,7 +69,7 @@ describe("plan undo stack — block options (the headline bug)", () => {
 
     t = 50;
     h.commit([callout("c1", "risk", "a")]);
-    t = 80; // within the text window, but data edits never coalesce
+    t = 80;
     h.commit([callout("c1", "warning", "a")]);
 
     expect(h.stack.undo()).toBe(true);
@@ -123,7 +109,6 @@ describe("plan undo stack — structural moves", () => {
     ];
     const h = makeHarness(before, () => t);
 
-    // Drag the right block out → column dissolves to two top-level blocks.
     t = 100;
     h.commit([rich("n1", "left"), rich("n2", "right")]);
     expect(h.get().map((b) => b.id)).toEqual(["n1", "n2"]);
@@ -171,7 +156,6 @@ describe("plan undo stack — text coalescing", () => {
     t = 200;
     h.commit([rich("r1", "hel")]);
 
-    // One undo reverts the entire burst back to before it began.
     expect(h.stack.undo()).toBe(true);
     expect((h.get()[0] as { data: { markdown: string } }).data.markdown).toBe(
       "",
@@ -185,7 +169,7 @@ describe("plan undo stack — text coalescing", () => {
 
     t = 0;
     h.commit([rich("r1", "one")]);
-    t = 2000; // > 1000ms window → new boundary
+    t = 2000;
     h.commit([rich("r1", "one two")]);
 
     expect(h.stack.undo()).toBe(true);
@@ -204,7 +188,7 @@ describe("plan undo stack — text coalescing", () => {
 
     t = 0;
     h.commit([rich("r1", "a"), rich("r2", "")]);
-    t = 100; // within window but different block
+    t = 100;
     h.commit([rich("r1", "a"), rich("r2", "b")]);
 
     expect(h.stack.undo()).toBe(true);
@@ -218,12 +202,136 @@ describe("plan undo stack — text coalescing", () => {
   });
 });
 
+describe("plan undo stack — survives external/agent edits", () => {
+  it("undoes the user's own edit normally when nothing external intervened", () => {
+    let t = 0;
+    const h = makeHarness([rich("a", "A"), rich("b", "B")], () => t);
+
+    t = 100;
+    h.commit([rich("a", "A edited"), rich("b", "B")]);
+
+    expect(h.stack.undo()).toBe(true);
+    expect((h.get()[0] as { data: { markdown: string } }).data.markdown).toBe(
+      "A",
+    );
+  });
+
+  it("does NOT wipe the whole stack when an agent edit lands (the core fix)", () => {
+    let t = 0;
+    const h = makeHarness([rich("a", "A"), rich("b", "B")], () => t);
+
+    t = 100;
+    h.commit([rich("a", "A edited"), rich("b", "B")]);
+    t = 2000;
+    h.commit([rich("a", "A edited"), rich("b", "B edited")]);
+
+    t = 3000;
+    h.external([rich("a", "A edited"), rich("b", "B edited"), rich("c", "C")]);
+    expect(h.stack.canUndo()).toBe(true);
+  });
+
+  it("scoped undo: agent edits a DIFFERENT block → user's text undo still works and never clobbers the agent edit", () => {
+    let t = 0;
+    const h = makeHarness([rich("a", "A"), rich("b", "B")], () => t);
+
+    t = 100;
+    h.commit([rich("a", "A edited"), rich("b", "B")]);
+
+    t = 200;
+    h.external([rich("a", "A edited"), rich("b", "B agent")]);
+
+    expect(h.stack.undo()).toBe(true);
+    expect((h.get()[0] as { data: { markdown: string } }).data.markdown).toBe(
+      "A",
+    );
+    expect((h.get()[1] as { data: { markdown: string } }).data.markdown).toBe(
+      "B agent",
+    );
+
+    expect(h.stack.redo()).toBe(true);
+    expect((h.get()[0] as { data: { markdown: string } }).data.markdown).toBe(
+      "A edited",
+    );
+    expect((h.get()[1] as { data: { markdown: string } }).data.markdown).toBe(
+      "B agent",
+    );
+  });
+
+  it("scoped undo survives the target block MOVING (agent structural edit elsewhere)", () => {
+    let t = 0;
+    const h = makeHarness([rich("a", "A"), rich("b", "B")], () => t);
+
+    t = 100;
+    h.commit([rich("a", "A edited"), rich("b", "B")]);
+
+    t = 200;
+    h.external([rich("c", "C"), rich("b", "B"), rich("a", "A edited")]);
+
+    expect(h.stack.undo()).toBe(true);
+    const a = h.get().find((blk) => blk.id === "a") as {
+      data: { markdown: string };
+    };
+    expect(a.data.markdown).toBe("A");
+    expect(h.get().map((blk) => blk.id)).toEqual(["c", "b", "a"]);
+  });
+
+  it("drops a text entry when the agent edited THAT block (no clobber either direction)", () => {
+    let t = 0;
+    const h = makeHarness([rich("a", "A"), rich("b", "B")], () => t);
+
+    t = 100;
+    h.commit([rich("a", "A edited"), rich("b", "B")]);
+
+    t = 200;
+    h.external([rich("a", "A agent"), rich("b", "B")]);
+
+    expect(h.stack.undo()).toBe(false);
+    expect((h.get()[0] as { data: { markdown: string } }).data.markdown).toBe(
+      "A agent",
+    );
+  });
+
+  it("skips a stale top entry and undoes the next entry whose baseline still matches", () => {
+    let t = 0;
+    const h = makeHarness([rich("a", "A"), rich("b", "B")], () => t);
+
+    t = 100;
+    h.commit([rich("a", "A edited"), rich("b", "B")]);
+    t = 2000;
+    h.commit([rich("a", "A edited"), rich("b", "B edited")]);
+
+    t = 3000;
+    h.external([rich("a", "A edited"), rich("b", "B")]);
+
+    expect(h.stack.undo()).toBe(true);
+    expect((h.get()[0] as { data: { markdown: string } }).data.markdown).toBe(
+      "A",
+    );
+    expect(h.stack.undo()).toBe(false);
+  });
+
+  it("skips a redo entry whose baseline was invalidated by an external edit", () => {
+    let t = 0;
+    const h = makeHarness([rich("a", "A"), rich("b", "B")], () => t);
+
+    t = 100;
+    h.commit([rich("a", "A"), rich("b", "B edited")]);
+    expect(h.stack.undo()).toBe(true);
+    expect(h.stack.canRedo()).toBe(true);
+
+    t = 200;
+    h.external([rich("a", "A")]);
+    expect(h.stack.redo()).toBe(false);
+    expect(h.get().map((b) => b.id)).toEqual(["a"]);
+  });
+});
+
 describe("plan undo stack — isolation & invariants", () => {
   it("does not record a no-op commit", () => {
     let t = 0;
     const h = makeHarness([rich("r1", "x")], () => t);
     t = 100;
-    h.commit([rich("r1", "x")]); // identical
+    h.commit([rich("r1", "x")]);
     expect(h.stack.canUndo()).toBe(false);
   });
 
@@ -271,7 +379,6 @@ describe("plan undo stack — isolation & invariants", () => {
       stack.record(current, next);
       current = next;
     }
-    // Only the most recent 3 boundaries survive.
     let count = 0;
     while (stack.undo()) count++;
     expect(count).toBe(3);

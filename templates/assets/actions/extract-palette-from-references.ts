@@ -1,11 +1,13 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
+import { accessFilter } from "@agent-native/core/sharing";
+import { and, eq } from "drizzle-orm";
 import { z } from "zod";
-import { eq } from "drizzle-orm";
-import { assertAccess } from "@agent-native/core/sharing";
+
 import { getDb, schema } from "../server/db/index.js";
 import { extractDominantColors } from "../server/lib/image-processing.js";
-import { getObject } from "../server/lib/storage.js";
 import { nowIso, parseJson, stringifyJson } from "../server/lib/json.js";
+import { assertCanApprove } from "../server/lib/library-access.js";
+import { getObject } from "../server/lib/storage.js";
 import type { StyleBrief } from "../shared/api.js";
 
 export default defineAction({
@@ -15,12 +17,18 @@ export default defineAction({
     libraryId: z.string(),
   }),
   run: async ({ libraryId }) => {
-    await assertAccess("asset-library", libraryId, "editor");
+    await assertCanApprove(libraryId, "Saving a palette");
     const db = getDb();
+    const libraryEditorAccess = accessFilter(
+      schema.assetLibraries,
+      schema.assetLibraryShares,
+      undefined,
+      "editor",
+    );
     const [library] = await db
       .select()
       .from(schema.assetLibraries)
-      .where(eq(schema.assetLibraries.id, libraryId))
+      .where(and(eq(schema.assetLibraries.id, libraryId), libraryEditorAccess))
       .limit(1);
     if (!library) throw new Error("Asset library not found.");
     const assets = await db
@@ -46,7 +54,7 @@ export default defineAction({
     await db
       .update(schema.assetLibraries)
       .set({ styleBrief: stringifyJson(styleBrief), updatedAt: nowIso() })
-      .where(eq(schema.assetLibraries.id, libraryId));
+      .where(and(eq(schema.assetLibraries.id, libraryId), libraryEditorAccess));
     return { libraryId, palette };
   },
 });

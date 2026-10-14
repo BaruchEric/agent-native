@@ -1,11 +1,13 @@
 import { Node } from "@tiptap/core";
 import { ReactNodeViewRenderer } from "@tiptap/react";
 import { defaultMarkdownSerializer } from "prosemirror-markdown";
+
 import { VideoBlock } from "./VideoBlock";
 
 export interface ContentVideoOptions {
   HTMLAttributes: Record<string, unknown>;
   documentId?: string;
+  canMutateMedia?: () => boolean;
   onVideoComment?: (quotedText: string, offsetTop: number) => void;
 }
 
@@ -59,6 +61,7 @@ export const VideoNode = Node.create<ContentVideoOptions>({
     return {
       HTMLAttributes: {},
       documentId: undefined,
+      canMutateMedia: undefined,
       onVideoComment: undefined,
     };
   },
@@ -111,6 +114,16 @@ export const VideoNode = Node.create<ContentVideoOptions>({
       uploadId: {
         default: null,
         parseHTML: () => null,
+        renderHTML: () => ({}),
+      },
+      sourcePanelOpen: {
+        default: false,
+        parseHTML: () => false,
+        renderHTML: () => ({}),
+      },
+      sourceTab: {
+        default: "upload",
+        parseHTML: () => "upload",
         renderHTML: () => ({}),
       },
     };

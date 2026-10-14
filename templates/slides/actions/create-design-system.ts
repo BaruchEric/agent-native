@@ -1,12 +1,15 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { nanoid } from "nanoid";
-import { eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
+import { defineAction } from "@agent-native/core/action";
 import {
   getRequestUserEmail,
   getRequestOrgId,
 } from "@agent-native/core/server/request-context";
+import { and, eq, isNull } from "drizzle-orm";
+import { nanoid } from "nanoid";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
+import { assertDesignSystemWorkflowsEnabled } from "../server/lib/design-system-workflows.js";
+import { missingDesignSystemDataFields } from "../shared/design-system-validation.js";
 
 export default defineAction({
   description:
@@ -35,11 +38,19 @@ export default defineAction({
       ),
   }),
   run: async ({ title, description, data, assets, customInstructions }) => {
-    // Validate that data is valid JSON
+    await assertDesignSystemWorkflowsEnabled();
+    let parsedData: unknown;
     try {
-      JSON.parse(data);
+      parsedData = JSON.parse(data);
     } catch {
       throw new Error("data must be a valid JSON string");
+    }
+    const missingFields = missingDesignSystemDataFields(parsedData);
+    if (missingFields.length > 0) {
+      throw new Error(
+        "data is missing required design system field(s): " +
+          missingFields.join(", "),
+      );
     }
     if (assets) {
       try {
@@ -56,12 +67,20 @@ export default defineAction({
     if (!ownerEmail) throw new Error("no authenticated user");
     const orgId = getRequestOrgId();
 
-    // Check only this user's owned systems. Shared systems should not prevent
-    // the first system a user creates from becoming their default.
     const existing = await db
       .select({ id: schema.designSystems.id })
       .from(schema.designSystems)
-      .where(eq(schema.designSystems.ownerEmail, ownerEmail))
+      .where(
+        orgId
+          ? and(
+              eq(schema.designSystems.ownerEmail, ownerEmail),
+              eq(schema.designSystems.orgId, orgId),
+            )
+          : and(
+              eq(schema.designSystems.ownerEmail, ownerEmail),
+              isNull(schema.designSystems.orgId),
+            ),
+      )
       .limit(1);
 
     const isDefault = existing.length === 0;
@@ -76,6 +95,7 @@ export default defineAction({
       isDefault,
       ownerEmail,
       orgId,
+      visibility: orgId ? "org" : "private",
       createdAt: now,
       updatedAt: now,
     });

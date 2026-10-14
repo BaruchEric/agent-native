@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import {
   accessFilter,
   currentAccess,
@@ -16,6 +16,7 @@ import {
   sql,
 } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 
 export default defineAction({
@@ -37,11 +38,6 @@ export default defineAction({
   http: { method: "GET" },
   run: async (args) => {
     const db = getDb();
-    // Explicit projection: the list view only needs lightweight metadata.
-    // The heavy `fields` / `settings` JSON blobs are intentionally NOT
-    // selected here — they can be large and are only required when opening a
-    // single form (`get-form`). Keeping them out of the list query avoids
-    // pulling (and JSON.parsing) every form's full schema on every list load.
     const rows = await db
       .select({
         id: schema.forms.id,
@@ -67,8 +63,6 @@ export default defineAction({
       )
       .orderBy(desc(schema.forms.updatedAt));
 
-    // Per-form effective role for the current user. Used by the UI to hide
-    // controls viewers shouldn't see (Delete, Duplicate, Publish, etc.).
     const { userEmail, orgId } = currentAccess();
     const formIds = rows.map((r) => r.id);
     const countsPromise =

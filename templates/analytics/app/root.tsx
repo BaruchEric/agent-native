@@ -1,23 +1,40 @@
-import { Links, Meta, Outlet, Scripts, ScrollRestoration } from "react-router";
-import { useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
-import { Toaster } from "@/components/ui/toaster";
-import { Toaster as Sonner } from "@/components/ui/sonner";
+import { configureTracking } from "@agent-native/core/client/analytics";
+import { appPath } from "@agent-native/core/client/api-path";
 import {
-  AppProviders,
-  appPath,
+  callAction,
   createAgentNativeQueryClient,
-  getThemeInitScript,
   useDbSync,
-} from "@agent-native/core/client";
+} from "@agent-native/core/client/hooks";
+import { getLocaleInitScript } from "@agent-native/core/client/i18n";
+import { getThemeInitScript } from "@agent-native/core/client/ui";
+import { AppProviders } from "@agent-native/toolkit/app/providers";
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import {
+  Links,
+  Meta,
+  Outlet,
+  Scripts,
+  ScrollRestoration,
+  useLocation,
+} from "react-router";
+import type { LinksFunction } from "react-router";
+
 import { AuthProvider } from "@/components/auth/AuthProvider";
 import { ProviderCorpusJobNotifier } from "@/components/ProviderCorpusJobNotifier";
+import "@/lib/register-analysis-result-renderer";
+import { Toaster as Sonner } from "@/components/ui/sonner";
+import { Toaster } from "@/components/ui/toaster";
+import { AppToolkitProvider } from "@/components/ui/toolkit-provider";
+import { notifyProviderCorpusJobSyncEvent } from "@/lib/provider-corpus-job-sync";
+import { TAB_ID } from "@/lib/tab-id";
+
 import { CommandPalette } from "./components/layout/CommandPalette";
 import { Layout as AppLayout } from "./components/layout/Layout";
-import type { LinksFunction } from "react-router";
+import { i18nCatalog } from "./i18n";
+import { isReplayFrameRequest } from "./pages/sessions/session-replay-frame";
+
 import stylesheet from "./global.css?url";
-import { TAB_ID } from "@/lib/tab-id";
-import { configureTracking } from "@agent-native/core/client";
 configureTracking({
   getDefaultProps: (_name, properties) => ({
     ...properties,
@@ -30,6 +47,7 @@ export const links: LinksFunction = () => [
 ];
 
 const THEME_INIT_SCRIPT = getThemeInitScript("dark", true);
+const LOCALE_INIT_SCRIPT = getLocaleInitScript();
 
 export function Layout({ children }: { children: React.ReactNode }) {
   return (
@@ -44,7 +62,11 @@ export function Layout({ children }: { children: React.ReactNode }) {
           suppressHydrationWarning
           dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }}
         />
-        <link rel="manifest" href={appPath("/manifest.json")} />
+        <script
+          data-agent-native-locale-init
+          suppressHydrationWarning
+          dangerouslySetInnerHTML={{ __html: LOCALE_INIT_SCRIPT }}
+        />
         <meta name="theme-color" content="#F59E0B" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta
@@ -67,35 +89,99 @@ export function Layout({ children }: { children: React.ReactNode }) {
 }
 
 function DbSyncBridge() {
-  // Invalidate react-query caches on DB changes (agent edits, other tabs,
-  // cron jobs). The hook invalidates every active query on any non-own
-  // change event, so we no longer need to enumerate dashboard / analysis
-  // / explorer keys here. Screen-refresh is handled automatically inside
-  // AgentSidebar.
   const queryClient = useQueryClient();
-  useDbSync({ queryClient, ignoreSource: TAB_ID });
+  useDbSync({
+    queryClient,
+    ignoreSource: TAB_ID,
+    onEvent: notifyProviderCorpusJobSyncEvent,
+    actionInvalidatePredicate: shouldInvalidateAnalyticsQueryForAction,
+    suppressActionInvalidationFor: [
+      "ensure-demo-dashboards",
+      "manage-agent-engine",
+    ],
+  });
+  return null;
+}
+
+export function shouldInvalidateAnalyticsQueryForAction(query: {
+  queryKey: readonly unknown[];
+}): boolean {
+  const [scope, name] = query.queryKey;
+  if (
+    (scope === "data" && name === "sql-dashboard") ||
+    scope === "sql-chart" ||
+    scope === "sql-dashboards-sidebar" ||
+    scope === "analyses-sidebar" ||
+    scope === "extensions"
+  ) {
+    return false;
+  }
+  if (scope === "action" && name === "provider-corpus-jobs") return false;
+  return true;
+}
+
+function DemoDashboardInstaller() {
+  useEffect(() => {
+    void callAction("ensure-demo-dashboards", {}).catch((err) => {
+      console.warn("[analytics] demo dashboard install failed", err);
+    });
+  }, []);
+
   return null;
 }
 
 export default function Root() {
   const [queryClient] = useState(() => createAgentNativeQueryClient());
-  return (
-    // defaultTheme="dark": analytics defaults to dark mode if no stored preference.
-    // toaster={null}: suppress AppProviders' built-in sonner; analytics renders
-    // both its styled Sonner and the legacy shadcn Toaster explicitly below.
-    <AppProviders queryClient={queryClient} defaultTheme="dark" toaster={null}>
-      <DbSyncBridge />
-      <Toaster />
-      <Sonner position="bottom-left" />
-      <AuthProvider>
-        <ProviderCorpusJobNotifier />
-        <CommandPalette />
-        <AppLayout>
+  const location = useLocation();
+
+  const isPublicStatusPath =
+    location.pathname === "/status" || location.pathname.startsWith("/status/");
+  // Frame mode renders one replay for a headless browser holding a signed,
+  // recording-scoped agent link: no session, no app chrome.
+  const isReplayFramePath = isReplayFrameRequest(
+    location.pathname,
+    location.search,
+  );
+
+  if (isPublicStatusPath || isReplayFramePath) {
+    return (
+      <AppToolkitProvider>
+        <AppProviders
+          queryClient={queryClient}
+          isPublicPath
+          defaultTheme="dark"
+          toaster={null}
+          i18n={{ catalog: i18nCatalog }}
+        >
           <Outlet />
-        </AppLayout>
-      </AuthProvider>
-    </AppProviders>
+        </AppProviders>
+      </AppToolkitProvider>
+    );
+  }
+
+  return (
+    <AppToolkitProvider>
+      <AppProviders
+        queryClient={queryClient}
+        skeletonLayout="assistant"
+        defaultTheme="dark"
+        toaster={null}
+        i18n={{ catalog: i18nCatalog }}
+      >
+        <DbSyncBridge />
+        <Toaster />
+        <Sonner position="bottom-left" />
+        <AuthProvider>
+          <DemoDashboardInstaller />
+          <ProviderCorpusJobNotifier />
+          <CommandPalette />
+          <AppLayout>
+            <Outlet />
+          </AppLayout>
+        </AuthProvider>
+      </AppProviders>
+    </AppToolkitProvider>
   );
 }
 
-export { ErrorBoundary } from "@agent-native/core/client";
+export { ErrorBoundary } from "@agent-native/toolkit/app/shared";

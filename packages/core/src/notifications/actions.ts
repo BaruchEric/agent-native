@@ -1,11 +1,3 @@
-/**
- * Framework-level agent actions for the notifications primitive.
- *
- * Registered as native tools (not template actions) so they're available in
- * every template. Consolidated into a single `manage-notifications` tool with
- * an `action` parameter that dispatches to the correct implementation.
- */
-
 import type { ActionEntry } from "../agent/production-agent.js";
 import { notify, listNotifications, countUnread } from "./registry.js";
 import type { NotificationSeverity } from "./types.js";
@@ -76,6 +68,11 @@ export function createNotificationToolEntries(
           },
           required: ["action"],
         },
+      },
+      planMode: {
+        effect: (args) => (args.action === "list" ? "read" : "write"),
+        allowedValues: { action: ["list"] },
+        description: "Plan mode allows listing notifications.",
       },
       run: async (args: Record<string, unknown>) => {
         const owner = getCurrentUser();

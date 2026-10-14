@@ -4,23 +4,31 @@ export type DataSourceType =
   | "amplitude"
   | "first-party"
   | "demo"
-  | "prometheus";
+  | "prometheus"
+  | "program";
 
-export type ChartType =
-  | "line"
-  | "area"
-  | "bar"
-  | "metric"
-  | "table"
-  | "pie"
-  | "section"
-  | "heatmap"
-  | "callout";
+export const PANEL_CHART_TYPES = [
+  "line",
+  "area",
+  "bar",
+  "combo",
+  "metric",
+  "table",
+  "pie",
+  "section",
+  "funnel",
+  "heatmap",
+  "callout",
+  "extension",
+] as const;
+
+export type ChartType = (typeof PANEL_CHART_TYPES)[number];
 
 export type FilterType =
   | "date"
   | "date-range"
   | "select"
+  | "multi-select"
   | "toggle"
   | "text"
   | "toggle-date";
@@ -53,32 +61,55 @@ export interface TableColumnConfig {
   format?: ColumnFormat;
   linkKey?: string;
   hidden?: boolean;
+  width?: number;
 }
 
 export interface PivotConfig {
   xKey: string;
   seriesKey: string;
   valueKey: string;
+  /** Series values drawn first, in this order; unlisted series follow. */
+  seriesOrder?: string[];
 }
 
+export type DashboardTimeScope =
+  | "dashboard"
+  | "fixed-window"
+  | "cohort-history"
+  | "all-time";
+
 export interface SqlPanelConfig {
+  timeScope?: DashboardTimeScope;
   xKey?: string;
   yKey?: string;
   yKeys?: string[];
   color?: string;
   colors?: string[];
   yFormatter?: "number" | "currency" | "percent";
+  rightYKeys?: string[];
+  rightYFormatter?: "number" | "currency" | "percent";
+  barKeys?: string[];
+  seriesLabels?: Record<string, string>;
   description?: string;
   pivot?: PivotConfig;
-  /** Stack bar/area series on top of each other instead of side-by-side / overlapping. */
   stacked?: boolean;
-  /** Show the chart legend. Defaults to true for chart renderers. */
   legend?: boolean;
-  /** Optional display labels for exact metric values, e.g. {"0":"normal"}. */
   valueLabels?: Record<string, string>;
   sortable?: boolean;
   columns?: TableColumnConfig[];
   limit?: number;
+  extensionId?: string;
+  extensionSlotId?: string;
+  customBlock?: {
+    authoredBy: "agent" | "user";
+    intent: "one-off";
+    scope: "dashboard";
+    nativeGapReason:
+      | "custom-visualization"
+      | "custom-interaction"
+      | "custom-layout"
+      | "other";
+  };
 }
 
 export interface SqlPanel {
@@ -87,34 +118,24 @@ export interface SqlPanel {
   sql: string;
   source: DataSourceType;
   chartType: ChartType;
-  /**
-   * How many grid columns this panel spans. Defaults to 1. The renderer
-   * clamps to the active section's column count, so a `width: 4` panel in a
-   * 2-column section still spans the full row. Sections always span every
-   * column regardless of this value.
-   */
   width: number;
-  /**
-   * Section panels only: number of columns the panels following this section
-   * (until the next section) should be laid out in. Falls back to the
-   * dashboard-level `columns`, then to 2.
-   */
   columns?: number;
   config?: SqlPanelConfig;
-  /**
-   * Optional tab assignment. When any panel in a dashboard declares a `tab`,
-   * the dashboard renders a tab strip and shows only panels matching the
-   * selected tab. Tabs are derived from the distinct `tab` values across
-   * panels in declaration order. Use "Group / Tab" to render grouped primary
-   * and secondary tabs without changing the storage model. Section panels can
-   * also carry a tab to group their header under the right tab.
-   */
   tab?: string;
+}
+
+export interface DashboardCertification {
+  status: "certified";
+  certifiedAt: string;
+  certifiedBy: string;
+  certifiedForUpdatedAt: string;
 }
 
 export interface SqlDashboardConfig {
   name: string;
   description?: string;
+  certification?: DashboardCertification;
+  parentId?: string;
   catalog?: {
     templateId?: string;
     templateVersion?: string;
@@ -127,21 +148,10 @@ export interface SqlDashboardConfig {
   };
   filters?: DashboardFilter[];
   variables?: Record<string, string>;
-  /**
-   * Default column count for panels that appear before any section. Sections
-   * can override this via their own `columns`. Always 1 column when the
-   * available content width is below the `md` threshold (the grid uses a
-   * container query, so it stacks when the agent sidebar narrows the pane —
-   * not only at narrow viewports). Defaults to 2.
-   */
   columns?: number;
   panels: SqlPanel[];
 }
 
-/**
- * Lower / upper bounds for the per-section column count. Keep in sync with
- * the validators in `actions/update-dashboard.ts`.
- */
 export const MIN_DASHBOARD_COLUMNS = 1;
 export const MAX_DASHBOARD_COLUMNS = 6;
 export const DEFAULT_DASHBOARD_COLUMNS = 2;

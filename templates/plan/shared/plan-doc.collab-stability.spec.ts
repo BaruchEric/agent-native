@@ -3,49 +3,47 @@
 /**
  * Collab-stability properties for the plan doc ↔ blocks[] serializer.
  *
- * These tests document and verify the properties that must hold for single-doc
- * Yjs collab to be safely re-enabled in `PlanDocumentEditor`.
+ * These tests verify the SERIALIZATION properties that must hold for single-doc
+ * Yjs collab in `PlanDocumentEditor`. Single-doc collab is now ENABLED
+ * (`SINGLE_DOC_COLLAB_ENABLED = true`); this suite remains the regression guard
+ * for the serialization layer it depends on.
  *
- * ROOT CAUSE DIAGNOSIS (2026-06):
+ * ROOT CAUSE DIAGNOSIS (2026-06) AND RESOLUTION:
  *   The pure `blocks[] → doc JSON → blocks[]` round-trip IS byte-stable —
  *   the existing `plan-doc.roundtrip.spec.ts` suite confirms this. The
- *   instability documented in `PlanDocumentEditor.tsx` (SINGLE_DOC_COLLAB_ENABLED
- *   = false) is NOT in the pure serialization layer.
+ *   instability that kept collab off was NOT in the pure serialization layer:
  *
- *   The actual instability, when single-doc Yjs collab is enabled, is:
- *
- *   1. FULL-FRAGMENT REWRITE: `editor.commands.setContent(newDoc)` when the
- *      Collaboration extension is active routes through y-prosemirror, which
- *      replaces the ENTIRE `Y.XmlFragment` rather than patching individual
- *      changed nodes. Every `planBlock` ReactNodeView (`Tiptap ReactRenderer`)
- *      is torn down and recreated; each `ReactRenderer` constructor calls
- *      `flushSync`, and that call fires inside a React render lifecycle,
- *      producing "flushSync called from inside a lifecycle method" warnings at
- *      a rate proportional to the autosave frequency × the number of structured
+ *   1. FULL-FRAGMENT REWRITE (the original problem): `editor.commands
+ *      .setContent(newDoc)` when the Collaboration extension is active routes
+ *      through y-prosemirror, which replaces the ENTIRE `Y.XmlFragment` rather
+ *      than patching individual changed nodes. Every `planBlock` ReactNodeView
+ *      (`Tiptap ReactRenderer`) is torn down and recreated; each `ReactRenderer`
+ *      constructor calls `flushSync`, firing inside a React render lifecycle and
+ *      producing "flushSync called from inside a lifecycle method" warnings at a
+ *      rate proportional to the autosave frequency × the number of structured
  *      blocks.
  *
- *   2. WHY `normalizeValue` IS NOT ENOUGH: The `normalizeValue` guard in
+ *   2. WHY `normalizeValue` WAS NOT ENOUGH: The `normalizeValue` guard in
  *      `useCollabReconcile` prevents UNNECESSARY `setContent` calls (those where
  *      the serialized content is already equivalent). But the initial seed and
- *      any external agent/peer edit still require a `setContent` call, which
- *      triggers the full-fragment rewrite described above.
+ *      any external agent/peer edit still require an apply, which — via the old
+ *      whole-document `setContent` — triggered the full-fragment rewrite above.
  *
- *   3. WHAT IS NEEDED TO RE-ENABLE COLLAB (requires `packages/core` change):
- *      The `setContent` path in `useCollabReconcile` must be replaced with a
- *      surgical Yjs transaction when collab is active: compare the incoming
- *      `blocks[]` against the live doc block-by-block and apply only the
- *      changed runs / atoms via targeted `tr.replaceWith(from, to, newNode)`
- *      calls, so unchanged `planBlock` NodeViews are never torn down.
- *      This change must live in `packages/core/src/client/rich-markdown-editor/
- *      useCollabReconcile.ts` because the surgical path requires access to the
- *      Yjs `Y.XmlFragment` and the Collaboration extension's encoding layer.
- *      Specifically, one of:
- *        Option A: Add a `setContentSurgical` hook to `UseCollabReconcileOptions`
- *          so the plan can supply a targeted transaction per changed block range,
- *          applied via the ProseMirror `tr.replaceWith(from, to, fragment)` API.
- *        Option B: Make `useCollabReconcile` diff the old vs new doc JSON and emit
- *          targeted Yjs step operations (insert/delete at specific positions) instead
- *          of replacing the whole `Y.XmlFragment`.
+ *   3. HOW COLLAB WAS RE-ENABLED (no `packages/core` change needed): The plan's
+ *      injected `setContent` (in `PlanDocumentEditor.tsx`) now applies external
+ *      edits SURGICALLY via `applyBlocksSurgically` → `applyDocSurgically`
+ *      (exported from `@agent-native/core/client/editor`). It parses the
+ *      authoritative `blocks[]` into a doc built with the LIVE editor's schema
+ *      (`editor.schema.nodeFromJSON(blocksToProseJSON(blocks))`), diffs it
+ *      top-level against the live doc, and dispatches ONE
+ *      `tr.replaceWith(from, to, changed)` for the changed run — so unchanged
+ *      `planBlock` NodeViews are never torn down and, under Collaboration, Yjs
+ *      sees a minimal edit instead of a full `Y.XmlFragment` rewrite. Because the
+ *      plan's serializer has no tiptap-markdown storage parser, the reconcile's
+ *      own `defaultParseValue` returns null and every external apply routes
+ *      through the plan's `setContent`, so the surgical path lives entirely in
+ *      template code. See `PlanDocumentEditor.surgical.spec.ts` for the direct
+ *      NodeView-identity regression test.
  *
  * SERIALIZATION STABILITY (no Yjs, pure data layer):
  *   The `normalizeValue` function used by `PlanDocumentEditor` runs:
@@ -62,10 +60,10 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { blocksToProseJSON, proseJSONToBlocks } from "./plan-doc";
-import type { PlanBlock } from "./plan-content";
 
-/** Mirrors the `normalizeValue` closure in `PlanDocumentEditor`. */
+import type { PlanBlock } from "./plan-content";
+import { blocksToProseJSON, proseJSONToBlocks } from "./plan-doc";
+
 function normalizeValue(input: string): string {
   try {
     const parsed = JSON.parse(input) as PlanBlock[];
@@ -75,14 +73,6 @@ function normalizeValue(input: string): string {
   }
 }
 
-/**
- * Simulates `getMarkdown(editor)` at steady state — what the live plan editor
- * emits after a `setContent(blocksToProseJSON(blocks))` followed by no further
- * user edits. In the live editor, `getMarkdown` is
- * `proseJSONToBlocks(editor.getJSON(), blocksRef.current)`. At steady state
- * (right after seeding, before any edit), `editor.getJSON()` equals what
- * `blocksToProseJSON` produced — so this pure-function simulation is accurate.
- */
 function simulateGetMarkdownAtSteadyState(blocks: PlanBlock[]): string {
   return JSON.stringify(proseJSONToBlocks(blocksToProseJSON(blocks), blocks));
 }
@@ -158,21 +148,6 @@ describe("plan-doc collab-stability: normalizeValue is a fixed point", () => {
 });
 
 describe("plan-doc collab-stability: autosave echo recognition property", () => {
-  /**
-   * The most critical property for the reconcile's echo guard:
-   *
-   * `normalizeValue(getMarkdown_result)` must equal `getMarkdown_result` so
-   * the reconcile's `recentEmittedRef` ring hit (which stores `getMarkdown`
-   * output) also catches the `normalizedValue` path:
-   *   `recentEmittedRef.current.includes(normalizedValue)`
-   *
-   * In the live non-collab editor, at steady state:
-   *   - `getMarkdown(editor)` produces `S`
-   *   - autosave records `S` in the ring
-   *   - autosave saves these blocks to SQL; SQL returns them as `content.blocks`
-   *   - `value = JSON.stringify(content.blocks)` — same or normalizeValue-equivalent
-   *   - `normalizeValue(value)` must equal `S` so the ring catches it
-   */
   it("normalizeValue(simulateGetMarkdown(blocks)) === simulateGetMarkdown(blocks) at steady state", () => {
     const blocks: PlanBlock[] = [
       {
@@ -200,8 +175,6 @@ describe("plan-doc collab-stability: autosave echo recognition property", () => 
   });
 
   it("structured block IDs are preserved through normalizeValue (ring key stability)", () => {
-    // Block IDs in the normalized form must match what getMarkdown emits, so the
-    // reconcile's ring comparison works for structured + prose mixed content.
     const blocks: PlanBlock[] = [
       {
         id: "rt-a",
@@ -226,10 +199,6 @@ describe("plan-doc collab-stability: autosave echo recognition property", () => 
   });
 
   it("adjacent rich-text blocks merge in normalizeValue (ring key preserves first block ID)", () => {
-    // Two adjacent rich-text blocks are normalized into ONE in the first pass
-    // (the serializer design: contiguous prose = one run). The merged block keeps
-    // the first block's id, so ring comparisons for ANY value that started with
-    // those two adjacent blocks will use the first id.
     const blocks: PlanBlock[] = [
       {
         id: "rt-first",
@@ -244,30 +213,15 @@ describe("plan-doc collab-stability: autosave echo recognition property", () => 
     ];
     const normalized = normalizeValue(JSON.stringify(blocks));
     const parsed = JSON.parse(normalized) as PlanBlock[];
-    // After normalization the two adjacent prose blocks merge to one.
     expect(parsed).toHaveLength(1);
     expect(parsed[0].id).toBe("rt-first");
-    // And that merged form is a fixed point.
     const reNormalized = normalizeValue(normalized);
     expect(reNormalized).toBe(normalized);
   });
 });
 
-describe("plan-doc collab-stability: documented preconditions for single-doc Yjs collab", () => {
-  /**
-   * Documents the remaining gap that keeps `SINGLE_DOC_COLLAB_ENABLED = false`.
-   *
-   * PRECONDITION MET: pure serialization stability (these tests).
-   * PRECONDITION NOT YET MET: surgical Yjs apply path (needs packages/core change).
-   *
-   * The presence of this test file documents the exact gap. When the
-   * packages/core surgical-apply change lands, flip the flag and these tests
-   * continue to serve as regression guard for the serialization layer.
-   */
-  it("serialization is a necessary but not sufficient precondition for safe Yjs collab (documents the gap)", () => {
-    // This test asserts the NECESSARY precondition: the pure serialization is stable.
-    // The SUFFICIENT precondition (surgical Yjs apply, not tested here because it
-    // requires a live editor + Yjs) is documented in the file-level comment above.
+describe("plan-doc collab-stability: preconditions for single-doc Yjs collab", () => {
+  it("serialization is a necessary precondition for safe Yjs collab (regression guard)", () => {
     const blocks: PlanBlock[] = [
       {
         id: "rt-1",
@@ -287,12 +241,9 @@ describe("plan-doc collab-stability: documented preconditions for single-doc Yjs
     const value = JSON.stringify(blocks);
     const canonical = normalizeValue(value);
     const recanonical = normalizeValue(canonical);
-    // Fixed-point check: once canonical, always canonical.
     expect(recanonical).toBe(canonical);
-    // All block IDs survive normalization.
     const parsed = JSON.parse(canonical) as PlanBlock[];
     expect(parsed.map((b) => b.id)).toEqual(["rt-1", "wireframe-1"]);
-    // The simulated getMarkdown output is already in canonical form.
     const emitted = simulateGetMarkdownAtSteadyState(
       JSON.parse(canonical) as PlanBlock[],
     );

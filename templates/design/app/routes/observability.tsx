@@ -1,7 +1,9 @@
-import { ObservabilityDashboard } from "@agent-native/core/client";
+import { ObservabilityDashboard } from "@agent-native/toolkit/app/observability";
+
+import enUSMessages from "@/i18n/en-US";
 
 export function meta() {
-  return [{ title: "Agent Observability" }];
+  return [{ title: enUSMessages.routeTitles.agentObservability }];
 }
 
 export default function ObservabilityPage() {

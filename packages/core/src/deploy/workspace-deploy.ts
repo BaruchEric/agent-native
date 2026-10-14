@@ -1,26 +1,40 @@
-/**
- * `agent-native deploy` — build and deploy every app in a workspace to a
- * single origin. Each app is served from `/<app-name>/*`, so:
- *
- *   https://your-agents.com/mail/*       → apps/mail
- *   https://your-agents.com/calendar/*   → apps/calendar
- *
- * Benefits of same-origin deploy:
- *   - Shared auth cookie → log in once, every app is signed in
- *   - Cross-app A2A is a same-origin fetch (no CORS, no JWT for siblings)
- *   - One DNS record, one TLS cert, one CDN cache
- *
- * Per-app independent deploy is still supported — just cd into the app and
- * run `agent-native build` as before. This orchestrator is for teams that
- * want the whole workspace behind one domain.
- */
-import { execFileSync } from "child_process";
+import { execFileSync, spawn } from "child_process";
 import fs from "fs";
+import os from "os";
 import path from "path";
+
+import {
+  AGENT_BACKGROUND_PROCESSOR_A2A,
+  AGENT_BACKGROUND_PROCESSOR_AGENT_TEAM,
+  AGENT_BACKGROUND_PROCESSOR_FIELD,
+  AGENT_BACKGROUND_PROCESSOR_INTEGRATION,
+  AGENT_BACKGROUND_PROCESSOR_ROUTE,
+  AGENT_BACKGROUND_PROCESSOR_ROUTE_FIELD,
+  AGENT_CHAT_PROCESS_RUN_PATH,
+  AGENT_TEAM_PROCESS_RUN_PATH,
+  isDurableBackgroundFlagExplicitlyDisabled,
+} from "../agent/durable-background.js";
+import { getAppConfig } from "../app-config/index.js";
+import type { AgentNativeWorkspaceRootPage } from "../config.js";
+import {
+  INTEGRATION_RECOVERY_RUNTIME_MARKER,
+  INTEGRATION_RETRY_SWEEP_PATH,
+  INTEGRATION_RETRY_SWEEP_TOKEN_SUBJECT,
+  isIntegrationDurableDispatchConfigured,
+} from "../integrations/integration-durable-dispatch-config.js";
+import {
+  RECURRING_JOBS_SWEEP_PATH,
+  RECURRING_JOBS_SWEEP_TOKEN_SUBJECT,
+} from "../jobs/scheduler-dispatch.js";
 import { findWorkspaceRoot } from "../scripts/utils.js";
-import { DISPATCH_WORKSPACE_ROOT_REDIRECTS } from "../shared/workspace-app-id.js";
+import {
+  BUILTIN_AGENTS_ENV_KEY,
+  workspaceBuiltinAgentsJson,
+} from "../server/builtin-agents.js";
+import { normalizeFrameworkRoutePrefix } from "../shared/framework-route-prefix.js";
 import {
   DEFAULT_WORKSPACE_APP_AUDIENCE,
+  normalizeWorkspaceAppHomePath,
   normalizeWorkspaceAppAudience,
   normalizeWorkspaceAppPathList,
   workspaceAppAudienceFromPackageJson,
@@ -29,13 +43,56 @@ import {
   type WorkspaceAppAudience,
 } from "../shared/workspace-app-audience.js";
 import {
+  DISPATCH_WORKSPACE_ROOT_REDIRECTS,
+  isValidWorkspaceAppIdFormat,
+} from "../shared/workspace-app-id.js";
+import {
+  createAgentNativeConfigContext,
+  loadResolvedAgentNativeConfig,
+} from "../vite/agent-native-config-loader.js";
+import {
+  inferWorkspaceAppRootHomePath,
+  readConfiguredWorkspaceAppHomePath,
+} from "../workspace-app-config.js";
+import {
+  assertEmittedBackgroundFunctionOnDisk,
+  isRecurringJobsDeployEnabled,
+  readVercelSweepCron,
+} from "./build.js";
+import {
+  cloneServerBundleForFunction,
+  pruneSsrIslandFromRewritingClone,
+} from "./function-bundle.js";
+import {
   collectImmutableAssetPaths,
   IMMUTABLE_ASSET_CACHE_HEADERS,
 } from "./immutable-assets.js";
 
-export type WorkspaceDeployPreset = "cloudflare_pages" | "netlify" | "vercel";
+function workspaceFrameworkRoutePrefixEnv(): string {
+  return (
+    process.env.AGENT_NATIVE_CONFIG_RUNTIME_FRAMEWORK_ROUTE_PREFIX?.trim() || ""
+  );
+}
+
+function workspaceFrameworkRoutePrefixEnvSnippet(): string {
+  const frameworkRoutePrefix = workspaceFrameworkRoutePrefixEnv();
+  return frameworkRoutePrefix
+    ? `  processRef.env.AGENT_NATIVE_CONFIG_RUNTIME_FRAMEWORK_ROUTE_PREFIX = ${JSON.stringify(frameworkRoutePrefix)};\n`
+    : "  delete processRef.env.AGENT_NATIVE_CONFIG_RUNTIME_FRAMEWORK_ROUTE_PREFIX;\n";
+}
+
+function workspaceFrameworkRoutePrefix(): string {
+  return normalizeFrameworkRoutePrefix(
+    workspaceFrameworkRoutePrefixEnv() || undefined,
+    "AGENT_NATIVE_CONFIG_RUNTIME_FRAMEWORK_ROUTE_PREFIX",
+  );
+}
+
+export type WorkspaceDeployPreset = "netlify" | "vercel";
 
 const NETLIFY_WORKSPACE_STATIC_DIR = "_workspace_static";
+const DEFAULT_HOSTED_FEEDBACK_URL =
+  "https://forms.agent-native.com/f/agent-native-feedback/_16ewV";
 const NETLIFY_PUBLIC_ASSET_EXTENSIONS = new Set([
   "avif",
   "css",
@@ -60,6 +117,7 @@ const NETLIFY_PUBLIC_ASSET_EXTENSIONS = new Set([
 const WORKSPACE_APPS_ENV_KEY = "AGENT_NATIVE_WORKSPACE_APPS_JSON";
 const WORKSPACE_APPS_MANIFEST_DIR = ".agent-native";
 const WORKSPACE_APPS_MANIFEST_FILE = "workspace-apps.json";
+const WORKSPACE_ROOT_GOOGLE_CALLBACK_PATH = "/_agent-native/google/callback";
 const VERCEL_OUTPUT_DIR = ".vercel/output";
 
 interface WorkspaceAppManifestEntry {
@@ -67,6 +125,7 @@ interface WorkspaceAppManifestEntry {
   name: string;
   description: string;
   path: string;
+  homePath: string;
   url?: string;
   isDispatch: boolean;
   audience: WorkspaceAppAudience;
@@ -74,9 +133,119 @@ interface WorkspaceAppManifestEntry {
   protectedPaths: string[];
 }
 
+function builtinAgentsEnvSnippet(): string {
+  const json = getAppConfig().workspace.builtinAgentsJson;
+  if (!json) return "";
+  return `
+  processRef.env[${JSON.stringify(BUILTIN_AGENTS_ENV_KEY)}] ??= ${JSON.stringify(json)};
+`;
+}
+
+function workspaceDirectoryEnvSnippet(
+  workspaceApps: WorkspaceAppManifestEntry[],
+): string {
+  const configuredOrgDirectoryUrl =
+    getAppConfig().workspace.orgDirectoryUrl?.trim();
+  const dispatchApp = workspaceApps.find((app) => app.isDispatch);
+  if (!configuredOrgDirectoryUrl && !dispatchApp) {
+    return builtinAgentsEnvSnippet();
+  }
+  const runtimeDirectoryResolver = dispatchApp
+    ? `
+  function logInvalidDirectoryBase() {
+    const logKey = Symbol.for("agent-native.workspace.invalid-directory-base");
+    if (globalThis[logKey]) return;
+    globalThis[logKey] = true;
+    console.error("[workspace] Invalid organization directory base URL");
+  }
+
+  function resolveRuntimeDirectoryUrl() {
+    const isVercelProduction =
+      processRef.env.VERCEL_ENV?.trim().toLowerCase() === "production";
+    const vercelCandidates = processRef.env.VERCEL
+      ? (isVercelProduction
+          ? [
+              processRef.env.VERCEL_PROJECT_PRODUCTION_URL,
+              processRef.env.VERCEL_URL,
+              processRef.env.VERCEL_BRANCH_URL,
+            ]
+          : [processRef.env.VERCEL_URL, processRef.env.VERCEL_BRANCH_URL]
+        )
+          .filter(Boolean)
+          .map((candidate) =>
+            /^https?:\\/\\//i.test(candidate)
+              ? candidate
+              : "https://" + candidate,
+          )
+      : [];
+    const candidates = [
+      processRef.env.APP_URL,
+      processRef.env.URL,
+      processRef.env.DEPLOY_URL,
+      processRef.env.BETTER_AUTH_URL,
+      ...vercelCandidates,
+      processRef.env.WORKSPACE_GATEWAY_URL,
+      processRef.env.VITE_WORKSPACE_GATEWAY_URL,
+    ].filter(Boolean);
+    let loopbackUrl;
+    for (const candidate of candidates) {
+      let baseUrl;
+      try {
+        baseUrl = new URL(candidate);
+      } catch {
+        logInvalidDirectoryBase();
+        continue;
+      }
+      if (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") {
+        logInvalidDirectoryBase();
+        continue;
+      }
+      const directoryUrl = new URL(${JSON.stringify(dispatchApp.path)}, baseUrl)
+      .toString()
+      .replace(/\\/$/, "");
+      const hostname = baseUrl.hostname.toLowerCase().replace(/\\.$/, "");
+      const mappedIpv4 = hostname.match(
+        /^\\[::ffff:([0-9a-f]{1,4}):[0-9a-f]{1,4}\\]$/,
+      );
+      const isMappedIpv4Loopback =
+        mappedIpv4 !== null &&
+        (Number.parseInt(mappedIpv4[1], 16) >> 8) === 0x7f;
+      if (
+        hostname === "localhost" ||
+        hostname.endsWith(".localhost") ||
+        /^127(?:\\.\\d{1,3}){3}$/.test(hostname) ||
+        /^0(?:\\.\\d{1,3}){3}$/.test(hostname) ||
+        hostname === "[::1]" ||
+        hostname === "::1" ||
+        hostname === "[::]" ||
+        hostname === "::" ||
+        isMappedIpv4Loopback
+      ) {
+        loopbackUrl ??= directoryUrl;
+        continue;
+      }
+      return directoryUrl;
+    }
+    return loopbackUrl ?? null;
+  }
+`
+    : "";
+  return `${builtinAgentsEnvSnippet()}
+${runtimeDirectoryResolver}
+  const directoryOrigin =
+    processRef.env.AGENT_NATIVE_ORG_DIRECTORY_URL ||
+    ${JSON.stringify(configuredOrgDirectoryUrl ?? null)} ||
+    ${dispatchApp ? "resolveRuntimeDirectoryUrl()" : "null"};
+  if (directoryOrigin) {
+    processRef.env.AGENT_NATIVE_ORG_DIRECTORY_URL = directoryOrigin;
+  }
+`;
+}
+
 interface WorkspaceAppManifestOverride {
   id: string;
   url?: string;
+  homePath?: string;
   audience?: WorkspaceAppAudience;
   publicPaths?: string[];
   protectedPaths?: string[];
@@ -84,11 +253,8 @@ interface WorkspaceAppManifestOverride {
 
 export interface WorkspaceDeployOptions {
   args?: string[];
-  /** Override the workspace root (defaults to walking up from cwd). */
   workspaceRoot?: string;
-  /** Only build — don't invoke the deploy platform CLI. */
   buildOnly?: boolean;
-  /** Target preset. Defaults to `cloudflare_pages`. */
   preset?: WorkspaceDeployPreset;
   /** @internal Override process execution in tests. */
   execFile?: typeof execFileSync;
@@ -99,7 +265,18 @@ export async function runWorkspaceDeploy(
 ): Promise<void> {
   const workspaceRoot =
     opts.workspaceRoot ?? findWorkspaceRoot(process.cwd()) ?? process.cwd();
-  const appsDir = path.join(workspaceRoot, "apps");
+  const config = await loadResolvedAgentNativeConfig(
+    workspaceRoot,
+    createAgentNativeConfigContext(
+      "build",
+      process.env.CONTEXT ?? "production",
+    ),
+  );
+  const appsDirectory = config.deployment?.workspace?.appsDirectory ?? "apps";
+  const workspaceAuthMode = config.deployment?.workspace?.authMode ?? "shared";
+  const workspaceRootPage =
+    config.deployment?.workspace?.rootPage ?? "redirect";
+  const appsDir = path.resolve(workspaceRoot, appsDirectory);
   if (!fs.existsSync(appsDir)) {
     throw new Error(
       `No apps/ directory found at ${workspaceRoot}. Run this inside an agent-native workspace.`,
@@ -122,8 +299,17 @@ export async function runWorkspaceDeploy(
       `Workspace has no apps. Run \`agent-native add-app\` to add one.`,
     );
   }
-  assertNoReservedWorkspaceAppIds(apps);
-  const workspaceApps = readWorkspaceAppManifest(workspaceRoot, apps);
+  assertValidWorkspaceAppIds(apps);
+  // Child builds inherit process.env, and the function shims embed it so
+  // deployed apps see the builder config without the workspace package.json.
+  const builtinAgentsJson = workspaceBuiltinAgentsJson(workspaceRoot);
+  if (builtinAgentsJson)
+    process.env[BUILTIN_AGENTS_ENV_KEY] = builtinAgentsJson;
+  const workspaceApps = await readWorkspaceAppManifest(
+    workspaceRoot,
+    apps,
+    appsDir,
+  );
 
   const preset = resolvePreset(opts.preset, rawArgs);
   assertWorkspaceDeployProductionEnv({ buildOnly, preset });
@@ -150,33 +336,61 @@ export async function runWorkspaceDeploy(
     `[workspace-deploy] Building ${apps.length} app(s) for preset=${preset}`,
   );
 
-  const execFile = opts.execFile ?? execFileSync;
+  const concurrency = workspaceBuildConcurrency();
+  const runBuild: BuildRunner = opts.execFile ?? spawnBuild;
+  await runWithConcurrency(apps, concurrency, (app) =>
+    buildOneApp(
+      workspaceRoot,
+      appsDir,
+      app,
+      preset,
+      runBuild,
+      workspaceApps,
+      workspaceAuthMode,
+      concurrency > 1 ? "pipe" : "inherit",
+    ),
+  );
+  // Copy in app order after all builds so shared outputs stay deterministic.
+  const sweepCrons: Array<{ path: string; schedule: string }> = [];
   for (const app of apps) {
-    buildOneApp(workspaceRoot, app, preset, execFile, workspaceApps);
     moveAppBuildIntoWorkspaceOutput(
       workspaceRoot,
+      appsDir,
       app,
       preset,
       distDir,
       vercelOutputDir,
       workspaceApps,
+      workspaceAuthMode,
+    );
+    if (preset === "vercel") {
+      sweepCrons.push(
+        readVercelSweepCron(
+          path.join(appsDir, app, VERCEL_OUTPUT_DIR),
+          `/${app}`,
+        ),
+      );
+    }
+  }
+  writeWorkspaceAppManifests(workspaceRoot, apps, workspaceApps, preset);
+  if (workspaceRootPage === "directory") {
+    writeWorkspaceDirectoryPage(
+      preset === "vercel" ? path.join(vercelOutputDir, "static") : distDir,
+      workspaceApps,
     );
   }
-  writeWorkspaceAppManifests(
-    workspaceRoot,
-    distDir,
-    apps,
-    workspaceApps,
-    preset,
-  );
 
   if (preset === "netlify") {
-    writeNetlifyRedirects(distDir, apps);
+    writeNetlifyRedirects(distDir, apps, workspaceApps, workspaceRootPage);
     writeNetlifyHeaders(distDir, apps);
-  } else if (preset === "vercel") {
-    writeVercelBuildConfig(vercelOutputDir, apps);
   } else {
-    writeCloudflareRoutingManifest(distDir, apps);
+    writeVercelBuildConfig(
+      vercelOutputDir,
+      apps,
+      workspaceApps,
+      workspaceRootPage,
+      sweepCrons,
+    );
   }
 
   if (buildOnly) {
@@ -193,39 +407,50 @@ export async function runWorkspaceDeploy(
     console.log(
       `  netlify deploy --prod --dir=dist --functions=.netlify/functions-internal\n`,
     );
-  } else if (preset === "vercel") {
-    console.log(`  vercel deploy --prebuilt\n`);
   } else {
-    console.log(`  wrangler pages deploy dist\n`);
+    console.log(`  vercel deploy --prebuilt\n`);
   }
   console.log(
     `All apps live at https://<origin>/<app-name>/*. Log in once on any app\nand the session is shared across the workspace.`,
   );
 }
 
-function buildOneApp(
+async function buildOneApp(
   workspaceRoot: string,
+  appsDir: string,
   app: string,
   preset: WorkspaceDeployPreset,
-  execFile: typeof execFileSync,
+  runBuild: BuildRunner,
   workspaceApps: WorkspaceAppManifestEntry[],
-): void {
-  const appDir = path.join(workspaceRoot, "apps", app);
+  workspaceAuthMode: "shared" | "isolated",
+  stdio: "inherit" | "pipe",
+): Promise<void> {
+  const appDir = path.join(appsDir, app);
   const workspaceAppAudience = workspaceAppAudienceForApp(workspaceApps, app);
   const workspaceAppRouteAccess = workspaceAppRouteAccessForApp(
     workspaceApps,
     app,
   );
-  const workspaceGatewayUrl =
-    process.env.VITE_WORKSPACE_GATEWAY_URL || workspaceBaseUrl();
+  const workspaceGatewayUrl = workspaceBaseUrl();
+  const orgDirectoryUrl = getAppConfig().workspace.orgDirectoryUrl?.trim();
   const workspaceOAuthUrl = workspaceOAuthOrigin(workspaceGatewayUrl);
+  const frameworkRoutePrefix = workspaceFrameworkRoutePrefixEnv();
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     NITRO_PRESET: preset,
     AGENT_NATIVE_WORKSPACE: "1",
+    AGENT_NATIVE_WORKSPACE_AUTH_MODE: workspaceAuthMode,
     AGENT_NATIVE_WORKSPACE_APP_ID: app,
     VITE_AGENT_NATIVE_WORKSPACE: "1",
+    VITE_AGENT_NATIVE_WORKSPACE_AUTH_MODE: workspaceAuthMode,
     VITE_AGENT_NATIVE_WORKSPACE_APP_ID: app,
+    ...(preset === "netlify"
+      ? {
+          VITE_AGENT_NATIVE_FEEDBACK_URL:
+            process.env.VITE_AGENT_NATIVE_FEEDBACK_URL ??
+            DEFAULT_HOSTED_FEEDBACK_URL,
+        }
+      : {}),
     APP_BASE_PATH: `/${app}`,
     VITE_APP_BASE_PATH: `/${app}`,
     AGENT_NATIVE_WORKSPACE_APP_AUDIENCE: workspaceAppAudience,
@@ -243,6 +468,9 @@ function buildOneApp(
       workspaceAppRouteAccess.protectedPaths,
     ),
     VITE_AGENT_NATIVE_WORKSPACE_APPS_JSON: JSON.stringify(workspaceApps),
+    ...(orgDirectoryUrl
+      ? { AGENT_NATIVE_ORG_DIRECTORY_URL: orgDirectoryUrl }
+      : {}),
     ...(workspaceGatewayUrl
       ? {
           WORKSPACE_GATEWAY_URL:
@@ -255,6 +483,13 @@ function buildOneApp(
       : {}),
     [WORKSPACE_APPS_ENV_KEY]: JSON.stringify(workspaceApps),
   };
+
+  if (frameworkRoutePrefix) {
+    env.AGENT_NATIVE_CONFIG_RUNTIME_FRAMEWORK_ROUTE_PREFIX =
+      frameworkRoutePrefix;
+  } else {
+    delete env.AGENT_NATIVE_CONFIG_RUNTIME_FRAMEWORK_ROUTE_PREFIX;
+  }
 
   if (preset === "netlify" && appUsesNetlifyUnpooledDatabaseUrl(appDir)) {
     env.DATABASE_URL =
@@ -269,35 +504,118 @@ function buildOneApp(
 
   cleanAppBuildOutputs(appDir);
 
-  execFile("pnpm", ["--filter", app, "build"], {
+  const startedAt = Date.now();
+  await runBuild("pnpm", ["--filter", app, "build"], {
     cwd: workspaceRoot,
     env,
-    stdio: "inherit",
+    stdio,
+  });
+  console.log(
+    `[workspace-deploy] Built ${app} in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
+  );
+}
+
+type BuildRunner = (
+  cmd: string,
+  args: string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; stdio: "inherit" | "pipe" },
+) => unknown;
+
+function workspaceBuildConcurrency(): number {
+  const raw = process.env.AGENT_NATIVE_DEPLOY_CONCURRENCY?.trim();
+  if (raw) {
+    const parsed = Number(raw);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      throw new Error(
+        `AGENT_NATIVE_DEPLOY_CONCURRENCY must be a positive integer, got "${raw}"`,
+      );
+    }
+    return parsed;
+  }
+  // Each app build can use 1-2 GB, so stay well under typical CI memory limits.
+  return Math.min(3, os.availableParallelism());
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const errors: unknown[] = [];
+  const worker = async () => {
+    while (errors.length === 0 && next < items.length) {
+      try {
+        await fn(items[next++]);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+  };
+  // Let in-flight builds finish so none are orphaned when the CLI exits and
+  // every failure gets reported, not just the first.
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new Error(
+      errors
+        .map((error) =>
+          error instanceof Error ? error.message : String(error),
+        )
+        .join("\n"),
+    );
+  }
+}
+
+function spawnBuild(
+  cmd: string,
+  args: string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; stdio: "inherit" | "pipe" },
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, options);
+    // Buffered so parallel builds print as whole blocks instead of interleaving.
+    const chunks: Buffer[] = [];
+    child.stdout?.on("data", (chunk: Buffer) => chunks.push(chunk));
+    child.stderr?.on("data", (chunk: Buffer) => chunks.push(chunk));
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      if (chunks.length) process.stdout.write(Buffer.concat(chunks));
+      if (code === 0) resolve();
+      else
+        reject(
+          new Error(
+            `Command failed: ${cmd} ${args.join(" ")} (${signal ?? `exit code ${code}`})`,
+          ),
+        );
+    });
   });
 }
 
 function moveAppBuildIntoWorkspaceOutput(
   workspaceRoot: string,
+  appsDir: string,
   app: string,
   preset: WorkspaceDeployPreset,
   distDir: string,
   vercelOutputDir: string,
   workspaceApps: WorkspaceAppManifestEntry[],
+  workspaceAuthMode: "shared" | "isolated",
 ): void {
-  const appDir = path.join(workspaceRoot, "apps", app);
+  const appDir = path.join(appsDir, app);
   if (preset === "vercel") {
     copyVercelAppBuildIntoWorkspace(
-      workspaceRoot,
+      appsDir,
       app,
       vercelOutputDir,
       workspaceApps,
+      workspaceAuthMode,
     );
     return;
   }
 
-  // Resolve the per-app build output: prefer dist/ (standard), fall back to
-  // .output/ (Nitro's default). The Cloudflare preset emits into dist/
-  // containing the worker + assets.
   const candidates = ["dist", ".output"];
   const src = candidates
     .map((c) => path.join(appDir, c))
@@ -313,25 +631,28 @@ function moveAppBuildIntoWorkspaceOutput(
     const target = path.join(distDir, NETLIFY_WORKSPACE_STATIC_DIR, app);
     fs.mkdirSync(target, { recursive: true });
     copyDir(staticSrc, target);
-    // Nitro/Vite mounted builds can contain a nested copy of public assets at
-    // dist/<app>/<app>/...; the workspace root already supplies the outer
-    // mount path, so keeping it would publish duplicate /<app>/<app> URLs.
-    fs.rmSync(path.join(target, app), { recursive: true, force: true });
-    copyNetlifyFunctionIntoWorkspace(workspaceRoot, app, workspaceApps, target);
-  } else {
-    const target = path.join(distDir, app);
-    fs.mkdirSync(target, { recursive: true });
-    copyDir(src, target);
+    if (app !== "assets") {
+      fs.rmSync(path.join(target, app), { recursive: true, force: true });
+    }
+    copyNetlifyFunctionIntoWorkspace(
+      workspaceRoot,
+      appsDir,
+      app,
+      workspaceApps,
+      target,
+      workspaceAuthMode,
+    );
   }
 }
 
 function copyVercelAppBuildIntoWorkspace(
-  workspaceRoot: string,
+  appsDir: string,
   app: string,
   vercelOutputDir: string,
   workspaceApps: WorkspaceAppManifestEntry[],
+  workspaceAuthMode: "shared" | "isolated",
 ): void {
-  const appDir = path.join(workspaceRoot, "apps", app);
+  const appDir = path.join(appsDir, app);
   const src = path.join(appDir, VERCEL_OUTPUT_DIR);
   if (!fs.existsSync(src)) {
     throw new Error(
@@ -343,13 +664,12 @@ function copyVercelAppBuildIntoWorkspace(
   const staticDest = path.join(vercelOutputDir, "static");
   if (fs.existsSync(staticSrc)) {
     copyDir(staticSrc, staticDest);
-    // Nitro's Vercel preset already nests assets under baseURL. The shared
-    // deploy build also mirrors client assets under baseURL for other Nitro
-    // presets, so mounted apps can contain a duplicate /<app>/<app> copy.
-    fs.rmSync(path.join(staticDest, app, app), {
-      recursive: true,
-      force: true,
-    });
+    if (app !== "assets") {
+      fs.rmSync(path.join(staticDest, app, app), {
+        recursive: true,
+        force: true,
+      });
+    }
   }
 
   const functionSrc = path.join(src, "functions", "__server.func");
@@ -365,112 +685,60 @@ function copyVercelAppBuildIntoWorkspace(
     `${app}-server.func`,
   );
   fs.rmSync(functionDest, { recursive: true, force: true });
-  copyDir(functionSrc, functionDest);
-  patchVercelFunctionEntry(functionDest, app, workspaceApps);
+  cloneServerBundleForFunction(functionSrc, functionDest);
+  patchVercelFunctionEntry(functionDest, app, workspaceApps, workspaceAuthMode);
 }
 
-/**
- * Write the Cloudflare Pages `_routes.json` and a dispatcher `_worker.js` at
- * the workspace dist root so each app is reachable under /<app>/*.
- */
-function writeCloudflareRoutingManifest(distDir: string, apps: string[]): void {
-  const dispatchFaviconAsset = apps.includes("dispatch")
-    ? dispatchRootFaviconAsset(distDir)
-    : null;
-  // _routes.json tells Cloudflare which paths are dynamic (Functions) vs
-  // static. Mark both /<app> and /<app>/* as include so every app's worker
-  // handles its root and subtree.
-  const include = apps.flatMap((a) => [`/${a}`, `/${a}/*`]).concat(["/"]);
-  if (apps.includes("dispatch")) {
-    include.push("/_agent-native/*");
-    include.push("/.well-known/*");
-    include.push(
-      ...DISPATCH_WORKSPACE_ROOT_REDIRECTS.map(([from]) => `/${from}`),
-    );
-    include.push("/apps/*");
-    if (dispatchFaviconAsset) include.push("/favicon.ico");
-  }
-  const routes = {
-    version: 1,
-    include,
-    exclude: [],
-  };
-  fs.writeFileSync(
-    path.join(distDir, "_routes.json"),
-    JSON.stringify(routes, null, 2) + "\n",
+function workspaceOAuthDiscoveryRoutes(
+  app: string,
+): Array<{ path: string; descendants: boolean }> {
+  return [
+    {
+      path: `/.well-known/oauth-authorization-server/${app}`,
+      descendants: false,
+    },
+    {
+      path: `/.well-known/openid-configuration/${app}`,
+      descendants: false,
+    },
+    {
+      path: `/.well-known/oauth-protected-resource/${app}`,
+      descendants: true,
+    },
+  ];
+}
+
+function workspaceOAuthCallbackApp(
+  workspaceApps: WorkspaceAppManifestEntry[],
+): string | undefined {
+  return (
+    workspaceApps.find((entry) => entry.isDispatch)?.id ?? workspaceApps[0]?.id
   );
-
-  // Dispatcher worker: inspects the path and forwards to the matching
-  // per-app worker.
-  const imports = apps
-    .map((a) => `import ${moduleIdent(a)} from "./${a}/_worker.js";`)
-    .join("\n");
-  const dispatch = apps
-    .map(
-      (a) =>
-        `  if (pathname === "/${a}" || pathname.startsWith("/${a}/")) return ${moduleIdent(a)}.fetch(requestForMountedApp(request, "/${a}"), env, ctx);`,
-    )
-    .join("\n");
-  const dispatchRootFrameworkRoutes = apps.includes("dispatch")
-    ? `    if (pathname === "/_agent-native" || pathname.startsWith("/_agent-native/") || pathname === "/.well-known" || pathname.startsWith("/.well-known/")) return ${moduleIdent("dispatch")}.fetch(request, env, ctx);
-`
-    : "";
-  const dispatchRootFaviconRoute = dispatchFaviconAsset
-    ? `    if (pathname === "/favicon.ico") return Response.redirect(new URL("/dispatch/${dispatchFaviconAsset}", request.url).toString(), 302);
-`
-    : "";
-  const dispatchRootAliasRoutes = apps.includes("dispatch")
-    ? DISPATCH_WORKSPACE_ROOT_REDIRECTS.map(
-        ([from, to]) =>
-          `    if (pathname === "/${from}") return Response.redirect(new URL("/dispatch/${to}" + search, request.url).toString(), 302);`,
-      ).join("\n") + "\n"
-    : "";
-  const dispatchRootDynamicAliasRoutes = apps.includes("dispatch")
-    ? `    if (pathname.startsWith("/apps/")) return Response.redirect(new URL("/dispatch" + pathname + search, request.url).toString(), 302);
-`
-    : "";
-  const dispatchMountedRootRedirect = apps.includes("dispatch")
-    ? `    if (pathname === "/dispatch" || pathname === "/dispatch/") return Response.redirect(new URL("/dispatch/overview" + search, request.url).toString(), 302);
-`
-    : "";
-
-  const worker = `${imports}
-
-function requestForMountedApp(request, basePath) {
-  const url = new URL(request.url);
-  if (url.pathname !== basePath && url.pathname !== \`\${basePath}/\`) {
-    return request;
-  }
-  url.pathname = \`\${basePath}//\`;
-  return new Request(url, request);
 }
 
-export default {
-  async fetch(request, env, ctx) {
-    const { pathname, search } = new URL(request.url);
-${dispatchRootFrameworkRoutes}${dispatchRootFaviconRoute}${dispatchRootAliasRoutes}${dispatchRootDynamicAliasRoutes}${dispatchMountedRootRedirect}${dispatch}
-    if (pathname === "/") {
-      return Response.redirect(new URL("${cloudflareRootRedirectPath(apps)}", request.url).toString(), 302);
-    }
-    return new Response("Not found", { status: 404 });
-  },
-};
-`;
-  fs.writeFileSync(path.join(distDir, "_worker.js"), worker);
-}
-
-function cloudflareRootRedirectPath(apps: string[]): string {
-  return apps.includes("dispatch") ? "/dispatch/overview" : `/${apps[0]}/`;
-}
-
-function writeNetlifyRedirects(distDir: string, apps: string[]): void {
+function writeNetlifyRedirects(
+  distDir: string,
+  apps: string[],
+  workspaceApps: WorkspaceAppManifestEntry[],
+  rootPage: AgentNativeWorkspaceRootPage,
+): void {
   const lines: string[] = [
     "# Generated by agent-native deploy --preset netlify",
     "# Static app assets are stored under a safe namespace; dynamic app routes are handled by function route config.",
   ];
 
+  for (const app of apps) {
+    for (const { path, descendants } of workspaceOAuthDiscoveryRoutes(app)) {
+      const target = `/.netlify/functions/${app}-server 200`;
+      lines.push(`${path} ${target}`);
+      if (descendants) lines.push(`${path}/* ${target}`);
+    }
+  }
+
   if (apps.includes("dispatch")) {
-    lines.push("/_agent-native/* /.netlify/functions/dispatch-server 200");
+    lines.push(
+      `${workspaceFrameworkRoutePrefix()}/* /.netlify/functions/dispatch-server 200`,
+    );
     lines.push("/.well-known/* /.netlify/functions/dispatch-server 200");
     const faviconAsset = dispatchRootFaviconAsset(distDir);
     if (faviconAsset) {
@@ -483,7 +751,9 @@ function writeNetlifyRedirects(distDir: string, apps: string[]): void {
   }
 
   if (apps.includes("dispatch")) {
-    lines.push("/ /dispatch/overview 302");
+    if (rootPage !== "directory") {
+      lines.push("/ /dispatch/overview 302");
+    }
     lines.push("/dispatch /dispatch/overview 302");
     lines.push("/dispatch/ /dispatch/overview 302");
     for (const [from, to] of DISPATCH_WORKSPACE_ROOT_REDIRECTS) {
@@ -491,7 +761,15 @@ function writeNetlifyRedirects(distDir: string, apps: string[]): void {
     }
     lines.push("/apps/* /dispatch/apps/:splat 302");
   } else {
-    lines.push(`/ /${apps[0]}/ 302`);
+    const callbackApp = workspaceOAuthCallbackApp(workspaceApps);
+    if (callbackApp) {
+      lines.push(
+        `${WORKSPACE_ROOT_GOOGLE_CALLBACK_PATH} /.netlify/functions/${callbackApp}-server 200`,
+      );
+    }
+    if (rootPage !== "directory") {
+      lines.push(`/ /${apps[0]}/ 302`);
+    }
   }
 
   fs.writeFileSync(path.join(distDir, "_redirects"), lines.join("\n") + "\n");
@@ -519,16 +797,36 @@ function netlifyHeaderBlock(pathname: string): string {
   ].join("\n");
 }
 
-function writeVercelBuildConfig(outputDir: string, apps: string[]): void {
+function writeVercelBuildConfig(
+  outputDir: string,
+  apps: string[],
+  workspaceApps: WorkspaceAppManifestEntry[],
+  rootPage: AgentNativeWorkspaceRootPage,
+  sweepCrons: Array<{ path: string; schedule: string }>,
+): void {
   const routes: Array<Record<string, any>> = [
     ...vercelImmutableAssetHeaderRoutes(outputDir, apps),
     { handle: "filesystem" },
   ];
 
+  routes.push(
+    ...apps.flatMap((app) =>
+      workspaceOAuthDiscoveryRoutes(app).flatMap(({ path, descendants }) => [
+        { src: vercelRouteSrc(path), dest: `/${app}-server` },
+        ...(descendants
+          ? [{ src: `${vercelRouteSrc(path)}/(.*)`, dest: `/${app}-server` }]
+          : []),
+      ]),
+    ),
+  );
+
   if (apps.includes("dispatch")) {
     routes.push(
-      { src: "/_agent-native", dest: "/dispatch-server" },
-      { src: "/_agent-native/(.*)", dest: "/dispatch-server" },
+      { src: workspaceFrameworkRoutePrefix(), dest: "/dispatch-server" },
+      {
+        src: `${workspaceFrameworkRoutePrefix()}/(.*)`,
+        dest: "/dispatch-server",
+      },
       { src: "/\\.well-known", dest: "/dispatch-server" },
       { src: "/\\.well-known/(.*)", dest: "/dispatch-server" },
     );
@@ -540,8 +838,10 @@ function writeVercelBuildConfig(outputDir: string, apps: string[]): void {
       routes.push(vercelRedirect("/favicon.ico", `/dispatch/${faviconAsset}`));
     }
 
+    if (rootPage !== "directory") {
+      routes.push(vercelRedirect("/", "/dispatch/overview"));
+    }
     routes.push(
-      vercelRedirect("/", "/dispatch/overview"),
       vercelRedirect("/dispatch", "/dispatch/overview"),
       vercelRedirect("/dispatch/", "/dispatch/overview"),
     );
@@ -550,12 +850,25 @@ function writeVercelBuildConfig(outputDir: string, apps: string[]): void {
     }
     routes.push(vercelRedirect("/apps/(.*)", "/dispatch/apps/$1"));
   } else {
-    routes.push(vercelRedirect("/", `/${apps[0]}/`));
+    const callbackApp = workspaceOAuthCallbackApp(workspaceApps);
+    if (callbackApp) {
+      routes.push({
+        src: vercelRouteSrc(WORKSPACE_ROOT_GOOGLE_CALLBACK_PATH),
+        dest: `/${callbackApp}-server`,
+      });
+    }
+    if (rootPage !== "directory") {
+      routes.push(vercelRedirect("/", `/${apps[0]}/`));
+    }
   }
 
   for (const app of apps) {
     if (app !== "dispatch") {
       routes.push({ src: `/${app}`, dest: `/${app}-server` });
+      routes.push({
+        src: vercelRouteSrc(`/${app}.data`),
+        dest: `/${app}-server`,
+      });
     }
     routes.push({ src: `/${app}/(.*)`, dest: `/${app}-server` });
   }
@@ -563,6 +876,7 @@ function writeVercelBuildConfig(outputDir: string, apps: string[]): void {
   const config = {
     version: 3,
     routes,
+    crons: sweepCrons,
   };
   fs.writeFileSync(
     path.join(outputDir, "config.json"),
@@ -601,7 +915,7 @@ function netlifyAssetRedirectsFor(app: string, distDir: string): string[] {
   const to = `/${NETLIFY_WORKSPACE_STATIC_DIR}/${app}`;
   return [
     `${from}/assets/* ${to}/assets/:splat 200`,
-    ...netlifyPublicRootAssetPaths(
+    ...netlifyPublicAssetPaths(
       app,
       path.join(distDir, NETLIFY_WORKSPACE_STATIC_DIR, app),
     ).map((assetPath) => {
@@ -637,7 +951,14 @@ const RESERVED_WORKSPACE_APP_IDS = new Set([
   ...DISPATCH_WORKSPACE_ROOT_REDIRECTS.map(([from]) => from),
 ]);
 
-function assertNoReservedWorkspaceAppIds(apps: string[]): void {
+function assertValidWorkspaceAppIds(apps: string[]): void {
+  const invalidIds = apps.filter((app) => !isValidWorkspaceAppIdFormat(app));
+  if (invalidIds.length > 0) {
+    throw new Error(
+      `Workspace app id ${invalidIds.map((id) => `"${id}"`).join(", ")} must use lowercase letters, numbers, and hyphens.`,
+    );
+  }
+
   const conflicts = apps.filter(
     (app) => app !== "dispatch" && RESERVED_WORKSPACE_APP_IDS.has(app),
   );
@@ -649,11 +970,13 @@ function assertNoReservedWorkspaceAppIds(apps: string[]): void {
 
 function copyNetlifyFunctionIntoWorkspace(
   workspaceRoot: string,
+  appsDir: string,
   app: string,
   workspaceApps: WorkspaceAppManifestEntry[],
   staticDir: string,
+  workspaceAuthMode: "shared" | "isolated",
 ): void {
-  const appDir = path.join(workspaceRoot, "apps", app);
+  const appDir = path.join(appsDir, app);
   const src = path.join(appDir, ".netlify", "functions-internal", "server");
   if (!fs.existsSync(src)) {
     throw new Error(
@@ -663,8 +986,390 @@ function copyNetlifyFunctionIntoWorkspace(
 
   const dest = path.join(netlifyFunctionsDir(workspaceRoot), `${app}-server`);
   fs.rmSync(dest, { recursive: true, force: true });
-  copyDir(src, dest);
-  patchNetlifyFunctionEntry(dest, app, workspaceApps, staticDir);
+  cloneServerBundleForFunction(src, dest);
+  patchNetlifyFunctionEntry(
+    dest,
+    app,
+    workspaceApps,
+    staticDir,
+    workspaceAuthMode,
+  );
+
+  const integrationDurableDispatch =
+    app === "dispatch" && isIntegrationDurableDispatchConfigured();
+  const durableChat = isDurableBackgroundWorkspaceDeployEnabled();
+  const recurringJobs = isRecurringJobsDeployEnabled();
+  if (durableChat || integrationDurableDispatch || recurringJobs) {
+    emitNetlifyBackgroundFunction(
+      workspaceRoot,
+      app,
+      src,
+      workspaceApps,
+      workspaceAuthMode,
+    );
+  }
+  if (recurringJobs || durableChat) {
+    emitNetlifyRecurringJobsFunction(workspaceRoot, app);
+  }
+  if (integrationDurableDispatch) {
+    emitNetlifyIntegrationRecoveryFunction(
+      workspaceRoot,
+      app,
+      src,
+      workspaceApps,
+      workspaceAuthMode,
+    );
+  }
+}
+
+function emitNetlifyRecurringJobsFunction(
+  workspaceRoot: string,
+  app: string,
+): void {
+  const functionName = `${app}-agent-recurring-jobs`;
+  const dest = path.join(netlifyFunctionsDir(workspaceRoot), functionName);
+  const backgroundName = `${app}-agent-background`;
+  const backgroundPath = `/.netlify/functions/${backgroundName}`;
+  const sweepPath = `/${app}${RECURRING_JOBS_SWEEP_PATH}`;
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.mkdirSync(dest, { recursive: true });
+
+  const entry = `import { createHmac } from "node:crypto";
+
+const BACKGROUND_PATH = ${JSON.stringify(backgroundPath)};
+const SWEEP_PATH = ${JSON.stringify(sweepPath)};
+const TOKEN_SUBJECT = ${JSON.stringify(RECURRING_JOBS_SWEEP_TOKEN_SUBJECT)};
+const PROCESSOR_FIELD = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_FIELD)};
+const PROCESSOR_ROUTE = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_ROUTE)};
+const PROCESSOR_ROUTE_FIELD = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_ROUTE_FIELD)};
+
+function siteOrigin(request) {
+  return new URL(request.url).origin;
+}
+
+function token(secret) {
+  const timestamp = Date.now();
+  const signature = createHmac("sha256", secret)
+    .update(\`${RECURRING_JOBS_SWEEP_TOKEN_SUBJECT}:\${timestamp}\`)
+    .digest("hex");
+  return \`\${timestamp}.\${signature}\`;
+}
+
+export default async function handler(request) {
+  const secret = process.env.A2A_SECRET;
+  if (!secret) {
+    throw new Error("[recurring-jobs] A2A_SECRET is required for the scheduled sweep");
+  }
+  const url = new URL(BACKGROUND_PATH, siteOrigin(request));
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: \`Bearer \${token(secret)}\`,
+      "Content-Type": "application/json",
+      "user-agent": "agent-native-recurring-jobs",
+    },
+    body: JSON.stringify({
+      [PROCESSOR_FIELD]: PROCESSOR_ROUTE,
+      [PROCESSOR_ROUTE_FIELD]: SWEEP_PATH,
+    }),
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(
+      \`[recurring-jobs] Durable sweep handoff failed (\${response.status}): \${body.slice(0, 500)}\`,
+    );
+  }
+  console.log("[recurring-jobs] Durable sweep handed off", url.toString());
+  return new Response(null, { status: 204 });
+}
+
+export const config = {
+  name: ${JSON.stringify(`${app} agent-native recurring jobs`)},
+  generator: "agent-native workspace deploy",
+  schedule: "* * * * *",
+  nodeBundler: "none",
+  includedFiles: ["**"],
+};
+`;
+  fs.writeFileSync(path.join(dest, `${functionName}.mjs`), entry);
+  console.log(
+    `[workspace-deploy] Emitted Netlify scheduled recurring-job function "${functionName}" for app "${app}".`,
+  );
+}
+
+export function isDurableBackgroundWorkspaceDeployEnabled(): boolean {
+  return !isDurableBackgroundFlagExplicitlyDisabled();
+}
+
+function emitNetlifyBackgroundFunction(
+  workspaceRoot: string,
+  app: string,
+  srcServerDir: string,
+  workspaceApps: WorkspaceAppManifestEntry[],
+  workspaceAuthMode: "shared" | "isolated",
+): void {
+  const backgroundName = `${app}-agent-background`;
+  const dest = path.join(netlifyFunctionsDir(workspaceRoot), backgroundName);
+  fs.rmSync(dest, { recursive: true, force: true });
+  cloneServerBundleForFunction(srcServerDir, dest);
+
+  const basePath = `/${app}`;
+  const workspaceAppAudience = workspaceAppAudienceForApp(workspaceApps, app);
+  const workspaceAppRouteAccess = workspaceAppRouteAccessForApp(
+    workspaceApps,
+    app,
+  );
+  const processRunPath = `${basePath}${AGENT_CHAT_PROCESS_RUN_PATH}`;
+  const agentTeamProcessRunPath = `${basePath}${AGENT_TEAM_PROCESS_RUN_PATH}`;
+  const a2aProcessTaskPath = `${basePath}/_agent-native/a2a/_process-task`;
+  const integrationProcessTaskPath = `${basePath}/_agent-native/integrations/process-task`;
+  const recurringJobsSweepPath = `${basePath}${RECURRING_JOBS_SWEEP_PATH}`;
+  const server = `// Mark this isolate as the durable background runtime BEFORE the handler bundle
+// is imported, so isInBackgroundFunctionRuntime() reliably returns true in this
+// function (the deployed Lambda name is not guaranteed to end in -background). A
+// globalThis flag (NOT process.env) avoids the no-env-mutation guard and carries
+// no cross-request state.
+globalThis.__AGENT_NATIVE_BACKGROUND_RUNTIME__ = true;
+
+const basePath = ${JSON.stringify(basePath)};
+// The base-path-prefixed framework route the Nitro router dispatches to.
+const PROCESS_RUN_PATH = ${JSON.stringify(processRunPath)};
+const AGENT_TEAM_PROCESS_RUN_PATH = ${JSON.stringify(agentTeamProcessRunPath)};
+const A2A_PROCESS_TASK_PATH = ${JSON.stringify(a2aProcessTaskPath)};
+const INTEGRATION_PROCESS_TASK_PATH = ${JSON.stringify(integrationProcessTaskPath)};
+const RECURRING_JOBS_SWEEP_PATH = ${JSON.stringify(recurringJobsSweepPath)};
+const BACKGROUND_PROCESSOR_FIELD = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_FIELD)};
+const BACKGROUND_PROCESSOR_A2A = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_A2A)};
+const BACKGROUND_PROCESSOR_AGENT_TEAM = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_AGENT_TEAM)};
+const BACKGROUND_PROCESSOR_INTEGRATION = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_INTEGRATION)};
+const BACKGROUND_PROCESSOR_ROUTE = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_ROUTE)};
+const BACKGROUND_PROCESSOR_ROUTE_FIELD = ${JSON.stringify(AGENT_BACKGROUND_PROCESSOR_ROUTE_FIELD)};
+
+function processorPathFromBody(body) {
+  if (!body) return null;
+  try {
+    const parsed = JSON.parse(body);
+    if (parsed?.[BACKGROUND_PROCESSOR_FIELD] === BACKGROUND_PROCESSOR_A2A) {
+      return A2A_PROCESS_TASK_PATH;
+    }
+    if (
+      parsed?.[BACKGROUND_PROCESSOR_FIELD] === BACKGROUND_PROCESSOR_AGENT_TEAM
+    ) {
+      return AGENT_TEAM_PROCESS_RUN_PATH;
+    }
+    if (
+      parsed?.[BACKGROUND_PROCESSOR_FIELD] ===
+      BACKGROUND_PROCESSOR_INTEGRATION
+    ) {
+      return INTEGRATION_PROCESS_TASK_PATH;
+    }
+    const route = parsed?.[BACKGROUND_PROCESSOR_ROUTE_FIELD];
+    if (
+      parsed?.[BACKGROUND_PROCESSOR_FIELD] === BACKGROUND_PROCESSOR_ROUTE &&
+      typeof route === "string" &&
+      (route === RECURRING_JOBS_SWEEP_PATH ||
+        route.startsWith(basePath + "/api/_agent-native-background/")) &&
+      !route.includes("?") &&
+      !route.includes("#")
+    ) {
+      return route;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function setBasePathEnv() {
+  const processRef = globalThis.process ??= { env: {} };
+  processRef.env ??= {};
+${workspaceDirectoryEnvSnippet(workspaceApps)}
+  Object.assign(processRef.env, {
+    AGENT_NATIVE_WORKSPACE: "1",
+    AGENT_NATIVE_WORKSPACE_AUTH_MODE: ${JSON.stringify(workspaceAuthMode)},
+    AGENT_NATIVE_WORKSPACE_APP_ID: ${JSON.stringify(app)},
+    APP_BASE_PATH: basePath,
+    AGENT_NATIVE_WORKSPACE_APP_AUDIENCE: ${JSON.stringify(workspaceAppAudience)},
+    AGENT_NATIVE_WORKSPACE_APP_PUBLIC_PATHS: ${JSON.stringify(JSON.stringify(workspaceAppRouteAccess.publicPaths))},
+    AGENT_NATIVE_WORKSPACE_APP_PROTECTED_PATHS: ${JSON.stringify(JSON.stringify(workspaceAppRouteAccess.protectedPaths))},
+    VITE_AGENT_NATIVE_WORKSPACE: "1",
+    VITE_AGENT_NATIVE_WORKSPACE_AUTH_MODE: ${JSON.stringify(workspaceAuthMode)},
+    VITE_AGENT_NATIVE_WORKSPACE_APP_ID: ${JSON.stringify(app)},
+    VITE_APP_BASE_PATH: basePath,
+    VITE_AGENT_NATIVE_WORKSPACE_APP_AUDIENCE: ${JSON.stringify(workspaceAppAudience)},
+    VITE_AGENT_NATIVE_WORKSPACE_APP_PUBLIC_PATHS: ${JSON.stringify(JSON.stringify(workspaceAppRouteAccess.publicPaths))},
+    VITE_AGENT_NATIVE_WORKSPACE_APP_PROTECTED_PATHS: ${JSON.stringify(JSON.stringify(workspaceAppRouteAccess.protectedPaths))},
+    VITE_AGENT_NATIVE_WORKSPACE_APPS_JSON: ${JSON.stringify(JSON.stringify(workspaceApps))},
+    ${JSON.stringify(WORKSPACE_APPS_ENV_KEY)}: ${JSON.stringify(JSON.stringify(workspaceApps))},
+  });
+${workspaceFrameworkRoutePrefixEnvSnippet()}
+}
+
+setBasePathEnv();
+
+let cachedHandler;
+
+// Reached at the DEFAULT url /.netlify/functions/${backgroundName}; REWRITE the
+// incoming pathname to the base-path-prefixed _process-run route so the Nitro
+// router runs the plugin. Method, ALL headers (the HMAC Authorization: Bearer
+// MUST survive) and the body are preserved.
+export default async function handler(request) {
+  setBasePathEnv();
+  cachedHandler ??= (await import("./main.mjs")).default;
+  const url = new URL(request.url);
+  const method = request.method || "POST";
+  const hasBody = method !== "GET" && method !== "HEAD";
+  const body = hasBody ? await request.text() : undefined;
+  url.pathname = processorPathFromBody(body) || PROCESS_RUN_PATH;
+  const rewritten = new Request(url.toString(), {
+    method,
+    headers: request.headers,
+    body,
+  });
+  return cachedHandler(rewritten);
+}
+
+export const config = {
+  name: ${JSON.stringify(`${app} agent background handler`)},
+  generator: "agent-native workspace deploy",
+  // background: true → async invoke (202, 15-min budget). NO custom path: the
+  // function keeps its default url /.netlify/functions/${backgroundName}, which
+  // the <app>-server catch-all never shadows (it excludes /.netlify/*).
+  background: true,
+  nodeBundler: "none",
+  includedFiles: ["**"],
+  preferStatic: false,
+};
+`;
+  fs.rmSync(path.join(dest, "server.mjs"), { force: true });
+  fs.writeFileSync(path.join(dest, `${backgroundName}.mjs`), server);
+  {
+    const freed = pruneSsrIslandFromRewritingClone(dest, server);
+    if (freed > 0) {
+      console.log(
+        `[deploy] Pruned ${(freed / 1024 / 1024).toFixed(1)}MB of unroutable SSR modules from ${path.basename(dest)}.`,
+      );
+    }
+  }
+  assertEmittedBackgroundFunctionOnDisk(dest, backgroundName);
+  console.log(
+    `[workspace-deploy] Emitted durable-background function "${backgroundName}" ` +
+      `for app "${app}" with config { background:true } and NO custom path — ` +
+      `reachable at its default url /.netlify/functions/${backgroundName} ` +
+      `(rewrites to ${processRunPath}). REQUIRES real-deploy verification of ` +
+      `Netlify async (202) invocation — see docs/design/durable-agent-runs.md.`,
+  );
+}
+
+function emitNetlifyIntegrationRecoveryFunction(
+  workspaceRoot: string,
+  app: string,
+  srcServerDir: string,
+  workspaceApps: WorkspaceAppManifestEntry[],
+  workspaceAuthMode: "shared" | "isolated",
+): void {
+  const functionName = `${app}-integration-recovery`;
+  const dest = path.join(netlifyFunctionsDir(workspaceRoot), functionName);
+  fs.rmSync(dest, { recursive: true, force: true });
+  cloneServerBundleForFunction(srcServerDir, dest);
+  fs.rmSync(path.join(dest, "server.mjs"), { force: true });
+
+  const basePath = `/${app}`;
+  const workspaceAppAudience = workspaceAppAudienceForApp(workspaceApps, app);
+  const workspaceAppRouteAccess = workspaceAppRouteAccessForApp(
+    workspaceApps,
+    app,
+  );
+  const sweepPath = `${basePath}${INTEGRATION_RETRY_SWEEP_PATH}`;
+  const entry = `import { createHmac } from "node:crypto";
+
+const basePath = ${JSON.stringify(basePath)};
+const SWEEP_PATH = ${JSON.stringify(sweepPath)};
+const SWEEP_SUBJECT = ${JSON.stringify(INTEGRATION_RETRY_SWEEP_TOKEN_SUBJECT)};
+globalThis.${INTEGRATION_RECOVERY_RUNTIME_MARKER} = true;
+
+function setBasePathEnv() {
+  const processRef = globalThis.process ??= { env: {} };
+  processRef.env ??= {};
+${workspaceDirectoryEnvSnippet(workspaceApps)}
+  Object.assign(processRef.env, {
+    AGENT_NATIVE_WORKSPACE: "1",
+    AGENT_NATIVE_WORKSPACE_AUTH_MODE: ${JSON.stringify(workspaceAuthMode)},
+    AGENT_NATIVE_WORKSPACE_APP_ID: ${JSON.stringify(app)},
+    APP_BASE_PATH: basePath,
+    AGENT_NATIVE_WORKSPACE_APP_AUDIENCE: ${JSON.stringify(workspaceAppAudience)},
+    AGENT_NATIVE_WORKSPACE_APP_PUBLIC_PATHS: ${JSON.stringify(JSON.stringify(workspaceAppRouteAccess.publicPaths))},
+    AGENT_NATIVE_WORKSPACE_APP_PROTECTED_PATHS: ${JSON.stringify(JSON.stringify(workspaceAppRouteAccess.protectedPaths))},
+    VITE_AGENT_NATIVE_WORKSPACE: "1",
+    VITE_AGENT_NATIVE_WORKSPACE_AUTH_MODE: ${JSON.stringify(workspaceAuthMode)},
+    VITE_AGENT_NATIVE_WORKSPACE_APP_ID: ${JSON.stringify(app)},
+    VITE_APP_BASE_PATH: basePath,
+    VITE_AGENT_NATIVE_WORKSPACE_APP_AUDIENCE: ${JSON.stringify(workspaceAppAudience)},
+    VITE_AGENT_NATIVE_WORKSPACE_APP_PUBLIC_PATHS: ${JSON.stringify(JSON.stringify(workspaceAppRouteAccess.publicPaths))},
+    VITE_AGENT_NATIVE_WORKSPACE_APP_PROTECTED_PATHS: ${JSON.stringify(JSON.stringify(workspaceAppRouteAccess.protectedPaths))},
+    VITE_AGENT_NATIVE_WORKSPACE_APPS_JSON: ${JSON.stringify(JSON.stringify(workspaceApps))},
+    ${JSON.stringify(WORKSPACE_APPS_ENV_KEY)}: ${JSON.stringify(JSON.stringify(workspaceApps))},
+  });
+${workspaceFrameworkRoutePrefixEnvSnippet()}
+}
+
+function enabled() {
+  const raw = process.env.AGENT_INTEGRATION_DURABLE_DISPATCH;
+  if (!raw) return false;
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
+function token(secret) {
+  const timestamp = Date.now();
+  const signature = createHmac("sha256", secret)
+    .update(\`${INTEGRATION_RETRY_SWEEP_TOKEN_SUBJECT}:\${timestamp}\`)
+    .digest("hex");
+  return \`\${timestamp}.\${signature}\`;
+}
+
+setBasePathEnv();
+let cachedHandler;
+
+export default async function handler(request, context) {
+  setBasePathEnv();
+  if (!enabled()) return new Response(null, { status: 204 });
+  const secret = process.env.A2A_SECRET;
+  if (!secret) {
+    console.error("[integration-recovery] A2A_SECRET is required; sweep skipped");
+    return new Response(null, { status: 204 });
+  }
+  cachedHandler ??= (await import("./main.mjs")).default;
+  const url = new URL(request.url);
+  url.pathname = SWEEP_PATH;
+  const rewritten = new Request(url.toString(), {
+    method: "POST",
+    headers: {
+      Authorization: \`Bearer \${token(secret)}\`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ taskId: SWEEP_SUBJECT }),
+  });
+  return cachedHandler(rewritten, context);
+}
+
+export const config = {
+  name: ${JSON.stringify(`${app} integration pending-task recovery`)},
+  generator: "agent-native workspace deploy",
+  schedule: "* * * * *",
+  nodeBundler: "none",
+  includedFiles: ["**"],
+  preferStatic: false,
+};
+`;
+  fs.writeFileSync(path.join(dest, `${functionName}.mjs`), entry);
+  {
+    const freed = pruneSsrIslandFromRewritingClone(dest, entry);
+    if (freed > 0) {
+      console.log(
+        `[deploy] Pruned ${(freed / 1024 / 1024).toFixed(1)}MB of unroutable SSR modules from ${path.basename(dest)}.`,
+      );
+    }
+  }
 }
 
 function patchNetlifyFunctionEntry(
@@ -672,6 +1377,7 @@ function patchNetlifyFunctionEntry(
   app: string,
   workspaceApps: WorkspaceAppManifestEntry[],
   staticDir: string,
+  workspaceAuthMode: "shared" | "isolated",
 ): void {
   const serverPath = path.join(functionDir, "server.mjs");
   if (!fs.existsSync(serverPath)) return;
@@ -682,10 +1388,30 @@ function patchNetlifyFunctionEntry(
     workspaceApps,
     app,
   );
+  const callbackApp = workspaceOAuthCallbackApp(workspaceApps);
+  const rootGoogleCallbackPath =
+    app === callbackApp && app !== "dispatch"
+      ? [WORKSPACE_ROOT_GOOGLE_CALLBACK_PATH]
+      : [];
   const pathConfig =
     app === "dispatch"
-      ? ["/_agent-native/*", "/.well-known/*", `${basePath}/*`]
-      : [basePath, `${basePath}/*`];
+      ? [
+          `${workspaceFrameworkRoutePrefix()}/*`,
+          "/.well-known/*",
+          `${basePath}/*`,
+        ]
+      : [
+          basePath,
+          `${basePath}.data`,
+          `${basePath}/*`,
+          ...workspaceOAuthDiscoveryRoutes(app).flatMap(
+            ({ path, descendants }) => [
+              path,
+              ...(descendants ? [`${path}/*`] : []),
+            ],
+          ),
+          ...rootGoogleCallbackPath,
+        ];
   const normalizeBasePathHelper =
     app === "dispatch"
       ? ""
@@ -696,6 +1422,10 @@ function normalizeBasePathArgs(args) {
     return args;
   }
   const url = new URL(request.url);
+  if (url.pathname === basePath + ".data") {
+    url.pathname = basePath + "/.data";
+    return [new Request(url, request), ...args.slice(1)];
+  }
   if (url.pathname === basePath || url.pathname === \`\${basePath}/\`) {
     url.pathname = \`\${basePath}//\`;
     return [new Request(url, request), ...args.slice(1)];
@@ -710,14 +1440,17 @@ function normalizeBasePathArgs(args) {
 function setBasePathEnv() {
   const processRef = globalThis.process ??= { env: {} };
   processRef.env ??= {};
+${workspaceDirectoryEnvSnippet(workspaceApps)}
   Object.assign(processRef.env, {
     AGENT_NATIVE_WORKSPACE: "1",
+    AGENT_NATIVE_WORKSPACE_AUTH_MODE: ${JSON.stringify(workspaceAuthMode)},
     AGENT_NATIVE_WORKSPACE_APP_ID: ${JSON.stringify(app)},
     APP_BASE_PATH: basePath,
     AGENT_NATIVE_WORKSPACE_APP_AUDIENCE: ${JSON.stringify(workspaceAppAudience)},
     AGENT_NATIVE_WORKSPACE_APP_PUBLIC_PATHS: ${JSON.stringify(JSON.stringify(workspaceAppRouteAccess.publicPaths))},
     AGENT_NATIVE_WORKSPACE_APP_PROTECTED_PATHS: ${JSON.stringify(JSON.stringify(workspaceAppRouteAccess.protectedPaths))},
     VITE_AGENT_NATIVE_WORKSPACE: "1",
+    VITE_AGENT_NATIVE_WORKSPACE_AUTH_MODE: ${JSON.stringify(workspaceAuthMode)},
     VITE_AGENT_NATIVE_WORKSPACE_APP_ID: ${JSON.stringify(app)},
     VITE_APP_BASE_PATH: basePath,
     VITE_AGENT_NATIVE_WORKSPACE_APP_AUDIENCE: ${JSON.stringify(workspaceAppAudience)},
@@ -726,6 +1459,7 @@ function setBasePathEnv() {
     VITE_AGENT_NATIVE_WORKSPACE_APPS_JSON: ${JSON.stringify(JSON.stringify(workspaceApps))},
     ${JSON.stringify(WORKSPACE_APPS_ENV_KEY)}: ${JSON.stringify(JSON.stringify(workspaceApps))},
   });
+${workspaceFrameworkRoutePrefixEnvSnippet()}
 }
 
 setBasePathEnv();
@@ -763,6 +1497,7 @@ function patchVercelFunctionEntry(
   functionDir: string,
   app: string,
   workspaceApps: WorkspaceAppManifestEntry[],
+  workspaceAuthMode: "shared" | "isolated",
 ): void {
   const entryPath = path.join(functionDir, "index.mjs");
   if (!fs.existsSync(entryPath)) return;
@@ -782,14 +1517,17 @@ function patchVercelFunctionEntry(
 function setBasePathEnv() {
   const processRef = globalThis.process ??= { env: {} };
   processRef.env ??= {};
+${workspaceDirectoryEnvSnippet(workspaceApps)}
   Object.assign(processRef.env, {
     AGENT_NATIVE_WORKSPACE: "1",
+    AGENT_NATIVE_WORKSPACE_AUTH_MODE: ${JSON.stringify(workspaceAuthMode)},
     AGENT_NATIVE_WORKSPACE_APP_ID: ${JSON.stringify(app)},
     APP_BASE_PATH: basePath,
     AGENT_NATIVE_WORKSPACE_APP_AUDIENCE: ${JSON.stringify(workspaceAppAudience)},
     AGENT_NATIVE_WORKSPACE_APP_PUBLIC_PATHS: ${JSON.stringify(JSON.stringify(workspaceAppRouteAccess.publicPaths))},
     AGENT_NATIVE_WORKSPACE_APP_PROTECTED_PATHS: ${JSON.stringify(JSON.stringify(workspaceAppRouteAccess.protectedPaths))},
     VITE_AGENT_NATIVE_WORKSPACE: "1",
+    VITE_AGENT_NATIVE_WORKSPACE_AUTH_MODE: ${JSON.stringify(workspaceAuthMode)},
     VITE_AGENT_NATIVE_WORKSPACE_APP_ID: ${JSON.stringify(app)},
     VITE_APP_BASE_PATH: basePath,
     VITE_AGENT_NATIVE_WORKSPACE_APP_AUDIENCE: ${JSON.stringify(workspaceAppAudience)},
@@ -798,6 +1536,7 @@ function setBasePathEnv() {
     VITE_AGENT_NATIVE_WORKSPACE_APPS_JSON: ${JSON.stringify(JSON.stringify(workspaceApps))},
     ${JSON.stringify(WORKSPACE_APPS_ENV_KEY)}: ${JSON.stringify(JSON.stringify(workspaceApps))},
   });
+${workspaceFrameworkRoutePrefixEnvSnippet()}
 }
 
 function normalizeBasePathArgs(args) {
@@ -806,6 +1545,10 @@ function normalizeBasePathArgs(args) {
 
   if (typeof Request === "function" && request instanceof Request) {
     const url = new URL(request.url);
+    if (url.pathname === basePath + ".data") {
+      url.pathname = basePath + "/.data";
+      return [new Request(url, request), ...args.slice(1)];
+    }
     if (url.pathname === basePath || url.pathname === \`\${basePath}/\`) {
       url.pathname = \`\${basePath}//\`;
       return [new Request(url, request), ...args.slice(1)];
@@ -815,6 +1558,10 @@ function normalizeBasePathArgs(args) {
 
   if (typeof request.url !== "string") return args;
   const url = new URL(request.url, "http://agent-native.local");
+  if (url.pathname === basePath + ".data") {
+    request.url = basePath + "/.data" + url.search;
+    return args;
+  }
   if (url.pathname === basePath || url.pathname === \`\${basePath}/\`) {
     request.url = \`\${basePath}//\${url.search}\`;
   }
@@ -825,10 +1572,20 @@ setBasePathEnv();
 
 let cachedHandler;
 
-export default async function handler(...args) {
-  setBasePathEnv();
-  cachedHandler ??= (await import("./main.mjs")).default;
-  return cachedHandler(...normalizeBasePathArgs(args));
+export default {
+  async fetch(...args) {
+    setBasePathEnv();
+    cachedHandler ??= (await import("./main.mjs")).default;
+    // Vercel invokes this { fetch } export web-style with a Web Request, and
+    // Nitro's Vercel entry is itself a web fetch handler ({ fetch }). Require that
+    // shape rather than forwarding a Web Request to a Node-style (req, res) handler.
+    if (typeof cachedHandler?.fetch !== "function") {
+      throw new Error(
+        "agent-native: Vercel workspace function expected a Web fetch handler ({ fetch }) from ./main.mjs",
+      );
+    }
+    return cachedHandler.fetch(...normalizeBasePathArgs(args));
+  },
 }
 `;
   fs.writeFileSync(entryPath, entry);
@@ -841,22 +1598,34 @@ function netlifyFunctionExcludedPaths(
   return [
     "/.netlify/*",
     `/${app}/assets/*`,
-    ...netlifyPublicRootAssetPaths(app, staticDir),
+    ...netlifyPublicAssetPaths(app, staticDir),
   ];
 }
 
-function netlifyPublicRootAssetPaths(app: string, staticDir: string): string[] {
+function netlifyPublicAssetPaths(app: string, staticDir: string): string[] {
   if (!fs.existsSync(staticDir)) return [];
-  return fs
-    .readdirSync(staticDir, { withFileTypes: true })
-    .filter((entry) => entry.isFile())
-    .map((entry) => entry.name)
-    .filter((name) => {
-      const ext = path.extname(name).slice(1).toLowerCase();
-      return NETLIFY_PUBLIC_ASSET_EXTENSIONS.has(ext);
-    })
+  const assetPaths: string[] = [];
+  const visit = (directory: string, relativeDirectory: string): void => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const relativePath = path.join(relativeDirectory, entry.name);
+      if (entry.isDirectory()) {
+        if (!relativeDirectory && entry.name === "assets") continue;
+        visit(path.join(directory, entry.name), relativePath);
+        continue;
+      }
+      const ext = path.extname(entry.name).slice(1).toLowerCase();
+      if (NETLIFY_PUBLIC_ASSET_EXTENSIONS.has(ext)) {
+        assetPaths.push(relativePath);
+      }
+    }
+  };
+  visit(staticDir, "");
+  return assetPaths
     .sort()
-    .map((name) => `/${app}/${encodeURI(name)}`);
+    .map(
+      (assetPath) =>
+        `/${app}/${encodeURI(assetPath.split(path.sep).join("/"))}`,
+    );
 }
 
 function netlifyFunctionsDir(workspaceRoot: string): string {
@@ -891,7 +1660,6 @@ function appUsesNetlifyUnpooledDatabaseUrl(appDir: string): boolean {
 
 function writeWorkspaceAppManifests(
   workspaceRoot: string,
-  distDir: string,
   apps: string[],
   workspaceApps: WorkspaceAppManifestEntry[],
   preset: WorkspaceDeployPreset,
@@ -915,25 +1683,16 @@ function writeWorkspaceAppManifests(
             WORKSPACE_APPS_MANIFEST_FILE,
           ),
         )
-      : preset === "vercel"
-        ? apps.map((app) =>
-            path.join(
-              workspaceRoot,
-              VERCEL_OUTPUT_DIR,
-              "functions",
-              `${app}-server.func`,
-              WORKSPACE_APPS_MANIFEST_DIR,
-              WORKSPACE_APPS_MANIFEST_FILE,
-            ),
-          )
-        : apps.map((app) =>
-            path.join(
-              distDir,
-              app,
-              WORKSPACE_APPS_MANIFEST_DIR,
-              WORKSPACE_APPS_MANIFEST_FILE,
-            ),
-          );
+      : apps.map((app) =>
+          path.join(
+            workspaceRoot,
+            VERCEL_OUTPUT_DIR,
+            "functions",
+            `${app}-server.func`,
+            WORKSPACE_APPS_MANIFEST_DIR,
+            WORKSPACE_APPS_MANIFEST_FILE,
+          ),
+        );
 
   for (const target of targets) {
     fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -941,51 +1700,153 @@ function writeWorkspaceAppManifests(
   }
 }
 
-function readWorkspaceAppManifest(
+function writeWorkspaceDirectoryPage(
+  outputDir: string,
+  apps: WorkspaceAppManifestEntry[],
+): void {
+  const accents = [
+    "AccentColor",
+    "LinkText",
+    "Mark",
+    "Highlight",
+    "ButtonText",
+  ];
+  const cards = apps
+    .map((app, index) => {
+      const name = escapeWorkspaceDirectoryHtml(app.name);
+      const description = escapeWorkspaceDirectoryHtml(
+        app.description || "A focused workspace app for your team.",
+      );
+      const href = escapeWorkspaceDirectoryHtml(`${app.path}/`);
+      const initial = escapeWorkspaceDirectoryHtml(app.name.charAt(0));
+      const accent = accents[index % accents.length];
+      return `<a class="app-card" href="${href}">
+  <span class="app-card__mark" style="--accent:${accent}" aria-hidden="true"><span>${initial}</span></span>
+  <span class="app-card__body"><strong>${name}</strong><span>${description}</span></span>
+  <span class="app-card__arrow" aria-hidden="true">↗</span>
+</a>`;
+    })
+    .join("\n");
+
+  const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Focused Agent-Native apps for the work ahead." />
+    <title>Agent-Native apps</title>
+    <style>
+      :root { color-scheme: light dark; --bg: Canvas; --ink: CanvasText; --muted: GrayText; --line: color-mix(in srgb, CanvasText 16%, Canvas); --card: Canvas; --soft: color-mix(in srgb, CanvasText 7%, Canvas); }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      a { color: inherit; }
+      .page { width: min(1180px, calc(100% - 48px)); margin: 0 auto; padding: 28px 0 72px; }
+      .topbar { display: flex; align-items: center; justify-content: space-between; padding: 4px 0 84px; }
+      .brand { display: inline-flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 650; letter-spacing: -.01em; text-decoration: none; }
+      .brand__mark { display: grid; width: 28px; height: 28px; place-items: center; border: 1px solid var(--ink); border-radius: 8px; }
+      .brand__mark::after { width: 10px; height: 10px; border-radius: 3px; background: var(--ink); content: ""; }
+      .topbar__label { color: var(--muted); font-size: 13px; }
+      .hero { max-width: 700px; padding-bottom: 52px; }
+      .eyebrow { margin: 0 0 14px; color: var(--muted); font-size: 12px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
+      h1 { max-width: 680px; margin: 0; font-size: clamp(42px, 7vw, 76px); font-weight: 580; letter-spacing: -.065em; line-height: .98; }
+      .hero__copy { max-width: 520px; margin: 24px 0 0; color: var(--muted); font-size: 17px; letter-spacing: -.01em; }
+      .app-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid var(--line); border-left: 1px solid var(--line); }
+      .app-card { position: relative; display: flex; min-height: 254px; flex-direction: column; gap: 22px; padding: 25px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--card); text-decoration: none; transition: background .18s ease, color .18s ease; }
+      .app-card:hover { background: var(--soft); }
+      .app-card:focus-visible { outline: 3px solid AccentColor; outline-offset: -3px; }
+      .app-card__mark { display: grid; width: 46px; height: 46px; place-items: center; border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line)); border-radius: 13px; background: color-mix(in srgb, var(--accent) 12%, var(--card)); color: var(--accent); font-size: 18px; font-weight: 700; letter-spacing: -.04em; }
+      .app-card__body { display: grid; gap: 8px; }
+      .app-card__body strong { font-size: 19px; font-weight: 620; letter-spacing: -.03em; }
+      .app-card__body span { max-width: 255px; color: var(--muted); line-height: 1.45; }
+      .app-card__arrow { margin-top: auto; color: var(--muted); font-size: 21px; line-height: 1; transition: color .18s ease, transform .18s ease; }
+      .app-card:hover .app-card__arrow { color: var(--ink); transform: translate(2px, -2px); }
+      @media (max-width: 900px) { .app-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+      @media (max-width: 600px) { .page { width: min(100% - 32px, 520px); padding-top: 20px; } .topbar { padding-bottom: 58px; } .hero { padding-bottom: 38px; } .app-grid { grid-template-columns: 1fr; } .app-card { min-height: 220px; } }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Agent-Native apps"><span class="brand__mark" aria-hidden="true"></span><span>Agent-Native</span></a>
+        <span class="topbar__label">Apps</span>
+      </header>
+      <section class="hero" aria-labelledby="page-title">
+        <p class="eyebrow">Agent-Native apps</p>
+        <h1 id="page-title">Pick the right app for the work ahead.</h1>
+        <p class="hero__copy">Focused tools that turn real signals into useful next steps - choose one to get started.</p>
+      </section>
+      <nav class="app-grid" aria-label="Apps">
+        ${cards}
+      </nav>
+    </main>
+  </body>
+</html>
+`;
+  fs.writeFileSync(path.join(outputDir, "index.html"), html);
+}
+
+function escapeWorkspaceDirectoryHtml(value: string): string {
+  return value.replace(
+    /[&<>"']/g,
+    (character) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      })[character] ?? character,
+  );
+}
+
+async function readWorkspaceAppManifest(
   workspaceRoot: string,
   apps: string[],
-): WorkspaceAppManifestEntry[] {
+  appsDir: string,
+): Promise<WorkspaceAppManifestEntry[]> {
   const explicitApps = readExistingWorkspaceAppManifest(workspaceRoot);
+  const entries: WorkspaceAppManifestEntry[] = [];
 
-  return apps
-    .map((app) => {
-      const appDir = path.join(workspaceRoot, "apps", app);
-      const pkg = readPackageJson(path.join(appDir, "package.json"));
-      const appPath = `/${app}`;
-      const explicit = explicitApps.get(app);
-      const url =
-        normalizeWorkspaceAppUrl(explicit?.url) ?? workspaceAppUrl(appPath);
-      const audience =
-        workspaceAppAudienceFromPackageJson(pkg) ??
-        explicit?.audience ??
-        DEFAULT_WORKSPACE_APP_AUDIENCE;
-      const packageRouteAccess = workspaceAppRouteAccessFromPackageJson(pkg);
-      // Prefer the package.json value whenever the field was set — including
-      // an explicit empty array, which is how a per-app package.json signals
-      // "clear any previously-published manifest override." Falling back on
-      // length > 0 would silently keep the explicit override even after the
-      // app owner blanked their list.
-      const publicPaths =
-        packageRouteAccess.publicPaths ?? explicit?.publicPaths ?? [];
-      const protectedPaths =
-        packageRouteAccess.protectedPaths ?? explicit?.protectedPaths ?? [];
-      return {
-        id: app,
-        name: pkg?.displayName || titleCase(app),
-        description: pkg?.description || "",
-        path: appPath,
-        ...(url ? { url } : {}),
-        isDispatch: app === "dispatch",
-        audience,
-        publicPaths,
-        protectedPaths,
-      };
-    })
-    .sort((a, b) => {
-      if (a.id === "dispatch") return -1;
-      if (b.id === "dispatch") return 1;
-      return a.name.localeCompare(b.name);
+  for (const app of apps) {
+    const appDir = path.join(appsDir, app);
+    const pkg = readPackageJson(path.join(appDir, "package.json"));
+    const appPath = `/${app}`;
+    const explicit = explicitApps.get(app);
+    const configuredHomePath = await readConfiguredWorkspaceAppHomePath(appDir);
+    const url =
+      normalizeWorkspaceAppUrl(explicit?.url) ?? workspaceAppUrl(appPath);
+    const audience =
+      workspaceAppAudienceFromPackageJson(pkg) ??
+      explicit?.audience ??
+      DEFAULT_WORKSPACE_APP_AUDIENCE;
+    const packageRouteAccess = workspaceAppRouteAccessFromPackageJson(pkg);
+    const publicPaths =
+      packageRouteAccess.publicPaths ?? explicit?.publicPaths ?? [];
+    const protectedPaths =
+      packageRouteAccess.protectedPaths ?? explicit?.protectedPaths ?? [];
+    entries.push({
+      id: app,
+      name: pkg?.displayName || titleCase(app),
+      description: pkg?.description || "",
+      path: appPath,
+      homePath: normalizeWorkspaceAppHomePath(
+        explicit?.homePath ??
+          configuredHomePath ??
+          inferWorkspaceAppRootHomePath(appDir),
+      ),
+      ...(url ? { url } : {}),
+      isDispatch: app === "dispatch",
+      audience,
+      publicPaths,
+      protectedPaths,
     });
+  }
+
+  return entries.sort((a, b) => {
+    if (a.id === "dispatch") return -1;
+    if (b.id === "dispatch") return 1;
+    return a.name.localeCompare(b.name);
+  });
 }
 
 function readExistingWorkspaceAppManifest(
@@ -1042,6 +1903,10 @@ function parseWorkspaceAppsManifest(
       const id = typeof e.id === "string" ? e.id.trim() : "";
       if (!id) return null;
       const url = normalizeWorkspaceAppUrl(e.url);
+      const hasHomePath = Object.prototype.hasOwnProperty.call(e, "homePath");
+      const homePath = hasHomePath
+        ? normalizeWorkspaceAppHomePath(e.homePath)
+        : undefined;
       const audience =
         e.audience === undefined
           ? undefined
@@ -1051,6 +1916,7 @@ function parseWorkspaceAppsManifest(
       return {
         id,
         ...(url ? { url } : {}),
+        ...(homePath ? { homePath } : {}),
         ...(audience ? { audience } : {}),
         ...(publicPaths.length > 0 ? { publicPaths } : {}),
         ...(protectedPaths.length > 0 ? { protectedPaths } : {}),
@@ -1109,11 +1975,6 @@ function isLoopbackOrigin(origin: string | undefined): boolean {
 function workspaceOAuthOrigin(
   workspaceGatewayUrl: string | null,
 ): string | undefined {
-  // Explicit overrides (env vars set by the operator) win even if they happen
-  // to be loopback — that's a deliberate dev-against-prod choice.
-  // The gateway-URL fallback, however, is auto-resolved and would silently
-  // send users to localhost if the configured gateway is loopback in a
-  // production deploy. Strip loopback there so OAuth fails loudly instead.
   const gatewayFallback = normalizeOrigin(workspaceGatewayUrl);
   return (
     normalizeOrigin(process.env.VITE_WORKSPACE_OAUTH_ORIGIN) ||
@@ -1182,7 +2043,7 @@ function resolvePreset(
     optionPreset ??
     parsePresetArg(args) ??
     normalizePreset(process.env.NITRO_PRESET) ??
-    "cloudflare_pages"
+    "netlify"
   );
 }
 
@@ -1218,9 +2079,6 @@ function isProductionWorkspaceDeploy(opts: {
   ) {
     return true;
   }
-  if (opts.preset === "cloudflare_pages" && process.env.CF_PAGES === "1") {
-    return true;
-  }
   if (opts.preset === "vercel" && process.env.VERCEL === "1") {
     return true;
   }
@@ -1232,17 +2090,15 @@ function normalizePreset(
 ): WorkspaceDeployPreset | null {
   if (!value) return null;
   if (value === "cloudflare_pages" || value === "cloudflare-pages") {
-    return "cloudflare_pages";
+    throw new Error(
+      `Unsupported workspace deploy preset "${value}". Cloudflare Pages was removed. Supported presets: netlify, vercel. For standalone Cloudflare Workers use NITRO_PRESET=cloudflare_module.`,
+    );
   }
   if (value === "netlify") return "netlify";
   if (value === "vercel") return "vercel";
   throw new Error(
-    `Unsupported workspace deploy preset "${value}". Supported presets: cloudflare_pages, netlify, vercel.`,
+    `Unsupported workspace deploy preset "${value}". Supported presets: netlify, vercel.`,
   );
-}
-
-function moduleIdent(app: string): string {
-  return "app_" + app.replace(/[^a-zA-Z0-9_]/g, "_");
 }
 
 function workspaceAppAudienceForApp(

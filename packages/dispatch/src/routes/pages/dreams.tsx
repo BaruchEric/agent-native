@@ -1,14 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "react-router";
-import { useActionMutation, useActionQuery } from "@agent-native/core/client";
-import { toast } from "sonner";
+import {
+  useActionMutation,
+  useActionQuery,
+} from "@agent-native/core/client/hooks";
 import {
   IconAlertTriangle,
-  IconBrain,
   IconCalendarTime,
   IconCheck,
-  IconCircleDashed,
-  IconClock,
   IconDatabase,
   IconFileDiff,
   IconPlayerPlay,
@@ -16,20 +13,24 @@ import {
   IconSettings,
   IconX,
 } from "@tabler/icons-react";
-import { DispatchShell } from "@/components/dispatch-shell";
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router";
+import { toast } from "sonner";
+
+import { DispatchShell } from "../../components/dispatch-shell";
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
-} from "@/components/ui/accordion";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { Separator } from "@/components/ui/separator";
+} from "../../components/ui/accordion";
+import { Alert, AlertDescription, AlertTitle } from "../../components/ui/alert";
+import { Badge } from "../../components/ui/badge";
+import { Button } from "../../components/ui/button";
+import { Input } from "../../components/ui/input";
+import { Label } from "../../components/ui/label";
+import { ScrollArea } from "../../components/ui/scroll-area";
+import { Separator } from "../../components/ui/separator";
 import {
   Sheet,
   SheetContent,
@@ -38,10 +39,10 @@ import {
   SheetHeader,
   SheetTitle,
   SheetTrigger,
-} from "@/components/ui/sheet";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Spinner } from "@/components/ui/spinner";
-import { Switch } from "@/components/ui/switch";
+} from "../../components/ui/sheet";
+import { Skeleton } from "../../components/ui/skeleton";
+import { Spinner } from "../../components/ui/spinner";
+import { Switch } from "../../components/ui/switch";
 import {
   Table,
   TableBody,
@@ -49,10 +50,15 @@ import {
   TableHead,
   TableHeader,
   TableRow,
-} from "@/components/ui/table";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Textarea } from "@/components/ui/textarea";
-import { cn } from "@/lib/utils";
+} from "../../components/ui/table";
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "../../components/ui/tabs";
+import { Textarea } from "../../components/ui/textarea";
+import { cn } from "../../lib/utils";
 import {
   dreamSettingsToDraft,
   dreamSettingsUpdateFromDraft,
@@ -73,7 +79,7 @@ type DreamStatus =
   | "applied"
   | "rejected"
   | "stale"
-  | string;
+  | (string & {});
 
 interface DreamPass {
   id: string;
@@ -176,7 +182,7 @@ interface CandidateRun {
 interface DreamSourceHealth {
   sourceId: string;
   label?: string | null;
-  status: "ok" | "timed_out" | "error" | string;
+  status: "ok" | "timed_out" | "error" | (string & {});
   startedAt?: number | string | null;
   completedAt?: number | string | null;
   durationMs: number;
@@ -246,7 +252,7 @@ interface ProposalMutationParams {
 }
 
 interface DreamProposalPreview {
-  operation?: "create" | "update" | "append" | string;
+  operation?: "create" | "update" | "append" | (string & {});
   targetExists?: boolean;
   currentContent?: string | null;
   proposedContent?: string | null;
@@ -480,7 +486,11 @@ function QueryState({ error, label }: { error: unknown; label: string }) {
       <IconAlertTriangle className="h-4 w-4" />
       <AlertTitle>{label}</AlertTitle>
       <AlertDescription>
-        {error instanceof Error ? error.message : String(error)}
+        {error instanceof Error
+          ? error.message
+          : typeof error === "string" || typeof error === "number"
+            ? String(error)
+            : JSON.stringify(error)}
       </AlertDescription>
     </Alert>
   );
@@ -535,32 +545,6 @@ function ProposalSkeleton() {
           <Skeleton className="mt-2 h-3 w-3/4" />
         </div>
       ))}
-    </div>
-  );
-}
-
-function StatTile({
-  label,
-  value,
-  icon: Icon,
-}: {
-  label: string;
-  value: string | number;
-  icon: typeof IconBrain;
-}) {
-  return (
-    <div className="rounded-lg border bg-card px-3 py-2.5">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-            {label}
-          </div>
-          <div className="mt-1 text-xl font-semibold tabular-nums text-foreground">
-            {value}
-          </div>
-        </div>
-        <Icon size={18} className="text-muted-foreground" />
-      </div>
     </div>
   );
 }
@@ -858,7 +842,7 @@ function ProposalCard({
   const preview = previewQuery.data;
 
   return (
-    <div className="rounded-lg border bg-card">
+    <div className="rounded-lg bg-card">
       <div className="flex flex-col gap-3 border-b px-4 py-3 md:flex-row md:items-start md:justify-between">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
@@ -1236,16 +1220,33 @@ export default function DreamsRoute() {
       setSelectedDreamId(urlDreamId);
       return;
     }
-    if (selectedDreamId && dreams.some((dream) => dream.id === selectedDreamId))
+    if (
+      selectedDreamId &&
+      dreams.some((dream) => dream.id === selectedDreamId)
+    ) {
       return;
+    }
+    if (dreamsQuery.isLoading) return;
+    if (dreamsQuery.error) return;
     const nextId = dreams[0]?.id ?? null;
     setSelectedDreamId(nextId);
     if (nextId && nextId !== urlDreamId) {
       const next = new URLSearchParams(searchParams);
       next.set("dreamId", nextId);
       setSearchParams(next, { replace: true });
+    } else if (!nextId && urlDreamId) {
+      const next = new URLSearchParams(searchParams);
+      next.delete("dreamId");
+      setSearchParams(next, { replace: true });
     }
-  }, [dreams, searchParams, selectedDreamId, setSearchParams]);
+  }, [
+    dreams,
+    dreamsQuery.isLoading,
+    dreamsQuery.error,
+    searchParams,
+    selectedDreamId,
+    setSearchParams,
+  ]);
 
   function selectDream(dreamId: string) {
     setSelectedDreamId(dreamId);
@@ -1275,8 +1276,8 @@ export default function DreamsRoute() {
             ? "Approval requested"
             : "Proposal applied",
         );
-        dreamDetailQuery.refetch();
-        dreamsQuery.refetch();
+        void dreamDetailQuery.refetch();
+        void dreamsQuery.refetch();
       },
       onError: (err) => toast.error(String(err)),
     },
@@ -1287,8 +1288,8 @@ export default function DreamsRoute() {
     {
       onSuccess: () => {
         toast.success("Proposal rejected");
-        dreamDetailQuery.refetch();
-        dreamsQuery.refetch();
+        void dreamDetailQuery.refetch();
+        void dreamsQuery.refetch();
       },
       onError: (err) => toast.error(String(err)),
     },
@@ -1299,7 +1300,7 @@ export default function DreamsRoute() {
   >("ensure-dream-job", {
     onSuccess: () => {
       toast.success("Dream schedule updated");
-      dreamSettingsQuery.refetch();
+      void dreamSettingsQuery.refetch();
     },
     onError: (err) => toast.error(String(err)),
   });
@@ -1311,8 +1312,8 @@ export default function DreamsRoute() {
       toast.success("Dream settings saved");
       setSettingsDraft(dreamSettingsToDraft(settings));
       setSettingsOpen(false);
-      dreamSettingsQuery.refetch();
-      candidatesQuery.refetch();
+      void dreamSettingsQuery.refetch();
+      void candidatesQuery.refetch();
     },
     onError: (err) => toast.error(String(err)),
   });
@@ -1321,13 +1322,12 @@ export default function DreamsRoute() {
   const dreamSettings = dreamSettingsQuery.data ?? null;
   const selectedDream =
     detail?.dream ?? dreams.find((dream) => dream.id === selectedDreamId);
-  const proposals = detail?.proposals ?? [];
-  const inspectedRuns = detail?.inspectedRuns ?? detail?.candidates ?? [];
-  const selectedSourceHealth = selectedDream?.sourceHealth ?? [];
-  const pendingProposalCount = proposals.filter(
-    (proposal) =>
-      String(proposal.status || "pending").toLowerCase() === "pending",
-  ).length;
+  const proposals: DreamProposal[] = detail?.proposals ?? [];
+  const inspectedRuns: CandidateRun[] =
+    detail?.inspectedRuns ?? detail?.candidates ?? [];
+  const evidenceItems: DreamEvidence[] = detail?.evidence ?? [];
+  const selectedSourceHealth: DreamSourceHealth[] =
+    selectedDream?.sourceHealth ?? [];
   const appliedProposalCount = proposals.filter(
     (proposal) => String(proposal.status || "").toLowerCase() === "applied",
   ).length;
@@ -1394,32 +1394,10 @@ export default function DreamsRoute() {
       description="Review agent runs, propose memory improvements, and apply evidence-backed learning changes."
     >
       <div className="space-y-4">
-        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-          <div className="grid flex-1 gap-2 sm:grid-cols-2 xl:grid-cols-4">
-            <StatTile
-              label="Dream passes"
-              value={dreams.length}
-              icon={IconBrain}
-            />
-            <StatTile
-              label="Pending proposals"
-              value={pendingProposalCount}
-              icon={IconCircleDashed}
-            />
-            <StatTile
-              label="Candidate runs"
-              value={candidates.length}
-              icon={IconClock}
-            />
-            <StatTile
-              label="Inspected threads"
-              value={selectedDream ? dreamInspectedCount(selectedDream) : 0}
-              icon={IconCheck}
-            />
-          </div>
-          <div className="flex shrink-0 flex-wrap gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-3">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
             {dreamSettings ? (
-              <Badge variant="outline" className="h-9 px-3">
+              <Badge variant="outline" className="max-w-full truncate">
                 {dreamSettings.enabled ? "Enabled" : "Paused"} ·{" "}
                 {dreamSettings.allSources
                   ? "All sources"
@@ -1427,6 +1405,11 @@ export default function DreamsRoute() {
                 · {dreamSettings.schedule}
               </Badge>
             ) : null}
+            <span className="text-xs text-muted-foreground">
+              {dreams.length} passes · {candidates.length} candidate runs
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
             <DreamSettingsSheet
               open={settingsOpen}
               onOpenChange={handleSettingsOpenChange}
@@ -1439,9 +1422,9 @@ export default function DreamsRoute() {
             <Button
               variant="outline"
               onClick={() => {
-                dreamsQuery.refetch();
-                candidatesQuery.refetch();
-                if (selectedDreamId) dreamDetailQuery.refetch();
+                void dreamsQuery.refetch();
+                void candidatesQuery.refetch();
+                if (selectedDreamId) void dreamDetailQuery.refetch();
               }}
             >
               <IconRefresh size={15} className="mr-1.5" />
@@ -1485,8 +1468,8 @@ export default function DreamsRoute() {
           </div>
         </div>
 
-        <div className="grid gap-4 xl:grid-cols-[280px_minmax(0,1fr)_380px]">
-          <section className="rounded-lg border bg-card">
+        <div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
+          <section className="min-w-0 rounded-lg bg-card">
             <div className="border-b px-4 py-3">
               <div className="text-sm font-semibold text-foreground">
                 Recent passes
@@ -1562,7 +1545,7 @@ export default function DreamsRoute() {
             </div>
           </section>
 
-          <section className="min-w-0 rounded-lg border bg-card">
+          <section className="min-w-0 rounded-lg bg-card">
             <div className="border-b px-4 py-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="min-w-0">
@@ -1668,7 +1651,7 @@ export default function DreamsRoute() {
                         <SourceHealthPanel sources={selectedSourceHealth} />
                       </div>
                     ) : null}
-                    {inspectedRuns.length > 0 || detail?.evidence?.length ? (
+                    {inspectedRuns.length > 0 || evidenceItems.length ? (
                       <Accordion type="multiple" className="rounded-lg border">
                         {inspectedRuns.map((run, index) => (
                           <AccordionItem
@@ -1710,7 +1693,7 @@ export default function DreamsRoute() {
                             </AccordionContent>
                           </AccordionItem>
                         ))}
-                        {(detail?.evidence ?? []).map((item, index) => (
+                        {evidenceItems.map((item, index) => (
                           <AccordionItem
                             key={item.id || `evidence-${index}`}
                             value={item.id || `evidence-${index}`}
@@ -1736,92 +1719,92 @@ export default function DreamsRoute() {
               ) : null}
             </div>
           </section>
+        </div>
 
-          <section className="rounded-lg border bg-card">
-            <div className="border-b px-4 py-3">
-              <div>
-                <div className="text-sm font-semibold text-foreground">
-                  Candidate runs
-                </div>
-                <div className="mt-1 text-xs text-muted-foreground">
-                  Grounded signals ready for review.
-                </div>
+        <section className="min-w-0 rounded-lg bg-card">
+          <div className="border-b px-4 py-3">
+            <div>
+              <div className="text-sm font-semibold text-foreground">
+                Candidate runs
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                Grounded signals ready for review.
               </div>
             </div>
-            <div className="max-h-[720px] overflow-auto p-3">
-              <QueryState
-                error={candidatesQuery.error}
-                label="Could not load candidates"
-              />
-              {candidatesQuery.isLoading ? <DreamListSkeleton /> : null}
-              {!candidatesQuery.isLoading &&
-              !candidatesQuery.error &&
-              candidateSourceHealth.length > 0 ? (
-                <div className="mb-3">
-                  <SourceHealthPanel sources={candidateSourceHealth} />
-                </div>
-              ) : null}
-              {!candidatesQuery.isLoading && !candidatesQuery.error ? (
-                candidates.length > 0 ? (
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Run</TableHead>
-                        <TableHead>Signals</TableHead>
-                        <TableHead className="w-20 text-right">Score</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {candidates.map((candidate) => {
-                        const id = candidateId(candidate);
-                        const signals = candidateSignals(candidate);
-                        return (
-                          <TableRow key={id}>
-                            <TableCell className="min-w-0 py-3">
-                              <div className="max-w-[230px] truncate text-sm font-medium text-foreground">
-                                {candidateLabel(candidate)}
-                              </div>
-                              <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
-                                {candidate.thread?.id ??
-                                  candidate.threadId ??
-                                  candidate.runId ??
-                                  id}
-                              </div>
-                              <div className="mt-1 text-[11px] text-muted-foreground">
-                                {candidateOwner(candidate)} ·{" "}
-                                {compactDate(candidateUpdatedAt(candidate))}
-                              </div>
-                            </TableCell>
-                            <TableCell className="py-3">
-                              <div className="mt-1 flex flex-wrap gap-1">
-                                <Badge variant="outline">
-                                  {candidateStatus(candidate)}
+          </div>
+          <div className="max-h-[720px] overflow-auto p-3">
+            <QueryState
+              error={candidatesQuery.error}
+              label="Could not load candidates"
+            />
+            {candidatesQuery.isLoading ? <DreamListSkeleton /> : null}
+            {!candidatesQuery.isLoading &&
+            !candidatesQuery.error &&
+            candidateSourceHealth.length > 0 ? (
+              <div className="mb-3">
+                <SourceHealthPanel sources={candidateSourceHealth} />
+              </div>
+            ) : null}
+            {!candidatesQuery.isLoading && !candidatesQuery.error ? (
+              candidates.length > 0 ? (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Run</TableHead>
+                      <TableHead>Signals</TableHead>
+                      <TableHead className="w-20 text-right">Score</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {candidates.map((candidate) => {
+                      const id = candidateId(candidate);
+                      const signals = candidateSignals(candidate);
+                      return (
+                        <TableRow key={id}>
+                          <TableCell className="min-w-0 py-3">
+                            <div className="max-w-[230px] truncate text-sm font-medium text-foreground">
+                              {candidateLabel(candidate)}
+                            </div>
+                            <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
+                              {candidate.thread?.id ??
+                                candidate.threadId ??
+                                candidate.runId ??
+                                id}
+                            </div>
+                            <div className="mt-1 text-[11px] text-muted-foreground">
+                              {candidateOwner(candidate)} ·{" "}
+                              {compactDate(candidateUpdatedAt(candidate))}
+                            </div>
+                          </TableCell>
+                          <TableCell className="py-3">
+                            <div className="mt-1 flex flex-wrap gap-1">
+                              <Badge variant="outline">
+                                {candidateStatus(candidate)}
+                              </Badge>
+                              {signals.slice(0, 2).map((signal) => (
+                                <Badge key={signal} variant="secondary">
+                                  {signal}
                                 </Badge>
-                                {signals.slice(0, 2).map((signal) => (
-                                  <Badge key={signal} variant="secondary">
-                                    {signal}
-                                  </Badge>
-                                ))}
-                              </div>
-                            </TableCell>
-                            <TableCell className="py-3 text-right text-sm tabular-nums text-muted-foreground">
-                              {candidate.score ?? "n/a"}
-                            </TableCell>
-                          </TableRow>
-                        );
-                      })}
-                    </TableBody>
-                  </Table>
-                ) : (
-                  <EmptyPanel
-                    title="No candidates"
-                    description="No recent runs matched the dream candidate heuristics."
-                  />
-                )
-              ) : null}
-            </div>
-          </section>
-        </div>
+                              ))}
+                            </div>
+                          </TableCell>
+                          <TableCell className="py-3 text-right text-sm tabular-nums text-muted-foreground">
+                            {candidate.score ?? "n/a"}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              ) : (
+                <EmptyPanel
+                  title="No candidates"
+                  description="No recent runs matched the dream candidate heuristics."
+                />
+              )
+            ) : null}
+          </div>
+        </section>
       </div>
     </DispatchShell>
   );

@@ -1,29 +1,24 @@
 import { useEffect, useMemo, useRef } from "react";
+
 import { cn } from "@/lib/utils";
+import type { FilmstripFrame, FilmstripSprite } from "@/lib/video-filmstrip";
 import type { WaveformPeaks } from "@/lib/waveform-peaks";
 
+import { getTimelineTotalWidth } from "./timeline-geometry";
+
 export interface WaveformProps {
-  /** Peaks computed via `computePeaks()`. */
   peaks: WaveformPeaks | null;
-  /** Width in px of the viewport (the scroll container). */
+  sprite?: FilmstripSprite | null;
+  frames?: FilmstripFrame[];
   width: number;
-  /** Height in px. */
   height?: number;
-  /** Horizontal zoom — 1 = fit; up to 50x per editor spec. */
   zoom?: number;
-  /** Current playhead in original ms. */
   playheadMs: number;
-  /** Total duration in ms. */
   durationMs: number;
-  /** Excluded ranges (original time) — drawn as striped overlays. */
   excludedRanges?: Array<{ startMs: number; endMs: number }>;
-  /** Optional selection range (original time) highlighted in brand color. */
-  selectionRange?: { startMs: number; endMs: number } | null;
-  /** Transcript-backed activity ranges used when browser audio decoding fails. */
   activityRanges?: Array<{ startMs: number; endMs: number }>;
-  /** Click handler — returns the original ms at the click position. */
   onSeek?: (originalMs: number) => void;
-  /** Called on scroll so the parent can sync ruler / chapter markers. */
+  scrollLeft?: number;
   onScroll?: (scrollLeft: number, totalWidth: number) => void;
   className?: string;
 }
@@ -44,14 +39,24 @@ const getBrandColorAlpha = (alpha: number) => {
   return v ? `hsl(${v} / ${alpha})` : `rgba(15, 23, 42, ${alpha})`;
 };
 
-const getWaveColor = () => getBrandColorAlpha(0.55);
-const getWaveBg = () => getBrandColorAlpha(0.12);
-const EXCLUDED_FILL = "rgba(15, 23, 42, 0.72)";
-const EXCLUDED_STROKE = "rgba(148, 163, 184, 0.45)";
+const getWaveColor = (overImagery = false) =>
+  getBrandColorAlpha(overImagery ? 0.98 : 0.85);
+const getQuietColor = (overImagery = false) =>
+  // guard:allow-raw-color — as above: read against the frames, not the theme.
+  overImagery ? "rgba(226, 232, 240, 0.45)" : getBrandColorAlpha(0.2);
+const getWaveBg = () => getBrandColorAlpha(0.08);
+/** Darkens the band behind the bars when they sit over filmstrip frames. */
+// guard:allow-raw-color — a scrim over video frames, which are whatever the recording holds; it has to darken them in either theme.
+const WAVE_SCRIM = "rgba(2, 6, 23, 0.46)";
+const EXCLUDED_FILL = "rgba(15, 23, 42, 0.65)";
+const EXCLUDED_STROKE = "rgba(148, 163, 184, 0.4)";
+const EMPTY_FRAMES: FilmstripFrame[] = [];
 const VISUAL_TARGET_PEAK = 0.78;
 const VISUAL_MAX_GAIN = 24;
 const VISUAL_GAIN_PERCENTILE = 0.95;
 const VISUAL_SILENCE_FLOOR = 0.001;
+
+const MAX_CANVAS_PIXELS_WIDTH = 4096;
 
 function clampSample(value: number): number {
   return Math.max(-1, Math.min(1, value));
@@ -75,114 +80,168 @@ function computeVisualGain(samples: number[]): number {
   return Math.min(VISUAL_MAX_GAIN, VISUAL_TARGET_PEAK / reference);
 }
 
-/** Canvas-rendered waveform. Supports up to 50x zoom with horizontal scroll. */
+function drawPillBar(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+) {
+  const radius = Math.min(width / 2, height / 2);
+  ctx.beginPath();
+  if (typeof ctx.roundRect === "function") {
+    ctx.roundRect(x, y, width, height, radius);
+  } else {
+    ctx.rect(x, y, width, height);
+  }
+  ctx.fill();
+}
+
 export function Waveform({
   peaks,
+  sprite,
+  frames = EMPTY_FRAMES,
   width,
   height = 120,
   zoom = 1,
   playheadMs,
   durationMs,
   excludedRanges,
-  selectionRange,
   activityRanges = [],
   onSeek,
+  scrollLeft = 0,
   onScroll,
   className,
 }: WaveformProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  // The total drawable width (scrolls horizontally). zoom=1 fits exactly.
-  const totalWidth = Math.max(width, Math.floor(width * Math.max(1, zoom)));
+  const totalWidth = getTimelineTotalWidth(width, zoom);
 
-  // Re-draw whenever peaks, size, or excluded ranges change.
+  const spriteCells = useMemo(() => {
+    if (!sprite?.url || sprite.frameCount <= 0 || sprite.columns <= 0)
+      return [];
+    const aspect =
+      sprite.frameHeight > 0 ? sprite.frameWidth / sprite.frameHeight : 16 / 9;
+    const cellWidth = Math.max(24, height * aspect);
+    const count = Math.max(
+      1,
+      Math.min(sprite.frameCount, Math.round(totalWidth / cellWidth)),
+    );
+    return Array.from({ length: count }, (_, i) => {
+      const frame = Math.min(
+        sprite.frameCount - 1,
+        Math.floor(((i + 0.5) * sprite.frameCount) / count),
+      );
+      return {
+        key: `${i}-${frame}`,
+        column: frame % sprite.columns,
+        row: Math.floor(frame / sprite.columns),
+      };
+    });
+  }, [sprite, totalWidth, height]);
+
+  const hasImagery = spriteCells.length > 0 || frames.length > 0;
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const next = Math.max(0, Math.min(scrollLeft, totalWidth - width));
+    if (Math.abs(el.scrollLeft - next) > 0.5) {
+      el.scrollLeft = next;
+    }
+  }, [scrollLeft, totalWidth, width]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.floor(totalWidth * dpr);
+    canvas.width = Math.min(
+      MAX_CANVAS_PIXELS_WIDTH,
+      Math.floor(totalWidth * dpr),
+    );
     canvas.height = Math.floor(height * dpr);
     canvas.style.width = `${totalWidth}px`;
     canvas.style.height = `${height}px`;
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    // Background
-    ctx.fillStyle = getWaveBg();
-    ctx.fillRect(0, 0, totalWidth, height);
+    const scaleX = canvas.width / totalWidth;
+    ctx.setTransform(scaleX, 0, 0, dpr, 0, 0);
 
     const hasPeaks = Boolean(
       peaks?.bucketCount &&
       peaks.peaks.some((value) => Math.abs(value) > 0.0001),
     );
 
+    ctx.clearRect(0, 0, totalWidth, height);
+    if (hasImagery) {
+      const bandHeight = Math.min(height, Math.max(28, height * 0.62));
+      ctx.fillStyle = WAVE_SCRIM;
+      ctx.fillRect(0, (height - bandHeight) / 2, totalWidth, bandHeight);
+    } else {
+      ctx.fillStyle = getWaveBg();
+      ctx.fillRect(0, 0, totalWidth, height);
+    }
+
+    const barWidth = 3;
+    const barGap = 1.5;
+    const step = barWidth + barGap;
+    const barCount = Math.floor(totalWidth / step);
+    const maxWaveHeight = Math.min(height * 0.5, 52);
+    const minBarHeight = 3;
+    const midY = height / 2;
+
     if (peaks && hasPeaks) {
-      // Map each x pixel to a bucket range. Use a visual-only auto-gain so
-      // quiet microphone recordings still read clearly in the trim track.
-      const mid = height / 2;
       const visualGain = computeVisualGain(peaks.peaks);
-      ctx.strokeStyle = getWaveColor();
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      const bucketsPerPx = peaks.bucketCount / totalWidth;
-      for (let x = 0; x < totalWidth; x++) {
-        const startBucket = Math.floor(x * bucketsPerPx);
+      const bucketsPerBar = peaks.bucketCount / barCount;
+
+      for (let i = 0; i < barCount; i++) {
+        const x = i * step;
+        const startBucket = Math.floor(i * bucketsPerBar);
         const endBucket = Math.max(
           startBucket + 1,
-          Math.floor((x + 1) * bucketsPerPx),
+          Math.floor((i + 1) * bucketsPerBar),
         );
-        let min = 0;
-        let max = 0;
-        for (let b = startBucket; b < endBucket && b < peaks.bucketCount; b++) {
-          const lo = peaks.peaks[b * 2];
-          const hi = peaks.peaks[b * 2 + 1];
-          if (lo < min) min = lo;
-          if (hi > max) max = hi;
-        }
-        let topY = mid + clampSample(min * visualGain) * mid * 0.95;
-        let botY = mid + clampSample(max * visualGain) * mid * 0.95;
-        if (
-          Math.max(Math.abs(min), Math.abs(max)) > VISUAL_SILENCE_FLOOR &&
-          botY - topY < 2
-        ) {
-          const centerY = (topY + botY) / 2;
-          topY = centerY - 1;
-          botY = centerY + 1;
-        }
-        ctx.moveTo(x + 0.5, topY);
-        ctx.lineTo(x + 0.5, botY);
-      }
-      ctx.stroke();
-    } else {
-      const mid = height / 2;
-      ctx.strokeStyle = getBrandColorAlpha(0.2);
-      ctx.lineWidth = 1;
-      ctx.setLineDash([3, 6]);
-      ctx.beginPath();
-      ctx.moveTo(0, mid);
-      ctx.lineTo(totalWidth, mid);
-      ctx.stroke();
-      ctx.setLineDash([]);
 
-      if (activityRanges.length) {
-        const blockHeight = Math.max(18, Math.min(32, height * 0.32));
-        const top = mid - blockHeight / 2;
-        ctx.fillStyle = getBrandColorAlpha(0.24);
-        for (const range of activityRanges) {
-          const xStart =
-            (Math.max(0, range.startMs) / Math.max(durationMs, 1)) * totalWidth;
-          const xEnd =
-            (Math.min(durationMs, range.endMs) / Math.max(durationMs, 1)) *
-            totalWidth;
-          ctx.fillRect(xStart, top, Math.max(2, xEnd - xStart), blockHeight);
+        let maxAmp = 0;
+        for (let b = startBucket; b < endBucket && b < peaks.bucketCount; b++) {
+          const lo = Math.abs(peaks.peaks[b * 2] ?? 0);
+          const hi = Math.abs(peaks.peaks[b * 2 + 1] ?? 0);
+          if (lo > maxAmp) maxAmp = lo;
+          if (hi > maxAmp) maxAmp = hi;
         }
+
+        const scaledAmp = clampSample(maxAmp * visualGain);
+        const barHeight = Math.max(minBarHeight, scaledAmp * maxWaveHeight);
+        const topY = midY - barHeight / 2;
+
+        ctx.fillStyle =
+          maxAmp > VISUAL_SILENCE_FLOOR
+            ? getWaveColor(hasImagery)
+            : getQuietColor(hasImagery);
+
+        drawPillBar(ctx, x, topY, barWidth, barHeight);
+      }
+    } else {
+      for (let i = 0; i < barCount; i++) {
+        const x = i * step;
+        const barMs = (i / Math.max(1, barCount)) * durationMs;
+        const inActivity = activityRanges.some(
+          (r) => barMs >= r.startMs && barMs <= r.endMs,
+        );
+
+        const barHeight = inActivity ? 12 : minBarHeight;
+        const topY = midY - barHeight / 2;
+
+        ctx.fillStyle = inActivity
+          ? getWaveColor(hasImagery)
+          : getQuietColor(hasImagery);
+
+        drawPillBar(ctx, x, topY, barWidth, barHeight);
       }
     }
 
-    // Excluded ranges — dimmed striped overlay
     if (excludedRanges?.length) {
       for (const r of excludedRanges) {
         const xStart = (r.startMs / Math.max(durationMs, 1)) * totalWidth;
@@ -204,43 +263,60 @@ export function Waveform({
         ctx.restore();
       }
     }
-
-    // Selection overlay
-    if (selectionRange) {
-      const xStart =
-        (Math.min(selectionRange.startMs, selectionRange.endMs) /
-          Math.max(durationMs, 1)) *
-        totalWidth;
-      const xEnd =
-        (Math.max(selectionRange.startMs, selectionRange.endMs) /
-          Math.max(durationMs, 1)) *
-        totalWidth;
-      ctx.fillStyle = getBrandColorAlpha(0.28);
-      ctx.fillRect(xStart, 0, xEnd - xStart, height);
-      ctx.strokeStyle = getBrandColor();
-      ctx.lineWidth = 1;
-      ctx.strokeRect(xStart + 0.5, 0.5, xEnd - xStart - 1, height - 1);
-    }
   }, [
     peaks,
+    hasImagery,
     totalWidth,
     height,
     excludedRanges,
-    selectionRange,
     durationMs,
     activityRanges,
   ]);
 
-  const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
+  const scrubRef = useRef<{ pointerId: number; startX: number } | null>(null);
+
+  const seekToEvent = (
+    e: React.PointerEvent<HTMLDivElement> | React.MouseEvent<HTMLDivElement>, // i18n-ignore
+  ) => {
     if (!onSeek) return;
-    const rect = (
-      e.currentTarget.firstElementChild as HTMLElement
-    )?.getBoundingClientRect();
-    if (!rect) return;
-    const scroll = scrollRef.current?.scrollLeft ?? 0;
+    const el = scrollRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const scroll = el.scrollLeft;
     const x = e.clientX - rect.left + scroll;
     const ms = Math.max(0, Math.min(durationMs, (x / totalWidth) * durationMs));
     onSeek(ms);
+  };
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!onSeek || e.button !== 0) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    if (e.clientY - el.getBoundingClientRect().top >= el.clientHeight) return;
+    scrubRef.current = { pointerId: e.pointerId, startX: e.clientX };
+    if (e.pointerType === "touch") return;
+    el.setPointerCapture(e.pointerId);
+    seekToEvent(e);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const scrub = scrubRef.current;
+    if (!scrub || scrub.pointerId !== e.pointerId) return;
+    if (e.pointerType === "touch") return;
+    seekToEvent(e);
+  };
+
+  const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    const scrub = scrubRef.current;
+    if (!scrub || scrub.pointerId !== e.pointerId) return;
+    scrubRef.current = null;
+    const el = scrollRef.current;
+    if (el?.hasPointerCapture(e.pointerId)) {
+      el.releasePointerCapture(e.pointerId);
+    }
+    if (e.pointerType === "touch" && Math.abs(e.clientX - scrub.startX) < 8) {
+      seekToEvent(e);
+    }
   };
 
   const handleScroll = () => {
@@ -249,7 +325,6 @@ export function Waveform({
     onScroll?.(el.scrollLeft, totalWidth);
   };
 
-  // Playhead position
   const playheadX = useMemo(
     () => (playheadMs / Math.max(durationMs, 1)) * totalWidth,
     [playheadMs, durationMs, totalWidth],
@@ -264,10 +339,53 @@ export function Waveform({
       )}
       style={{ width, height }}
       onScroll={handleScroll}
-      onClick={handleClick}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerUp}
     >
       <div className="relative" style={{ width: totalWidth, height }}>
-        <canvas ref={canvasRef} />
+        {spriteCells.length > 0 && sprite ? (
+          <div className="absolute inset-0 flex overflow-hidden pointer-events-none">
+            {spriteCells.map((cell) => (
+              <div
+                key={cell.key}
+                className="h-full animate-in fade-in duration-500"
+                style={{
+                  width: `${100 / spriteCells.length}%`,
+                  backgroundImage: `url(${sprite.url})`,
+                  backgroundSize: `${sprite.columns * 100}% ${sprite.rows * 100}%`,
+                  backgroundPosition: `${
+                    sprite.columns > 1
+                      ? (cell.column * 100) / (sprite.columns - 1)
+                      : 0
+                  }% ${
+                    sprite.rows > 1 ? (cell.row * 100) / (sprite.rows - 1) : 0
+                  }%`,
+                  backgroundRepeat: "no-repeat",
+                }}
+              />
+            ))}
+          </div>
+        ) : (
+          frames.length > 0 && (
+            <div className="absolute inset-0 flex overflow-hidden pointer-events-none">
+              {frames.map((frame) => (
+                <img
+                  key={frame.timeMs}
+                  src={frame.dataUrl}
+                  alt=""
+                  className="h-full object-cover animate-in fade-in duration-500"
+                  style={{ width: `${100 / frames.length}%` }}
+                />
+              ))}
+            </div>
+          )
+        )}
+        <canvas
+          ref={canvasRef}
+          className="absolute inset-0 pointer-events-none"
+        />
         <div
           className="absolute top-0 h-full w-[2px] pointer-events-none"
           style={{

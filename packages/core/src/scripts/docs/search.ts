@@ -1,17 +1,7 @@
-/**
- * Core script: docs-search
- *
- * Search and read agent-native framework documentation.
- * Docs are bundled in @agent-native/core so they're always the right version.
- *
- * Usage:
- *   pnpm action docs-search --query "actions"
- *   pnpm action docs-search --slug authentication
- *   pnpm action docs-search --list
- */
-
 import fs from "node:fs";
 import path from "node:path";
+
+import { getRequestUserEmail } from "../../server/request-context.js";
 import { parseArgs } from "../utils.js";
 
 interface DocMeta {
@@ -20,14 +10,11 @@ interface DocMeta {
   description: string;
 }
 
-interface DocFull extends DocMeta {
+export interface DocFull extends DocMeta {
   body: string;
 }
 
 function getDocsRoot(): string {
-  // Resolve from the package root:
-  //   src/scripts/docs/search.ts -> docs/
-  //   dist/scripts/docs/search.js -> docs/
   return path.resolve(
     path.dirname(new URL(import.meta.url).pathname),
     "../../../docs",
@@ -36,6 +23,16 @@ function getDocsRoot(): string {
 
 function getDocsDir(): string {
   return path.join(getDocsRoot(), "content");
+}
+
+function logMissingFrameworkDocsNote(): void {
+  if (fs.existsSync(getDocsDir())) return;
+  console.log(
+    "\nNote: bundled framework doc pages are not deployed here (only this " +
+      "app's AGENTS.md and skills are). A miss above does not mean the page " +
+      "does not exist — check the framework docs another way before concluding " +
+      "an API is missing.",
+  );
 }
 
 function parseFrontmatter(raw: string): {
@@ -56,6 +53,38 @@ function parseFrontmatter(raw: string): {
 function titleFromBody(body: string): string | null {
   const heading = body.match(/^#\s+(.+?)\s*$/m);
   return heading?.[1]?.trim() || null;
+}
+
+function isDocSourceFile(filename: string): boolean {
+  return filename.endsWith(".mdx") || filename.endsWith(".md");
+}
+
+function docSourcePathWithoutExtension(filename: string): string {
+  return filename.replace(/\.(?:mdx|md)$/, "");
+}
+
+function docSourceSlugFromFilename(filename: string): string {
+  return docSourcePathWithoutExtension(
+    filename.split(/[\\/]/).pop() ?? filename,
+  );
+}
+
+function preferMdxDocSourceFiles(files: string[]): string[] {
+  const byPath = new Map<string, string>();
+  for (const file of [...files].sort()) {
+    if (!isDocSourceFile(file)) continue;
+
+    const pathWithoutExtension = docSourcePathWithoutExtension(file);
+    const existing = byPath.get(pathWithoutExtension);
+    if (!existing || file.endsWith(".mdx")) {
+      byPath.set(pathWithoutExtension, file);
+    }
+  }
+  return Array.from(byPath.values()).sort((a, b) =>
+    docSourcePathWithoutExtension(a).localeCompare(
+      docSourcePathWithoutExtension(b),
+    ),
+  );
 }
 
 function loadMarkdownDoc(filePath: string, slug: string): DocFull {
@@ -86,10 +115,14 @@ function loadFilesystemDocs(): DocFull[] {
   const docsDir = getDocsDir();
   if (!fs.existsSync(docsDir)) return docs;
 
-  const files = fs.readdirSync(docsDir).filter((f) => f.endsWith(".md"));
+  const files = preferMdxDocSourceFiles(
+    fs
+      .readdirSync(docsDir)
+      .filter((file) => fs.statSync(path.join(docsDir, file)).isFile()),
+  );
   docs.push(
     ...files.map((file) => {
-      const slug = file.replace(/\.md$/, "");
+      const slug = docSourceSlugFromFilename(file);
       return loadMarkdownDoc(path.join(docsDir, file), slug);
     }),
   );
@@ -104,48 +137,82 @@ function slugifyDocId(value: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-async function loadAgentBundleDocs(): Promise<DocFull[]> {
-  try {
-    const { loadAgentsBundle, getRuntimeSkills } =
-      await import("../../server/agents-bundle.js");
-    const bundle = await loadAgentsBundle();
-    const docs: DocFull[] = [];
-    if (bundle.workspaceAgentsMd?.trim()) {
-      docs.push({
-        slug: "agents-workspace",
-        title: "Workspace AGENTS.md",
-        description: "Full bundled workspace-level agent instructions.",
-        body: bundle.workspaceAgentsMd,
-      });
-    }
-    if (bundle.agentsMd?.trim()) {
-      docs.push({
-        slug: "agents-template",
-        title: "Template AGENTS.md",
-        description: "Full bundled template/app agent instructions.",
-        body: bundle.agentsMd,
-      });
-    }
-    // Only runtime-visible skills are searchable/readable here — `scope: dev`
-    // skills are meant for the human's coding agent (Claude Code), not the
-    // in-app runtime agent, so they must not appear in docs-search results.
-    for (const skill of getRuntimeSkills(bundle)) {
-      const slug = `skill-${slugifyDocId(skill.meta.name)}`;
-      docs.push({
-        slug,
-        title: `Skill: ${skill.meta.name}`,
-        description: skill.meta.description,
-        body: skill.content,
-      });
-    }
-    return docs;
-  } catch {
-    return [];
+async function loadAgentBundleDocs(
+  userEmail?: string | null,
+): Promise<DocFull[]> {
+  const agentsBundleModule = await import("../../server/agents-bundle.js");
+  const bundle = await agentsBundleModule.loadAgentsBundle();
+
+  const docs: DocFull[] = [];
+  if (bundle.workspaceAgentsMd?.trim()) {
+    docs.push({
+      slug: "agents-workspace",
+      title: "Workspace AGENTS.md",
+      description: "Full bundled workspace-level agent instructions.",
+      body: bundle.workspaceAgentsMd,
+    });
   }
+  const runtimeAgentsMd = bundle.runtimeAgentsMd ?? bundle.agentsMd;
+  if (runtimeAgentsMd?.trim()) {
+    docs.push({
+      slug: "agents-template",
+      title: "Template AGENTS.md",
+      description: "Full bundled template/app agent instructions.",
+      body: runtimeAgentsMd,
+    });
+  }
+  // Only runtime-visible skills are searchable/readable here — `scope: dev`
+  // skills are meant for the human's coding agent (Claude Code), not the
+  // in-app runtime agent, so they must not appear in docs-search results.
+  const runtimeSkills = await agentsBundleModule.getRuntimeSkillsForUser(
+    bundle,
+    userEmail,
+  );
+  for (const skill of runtimeSkills) {
+    const slug = `skill-${slugifyDocId(skill.meta.name)}`;
+    docs.push({
+      slug,
+      title: `Skill: ${skill.meta.name}`,
+      description: skill.meta.description,
+      body: skill.content,
+    });
+    for (const [relPath, content] of Object.entries(skill.files)) {
+      docs.push({
+        slug: agentsBundleModule.skillSubfileDocsSlug(skill.meta.name, relPath),
+        title: `Skill: ${skill.meta.name} — ${relPath}`,
+        description: `Reference file from the "${skill.meta.name}" skill (${relPath}).`,
+        body: content,
+      });
+    }
+  }
+  return docs;
 }
 
-async function loadAllDocs(): Promise<DocFull[]> {
-  return [...loadFilesystemDocs(), ...(await loadAgentBundleDocs())];
+function formatDocPage(doc: DocFull): string {
+  return `# ${doc.title}\n\n${doc.description ? `${doc.description}\n\n` : ""}${doc.body}`;
+}
+
+// Slugs come from the client, so only skills visible to this user resolve.
+export async function loadSkillDocPages(
+  slugs: readonly string[],
+  userEmail: string | null | undefined,
+): Promise<Map<string, string>> {
+  const pages = new Map<string, string>();
+  if (slugs.length === 0) return pages;
+  const docs = new Map(
+    (await loadAgentBundleDocs(userEmail)).map((doc) => [doc.slug, doc]),
+  );
+  for (const slug of slugs) {
+    const doc = slug.startsWith("skill-") ? docs.get(slug) : undefined;
+    if (doc) pages.set(slug, formatDocPage(doc));
+  }
+  return pages;
+}
+
+export async function loadAllDocs(
+  userEmail = getRequestUserEmail(),
+): Promise<DocFull[]> {
+  return [...loadFilesystemDocs(), ...(await loadAgentBundleDocs(userEmail))];
 }
 
 async function searchDocs(query: string): Promise<DocMeta[]> {
@@ -161,7 +228,6 @@ async function searchDocs(query: string): Promise<DocMeta[]> {
         if (doc.title.toLowerCase().includes(term)) score += 10;
         if (doc.description.toLowerCase().includes(term)) score += 5;
         if (doc.slug.includes(term)) score += 8;
-        // Count body occurrences
         const bodyMatches = searchText.split(term).length - 1;
         score += Math.min(bodyMatches, 5);
       }
@@ -208,11 +274,10 @@ Options:
     if (!doc) {
       console.log(`Doc not found: ${parsed.slug}`);
       console.log(`Available: ${docs.map((d) => d.slug).join(", ")}`);
+      logMissingFrameworkDocsNote();
       return;
     }
-    console.log(`# ${doc.title}\n`);
-    if (doc.description) console.log(`${doc.description}\n`);
-    console.log(doc.body);
+    console.log(formatDocPage(doc));
     return;
   }
 
@@ -220,6 +285,7 @@ Options:
     const results = await searchDocs(parsed.query);
     if (results.length === 0) {
       console.log(`No docs found matching "${parsed.query}".`);
+      logMissingFrameworkDocsNote();
       return;
     }
     console.log(`Found ${results.length} doc(s) matching "${parsed.query}":\n`);
@@ -233,5 +299,12 @@ Options:
     return;
   }
 
-  console.log("Provide --query, --slug, or --list. Use --help for details.");
+  console.log(
+    [
+      "Usage:",
+      '  pnpm action docs-search --query "<feature>"',
+      "  pnpm action docs-search --slug <slug>",
+      "  pnpm action docs-search --list",
+    ].join("\n"),
+  );
 }

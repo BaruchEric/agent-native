@@ -22,6 +22,32 @@ describe("navigate action", () => {
     requestContext.runContext = undefined;
   });
 
+  it("opens the Ask tab for ask and home navigation", async () => {
+    appState.readAppState.mockResolvedValue(null);
+
+    await navigate.run({ view: "ask" });
+    await navigate.run({ view: "home" });
+
+    expect(appState.writeAppState).toHaveBeenNthCalledWith(
+      1,
+      "navigate",
+      expect.objectContaining({
+        view: "ask",
+        path: "/ask",
+        _writeId: expect.any(String),
+      }),
+    );
+    expect(appState.writeAppState).toHaveBeenNthCalledWith(
+      2,
+      "navigate",
+      expect.objectContaining({
+        view: "home",
+        path: "/ask",
+        _writeId: expect.any(String),
+      }),
+    );
+  });
+
   it("uses the current form when opening responses without an explicit formId", async () => {
     appState.readAppState.mockResolvedValue({
       view: "form",
@@ -39,7 +65,6 @@ describe("navigate action", () => {
         _writeId: expect.any(String),
       }),
     );
-    // Single navigation channel: the `navigate` command is the only write.
     expect(appState.writeAppState).toHaveBeenCalledTimes(1);
   });
 

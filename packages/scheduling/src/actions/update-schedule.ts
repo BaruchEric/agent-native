@@ -1,6 +1,7 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
+import { defineAction } from "@agent-native/core/action";
 import { assertAccess } from "@agent-native/core/sharing";
+import { z } from "zod";
+
 import { updateSchedule } from "../server/schedules-repo.js";
 
 export default defineAction({

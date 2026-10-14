@@ -1,33 +1,16 @@
-/**
- * Granola-style auto-start notes prompt banner.
- *
- * Appears at the top of the meeting detail page when the meeting's
- * `scheduledStart` is within ±2 minutes of now and `actualStart` is null.
- *
- * Behavior (matches Granola: "starts at calendar time if you're viewing the
- * event"):
- *   1. Banner appears — primary "Start notes" button.
- *   2. After 30 seconds of no interaction, transcription auto-starts.
- *   3. For the first 5 seconds after auto-fire, a "Cancel" link is visible
- *      so the user can abort if they didn't notice.
- *
- * The banner does not auto-start when the user has manually dismissed it.
- */
-
-import { useEffect, useState } from "react";
+import { useT } from "@agent-native/core/client/i18n";
 import { IconClock, IconPlayerPlayFilled, IconX } from "@tabler/icons-react";
+import { useEffect, useState } from "react";
+
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
 import { useAutoFireCountdown, useAutoRecord } from "@/hooks/use-auto-record";
+import { cn } from "@/lib/utils";
 
 interface AutoRecordPromptProps {
   scheduledStart?: string | null;
   actualStart?: string | null;
-  /** Called when the user (or auto-fire) starts the recording. */
   onStart: () => void;
-  /** Called when the user dismisses the banner. */
   onDismiss?: () => void;
-  /** Disable the auto-fire countdown (e.g. while another action is pending). */
   disabled?: boolean;
 }
 
@@ -38,6 +21,7 @@ export function AutoRecordPrompt({
   onDismiss,
   disabled = false,
 }: AutoRecordPromptProps) {
+  const t = useT();
   const [dismissed, setDismissed] = useState(false);
   const [autoFired, setAutoFired] = useState(false);
   const [graceRemaining, setGraceRemaining] = useState(0);
@@ -56,7 +40,6 @@ export function AutoRecordPrompt({
     },
   });
 
-  // 5-second cancel grace after auto-fire — counts down independently.
   useEffect(() => {
     if (graceRemaining <= 0) return;
     const id = setInterval(() => {
@@ -87,13 +70,15 @@ export function AutoRecordPrompt({
           <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-500 opacity-60" />
           <span className="relative inline-flex h-2 w-2 rounded-full bg-red-500" />
         </span>
-        <span className="text-sm">Notes started.</span>
+        <span className="text-sm">{t("autoRecordPrompt.notesStarted")}</span>
         <button
           type="button"
           onClick={cancel}
           className="ml-auto text-xs text-muted-foreground hover:text-foreground underline cursor-pointer"
         >
-          Cancel ({graceRemaining}s)
+          {t("autoRecordPrompt.cancelWithSeconds", {
+            count: graceRemaining,
+          })}
         </button>
       </div>
     );
@@ -111,10 +96,10 @@ export function AutoRecordPrompt({
     >
       <IconClock className="h-4 w-4 shrink-0 text-primary" />
       <span className="text-sm font-medium">
-        It's time for this meeting — start notes?
+        {t("autoRecordPrompt.startNotesQuestion")}
       </span>
       <span className="text-xs text-muted-foreground">
-        Auto-starts in {secondsRemaining}s
+        {t("autoRecordPrompt.autoStartsIn", { count: secondsRemaining })}
       </span>
       <div className="ml-auto flex items-center gap-2">
         <Button
@@ -123,15 +108,15 @@ export function AutoRecordPrompt({
             cancel();
             onStart();
           }}
-          className="cursor-pointer h-8 gap-1.5"
+          className="cursor-pointer gap-1.5"
         >
           <IconPlayerPlayFilled className="h-3.5 w-3.5" />
-          Start notes
+          {t("autoRecordPrompt.startNotes")}
         </Button>
         <button
           type="button"
           onClick={handleDismiss}
-          aria-label="Dismiss"
+          aria-label={t("autoRecordPrompt.dismiss")}
           className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-accent/50 cursor-pointer"
         >
           <IconX className="h-3.5 w-3.5" />

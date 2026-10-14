@@ -1,7 +1,9 @@
-import { ExtensionViewerPage } from "@agent-native/core/client/extensions";
+import { ExtensionViewerPage } from "@agent-native/toolkit/app/extensions";
+
+import enUSMessages from "@/i18n/en-US";
 
 export function meta() {
-  return [{ title: "Tool — Analytics" }];
+  return [{ title: enUSMessages.routeTitles.tool }];
 }
 
 export default function ExtensionViewerRoute() {

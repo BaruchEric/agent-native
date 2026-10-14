@@ -1,8 +1,13 @@
 import { defineAction, embedApp } from "@agent-native/core";
-import { writeAppState } from "@agent-native/core/application-state";
+import {
+  writeAppState,
+  writeAppStateForCurrentTab,
+} from "@agent-native/core/application-state";
 import { buildDeepLink } from "@agent-native/core/server";
 import { assertAccess } from "@agent-native/core/sharing";
 import { z } from "zod";
+
+import "../server/db/index.js";
 
 function designDeepLink(designId: string): string {
   return buildDeepLink({
@@ -47,13 +52,23 @@ const questionSchema = z.object({
   includeDecide: z.boolean().optional(),
 });
 
+function normalizeDesignQuestions(
+  questions: z.infer<typeof questionSchema>[],
+): z.infer<typeof questionSchema>[] {
+  return questions.map((question) => ({
+    ...question,
+    includeExplore: question.includeExplore ?? false,
+    includeDecide: question.includeDecide ?? false,
+  }));
+}
+
 export default defineAction({
   description:
-    "Show a Claude Design-style question form in the Design editor before " +
-    "generating a new design. Use this as the first step for non-trivial new " +
-    "design prompts: create/open the design shell, call show-design-questions " +
-    "with tailored questions, then stop and wait for the user's answers before " +
-    "calling generate-design or present-design-variants.",
+    "Show a Claude Design-style question form in the Design editor. This is " +
+    "the in-app Design agent's intake step for non-trivial new prompts — the " +
+    "user's answers return through the in-app chat, not this call's result.",
+  endsTurn: true,
+  mcpTool: false,
   schema: z.object({
     designId: z.string().describe("Design project ID to show questions for"),
     title: z
@@ -73,6 +88,16 @@ export default defineAction({
       .describe(
         "1-8 focused design-intake questions. Prefer 4-6 concise questions " +
           "with useful choices, Other enabled, and Decide for me where appropriate.",
+      )
+      .refine(
+        (questions) =>
+          new Set(questions.map((question) => question.id)).size ===
+          questions.length,
+        {
+          message:
+            "Question ids must be unique — duplicate ids share one answer " +
+            "slot in the form, silently discarding one question's answer.",
+        },
       ),
   }),
   mcpApp: {
@@ -95,6 +120,8 @@ export default defineAction({
   }) => {
     await assertAccess("design", designId, "editor");
 
+    const normalizedQuestions = normalizeDesignQuestions(questions);
+
     await writeAppState(designQuestionsStateKey(designId), {
       designId,
       title: title ?? "Quick questions before I design",
@@ -103,7 +130,13 @@ export default defineAction({
         "Pick what matters. Use Other for specifics, or let the agent decide.",
       skipLabel: skipLabel ?? "Decide for me",
       submitLabel: submitLabel ?? "Continue",
-      questions,
+      questions: normalizedQuestions,
+    });
+    await writeAppStateForCurrentTab("navigate", {
+      view: "editor",
+      designId,
+      editorView: "overview",
+      path: `/design/${encodeURIComponent(designId)}?editorView=overview`,
     });
 
     return {

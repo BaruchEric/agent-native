@@ -4,22 +4,74 @@ import {
   setResponseStatus,
   type H3Event,
 } from "h3";
+
 import {
   requireCredential,
   runApiHandlerWithContext,
 } from "../lib/credentials";
 import {
-  listChannels,
   getChannelHistory,
-  searchMessages,
-  resolveUsers,
   getTeamInfo,
+  listChannelsWithCoverage,
+  resolveUsersWithCoverage,
+  searchMessages,
   type Workspace,
   type SlackMessage,
 } from "../lib/slack";
 
-function parseWorkspace(raw?: string): Workspace {
-  return raw === "secondary" ? "secondary" : "primary";
+export function parseWorkspace(raw?: unknown): Workspace | null {
+  if (raw === undefined || raw === null || raw === "" || raw === "primary") {
+    return "primary";
+  }
+  if (raw === "secondary") return "secondary";
+  return null;
+}
+
+function invalidWorkspace(event: H3Event) {
+  setResponseStatus(event, 400);
+  return { error: "workspace must be primary or secondary" };
+}
+
+export function parseCursorMap(
+  raw?: unknown,
+): { ok: true; value: Record<string, string> } | { ok: false } {
+  if (raw === undefined || raw === null || raw === "") {
+    return { ok: true, value: {} };
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(
+      typeof raw === "string" ? raw : JSON.stringify(raw),
+    );
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { ok: false };
+    }
+    const entries = Object.entries(parsed);
+    if (
+      entries.some(
+        ([, value]) =>
+          typeof value !== "string" ||
+          !/^\d+(?:\.\d{1,6})?$/.test(value.trim()),
+      )
+    ) {
+      return { ok: false };
+    }
+    return {
+      ok: true,
+      value: Object.fromEntries(
+        entries.map(([channelId, value]) => [channelId, value.trim()]),
+      ),
+    };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function invalidCursors(event: H3Event) {
+  setResponseStatus(event, 400);
+  return {
+    error: "cursors must be a JSON object of channel IDs to timestamps",
+  };
 }
 
 async function requireSlackCredential(event: H3Event, workspace: Workspace) {
@@ -33,6 +85,7 @@ export const handleSlackTeam = defineEventHandler((event) =>
     try {
       const { workspace: workspaceParam } = getQuery(event);
       const workspace = parseWorkspace(workspaceParam as string);
+      if (!workspace) return invalidWorkspace(event);
       const missing = await requireSlackCredential(event, workspace);
       if (missing) return missing;
       const team = await getTeamInfo(workspace);
@@ -48,12 +101,22 @@ export const handleSlackTeam = defineEventHandler((event) =>
 export const handleSlackChannels = defineEventHandler((event) =>
   runApiHandlerWithContext(event, async () => {
     try {
-      const { workspace: workspaceParam } = getQuery(event);
+      const { workspace: workspaceParam, cursor } = getQuery(event);
       const workspace = parseWorkspace(workspaceParam as string);
+      if (!workspace) return invalidWorkspace(event);
       const missing = await requireSlackCredential(event, workspace);
       if (missing) return missing;
-      const channels = await listChannels(workspace);
-      return { channels, total: channels.length };
+      const result = await listChannelsWithCoverage(
+        workspace,
+        cursor as string | undefined,
+      );
+      return {
+        channels: result.channels,
+        total: result.total,
+        truncated: result.truncated,
+        pagination: result.pagination,
+        coverage: result.coverage,
+      };
     } catch (err: any) {
       console.error("Slack channels error:", err.message);
       setResponseStatus(event, 500);
@@ -62,7 +125,6 @@ export const handleSlackChannels = defineEventHandler((event) =>
   }),
 );
 
-/** Reconstruct text from Slack blocks for better line-break formatting */
 function enrichMessages(messages: SlackMessage[]): SlackMessage[] {
   return messages.map((m) => {
     const blocks = (m as any).blocks;
@@ -92,6 +154,7 @@ export const handleSlackHistory = defineEventHandler((event) =>
         cursor,
       } = getQuery(event);
       const workspace = parseWorkspace(workspaceParam as string);
+      if (!workspace) return invalidWorkspace(event);
       const missing = await requireSlackCredential(event, workspace);
       if (missing) return missing;
       const limit = parseInt((limitParam as string) || "50", 10);
@@ -111,15 +174,33 @@ export const handleSlackHistory = defineEventHandler((event) =>
       const userIds = result.messages
         .map((m) => m.user)
         .filter((id): id is string => !!id);
-      const users = await resolveUsers(workspace, userIds, result.messages);
+      const resolution = await resolveUsersWithCoverage(
+        workspace,
+        userIds,
+        result.messages,
+      );
 
       const enrichedMessages = enrichMessages(result.messages);
 
       return {
         messages: enrichedMessages,
-        users,
+        users: resolution.users,
         has_more: result.has_more,
         next_cursor: result.next_cursor,
+        truncated: result.truncated,
+        pagination: result.pagination,
+        coverage: {
+          ...result.coverage,
+          coverage_complete:
+            result.coverage.coverage_complete &&
+            resolution.coverage.coverage_complete,
+          truncated: result.coverage.truncated || resolution.coverage.truncated,
+          truncation_reasons: [
+            ...result.coverage.truncation_reasons,
+            ...resolution.coverage.truncation_reasons,
+          ],
+          authors: resolution.coverage,
+        },
       };
     } catch (err: any) {
       console.error("Slack history error:", err.message);
@@ -129,12 +210,6 @@ export const handleSlackHistory = defineEventHandler((event) =>
   }),
 );
 
-/**
- * Multi-channel paginated history endpoint.
- * Fetches `pageSize` messages from each channel (using cursor if provided),
- * merges by timestamp, and returns the top `pageSize` messages.
- * Returns per-channel cursors for next page.
- */
 export const handleSlackMultiHistory = defineEventHandler((event) =>
   runApiHandlerWithContext(event, async () => {
     try {
@@ -146,9 +221,9 @@ export const handleSlackMultiHistory = defineEventHandler((event) =>
         cursors: cursorsParam,
       } = getQuery(event);
       const workspace = parseWorkspace(workspaceParam as string);
+      if (!workspace) return invalidWorkspace(event);
       const missing = await requireSlackCredential(event, workspace);
       if (missing) return missing;
-      // cursors is a JSON-encoded object: { channelId: timestamp }
       const pageSize = parseInt((pageSizeParam as string) || "20", 10);
 
       if (!channelsParam) {
@@ -160,60 +235,154 @@ export const handleSlackMultiHistory = defineEventHandler((event) =>
       const channelNamesList = namesParam
         ? (namesParam as string).split(",")
         : channelIds;
-      const cursors: Record<string, string> = cursorsParam
-        ? JSON.parse(cursorsParam as string)
-        : {};
+      const parsedCursors = parseCursorMap(cursorsParam);
+      if (!parsedCursors.ok) return invalidCursors(event);
+      const cursors = parsedCursors.value;
 
-      // Fetch pageSize messages from each channel in parallel
-      const results = await Promise.all(
-        channelIds.map((id) =>
-          getChannelHistory(workspace, id, pageSize, cursors[id]),
+      const channelResults = await Promise.allSettled(
+        channelIds.map((channelId) =>
+          getChannelHistory(workspace, channelId, pageSize, cursors[channelId]),
         ),
       );
+      const successfulResults = channelResults.flatMap((entry, index) =>
+        entry.status === "fulfilled"
+          ? [{ channelId: channelIds[index], result: entry.value }]
+          : [],
+      );
+      const failedChannelIds = channelResults.flatMap((entry, index) =>
+        entry.status === "rejected" ? [channelIds[index]] : [],
+      );
 
-      // Tag messages with channel name and merge
-      const allMessages: (SlackMessage & { channel_name: string })[] = [];
+      const allMessages: (SlackMessage & {
+        channel_id: string;
+        channel_name: string;
+      })[] = [];
       const perChannelHasMore: Record<string, boolean> = {};
       const nextCursors: Record<string, string> = {};
 
-      results.forEach((result, idx) => {
-        const chId = channelIds[idx];
-        const chName = channelNamesList[idx] || chId;
-        perChannelHasMore[chId] = result.has_more;
-        if (result.next_cursor) {
-          nextCursors[chId] = result.next_cursor;
-        }
-        for (const m of result.messages) {
-          allMessages.push({ ...m, channel_name: chName });
+      successfulResults.forEach(({ channelId, result }) => {
+        const chName =
+          channelNamesList[channelIds.indexOf(channelId)] || channelId;
+        perChannelHasMore[channelId] = result.has_more;
+        for (const message of result.messages) {
+          allMessages.push({
+            ...message,
+            channel_id: channelId,
+            channel_name: chName,
+          });
         }
       });
+      failedChannelIds.forEach((channelId) => {
+        perChannelHasMore[channelId] = true;
+      });
 
-      // Sort merged by timestamp (newest first)
       allMessages.sort((a, b) => parseFloat(b.ts) - parseFloat(a.ts));
 
-      // Take top pageSize
       const pageMessages = allMessages.slice(0, pageSize);
 
-      // Enrich text from blocks
-      const enrichedMessages = enrichMessages(pageMessages);
+      const emittedByChannel = new Map<string, SlackMessage[]>();
+      for (const message of pageMessages) {
+        const emitted = emittedByChannel.get(message.channel_id) ?? [];
+        emitted.push(message);
+        emittedByChannel.set(message.channel_id, emitted);
+      }
+      for (const channelId of channelIds) {
+        const emitted = emittedByChannel.get(channelId);
+        const nextCursor = emitted?.[emitted.length - 1]?.ts;
+        if (nextCursor) nextCursors[channelId] = nextCursor;
+        else if (cursors[channelId])
+          nextCursors[channelId] = cursors[channelId];
+      }
 
-      // Resolve users
+      const enrichedMessages = pageMessages.map((message) => {
+        const enriched = enrichMessages([message])[0] ?? message;
+        const { channel_id: _channelId, ...rest } = enriched as typeof message;
+        return rest;
+      });
+
       const userIds = enrichedMessages
         .map((m) => m.user)
         .filter((id): id is string => !!id);
-      const users = await resolveUsers(workspace, userIds, enrichedMessages);
+      const resolution = await resolveUsersWithCoverage(
+        workspace,
+        userIds,
+        enrichedMessages,
+      );
 
-      // has_more is true if any channel has more messages
+      const providerTruncated = successfulResults.some(
+        ({ result }) => result.truncated,
+      );
+      const mergedResultTruncated = allMessages.length > pageSize;
       const hasMore =
-        Object.values(perChannelHasMore).some(Boolean) ||
-        allMessages.length > pageSize;
+        providerTruncated ||
+        mergedResultTruncated ||
+        failedChannelIds.length > 0;
+      const truncationReasons = [
+        ...(providerTruncated ? ["provider_has_more"] : []),
+        ...(mergedResultTruncated ? ["merged_result_limit"] : []),
+        ...failedChannelIds.map(
+          (channelId) => `channel_fetch_failed:${channelId}`,
+        ),
+      ];
+      const channelPagination = Object.fromEntries(
+        channelResults.map((entry, index) => [
+          channelIds[index],
+          entry.status === "fulfilled"
+            ? entry.value.pagination
+            : {
+                cursor_type: "latest_ts" as const,
+                ...(cursors[channelIds[index]]
+                  ? { request_cursor: cursors[channelIds[index]] }
+                  : {}),
+              },
+        ]),
+      );
+      const channelCoverage = Object.fromEntries(
+        channelResults.map((entry, index) => [
+          channelIds[index],
+          entry.status === "fulfilled"
+            ? entry.value.coverage
+            : {
+                requested: pageSize,
+                fetched: 0,
+                returned: 0,
+                pages_fetched: 0,
+                coverage_complete: false,
+                truncated: true,
+                truncation_reasons: [
+                  `channel_fetch_failed:${channelIds[index]}`,
+                ],
+              },
+        ]),
+      );
 
       return {
         messages: enrichedMessages,
-        users,
+        users: resolution.users,
         has_more: hasMore,
         next_cursors: nextCursors,
         total: allMessages.length,
+        truncated: hasMore,
+        pagination: {
+          cursor_type: "per_channel_latest_ts",
+          request_cursors: cursors,
+          next_cursors: nextCursors,
+          channels: channelPagination,
+        },
+        coverage: {
+          requested: channelIds.length * pageSize,
+          fetched: allMessages.length,
+          returned: enrichedMessages.length,
+          pages_fetched: successfulResults.length,
+          coverage_complete: !hasMore && resolution.coverage.coverage_complete,
+          truncated: hasMore || resolution.coverage.truncated,
+          truncation_reasons: [
+            ...truncationReasons,
+            ...resolution.coverage.truncation_reasons,
+          ],
+          channels: channelCoverage,
+          authors: resolution.coverage,
+        },
       };
     } catch (err: any) {
       console.error("Slack multi-history error:", err.message);
@@ -228,6 +397,7 @@ export const handleSlackSearch = defineEventHandler((event) =>
     try {
       const { workspace: workspaceParam, query } = getQuery(event);
       const workspace = parseWorkspace(workspaceParam as string);
+      if (!workspace) return invalidWorkspace(event);
       const missing = await requireSlackCredential(event, workspace);
       if (missing) return missing;
 
@@ -241,9 +411,33 @@ export const handleSlackSearch = defineEventHandler((event) =>
       const userIds = result.messages
         .map((m) => m.user)
         .filter((id): id is string => !!id);
-      const users = await resolveUsers(workspace, userIds, result.messages);
+      const resolution = await resolveUsersWithCoverage(
+        workspace,
+        userIds,
+        result.messages,
+      );
 
-      return { messages: result.messages, users, total: result.total };
+      return {
+        messages: result.messages,
+        users: resolution.users,
+        total: result.total,
+        unsupported: result.unsupported,
+        guidance: result.guidance,
+        truncated: result.truncated,
+        pagination: result.pagination,
+        coverage: {
+          ...result.coverage,
+          coverage_complete:
+            result.coverage.coverage_complete &&
+            resolution.coverage.coverage_complete,
+          truncated: result.coverage.truncated || resolution.coverage.truncated,
+          truncation_reasons: [
+            ...result.coverage.truncation_reasons,
+            ...resolution.coverage.truncation_reasons,
+          ],
+          authors: resolution.coverage,
+        },
+      };
     } catch (err: any) {
       console.error("Slack search error:", err.message);
       setResponseStatus(event, 500);

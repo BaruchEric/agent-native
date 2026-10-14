@@ -1,14 +1,28 @@
+import { useT } from "@agent-native/core/client/i18n";
 import { useMemo } from "react";
 
-/**
- * Lightweight Markdown renderer — handles headings, bold, italic, code blocks,
- * inline code, links, unordered/ordered lists, horizontal rules, and tables.
- * No external deps required.
- */
+import enUSMessages from "@/i18n/en-US";
+
 export default function Markdown({ content }: { content: string }) {
-  const html = useMemo(() => renderMarkdown(content), [content]);
+  const t = useT();
+  const labels = useMemo(
+    () => ({
+      embedBlocked: t("markdown.embedBlocked"),
+      sameOriginEmbedsOnly: t("markdown.sameOriginEmbedsOnly"),
+      embeddedContent: t("markdown.embeddedContent"),
+    }),
+    [t],
+  );
+  const html = useMemo(
+    () => renderMarkdown(content, labels),
+    [content, labels],
+  );
   return <div dangerouslySetInnerHTML={{ __html: html }} />;
 }
+
+type MarkdownLabels = (typeof enUSMessages)["markdown"];
+
+const DEFAULT_MARKDOWN_LABELS = enUSMessages.markdown;
 
 function escapeHtml(str: string): string {
   return str
@@ -39,18 +53,10 @@ function decodeHtmlEntities(value: string): string {
   return decoded;
 }
 
-/**
- * Sanitize a URL for use in an href. Rejects dangerous protocols
- * (javascript:, data:, vbscript:, file:) and empty strings. Returns a
- * safe-to-embed value — always HTML-escape the result when inserting
- * into an attribute.
- */
 function sanitizeUrl(url: string, kind: "link" | "image" = "link"): string {
   const trimmed = url.trim();
   if (!trimmed) return "#";
 
-  // Strip HTML entities and whitespace before protocol check so
-  // `javascript&#58;…` style attempts don't sneak through.
   const decoded = decodeHtmlEntities(trimmed);
   const stripped = decoded
     .replace(/[\s\u0000-\u001f\u007f]+/g, "")
@@ -69,10 +75,6 @@ function sanitizeUrl(url: string, kind: "link" | "image" = "link"): string {
       return "#";
     }
   }
-  // Defense-in-depth: when the URL carries a scheme, require http/https via
-  // a real URL parse (catches encodings the deny-list above might miss).
-  // Relative URLs (`/path`, `#anchor`, `?q=1`) without a scheme pass through.
-  // (audit 03 defense-in-depth)
   if (/^[a-z][a-z\d+.-]*:/i.test(stripped)) {
     try {
       const parsed = new URL(trimmed);
@@ -140,17 +142,21 @@ function sanitizeEmbedSrc(src: string | undefined): string | null {
   return null;
 }
 
-function renderEmbedBlock(body: string): string {
+function renderEmbedBlock(
+  body: string,
+  labels: MarkdownLabels = DEFAULT_MARKDOWN_LABELS,
+): string {
   const parsed = parseEmbedBody(body);
   const safeSrc = sanitizeEmbedSrc(parsed.src);
   if (!safeSrc) {
+    const blockedSourceHtml = parsed.src
+      ? `<div class="mt-1 truncate font-mono text-[10px]">${escapeHtml(parsed.src)}</div>` // i18n-ignore stable sanitized URL echo in generated HTML
+      : "";
     return [
       '<div class="my-3 rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">',
-      '<strong class="text-foreground">Embed blocked</strong>',
-      '<div class="mt-1">Only same-origin embed paths are allowed.</div>',
-      parsed.src
-        ? `<div class="mt-1 truncate font-mono text-[10px]">${escapeHtml(parsed.src)}</div>`
-        : "",
+      `<strong class="text-foreground">${escapeHtml(labels.embedBlocked)}</strong>`,
+      `<div class="mt-1">${escapeHtml(labels.sameOriginEmbedsOnly)}</div>`, // i18n-ignore generated HTML expression boundary
+      blockedSourceHtml,
       "</div>",
     ].join("");
   }
@@ -163,16 +169,12 @@ function renderEmbedBlock(body: string): string {
     : `aspect-ratio:${aspect.replace("/", " / ")}`;
   return [
     `<div class="my-4 overflow-hidden rounded-lg border border-border bg-muted/20" style="${style}">`,
-    `<iframe src="${escapeHtml(safeSrc)}" title="${escapeHtml(parsed.title || "Embedded content")}" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" referrerpolicy="same-origin" loading="lazy" class="h-full w-full border-0 bg-transparent"></iframe>`,
+    `<iframe src="${escapeHtml(safeSrc)}" title="${escapeHtml(parsed.title || labels.embeddedContent)}" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" referrerpolicy="same-origin" loading="lazy" class="h-full w-full border-0 bg-transparent"></iframe>`,
     "</div>",
   ].join("");
 }
 
 function renderInline(text: string): string {
-  // Escape the raw text before applying markdown replacements so any
-  // HTML the agent emits is inert. Note: markdown tokens like `**` and
-  // `[text](url)` are detected AFTER escaping — that's safe because our
-  // tokens don't overlap with escaped entities.
   return (
     escapeHtml(text)
       // Bold
@@ -197,7 +199,10 @@ function renderInline(text: string): string {
   );
 }
 
-export function renderMarkdown(md: string): string {
+export function renderMarkdown(
+  md: string,
+  labels: MarkdownLabels = DEFAULT_MARKDOWN_LABELS,
+): string {
   const lines = md.split("\n");
   const out: string[] = [];
   let i = 0;
@@ -213,11 +218,8 @@ export function renderMarkdown(md: string): string {
   while (i < lines.length) {
     const line = lines[i];
 
-    // Code block
     if (line.startsWith("```")) {
       closeList();
-      // Language hint is user-controlled (via the markdown fence); normalize
-      // to a safe identifier and then HTML-escape as a belt-and-suspenders.
       const rawLang = line.slice(3).trim();
       const safeLang = rawLang.replace(/[^a-zA-Z0-9_+#.-]/g, "").slice(0, 32);
       const codeLines: string[] = [];
@@ -226,9 +228,9 @@ export function renderMarkdown(md: string): string {
         codeLines.push(lines[i]);
         i++;
       }
-      i++; // skip closing ```
+      i++;
       if (safeLang === "embed") {
-        out.push(renderEmbedBlock(codeLines.join("\n")));
+        out.push(renderEmbedBlock(codeLines.join("\n"), labels));
         continue;
       }
       out.push(
@@ -237,14 +239,12 @@ export function renderMarkdown(md: string): string {
       continue;
     }
 
-    // Blank line
     if (line.trim() === "") {
       closeList();
       i++;
       continue;
     }
 
-    // Horizontal rule
     if (/^(-{3,}|\*{3,}|_{3,})$/.test(line.trim())) {
       closeList();
       out.push("<hr />");
@@ -252,7 +252,6 @@ export function renderMarkdown(md: string): string {
       continue;
     }
 
-    // Headings
     const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
     if (headingMatch) {
       closeList();
@@ -262,7 +261,6 @@ export function renderMarkdown(md: string): string {
       continue;
     }
 
-    // Table
     if (
       line.includes("|") &&
       i + 1 < lines.length &&
@@ -273,7 +271,7 @@ export function renderMarkdown(md: string): string {
         .split("|")
         .map((c) => c.trim())
         .filter(Boolean);
-      i += 2; // skip header + separator
+      i += 2;
       const rows: string[][] = [];
       while (
         i < lines.length &&
@@ -306,7 +304,6 @@ export function renderMarkdown(md: string): string {
       continue;
     }
 
-    // Unordered list
     const ulMatch = line.match(/^(\s*)[-*+]\s+(.+)$/);
     if (ulMatch) {
       if (inList !== "ul") {
@@ -319,7 +316,6 @@ export function renderMarkdown(md: string): string {
       continue;
     }
 
-    // Ordered list
     const olMatch = line.match(/^(\s*)\d+[.)]\s+(.+)$/);
     if (olMatch) {
       if (inList !== "ol") {
@@ -332,7 +328,6 @@ export function renderMarkdown(md: string): string {
       continue;
     }
 
-    // Paragraph
     closeList();
     out.push(`<p>${renderInline(line)}</p>`);
     i++;

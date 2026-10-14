@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from "react";
-import { callAction } from "@agent-native/core/client";
+import { useT } from "@agent-native/core/client/i18n";
+import { startWorkspaceProviderOAuth } from "@agent-native/core/client/integrations";
 import {
   IconSearch,
   IconX,
@@ -7,39 +7,41 @@ import {
   IconLoader2,
   IconLink,
   IconCalendarPlus,
+  IconBrandGoogle,
 } from "@tabler/icons-react";
+import { useState, useEffect, useMemo, useRef } from "react";
+import { toast } from "sonner";
+
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import {
+  useExternalCalendars,
+  useAddExternalCalendar,
+  useRemoveExternalCalendar,
+} from "@/hooks/use-external-calendars";
+import {
+  useGoogleAuthStatus,
+  useGoogleDesktopAuth,
+} from "@/hooks/use-google-auth";
 import {
   useOverlayPeople,
   useAddOverlayPerson,
   useRemoveOverlayPerson,
 } from "@/hooks/use-overlay-people";
 import {
-  useExternalCalendars,
-  useAddExternalCalendar,
-  useRemoveExternalCalendar,
-} from "@/hooks/use-external-calendars";
-import { toast } from "sonner";
-
-interface SearchResult {
-  name: string;
-  email: string;
-  photoUrl?: string;
-}
-
-interface SearchResponse {
-  results: SearchResult[];
-  scopeRequired?: boolean;
-}
+  filterPeopleResults,
+  mergePeopleResults,
+  usePeopleContacts,
+  usePeopleSearch,
+} from "@/hooks/use-people";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const URL_REGEX = /^(https?|webcal):\/\/.+/i;
@@ -47,65 +49,144 @@ const URL_REGEX = /^(https?|webcal):\/\/.+/i;
 interface AddCalendarDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  defaultTab?: "people" | "url";
+  defaultTab?: "people" | "url" | "google";
+  visibleTabs?: Array<"people" | "url" | "google">;
+  onPersonAdded?: (person: { email: string; name?: string }) => void;
+  prefillPersonEmail?: string;
 }
 
 export function AddCalendarDialog({
   open,
   onOpenChange,
   defaultTab = "people",
+  visibleTabs = ["people", "url", "google"],
+  onPersonAdded,
+  prefillPersonEmail,
 }: AddCalendarDialogProps) {
-  const [activeTab, setActiveTab] = useState<"people" | "url">(defaultTab);
+  const t = useT();
+  const [activeTab, setActiveTab] = useState<"people" | "url" | "google">(
+    defaultTab,
+  );
 
-  // Sync default tab when dialog opens
   useEffect(() => {
     if (open) setActiveTab(defaultTab);
   }, [open, defaultTab]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[440px] gap-0 p-0 top-[8%] translate-y-0">
+      <DialogContent className="sm:max-w-[440px] max-h-[calc(85vh-1rem)] gap-0 overflow-y-auto p-0 top-[15vh] !translate-y-0">
         <DialogHeader className="px-4 pt-4 pb-0">
-          <DialogTitle className="text-base">Add Calendar</DialogTitle>
+          <DialogTitle className="text-base">
+            {t("eventForm.addCalendar")}
+          </DialogTitle>
         </DialogHeader>
 
         <Tabs
           value={activeTab}
-          onValueChange={(v) => setActiveTab(v as "people" | "url")}
+          onValueChange={(v) => setActiveTab(v as "people" | "url" | "google")}
           className="mt-3"
         >
-          <TabsList className="mx-4 w-[calc(100%-2rem)]">
-            <TabsTrigger value="people" className="flex-1">
-              People
-            </TabsTrigger>
-            <TabsTrigger value="url" className="flex-1">
-              From URL
-            </TabsTrigger>
-          </TabsList>
+          {visibleTabs.length > 1 && (
+            <TabsList className="mx-4 w-[calc(100%-2rem)]">
+              {visibleTabs.includes("people") && (
+                <TabsTrigger value="people" className="flex-1">
+                  {t("eventForm.people")}
+                </TabsTrigger>
+              )}
+              {visibleTabs.includes("url") && (
+                <TabsTrigger value="url" className="flex-1">
+                  {t("eventForm.fromUrl")}
+                </TabsTrigger>
+              )}
+              {visibleTabs.includes("google") && (
+                <TabsTrigger value="google" className="flex-1">
+                  Google
+                </TabsTrigger>
+              )}
+            </TabsList>
+          )}
 
-          <TabsContent value="people" className="mt-0">
-            <PeopleTab onClose={() => onOpenChange(false)} />
-          </TabsContent>
+          {visibleTabs.includes("people") && (
+            <TabsContent value="people" className="mt-0">
+              <PeopleTab
+                open={open}
+                onPersonAdded={onPersonAdded}
+                prefillPersonEmail={prefillPersonEmail}
+              />
+            </TabsContent>
+          )}
 
-          <TabsContent value="url" className="mt-0 px-4 pb-4 pt-3">
-            <UrlTab onClose={() => onOpenChange(false)} />
-          </TabsContent>
+          {visibleTabs.includes("url") && (
+            <TabsContent value="url" className="mt-0 px-4 pb-4 pt-3">
+              <UrlTab onClose={() => onOpenChange(false)} />
+            </TabsContent>
+          )}
+          {visibleTabs.includes("google") && (
+            <TabsContent value="google" className="mt-0 px-4 pb-4 pt-3">
+              <GoogleTab />
+            </TabsContent>
+          )}
         </Tabs>
       </DialogContent>
     </Dialog>
   );
 }
 
-// ─── People tab ──────────────────────────────────────────────────────────────
+function GoogleTab() {
+  const t = useT();
+  const status = useGoogleAuthStatus();
+  const {
+    isDesktopGoogleAuth,
+    isGoogleDesktopAuthPending,
+    startDesktopGoogleAuth,
+  } = useGoogleDesktopAuth({
+    onError: (issue) =>
+      toast.error(issue.message || issue.error || t("settings.googleFailed")),
+    onSuccess: () => window.location.reload(),
+  });
 
-function PeopleTab({ onClose: _ }: { onClose: () => void }) {
+  function connect() {
+    if (isDesktopGoogleAuth) {
+      startDesktopGoogleAuth({
+        addAccount: true,
+        previousAccountCount: status.data?.accounts.length ?? 0,
+      });
+      return;
+    }
+    startWorkspaceProviderOAuth("google_calendar", {
+      appId: "calendar",
+      returnPath: `${window.location.pathname}${window.location.search}`,
+      scope: "user",
+    });
+  }
+
+  return (
+    <Button
+      type="button"
+      className="w-full gap-2"
+      onClick={connect}
+      disabled={isGoogleDesktopAuthPending}
+    >
+      <IconBrandGoogle className="size-4" />
+      {t("settings.connectGoogleCalendar")}
+    </Button>
+  );
+}
+
+function PeopleTab({
+  open,
+  onPersonAdded,
+  prefillPersonEmail,
+}: {
+  open: boolean;
+  onPersonAdded?: (person: { email: string; name?: string }) => void;
+  prefillPersonEmail?: string;
+}) {
+  const t = useT();
   const [query, setQuery] = useState("");
-  const [results, setResults] = useState<SearchResult[]>([]);
-  const [scopeRequired, setScopeRequired] = useState(false);
-  const [searching, setSearching] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(-1);
   const inputRef = useRef<HTMLInputElement>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const listRef = useRef<HTMLDivElement>(null);
   const shouldScrollActiveResultRef = useRef(false);
 
@@ -113,46 +194,58 @@ function PeopleTab({ onClose: _ }: { onClose: () => void }) {
   const overlayPeople = Array.isArray(rawOverlayPeople) ? rawOverlayPeople : [];
   const addPerson = useAddOverlayPerson();
   const removePerson = useRemoveOverlayPerson();
+  const contacts = usePeopleContacts("directory", open);
+  const directorySearch = usePeopleSearch(searchQuery, open, "directory");
 
-  const overlayEmails = new Set(overlayPeople.map((p) => p.email));
-  const selectableResults = results.filter((r) => !overlayEmails.has(r.email));
+  const overlayEmails = useMemo(
+    () => new Set(overlayPeople.map((p) => p.email.toLowerCase())),
+    [overlayPeople],
+  );
 
-  const search = useCallback(async (q: string) => {
-    setSearching(true);
-    try {
-      const data = await callAction<SearchResponse>(
-        "search-people",
-        q ? { q, scope: "directory" } : { scope: "directory" },
-        { method: "GET" },
-      );
-      setResults(data.results ?? []);
-      setScopeRequired(data.scopeRequired ?? false);
-    } catch {
-      // ignore
-    } finally {
-      setSearching(false);
-    }
-  }, []);
+  const results = useMemo(
+    () =>
+      filterPeopleResults(
+        mergePeopleResults(
+          contacts.data?.results,
+          directorySearch.data?.results,
+        ),
+        query,
+        new Set(),
+      ),
+    [contacts.data?.results, directorySearch.data?.results, query],
+  );
+  const selectableResults = results.filter(
+    (r) => !overlayEmails.has(r.email.toLowerCase()),
+  );
+
+  const searching =
+    contacts.isLoading ||
+    contacts.isFetching ||
+    directorySearch.isLoading ||
+    directorySearch.isFetching;
+  const scopeRequired = Boolean(
+    contacts.data?.scopeRequired || directorySearch.data?.scopeRequired,
+  );
 
   useEffect(() => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => search(query), query ? 300 : 0);
-    return () => {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-    };
-  }, [query, search]);
+    const timeout = window.setTimeout(
+      () => setSearchQuery(query),
+      query.trim() ? 300 : 0,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [query]);
 
   useEffect(() => {
     setActiveIndex(results.length > 0 ? 0 : -1);
   }, [results]);
 
   useEffect(() => {
-    setQuery("");
-    setResults([]);
-    setScopeRequired(false);
+    if (!open) return;
+    setQuery(prefillPersonEmail ?? "");
+    setSearchQuery(prefillPersonEmail ?? "");
     setActiveIndex(-1);
-    search("");
-  }, [search]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only re-run on open, not on every prefill change
+  }, [open]);
 
   useEffect(() => {
     if (
@@ -168,7 +261,10 @@ function PeopleTab({ onClose: _ }: { onClose: () => void }) {
   }, [activeIndex]);
 
   function handleAdd(email: string, name?: string) {
-    addPerson.mutate({ email, name });
+    addPerson.mutate(
+      { email, name },
+      { onSuccess: () => onPersonAdded?.({ email, name }) },
+    );
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
@@ -192,7 +288,10 @@ function PeopleTab({ onClose: _ }: { onClose: () => void }) {
         return;
       }
       const trimmed = query.trim();
-      if (EMAIL_REGEX.test(trimmed) && !overlayEmails.has(trimmed)) {
+      if (
+        EMAIL_REGEX.test(trimmed) &&
+        !overlayEmails.has(trimmed.toLowerCase())
+      ) {
         handleAdd(trimmed);
         setQuery("");
       }
@@ -208,7 +307,7 @@ function PeopleTab({ onClose: _ }: { onClose: () => void }) {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Search by name or type an email..."
+          placeholder={t("eventForm.searchPeoplePlaceholder")}
           className="h-9 w-full rounded-md border border-input bg-background pl-9 pr-3 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           autoFocus
         />
@@ -223,7 +322,7 @@ function PeopleTab({ onClose: _ }: { onClose: () => void }) {
           className="max-h-48 overflow-y-auto border-t border-border"
         >
           {results.map((person) => {
-            const alreadyAdded = overlayEmails.has(person.email);
+            const alreadyAdded = overlayEmails.has(person.email.toLowerCase());
             const selectableIdx = selectableResults.indexOf(person);
             const isActive = !alreadyAdded && selectableIdx === activeIndex;
             return (
@@ -255,7 +354,9 @@ function PeopleTab({ onClose: _ }: { onClose: () => void }) {
                   </div>
                 </div>
                 {alreadyAdded && (
-                  <span className="text-xs text-muted-foreground">Added</span>
+                  <span className="text-xs text-muted-foreground">
+                    {t("eventForm.added")}
+                  </span>
                 )}
               </button>
             );
@@ -265,7 +366,7 @@ function PeopleTab({ onClose: _ }: { onClose: () => void }) {
 
       {scopeRequired && (
         <div className="px-4 py-2 text-xs text-muted-foreground">
-          Directory search is limited. Type a full email and press Enter to add.
+          {t("eventForm.directorySearchLimited")}
         </div>
       )}
 
@@ -274,11 +375,11 @@ function PeopleTab({ onClose: _ }: { onClose: () => void }) {
         !searching &&
         EMAIL_REGEX.test(query.trim()) && (
           <div className="border-t border-border px-4 py-2.5 text-xs text-muted-foreground">
-            Press{" "}
+            {t("eventForm.press")}{" "}
             <kbd className="rounded border border-border bg-muted px-1 font-mono">
               Enter
             </kbd>{" "}
-            to add{" "}
+            {t("eventForm.toAdd")}{" "}
             <span className="font-medium text-foreground">{query.trim()}</span>
           </div>
         )}
@@ -286,7 +387,7 @@ function PeopleTab({ onClose: _ }: { onClose: () => void }) {
       {overlayPeople.length > 0 && (
         <div className="border-t border-border px-4 py-3">
           <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-            Showing calendars
+            {t("eventForm.showingCalendars")}
           </p>
           <div className="space-y-1.5">
             {overlayPeople.map((person) => (
@@ -316,9 +417,8 @@ function PeopleTab({ onClose: _ }: { onClose: () => void }) {
   );
 }
 
-// ─── URL / ICS tab ───────────────────────────────────────────────────────────
-
 function UrlTab({ onClose }: { onClose: () => void }) {
+  const t = useT();
   const [url, setUrl] = useState("");
   const addCalendar = useAddExternalCalendar();
   const removeCalendar = useRemoveExternalCalendar();
@@ -334,11 +434,11 @@ function UrlTab({ onClose }: { onClose: () => void }) {
       { url: url.trim() },
       {
         onSuccess: (cal) => {
-          toast.success(`"${cal.name}" added`);
+          toast.success(t("eventForm.calendarFeedAdded", { name: cal.name }));
           setUrl("");
           onClose();
         },
-        onError: () => toast.error("Failed to add calendar"),
+        onError: () => toast.error(t("eventForm.addCalendarFailed")),
       },
     );
   }
@@ -362,8 +462,7 @@ function UrlTab({ onClose }: { onClose: () => void }) {
             />
           </div>
           <p className="text-[11px] text-muted-foreground">
-            Paste a shareable calendar link from Google Calendar, iCloud,
-            Outlook, etc.
+            {t("eventForm.pasteShareableCalendarLink")}
           </p>
         </div>
         <Button
@@ -377,14 +476,14 @@ function UrlTab({ onClose }: { onClose: () => void }) {
           ) : (
             <IconCalendarPlus className="mr-1.5 h-4 w-4" />
           )}
-          Add Calendar
+          {t("eventForm.addCalendar")}
         </Button>
       </form>
 
       {calendars.length > 0 && (
         <div className="mt-4 border-t border-border pt-3">
           <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-            Subscribed feeds
+            {t("eventForm.subscribedFeeds")}
           </p>
           <div className="space-y-1.5">
             {calendars.map((cal) => (

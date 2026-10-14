@@ -1,20 +1,22 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
+import { defineAction } from "@agent-native/core/action";
 import {
+  buildBrandAnalysisResult,
   normalizeBrandWebsiteUrl,
-  fetchBrandWebsiteSignals,
 } from "@agent-native/core/brand-kit";
 import { resolveAccess } from "@agent-native/core/sharing";
-import "../server/db/index.js"; // ensure registerShareableResource runs
+import { extractRenderedDesignSystemFromUrl } from "@agent-native/creative-context/server";
+import { z } from "zod";
 
-// Re-exported for back-compat with existing imports/tests.
+import "../server/db/index.js";
+
 export { normalizeBrandWebsiteUrl };
 
 export default defineAction({
   description:
     "Gather brand data from various sources for agent analysis. " +
-    "If a websiteUrl is provided, fetches the page HTML and extracts: " +
-    "meta theme-color, CSS custom properties, font-face declarations. " +
+    "If a websiteUrl is provided, renders the page in a real browser and extracts " +
+    "computed colors, typography, spacing, radii, shadows, component styles, " +
+    "CSS custom properties, logo references, and a design.md-style summary. " +
     "If a designSystemId is provided, includes its existing data. " +
     "Returns structured data the agent can use to build or refine a design system.",
   schema: z.object({
@@ -35,21 +37,13 @@ export default defineAction({
   readOnly: true,
   http: { method: "GET" },
   run: async ({ designSystemId, companyName, brandNotes, websiteUrl }) => {
-    const result: Record<string, unknown> = {};
+    let existingDesignSystem: unknown;
 
-    if (companyName) {
-      result.companyName = companyName;
-    }
-    if (brandNotes) {
-      result.brandNotes = brandNotes;
-    }
-
-    // Include existing design system data if provided
     if (designSystemId) {
       const access = await resolveAccess("design-system", designSystemId);
       if (access) {
         const row = access.resource;
-        result.existingDesignSystem = {
+        existingDesignSystem = {
           id: row.id,
           title: row.title,
           data: row.data ? JSON.parse(row.data) : null,
@@ -58,11 +52,15 @@ export default defineAction({
       }
     }
 
-    // Fetch and analyze website if URL provided
-    if (websiteUrl) {
-      result.websiteAnalysis = await fetchBrandWebsiteSignals(websiteUrl);
-    }
+    const websiteAnalysis = websiteUrl
+      ? await extractRenderedDesignSystemFromUrl(websiteUrl)
+      : undefined;
 
-    return result;
+    return buildBrandAnalysisResult({
+      companyName,
+      brandNotes,
+      existingDesignSystem,
+      websiteAnalysis,
+    });
   },
 });

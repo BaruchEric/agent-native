@@ -1,9 +1,10 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { getRequestUserEmail } from "@agent-native/core/server";
 import { getUserSetting } from "@agent-native/core/settings";
 import { z } from "zod";
-import type { UserSettings } from "../shared/types.js";
+
 import { normalizeSignature } from "../shared/signature.js";
+import type { UserSettings } from "../shared/types.js";
 
 function normalize(settings: Partial<UserSettings> | undefined, email: string) {
   return {
@@ -11,12 +12,14 @@ function normalize(settings: Partial<UserSettings> | undefined, email: string) {
     email: settings?.email || email,
     signature: normalizeSignature(settings?.signature),
     writingStyle: settings?.writingStyle ?? "",
+    autocompleteEnabled: settings?.autocompleteEnabled === true,
+    sendAndArchive: settings?.sendAndArchive === true,
   };
 }
 
 export default defineAction({
   description:
-    "Read the user's mail drafting settings, including configured signature and writing style.",
+    "Read the user's mail drafting settings, including signature, writing style, autocomplete, and Send + Mark Done preference. Use this before changing a durable preference so unrelated settings can be preserved.",
   schema: z.object({}),
   http: { method: "GET" },
   readOnly: true,

@@ -1,44 +1,145 @@
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { z } from "zod";
+
 import { defineAction } from "../../action.js";
-import { resolveAccess } from "../access.js";
+import { organizations } from "../../org/schema.js";
+import { listWorkspaceUserGroupsForOrg } from "../../workspace-connections/groups.js";
+import { assertAccess, resolveAccess } from "../access.js";
 import { requireShareableResource } from "../registry.js";
+import { assertWidgetShareReadGrant } from "../widget-grant.js";
+
+async function loadOrgDisplayNames(
+  db: any,
+  shares: Array<{ principalType: string; principalId: string }>,
+): Promise<Map<string, string>> {
+  const orgIds = Array.from(
+    new Set(
+      shares
+        .filter((s) => s.principalType === "org" && s.principalId)
+        .map((s) => s.principalId),
+    ),
+  );
+  if (!orgIds.length) return new Map();
+
+  try {
+    const rows = await db
+      .select({ id: organizations.id, name: organizations.name })
+      .from(organizations)
+      .where(inArray(organizations.id, orgIds));
+    return new Map(
+      rows.flatMap(
+        (row: {
+          id?: string | null;
+          name?: string | null;
+        }): Array<[string, string]> => {
+          if (typeof row.id !== "string" || typeof row.name !== "string") {
+            return [];
+          }
+          const name = row.name.trim();
+          return name ? [[row.id, name]] : [];
+        },
+      ),
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+async function loadGroupDisplayNames(
+  orgId: string | null | undefined,
+  shares: Array<{ principalType: string; principalId: string }>,
+): Promise<Map<string, string>> {
+  const groupIds = Array.from(
+    new Set(
+      shares
+        .filter((share) => share.principalType === "group" && share.principalId)
+        .map((share) => share.principalId),
+    ),
+  );
+  if (!groupIds.length || !orgId) return new Map();
+  try {
+    const groups = await listWorkspaceUserGroupsForOrg(orgId, groupIds);
+    return new Map(
+      groups.flatMap((group): Array<[string, string]> => {
+        const id = group.id;
+        const name = group.name.trim();
+        return id && name ? [[id, name]] : [];
+      }),
+    );
+  } catch {
+    return new Map();
+  }
+}
 
 export default defineAction({
   description:
-    "List the current visibility and share grants on a shareable resource. Any read access is sufficient.",
+    "List the current visibility and share grants on a shareable resource. Ordinary reads require resource access; widget reads require admin access.",
   schema: z.object({
     resourceType: z.string(),
     resourceId: z.string(),
   }),
   http: { method: "GET" },
-  run: async (args) => {
+  run: async (args, context) => {
+    assertWidgetShareReadGrant(context, args);
     const reg = requireShareableResource(args.resourceType);
-    const policy = {
-      // Defaults match registration defaults so the UI behaves the same for
-      // resources that haven't opted into restrictions.
+    const policy: {
+      allowPublic: boolean;
+      requireOrgMemberForUserShares: boolean;
+      supportsGroupShares?: boolean;
+    } = {
       allowPublic: reg.allowPublic !== false,
       requireOrgMemberForUserShares: reg.requireOrgMemberForUserShares === true,
+      ...(reg.supportsGroupShares === true
+        ? { supportsGroupShares: true }
+        : {}),
     };
-    const access = await resolveAccess(args.resourceType, args.resourceId);
+    const access = context?.mcpDirectoryWidgetReadOnly
+      ? await assertAccess(
+          args.resourceType,
+          args.resourceId,
+          "admin",
+          undefined,
+          { skipResourceBody: true },
+        )
+      : await resolveAccess(args.resourceType, args.resourceId, undefined, {
+          skipResourceBody: true,
+        });
     if (!access)
       return { ownerEmail: null, visibility: null, shares: [], policy };
 
     const db = reg.getDb() as any;
     const shares = await db
-      .select()
+      .select({
+        id: reg.sharesTable.id,
+        principalType: reg.sharesTable.principalType,
+        principalId: reg.sharesTable.principalId,
+        role: reg.sharesTable.role,
+        createdAt: reg.sharesTable.createdAt,
+      })
       .from(reg.sharesTable)
       .where(eq(reg.sharesTable.resourceId, args.resourceId));
+    const orgDisplayNames = await loadOrgDisplayNames(db, shares);
+    const groupDisplayNames = await loadGroupDisplayNames(
+      access.resource.orgId,
+      shares,
+    );
 
     return {
       ownerEmail: access.resource.ownerEmail ?? null,
       orgId: access.resource.orgId ?? null,
       visibility: access.resource.visibility ?? "private",
       role: access.role,
+      agentReadable: Boolean(reg.agentReadable),
       shares: shares.map((s: any) => ({
         id: s.id,
         principalType: s.principalType,
         principalId: s.principalId,
+        displayName:
+          s.principalType === "org"
+            ? orgDisplayNames.get(s.principalId)
+            : s.principalType === "group"
+              ? groupDisplayNames.get(s.principalId)
+              : undefined,
         role: s.role,
         createdAt: s.createdAt,
       })),

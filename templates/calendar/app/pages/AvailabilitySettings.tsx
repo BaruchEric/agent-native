@@ -1,8 +1,11 @@
+import { useT } from "@agent-native/core/client/i18n";
+import type { AvailabilityConfig, DaySchedule } from "@shared/api";
+import { IconPlus, IconTrash } from "@tabler/icons-react";
 import { useState, useEffect } from "react";
+import { toast } from "sonner";
+
+import { TimezoneCombobox } from "@/components/TimezoneCombobox";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
 import {
   Card,
   CardContent,
@@ -10,34 +13,42 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
   useAvailability,
   useUpdateAvailability,
 } from "@/hooks/use-availability";
-import { TimezoneCombobox } from "@/components/TimezoneCombobox";
-import { useDbStatus } from "@/hooks/use-db-status";
-import { CloudUpgrade } from "@/components/CloudUpgrade";
-import { toast } from "sonner";
-import type { AvailabilityConfig, DaySchedule } from "@shared/api";
+import {
+  DEFAULT_TIME_SLOT,
+  addTimeSlot,
+  getEditableTimeSlots,
+  removeTimeSlot,
+  setDayEnabled,
+  updateTimeSlot,
+} from "@/lib/availability-schedule";
+import { copyTextToClipboard } from "@/lib/clipboard";
 
 type DayName = keyof AvailabilityConfig["weeklySchedule"];
 
-const DAYS: { key: DayName; label: string }[] = [
-  { key: "monday", label: "Monday" },
-  { key: "tuesday", label: "Tuesday" },
-  { key: "wednesday", label: "Wednesday" },
-  { key: "thursday", label: "Thursday" },
-  { key: "friday", label: "Friday" },
-  { key: "saturday", label: "Saturday" },
-  { key: "sunday", label: "Sunday" },
+const DAYS: { key: DayName }[] = [
+  { key: "monday" },
+  { key: "tuesday" },
+  { key: "wednesday" },
+  { key: "thursday" },
+  { key: "friday" },
+  { key: "saturday" },
+  { key: "sunday" },
 ];
 
 const DEFAULT_SCHEDULE: DaySchedule = {
   enabled: false,
-  slots: [{ start: "09:00", end: "17:00" }],
+  slots: [{ ...DEFAULT_TIME_SLOT }],
 };
 
 export default function AvailabilitySettings() {
+  const t = useT();
   const { data: availability } = useAvailability();
   const updateAvailability = useUpdateAvailability();
 
@@ -58,8 +69,14 @@ export default function AvailabilitySettings() {
   const [slotDuration, setSlotDuration] = useState(30);
   const [bookingSlug, setBookingSlug] = useState("meeting");
   const [timezone, setTimezone] = useState("America/New_York");
-  const { isLocal } = useDbStatus();
-  const [showCloudUpgrade, setShowCloudUpgrade] = useState(false);
+  async function handleCopyBookingLink() {
+    const url = `${window.location.origin}/book/${bookingSlug}`;
+    if (await copyTextToClipboard(url)) {
+      toast.success(t("bookingLinks.bookingLinkCopied"));
+      return;
+    }
+    toast.error(t("common.clipboardUnavailable"));
+  }
 
   useEffect(() => {
     if (availability) {
@@ -76,17 +93,36 @@ export default function AvailabilitySettings() {
   function updateDay(day: DayName, updates: Partial<DaySchedule>) {
     setSchedule((prev) => ({
       ...prev,
-      [day]: { ...prev[day], ...updates },
+      [day]:
+        typeof updates.enabled === "boolean"
+          ? setDayEnabled(prev[day], updates.enabled)
+          : { ...prev[day], ...updates },
     }));
   }
 
-  function updateDaySlot(day: DayName, field: "start" | "end", value: string) {
+  function updateDaySlot(
+    day: DayName,
+    slotIndex: number,
+    field: "start" | "end",
+    value: string,
+  ) {
     setSchedule((prev) => ({
       ...prev,
-      [day]: {
-        ...prev[day],
-        slots: [{ ...prev[day].slots[0], [field]: value }],
-      },
+      [day]: updateTimeSlot(prev[day], slotIndex, field, value),
+    }));
+  }
+
+  function addDaySlot(day: DayName) {
+    setSchedule((prev) => ({
+      ...prev,
+      [day]: addTimeSlot(prev[day]),
+    }));
+  }
+
+  function removeDaySlot(day: DayName, slotIndex: number) {
+    setSchedule((prev) => ({
+      ...prev,
+      [day]: removeTimeSlot(prev[day], slotIndex),
     }));
   }
 
@@ -102,45 +138,69 @@ export default function AvailabilitySettings() {
         bookingPageSlug: bookingSlug,
       },
       {
-        onSuccess: () => toast.success("Availability saved"),
-        onError: () => toast.error("Failed to save availability"),
+        onSuccess: () => toast.success(t("bookingLinks.availabilitySaved")),
+        onError: () => toast.error(t("bookingLinks.availabilitySaveFailed")),
       },
     );
+  }
+
+  function dayLabel(day: DayName) {
+    switch (day) {
+      case "monday":
+        return t("bookingLinks.days.monday");
+      case "tuesday":
+        return t("bookingLinks.days.tuesday");
+      case "wednesday":
+        return t("bookingLinks.days.wednesday");
+      case "thursday":
+        return t("bookingLinks.days.thursday");
+      case "friday":
+        return t("bookingLinks.days.friday");
+      case "saturday":
+        return t("bookingLinks.days.saturday");
+      case "sunday":
+        return t("bookingLinks.days.sunday");
+    }
   }
 
   return (
     <div className="mx-auto max-w-2xl space-y-6 px-4 py-8 pb-12">
       <div>
-        <h1 className="text-2xl font-semibold">Availability</h1>
+        <h1 className="text-2xl font-semibold">
+          {t("bookingLinks.availability")}
+        </h1>
         <p className="text-sm text-muted-foreground mt-1">
-          Set your available hours for bookings.
+          {t("bookingLinks.availabilityDescription")}
         </p>
       </div>
 
       {/* Weekly Schedule */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">Weekly Schedule</CardTitle>
+          <CardTitle className="text-lg">
+            {t("bookingLinks.weeklySchedule")}
+          </CardTitle>
           <CardDescription>
-            Toggle days and set available hours.
+            {t("bookingLinks.weeklyScheduleDescription")}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-2 rounded-lg border border-border bg-muted/20 p-3">
-            <Label htmlFor="availability-timezone">Timezone</Label>
+            <Label htmlFor="availability-timezone">
+              {t("eventForm.timezone")}
+            </Label>
             <TimezoneCombobox
               id="availability-timezone"
               value={timezone}
               onChange={setTimezone}
             />
             <p className="text-xs text-muted-foreground">
-              Weekly hours like 9 AM-5 PM are interpreted in this timezone
-              before visitors see them in their own browser timezone.
+              {t("bookingLinks.timezoneHelp")}
             </p>
           </div>
-          {DAYS.map(({ key, label }) => {
+          {DAYS.map(({ key }) => {
             const day = schedule[key];
-            const slot = day.slots[0] ?? { start: "09:00", end: "17:00" };
+            const slots = getEditableTimeSlots(day);
             return (
               <div
                 key={key}
@@ -153,32 +213,68 @@ export default function AvailabilitySettings() {
                       updateDay(key, { enabled: checked })
                     }
                   />
-                  <span className="text-sm font-medium">{label}</span>
+                  <span className="text-sm font-medium">{dayLabel(key)}</span>
                 </div>
 
                 {day.enabled ? (
-                  <div className="flex items-center gap-2">
-                    <Input
-                      type="time"
-                      value={slot.start}
-                      onChange={(e) =>
-                        updateDaySlot(key, "start", e.target.value)
-                      }
-                      className="w-28 sm:w-32"
-                    />
-                    <span className="text-muted-foreground">to</span>
-                    <Input
-                      type="time"
-                      value={slot.end}
-                      onChange={(e) =>
-                        updateDaySlot(key, "end", e.target.value)
-                      }
-                      className="w-28 sm:w-32"
-                    />
+                  <div className="min-w-0 flex-1 space-y-2">
+                    {slots.map((slot, slotIndex) => (
+                      <div
+                        key={`${key}-${slotIndex}`}
+                        className="flex flex-wrap items-center gap-2"
+                      >
+                        <Input
+                          type="time"
+                          value={slot.start}
+                          onChange={(e) =>
+                            updateDaySlot(
+                              key,
+                              slotIndex,
+                              "start",
+                              e.target.value,
+                            )
+                          }
+                          className="w-28 sm:w-32"
+                        />
+                        <span className="text-muted-foreground">
+                          {t("bookingLinks.to")}
+                        </span>
+                        <Input
+                          type="time"
+                          value={slot.end}
+                          onChange={(e) =>
+                            updateDaySlot(key, slotIndex, "end", e.target.value)
+                          }
+                          className="w-28 sm:w-32"
+                        />
+                        {slots.length > 1 && (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="px-2 text-muted-foreground hover:text-destructive"
+                            onClick={() => removeDaySlot(key, slotIndex)}
+                          >
+                            <IconTrash className="mr-1.5 h-3.5 w-3.5" />
+                            {t("eventForm.delete")}
+                          </Button>
+                        )}
+                      </div>
+                    ))}
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="px-2"
+                      onClick={() => addDaySlot(key)}
+                    >
+                      <IconPlus className="mr-1.5 h-3.5 w-3.5" />
+                      {t("bookingLinks.add")}
+                    </Button>
                   </div>
                 ) : (
                   <span className="text-sm text-muted-foreground">
-                    Unavailable
+                    {t("bookingLinks.unavailable")}
                   </span>
                 )}
               </div>
@@ -190,15 +286,17 @@ export default function AvailabilitySettings() {
       {/* Booking Settings */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">Booking Rules</CardTitle>
+          <CardTitle className="text-lg">
+            {t("bookingLinks.bookingRules")}
+          </CardTitle>
           <CardDescription>
-            Configure buffer time, notice periods, and slot settings.
+            {t("bookingLinks.bookingRulesDescription")}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label>Buffer between events (min)</Label>
+              <Label>{t("bookingLinks.bufferBetweenEvents")}</Label>
               <Input
                 type="number"
                 value={bufferMinutes}
@@ -207,7 +305,7 @@ export default function AvailabilitySettings() {
               />
             </div>
             <div className="space-y-2">
-              <Label>Minimum notice (hours)</Label>
+              <Label>{t("bookingLinks.minimumNotice")}</Label>
               <Input
                 type="number"
                 value={minNoticeHours}
@@ -216,7 +314,7 @@ export default function AvailabilitySettings() {
               />
             </div>
             <div className="space-y-2">
-              <Label>Max advance booking (days)</Label>
+              <Label>{t("bookingLinks.maxAdvanceBooking")}</Label>
               <Input
                 type="number"
                 value={maxAdvanceDays}
@@ -225,7 +323,7 @@ export default function AvailabilitySettings() {
               />
             </div>
             <div className="space-y-2">
-              <Label>Slot duration (minutes)</Label>
+              <Label>{t("bookingLinks.slotDuration")}</Label>
               <Input
                 type="number"
                 value={slotDuration}
@@ -236,7 +334,7 @@ export default function AvailabilitySettings() {
           </div>
 
           <div className="space-y-2">
-            <Label>Booking page slug</Label>
+            <Label>{t("bookingLinks.bookingPageSlug")}</Label>
             <div className="flex items-center gap-2">
               <span className="text-sm text-muted-foreground">/book/</span>
               <Input
@@ -248,21 +346,13 @@ export default function AvailabilitySettings() {
           </div>
 
           <div className="space-y-2">
-            <Label>Share booking link</Label>
+            <Label>{t("bookingLinks.shareBookingLink")}</Label>
             <Button
               variant="outline"
               size="sm"
-              onClick={() => {
-                if (isLocal) {
-                  setShowCloudUpgrade(true);
-                  return;
-                }
-                const url = `${window.location.origin}/book/${bookingSlug}`;
-                navigator.clipboard.writeText(url);
-                toast.success("Booking link copied to clipboard");
-              }}
+              onClick={() => void handleCopyBookingLink()}
             >
-              Copy Booking Link
+              {t("bookingLinks.copyBookingLink")}
             </Button>
           </div>
         </CardContent>
@@ -273,18 +363,10 @@ export default function AvailabilitySettings() {
         disabled={updateAvailability.isPending}
         className="w-full"
       >
-        {updateAvailability.isPending ? "Saving..." : "Save Availability"}
+        {updateAvailability.isPending
+          ? t("common.saving")
+          : t("bookingLinks.saveAvailability")}
       </Button>
-
-      {showCloudUpgrade && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-          <CloudUpgrade
-            title="Share Booking Link"
-            description="To share your booking page publicly, connect a cloud database so bookings can be received from anywhere."
-            onClose={() => setShowCloudUpgrade(false)}
-          />
-        </div>
-      )}
     </div>
   );
 }

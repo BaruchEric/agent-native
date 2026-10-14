@@ -1,38 +1,71 @@
+import { navigateWithAgentChatViewTransition } from "@agent-native/core/client/agent-chat";
+import { configureTracking } from "@agent-native/core/client/analytics";
+import { appPath } from "@agent-native/core/client/api-path";
+import {
+  createAgentNativeQueryClient,
+  useDbSync,
+} from "@agent-native/core/client/hooks";
+import { getLocaleInitScript, useT } from "@agent-native/core/client/i18n";
+import { getThemeInitScript } from "@agent-native/core/client/ui";
+import { AppProviders } from "@agent-native/toolkit/app/providers";
+import {
+  CommandMenu,
+  useCommandMenuShortcut,
+} from "@agent-native/toolkit/app/shared";
+import { PLAN_KIND_ROUTE_SEGMENT } from "@shared/plan-routes";
+import {
+  IconHierarchy2,
+  IconMoon,
+  IconScribble,
+  IconShape2,
+  IconSun,
+} from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useTheme } from "next-themes";
+import { useCallback, useEffect, useState } from "react";
 import {
   Links,
   Meta,
   Outlet,
   Scripts,
   ScrollRestoration,
+  useLocation,
   useNavigate,
 } from "react-router";
-import { useCallback, useState } from "react";
-import { useNavigationState } from "@/hooks/use-navigation-state";
-import { useQueryClient } from "@tanstack/react-query";
-import { useDbSync } from "@agent-native/core/client";
-import {
-  AppProviders,
-  CommandMenu,
-  appPath,
-  createAgentNativeQueryClient,
-  getThemeInitScript,
-  markAgentChatHomeHandoff,
-  navigateWithAgentChatViewTransition,
-  useCommandMenuShortcut,
-} from "@agent-native/core/client";
-import { IconSun, IconMoon } from "@tabler/icons-react";
-import { useTheme } from "next-themes";
-import { Toaster } from "@/components/ui/sonner";
+import type { LinksFunction } from "react-router";
+
 import { Layout as AppLayout } from "@/components/layout/Layout";
-import { TAB_ID } from "@/lib/tab-id";
-import { APP_TITLE } from "@/lib/app-config";
+import {
+  toggleWireframeStyle,
+  useWireframeStyle,
+} from "@/components/plan/wireframe/use-wireframe-style";
+import { Toaster } from "@/components/ui/sonner";
+import { AppToolkitProvider } from "@/components/ui/toolkit-provider";
 // Side effect: register Plan's native chat renderers so visual answers render
 // their diagram/wireframe/api-spec blocks inline in the agent chat.
 import "@/lib/register-chat-renderers";
-import type { LinksFunction } from "react-router";
+import { useNavigationState } from "@/hooks/use-navigation-state";
+import { APP_TITLE } from "@/lib/app-config";
+import { isPlanChatPath } from "@/lib/chat-route";
+import { shouldCapturePlanContent } from "@/lib/plan-tracking";
+import { TAB_ID } from "@/lib/tab-id";
+
+import changelog from "../CHANGELOG.md?raw";
+import { i18nCatalog } from "./i18n";
+
 import stylesheet from "./global.css?url";
-import { configureTracking } from "@agent-native/core/client";
+
+/**
+ * Routes that render the impersonal public shell. A plan kind missing here
+ * bounces an anonymous reader through the session gate before the SSR shell can
+ * render, so the list is derived from the route-segment map.
+ */
+const PUBLIC_SHELL_ROUTE_PREFIXES = [
+  ...Object.values(PLAN_KIND_ROUTE_SEGMENT),
+  "local-plans",
+].map((segment) => `/${segment}`);
 configureTracking({
+  contentCaptureForPath: shouldCapturePlanContent,
   getDefaultProps: (_name, properties) => ({
     ...properties,
     app: "plan",
@@ -43,11 +76,35 @@ export const links: LinksFunction = () => [
   { rel: "stylesheet", href: stylesheet },
 ];
 
-const THEME_INIT_SCRIPT = getThemeInitScript();
+const THEME_INIT_SCRIPT_SELECTOR = "script[data-agent-native-theme-init]";
+const LOCALE_INIT_SCRIPT_SELECTOR = "script[data-agent-native-locale-init]";
+
+function getHydrationStableThemeInitScript() {
+  if (typeof document !== "undefined") {
+    const existing = document.querySelector<HTMLScriptElement>(
+      THEME_INIT_SCRIPT_SELECTOR,
+    );
+    if (existing?.innerHTML) return existing.innerHTML;
+  }
+  return getThemeInitScript();
+}
+
+function getHydrationStableLocaleInitScript() {
+  if (typeof document !== "undefined") {
+    const existing = document.querySelector<HTMLScriptElement>(
+      LOCALE_INIT_SCRIPT_SELECTOR,
+    );
+    if (existing?.innerHTML) return existing.innerHTML;
+  }
+  return getLocaleInitScript();
+}
+
+const THEME_INIT_SCRIPT = getHydrationStableThemeInitScript();
+const LOCALE_INIT_SCRIPT = getHydrationStableLocaleInitScript();
 
 export function Layout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en-US" dir="ltr" data-locale="en-US" suppressHydrationWarning>
       <head>
         <meta charSet="utf-8" />
         <meta
@@ -55,10 +112,15 @@ export function Layout({ children }: { children: React.ReactNode }) {
           content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
         />
         <script
+          data-agent-native-theme-init
           suppressHydrationWarning
           dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }}
         />
-        <link rel="manifest" href={appPath("/manifest.json")} />
+        <script
+          data-agent-native-locale-init
+          suppressHydrationWarning
+          dangerouslySetInnerHTML={{ __html: LOCALE_INIT_SCRIPT }}
+        />
         <meta name="theme-color" content="#71717A" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta
@@ -80,12 +142,20 @@ export function Layout({ children }: { children: React.ReactNode }) {
   );
 }
 
+function isPrivatePlanEditorPath(pathname: string): boolean {
+  return /^\/(?:plans|recaps)\/[^/]+\/?$/.test(pathname);
+}
+
 function DbSyncSetup() {
   const qc = useQueryClient();
+  const location = useLocation();
   useNavigationState();
   useDbSync({
     queryClient: qc,
     ignoreSource: TAB_ID,
+    realtime: isPrivatePlanEditorPath(location.pathname)
+      ? { reason: "collaborators can edit and comment on this open plan" }
+      : undefined,
   });
   return null;
 }
@@ -95,10 +165,11 @@ function AppContent() {
   const navigate = useNavigate();
   const { resolvedTheme, setTheme } = useTheme();
   const isDark = resolvedTheme === "dark";
+  const wireframeStyle = useWireframeStyle();
+  const t = useT();
   useCommandMenuShortcut(useCallback(() => setCmdkOpen(true), []));
   const go = useCallback(
     (path: string) => {
-      if (path !== "/") markAgentChatHomeHandoff("plans");
       navigateWithAgentChatViewTransition(navigate, path);
       setCmdkOpen(false);
     },
@@ -106,23 +177,58 @@ function AppContent() {
   );
   return (
     <>
-      <CommandMenu open={cmdkOpen} onOpenChange={setCmdkOpen}>
-        <CommandMenu.Group heading="Actions">
-          <CommandMenu.Item onSelect={() => go("/")}>Ask Plan</CommandMenu.Item>
+      <CommandMenu
+        open={cmdkOpen}
+        onOpenChange={setCmdkOpen}
+        changelog={changelog}
+        changelogKey="plan"
+        chatStorageKey="plans"
+      >
+        <CommandMenu.Group heading={t("root.commandActions")}>
+          <CommandMenu.Item onSelect={() => go("/chat")}>
+            {t("root.askPlan")}
+          </CommandMenu.Item>
           <CommandMenu.Item onSelect={() => go("/plans")}>
-            Open plans
+            {t("root.openPlans")}
           </CommandMenu.Item>
           <CommandMenu.Item onSelect={() => go("/recaps")}>
-            Open recaps
+            {t("root.openRecaps")}
+          </CommandMenu.Item>
+          <CommandMenu.Item
+            onSelect={() => go("/settings/agent")}
+            keywords={["agent", "context", "connections", "jobs", "access"]}
+          >
+            <IconHierarchy2 size={16} />
+            {t("settings.openAgentSettings")}
           </CommandMenu.Item>
         </CommandMenu.Group>
-        <CommandMenu.Group heading="Appearance">
+        <CommandMenu.Group heading={t("root.commandAppearance")}>
           <CommandMenu.Item
             onSelect={() => setTheme(isDark ? "light" : "dark")}
             keywords={["theme", "dark", "light", "mode"]}
           >
             {isDark ? <IconSun size={16} /> : <IconMoon size={16} />}
-            Toggle {isDark ? "light" : "dark"} mode
+            {t("root.toggleTheme")}
+          </CommandMenu.Item>
+          <CommandMenu.Item
+            onSelect={() => toggleWireframeStyle()}
+            keywords={[
+              "wireframe",
+              "wireframes",
+              "sketchy",
+              "sketch",
+              "clean",
+              "style",
+            ]}
+          >
+            {wireframeStyle === "sketchy" ? (
+              <IconShape2 size={16} />
+            ) : (
+              <IconScribble size={16} />
+            )}
+            {wireframeStyle === "sketchy"
+              ? t("plansPage.reader.cleanWireframes")
+              : t("plansPage.reader.sketchyWireframes")}
           </CommandMenu.Item>
         </CommandMenu.Group>
       </CommandMenu>
@@ -135,18 +241,34 @@ function AppContent() {
 
 export default function Root() {
   const [queryClient] = useState(() => createAgentNativeQueryClient());
+  const location = useLocation();
+  const pathname = location.pathname.replace(/\/+$/, "") || "/";
+  const sessionBypass =
+    isPlanChatPath(pathname) ||
+    PUBLIC_SHELL_ROUTE_PREFIXES.some(
+      (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
+    );
+  const localPlanPrivacyRoute = !shouldCapturePlanContent(location.pathname);
   return (
-    // Pass the plan-specific styled Toaster via `toaster` so only one sonner
-    // instance renders (avoids the duplicate that would appear if AppProviders'
-    // built-in Toaster AND a children-rendered Toaster both mounted).
-    <AppProviders
-      queryClient={queryClient}
-      toaster={<Toaster richColors position="bottom-left" />}
-    >
-      <DbSyncSetup />
-      <AppContent />
-    </AppProviders>
+    <AppToolkitProvider>
+      <AppProviders
+        queryClient={queryClient}
+        skeletonLayout="list"
+        sessionBypass={sessionBypass}
+        documentTitleFallback={APP_TITLE}
+        toaster={<Toaster richColors position="bottom-left" />}
+        i18n={{ catalog: i18nCatalog }}
+      >
+        <div
+          data-an-mask={localPlanPrivacyRoute ? "" : undefined}
+          style={{ display: "contents" }}
+        >
+          <DbSyncSetup />
+          <AppContent />
+        </div>
+      </AppProviders>
+    </AppToolkitProvider>
   );
 }
 
-export { ErrorBoundary } from "@agent-native/core/client";
+export { ErrorBoundary } from "@agent-native/toolkit/app/shared";

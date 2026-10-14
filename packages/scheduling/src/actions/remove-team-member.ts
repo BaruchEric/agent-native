@@ -1,6 +1,7 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
+import { defineAction } from "@agent-native/core/action";
 import { and, eq } from "drizzle-orm";
+import { z } from "zod";
+
 import { getSchedulingContext } from "../server/context.js";
 import { assertTeamAdmin } from "./_helpers.js";
 

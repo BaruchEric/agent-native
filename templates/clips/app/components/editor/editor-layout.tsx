@@ -1,27 +1,31 @@
-/**
- * Non-destructive editor for a single recording.
- *
- * Three rows, top to bottom:
- *   1. Preview — a simple <video> element plus a side panel for transcript.
- *   2. Transcript editor (middle) + chapters sidebar.
- *   3. Waveform, trim handles, timeline ruler (bottom).
- *
- * All edits (trim, split, thumbnail, chapters, stitch) go through actions so
- * the agent and UI stay in sync via `useDbSync` + the `refresh-signal` poke.
- */
-
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   agentNativePath,
   appBasePath,
+} from "@agent-native/core/client/api-path";
+import {
   useActionMutation,
   useActionQuery,
-} from "@agent-native/core/client";
+} from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { FileStorageSetupPopover } from "@agent-native/toolkit/app/chat/FileStorageSetupPopover";
+import {
+  IconArrowLeft,
+  IconCheck,
+  IconInfoCircle,
+  IconLoader2,
+} from "@tabler/icons-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
-// Client-side app-state helpers — the `@agent-native/core/application-state`
-// module is server-only (requires DB access). In the browser we hit the
-// framework's auto-mounted route, which handles per-session scoping.
+import { Button } from "@/components/ui/button";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+
 async function readAppStateClient<T = unknown>(key: string): Promise<T | null> {
   try {
     const r = await fetch(
@@ -53,35 +57,211 @@ async function writeAppStateClient(key: string, value: unknown): Promise<void> {
   }
 }
 
-import { cn } from "@/lib/utils";
-import { computePeaks, type WaveformPeaks } from "@/lib/waveform-peaks";
+import { useVideoStorageStatus } from "@/hooks/use-video-storage-status";
+import {
+  beginEditorSave,
+  beginRecordingEditorOperation,
+  createEditorSaveLedger,
+  enqueueRecordingEditorSave,
+  finishEditorSave,
+  isLatestEditorSave,
+  refreshAfterRecordingEditorSaves,
+  removeEditorHistoryEntry,
+  type EditSaveKind,
+  type EditorSaveStatus,
+} from "@/lib/editor-save-status";
+import { withMediaVersion } from "@/lib/media-url";
 import {
   parsePlaybackSpeed,
   readPlaybackSpeedPreference,
   savePlaybackSpeedPreference,
+  SLOW_SPEED_CEILING,
 } from "@/lib/playback-speed";
+import { storageAwareErrorMessage } from "@/lib/storage-setup-error-message";
 import {
-  parseEdits,
-  getExcludedRanges,
+  addCut,
+  addSplitAt,
+  buildTimelinePieces,
   formatMs,
+  getExcludedRanges,
+  parseEdits,
+  removeCut,
+  removeSplit,
+  skipExcludedRange,
+  visibleSplitPoints,
   type EditsJson,
+  type TrimRange,
 } from "@/lib/timestamp-mapping";
+import { cn } from "@/lib/utils";
+import {
+  extractFilmstripThumbnails,
+  type FilmstripFrame,
+  type FilmstripSprite,
+} from "@/lib/video-filmstrip";
+import {
+  clampRedactionToDuration,
+  DEFAULT_REDACTION_STYLE,
+  newRedactionId,
+  otherOverlays,
+  parseRedactions,
+  setRedactionKey,
+  type RedactionRect,
+  type RedactionStyle,
+  type VideoRedaction,
+} from "@/lib/video-redactions";
+import { computePeaks, type WaveformPeaks } from "@/lib/waveform-peaks";
 
-import { EditorToolbar } from "./editor-toolbar";
-import { Waveform } from "./waveform";
-import { TrimHandles } from "./trim-handles";
-import { Timeline } from "./timeline";
-import { TranscriptEditor } from "./transcript-editor";
 import { ChaptersEditor } from "./chapters-editor";
-import { ThumbnailPicker } from "./thumbnail-picker";
+import { EditorToolbar } from "./editor-toolbar";
+import { RedactionLane } from "./redaction-lane";
+import { RedactionOverlay } from "./redaction-overlay";
 import { StitchManager } from "./stitch-manager";
+import { ThumbnailPicker } from "./thumbnail-picker";
+import { Timeline } from "./timeline";
+import { getTimelineTotalWidth } from "./timeline-geometry";
+import { TimelineTrack, type TrackSelection } from "./timeline-track";
+import { TranscriptEditor } from "./transcript-editor";
+import { Waveform } from "./waveform";
 
 export interface EditorLayoutProps {
   recordingId: string;
+  onBack: () => void;
   className?: string;
 }
 
-const WAVEFORM_HEIGHT = 120;
+interface EditSnapshot {
+  trims: TrimRange[];
+  overlays: unknown[];
+}
+
+function snapshotOf(edits: EditsJson): EditSnapshot {
+  return { trims: edits.trims, overlays: edits.overlays ?? [] };
+}
+
+function sameList(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+const MAX_UNREADABLE_BURN_POLLS = 12;
+
+const BURN_REGISTRATION_GRACE_MS = 15_000;
+
+function HelpPopover({
+  label,
+  lead,
+  rows,
+}: {
+  label: string;
+  lead?: string;
+  rows: Array<{ term?: string; text: string }>;
+}) {
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          aria-label={label}
+          className="inline-flex size-5 shrink-0 items-center justify-center rounded-full text-muted-foreground hover:bg-accent hover:text-foreground"
+        >
+          <IconInfoCircle className="size-4" aria-hidden="true" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="start"
+        collisionPadding={8}
+        className="max-h-[var(--radix-popover-content-available-height)] w-80 overflow-y-auto text-[11px] leading-relaxed"
+      >
+        <p className="text-xs font-semibold">{label}</p>
+        {lead ? (
+          <p className="mt-1 font-medium text-amber-600 dark:text-amber-400">
+            {lead}
+          </p>
+        ) : null}
+        <dl className="mt-2 space-y-1.5">
+          {rows.map((row, index) => (
+            <div key={index}>
+              {row.term ? (
+                <dt className="font-medium text-foreground">{row.term}</dt>
+              ) : null}
+              <dd className="text-muted-foreground">{row.text}</dd>
+            </div>
+          ))}
+        </dl>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+function RedactionStyleToggle({
+  value,
+  onChange,
+  t,
+}: {
+  value: RedactionStyle;
+  onChange: (style: RedactionStyle) => void;
+  t: (key: string, vars?: Record<string, unknown>) => string;
+}) {
+  return (
+    <span className="inline-flex shrink-0 overflow-hidden rounded-full border border-border text-[11px]">
+      {(["mosaic", "solid"] as const).map((style) => (
+        <button
+          key={style}
+          type="button"
+          aria-pressed={value === style}
+          className={cn(
+            "px-2 py-0.5",
+            value === style
+              ? "bg-foreground text-background"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+          title={t(
+            style === "mosaic"
+              ? "redaction.styleBlurHint"
+              : "redaction.styleSolidHint",
+          )}
+          onClick={() => onChange(style)}
+        >
+          {t(
+            style === "mosaic" ? "redaction.styleBlur" : "redaction.styleSolid",
+          )}
+        </button>
+      ))}
+    </span>
+  );
+}
+
+const WAVEFORM_HEIGHT = 50;
+const HISTORY_LIMIT = 50;
+const MIN_TIMELINE_ZOOM = 1;
+const MAX_TIMELINE_ZOOM = 50;
+
+function contentWidthOf(el: HTMLElement): number {
+  const style =
+    typeof window === "undefined" ? null : window.getComputedStyle(el);
+  const padding = style
+    ? Number.parseFloat(style.paddingLeft || "0") +
+      Number.parseFloat(style.paddingRight || "0")
+    : 0;
+  return Math.max(0, el.clientWidth - (Number.isFinite(padding) ? padding : 0));
+}
+
+function clampTimelineZoom(value: number): number {
+  if (!Number.isFinite(value)) return MIN_TIMELINE_ZOOM;
+  const clamped = Math.max(
+    MIN_TIMELINE_ZOOM,
+    Math.min(MAX_TIMELINE_ZOOM, value),
+  );
+  return Math.round(clamped * 10) / 10;
+}
+
+function normalizeWheelDeltaY(
+  event: WheelEvent,
+  viewportWidth: number,
+): number {
+  if (event.deltaMode === 1) return event.deltaY * 16;
+  if (event.deltaMode === 2) return event.deltaY * viewportWidth;
+  return event.deltaY;
+}
 
 function shouldProxyWaveformUrl(videoUrl: string): boolean {
   try {
@@ -115,39 +295,85 @@ function getWaveformMediaUrl({
 }): string | null {
   if (!videoUrl) return null;
   if (!shouldProxyWaveformUrl(videoUrl)) {
-    // Internal URLs already carry a short-lived `?t=<token>` for non-owner
-    // viewers of password-protected recordings (minted in
-    // `get-recording-player-data`). Pass through as-is.
     return videoUrl.startsWith("/") ? `${appBasePath()}${videoUrl}` : videoUrl;
   }
 
-  // Cross-origin provider URLs (R2 / S3 / Builder) get proxied through the
-  // same-origin `/api/video/:id` route for CORS reasons. We intentionally do
-  // NOT forward the password here — the plaintext password was previously
-  // appended via `?password=…`, but it isn't sent to this component anymore
-  // (the action returns `hasPassword: boolean` instead of the plaintext).
-  // For owners the proxy bypasses the password gate; for non-owner editors
-  // of password-protected recordings with cross-origin storage the waveform
-  // will be empty — they can still see / scrub the video, just not the
-  // waveform visualization.
   return `${appBasePath()}/api/video/${encodeURIComponent(recordingId)}`;
 }
 
-export function EditorLayout({ recordingId, className }: EditorLayoutProps) {
-  // --- server state -------------------------------------------------------
+export function EditorLayout({
+  recordingId,
+  onBack,
+  className,
+}: EditorLayoutProps) {
+  const t = useT();
+  const videoStorageStatus = useVideoStorageStatus();
+  const [storageSetupOpen, setStorageSetupOpen] = useState(false);
+  useEffect(() => {
+    if (
+      storageSetupOpen &&
+      videoStorageStatus.data?.configured &&
+      !videoStorageStatus.isError
+    ) {
+      setStorageSetupOpen(false);
+    }
+  }, [
+    storageSetupOpen,
+    videoStorageStatus.data?.configured,
+    videoStorageStatus.isError,
+  ]);
   const playerDataQuery = useActionQuery("get-recording-player-data", {
     recordingId,
   });
+  const [resumeState, setResumeState] = useState<"ready" | "waiting" | "error">(
+    "waiting",
+  );
 
   const playerData: any = playerDataQuery.data;
   const recording: any = playerData?.recording;
   const durationMs = recording?.durationMs ?? 0;
   const videoUrl: string | null = recording?.videoUrl ?? null;
   const videoFormat: "webm" | "mp4" = recording?.videoFormat ?? "webm";
+  const editorVideoUrl = useMemo(
+    () =>
+      videoUrl
+        ? withMediaVersion(
+            videoUrl,
+            recording?.mediaUpdatedAt ?? recording?.videoSizeBytes ?? null,
+          )
+        : null,
+    [recording?.mediaUpdatedAt, recording?.videoSizeBytes, videoUrl],
+  );
   const defaultPreviewSpeed = useMemo(
     () => parsePlaybackSpeed(recording?.defaultSpeed) ?? 1.2,
     [recording?.defaultSpeed],
   );
+
+  const [selection, setSelection] = useState<TrackSelection | null>(null);
+  const [previewEdits, setPreviewEdits] = useState<EditsJson | null>(null);
+  const [pendingTrims, setPendingTrims] = useState<TrimRange[] | null>(null);
+  const [pendingOverlays, setPendingOverlays] = useState<unknown[] | null>(
+    null,
+  );
+  const [previewRedactions, setPreviewRedactions] = useState<
+    VideoRedaction[] | null
+  >(null);
+  const [selectedRedactionId, setSelectedRedactionId] = useState<string | null>(
+    null,
+  );
+  const [redactMode, setRedactMode] = useState(false);
+  const [redactionStyle, setRedactionStyle] = useState<RedactionStyle>(
+    DEFAULT_REDACTION_STYLE,
+  );
+  const [videoSize, setVideoSize] = useState({ width: 0, height: 0 });
+  const [burning, setBurning] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<EditorSaveStatus>("ready");
+  const editSaveLedgerRef = useRef(createEditorSaveLedger());
+  const burnStorageCheckInFlightRef = useRef(false);
+  const burnToastRef = useRef<string | number | null>(null);
+  const undoStackRef = useRef<EditSnapshot[]>([]);
+  const redoStackRef = useRef<EditSnapshot[]>([]);
+  const [history, setHistory] = useState({ undo: 0, redo: 0 });
 
   const edits: EditsJson = useMemo(
     () => parseEdits(recording?.editsJson),
@@ -162,14 +388,51 @@ export function EditorLayout({ recordingId, className }: EditorLayoutProps) {
     }
   }, [playerData?.chapters, recording?.chaptersJson]);
 
-  const excludedRanges = useMemo(() => getExcludedRanges(edits), [edits]);
-  const splitPoints = useMemo(
+  const savedEdits: EditsJson = useMemo(() => {
+    const next = pendingTrims ? { ...edits, trims: pendingTrims } : edits;
+    return pendingOverlays ? { ...next, overlays: pendingOverlays } : next;
+  }, [edits, pendingOverlays, pendingTrims]);
+  const shownEdits: EditsJson = previewEdits ?? savedEdits;
+
+  const savedRedactions = useMemo(
     () =>
-      edits.trims
-        .filter((t) => !t.excluded && t.startMs === t.endMs)
-        .map((t) => t.startMs),
-    [edits],
+      parseRedactions(savedEdits.overlays).map((r) =>
+        clampRedactionToDuration(r, durationMs),
+      ),
+    [durationMs, savedEdits],
   );
+  const redactions = previewRedactions ?? savedRedactions;
+  const selectedRedaction = useMemo(
+    () => redactions.find((r) => r.id === selectedRedactionId) ?? null,
+    [redactions, selectedRedactionId],
+  );
+
+  const excludedRanges = useMemo(
+    () => getExcludedRanges(savedEdits),
+    [savedEdits],
+  );
+  const shownExcludedRanges = useMemo(
+    () => getExcludedRanges(shownEdits),
+    [shownEdits],
+  );
+  const splitPoints = useMemo(
+    () => visibleSplitPoints(shownEdits, durationMs),
+    [durationMs, shownEdits],
+  );
+  const pieces = useMemo(
+    () => buildTimelinePieces(durationMs, shownEdits),
+    [durationMs, shownEdits],
+  );
+  const selectedClip = useMemo(() => {
+    if (selection?.kind !== "clip") return null;
+    const piece = pieces.find(
+      (p) =>
+        p.kind === "clip" &&
+        selection.anchorMs >= p.startMs &&
+        selection.anchorMs < p.endMs,
+    );
+    return piece ? { startMs: piece.startMs, endMs: piece.endMs } : null;
+  }, [pieces, selection]);
 
   const transcriptSegments: Array<{
     startMs: number;
@@ -188,7 +451,6 @@ export function EditorLayout({ recordingId, className }: EditorLayoutProps) {
     return [];
   }, [playerData?.transcript?.segments]);
 
-  // --- player state -------------------------------------------------------
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [playheadMs, setPlayheadMs] = useState(0);
@@ -198,32 +460,107 @@ export function EditorLayout({ recordingId, className }: EditorLayoutProps) {
   const [zoom, setZoom] = useState(1);
   const [viewportWidth, setViewportWidth] = useState(800);
   const [scrollLeft, setScrollLeft] = useState(0);
-  const [selectionRange, setSelectionRange] = useState<{
-    startMs: number;
-    endMs: number;
-  } | null>(null);
+  const [editingSurface, setEditingSurface] = useState<
+    "transcript" | "timeline"
+  >("timeline");
+  const activeSurface = redactMode ? "timeline" : editingSurface;
 
   const [thumbOpen, setThumbOpen] = useState(false);
   const [stitchOpen, setStitchOpen] = useState(false);
   const [chaptersOpen, setChaptersOpen] = useState(false);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const trackpadGestureRef = useRef<{
+    zoom: number;
+    scrollLeft: number;
+    anchorRatio: number;
+    viewportX: number;
+  } | null>(null);
 
-  // Measure viewport so waveform + timeline stay responsive.
   useEffect(() => {
     if (!containerRef.current) return;
     const el = containerRef.current;
-    const ro = new ResizeObserver(() => {
-      setViewportWidth(Math.max(1, el.clientWidth));
+    const ro = new ResizeObserver(([entry]) => {
+      const measured = entry?.contentRect.width ?? contentWidthOf(el);
+      setViewportWidth(Math.max(1, Math.floor(measured)));
     });
     ro.observe(el);
-    setViewportWidth(Math.max(1, el.clientWidth));
+    setViewportWidth(Math.max(1, Math.floor(contentWidthOf(el))));
     return () => ro.disconnect();
-  }, []);
+  }, [activeSurface]);
 
-  const totalWidth = Math.max(
-    viewportWidth,
-    Math.floor(viewportWidth * Math.max(1, zoom)),
+  const totalWidth = useMemo(
+    () => getTimelineTotalWidth(viewportWidth, zoom),
+    [viewportWidth, zoom],
+  );
+
+  const clampedScrollLeft = Math.min(
+    scrollLeft,
+    Math.max(0, totalWidth - viewportWidth),
+  );
+
+  const handleTimelineWheel = useCallback(
+    (e: React.WheelEvent<HTMLDivElement>) => {
+      const maxScroll = Math.max(0, totalWidth - viewportWidth);
+      if (maxScroll <= 0) return;
+      const delta =
+        Math.abs(e.deltaX) > Math.abs(e.deltaY)
+          ? e.deltaX
+          : e.shiftKey
+            ? e.deltaY
+            : 0;
+      if (delta === 0) return;
+      e.preventDefault();
+      setScrollLeft((current) =>
+        Math.max(0, Math.min(maxScroll, current + delta)),
+      );
+    },
+    [totalWidth, viewportWidth],
+  );
+
+  const calculateAnchoredScrollLeft = useCallback(
+    (
+      nextZoom: number,
+      anchor?: { anchorRatio?: number; viewportX?: number },
+    ) => {
+      const nextTotalWidth = getTimelineTotalWidth(viewportWidth, nextZoom);
+      const maxScrollLeft = Math.max(0, nextTotalWidth - viewportWidth);
+      const anchorMs = selectedClip
+        ? (selectedClip.startMs + selectedClip.endMs) / 2
+        : playheadMs;
+      const fallbackAnchorRatio =
+        durationMs > 0
+          ? Math.max(0, Math.min(durationMs, anchorMs)) / durationMs
+          : 0;
+      const anchorRatio = Math.max(
+        0,
+        Math.min(1, anchor?.anchorRatio ?? fallbackAnchorRatio),
+      );
+      const viewportX =
+        typeof anchor?.viewportX === "number"
+          ? Math.max(0, Math.min(viewportWidth, anchor.viewportX))
+          : viewportWidth / 2;
+      const anchorX = anchorRatio * nextTotalWidth;
+      return Math.max(0, Math.min(maxScrollLeft, anchorX - viewportX));
+    },
+    [durationMs, playheadMs, selectedClip, viewportWidth],
+  );
+
+  const setAnchoredZoom = useCallback(
+    (
+      nextZoom: number,
+      anchor?: { anchorRatio?: number; viewportX?: number },
+    ) => {
+      const clamped = clampTimelineZoom(nextZoom);
+      setZoom(clamped);
+      setScrollLeft(calculateAnchoredScrollLeft(clamped, anchor));
+    },
+    [calculateAnchoredScrollLeft],
+  );
+
+  const handleZoomChange = useCallback(
+    (nextZoom: number) => setAnchoredZoom(nextZoom),
+    [setAnchoredZoom],
   );
 
   useEffect(() => {
@@ -232,7 +569,92 @@ export function EditorLayout({ recordingId, className }: EditorLayoutProps) {
     );
   }, [totalWidth, viewportWidth]);
 
-  // Sync the <video> to play state.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const getViewportX = (clientX?: number) => {
+      if (typeof clientX !== "number") return viewportWidth / 2;
+      const rect = el.getBoundingClientRect();
+      return Math.max(0, Math.min(viewportWidth, clientX - rect.left));
+    };
+
+    const getAnchorRatio = (
+      sourceZoom: number,
+      sourceScrollLeft: number,
+      viewportX: number,
+    ) => {
+      const sourceTotalWidth = getTimelineTotalWidth(viewportWidth, sourceZoom);
+      return Math.max(
+        0,
+        Math.min(
+          1,
+          (sourceScrollLeft + viewportX) / Math.max(1, sourceTotalWidth),
+        ),
+      );
+    };
+
+    const handleWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      const deltaY = normalizeWheelDeltaY(event, viewportWidth);
+      if (Math.abs(deltaY) < 0.01) return;
+      const viewportX = getViewportX(event.clientX);
+      const anchorRatio = getAnchorRatio(zoom, scrollLeft, viewportX);
+      const nextZoom = clampTimelineZoom(zoom * Math.exp(-deltaY * 0.006));
+      if (nextZoom === zoom) return;
+      setAnchoredZoom(nextZoom, { anchorRatio, viewportX });
+    };
+
+    const handleGestureStart = (event: Event) => {
+      event.preventDefault();
+      const gesture = event as Event & { clientX?: number };
+      const viewportX = getViewportX(gesture.clientX);
+      trackpadGestureRef.current = {
+        zoom,
+        scrollLeft,
+        anchorRatio: getAnchorRatio(zoom, scrollLeft, viewportX),
+        viewportX,
+      };
+    };
+
+    const handleGestureChange = (event: Event) => {
+      const start = trackpadGestureRef.current;
+      if (!start) return;
+      event.preventDefault();
+      const gesture = event as Event & { scale?: number };
+      const scale =
+        typeof gesture.scale === "number" && Number.isFinite(gesture.scale)
+          ? gesture.scale
+          : 1;
+      const nextZoom = clampTimelineZoom(start.zoom * scale);
+      if (nextZoom === zoom) return;
+      setAnchoredZoom(nextZoom, {
+        anchorRatio: start.anchorRatio,
+        viewportX: start.viewportX,
+      });
+    };
+
+    const handleGestureEnd = () => {
+      trackpadGestureRef.current = null;
+    };
+
+    el.addEventListener("wheel", handleWheel, { passive: false });
+    el.addEventListener("gesturestart", handleGestureStart, {
+      passive: false,
+    });
+    el.addEventListener("gesturechange", handleGestureChange, {
+      passive: false,
+    });
+    el.addEventListener("gestureend", handleGestureEnd);
+    return () => {
+      el.removeEventListener("wheel", handleWheel);
+      el.removeEventListener("gesturestart", handleGestureStart);
+      el.removeEventListener("gesturechange", handleGestureChange);
+      el.removeEventListener("gestureend", handleGestureEnd);
+    };
+  }, [scrollLeft, setAnchoredZoom, viewportWidth, zoom]);
+
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
@@ -243,19 +665,20 @@ export function EditorLayout({ recordingId, className }: EditorLayoutProps) {
     }
   }, [playing]);
 
-  // Load the clip's default speed (or the user's saved override) when a new
-  // recording enters the editor.
   useEffect(() => {
     if (!recording?.id) return;
     const next = readPlaybackSpeedPreference(defaultPreviewSpeed);
     setPlaybackSpeed(next);
-    if (videoRef.current) videoRef.current.playbackRate = next;
+    if (videoRef.current) {
+      videoRef.current.defaultPlaybackRate = next;
+      videoRef.current.playbackRate = next;
+    }
   }, [defaultPreviewSpeed, recording?.id]);
 
-  // Keep the editor preview speed visible and in sync with the media element.
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
+    v.defaultPlaybackRate = playbackSpeed;
     v.playbackRate = playbackSpeed;
   }, [playbackSpeed, videoUrl]);
 
@@ -263,30 +686,35 @@ export function EditorLayout({ recordingId, className }: EditorLayoutProps) {
     const next = parsePlaybackSpeed(rate) ?? 1.2;
     setPlaybackSpeed(next);
     savePlaybackSpeedPreference(next);
-    if (videoRef.current) videoRef.current.playbackRate = next;
+    if (videoRef.current) {
+      videoRef.current.defaultPlaybackRate = next;
+      videoRef.current.playbackRate = next;
+    }
   }, []);
 
-  // Keep the playheadMs in sync with the element's currentTime.
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
-    const onTime = () => setPlayheadMs(v.currentTime * 1000);
+    const onTime = () => {
+      const rawMs = v.currentTime * 1000;
+      const visibleMs = skipExcludedRange(rawMs, excludedRanges, durationMs);
+      if (visibleMs !== rawMs) v.currentTime = visibleMs / 1000;
+      setPlayheadMs(visibleMs);
+    };
     v.addEventListener("timeupdate", onTime);
     return () => v.removeEventListener("timeupdate", onTime);
-  }, [videoUrl]);
+  }, [durationMs, excludedRanges, videoUrl]);
 
-  // Expose the in-editor state so the agent can read "the user is editing and scrubbed to X".
   useEffect(() => {
-    writeAppStateClient("editor-draft", {
+    void writeAppStateClient("editor-draft", {
       recordingId,
       playheadMs: Math.round(playheadMs),
       playbackSpeed,
       zoom,
-      editsJson: edits,
+      editsJson: savedEdits,
     });
-  }, [recordingId, playheadMs, playbackSpeed, zoom, edits]);
+  }, [recordingId, playheadMs, playbackSpeed, zoom, savedEdits]);
 
-  // --- waveform peaks, cached in application_state ------------------------
   const [peaks, setPeaks] = useState<WaveformPeaks | null>(null);
   const waveformMediaUrl = useMemo(
     () =>
@@ -300,8 +728,7 @@ export function EditorLayout({ recordingId, className }: EditorLayoutProps) {
   useEffect(() => {
     if (!waveformMediaUrl) return;
     let cancelled = false;
-    (async () => {
-      // 1) Try cached peaks.
+    void (async () => {
       const cached = await readAppStateClient<WaveformPeaks>(
         `waveform-${recordingId}`,
       );
@@ -309,8 +736,6 @@ export function EditorLayout({ recordingId, className }: EditorLayoutProps) {
         if (!cancelled) setPeaks(cached);
         return;
       }
-      // 2) Compute from the video URL. Cross-origin provider URLs go through
-      // the same-origin /api/video proxy so CDN CORS cannot blank the waveform.
       const result = await computePeaks(waveformMediaUrl);
       if (cancelled) return;
       setPeaks(result);
@@ -323,114 +748,750 @@ export function EditorLayout({ recordingId, className }: EditorLayoutProps) {
     };
   }, [recordingId, waveformMediaUrl]);
 
-  // --- actions ------------------------------------------------------------
-  const trim = useActionMutation("trim-recording");
-  const split = useActionMutation("split-recording");
-  const undo = useActionMutation("undo-edit");
+  const filmstripSprite = useMemo<FilmstripSprite | null>(() => {
+    const url = recording?.filmstripUrl;
+    const frameCount = Number(recording?.filmstripFrameCount ?? 0);
+    const columns = Number(recording?.filmstripColumns ?? 0);
+    if (!url || frameCount <= 0 || columns <= 0) return null;
+    return {
+      url,
+      frameCount,
+      columns,
+      rows: Number(recording?.filmstripRows ?? 1) || 1,
+      frameWidth: Number(recording?.filmstripFrameWidth ?? 0) || 160,
+      frameHeight: Number(recording?.filmstripFrameHeight ?? 0) || 90,
+    };
+  }, [
+    recording?.filmstripUrl,
+    recording?.filmstripFrameCount,
+    recording?.filmstripColumns,
+    recording?.filmstripRows,
+    recording?.filmstripFrameWidth,
+    recording?.filmstripFrameHeight,
+  ]);
+
+  const [filmstripFrames, setFilmstripFrames] = useState<FilmstripFrame[]>([]);
+
+  useEffect(() => {
+    setFilmstripFrames([]);
+  }, [recordingId]);
+
+  const filmstripFrameCount = useMemo(() => {
+    const bucketedWidth = Math.max(240, Math.round(viewportWidth / 120) * 120);
+    const cellWidth = WAVEFORM_HEIGHT * (16 / 9);
+    return Math.min(48, Math.max(6, Math.round(bucketedWidth / cellWidth)));
+  }, [viewportWidth]);
+
+  useEffect(() => {
+    if (activeSurface !== "timeline" || filmstripSprite) {
+      setFilmstripFrames([]);
+      return;
+    }
+    if (!waveformMediaUrl || durationMs <= 0) {
+      setFilmstripFrames([]);
+      return;
+    }
+    setFilmstripFrames([]);
+    let cancelled = false;
+    extractFilmstripThumbnails({
+      videoUrl: waveformMediaUrl,
+      durationMs,
+      frameCount: filmstripFrameCount,
+    })
+      .then((result) => {
+        if (cancelled) return;
+        if (result.status !== "ok") {
+          console.warn("[editor] filmstrip extraction failed", {
+            recordingId,
+            status: result.status,
+            detail: result.detail,
+          });
+        }
+        setFilmstripFrames(result.frames);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.warn("[editor] filmstrip extraction threw", {
+          recordingId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    recordingId,
+    waveformMediaUrl,
+    durationMs,
+    activeSurface,
+    filmstripFrameCount,
+    filmstripSprite,
+  ]);
+
+  const setTrims = useActionMutation("set-recording-trims");
+  const beginEditSave = useCallback((kind: EditSaveKind) => {
+    const generation = beginEditorSave(editSaveLedgerRef.current, kind);
+    setSaveStatus("saving");
+    return generation;
+  }, []);
+  const finishEditSave = useCallback(
+    (kind: EditSaveKind, generation: number, succeeded: boolean) => {
+      setSaveStatus(
+        finishEditorSave(
+          editSaveLedgerRef.current,
+          kind,
+          generation,
+          succeeded,
+        ),
+      );
+    },
+    [],
+  );
+
+  const pushHistory = useCallback((snapshot: EditSnapshot) => {
+    undoStackRef.current = [...undoStackRef.current, snapshot].slice(
+      -HISTORY_LIMIT,
+    );
+    redoStackRef.current = [];
+    setHistory({ undo: undoStackRef.current.length, redo: 0 });
+  }, []);
+
+  const discardHistory = useCallback((snapshot: EditSnapshot) => {
+    const remaining = removeEditorHistoryEntry(undoStackRef.current, snapshot);
+    if (remaining === undoStackRef.current) return;
+    undoStackRef.current = remaining;
+    setHistory({
+      undo: undoStackRef.current.length,
+      redo: redoStackRef.current.length,
+    });
+  }, []);
+
+  const commitEdits = useCallback(
+    async (next: EditsJson, options?: { record?: boolean }) => {
+      if (resumeState !== "ready") return false;
+      const record = options?.record ?? true;
+      const historyEntry = record ? snapshotOf(savedEdits) : null;
+      if (historyEntry) pushHistory(historyEntry);
+      setPendingTrims(next.trims);
+      const saveGeneration = beginEditSave("trims");
+      let succeeded = false;
+      try {
+        await enqueueRecordingEditorSave(recordingId, "trims", async () => {
+          await setTrims.mutateAsync({ recordingId, trims: next.trims });
+          await playerDataQuery.refetch();
+        });
+        succeeded = true;
+        return true;
+      } catch (err: any) {
+        if (historyEntry) discardHistory(historyEntry);
+        toast.error(err?.message ?? t("editorLayout.editFailed"));
+        return false;
+      } finally {
+        finishEditSave("trims", saveGeneration, succeeded);
+        if (
+          isLatestEditorSave(editSaveLedgerRef.current, "trims", saveGeneration)
+        ) {
+          setPendingTrims(null);
+        }
+      }
+    },
+    [
+      beginEditSave,
+      discardHistory,
+      finishEditSave,
+      playerDataQuery,
+      pushHistory,
+      recordingId,
+      resumeState,
+      savedEdits,
+      setTrims,
+      t,
+    ],
+  );
+
+  const setOverlays = useActionMutation("set-recording-overlays");
+  const burnRedactions = useActionMutation("burn-recording-redactions");
+  const [burnPercent, setBurnPercent] = useState(0);
+  const refetchPlayerDataRef = useRef(playerDataQuery.refetch);
+  refetchPlayerDataRef.current = playerDataQuery.refetch;
+
+  useEffect(() => {
+    if (resumeState !== "waiting") return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        await refreshAfterRecordingEditorSaves(recordingId, () =>
+          refetchPlayerDataRef.current({ throwOnError: true }),
+        );
+        if (!cancelled) setResumeState("ready");
+      } catch {
+        if (!cancelled) setResumeState("error");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [recordingId, resumeState]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch(
+          `${appBasePath()}/api/redaction-burn-progress?id=${encodeURIComponent(
+            recordingId,
+          )}`,
+        );
+        if (!res.ok) return;
+        const data = (await res.json()) as { status?: string };
+        if (!cancelled && data.status === "running") setBurning(true);
+      } catch (err) {
+        console.warn("[editor] could not check for a running burn", {
+          recordingId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [recordingId]);
+
+  useEffect(() => {
+    if (!burning) {
+      setBurnPercent(0);
+      return;
+    }
+
+    let unreadable = 0;
+    let sawRunning = false;
+    const startedAt = Date.now();
+    const givingUp = () => {
+      unreadable += 1;
+      if (unreadable < MAX_UNREADABLE_BURN_POLLS) return;
+      setBurning(false);
+      if (burnToastRef.current !== null) toast.dismiss(burnToastRef.current);
+      burnToastRef.current = null;
+      toast.message(t("editorLayout.burnProgressUnreadable"));
+    };
+
+    const poll = async () => {
+      try {
+        const res = await fetch(
+          `${appBasePath()}/api/redaction-burn-progress?id=${encodeURIComponent(
+            recordingId,
+          )}`,
+        );
+        if (!res.ok) {
+          givingUp();
+          return;
+        }
+        unreadable = 0;
+        const data = (await res.json()) as {
+          status?: string;
+          percent?: number;
+          error?: string;
+          errorCode?: string;
+        };
+        if (typeof data.percent === "number") setBurnPercent(data.percent);
+        if (data.status === "running") {
+          sawRunning = true;
+          return;
+        }
+        if (
+          data.status === "idle" &&
+          !sawRunning &&
+          Date.now() - startedAt < BURN_REGISTRATION_GRACE_MS
+        ) {
+          return;
+        }
+
+        setBurning(false);
+        if (burnToastRef.current !== null) toast.dismiss(burnToastRef.current);
+        burnToastRef.current = null;
+
+        if (data.status === "failed") {
+          toast.error(
+            storageAwareErrorMessage(
+              data,
+              t("recordingPage.connectStorageFinishSaving"),
+              t("editorLayout.burnFailed"),
+            ),
+          );
+          try {
+            await refetchPlayerDataRef.current();
+          } catch (err) {
+            console.warn("[editor] could not refresh after a failed burn", {
+              recordingId,
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+          return;
+        }
+
+        const refreshed = await refetchPlayerDataRef.current();
+        const overlaysLeft = parseRedactions(
+          parseEdits((refreshed?.data as any)?.recording?.editsJson).overlays,
+        ).length;
+        if (
+          data.status === "done" ||
+          (data.status === "idle" && !overlaysLeft)
+        ) {
+          setSelectedRedactionId(null);
+          setRedactMode(false);
+          toast.success(t("editorLayout.burnedRedactionsDone"));
+        } else {
+          toast.message(t("editorLayout.burnProgressUnreadable"));
+        }
+      } catch {
+        givingUp();
+      }
+    };
+    void poll();
+    const timer = setInterval(() => void poll(), 700);
+    return () => {
+      clearInterval(timer);
+    };
+  }, [burning, recordingId, t]);
+
+  const writeOverlays = useCallback(
+    async (overlays: unknown[], record: boolean) => {
+      if (resumeState !== "ready") return false;
+      const historyEntry = record ? snapshotOf(savedEdits) : null;
+      if (historyEntry) pushHistory(historyEntry);
+      setPendingOverlays(overlays);
+      const saveGeneration = beginEditSave("overlays");
+      let succeeded = false;
+      try {
+        await enqueueRecordingEditorSave(recordingId, "overlays", async () => {
+          await setOverlays.mutateAsync({
+            recordingId,
+            overlays: overlays as Record<string, unknown>[],
+          });
+          await playerDataQuery.refetch();
+        });
+        succeeded = true;
+        return true;
+      } catch (err: any) {
+        if (historyEntry) discardHistory(historyEntry);
+        toast.error(err?.message ?? t("editorLayout.editFailed"));
+        return false;
+      } finally {
+        finishEditSave("overlays", saveGeneration, succeeded);
+        if (
+          isLatestEditorSave(
+            editSaveLedgerRef.current,
+            "overlays",
+            saveGeneration,
+          )
+        ) {
+          setPendingOverlays(null);
+        }
+      }
+    },
+    [
+      beginEditSave,
+      discardHistory,
+      finishEditSave,
+      playerDataQuery,
+      pushHistory,
+      recordingId,
+      resumeState,
+      savedEdits,
+      setOverlays,
+      t,
+    ],
+  );
+
+  const commitRedactions = useCallback(
+    async (next: VideoRedaction[], options?: { record?: boolean }) => {
+      return await writeOverlays(
+        [
+          ...next.map((r) => clampRedactionToDuration(r, durationMs)),
+          ...otherOverlays(savedEdits.overlays),
+        ],
+        options?.record ?? true,
+      );
+    },
+    [durationMs, savedEdits, writeOverlays],
+  );
+
+  const addRedaction = useCallback(
+    (rect: RedactionRect) => {
+      const at = Math.round(playheadMs);
+      const range = selectedClip ?? { startMs: at, endMs: at + 5_000 };
+      const startMs = Math.round(range.startMs);
+      const redaction: VideoRedaction = clampRedactionToDuration(
+        {
+          id: newRedactionId(),
+          kind: "redact",
+          style: redactionStyle,
+          startMs,
+          endMs: Math.max(startMs + 200, Math.round(range.endMs)),
+          keys: [{ atMs: startMs, ...rect }],
+        },
+        durationMs,
+      );
+      setSelectedRedactionId(redaction.id);
+      void commitRedactions([...savedRedactions, redaction]);
+    },
+    [
+      commitRedactions,
+      durationMs,
+      playheadMs,
+      redactionStyle,
+      savedRedactions,
+      selectedClip,
+    ],
+  );
+
+  const reshapeRedaction = useCallback(
+    (id: string, rect: RedactionRect) => {
+      const target = savedRedactions.find((r) => r.id === id);
+      if (!target) return;
+      const at = Math.min(
+        Math.max(Math.round(playheadMs), target.startMs),
+        Math.max(target.startMs, target.endMs - 1),
+      );
+      void commitRedactions(
+        savedRedactions.map((r) =>
+          r.id === id ? setRedactionKey(r, at, rect) : r,
+        ),
+      );
+    },
+    [commitRedactions, playheadMs, savedRedactions],
+  );
+
+  const setStyle = useCallback(
+    (style: RedactionStyle) => {
+      setRedactionStyle(style);
+      if (!selectedRedactionId) return;
+      void commitRedactions(
+        savedRedactions.map((r) =>
+          r.id === selectedRedactionId ? { ...r, style } : r,
+        ),
+      );
+    },
+    [commitRedactions, savedRedactions, selectedRedactionId],
+  );
+
+  const removeRedaction = useCallback(
+    (id: string) => {
+      setSelectedRedactionId(null);
+      void commitRedactions(savedRedactions.filter((r) => r.id !== id));
+    },
+    [commitRedactions, savedRedactions],
+  );
+
+  const pictureSize = useMemo(
+    () =>
+      videoSize.width > 0 && videoSize.height > 0
+        ? videoSize
+        : { width: recording?.width ?? 0, height: recording?.height ?? 0 },
+    [recording?.height, recording?.width, videoSize],
+  );
+
+  const burnIn = useCallback(async () => {
+    if (resumeState !== "ready") return;
+    if (burning || burnStorageCheckInFlightRef.current) return;
+    burnStorageCheckInFlightRef.current = true;
+    try {
+      const storageCheck = await videoStorageStatus.refetch();
+      if (
+        storageCheck.isError ||
+        typeof storageCheck.data?.configured !== "boolean"
+      ) {
+        toast.error(t("recordingPage.tryAgainMoment"));
+        return;
+      }
+      if (!storageCheck.data.configured) {
+        setStorageSetupOpen(true);
+        return;
+      }
+    } catch {
+      toast.error(t("recordingPage.tryAgainMoment"));
+      return;
+    } finally {
+      burnStorageCheckInFlightRef.current = false;
+    }
+    setBurning(true);
+    burnToastRef.current = toast.loading(t("editorLayout.burningRedactions"));
+    try {
+      const result: any = await burnRedactions.mutateAsync({ recordingId });
+      if (result && result.started === false) {
+        setBurning(false);
+        toast.error(result.reason ?? t("editorLayout.burnFailed"), {
+          id: burnToastRef.current ?? undefined,
+        });
+        burnToastRef.current = null;
+      }
+    } catch (err: any) {
+      setBurning(false);
+      toast.error(
+        storageAwareErrorMessage(
+          err,
+          t("recordingPage.connectStorageFinishSaving"),
+          t("editorLayout.burnFailed"),
+        ),
+        { id: burnToastRef.current ?? undefined },
+      );
+      burnToastRef.current = null;
+    }
+  }, [
+    burnRedactions,
+    burning,
+    recordingId,
+    resumeState,
+    t,
+    videoStorageStatus.refetch,
+  ]);
+
+  useEffect(() => {
+    if (!burning || !burnToastRef.current) return;
+    toast.loading(
+      burnPercent > 0
+        ? t("editorLayout.burningRedactionsPercent", { percent: burnPercent })
+        : t("editorLayout.burningRedactions"),
+      { id: burnToastRef.current },
+    );
+  }, [burnPercent, burning, t]);
+
+  const stepHistory = useCallback(
+    async (direction: "undo" | "redo") => {
+      if (resumeState !== "ready") return;
+      const from =
+        direction === "undo" ? undoStackRef.current : redoStackRef.current;
+      if (!from.length) {
+        toast.info(
+          direction === "undo"
+            ? t("editorToolbar.nothingToUndo")
+            : t("editorLayout.nothingToRedo"),
+        );
+        return;
+      }
+      const finishOperation = beginRecordingEditorOperation(recordingId);
+      try {
+        const target = from[from.length - 1];
+        const rest = from.slice(0, -1);
+        const current = snapshotOf(savedEdits);
+
+        let saved = true;
+        if (!sameList(target.trims, current.trims)) {
+          saved = await commitEdits(
+            { ...savedEdits, trims: target.trims },
+            { record: false },
+          );
+        }
+        if (saved && !sameList(target.overlays, current.overlays)) {
+          saved = await writeOverlays(target.overlays, false);
+        }
+        if (!saved) return;
+
+        if (direction === "undo") {
+          undoStackRef.current = rest;
+          redoStackRef.current = [...redoStackRef.current, current];
+        } else {
+          redoStackRef.current = rest;
+          undoStackRef.current = [...undoStackRef.current, current];
+        }
+        setHistory({
+          undo: undoStackRef.current.length,
+          redo: redoStackRef.current.length,
+        });
+      } finally {
+        finishOperation();
+      }
+    },
+    [commitEdits, recordingId, resumeState, savedEdits, t, writeOverlays],
+  );
 
   const callTrim = useCallback(
     async (range: { startMs: number; endMs: number }) => {
-      try {
-        await trim.mutateAsync({
-          recordingId,
-          startMs: Math.round(range.startMs),
-          endMs: Math.round(range.endMs),
-        });
-        toast.success("Trimmed");
-        setSelectionRange(null);
-      } catch (err: any) {
-        toast.error(err?.message ?? "Trim failed");
-      }
+      setSelection(null);
+      return await commitEdits(
+        addCut(savedEdits, Math.round(range.startMs), Math.round(range.endMs)),
+      );
     },
-    [recordingId, trim],
+    [commitEdits, savedEdits],
   );
 
-  const seek = useCallback((ms: number) => {
-    const v = videoRef.current;
-    if (v) v.currentTime = ms / 1000;
-    setPlayheadMs(ms);
-  }, []);
+  const splitAtPlayhead = useCallback(async () => {
+    const at = Math.round(playheadMs);
+    if (at > 0) setSelection({ kind: "clip", anchorMs: at - 1 });
+    return await commitEdits(addSplitAt(savedEdits, at));
+  }, [commitEdits, playheadMs, savedEdits]);
 
-  // --- keyboard shortcuts -------------------------------------------------
+  const deleteSelection = useCallback(async () => {
+    if (selection?.kind === "split") {
+      setSelection(null);
+      await commitEdits(removeSplit(savedEdits, selection.splitId));
+      return;
+    }
+    if (selection?.kind === "gap") {
+      setSelection(null);
+      await commitEdits(removeCut(savedEdits, selection.cutId));
+      return;
+    }
+    if (!selectedClip) return;
+    setSelection(null);
+    await commitEdits(
+      addCut(savedEdits, selectedClip.startMs, selectedClip.endMs),
+    );
+  }, [commitEdits, savedEdits, selectedClip, selection]);
+
+  const seek = useCallback(
+    (ms: number) => {
+      const visibleMs = skipExcludedRange(ms, excludedRanges, durationMs);
+      const v = videoRef.current;
+      if (v) v.currentTime = visibleMs / 1000;
+      setPlayheadMs(visibleMs);
+    },
+    [durationMs, excludedRanges],
+  );
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      // Ignore when focus is inside an editable element.
+      if (resumeState !== "ready") return;
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName.toLowerCase();
       const editable =
         tag === "input" || tag === "textarea" || target?.isContentEditable;
       if (editable) return;
 
+      const modified = e.metaKey || e.ctrlKey;
+
       if (e.code === "Space") {
         e.preventDefault();
         setPlaying((p) => !p);
+      } else if (modified && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        void stepHistory(e.shiftKey ? "redo" : "undo");
+      } else if (e.key === "Escape") {
+        setSelection(null);
+        setSelectedRedactionId(null);
+        setRedactMode(false);
       } else if (
-        (e.metaKey || e.ctrlKey) &&
-        !e.shiftKey &&
-        e.key.toLowerCase() === "z"
+        (e.key === "Delete" || e.key === "Backspace") &&
+        !modified &&
+        !e.altKey
       ) {
-        e.preventDefault();
-        undo.mutate({ recordingId });
-      } else if (e.key.toLowerCase() === "i") {
-        setSelectionRange((r) => ({
-          startMs: playheadMs,
-          endMs: r?.endMs && r.endMs > playheadMs ? r.endMs : playheadMs + 1000,
-        }));
-      } else if (e.key.toLowerCase() === "o") {
-        setSelectionRange((r) => ({
-          startMs:
-            r?.startMs && r.startMs < playheadMs
-              ? r.startMs
-              : Math.max(0, playheadMs - 1000),
-          endMs: playheadMs,
-        }));
-      } else if (e.key.toLowerCase() === "x") {
-        // Cut: trim the current selection range
-        const range = selectionRange;
-        if (range) {
+        if (selectedRedactionId) {
           e.preventDefault();
-          trim
-            .mutateAsync({
-              recordingId,
-              startMs: Math.round(range.startMs),
-              endMs: Math.round(range.endMs),
-            })
-            .then(() => {
-              toast.success("Cut");
-              setSelectionRange(null);
-            })
-            .catch((err: any) => toast.error(err?.message ?? "Cut failed"));
+          removeRedaction(selectedRedactionId);
+          return;
         }
-      } else if (e.key.toLowerCase() === "s") {
-        // Split at playhead
+        if (!selection) return;
         e.preventDefault();
-        split
-          .mutateAsync({ recordingId, atMs: Math.round(playheadMs) })
-          .then(() => toast.success("Split"))
-          .catch((err: any) => toast.error(err?.message ?? "Split failed"));
+        void deleteSelection();
+      } else if (!modified && !e.altKey && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        void splitAtPlayhead();
+      } else if (!modified && !e.altKey && e.key.toLowerCase() === "b") {
+        if (playheadMs < 500) return;
+        e.preventDefault();
+        void callTrim({ startMs: 0, endMs: Math.round(playheadMs) });
+      } else if (!modified && !e.altKey && e.key.toLowerCase() === "a") {
+        if (durationMs - playheadMs < 500) return;
+        e.preventDefault();
+        void callTrim({
+          startMs: Math.round(playheadMs),
+          endMs: Math.round(durationMs),
+        });
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [playheadMs, recordingId, selectionRange, split, trim, undo]);
+  }, [
+    callTrim,
+    deleteSelection,
+    durationMs,
+    playheadMs,
+    removeRedaction,
+    selectedRedactionId,
+    selection,
+    splitAtPlayhead,
+    stepHistory,
+    resumeState,
+  ]);
 
-  // Default selection window so the TrimHandles have something to render.
-  const effectiveSelection = selectionRange ?? {
-    startMs: Math.max(0, playheadMs - 1000),
-    endMs: Math.min(durationMs || 1_000, playheadMs + 1000),
-  };
-
-  if (playerDataQuery.isLoading) {
+  if (playerDataQuery.isLoading || resumeState === "waiting") {
     return (
-      <div className="p-6 text-sm text-muted-foreground">
-        Loading recording…
+      <div
+        aria-busy="true"
+        className={cn(
+          "flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-background",
+          className,
+        )}
+      >
+        <div className="flex h-9 shrink-0 items-center border-b border-border px-3">
+          <Button type="button" variant="ghost" size="sm" onClick={onBack}>
+            <IconArrowLeft className="size-4" aria-hidden="true" />
+            {t("recordingPage.backToClip")}
+          </Button>
+        </div>
+        <div className="grid min-h-0 min-w-0 flex-1 grid-cols-[minmax(0,1fr)] overflow-hidden">
+          <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">
+            <div
+              className={
+                // guard:allow-raw-color — the editor preview needs a black video stage
+                "flex min-h-0 min-w-0 flex-1 basis-[220px] items-center justify-center overflow-hidden bg-black p-4"
+              }
+            >
+              <Skeleton className="h-full w-full rounded" />
+            </div>
+            <div className="flex h-10 shrink-0 items-center gap-2 border-y border-border px-2">
+              <Skeleton className="h-7 w-24 rounded-md" />
+              <Skeleton className="h-7 w-24 rounded-md" />
+              <Skeleton className="ms-auto h-7 w-20 rounded-md" />
+            </div>
+            <div className="shrink-0 border-t border-border bg-card/30">
+              <div className="flex h-9 items-center gap-2 px-2">
+                <Skeleton className="h-6 w-36 rounded-md" />
+                <Skeleton className="h-4 w-4 rounded-full" />
+              </div>
+              <div className="space-y-2 p-3">
+                <Skeleton className="h-4 w-full" />
+                <Skeleton className="h-4 w-11/12" />
+                <Skeleton className="h-4 w-4/5" />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  if (resumeState === "error") {
+    return (
+      <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-background">
+        <div className="flex h-9 shrink-0 items-center border-b border-border px-3">
+          <Button type="button" variant="ghost" size="sm" onClick={onBack}>
+            <IconArrowLeft className="size-4" aria-hidden="true" />
+            {t("recordingPage.backToClip")}
+          </Button>
+        </div>
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6">
+          <p role="alert" className="text-sm text-destructive">
+            {t("editorLayout.refreshFailed")}
+          </p>
+          <Button type="button" onClick={() => setResumeState("waiting")}>
+            {t("agentChat.common.retry")}
+          </Button>
+        </div>
       </div>
     );
   }
   if (!recording) {
     return (
-      <div className="p-6 text-sm text-muted-foreground">
-        Recording not found
+      <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-background">
+        <div className="flex h-9 shrink-0 items-center border-b border-border px-3">
+          <Button type="button" variant="ghost" size="sm" onClick={onBack}>
+            <IconArrowLeft className="size-4" aria-hidden="true" />
+            {t("recordingPage.backToClip")}
+          </Button>
+        </div>
+        <div className="p-6 text-sm text-muted-foreground">
+          {t("editorLayout.recordingNotFound")}
+        </div>
       </div>
     );
   }
@@ -442,25 +1503,47 @@ export function EditorLayout({ recordingId, className }: EditorLayoutProps) {
         className,
       )}
     >
-      <EditorToolbar
-        recordingId={recordingId}
-        playheadMs={playheadMs}
-        durationMs={durationMs}
-        playing={playing}
-        onPlayPause={() => setPlaying((p) => !p)}
-        playbackSpeed={playbackSpeed}
-        onPlaybackSpeedChange={handlePlaybackSpeedChange}
-        zoom={zoom}
-        onZoomChange={setZoom}
-        edits={edits}
-        selectionRange={selectionRange}
-        video={{ videoUrl, videoFormat, title: recording.title }}
-        onOpenThumbnailPicker={() => setThumbOpen(true)}
-        onOpenChapters={() => setChaptersOpen((v) => !v)}
-        onOpenStitch={() => setStitchOpen(true)}
-        chaptersOpen={chaptersOpen}
-      />
-
+      <div className="flex h-9 shrink-0 items-center justify-between gap-3 border-b border-border px-3">
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          disabled={saveStatus === "saving"}
+          onClick={onBack}
+        >
+          <IconArrowLeft className="size-4" aria-hidden="true" />
+          {t("recordingPage.backToClip")}
+        </Button>
+        <span
+          role="status"
+          aria-live="polite"
+          className={cn(
+            "flex min-w-0 items-center gap-1.5 truncate text-xs",
+            saveStatus === "error"
+              ? "text-destructive"
+              : "text-muted-foreground",
+          )}
+        >
+          {saveStatus === "saving" ? (
+            <>
+              <IconLoader2
+                className="size-3.5 shrink-0 animate-spin"
+                aria-hidden="true"
+              />
+              {t("editorLayout.savingChanges")}
+            </>
+          ) : saveStatus === "saved" ? (
+            <>
+              <IconCheck className="size-3.5 shrink-0" aria-hidden="true" />
+              {t("editorLayout.changesSaved")}
+            </>
+          ) : saveStatus === "error" ? (
+            t("editorLayout.editFailed")
+          ) : (
+            t("editorLayout.autoSaveHint")
+          )}
+        </span>
+      </div>
       {/* Preview + transcript + chapters sidebar */}
       <div
         className={cn(
@@ -474,109 +1557,365 @@ export function EditorLayout({ recordingId, className }: EditorLayoutProps) {
           {/* Row 1: video */}
           <div className="flex min-h-0 min-w-0 flex-1 basis-[220px] items-center justify-center overflow-hidden bg-black p-4">
             {videoUrl ? (
-              <video
-                ref={videoRef}
-                src={videoUrl}
-                className="h-full w-full rounded object-contain shadow"
-                onPlay={() => setPlaying(true)}
-                onPause={() => setPlaying(false)}
-                controls={false}
-                crossOrigin="anonymous"
-              />
+              <div className="relative h-full w-full">
+                <video
+                  ref={videoRef}
+                  src={editorVideoUrl ?? undefined}
+                  className="h-full w-full rounded object-contain shadow"
+                  onPlay={() => setPlaying(true)}
+                  onPause={() => setPlaying(false)}
+                  onLoadedMetadata={(e) => {
+                    const el = e.currentTarget;
+                    if (el.videoWidth && el.videoHeight) {
+                      setVideoSize({
+                        width: el.videoWidth,
+                        height: el.videoHeight,
+                      });
+                    }
+                  }}
+                  controls={false}
+                />
+                <RedactionOverlay
+                  redactions={redactions}
+                  playheadMs={playheadMs}
+                  selectedId={selectedRedactionId}
+                  onSelect={setSelectedRedactionId}
+                  onDraw={addRedaction}
+                  onReshape={reshapeRedaction}
+                  drawing={redactMode}
+                  newStyle={redactionStyle}
+                  videoWidth={pictureSize.width}
+                  videoHeight={pictureSize.height}
+                />
+              </div>
             ) : (
               <div className="text-sm text-muted-foreground">
-                No video available yet.
+                {t("editorLayout.noVideoYet")}
               </div>
             )}
           </div>
 
-          {/* Row 2: transcript editor */}
-          <div className="h-40 shrink-0 border-t border-border">
-            <TranscriptEditor
-              segments={transcriptSegments}
-              edits={edits}
-              currentMs={playheadMs}
-              onSeek={seek}
-              onTrimRange={callTrim}
-            />
-          </div>
+          <EditorToolbar
+            recordingId={recordingId}
+            playheadMs={playheadMs}
+            durationMs={durationMs}
+            playing={playing}
+            onPlayPause={() => setPlaying((p) => !p)}
+            playbackSpeed={playbackSpeed}
+            onPlaybackSpeedChange={handlePlaybackSpeedChange}
+            zoom={zoom}
+            onZoomChange={handleZoomChange}
+            timelineActive={activeSurface === "timeline"}
+            edits={savedEdits}
+            selectionRange={selectedClip}
+            onCutRange={callTrim}
+            onSplit={splitAtPlayhead}
+            redactMode={redactMode}
+            onToggleRedact={() => {
+              setRedactMode((on) => {
+                if (on && playbackSpeed < SLOW_SPEED_CEILING) {
+                  handlePlaybackSpeedChange(1);
+                }
+                return !on;
+              });
+              setSelectedRedactionId(null);
+            }}
+            pendingRedactions={savedRedactions.length}
+            onBurnRedactions={burnIn}
+            burningRedactions={burning}
+            burnPercent={burnPercent}
+            onUndo={() => stepHistory("undo")}
+            onRedo={() => stepHistory("redo")}
+            canUndo={history.undo > 0}
+            canRedo={history.redo > 0}
+            video={{ videoUrl, videoFormat, title: recording.title }}
+            onOpenThumbnailPicker={() => setThumbOpen(true)}
+            onOpenChapters={() => setChaptersOpen((v) => !v)}
+            onOpenStitch={() => setStitchOpen(true)}
+            chaptersOpen={chaptersOpen}
+          />
 
-          {/* Row 3: waveform + timeline */}
-          <div
-            ref={containerRef}
-            className="min-w-0 shrink-0 space-y-1 overflow-hidden border-t border-border bg-card/30 p-2"
-          >
-            <div className="relative min-w-0 overflow-hidden">
-              <Waveform
-                peaks={peaks}
-                width={viewportWidth}
-                height={WAVEFORM_HEIGHT}
-                zoom={zoom}
-                playheadMs={playheadMs}
-                durationMs={durationMs}
-                excludedRanges={excludedRanges}
-                selectionRange={selectionRange}
-                activityRanges={transcriptSegments}
-                onSeek={seek}
-                onScroll={(s) => setScrollLeft(s)}
-              />
-              <div
-                className="pointer-events-none absolute inset-0 overflow-hidden"
-                style={{ height: WAVEFORM_HEIGHT }}
-              >
-                <div
-                  className="relative h-full"
-                  style={{
-                    width: totalWidth,
-                    transform: `translateX(${-scrollLeft}px)`,
-                  }}
-                >
-                  <TrimHandles
-                    width={totalWidth}
-                    height={WAVEFORM_HEIGHT}
-                    value={effectiveSelection}
-                    onChange={setSelectionRange}
-                    durationMs={durationMs}
-                    scrollLeft={scrollLeft}
+          <div className="shrink-0 border-t border-border bg-card/30">
+            <div className="flex h-9 items-center gap-2 px-2">
+              {/*
+                While redacting, this row belongs to the redaction: the
+                transcript is not something anyone edits with a box half drawn,
+                and the tabs were a line of height spent on a choice nobody
+                makes here. The controls that were under the timeline move up
+                into the space instead.
+              */}
+              {redactMode ? (
+                <>
+                  <RedactionStyleToggle
+                    value={selectedRedaction?.style ?? redactionStyle}
+                    onChange={setStyle}
+                    t={t}
                   />
-                </div>
-              </div>
+                  <HelpPopover
+                    label={t("redaction.helpTitle")}
+                    lead={t("redaction.helpLead")}
+                    rows={[
+                      {
+                        term: t("redaction.helpDrawTerm"),
+                        text: t("redaction.helpDraw"),
+                      },
+                      {
+                        term: t("redaction.helpMoveTerm"),
+                        text: t("redaction.helpMove"),
+                      },
+                      {
+                        term: t("redaction.helpFollowTerm"),
+                        text: t("redaction.helpFollow"),
+                      },
+                      {
+                        term: t("redaction.helpTimingTerm"),
+                        text: t("redaction.helpTiming"),
+                      },
+                      {
+                        term: t("redaction.helpWaypointTerm"),
+                        text: t("redaction.helpWaypoint"),
+                      },
+                      {
+                        term: t("redaction.helpRemoveTerm"),
+                        text: t("redaction.helpRemove"),
+                      },
+                      {
+                        term: t("redaction.helpStylesTerm"),
+                        text: t("redaction.styleBlurHint"),
+                      },
+                      { text: t("redaction.styleSolidHint") },
+                      { text: t("redaction.helpWhenInDoubt") },
+                    ]}
+                  />
+                </>
+              ) : (
+                <>
+                  <Tabs
+                    value={editingSurface}
+                    onValueChange={(value) =>
+                      setEditingSurface(value as typeof editingSurface)
+                    }
+                  >
+                    <TabsList className="h-7 p-0.5">
+                      <TabsTrigger
+                        value="timeline"
+                        className="h-6 px-3 text-xs"
+                      >
+                        {t("editorLayout.timeline")}
+                      </TabsTrigger>
+                      <TabsTrigger
+                        value="transcript"
+                        className="h-6 px-3 text-xs"
+                      >
+                        {t("recordingPage.transcript")}
+                      </TabsTrigger>
+                    </TabsList>
+                  </Tabs>
+                  {activeSurface === "timeline" ? (
+                    <HelpPopover
+                      label={t("timelineTrack.helpTitle")}
+                      rows={[
+                        {
+                          term: t("timelineTrack.helpSplitTerm"),
+                          text: t("timelineTrack.helpSplit"),
+                        },
+                        {
+                          term: t("timelineTrack.helpShortenTerm"),
+                          text: t("timelineTrack.helpShorten"),
+                        },
+                        {
+                          term: t("timelineTrack.helpOtherSideTerm"),
+                          text: t("timelineTrack.helpOtherSide"),
+                        },
+                        {
+                          term: t("timelineTrack.helpRemoveTerm"),
+                          text: t("timelineTrack.helpRemove"),
+                        },
+                        {
+                          term: t("timelineTrack.helpRestoreTerm"),
+                          text: t("timelineTrack.helpRestore"),
+                        },
+                      ]}
+                    />
+                  ) : null}
+                </>
+              )}
+              {savedRedactions.length > 0 ? (
+                <span className="ms-auto truncate text-[11px] font-medium text-amber-600 dark:text-amber-400">
+                  {t("redaction.notYetBurned", {
+                    count: savedRedactions.length,
+                  })}
+                </span>
+              ) : null}
             </div>
 
-            <div
-              className="min-w-0 overflow-hidden rounded-sm border border-border/70"
-              style={{ width: viewportWidth }}
-            >
-              <div
-                style={{
-                  transform: `translateX(${-scrollLeft}px)`,
-                  width: totalWidth,
-                }}
-              >
-                <Timeline
-                  width={totalWidth}
-                  durationMs={durationMs}
-                  playheadMs={playheadMs}
-                  chapters={chapters}
-                  excludedRanges={excludedRanges}
-                  splitPoints={splitPoints}
-                  scrollLeft={scrollLeft}
+            {activeSurface === "transcript" ? (
+              <div className="h-40 border-t border-border">
+                <TranscriptEditor
+                  segments={transcriptSegments}
+                  edits={savedEdits}
+                  currentMs={playheadMs}
                   onSeek={seek}
-                  onClickChapter={(c) => seek(c.startMs)}
+                  onTrimRange={callTrim}
                 />
               </div>
-            </div>
+            ) : (
+              <div
+                ref={containerRef}
+                className="min-w-0 space-y-1 overflow-hidden border-t border-border p-2"
+              >
+                <div
+                  className="relative min-w-0 overflow-hidden"
+                  onWheel={handleTimelineWheel}
+                >
+                  <Waveform
+                    peaks={peaks}
+                    sprite={filmstripSprite}
+                    frames={filmstripFrames}
+                    width={viewportWidth}
+                    height={WAVEFORM_HEIGHT}
+                    zoom={zoom}
+                    playheadMs={playheadMs}
+                    durationMs={durationMs}
+                    excludedRanges={shownExcludedRanges}
+                    activityRanges={transcriptSegments}
+                    onSeek={seek}
+                    scrollLeft={clampedScrollLeft}
+                    onScroll={(s) => setScrollLeft(s)}
+                  />
+                  <div
+                    className="absolute inset-0 overflow-hidden"
+                    style={{ height: WAVEFORM_HEIGHT }}
+                  >
+                    <div
+                      className="relative h-full"
+                      style={{
+                        width: totalWidth,
+                        transform: `translateX(${-clampedScrollLeft}px)`,
+                      }}
+                    >
+                      {durationMs > 0 && (
+                        <TimelineTrack
+                          width={totalWidth}
+                          height={WAVEFORM_HEIGHT}
+                          durationMs={durationMs}
+                          edits={shownEdits}
+                          selection={selection}
+                          onSelectionChange={setSelection}
+                          onPreview={setPreviewEdits}
+                          onCommit={(next) => void commitEdits(next)}
+                          onSeek={seek}
+                        />
+                      )}
+                    </div>
+                  </div>
+                </div>
 
-            <div className="flex justify-between gap-3 pt-1 font-mono text-[10px] text-muted-foreground">
-              <span>
-                {excludedRanges.length} trim(s) · {splitPoints.length} split(s)
-              </span>
-              <span className="truncate text-right">
-                speed {playbackSpeed}x · zoom {zoom}x · selection{" "}
-                {formatMs(effectiveSelection.startMs)}–
-                {formatMs(effectiveSelection.endMs)}
-              </span>
-            </div>
+                {redactions.length > 0 ? (
+                  <div
+                    className="min-w-0 overflow-hidden"
+                    style={{ width: viewportWidth }}
+                  >
+                    <div
+                      style={{
+                        transform: `translateX(${-clampedScrollLeft}px)`,
+                        width: totalWidth,
+                      }}
+                    >
+                      <RedactionLane
+                        width={totalWidth}
+                        durationMs={durationMs}
+                        redactions={redactions}
+                        selectedId={selectedRedactionId}
+                        onSelect={setSelectedRedactionId}
+                        onPreview={setPreviewRedactions}
+                        onCommit={(next) => void commitRedactions(next)}
+                        onSeek={seek}
+                      />
+                    </div>
+                  </div>
+                ) : null}
+
+                <div
+                  className="min-w-0 overflow-hidden rounded-sm border border-border/70"
+                  style={{ width: viewportWidth }}
+                >
+                  <div
+                    style={{
+                      transform: `translateX(${-clampedScrollLeft}px)`,
+                      width: totalWidth,
+                    }}
+                  >
+                    <Timeline
+                      width={totalWidth}
+                      durationMs={durationMs}
+                      playheadMs={playheadMs}
+                      chapters={chapters}
+                      splitPoints={splitPoints}
+                      originalStartMs={edits.rewindOriginalStartMs}
+                      onSeek={seek}
+                      onClickChapter={(c) => seek(c.startMs)}
+                    />
+                  </div>
+                </div>
+                {savedRedactions.length > 0 || redactMode ? (
+                  <>
+                    {/*
+                      Every redaction, always reachable. The bar on the lane can
+                      be scrolled out of view or squeezed to a few pixels at low
+                      zoom, and the box on the picture only appears while the
+                      playhead is inside its range — so neither is somewhere a
+                      redaction can be relied on to be deleted from.
+                    */}
+                    <div className="flex flex-wrap items-center gap-1 px-1 pt-1">
+                      {savedRedactions.map((redaction, index) => {
+                        const selected = redaction.id === selectedRedactionId;
+                        return (
+                          <span
+                            key={redaction.id}
+                            className={cn(
+                              "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px]",
+                              selected
+                                ? "border-amber-400 bg-amber-400/15 text-foreground"
+                                : "border-border text-muted-foreground",
+                            )}
+                          >
+                            <button
+                              type="button"
+                              className="font-medium"
+                              onClick={() => {
+                                setSelectedRedactionId(redaction.id);
+                                seek(redaction.startMs);
+                              }}
+                              title={t("redaction.goTo")}
+                            >
+                              {t("redaction.chip", {
+                                number: index + 1,
+                                start: formatMs(redaction.startMs),
+                                end: formatMs(redaction.endMs),
+                              })}
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-full px-1 leading-none text-muted-foreground hover:text-destructive"
+                              aria-label={t("redaction.remove", {
+                                number: index + 1,
+                              })}
+                              title={t("redaction.remove", {
+                                number: index + 1,
+                              })}
+                              onClick={() => removeRedaction(redaction.id)}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : null}
+              </div>
+            )}
           </div>
         </div>
 
@@ -603,11 +1942,23 @@ export function EditorLayout({ recordingId, className }: EditorLayoutProps) {
         durationMs={durationMs}
         currentThumbnailUrl={recording.thumbnailUrl}
         currentAnimatedUrl={recording.animatedThumbnailUrl}
+        currentThumbnail={edits.thumbnail}
       />
       <StitchManager
         open={stitchOpen}
         onOpenChange={setStitchOpen}
         seedRecordingId={recordingId}
+      />
+      <FileStorageSetupPopover
+        open={storageSetupOpen}
+        onOpenChange={setStorageSetupOpen}
+        onConnected={() => void videoStorageStatus.refetch()}
+        {...(!videoStorageStatus.isSuccess || videoStorageStatus.isError
+          ? {
+              status: "unavailable" as const,
+              onRetry: () => void videoStorageStatus.refetch(),
+            }
+          : { status: "missing" as const })}
       />
     </div>
   );

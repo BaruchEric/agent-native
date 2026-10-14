@@ -1,46 +1,16 @@
 export interface RuntimeContextOptions {
   now?: Date;
   timezone?: string | null;
-  /**
-   * Delegation depth of the agent this prompt is built for. 0 = the top-level
-   * (user-facing) agent, 1 = a sub-agent spawned by the top-level agent, and so
-   * on. Threaded through so a spawned sub-agent knows how deep it sits and
-   * whether it is still allowed to delegate further. Omitted (or 0) for the
-   * top-level chat. See `MAX_SUBAGENT_DELEGATION_DEPTH`.
-   */
   delegationDepth?: number;
 }
 
-/**
- * Default hard cap on sub-agent delegation depth. The top-level agent is depth
- * 0 and may spawn sub-agents (depth 1); those may spawn once more (depth 2);
- * a spawn that would create a depth-3 sub-agent is refused. Borrowed from the
- * "sub-agents must not infinitely spawn sub-agents" runaway/cost safety rail.
- *
- * Override at deploy time via `AGENT_NATIVE_MAX_SUBAGENT_DEPTH` (see
- * `resolveMaxSubagentDelegationDepth`).
- */
 export const MAX_SUBAGENT_DELEGATION_DEPTH = 2;
 
-/**
- * Upper bound the env override is clamped to. A misconfigured very-large value
- * would defeat the guardrail entirely, so we cap it at a still-generous depth.
- */
 const MAX_SUBAGENT_DELEGATION_DEPTH_CEILING = 16;
 
-/** Env var name that overrides the default sub-agent delegation-depth cap. */
 export const MAX_SUBAGENT_DELEGATION_DEPTH_ENV =
   "AGENT_NATIVE_MAX_SUBAGENT_DEPTH";
 
-/**
- * Resolve the effective maximum sub-agent delegation depth.
- *
- * Reads `AGENT_NATIVE_MAX_SUBAGENT_DEPTH` and, when it parses to a finite
- * non-negative integer, clamps it to `[0, MAX_SUBAGENT_DELEGATION_DEPTH_CEILING]`.
- * Any invalid value (non-numeric, negative, NaN, Infinity, fractional) falls
- * back to `MAX_SUBAGENT_DELEGATION_DEPTH` so a typo can never silently disable
- * the guardrail. `0` is a valid override meaning "no sub-agents may be spawned".
- */
 export function resolveMaxSubagentDelegationDepth(
   env: Record<string, string | undefined> = process.env,
 ): number {
@@ -48,7 +18,6 @@ export function resolveMaxSubagentDelegationDepth(
   if (raw === undefined) return MAX_SUBAGENT_DELEGATION_DEPTH;
   const trimmed = raw.trim();
   if (trimmed === "") return MAX_SUBAGENT_DELEGATION_DEPTH;
-  // Only accept plain non-negative integers; reject "2.5", "1e3", "0x4", etc.
   if (!/^\d+$/.test(trimmed)) return MAX_SUBAGENT_DELEGATION_DEPTH;
   const parsed = Number(trimmed);
   if (!Number.isSafeInteger(parsed) || parsed < 0) {
@@ -57,7 +26,7 @@ export function resolveMaxSubagentDelegationDepth(
   return Math.min(parsed, MAX_SUBAGENT_DELEGATION_DEPTH_CEILING);
 }
 
-function isValidTimezone(timezone: string): boolean {
+export function isValidTimezone(timezone: string): boolean {
   try {
     new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format();
     return true;
@@ -66,7 +35,7 @@ function isValidTimezone(timezone: string): boolean {
   }
 }
 
-function formatDateTime(date: Date, timezone: string): string {
+export function formatDateTime(date: Date, timezone: string): string {
   return new Intl.DateTimeFormat("en-US", {
     timeZone: timezone,
     weekday: "long",
@@ -80,7 +49,7 @@ function formatDateTime(date: Date, timezone: string): string {
   }).format(date);
 }
 
-function formatDate(date: Date, timezone: string): string {
+export function formatDate(date: Date, timezone: string): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: timezone,
     year: "numeric",
@@ -93,14 +62,17 @@ function formatDate(date: Date, timezone: string): string {
   return `${year}-${month}-${day}`;
 }
 
+function resolveTimezone(timezone?: string | null): string {
+  return typeof timezone === "string" && isValidTimezone(timezone)
+    ? timezone
+    : "UTC";
+}
+
 export function buildRuntimeContextPrompt(
   options: RuntimeContextOptions = {},
 ): string {
   const now = options.now ?? new Date();
-  const timezone =
-    typeof options.timezone === "string" && isValidTimezone(options.timezone)
-      ? options.timezone
-      : "UTC";
+  const timezone = resolveTimezone(options.timezone);
 
   const depth =
     typeof options.delegationDepth === "number" &&
@@ -121,11 +93,23 @@ export function buildRuntimeContextPrompt(
   return `
 
 <runtime-context>
-currentUtc: ${now.toISOString()}
-currentDateUtc: ${formatDate(now, "UTC")}
+currentDate: ${formatDate(now, "UTC")}
 currentTimezone: ${timezone}
-currentDateInTimezone: ${formatDate(now, timezone)}
-currentTimeInTimezone: ${formatDateTime(now, timezone)}${delegationLine}
-Use this runtime context as authoritative for relative dates such as today, yesterday, tomorrow, this week, and last month. Resolve relative dates to explicit calendar dates before querying data or creating artifacts, and include the exact date or date range in factual answers.
+currentDateInTimezone: ${formatDate(now, timezone)}${delegationLine}
+Use this runtime context as authoritative for relative dates such as today, yesterday, tomorrow, this week, and last month. Resolve relative dates to explicit calendar dates before querying data or creating artifacts, and include the exact date or date range in factual answers. This block only carries day-granularity; for the precise current time, see the <current-time> block in the user message.
 </runtime-context>`;
+}
+
+export interface CurrentTimeContextOptions {
+  now?: Date;
+  timezone?: string | null;
+}
+
+export function buildCurrentTimeUserContext(
+  options: CurrentTimeContextOptions = {},
+): string {
+  const now = options.now ?? new Date();
+  const timezone = resolveTimezone(options.timezone);
+
+  return `\n\n<current-time>\ncurrentUtc: ${now.toISOString()}\ncurrentTimezone: ${timezone}\ncurrentTimeInTimezone: ${formatDateTime(now, timezone)}\n</current-time>`;
 }

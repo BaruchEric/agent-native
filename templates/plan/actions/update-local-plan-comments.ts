@@ -1,21 +1,23 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction, fail } from "@agent-native/core/action";
 import { z } from "zod";
-import {
-  buildUpdatedPlanCommentRows,
-  commentInputSchema,
-  nowIso,
-} from "../server/plans.js";
+
 import {
   getLocalPlanOwnerEmail,
   isLocalPlanRuntime,
 } from "../server/lib/local-identity.js";
+import { buildLocalPlanBundleResult } from "../server/lib/local-plan-bundle.js";
 import {
   readLocalPlanComments,
   readPlanLocalFolder,
   writeLocalPlanComments,
 } from "../server/lib/local-plan-files.js";
-import { buildLocalPlanBundleResult } from "../server/lib/local-plan-bundle.js";
-import type { PlanComment, PlanKind } from "../shared/types.js";
+import { resolveLocalPlanKind } from "../server/lib/local-plan-kind.js";
+import {
+  buildUpdatedPlanCommentRows,
+  commentInputSchema,
+  nowIso,
+} from "../server/plans.js";
+import type { PlanComment } from "../shared/types.js";
 
 export default defineAction({
   description:
@@ -59,9 +61,10 @@ export default defineAction({
   },
   run: async (args) => {
     if (!isLocalPlanRuntime()) {
-      throw new Error(
-        "Local plan comments are only available in local Plan runtime.",
-      );
+      fail("Local plan comments are only available in local Plan runtime.", {
+        errorCode: "local_plan_runtime_required",
+        statusCode: 412,
+      });
     }
 
     const local = await readPlanLocalFolder({
@@ -76,8 +79,6 @@ export default defineAction({
       existing.map((comment) => [comment.id, comment]),
     );
 
-    // New comments (and replies) reuse the hosted row-builder for id minting,
-    // thread linkage, and metadata; existing ids fall through to the edit path.
     const inserts = args.comments.filter(
       (comment) => !comment.id || !existingById.has(comment.id),
     );
@@ -94,7 +95,6 @@ export default defineAction({
       now,
     });
     for (const row of insertedRows) {
-      // Local comments are always a one-way note to the agent.
       merged.set(row.id, {
         id: row.id,
         planId: row.planId,
@@ -161,9 +161,10 @@ export default defineAction({
       slug: local.slug,
       path: local.repoPath,
     });
+    const kind = resolveLocalPlanKind(undefined, fresh.mdx);
     return buildLocalPlanBundleResult({
       local: fresh,
-      kind: "plan" as PlanKind,
+      kind,
       role: "editor",
       comments: next,
       currentFocus: "local-files commenting",

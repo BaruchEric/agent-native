@@ -10,20 +10,17 @@
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
+
 import {
   encryptSecretValue,
   decryptSecretValue,
   isEncryptedSecretValue,
 } from "@agent-native/core/secrets/crypto";
 
-/**
- * Encrypt a share password for storage. Empty / nullish clears it (returns
- * null), matching the prior `args.password ?? null` semantics.
- */
 export function encryptSharePassword(
   raw: string | null | undefined,
 ): string | null {
-  const value = typeof raw === "string" ? raw : "";
+  const value = typeof raw === "string" ? raw.trim() : "";
   if (!value) return null;
   return encryptSecretValue(value);
 }
@@ -48,11 +45,6 @@ function decodeStoredPassword(
   return stored;
 }
 
-/**
- * Constant-time check of a supplied password against the stored (encrypted or
- * legacy-plaintext) value. Hashing both sides to a fixed width lets
- * `timingSafeEqual` run without leaking length via an early return.
- */
 export function verifySharePassword(
   supplied: string,
   stored: string | null | undefined,
@@ -62,4 +54,29 @@ export function verifySharePassword(
   const a = createHash("sha256").update(supplied, "utf8").digest();
   const b = createHash("sha256").update(expected, "utf8").digest();
   return timingSafeEqual(a, b);
+}
+
+export function getRecordingAccessTokenResourceId(
+  recordingId: string,
+  storedPassword: string | null | undefined,
+  sharePasswordVersion: string | null | undefined,
+): string {
+  if (
+    sharePasswordVersion === "initial" ||
+    sharePasswordVersion?.startsWith("legacy:")
+  ) {
+    // Keep pre-version grants and grants from older writers valid until a password mutation.
+    return recordingId;
+  }
+
+  // Encrypted passwords scope grants to the ciphertext; other rows use the dedicated version.
+  const versionSource =
+    storedPassword && isEncryptedSecretValue(storedPassword)
+      ? storedPassword
+      : sharePasswordVersion;
+  if (!versionSource) {
+    throw new Error("Recording access scope requires a password version");
+  }
+  const version = createHash("sha256").update(versionSource).digest("hex");
+  return `${recordingId}:access:${version}`;
 }

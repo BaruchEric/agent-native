@@ -1,11 +1,13 @@
-import { useMemo } from "react";
-import { cn } from "@/lib/utils";
-import { formatMs } from "@/lib/timestamp-mapping";
+import { useT } from "@agent-native/core/client/i18n";
+import { useMemo, useRef } from "react";
+
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { formatMs } from "@/lib/timestamp-mapping";
+import { cn } from "@/lib/utils";
 
 export interface TimelineChapter {
   startMs: number;
@@ -15,12 +17,11 @@ export interface TimelineChapter {
 export interface TimelineProps {
   width: number;
   durationMs: number;
-  /** Current playhead in original ms. */
   playheadMs: number;
   chapters?: TimelineChapter[];
   excludedRanges?: Array<{ startMs: number; endMs: number }>;
   splitPoints?: number[];
-  scrollLeft?: number;
+  originalStartMs?: number;
   onSeek?: (originalMs: number) => void;
   onClickChapter?: (chapter: TimelineChapter) => void;
   className?: string;
@@ -36,7 +37,6 @@ const getBrandColor = () => {
   return v ? `hsl(${v})` : "#0f172a";
 };
 
-/** Timestamp ruler + playhead + chapter markers + excluded overlays. */
 export function Timeline({
   width,
   durationMs,
@@ -44,14 +44,14 @@ export function Timeline({
   chapters = [],
   excludedRanges = [],
   splitPoints = [],
-  scrollLeft = 0,
+  originalStartMs,
   onSeek,
   onClickChapter,
   className,
 }: TimelineProps) {
+  const t = useT();
   const ticks = useMemo(() => {
     if (durationMs <= 0) return [];
-    // Target ~1 tick per 100px at the current zoom, rounded to a human interval.
     const targetTickCount = Math.max(4, Math.floor(width / 100));
     const rawInterval = durationMs / targetTickCount;
     const niceIntervals = [
@@ -68,12 +68,34 @@ export function Timeline({
     return out;
   }, [durationMs, width]);
 
-  const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
+  const seekTo = (e: { currentTarget: Element; clientX: number }) => {
     if (!onSeek) return;
     const rect = e.currentTarget.getBoundingClientRect();
-    const x = e.clientX - rect.left + scrollLeft;
+    const x = e.clientX - rect.left;
     const ms = Math.max(0, Math.min(durationMs, (x / width) * durationMs));
     onSeek(ms);
+  };
+
+  const scrubbingRef = useRef(false);
+
+  const startScrub = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!onSeek || e.button !== 0) return;
+    scrubbingRef.current = true;
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    seekTo(e);
+  };
+
+  const continueScrub = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!scrubbingRef.current) return;
+    seekTo(e);
+  };
+
+  const endScrub = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!scrubbingRef.current) return;
+    scrubbingRef.current = false;
+    if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
   };
 
   const playheadX = (playheadMs / Math.max(durationMs, 1)) * width;
@@ -82,9 +104,12 @@ export function Timeline({
     <div className={cn("relative", className)}>
       {/* Ruler */}
       <div
-        className="relative border-b border-border bg-card/40 cursor-pointer"
+        className="relative border-b border-border bg-card/40 cursor-ew-resize"
         style={{ width, height: RULER_HEIGHT }}
-        onClick={handleSeek}
+        onPointerDown={startScrub}
+        onPointerMove={continueScrub}
+        onPointerUp={endScrub}
+        onPointerCancel={endScrub}
       >
         {ticks.map((t) => {
           const x = (t.ms / Math.max(durationMs, 1)) * width;
@@ -133,6 +158,27 @@ export function Timeline({
             />
           );
         })}
+
+        {typeof originalStartMs === "number" && originalStartMs > 0 ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div
+                className="absolute top-0 z-10 h-full w-0.5 cursor-help bg-amber-500"
+                style={{
+                  left: (originalStartMs / Math.max(durationMs, 1)) * width - 1,
+                }}
+                aria-label={`Original Clip start at ${formatMs(originalStartMs)}`}
+              >
+                <span className="absolute left-1 top-0 whitespace-nowrap rounded-sm bg-amber-500 px-1 text-[9px] font-semibold text-black">
+                  {t("timeline.clipStartedHere")}
+                </span>
+              </div>
+            </TooltipTrigger>
+            <TooltipContent>
+              Recording began after the countdown · {formatMs(originalStartMs)}
+            </TooltipContent>
+          </Tooltip>
+        ) : null}
 
         {/* Playhead */}
         <div

@@ -1,52 +1,148 @@
-/**
- * Client helpers for calling actions through the framework transport.
- *
- * Components should prefer `useActionQuery` / `useActionMutation`; use
- * `callAction` for imperative cases such as debounced search, prefetching, or
- * event handlers that do not fit a hook.
- *
- * ## End-to-end type safety
- *
- * When the action type registry is generated (via the Vite plugin or CLI),
- * `useActionQuery` and `useActionMutation` automatically infer the correct
- * return type and parameter types from the action definitions — no manual
- * type annotations needed.
- *
- * ```ts
- * // Fully typed — return type and params inferred from the action's defineAction()
- * const { data } = useActionQuery("list-forms", { status: "published" });
- * //      ^? Form[]  (inferred from the action's run() return type)
- * ```
- *
- * Without the registry, the hooks fall back to `any` types for backward
- * compatibility.
- */
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  hashKey,
+  useQuery,
+  useMutation,
+  useQueryClient,
+} from "@tanstack/react-query";
 import type {
+  Query,
+  QueryClient,
   UseQueryOptions,
   UseMutationOptions,
 } from "@tanstack/react-query";
+
+import { ACTION_BATCH_ACTION_NAME } from "../shared/action-batch.js";
+import {
+  ACTION_BROWSER_PERSIST_ALLOW,
+  ACTION_BROWSER_PERSIST_HEADER,
+} from "../shared/action-browser-persist.js";
+import {
+  ACTION_CHANGE_MARKER_FAILED,
+  ACTION_CHANGE_MARKER_HEADER,
+} from "../shared/action-change-marker-header.js";
+import { SLOW_ACTION_RESPONSE_MS } from "../shared/analytics-events.js";
+import { ANALYTICS_CLIENT_PLATFORM_HEADER } from "../shared/analytics-platform.js";
+import {
+  actionCircuitRemainingMs,
+  actionErrorCode,
+  actionErrorRetryAfterMs,
+  actionErrorStatus,
+  assertActionCircuitClosed,
+  type ActionCircuitTrip,
+  endsActionPolling,
+  isActionCircuitOpenError,
+  isTerminalActionError,
+  recordActionFailure,
+  resetActionFailureCircuit,
+  resetActionFailureCircuits,
+} from "./action-failure-circuit.js";
+import { fetchActionGet } from "./action-get-batch.js";
+import {
+  ACTION_RESOURCES_META_KEY,
+  actionQueryAffectedByResources,
+  type ActionScopedQuery,
+} from "./action-query-scope.js";
+import { getAnalyticsClientPlatform } from "./analytics-platform.js";
+import { getOrCreateAnalyticsSessionId } from "./analytics-session.js";
+import { trackEvent } from "./analytics.js";
 import { agentNativePath } from "./api-path.js";
-import { ensureEmbedAuthFetchInterceptor } from "./embed-auth.js";
+import {
+  agentNativeApiDisabledReason,
+  assertAgentNativeApiEnabled,
+} from "./api-surface.js";
+import { getBrowserTabId } from "./browser-tab-id.js";
+import {
+  clientBuildId,
+  clientCompatibilityVersion,
+  reloadForClientCompatibilityMismatch,
+} from "./build-compatibility.js";
+import {
+  ensureEmbedAuthFetchInterceptor,
+  isEmbedAuthActive,
+} from "./embed-auth.js";
+import { currentRouteTemplate } from "./route-template.js";
+import { recheckSessionAfterUnauthorized } from "./use-session.js";
 
-const ACTION_PREFIX = agentNativePath("/_agent-native/actions");
+function actionPrefix(): string {
+  return agentNativePath("/_agent-native/actions");
+}
 
-function isAuthFailure(error: unknown): boolean {
+const DEFAULT_ACTION_TIMEOUT_MS = 60_000;
+
+function isActionTimeout(error: unknown): boolean {
   return (
     !!error &&
     typeof error === "object" &&
-    "status" in error &&
-    ((error as { status?: unknown }).status === 401 ||
-      (error as { status?: unknown }).status === 403)
+    (error as { timedOut?: unknown }).timedOut === true
   );
 }
 
-function defaultActionQueryRetry(
+function isRetryableActionStatus(status: number): boolean {
+  return status === 429 || status === 502 || status === 503;
+}
+
+/** @internal exported for tests */
+export function defaultActionQueryRetry(
   failureCount: number,
   error: unknown,
 ): boolean {
-  if (isAuthFailure(error)) return false;
-  return failureCount < 3;
+  if (isActionCircuitOpenError(error)) return false;
+  if (isActionTimeout(error)) return false;
+  if (isBrowserResourceExhaustion(error)) return false;
+  // A named Retry-After is the server's answer; the failure circuit holds the
+  // cooldown, so retrying inside it only repeats the refusal.
+  if (actionErrorRetryAfterMs(error) !== undefined) return false;
+  if (isTerminalActionError(error)) return false;
+  if (isNetworkLevelFailure(error)) return failureCount < 1;
+
+  const status = actionErrorStatus(error);
+  if (status === undefined) return failureCount < 3;
+
+  return isRetryableActionStatus(status) && failureCount < 3;
+}
+
+/** @internal alias kept for existing specs. */
+export const shouldRetryActionQueryForError = defaultActionQueryRetry;
+
+function isBrowserResourceExhaustion(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "";
+  return /ERR_INSUFFICIENT_RESOURCES|insufficient resources/i.test(message);
+}
+
+function isNetworkLevelFailure(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error as { status?: unknown }).status === undefined &&
+    /^Action .+ failed: /.test(error.message)
+  );
+}
+
+/**
+ * Default retry backoff for action queries. React Query's stock retryDelay
+ * (1s → 2s → 4s) makes a failing query sit on a spinner for ~7s before the
+ * error surfaces; interactive data fetches want failures visible fast. The
+ * delay is jittered into the upper half of the step so clients that failed
+ * together do not retry together.
+ *
+ * React Query passes the error as a second argument, so this takes no
+ * randomness parameter.
+ *
+ * @internal exported for tests
+ */
+export function defaultActionQueryRetryDelay(failureCount: number): number {
+  const step = Math.min(500 * 2 ** failureCount, 2_000);
+  return Math.round(step / 2 + (Math.random() * step) / 2);
+}
+
+export function actionErrorMessage(error: unknown): string | undefined {
+  const value = (error as { actionMessage?: unknown } | undefined)
+    ?.actionMessage;
+  return typeof value === "string" ? value : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -59,21 +155,22 @@ function defaultActionQueryRetry(
  * it maps action names to their parameter and return types, enabling
  * end-to-end type safety for `useActionQuery` and `useActionMutation`.
  */
-export interface ActionRegistry {}
+declare global {
+  interface AgentNativeActionRegistry {}
+}
 
-/** Resolves to the union of registered action names, or `string` if no registry exists. */
+export interface ActionRegistry extends AgentNativeActionRegistry {}
+
 type ActionName = keyof ActionRegistry extends never
   ? string
   : (keyof ActionRegistry & string) | (string & {});
 
-/** Resolves the return type of an action, or `any` if not in the registry. */
 type ActionResult<T extends string> = T extends keyof ActionRegistry
   ? ActionRegistry[T] extends { result: infer R }
     ? R
     : any
   : any;
 
-/** Resolves the parameter type of an action, or `Record<string, any>` if not in the registry. */
 type ActionParams<T extends string> = T extends keyof ActionRegistry
   ? ActionRegistry[T] extends { params: infer P }
     ? P
@@ -84,17 +181,11 @@ export type ClientActionMethod = "GET" | "POST" | "PUT" | "DELETE";
 
 export interface ClientActionCallOptions {
   method?: ClientActionMethod;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  headers?: Record<string, string>;
 }
 
-// ---------------------------------------------------------------------------
-// Fetch helper
-// ---------------------------------------------------------------------------
-
-/**
- * Resolve the browser's IANA timezone (e.g. "America/Los_Angeles"). This is
- * sent on every action request as `x-user-timezone` so server-side defaults
- * like "today" honor the user's local day rather than the server's UTC clock.
- */
 function resolveUserTimezone(): string | undefined {
   try {
     return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
@@ -120,78 +211,249 @@ function appendActionQueryParam(
 ) {
   if (value === null || value === undefined) return;
   if (Array.isArray(value)) {
-    // Use bracket keys so a one-item array still arrives as an array after the
-    // server parses URLSearchParams. Repeated bare keys lose that distinction.
     for (const item of value) {
       appendActionQueryParam(qs, `${key}[]`, item);
     }
     return;
   }
+  if (typeof value === "object") {
+    qs.append(key, JSON.stringify(value));
+    return;
+  }
   qs.append(key, String(value));
 }
 
-async function actionFetch<T>(
+export interface ActionFetchOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  keepalive?: boolean;
+  serializedBody?: string;
+  responseType?: "blob";
+  includeRequestSource?: boolean;
+  headers?: Record<string, string>;
+}
+
+type InternalActionFetchOptions = ActionFetchOptions & {
+  onResponse?: (response: Response) => void;
+  uiCapabilityRetry?: boolean;
+};
+
+let uiCapabilityRequest: Promise<void> | undefined;
+
+async function ensureUiActionCapability(): Promise<void> {
+  const request =
+    uiCapabilityRequest ??
+    (uiCapabilityRequest = fetch(
+      agentNativePath("/_agent-native/ui-capability"),
+      { credentials: "same-origin", cache: "no-store" },
+    )
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error("Could not establish the browser UI capability.");
+        }
+      })
+      .finally(() => {
+        uiCapabilityRequest = undefined;
+      }));
+  return request;
+}
+
+export const ACTION_KEEPALIVE_BODY_BUDGET_BYTES = 48_000;
+
+let reservedKeepaliveBodyBytes = 0;
+
+function utf8ByteLength(value: string): number {
+  if (typeof TextEncoder !== "undefined") {
+    return new TextEncoder().encode(value).byteLength;
+  }
+
+  let bytes = 0;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    bytes +=
+      codePoint <= 0x7f
+        ? 1
+        : codePoint <= 0x7ff
+          ? 2
+          : codePoint <= 0xffff
+            ? 3
+            : 4;
+  }
+  return bytes;
+}
+
+/**
+ * A GET with no per-call headers or blob body can share a request with the
+ * other GETs in its tick. Inside an embed the embed token's scope decides which
+ * requests the server accepts, and a batch POST can be refused where its GETs
+ * would pass, so an embed keeps one request per call.
+ */
+function canBatchActionGet(options?: InternalActionFetchOptions): boolean {
+  return (
+    options?.responseType !== "blob" &&
+    options?.headers === undefined &&
+    !isEmbedAuthActive()
+  );
+}
+
+async function performActionFetch<T>(
   name: string,
   method: string,
   params?: Record<string, any>,
+  options?: InternalActionFetchOptions,
 ): Promise<T> {
   ensureEmbedAuthFetchInterceptor();
-  let url = `${ACTION_PREFIX}/${name}`;
+  let url = `${actionPrefix()}/${name}`;
+  let query = "";
+  const browserTabId = getBrowserTabId();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    // Tag browser-originated action calls so the server can set
-    // `ctx.caller = "frontend"` (vs a bare programmatic `"http"` POST).
-    // Mirrors the X-Agent-Native-Tool-Bridge: 1 convention. The header is
-    // safe to expose: CORS allows it (see action-routes.ts) and it carries
-    // no auth weight — it only narrows the caller tag.
+    "X-Agent-Native-Browser-Tab": browserTabId,
     "X-Agent-Native-Frontend": "1",
+    ...(options?.includeRequestSource !== false
+      ? {
+          "X-Request-Source": browserTabId,
+        }
+      : {}),
+    ...(options?.headers ?? {}),
   };
+  const compatibilityVersion = clientCompatibilityVersion();
+  if (compatibilityVersion) {
+    headers["X-Agent-Native-Client-Compatibility"] = compatibilityVersion;
+  }
+  const buildId = clientBuildId();
+  if (buildId) headers["X-Agent-Native-Build-Id"] = buildId;
   const tz = resolveUserTimezone();
-  if (tz) headers["x-user-timezone"] = tz;
+  if (tz) {
+    headers["x-user-timezone"] = tz;
+  }
+  const browserSessionId = getOrCreateAnalyticsSessionId();
+  if (browserSessionId) {
+    headers["X-Agent-Native-Session-Id"] = browserSessionId;
+  }
+  headers[ANALYTICS_CLIENT_PLATFORM_HEADER] = getAnalyticsClientPlatform();
   const init: RequestInit = {
     method,
     headers,
     cache: "no-store",
+    keepalive: options?.keepalive,
   };
 
   if (method === "GET" && params && Object.keys(params).length > 0) {
-    // Skip null/undefined so optional filters don't turn into literal "null"
-    // strings in the query string (e.g. `?folderId=null`).
-    const qs = serializeActionQueryParams(params);
-    if (qs) url += `?${qs}`;
+    query = serializeActionQueryParams(params);
+    if (query) url += `?${query}`;
   } else if (method !== "GET" && params) {
-    init.body = JSON.stringify(params);
+    init.body = options?.serializedBody ?? JSON.stringify(params);
   }
+
+  const outerSignal = options?.signal;
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS;
+  const controller =
+    typeof AbortController === "undefined" ? null : new AbortController();
+  const onOuterAbort = () => controller?.abort();
+  if (outerSignal && controller) {
+    if (outerSignal.aborted) controller.abort();
+    else outerSignal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+  let timedOut = false;
+  const timeoutError = (): Error => {
+    const error = new Error(
+      `Action ${name} timed out after ${Math.round(timeoutMs / 1000)}s`,
+    );
+    (error as any).timedOut = true;
+    (error as any).status = 408;
+    return error;
+  };
+  const throwTimeout = (): never => {
+    throw timeoutError();
+  };
+  let rejectTimedOut: (error: unknown) => void = () => {};
+  const timedOutSignal = new Promise<never>((_resolve, reject) => {
+    rejectTimedOut = reject;
+  });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller?.abort();
+    rejectTimedOut(timeoutError());
+  }, timeoutMs);
+  if (controller) init.signal = controller.signal;
 
   let res: Response;
-  try {
-    res = await fetch(url, init);
-  } catch (err) {
-    // Network failures, CORS, server unreachable, etc. — give the caller a
-    // useful message instead of the opaque "Failed to fetch".
-    const cause = err instanceof Error ? err.message : String(err);
-    throw new Error(`Action ${name} failed: ${cause}`);
-  }
-
-  // 204 No Content — nothing to parse.
-  if (res.status === 204) return null as T;
-
-  // Read the body as text first so we can:
-  //   - tolerate empty bodies (avoids "Unexpected end of JSON input")
-  //   - surface non-JSON error responses (HTML 401/404 pages, plain text, etc.)
-  //   - preserve the original HTTP status in the thrown error
-  // Track read failures separately from "no body" — a stream interruption /
-  // decode failure on a 2xx response should error rather than silently
-  // succeed with `null`.
   let raw = "";
+  let blob: Blob | undefined;
   let readFailed = false;
   let readError: unknown;
   try {
-    raw = await res.text();
-  } catch (err) {
-    readFailed = true;
-    readError = err;
+    try {
+      const request =
+        method === "GET" && canBatchActionGet(options)
+          ? fetchActionGet({
+              name,
+              query,
+              url,
+              init,
+              headers,
+              batchUrl: `${actionPrefix()}/${ACTION_BATCH_ACTION_NAME}`,
+            })
+          : fetch(url, init);
+      res = await Promise.race([request, timedOutSignal]);
+      throwIfAborted(outerSignal);
+      options?.onResponse?.(res);
+    } catch (err) {
+      if (timedOut) throwTimeout();
+      if (outerSignal?.aborted) throw err;
+      const cause = err instanceof Error ? err.message : String(err);
+      throw new Error(`Action ${name} failed: ${cause}`);
+    }
+
+    if (
+      res.status === 409 &&
+      res.headers.get("X-Agent-Native-Client-Mismatch") === "1"
+    ) {
+      const serverBuildId =
+        res.headers.get("X-Agent-Native-Build-Id") ?? "latest";
+      const requiredCompatibility =
+        res.headers.get("X-Agent-Native-Client-Compatibility") ?? "unknown";
+      reloadForClientCompatibilityMismatch(
+        serverBuildId,
+        requiredCompatibility,
+      );
+      const error = new Error(
+        `Action ${name} requires a refreshed browser client`,
+      );
+      (error as any).status = 409;
+      (error as any).code = "client_build_mismatch";
+      (error as any).serverBuildId = serverBuildId;
+      (error as any).requiredCompatibility = requiredCompatibility;
+      throw error;
+    }
+
+    throwIfAborted(outerSignal);
+    if (res.status === 204) {
+      if (options?.responseType === "blob") {
+        throw new Error(`Action ${name} did not return a binary response.`);
+      }
+      return null as T;
+    }
+
+    try {
+      if (res.ok && options?.responseType === "blob") {
+        blob = await Promise.race([res.blob(), timedOutSignal]);
+      } else {
+        raw = await Promise.race([res.text(), timedOutSignal]);
+      }
+    } catch (err) {
+      if (timedOut) throwTimeout();
+      if (outerSignal?.aborted) throw err;
+      readFailed = true;
+      readError = err;
+    }
+  } finally {
+    clearTimeout(timer);
+    if (outerSignal) outerSignal.removeEventListener("abort", onOuterAbort);
   }
+
+  throwIfAborted(outerSignal);
 
   let data: any = undefined;
   let parseFailed = false;
@@ -199,26 +461,82 @@ async function actionFetch<T>(
     try {
       data = JSON.parse(raw);
     } catch {
-      // Body wasn't JSON — keep `data` undefined and use the raw text below.
       parseFailed = true;
     }
   }
 
   if (!res.ok) {
+    if (
+      res.status === 403 &&
+      data?.errorCode === "ui_capability_required" &&
+      !options?.uiCapabilityRetry &&
+      typeof window !== "undefined"
+    ) {
+      await ensureUiActionCapability();
+      return performActionFetch<T>(name, method, params, {
+        ...options,
+        uiCapabilityRetry: true,
+      });
+    }
+
+    if (res.status === 401) recheckSessionAfterUnauthorized();
+
+    const authored =
+      typeof data?.error === "string" && data.error
+        ? data.error
+        : typeof data?.message === "string" && data.message
+          ? data.message
+          : undefined;
     const message =
-      (data && (data.error || data.message)) ||
-      // Truncate non-JSON bodies so we don't dump entire HTML pages into the
-      // console, but still give the developer a hint as to what came back.
+      authored ||
       (raw && raw.slice(0, 200)) ||
       res.statusText ||
       `HTTP ${res.status}`;
+
+    if (res.status === 405) {
+      const requiredMethod = /\bUse (GET|POST|PUT|DELETE)\b/.exec(message)?.[1];
+      const error = new Error(
+        `Action ${name} was called with ${method}, but it declares ` +
+          `http: { method: "${requiredMethod ?? "?"}" }. Pass { method: "${requiredMethod ?? "..."}" } ` +
+          `to this call (or use the hook that defaults to it) to match the action's declared method.`,
+      );
+      (error as any).status = 405;
+      (error as any).code = "action_method_mismatch";
+      (error as any).sentMethod = method;
+      if (requiredMethod) (error as any).requiredMethod = requiredMethod;
+      throw error;
+    }
+
     const error = new Error(`Action ${name} failed: ${message}`);
     (error as any).status = res.status;
+    const retryAfterHeader = res.headers.get("Retry-After");
+    const retryAfterSeconds =
+      retryAfterHeader === null ? NaN : Number(retryAfterHeader);
+    if (
+      Number.isInteger(retryAfterSeconds) &&
+      retryAfterSeconds > 0 &&
+      retryAfterSeconds <= 300
+    ) {
+      (error as any).retryAfterMs = retryAfterSeconds * 1000;
+    }
+    if (authored !== undefined) (error as any).actionMessage = authored;
+    if (typeof data?.errorCode === "string") {
+      (error as any).errorCode = data.errorCode;
+    }
+    // The id the server stamps on every response; it is also on the server's
+    // own capture of this failure, so a report that quotes it opens that event.
+    const requestId = res.headers.get("x-agent-native-request-id");
+    if (requestId) (error as any).requestId = requestId;
+    if (
+      data?.details &&
+      typeof data.details === "object" &&
+      !Array.isArray(data.details)
+    ) {
+      (error as any).details = data.details;
+    }
     throw error;
   }
 
-  // 2xx but the body couldn't even be read (mid-stream abort, decode failure,
-  // etc.). Don't silently treat that as a `null` success.
   if (readFailed) {
     const cause =
       readError instanceof Error ? readError.message : String(readError);
@@ -229,11 +547,14 @@ async function actionFetch<T>(
     throw error;
   }
 
-  // 2xx with a non-empty, non-JSON body. Action callers expect typed data, so
-  // returning `null` here would silently mask a real server bug (e.g. a proxy
-  // returning HTML 200 instead of JSON). Throw instead — empty bodies (handled
-  // above by the `raw.length > 0` guard and the 204 short-circuit) still
-  // correctly resolve to `null`.
+  if (options?.responseType === "blob") {
+    if (blob === undefined) {
+      throw new Error(`Action ${name} did not return a binary response.`);
+    }
+    throwIfAborted(outerSignal);
+    return blob as T;
+  }
+
   if (parseFailed) {
     const error = new Error(
       `Action ${name} returned a non-JSON ${res.status} response: ${raw.slice(0, 200)}`,
@@ -242,16 +563,244 @@ async function actionFetch<T>(
     throw error;
   }
 
+  throwIfAborted(outerSignal);
   return (data ?? (null as unknown)) as T;
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  throw error;
+}
+
+function actionTelemetryNow(): number {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
+let pageHiddenEpoch = 0;
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") pageHiddenEpoch += 1;
+  });
+}
+
 /**
- * Imperatively call an action from browser/client code.
+ * `undefined` when there is no document to ask (SSR, a non-browser caller) —
+ * "unknown" must stay absent rather than default to a guessed `false`.
  *
- * Prefer `useActionQuery` / `useActionMutation` in React render flows. Use this
- * helper when a hook is not ergonomic; do not hand-write fetch calls to
- * `/_agent-native/actions/*` in components.
+ * `hiddenEpochAtStart`/`hiddenEpochNow` only catch a transition INTO hidden
+ * that happens during the call. A call that starts already hidden (a
+ * background tab load, a cmd-click, a hidden desktop webview) sees no such
+ * transition even if the tab surfaces again before the call completes, so
+ * `hiddenAtStart` is checked directly instead of being inferred from a
+ * transition that never fires.
+ *
+ * @internal exported for tests
  */
+export function computePageHidden(
+  hiddenAtStart: boolean,
+  hiddenEpochAtStart: number,
+  hiddenEpochNow: number,
+  visibilityState: DocumentVisibilityState | undefined,
+): boolean | undefined {
+  if (visibilityState === undefined) return undefined;
+  return (
+    hiddenAtStart ||
+    hiddenEpochAtStart !== hiddenEpochNow ||
+    visibilityState !== "visible"
+  );
+}
+
+function parseServerTiming(
+  response: Response | undefined,
+): Map<string, number> {
+  const timings = new Map<string, number>();
+  const value = response?.headers.get("server-timing");
+  if (!value) return timings;
+
+  for (const entry of value.split(",")) {
+    const [rawName, ...params] = entry.trim().split(";");
+    const name = rawName?.trim();
+    if (!name) continue;
+    const duration = params
+      .map((param) => /^dur=(.+)$/i.exec(param.trim())?.[1])
+      .find(Boolean);
+    const parsed = duration === undefined ? NaN : Number(duration);
+    if (Number.isFinite(parsed)) timings.set(name, parsed);
+  }
+  return timings;
+}
+
+type ActionResponseSampling = {
+  track: boolean;
+  sampleRate: number;
+  sampled: boolean;
+};
+
+function actionTelemetryRoute(): string | undefined {
+  if (typeof window === "undefined") return undefined;
+  try {
+    return currentRouteTemplate() ?? undefined;
+  } catch {
+    // coercion-ok: telemetry never changes the action; the event omits route.
+    return undefined;
+  }
+}
+
+function getActionResponseSampling(
+  error: unknown,
+  durationMs: number,
+  response: Response | undefined,
+): ActionResponseSampling {
+  if (error || durationMs >= SLOW_ACTION_RESPONSE_MS) {
+    return { track: true, sampleRate: 1, sampled: false };
+  }
+  if (response && response.status >= 400 && response.status < 500) {
+    return { track: true, sampleRate: 1, sampled: false };
+  }
+  if (
+    /\bstartup(?:-db)?\s*;/i.test(response?.headers.get("server-timing") ?? "")
+  ) {
+    return { track: true, sampleRate: 1, sampled: false };
+  }
+  const raw = (import.meta.env as Record<string, string | undefined>)
+    ?.VITE_AGENT_NATIVE_ACTION_TELEMETRY_SAMPLE_RATE;
+  const parsed = raw === undefined ? 0.1 : Number(raw);
+  const rate = Number.isFinite(parsed) ? Math.max(0, Math.min(1, parsed)) : 0.1;
+  return { track: Math.random() < rate, sampleRate: rate, sampled: true };
+}
+
+async function actionFetch<T>(
+  name: string,
+  method: string,
+  params?: Record<string, any>,
+  options?: InternalActionFetchOptions,
+): Promise<T> {
+  assertAgentNativeApiEnabled(`${method} ${name}`);
+  const startedAt = actionTelemetryNow();
+  const routeAtStart = actionTelemetryRoute();
+  const hiddenEpochAtStart = pageHiddenEpoch;
+  const hiddenAtStart =
+    typeof document !== "undefined" && document.visibilityState !== "visible";
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS;
+  let response: Response | undefined;
+  let responseAt: number | undefined;
+  let error: unknown;
+
+  try {
+    return await performActionFetch<T>(name, method, params, {
+      ...options,
+      onResponse: (nextResponse) => {
+        response = nextResponse;
+        responseAt = actionTelemetryNow();
+        options?.onResponse?.(nextResponse);
+      },
+    });
+  } catch (caught) {
+    error = caught;
+    throw caught;
+  } finally {
+    try {
+      const completedAt = actionTelemetryNow();
+      const durationMs = Math.max(0, completedAt - startedAt);
+      const sampling = getActionResponseSampling(error, durationMs, response);
+      if (sampling.track) {
+        const ttfbMs =
+          responseAt === undefined
+            ? undefined
+            : Math.max(0, responseAt - startedAt);
+        const serverTiming = parseServerTiming(response);
+        const serverDurationMs = serverTiming.get("app");
+        const errorStatus = Number(
+          (error as { status?: unknown } | undefined)?.status,
+        );
+        const statusCode =
+          response?.status ??
+          (Number.isFinite(errorStatus) ? errorStatus : undefined);
+        const timedOut =
+          (error as { timedOut?: unknown } | undefined)?.timedOut === true;
+        const cancelled = options?.signal?.aborted === true && !timedOut;
+        const contentLengthHeader = response?.headers.get("content-length");
+        const contentLength =
+          contentLengthHeader == null ? undefined : Number(contentLengthHeader);
+        const serverBootMs = serverTiming.get("boot");
+        const serverInitMs = serverTiming.get("init");
+        const pageHidden = computePageHidden(
+          hiddenAtStart,
+          hiddenEpochAtStart,
+          pageHiddenEpoch,
+          typeof document === "undefined"
+            ? undefined
+            : document.visibilityState,
+        );
+
+        trackEvent("action.response", {
+          request_id:
+            response?.headers.get("x-agent-native-request-id") ?? undefined,
+          action: name,
+          method,
+          route: routeAtStart,
+          sample_rate: sampling.sampleRate,
+          sample_weight: 1 / sampling.sampleRate,
+          sampled: sampling.sampled,
+          status_code: statusCode,
+          error_code: actionErrorCode(error),
+          status_class:
+            statusCode === undefined
+              ? "network"
+              : `${Math.floor(statusCode / 100)}xx`,
+          success: !error,
+          outcome: !error
+            ? "success"
+            : timedOut
+              ? "timeout"
+              : cancelled
+                ? "cancelled"
+                : response
+                  ? "http-error"
+                  : "network-error",
+          duration_ms: Math.round(durationMs),
+          ttfb_ms: ttfbMs === undefined ? undefined : Math.round(ttfbMs),
+          body_ms:
+            ttfbMs === undefined ? undefined : Math.round(durationMs - ttfbMs),
+          server_duration_ms:
+            serverDurationMs === undefined
+              ? undefined
+              : Math.round(serverDurationMs),
+          network_overhead_ms:
+            ttfbMs === undefined || serverDurationMs === undefined
+              ? undefined
+              : Math.max(0, Math.round(ttfbMs - serverDurationMs)),
+          framework_ready_wait_ms: serverTiming.get("startup"),
+          db_operation_wall_ms: serverTiming.get("db"),
+          db_connect_total_ms: serverTiming.get("db-connect"),
+          db_slowest_operation_ms: serverTiming.get("db-slowest"),
+          startup_db_operation_wall_ms: serverTiming.get("startup-db"),
+          startup_db_connect_total_ms: serverTiming.get("startup-db-connect"),
+          response_bytes:
+            contentLength === undefined ||
+            !Number.isFinite(contentLength) ||
+            contentLength < 0
+              ? undefined
+              : contentLength,
+          server_boot_ms:
+            serverBootMs === undefined ? undefined : Math.round(serverBootMs),
+          server_init_ms:
+            serverInitMs === undefined ? undefined : Math.round(serverInitMs),
+          cold_start: serverTiming.has("app")
+            ? serverTiming.has("boot")
+            : undefined,
+          page_hidden: pageHidden,
+          timeout_ms: timeoutMs,
+        });
+      }
+    } catch {
+      // Performance telemetry must never change the action result.
+    }
+  }
+}
+
 export function callAction<
   TResult = undefined,
   TName extends ActionName = ActionName,
@@ -261,7 +810,178 @@ export function callAction<
   options: ClientActionCallOptions = {},
 ): Promise<TResult extends undefined ? ActionResult<TName> : TResult> {
   type R = TResult extends undefined ? ActionResult<TName> : TResult;
-  return actionFetch<R>(actionName, options.method ?? "POST", params);
+  return actionFetch<R>(actionName, options.method ?? "POST", params, {
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+    includeRequestSource: false,
+    headers: options.headers,
+  });
+}
+
+export function callActionBlob<TName extends ActionName = ActionName>(
+  actionName: TName,
+  params?: ActionParams<TName>,
+  options: ClientActionCallOptions = {},
+): Promise<Blob> {
+  return actionFetch<Blob>(actionName, options.method ?? "POST", params, {
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+    includeRequestSource: false,
+    headers: options.headers,
+    responseType: "blob",
+  });
+}
+
+function isAbortError(error: unknown): boolean {
+  return (
+    !!error &&
+    typeof error === "object" &&
+    (error as Error).name === "AbortError"
+  );
+}
+
+function isAborted(signal?: AbortSignal): boolean {
+  return signal?.aborted === true;
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal.addEventListener("abort", finish, { once: true });
+  });
+}
+
+export type RetriedActionCallOptions = Omit<
+  ClientActionCallOptions,
+  "method"
+> & { method?: "GET" };
+
+export async function callActionWithRetry<
+  TResult = undefined,
+  TName extends ActionName = ActionName,
+>(
+  actionName: TName,
+  params?: ActionParams<TName>,
+  options: RetriedActionCallOptions = {},
+): Promise<TResult extends undefined ? ActionResult<TName> : TResult> {
+  const method = (options as ClientActionCallOptions).method;
+  if (method !== undefined && method !== "GET") {
+    throw new Error(
+      `callActionWithRetry refuses ${method} for "${String(actionName)}": ` +
+        "retrying a write can duplicate a mutation the origin already " +
+        "committed. Use callAction for writes.",
+    );
+  }
+  let failureCount = 0;
+  for (;;) {
+    try {
+      return await callAction<TResult, TName>(actionName, params, {
+        ...options,
+        method: "GET",
+      });
+    } catch (error) {
+      if (
+        isAbortError(error) ||
+        isAborted(options.signal) ||
+        !defaultActionQueryRetry(failureCount, error)
+      ) {
+        throw error;
+      }
+      const delayMs = defaultActionQueryRetryDelay(failureCount);
+      failureCount += 1;
+      await abortableDelay(delayMs, options.signal);
+      if (isAborted(options.signal)) throw error;
+    }
+  }
+}
+
+export type KeepaliveActionCallRejectionReason =
+  | "body-too-large"
+  | "budget-exhausted"
+  | "api-disabled";
+
+export type KeepaliveActionCallResult<TResult> =
+  | {
+      accepted: true;
+      bodyBytes: number;
+      completion: Promise<TResult>;
+    }
+  | {
+      accepted: false;
+      bodyBytes: number;
+      reason: KeepaliveActionCallRejectionReason;
+      completion: null;
+    };
+
+export function tryCallActionKeepalive<
+  TResult = undefined,
+  TName extends ActionName = ActionName,
+>(
+  actionName: TName,
+  params?: ActionParams<TName>,
+  options: Omit<ClientActionCallOptions, "method"> & {
+    method?: "POST" | "PUT";
+  } = {},
+): KeepaliveActionCallResult<
+  TResult extends undefined ? ActionResult<TName> : TResult
+> {
+  type R = TResult extends undefined ? ActionResult<TName> : TResult;
+  const method = options.method ?? "POST";
+  const serializedBody = JSON.stringify(params ?? {});
+  const bodyBytes = utf8ByteLength(serializedBody);
+
+  if (agentNativeApiDisabledReason()) {
+    return {
+      accepted: false,
+      bodyBytes,
+      reason: "api-disabled",
+      completion: null,
+    };
+  }
+
+  if (bodyBytes > ACTION_KEEPALIVE_BODY_BUDGET_BYTES) {
+    return {
+      accepted: false,
+      bodyBytes,
+      reason: "body-too-large",
+      completion: null,
+    };
+  }
+
+  if (
+    reservedKeepaliveBodyBytes + bodyBytes >
+    ACTION_KEEPALIVE_BODY_BUDGET_BYTES
+  ) {
+    return {
+      accepted: false,
+      bodyBytes,
+      reason: "budget-exhausted",
+      completion: null,
+    };
+  }
+
+  reservedKeepaliveBodyBytes += bodyBytes;
+  const completion = actionFetch<R>(actionName, method, params, {
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+    keepalive: true,
+    serializedBody,
+  }).finally(() => {
+    reservedKeepaliveBodyBytes = Math.max(
+      0,
+      reservedKeepaliveBodyBytes - bodyBytes,
+    );
+  });
+
+  return { accepted: true, bodyBytes, completion };
 }
 
 // ---------------------------------------------------------------------------
@@ -269,19 +989,187 @@ export function callAction<
 // ---------------------------------------------------------------------------
 
 /**
- * Query an action exposed as GET.
+ * Wraps a caller-supplied `refetchInterval` so polling stops once the query's
+ * last error says it is over (401/403/410, or a non-retryable typed code such
+ * as `not_found`) instead of reissuing the identical rejection on every tick,
+ * and stretches the interval to the circuit's remaining cooldown after
+ * repeated refusals or a named Retry-After. A plain 404 keeps polling (see
+ * `endsActionPolling`). A remount, a mutation's invalidation, or an explicit
+ * `refetch()` still retries: this only gates the interval timer, not the
+ * query's error state.
  *
- * When the action type registry is generated, the return type and parameter
- * types are inferred automatically from the action's `defineAction()` call.
- *
- * ```ts
- * // Type-safe — no manual generic needed
- * const { data } = useActionQuery("list-meals", { date: "2025-01-01" });
- *
- * // Manual override still works when needed
- * const { data } = useActionQuery<CustomType>("list-meals");
- * ```
+ * @internal exported for tests
  */
+export function guardActionQueryRefetchInterval<TData = unknown>(
+  refetchInterval: NonNullable<UseQueryOptions<TData>["refetchInterval"]>,
+): NonNullable<UseQueryOptions<TData>["refetchInterval"]> {
+  return (query) => {
+    const error = query.state.error;
+    if (
+      error &&
+      actionErrorRetryAfterMs(error) === undefined &&
+      endsActionPolling(error)
+    ) {
+      return false;
+    }
+    const interval =
+      typeof refetchInterval === "function"
+        ? refetchInterval(query)
+        : refetchInterval;
+    if (typeof interval !== "number") return interval;
+    const cooldown = actionCircuitRemainingMs(query.queryHash);
+    return cooldown > 0 ? Math.max(interval, cooldown + 1) : interval;
+  };
+}
+
+/** @internal exported for tests */
+export function resolveActionQueryRetry(
+  retry: unknown,
+  failureCount: number,
+  error: unknown,
+): boolean {
+  if (typeof retry === "function") return Boolean(retry(failureCount, error));
+  if (typeof retry === "number") return failureCount < retry;
+  if (retry === undefined) return defaultActionQueryRetry(failureCount, error);
+  return Boolean(retry);
+}
+
+if (typeof window !== "undefined") {
+  // A freshly connected provider invalidates "no provider" failures that would
+  // otherwise stay paused.
+  window.addEventListener(
+    "agent-engine:configured-changed",
+    resetActionFailureCircuits,
+  );
+  // Coming back online is a new chance for every paused query. This is the
+  // window event rather than React Query's onlineManager so loading this
+  // module never touches a partially mocked `@tanstack/react-query`.
+  window.addEventListener("online", resetActionFailureCircuits);
+}
+
+// A page that keeps failing trips many circuits; a few reports say which
+// actions, a flood of them says nothing more.
+const MAX_CIRCUIT_TRIP_EVENTS_PER_SESSION = 20;
+let circuitTripEventsSent = 0;
+
+/** @internal exported for tests */
+export function resetActionCircuitTripEventsForTests(): void {
+  circuitTripEventsSent = 0;
+}
+
+function trackActionCircuitTrip(
+  actionName: string,
+  error: unknown,
+  trip: ActionCircuitTrip,
+): void {
+  if (
+    !trip.tripped ||
+    circuitTripEventsSent >= MAX_CIRCUIT_TRIP_EVENTS_PER_SESSION
+  ) {
+    return;
+  }
+  circuitTripEventsSent += 1;
+  try {
+    trackEvent("action_circuit_tripped", {
+      action_name: actionName,
+      error_code: actionErrorCode(error) ?? "untyped",
+      status_code: actionErrorStatus(error),
+      failures: trip.failures,
+      cooldown_ms: trip.cooldownMs,
+    });
+  } catch {
+    // coercion-ok: telemetry must never change what the circuit does.
+  }
+}
+
+// Identical keys in another client or auth scope must earn their own permission.
+const browserPersistableActionQueries = new WeakSet<Query>();
+const browserPersistableActionQueryBindings = new WeakMap<Query, object>();
+const actionQueryCacheRevokers = new WeakMap<QueryClient, () => void>();
+const actionQueryCacheBindingRevokers = new WeakMap<object, () => void>();
+let actionQueryCacheBindingToken: object | undefined;
+
+export function registerActionQueryCacheRevoker(
+  client: QueryClient,
+  revoke: () => void,
+  bindingToken?: object,
+): void {
+  actionQueryCacheRevokers.set(client, revoke);
+  if (bindingToken) actionQueryCacheBindingRevokers.set(bindingToken, revoke);
+}
+
+function revokeActionQueryCacheForClient(
+  client: QueryClient,
+  bindingToken?: object,
+): void {
+  const bindingRevoker = bindingToken
+    ? actionQueryCacheBindingRevokers.get(bindingToken)
+    : undefined;
+  (bindingRevoker ?? actionQueryCacheRevokers.get(client))?.();
+}
+
+/** @internal set only by the scoped action-query cache binder. */
+export function setActionQueryCacheBindingToken(
+  token: object | undefined,
+): void {
+  actionQueryCacheBindingToken = token;
+}
+
+const accessDeniedActionQueryBindings = new WeakMap<Query, object>();
+
+export function setAccessDeniedActionQueryBinding(
+  query: Query,
+  token: object | undefined,
+): void {
+  if (token) accessDeniedActionQueryBindings.set(query, token);
+  else accessDeniedActionQueryBindings.delete(query);
+}
+
+export function getAccessDeniedActionQueryBinding(
+  query: Query,
+): object | undefined {
+  return accessDeniedActionQueryBindings.get(query);
+}
+
+export function clearAccessDeniedActionQueryBinding(query: Query): void {
+  accessDeniedActionQueryBindings.delete(query);
+}
+
+/** @internal read by the persisted query cache. */
+export function isBrowserPersistableActionQuery(query: Query): boolean {
+  return (
+    query.queryKey[0] === "action" &&
+    query.state.status === "success" &&
+    browserPersistableActionQueries.has(query)
+  );
+}
+
+/** @internal a response is persistable only in the binding active at fetch start. */
+export function isBrowserPersistableActionQueryForBinding(
+  query: Query,
+  token: object,
+): boolean {
+  return (
+    isBrowserPersistableActionQuery(query) &&
+    browserPersistableActionQueryBindings.get(query) === token
+  );
+}
+
+/** @internal used only after a persisted action result is accepted and hydrated. */
+export function markRestoredBrowserPersistableActionQuery(
+  query: Query,
+  token?: object,
+): void {
+  browserPersistableActionQueries.add(query);
+  if (token) browserPersistableActionQueryBindings.set(query, token);
+  else browserPersistableActionQueryBindings.delete(query);
+}
+
+export function revokeBrowserPersistableActionQuery(query: Query): void {
+  browserPersistableActionQueries.delete(query);
+  browserPersistableActionQueryBindings.delete(query);
+}
+
 export function useActionQuery<
   TResult = undefined,
   TName extends ActionName = ActionName,
@@ -291,33 +1179,127 @@ export function useActionQuery<
   options?: Omit<
     UseQueryOptions<TResult extends undefined ? ActionResult<TName> : TResult>,
     "queryKey" | "queryFn"
-  >,
+  > & {
+    queryKeyScope?: readonly unknown[];
+    /**
+     * The resource types this query reads (matching a write's `resources` and a
+     * sync event's `resourceType`). Omit it and every resource-scoped change
+     * still refetches the query.
+     */
+    resources?: readonly string[];
+  },
 ) {
   type R = TResult extends undefined ? ActionResult<TName> : TResult;
+  const apiDisabled = Boolean(agentNativeApiDisabledReason());
+  const {
+    refetchInterval,
+    retry: callerRetry,
+    queryKeyScope,
+    resources,
+    ...restOptions
+  } = options ?? {};
+  const queryKey = ["action", actionName, params, ...(queryKeyScope ?? [])];
+  const circuitKey = () => hashKey(queryKey);
   return useQuery<R>({
-    queryKey: ["action", actionName, params],
-    queryFn: () => actionFetch<R>(actionName, "GET", params),
-    retry: defaultActionQueryRetry,
-    ...options,
+    queryKey,
+    queryFn: async ({ signal, client }) => {
+      const key = circuitKey();
+      const query = client.getQueryCache().find({ queryKey, exact: true });
+      const bindingTokenAtFetch = actionQueryCacheBindingToken;
+      assertActionCircuitClosed(key);
+      let browserPersist = false;
+      let result: R;
+      try {
+        result = await actionFetch<R>(actionName, "GET", params, {
+          signal,
+          onResponse: (response) => {
+            browserPersist =
+              response.headers.get(ACTION_BROWSER_PERSIST_HEADER) ===
+              ACTION_BROWSER_PERSIST_ALLOW;
+          },
+        });
+      } catch (error) {
+        const status = actionErrorStatus(error);
+        if (
+          !signal.aborted &&
+          (status === 401 || status === 403 || status === 404)
+        ) {
+          if (query) {
+            setAccessDeniedActionQueryBinding(query, bindingTokenAtFetch);
+            revokeBrowserPersistableActionQuery(query);
+            query.setState({ data: undefined, dataUpdatedAt: 0 });
+          }
+          revokeActionQueryCacheForClient(client, bindingTokenAtFetch);
+        }
+        throw error;
+      }
+      resetActionFailureCircuit(key);
+      if (query && !signal.aborted) {
+        clearAccessDeniedActionQueryBinding(query);
+        if (browserPersist) {
+          browserPersistableActionQueries.add(query);
+          if (
+            bindingTokenAtFetch !== undefined &&
+            actionQueryCacheBindingToken === bindingTokenAtFetch
+          ) {
+            browserPersistableActionQueryBindings.set(
+              query,
+              bindingTokenAtFetch,
+            );
+          } else {
+            browserPersistableActionQueryBindings.delete(query);
+          }
+        } else {
+          revokeBrowserPersistableActionQuery(query);
+        }
+      }
+      return result;
+    },
+    // The failure circuit counts fetch cycles, so a cycle is recorded where
+    // React Query gives up on it: the first `retry` call that answers false.
+    retry: (failureCount, error) => {
+      if (isActionCircuitOpenError(error)) return false;
+      const again = resolveActionQueryRetry(callerRetry, failureCount, error);
+      if (!again && !isAbortError(error)) {
+        trackActionCircuitTrip(
+          actionName,
+          error,
+          recordActionFailure(circuitKey(), error),
+        );
+      }
+      return again;
+    },
+    retryDelay: defaultActionQueryRetryDelay,
+    ...restOptions,
+    ...(resources
+      ? {
+          meta: {
+            ...restOptions.meta,
+            [ACTION_RESOURCES_META_KEY]: resources,
+          },
+        }
+      : {}),
+    ...(refetchInterval !== undefined
+      ? { refetchInterval: guardActionQueryRefetchInterval(refetchInterval) }
+      : {}),
+    ...(apiDisabled ? { enabled: false as const } : {}),
   });
 }
 
-// ---------------------------------------------------------------------------
-// Mutation hook
-// ---------------------------------------------------------------------------
-
 /**
- * Mutate via an action exposed as POST (default), PUT, or DELETE.
- *
- * When the action type registry is generated, the return type and parameter
- * types are inferred automatically.
- *
- * ```ts
- * // Type-safe
- * const { mutate } = useActionMutation("log-meal");
- * mutate({ name: "Salad", calories: 350 });
- * ```
+ * A write that names its resources refreshes only the action queries tagged for
+ * them (and untagged ones, whose reads are unknown). A write that names none
+ * refreshes every action query.
  */
+function actionQueryInvalidation(resources: readonly string[] | undefined) {
+  if (!resources?.length) return { queryKey: ["action"] };
+  const changed = new Set(resources);
+  return {
+    predicate: (query: ActionScopedQuery) =>
+      actionQueryAffectedByResources(query, changed),
+  };
+}
+
 export function useActionMutation<
   TData = undefined,
   TVariables = undefined,
@@ -333,12 +1315,27 @@ export function useActionMutation<
     "mutationFn"
   > & {
     method?: "POST" | "PUT" | "DELETE";
+    skipActionQueryInvalidation?: boolean;
+    /** The resource types this write changes; see `useActionQuery`. */
+    resources?: readonly string[];
+    timeoutMs?: number;
+    headers?:
+      | Record<string, string>
+      | ((
+          variables: TVariables extends undefined
+            ? ActionParams<TName>
+            : TVariables,
+        ) => Record<string, string> | undefined);
   },
 ) {
   const queryClient = useQueryClient();
   const {
     method: methodOpt,
     onSuccess,
+    skipActionQueryInvalidation = false,
+    resources,
+    timeoutMs,
+    headers,
     ...restOptions
   } = options ?? ({} as any);
   const method = methodOpt ?? "POST";
@@ -348,12 +1345,40 @@ export function useActionMutation<
 
   return useMutation<D, Error, V>({
     ...restOptions,
-    mutationFn: (params) =>
-      actionFetch<D>(actionName, method, params as Record<string, any>),
+    mutationFn: async (params) => {
+      let markerFailed = false;
+      const data = await actionFetch<D>(
+        actionName,
+        method,
+        params as Record<string, any>,
+        {
+          timeoutMs,
+          headers: typeof headers === "function" ? headers(params) : headers,
+          onResponse: (response) => {
+            markerFailed =
+              response.headers.get(ACTION_CHANGE_MARKER_HEADER) ===
+              ACTION_CHANGE_MARKER_FAILED;
+          },
+        },
+      );
+      // A normal success already refreshes these queries in onSuccess. A skip
+      // caller manages its own cache, so the failed marker is the only signal
+      // that polling did not see this write.
+      if (markerFailed && skipActionQueryInvalidation) {
+        void queryClient.invalidateQueries(actionQueryInvalidation(resources));
+      }
+      return data;
+    },
     onSuccess: (...args: [any, any, any]) => {
-      // Invalidate related action queries
-      queryClient.invalidateQueries({ queryKey: ["action"] });
-      (onSuccess as Function)?.(...args);
+      // A write that succeeded may have fixed whatever was failing reads.
+      resetActionFailureCircuits();
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new Event("agentNative:syncActivity"));
+      }
+      if (!skipActionQueryInvalidation) {
+        void queryClient.invalidateQueries(actionQueryInvalidation(resources));
+      }
+      return (onSuccess as Function)?.(...args);
     },
   });
 }

@@ -1,9 +1,26 @@
+import { AgentConnectionRequiredError } from "@agent-native/core/action";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   coreResult: null as unknown,
   localCredentials: new Map<string, string>(),
   coreResolverCalls: [] as Array<Record<string, unknown>>,
+  workspaceConnectionResult: null as unknown,
+  workspaceConnectionCalls: [] as Array<Record<string, unknown>>,
+  oauthResult: null as unknown,
+  oauthError: null as Error | null,
+  oauthCalls: [] as Array<Record<string, unknown>>,
+}));
+
+vi.mock("@agent-native/core/provider-api", () => ({
+  isProviderApiId: vi.fn((provider: string) =>
+    ["bigquery", "hubspot", "notion", "slack"].includes(provider),
+  ),
+  resolveProviderApiOAuthAccessToken: vi.fn(async (...args) => {
+    mocks.oauthCalls.push({ args });
+    if (mocks.oauthError) throw mocks.oauthError;
+    return mocks.oauthResult;
+  }),
 }));
 
 vi.mock("@agent-native/core/workspace-connections", () => ({
@@ -21,12 +38,24 @@ vi.mock("@agent-native/core/workspace-connections", () => ({
       }
     );
   }),
+  resolveWorkspaceConnectionForApp: vi.fn(async (args) => {
+    mocks.workspaceConnectionCalls.push(args);
+    return (
+      mocks.workspaceConnectionResult ?? {
+        available: false,
+        connection: null,
+        appAccess: null,
+        reason: "No workspace connection",
+      }
+    );
+  }),
 }));
 
 vi.mock("./credentials", () => ({
-  resolveCredential: vi.fn(async (key: string) =>
-    mocks.localCredentials.get(key),
-  ),
+  resolveCredentialDetailed: vi.fn(async (key: string) => {
+    const value = mocks.localCredentials.get(key);
+    return value ? { value, scope: "org", scopeId: "org-1" } : undefined;
+  }),
 }));
 
 import {
@@ -34,6 +63,7 @@ import {
   HUBSPOT_ANALYTICS_CREDENTIAL_KEYS,
   resolveAnalyticsGongCredentials,
   resolveAnalyticsProviderCredential,
+  resolveBigQueryOAuthCredential,
   resolveWorkspaceConnectionProviderCredential,
 } from "./provider-credentials.js";
 
@@ -42,6 +72,11 @@ describe("analytics provider credentials", () => {
     mocks.coreResult = null;
     mocks.localCredentials.clear();
     mocks.coreResolverCalls = [];
+    mocks.workspaceConnectionResult = null;
+    mocks.workspaceConnectionCalls = [];
+    mocks.oauthResult = null;
+    mocks.oauthError = null;
+    mocks.oauthCalls = [];
   });
 
   it("prefers the core workspace connection helper when it resolves a value", async () => {
@@ -148,6 +183,283 @@ describe("analytics provider credentials", () => {
       key: "HUBSPOT_ACCESS_TOKEN",
       source: "analytics_local",
     });
+  });
+
+  it("prefers a granted HubSpot OAuth bearer token over legacy credentials", async () => {
+    mocks.workspaceConnectionResult = {
+      available: true,
+      connection: {
+        id: "hubspot-oauth-connection",
+        label: "HubSpot: Builder.io",
+        config: { credentialMode: "oauth" },
+      },
+      appAccess: { available: true, mode: "explicit-grant" },
+      reason: "Available.",
+    };
+    mocks.oauthResult = {
+      accessToken: "hubspot-oauth-token",
+      accountId: "portal-1",
+      accountLabel: "builder.io",
+      connectionId: "hubspot-oauth-connection",
+      connectionLabel: "HubSpot: Builder.io",
+    };
+    mocks.localCredentials.set(
+      "HUBSPOT_PRIVATE_APP_TOKEN",
+      "legacy-hubspot-token",
+    );
+
+    await expect(
+      resolveAnalyticsProviderCredential({
+        provider: "hubspot",
+        keys: HUBSPOT_ANALYTICS_CREDENTIAL_KEYS,
+        ctx: { userEmail: "member@example.test", orgId: "org-1" },
+      }),
+    ).resolves.toMatchObject({
+      value: "hubspot-oauth-token",
+      key: "HUBSPOT_OAUTH_TOKEN",
+      source: "workspace_connection",
+      connectionId: "hubspot-oauth-connection",
+      connectionLabel: "HubSpot: Builder.io",
+    });
+    expect(mocks.workspaceConnectionCalls).toEqual([
+      {
+        appId: "analytics",
+        provider: "hubspot",
+        connectionId: undefined,
+        requireConnected: true,
+      },
+    ]);
+    expect(mocks.oauthCalls).toEqual([
+      {
+        args: [
+          {
+            provider: "hubspot",
+            connectionId: "hubspot-oauth-connection",
+          },
+          expect.objectContaining({
+            appId: "analytics",
+            providerIds: ["hubspot"],
+          }),
+        ],
+      },
+    ]);
+    expect(mocks.coreResolverCalls).toEqual([]);
+  });
+
+  it("does not hide failures while resolving a granted HubSpot OAuth token", async () => {
+    mocks.workspaceConnectionResult = {
+      available: true,
+      connection: {
+        id: "hubspot-oauth-connection",
+        label: "HubSpot: Builder.io",
+        config: { credentialMode: "oauth" },
+      },
+      appAccess: { available: true, mode: "all-apps" },
+      reason: "Available.",
+    };
+    mocks.oauthError = new Error("HubSpot OAuth token refresh failed");
+    mocks.localCredentials.set(
+      "HUBSPOT_PRIVATE_APP_TOKEN",
+      "legacy-hubspot-token",
+    );
+
+    await expect(
+      resolveAnalyticsProviderCredential({
+        provider: "hubspot",
+        keys: HUBSPOT_ANALYTICS_CREDENTIAL_KEYS,
+        ctx: { userEmail: "member@example.test", orgId: "org-1" },
+      }),
+    ).rejects.toThrow("HubSpot OAuth token refresh failed");
+    expect(mocks.coreResolverCalls).toEqual([]);
+  });
+
+  it("resolves OAuth at the provider boundary without requiring a matching fallback key", async () => {
+    mocks.workspaceConnectionResult = {
+      available: true,
+      connection: {
+        id: "notion-oauth-connection",
+        label: "Notion: Product",
+        config: { credentialMode: "oauth" },
+      },
+      appAccess: { available: true, mode: "explicit-grant" },
+      reason: "Available.",
+    };
+    mocks.oauthResult = {
+      accessToken: "notion-oauth-token",
+      connectionId: "notion-oauth-connection",
+      connectionLabel: "Notion: Product",
+    };
+
+    await expect(
+      resolveAnalyticsProviderCredential({
+        provider: "notion",
+        keys: ["NOTION_API_KEY"],
+        ctx: { userEmail: "member@example.test", orgId: "org-1" },
+      }),
+    ).resolves.toMatchObject({
+      value: "notion-oauth-token",
+      key: "NOTION_OAUTH_TOKEN",
+      provider: "notion",
+      source: "workspace_connection",
+    });
+    expect(mocks.coreResolverCalls).toEqual([]);
+  });
+
+  it("resolves the current user's BigQuery OAuth connection before local keys", async () => {
+    mocks.workspaceConnectionResult = {
+      available: true,
+      connection: {
+        id: "bigquery-user-connection",
+        label: "Analyst Google",
+        ownerEmail: "analyst@example.test",
+        config: { credentialMode: "oauth" },
+      },
+      appAccess: { available: true, mode: "explicit-grant" },
+      reason: "Available.",
+    };
+    mocks.oauthResult = {
+      accessToken: "bigquery-user-token",
+      accountId: "analyst@example.test",
+      connectionId: "bigquery-user-connection",
+      connectionLabel: "Analyst Google",
+    };
+
+    await expect(
+      resolveAnalyticsProviderCredential({
+        provider: "bigquery",
+        keys: [],
+        ctx: { userEmail: "analyst@example.test", orgId: "org-1" },
+      }),
+    ).resolves.toMatchObject({
+      value: "bigquery-user-token",
+      key: "BIGQUERY_OAUTH_TOKEN",
+      provider: "bigquery",
+      source: "workspace_connection",
+      connectionId: "bigquery-user-connection",
+    });
+    expect(mocks.oauthCalls[0]).toMatchObject({
+      args: [
+        { provider: "bigquery", connectionId: "bigquery-user-connection" },
+        expect.objectContaining({
+          appId: "analytics",
+          providerIds: ["bigquery"],
+        }),
+      ],
+    });
+    expect(mocks.workspaceConnectionCalls[0]).toMatchObject({
+      connectionOwnerEmail: "analyst@example.test",
+    });
+    expect(mocks.coreResolverCalls).toEqual([]);
+  });
+
+  it("keeps explicitly selected BigQuery OAuth connections owner-scoped", async () => {
+    mocks.workspaceConnectionResult = {
+      available: true,
+      connection: {
+        id: "bigquery-selected-connection",
+        label: "Analyst Google",
+        ownerEmail: "analyst@example.test",
+        config: { credentialMode: "oauth" },
+      },
+      appAccess: { available: true, mode: "explicit-grant" },
+      reason: "Available.",
+    };
+    mocks.oauthResult = {
+      accessToken: "bigquery-user-token",
+      accountId: "analyst@example.test",
+      connectionId: "bigquery-selected-connection",
+      connectionLabel: "Analyst Google",
+    };
+
+    await expect(
+      resolveAnalyticsProviderCredential({
+        provider: "bigquery",
+        keys: [],
+        connectionId: "bigquery-selected-connection",
+        ctx: { userEmail: "analyst@example.test", orgId: "org-1" },
+      }),
+    ).resolves.toMatchObject({
+      value: "bigquery-user-token",
+      connectionId: "bigquery-selected-connection",
+    });
+    expect(mocks.workspaceConnectionCalls[0]).toMatchObject({
+      connectionId: "bigquery-selected-connection",
+      connectionOwnerEmail: "analyst@example.test",
+    });
+  });
+
+  it("allows service-account fallback when BigQuery OAuth needs reauthorization", async () => {
+    mocks.workspaceConnectionResult = {
+      available: true,
+      connection: {
+        id: "bigquery-user-connection",
+        label: "Analyst Google",
+        ownerEmail: "analyst@example.test",
+        config: { credentialMode: "oauth" },
+      },
+      appAccess: { available: true, mode: "explicit-grant" },
+      reason: "Available.",
+    };
+    mocks.oauthError = new AgentConnectionRequiredError(
+      "BigQuery needs to be reconnected.",
+      { provider: "bigquery", reason: "reauthorize", appId: "analytics" },
+    );
+
+    await expect(
+      resolveBigQueryOAuthCredential({
+        userEmail: "analyst@example.test",
+        orgId: "org-1",
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("preserves transient BigQuery OAuth resolution failures", async () => {
+    mocks.workspaceConnectionResult = {
+      available: true,
+      connection: {
+        id: "bigquery-user-connection",
+        label: "Analyst Google",
+        ownerEmail: "analyst@example.test",
+        config: { credentialMode: "oauth" },
+      },
+      appAccess: { available: true, mode: "explicit-grant" },
+      reason: "Available.",
+    };
+    mocks.oauthError = new Error("OAuth refresh service unavailable");
+
+    await expect(
+      resolveBigQueryOAuthCredential({
+        userEmail: "analyst@example.test",
+        orgId: "org-1",
+      }),
+    ).rejects.toThrow("OAuth refresh service unavailable");
+  });
+
+  it("does not use a personal BigQuery OAuth connection for org-only credentials", async () => {
+    mocks.workspaceConnectionResult = {
+      available: true,
+      connection: {
+        id: "bigquery-user-connection",
+        label: "Analyst Google",
+        config: { credentialMode: "oauth" },
+      },
+      appAccess: { available: true, mode: "explicit-grant" },
+      reason: "Available.",
+    };
+
+    await expect(
+      resolveAnalyticsProviderCredential({
+        provider: "bigquery",
+        keys: [],
+        ctx: {
+          userEmail: "analyst@example.test",
+          orgId: "org-1",
+          credentialScope: "org",
+        },
+      }),
+    ).resolves.toBeNull();
+    expect(mocks.workspaceConnectionCalls).toEqual([]);
+    expect(mocks.oauthCalls).toEqual([]);
   });
 
   it("splits legacy Gong API keys for current access key and secret lookups", async () => {

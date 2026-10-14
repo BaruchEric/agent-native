@@ -1,3 +1,20 @@
+import { navigateWithAgentChatViewTransition } from "@agent-native/core/client/agent-chat";
+import { configureTracking } from "@agent-native/core/client/analytics";
+import { appPath } from "@agent-native/core/client/api-path";
+import {
+  useDbSync,
+  createAgentNativeQueryClient,
+  setClientAppState,
+} from "@agent-native/core/client/hooks";
+import { getLocaleInitScript, useT } from "@agent-native/core/client/i18n";
+import { getThemeInitScript } from "@agent-native/core/client/ui";
+import { AppProviders } from "@agent-native/toolkit/app/providers";
+import { useCommandMenuShortcut } from "@agent-native/toolkit/app/shared";
+import { CommandMenu } from "@agent-native/toolkit/app/shared";
+import { IconHierarchy2, IconSun, IconMoon } from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useTheme } from "next-themes";
+import { useCallback, useEffect, useState } from "react";
 import {
   Links,
   Meta,
@@ -7,28 +24,19 @@ import {
   useLocation,
   useNavigate,
 } from "react-router";
-import { useCallback, useEffect, useState } from "react";
-import { useNavigationState } from "@/hooks/use-navigation-state";
-import { formsRoutePath } from "@/lib/form-builder-tabs";
-import { useQueryClient } from "@tanstack/react-query";
-import { useTheme } from "next-themes";
-import { IconSun, IconMoon } from "@tabler/icons-react";
-import {
-  useDbSync,
-  AppProviders,
-  CommandMenu,
-  appPath,
-  createAgentNativeQueryClient,
-  useCommandMenuShortcut,
-  getThemeInitScript,
-  configureTracking,
-  markAgentChatHomeHandoff,
-  navigateWithAgentChatViewTransition,
-  setClientAppState,
-} from "@agent-native/core/client";
 import type { LinksFunction } from "react-router";
-import stylesheet from "./global.css?url";
+
+import { AppToolkitProvider } from "@/components/ui/toolkit-provider";
+import { useNavigationState } from "@/hooks/use-navigation-state";
+import { isFormsAskPath } from "@/lib/chat-route";
+import { formsRoutePath } from "@/lib/form-builder-tabs";
 import { TAB_ID } from "@/lib/tab-id";
+
+import changelog from "../CHANGELOG.md?raw";
+import "./lib/register-chat-renderers";
+import { i18nCatalog } from "./i18n";
+
+import stylesheet from "./global.css?url";
 
 configureTracking({
   getDefaultProps: (_name, properties) => ({
@@ -41,7 +49,31 @@ export const links: LinksFunction = () => [
   { rel: "stylesheet", href: stylesheet },
 ];
 
-const THEME_INIT_SCRIPT = getThemeInitScript();
+const THEME_INIT_SCRIPT_SELECTOR = "script[data-agent-native-theme-init]";
+const LOCALE_INIT_SCRIPT_SELECTOR = "script[data-agent-native-locale-init]";
+
+function getHydrationStableThemeInitScript() {
+  if (typeof document !== "undefined") {
+    const existing = document.querySelector<HTMLScriptElement>(
+      THEME_INIT_SCRIPT_SELECTOR,
+    );
+    if (existing?.innerHTML) return existing.innerHTML;
+  }
+  return getThemeInitScript();
+}
+
+function getHydrationStableLocaleInitScript() {
+  if (typeof document !== "undefined") {
+    const existing = document.querySelector<HTMLScriptElement>(
+      LOCALE_INIT_SCRIPT_SELECTOR,
+    );
+    if (existing?.innerHTML) return existing.innerHTML;
+  }
+  return getLocaleInitScript();
+}
+
+const THEME_INIT_SCRIPT = getHydrationStableThemeInitScript();
+const LOCALE_INIT_SCRIPT = getHydrationStableLocaleInitScript();
 
 export function Layout({ children }: { children: React.ReactNode }) {
   return (
@@ -53,11 +85,16 @@ export function Layout({ children }: { children: React.ReactNode }) {
           content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
         />
         <script
+          data-agent-native-theme-init
           suppressHydrationWarning
           dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }}
         />
+        <script
+          data-agent-native-locale-init
+          suppressHydrationWarning
+          dangerouslySetInnerHTML={{ __html: LOCALE_INIT_SCRIPT }}
+        />
         <link rel="icon" type="image/svg+xml" href={appPath("/favicon.svg")} />
-        <link rel="manifest" href={appPath("/manifest.json")} />
         <meta name="theme-color" content="#06B6D4" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta
@@ -161,9 +198,6 @@ function OpenLinkInterceptor() {
       if (!path) return;
 
       event.preventDefault();
-      if (location.pathname === "/" && path !== "/") {
-        markAgentChatHomeHandoff("forms");
-      }
       navigateWithAgentChatViewTransition(navigate, path);
     }
 
@@ -176,6 +210,7 @@ function OpenLinkInterceptor() {
 
 function ThemeToggleItem() {
   const { resolvedTheme, setTheme } = useTheme();
+  const t = useT();
   const isDark = resolvedTheme === "dark";
   return (
     <CommandMenu.Item
@@ -183,32 +218,111 @@ function ThemeToggleItem() {
       keywords={["theme", "dark", "light", "mode"]}
     >
       {isDark ? <IconSun size={16} /> : <IconMoon size={16} />}
-      Toggle theme
+      {t("root.toggleTheme")}
     </CommandMenu.Item>
+  );
+}
+
+function FormsCommandMenu({
+  open,
+  onOpenChange,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const t = useT();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const formId = location.pathname.match(/^\/forms\/([^/]+)/)?.[1];
+  const isResponsesRoute = location.pathname.endsWith("/responses");
+  return (
+    <CommandMenu
+      open={open}
+      onOpenChange={onOpenChange}
+      changelog={changelog}
+      changelogKey="forms"
+      chatStorageKey="forms"
+    >
+      <CommandMenu.Group heading={t("root.commandForms")}>
+        {formId && !isResponsesRoute ? (
+          <CommandMenu.Item
+            onSelect={() => navigate(`/forms/${formId}/responses`)}
+          >
+            {t("header.responses")}
+          </CommandMenu.Item>
+        ) : null}
+        {formId && isResponsesRoute ? (
+          <CommandMenu.Item onSelect={() => navigate(`/forms/${formId}`)}>
+            {t("header.form")}
+          </CommandMenu.Item>
+        ) : null}
+        {isFormsAskPath(location.pathname) ? (
+          <CommandMenu.Item onSelect={() => navigate("/forms")}>
+            {t("navigation.allForms")}
+          </CommandMenu.Item>
+        ) : null}
+        {!isFormsAskPath(location.pathname) && !formId ? (
+          <CommandMenu.Item onSelect={() => navigate("/ask")}>
+            {t("navigation.askForms")}
+          </CommandMenu.Item>
+        ) : null}
+        <CommandMenu.Item onSelect={() => navigate("/settings/agent")}>
+          <IconHierarchy2 size={16} />
+          {t("root.openAgent")}
+        </CommandMenu.Item>
+      </CommandMenu.Group>
+      <CommandMenu.Group heading={t("root.appearance")}>
+        <ThemeToggleItem />
+      </CommandMenu.Group>
+    </CommandMenu>
+  );
+}
+
+function PrivateAppContent() {
+  const [cmdkOpen, setCmdkOpen] = useState(false);
+  useCommandMenuShortcut(useCallback(() => setCmdkOpen(true), []));
+  return (
+    <>
+      <DbSyncSetup />
+      <NavigationStateSync />
+      <UrlStateSync />
+      <OpenLinkInterceptor />
+      <FormsCommandMenu open={cmdkOpen} onOpenChange={setCmdkOpen} />
+      <Outlet />
+    </>
   );
 }
 
 export default function Root() {
   const [queryClient] = useState(() => createAgentNativeQueryClient());
-  const [cmdkOpen, setCmdkOpen] = useState(false);
-  useCommandMenuShortcut(useCallback(() => setCmdkOpen(true), []));
+  const location = useLocation();
+  const isPublicPath =
+    location.pathname === "/f" || location.pathname.startsWith("/f/");
+  if (isPublicPath) {
+    return (
+      <AppToolkitProvider>
+        <AppProviders
+          queryClient={queryClient}
+          isPublicPath={isPublicPath}
+          i18n={{ catalog: i18nCatalog }}
+        >
+          <Outlet />
+        </AppProviders>
+      </AppToolkitProvider>
+    );
+  }
+
   return (
-    <AppProviders queryClient={queryClient}>
-      <DbSyncSetup />
-      <NavigationStateSync />
-      <UrlStateSync />
-      <OpenLinkInterceptor />
-      <CommandMenu open={cmdkOpen} onOpenChange={setCmdkOpen}>
-        <CommandMenu.Group heading="Forms">
-          <CommandMenu.Item onSelect={() => {}}>Search forms</CommandMenu.Item>
-        </CommandMenu.Group>
-        <CommandMenu.Group heading="Appearance">
-          <ThemeToggleItem />
-        </CommandMenu.Group>
-      </CommandMenu>
-      <Outlet />
-    </AppProviders>
+    <AppToolkitProvider>
+      <AppProviders
+        queryClient={queryClient}
+        skeletonLayout="assistant"
+        i18n={{ catalog: i18nCatalog }}
+      >
+        <PrivateAppContent />
+      </AppProviders>
+    </AppToolkitProvider>
   );
 }
 
-export { ErrorBoundary } from "@agent-native/core/client";
+export { ErrorBoundary } from "@agent-native/toolkit/app/shared";

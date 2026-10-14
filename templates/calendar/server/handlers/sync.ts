@@ -1,6 +1,7 @@
-import { defineEventHandler, setResponseStatus, type H3Event } from "h3";
-import * as googleCalendar from "../lib/google-calendar.js";
 import { getSession, readBody } from "@agent-native/core/server";
+import { defineEventHandler, setResponseStatus, type H3Event } from "h3";
+
+import * as googleCalendar from "../lib/google-calendar.js";
 
 export const syncGoogleCalendar = defineEventHandler(async (event: H3Event) => {
   try {
@@ -25,8 +26,6 @@ export const syncGoogleCalendar = defineEventHandler(async (event: H3Event) => {
     const from = (body?.from as string) || defaultFrom.toISOString();
     const to = (body?.to as string) || defaultTo.toISOString();
 
-    // Events are now read directly from Google Calendar API — no local sync needed.
-    // This endpoint just verifies the connection and returns a count.
     const { events: googleEvents, errors } = await googleCalendar.listEvents(
       from,
       to,

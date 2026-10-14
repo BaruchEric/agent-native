@@ -1,15 +1,5 @@
 import { useEffect, useSyncExternalStore, type ReactNode } from "react";
 
-/**
- * External store for the page's header title + actions used by the
- * "standard layout" (settings, team, tools, draft-queue). The inbox
- * view has its own bespoke header and ignores this store.
- *
- * We use an external store (not React context) so that pages can mount
- * ReactNode without subscribing — subscribing would re-render and create
- * new JSX every render, which would update the store again, infinite-looping.
- */
-
 type Listener = () => void;
 
 let currentTitle: ReactNode = null;
@@ -51,16 +41,20 @@ export function useSetPageTitle(node: ReactNode) {
       currentTitle = null;
       notify();
     };
-  });
+  }, [node]);
 }
 
 export function useSetHeaderActions(node: ReactNode) {
   useEffect(() => {
-    currentActions = node;
-    notify();
-    return () => {
-      currentActions = null;
+    if (currentActions !== node) {
+      currentActions = node;
       notify();
+    }
+    return () => {
+      if (currentActions === node) {
+        currentActions = null;
+        notify();
+      }
     };
-  });
+  }, [node]);
 }

@@ -1,18 +1,6 @@
-import { useEffect, useState } from "react";
-import { useSession } from "@agent-native/core/client";
+import { useSession } from "@agent-native/core/client/hooks";
 import { useOrg } from "@agent-native/core/client/org";
-
-/**
- * Per-user view counts for sidebar items, stored in localStorage. Used to
- * sort dashboards and analyses by how often the signed-in user actually
- * opens them. Kept local (not synced cross-device) so the sidebar stays
- * snappy and doesn't need a server round-trip on every navigation.
- *
- * Storage is namespaced by `${email}:${orgId}` so signed-in users sharing
- * the same browser (or the same user switching between orgs) don't see each
- * other's counts. Writes before the session has loaded land under
- * `anonymous:none` and are migrated on sign-in.
- */
+import { useEffect, useState } from "react";
 
 const KEY_PREFIX = "item-popularity:v1:";
 const CHANGE_EVENT = "item-popularity-change";
@@ -20,6 +8,10 @@ const ANONYMOUS_SCOPE = "anonymous:none";
 
 export type ItemType = "dashboard" | "analysis" | "extension";
 export type Popularity = Record<string, number>;
+export type PopularityState = {
+  data: Popularity;
+  isReady: boolean;
+};
 
 let currentScope = ANONYMOUS_SCOPE;
 
@@ -27,12 +19,6 @@ function scopeKey(scope: string): string {
   return `${KEY_PREFIX}${scope}`;
 }
 
-/**
- * Update the module-level scope used by imperative read/write helpers.
- * Called from `usePopularity` as soon as the session + active org resolve.
- * The first real scope absorbs any anonymous writes that happened before
- * sign-in so the user doesn't lose counts accumulated during page load.
- */
 function setScope(next: string): void {
   if (next === currentScope) return;
   const previous = currentScope;
@@ -94,18 +80,20 @@ export function incrementItemView(type: ItemType, id: string): void {
   write(p);
 }
 
-export function usePopularity(): Popularity {
-  const { session } = useSession();
-  const { data: org } = useOrg();
+export function usePopularity(): PopularityState {
+  const { session, isLoading: sessionLoading } = useSession();
+  const { data: org, isLoading: orgLoading } = useOrg();
   const email = session?.email?.trim() || "anonymous";
   const orgId = org?.orgId ?? "none";
   const nextScope = `${email}:${orgId}`;
 
   const [snapshot, setSnapshot] = useState<Popularity>(() => read());
+  const [readyScope, setReadyScope] = useState<string | null>(null);
 
   useEffect(() => {
     setScope(nextScope);
     setSnapshot(read());
+    setReadyScope(nextScope);
   }, [nextScope]);
 
   useEffect(() => {
@@ -117,7 +105,10 @@ export function usePopularity(): Popularity {
       window.removeEventListener("storage", refresh);
     };
   }, []);
-  return snapshot;
+  return {
+    data: snapshot,
+    isReady: !sessionLoading && !orgLoading && readyScope === nextScope,
+  };
 }
 
 export function popularityOf(

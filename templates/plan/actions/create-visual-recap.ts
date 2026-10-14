@@ -1,33 +1,31 @@
 import { defineAction, embedApp } from "@agent-native/core";
 import {
-  getRequestContext,
   getRequestOrgId,
   getRequestUserEmail,
-  runWithRequestContext,
 } from "@agent-native/core/server/request-context";
 import {
   accessFilter,
   assertAccess,
   currentAccess,
-  ForbiddenError,
 } from "@agent-native/core/sharing";
 import setResourceVisibilityAction from "@agent-native/core/sharing/actions/set-resource-visibility";
-import { resolveOrgIdForEmail } from "@agent-native/core/org";
 import { and, desc, eq, isNull } from "drizzle-orm";
 import { z } from "zod";
-import importVisualPlanSourceAction from "./import-visual-plan-source.js";
-import { planMdxFileSchema } from "../server/plan-mdx.js";
-import {
-  planDeepLink,
-  planSourceSchema,
-  planStatusSchema,
-} from "../server/plans.js";
+
 import { getDb, schema } from "../server/db/index.js";
 import {
   requirePlanOwnerEmailForWrite,
   resolvePlanAccessContext,
   resolvePlanOrgIdForWrite,
 } from "../server/lib/local-identity.js";
+import { runWithPlanOrgContext } from "../server/lib/plan-org-context.js";
+import { planMdxFileSchema } from "../server/plan-mdx.js";
+import {
+  planDeepLink,
+  planSourceSchema,
+  planStatusSchema,
+} from "../server/plans.js";
+import importVisualPlanSourceAction from "./import-visual-plan-source.js";
 
 const sourceUrlSchema = z
   .string()
@@ -43,12 +41,24 @@ const sourceTypeSchema = z
 
 const sourcePrStateSchema = z.enum(["open", "closed", "merged", "unknown"]);
 
+const sourceAuthorEmailSchema = z
+  .string()
+  .trim()
+  .email()
+  .transform((email) => email.toLowerCase())
+  .optional();
+
+const sourceAuthorTextSchema = z.string().trim().min(1).optional();
+
 type RecapSourceMetadata = {
   sourceType?: string;
   sourceRepo?: string;
   sourcePrNumber?: number;
   sourcePrState?: "open" | "closed" | "merged" | "unknown";
   sourcePrMergedAt?: string;
+  sourceAuthorEmail?: string;
+  sourceAuthorName?: string;
+  sourceAuthorLogin?: string;
 };
 
 type RecapVisibility = "private" | "org" | "public";
@@ -81,17 +91,26 @@ function normalizeRecapSourceMetadata(args: {
   sourcePrNumber?: number;
   sourcePrState?: "open" | "closed" | "merged" | "unknown";
   sourcePrMergedAt?: string;
+  sourceAuthorEmail?: string;
+  sourceAuthorName?: string;
+  sourceAuthorLogin?: string;
 }): RecapSourceMetadata {
   const inferred = inferGithubPullRequestSource(args.sourceUrl);
   const sourcePrMergedAt = args.sourcePrMergedAt?.trim();
   const sourcePrState =
     args.sourcePrState ?? (sourcePrMergedAt ? "merged" : undefined);
+  const sourceAuthorEmail = args.sourceAuthorEmail?.trim().toLowerCase();
+  const sourceAuthorName = args.sourceAuthorName?.trim();
+  const sourceAuthorLogin = args.sourceAuthorLogin?.trim();
   return {
     sourceType: args.sourceType ?? inferred.sourceType,
     sourceRepo: args.sourceRepo ?? inferred.sourceRepo,
     sourcePrNumber: args.sourcePrNumber ?? inferred.sourcePrNumber,
     sourcePrState,
     sourcePrMergedAt: sourcePrMergedAt || undefined,
+    sourceAuthorEmail: sourceAuthorEmail || undefined,
+    sourceAuthorName: sourceAuthorName || undefined,
+    sourceAuthorLogin: sourceAuthorLogin || undefined,
   };
 }
 
@@ -134,50 +153,9 @@ async function findExistingRecapForIdempotencyKey(
   return row?.id;
 }
 
-async function resolveRecapOrgIdForVisibility(
-  visibility: RecapVisibility,
-): Promise<string | undefined> {
-  if (visibility !== "org") return undefined;
-
-  const requesterEmail = getRequestUserEmail();
-  const requestOrgId = resolvePlanOrgIdForWrite(
-    requesterEmail,
-    getRequestOrgId(),
-  );
-  if (requestOrgId) return requestOrgId;
-
-  const ownerEmail = requirePlanOwnerEmailForWrite(
-    requesterEmail,
-    "Creating a visual recap",
-  );
-  const ownerOrgId = await resolveOrgIdForEmail(ownerEmail);
-  if (ownerOrgId) return ownerOrgId;
-
-  throw new ForbiddenError(
-    "Creating an org-visible visual recap requires an active organization. Connect Plan from an organization or publish with private visibility.",
-  );
-}
-
-async function runWithRecapOrgContext<T>(
-  visibility: RecapVisibility,
-  fn: () => Promise<T>,
-): Promise<T> {
-  const orgId = await resolveRecapOrgIdForVisibility(visibility);
-  if (!orgId || orgId === getRequestOrgId()) return fn();
-  const requestContext = getRequestContext() ?? {};
-  return runWithRequestContext(
-    {
-      ...requestContext,
-      userEmail: requestContext.userEmail ?? getRequestUserEmail(),
-      orgId,
-    },
-    fn,
-  ) as Promise<T>;
-}
-
 export default defineAction({
   description:
-    "Create a visual code-review recap from an existing PR, commit, branch, or git diff. For a forward plan before implementation use create-visual-plan; for a UI-first plan use create-ui-plan; for a running prototype use create-prototype-plan. Derive all content from the real diff — never invent schema, API, file, or contract facts. Publish via this tool; never deliver the recap as inline chat text.",
+    "Create a visual code-review recap from an existing PR, commit, branch, or git diff. Also the way to regenerate or rewrite an existing recap: pass planId to replace a recap you own in place. For a forward plan before implementation use create-visual-plan; for a UI-first plan use create-ui-plan; for a running prototype use create-prototype-plan. Derive all content from the real diff — never invent schema, API, file, or contract facts. Publish via this tool; never deliver the recap as inline chat text.",
   schema: z.object({
     planId: z
       .string()
@@ -228,6 +206,15 @@ export default defineAction({
       .min(1)
       .optional()
       .describe("ISO timestamp for when the source pull request was merged."),
+    sourceAuthorEmail: sourceAuthorEmailSchema.describe(
+      "Email address for the human author of the source PR, used as the default human comment target for recap feedback.",
+    ),
+    sourceAuthorName: sourceAuthorTextSchema.describe(
+      "Display name for the human author of the source PR.",
+    ),
+    sourceAuthorLogin: sourceAuthorTextSchema.describe(
+      "GitHub login for the human author of the source PR.",
+    ),
     idempotencyKey: z
       .string()
       .trim()
@@ -244,7 +231,7 @@ export default defineAction({
       .describe("Current focus for the review surface."),
     status: planStatusSchema.optional().default("review"),
     mdx: planMdxFileSchema.describe(
-      "Recap source files. Call the get-plan-blocks tool FIRST for the authoritative block catalog, authoring rules, and style tokens — do not author from memory. Key rules: derive all blocks from the real diff only; use diff blocks with line-anchored annotations on key hunks; for UI changes include realistic, non-empty WireframeBlock before/after in a Columns block (labels: Before / After) with visible product text/controls; use .diagram-* primitives and --wf-* tokens in diagrams (no hex/rgb/hsl, no custom fonts); keep API endpoint blocks in single-column flow unless it is an explicit before/after contract comparison.",
+      "Recap source files. Call the get-plan-blocks tool FIRST for the authoritative block catalog, visual frame guidance, authoring rules, and style tokens — do not author from memory. Key rules: derive all blocks from the real diff only; use diff blocks with line-anchored annotations on key hunks; for UI changes include realistic, non-empty WireframeBlock before/after in a Columns block (labels: Before / After) with visible product text/controls; if canvas.mdx is present, DesignBoard artboards must use Screen html/data.html wireframes, never fresh nested kit-tree children such as FrameScreen/Card/Row/Btn; use .diagram-* primitives and --wf-* tokens in diagrams (no hex/rgb/hsl, no custom fonts); keep API endpoint blocks in single-column flow unless it is an explicit before/after contract comparison.",
     ),
   }),
   publicAgent: {
@@ -264,86 +251,99 @@ export default defineAction({
         "Open the Agent-Native Plan review surface for a visual code-review recap.",
       iframeTitle: "Agent-Native Plan",
       openLabel: "Open Recap",
-      height: 860,
+      height: 900,
     }),
   },
   run: async (args) => {
     const visibility = args.visibility ?? "org";
-    return runWithRecapOrgContext(visibility, async () => {
-      const { idempotencyKey, ...importArgs } = args;
-      const sourceMetadata = normalizeRecapSourceMetadata(args);
-      const existingPlanId = args.planId
-        ? undefined
-        : await findExistingRecapForIdempotencyKey(idempotencyKey);
-      const importRecap = (planId: string | undefined) =>
-        importVisualPlanSourceAction.run({
-          ...importArgs,
-          planId,
-          kind: "recap",
-          ...(idempotencyKey ? { recapIdempotencyKey: idempotencyKey } : {}),
-          source: args.source ?? "imported",
-          currentFocus: args.currentFocus ?? "visual recap review",
-          status: args.status ?? "review",
-        });
-      let result;
-      try {
-        result = await importRecap(args.planId ?? existingPlanId);
-      } catch (error) {
-        if (args.planId || existingPlanId || !idempotencyKey) throw error;
-        const replayPlanId =
-          await findExistingRecapForIdempotencyKey(idempotencyKey);
-        if (!replayPlanId) throw error;
-        result = await importRecap(replayPlanId);
-      }
-      // Apply requested visibility server-side so the recap is never left private
-      // (the import action always creates with visibility='private'). Route this
-      // through the shared visibility action instead of updating the row directly:
-      // when visibility is "org", that action also binds the current org onto
-      // older/unscoped plans so org-scoped recap links are actually readable.
-      const planId = (result as { planId?: string } | null)?.planId;
-      if (planId) {
-        await assertAccess(
-          "plan",
-          planId,
-          "editor",
-          resolvePlanAccessContext(currentAccess()),
-        );
-        const planPatch = {
-          ...(args.sourceUrl !== undefined
-            ? { sourceUrl: args.sourceUrl ?? null }
-            : {}),
-          ...(sourceMetadata.sourceType !== undefined
-            ? { sourceType: sourceMetadata.sourceType }
-            : {}),
-          ...(sourceMetadata.sourceRepo !== undefined
-            ? { sourceRepo: sourceMetadata.sourceRepo }
-            : {}),
-          ...(sourceMetadata.sourcePrNumber !== undefined
-            ? { sourcePrNumber: sourceMetadata.sourcePrNumber }
-            : {}),
-          ...(sourceMetadata.sourcePrState !== undefined
-            ? { sourcePrState: sourceMetadata.sourcePrState }
-            : {}),
-          ...(sourceMetadata.sourcePrMergedAt !== undefined
-            ? { sourcePrMergedAt: sourceMetadata.sourcePrMergedAt }
-            : {}),
-          ...(idempotencyKey ? { recapIdempotencyKey: idempotencyKey } : {}),
-        };
-        if (Object.keys(planPatch).length > 0) {
-          const db = getDb();
-          await db
-            .update(schema.plans)
-            .set(planPatch)
-            .where(eq(schema.plans.id, planId));
+    return runWithPlanOrgContext(
+      visibility,
+      "Creating a visual recap",
+      async () => {
+        const { idempotencyKey, ...importArgs } = args;
+        const sourceMetadata = normalizeRecapSourceMetadata(args);
+        const existingPlanId = args.planId
+          ? undefined
+          : await findExistingRecapForIdempotencyKey(idempotencyKey);
+        const importRecap = (planId: string | undefined) =>
+          importVisualPlanSourceAction.run({
+            ...importArgs,
+            planId,
+            kind: "recap",
+            ...(idempotencyKey ? { recapIdempotencyKey: idempotencyKey } : {}),
+            source: args.source ?? "imported",
+            currentFocus: args.currentFocus ?? "visual recap review",
+            status: args.status ?? "review",
+          });
+        let result;
+        try {
+          result = await importRecap(args.planId ?? existingPlanId);
+        } catch (error) {
+          if (args.planId || existingPlanId || !idempotencyKey) throw error;
+          const replayPlanId =
+            await findExistingRecapForIdempotencyKey(idempotencyKey);
+          if (!replayPlanId) throw error;
+          result = await importRecap(replayPlanId);
         }
-        await setResourceVisibilityAction.run({
-          resourceType: "plan",
-          resourceId: planId,
-          visibility,
-        });
-      }
-      return result;
-    });
+        // Apply requested visibility server-side so the recap is never left private
+        // (the import action always creates with visibility='private'). Route this
+        // through the shared visibility action instead of updating the row directly:
+        // when visibility is "org", that action also binds the current org onto
+        // older/unscoped plans so org-scoped recap links are actually readable.
+        const planId = (result as { planId?: string } | null)?.planId;
+        if (planId) {
+          await assertAccess(
+            "plan",
+            planId,
+            "editor",
+            resolvePlanAccessContext(currentAccess()),
+          );
+          const planPatch = {
+            ...(args.sourceUrl !== undefined
+              ? { sourceUrl: args.sourceUrl ?? null }
+              : {}),
+            ...(sourceMetadata.sourceType !== undefined
+              ? { sourceType: sourceMetadata.sourceType }
+              : {}),
+            ...(sourceMetadata.sourceRepo !== undefined
+              ? { sourceRepo: sourceMetadata.sourceRepo }
+              : {}),
+            ...(sourceMetadata.sourcePrNumber !== undefined
+              ? { sourcePrNumber: sourceMetadata.sourcePrNumber }
+              : {}),
+            ...(sourceMetadata.sourcePrState !== undefined
+              ? { sourcePrState: sourceMetadata.sourcePrState }
+              : {}),
+            ...(sourceMetadata.sourcePrMergedAt !== undefined
+              ? { sourcePrMergedAt: sourceMetadata.sourcePrMergedAt }
+              : {}),
+            ...(sourceMetadata.sourceAuthorEmail !== undefined
+              ? { sourceAuthorEmail: sourceMetadata.sourceAuthorEmail }
+              : {}),
+            ...(sourceMetadata.sourceAuthorName !== undefined
+              ? { sourceAuthorName: sourceMetadata.sourceAuthorName }
+              : {}),
+            ...(sourceMetadata.sourceAuthorLogin !== undefined
+              ? { sourceAuthorLogin: sourceMetadata.sourceAuthorLogin }
+              : {}),
+            ...(idempotencyKey ? { recapIdempotencyKey: idempotencyKey } : {}),
+          };
+          if (Object.keys(planPatch).length > 0) {
+            const db = getDb();
+            await db
+              .update(schema.plans)
+              .set(planPatch)
+              .where(eq(schema.plans.id, planId));
+          }
+          await setResourceVisibilityAction.run({
+            resourceType: "plan",
+            resourceId: planId,
+            visibility,
+          });
+        }
+        return result;
+      },
+    );
   },
   link: ({ result }) => {
     const plan = (result as { plan?: { id?: string } } | null)?.plan;

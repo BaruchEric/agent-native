@@ -1,10 +1,7 @@
 ---
 name: analysis-workspace
 description: >-
-  How to use Resources-backed workspace files for large-scale multi-source
-  analyses: scratch/ temporary staging, chunked batch processing with per-item
-  memos, run-code aggregation, saveToFile for big API pulls, and synthesizing
-  across files that exceed one context window.
+  Large analyses and file delivery: scratch staging, chunked batches, run-code aggregation, CSV/XLSX exports. Use when work exceeds one context window or the user wants a file.
 ---
 
 # Analysis Workspace
@@ -39,24 +36,71 @@ window, then read them back selectively for synthesis.
   durable files outside `scratch/` only when the user wants to keep them.
 - **run-code aggregation**: call `workspaceRead` / `workspaceWrite` inside a
   `run-code` block to load and process data that's too large to print as output.
+- **Long compute**: for aggregation scripts that could exceed ~30 s (big
+  cross-source joins, multi-page provider sweeps), run `run-code` with
+  `background: true`. It returns `{ executionId, status: "queued" }`
+  immediately and executes durably out-of-band (default 10 min budget),
+  surviving the hosted run timeout. Continue other work, then poll with
+  `run-code` `{ executionId }` for the persisted result. On `failed`/
+  `timed_out`, chunk the work or persist intermediate progress with
+  `workspaceWrite` and re-run.
+
+## Delegated Analysis Handoff
+
+Background sub-agents start with a clean context. A handoff for a large
+analysis must include the exact staged dataset id or workspace path, the
+records/chunk range to process, the output path, and the checkpoint or resume
+operation. The child must read that staged input before making provider calls.
+
+- If a readable staged file or dataset already exists, process it in place. Do
+  not re-page the provider endpoint to recreate the same corpus.
+- If the named staged input is missing or unreadable, stop with an explicit
+  missing-input error. Do not silently fall back to a full provider sweep.
+- For 500 or more Gong records, do not use `gong-calls(exhaustive=true)`, a
+  per-call transcript loop, or a single `provider-api-request` `fetchAllPages`
+  call as the analysis itself. If the term is a configured keyword tracker,
+  stage `/calls/extensive` tracker results and reduce them with a Data Program
+  or `query-staged-dataset`. Otherwise use `provider-corpus-job` with a staged
+  call-id input and continue raw transcript retrieval in bounded, checkpointed
+  batches.
+- Write a compact result or progress marker after every completed chunk. A
+  final answer written only after the whole corpus is processed is not a
+  checkpoint.
 
 ## Workspace File Helpers
 
 Inside `run-code`, use the workspace helper functions:
 
-| Helper | Use |
-|--------|-----|
-| `workspaceWrite(path, content, contentType?)` | Create or overwrite a file |
-| `workspaceAppend(path, content)` | Append text to a file |
-| `workspaceRead(path, opts?)` | Read content, with optional paging |
-| `workspaceReadMeta(path, opts?)` | Read content plus metadata/truncation info |
-| `workspaceList(prefix?)` | List files under a prefix |
+| Helper                                        | Use                                        |
+| --------------------------------------------- | ------------------------------------------ |
+| `workspaceWrite(path, content, contentType?)` | Create or overwrite a file                 |
+| `workspaceAppend(path, content)`              | Append text to a file                      |
+| `workspaceRead(path, opts?)`                  | Read content, with optional paging         |
+| `workspaceReadMeta(path, opts?)`              | Read content plus metadata/truncation info |
+| `workspaceList(prefix?)`                      | List files under a prefix                  |
 
 - `read` supports `{ offset, maxChars }` for paging large files.
 - `list` supports a prefix filter, e.g. `workspaceList("scratch/q2/")`.
 - Direct writes cap at 2 MB each. `saveToFile` allows up to 20 MB per pull.
 - Temporary files belong under `scratch/`; durable user-facing files belong in
   normal Resources folders.
+- When the user asked for a file they can keep or download, call
+  `show-workspace-file` with the durable path immediately after the write. The
+  download must appear in chat; do not answer with only a path or navigation
+  instructions.
+
+## CSV and XLSX Exports
+
+- For a compact result, use `query-agent-native-analytics` and its Download
+  CSV control. For a durable CSV, use `run-code` with `workspaceWrite` in a
+  normal Resources folder, then call `show-workspace-file` with that path. If
+  `run-code` is not available, discover it once with tool search.
+- Deliver a requested CSV, Markdown, or other file in the same chat turn. Write
+  only verified successful data to a non-scratch workspace path, never an error
+  or failed response, and never finish with only a path or filename.
+- For an explicit `.xlsx` request, call `docs-search` once for `xlsx export`
+  and follow the returned workflow. The QuickJS `run-code` sandbox has no Node
+  imports; do not try to load `xlsx` or `exceljs` there.
 
 ## Chunked Batch Analysis (30+ items)
 
@@ -70,7 +114,7 @@ For large fan-outs (account deep dives, Gong call reviews, deal cohorts):
    await workspaceWrite(
      "scratch/analysis/q2-churn/acme-corp.md",
      "## Acme Corp\n\n**ARR**: $120k\n**Risk signals**: ...",
-     "text/markdown"
+     "text/markdown",
    );
    ```
 4. **Synthesize**: after all items are processed, list files and read each memo:
@@ -93,11 +137,15 @@ narrow, where records must be joined across systems, or where absence matters:
 
 1. Discover the provider surface with `provider-api-catalog` and
    `provider-api-docs` when endpoint/filter/pagination details are uncertain.
-2. Pull the relevant records with `provider-api-request`. Use `fetchAllPages`
-   for cursor pagination, `stageAs` for queryable staged datasets, and
-   `saveToFile` for large raw responses.
-3. Use `run-code` to call `providerFetch` or `appAction` in loops, write
-   intermediate files, normalize records, join identity fields, and aggregate.
+2. For a broad or absence-sensitive corpus, start with the provider's native
+   search or indexed tracker surface when one exists. Otherwise use
+   `provider-api-request` as the raw ingestion step with `stageAs` or
+   `saveToFile`, then reduce the staged data with `query-staged-dataset` or a
+   Data Program. Use `provider-corpus-job` for durable paginated or batched
+   transcript/body scans so each page or batch is checkpointed durably.
+3. Use `run-code` to read staged data, write intermediate files, normalize
+   records, join identity fields, and aggregate. For long code, use
+   `background: true` and persist progress after each chunk.
 4. Validate coverage before synthesis. Track pages fetched, records inspected,
    truncation flags, aborted calls, and records skipped for missing joins.
 5. Finalize with the answer plus coverage and caveats. If coverage is partial,
@@ -123,8 +171,11 @@ provider-api-request
 Returns: `{ savedToFile: true, savedTo, status, bytes, contentType, preview }`.
 
 Then use `run-code` to process the saved file:
+
 ```javascript
-const raw = await workspaceRead("scratch/analysis/provider-records-2026-q2.json");
+const raw = await workspaceRead(
+  "scratch/analysis/provider-records-2026-q2.json",
+);
 const records = JSON.parse(raw);
 // … aggregate, filter, join …
 ```
@@ -149,6 +200,7 @@ provider-api-request
 ```
 
 Common cursor paths:
+
 - HubSpot: `paging.next.after` / `after`
 - Gong: `records.cursor` / `cursor`
 - Pylon: `nextCursor` / `cursor`
@@ -175,7 +227,7 @@ for (const deal of deals) {
 await workspaceWrite(
   "scratch/analysis/deals-by-stage.json",
   JSON.stringify(byStage, null, 2),
-  "application/json"
+  "application/json",
 );
 console.log(JSON.stringify(byStage, null, 2));
 ```
@@ -215,6 +267,10 @@ agent's credential system handles auth automatically.
 
 ## Learnings Flywheel
 
-After any significant batch analysis, record discoveries to `LEARNINGS.md`
-via the `resources` tool (`action: "write"`). Capture confirmed schema paths,
-cursor fields, identity join keys, and pagination patterns.
+After any significant batch analysis, check whether each discovery applies to
+the user's setup or to the whole organization. Keep setup-specific discoveries
+in personal memory or the current analysis. Ask the user and get approval
+before writing anything to shared `LEARNINGS.md` or organization memory. For
+approved shared discoveries, use the `resources` tool (`action: "write"`) and
+capture confirmed schema paths, cursor fields, identity join keys, and
+pagination patterns.

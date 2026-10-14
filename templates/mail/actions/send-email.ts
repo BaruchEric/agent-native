@@ -1,24 +1,20 @@
-import { defineAction } from "@agent-native/core";
-import { getAccessTokens } from "./helpers.js";
-import { z } from "zod";
-import { nanoid } from "nanoid";
-import { gmailGetMessage, gmailSendMessage } from "../server/lib/google-api.js";
-import {
-  getAccountDisplayName,
-  invalidateListCacheForOwner,
-  setAccountDisplayName,
-} from "../server/lib/google-auth.js";
+import { defineAction } from "@agent-native/core/action";
+import type { ActionRunContext } from "@agent-native/core/action";
+import { ACTION_CHAT_UI_RECORD_CHANGE_RENDERER } from "@agent-native/core/action-ui";
+import { writeAppState } from "@agent-native/core/application-state";
+import { emit } from "@agent-native/core/event-bus";
 import { setOAuthDisplayName } from "@agent-native/core/oauth-tokens";
 import {
-  bodyToHtml,
-  buildRawEmail,
-  resolveComposeAttachments,
-  splitReplyQuote,
-} from "../server/lib/outgoing-email.js";
-import { resolveGoogleSenderIdentity } from "../server/lib/sender-identity.js";
-import { getRequestUserEmail } from "@agent-native/core/server";
-import { getUserSetting, putUserSetting } from "@agent-native/core/settings";
-import { emit } from "@agent-native/core/event-bus";
+  buildDeepLink,
+  getAppProductionUrl,
+  getRequestUserEmail,
+} from "@agent-native/core/server";
+import { getUserSetting } from "@agent-native/core/settings";
+import { track } from "@agent-native/core/tracking";
+import { nanoid } from "nanoid";
+import { z } from "zod";
+
+import { requiresEmailSendApproval } from "../server/lib/automation-settings.js";
 import {
   collectLinks,
   newClickToken,
@@ -26,9 +22,27 @@ import {
   persistTracking,
   type TrackingContext,
 } from "../server/lib/email-tracking.js";
-import { getAppProductionUrl } from "@agent-native/core/server";
-import type { UserSettings } from "../shared/types.js";
+import { gmailGetMessage, gmailSendMessage } from "../server/lib/google-api.js";
+import {
+  getAccountDisplayName,
+  invalidateListCacheForOwner,
+  setAccountDisplayName,
+} from "../server/lib/google-auth.js";
+import {
+  readLocalEmails,
+  withLocalEmailMutationLock,
+  writeLocalEmails,
+} from "../server/lib/local-email-store.js";
+import {
+  bodyToHtml,
+  buildRawEmail,
+  resolveComposeAttachments,
+  splitReplyQuote,
+} from "../server/lib/outgoing-email.js";
+import { resolveGoogleSenderIdentity } from "../server/lib/sender-identity.js";
 import { markdownPreviewSnippet } from "../shared/markdown.js";
+import type { UserSettings } from "../shared/types.js";
+import { getAccessTokens } from "./helpers.js";
 
 async function readSettings(): Promise<{
   name: string;
@@ -76,6 +90,40 @@ function buildTrackingContext(
   };
 }
 
+async function signalMailRefresh(): Promise<void> {
+  await writeAppState("refresh-signal", { ts: Date.now() }).catch((error) => {
+    console.error("[send-email] refresh signal failed:", error);
+  });
+}
+
+function countRecipients(...values: Array<string | undefined>): number {
+  return values
+    .flatMap((value) => value?.split(",") ?? [])
+    .filter((value) => value.trim()).length;
+}
+
+function sentMessageId(result: unknown): string | undefined {
+  if (typeof result !== "string") return undefined;
+  const match = result.match(/^Email sent successfully \(id: ([^)]+)\)$/);
+  if (match?.[1]) return match[1];
+  try {
+    const localResult: unknown = JSON.parse(result);
+    if (
+      localResult &&
+      typeof localResult === "object" &&
+      !Array.isArray(localResult) &&
+      (localResult as Record<string, unknown>).isSent === true &&
+      typeof (localResult as Record<string, unknown>).id === "string"
+    ) {
+      return (localResult as Record<string, string>).id;
+    }
+  } catch {
+    // coercion-ok: plain Gmail result text has no local message id to project.
+    return undefined;
+  }
+  return undefined;
+}
+
 const attachmentSchema = z.object({
   filename: z
     .string()
@@ -96,7 +144,7 @@ const attachmentSchema = z.object({
 
 export default defineAction({
   description:
-    "Send an email via Gmail. IMPORTANT: Never call this unless the user explicitly asks to send — always draft first and show the content to the user for review before sending.",
+    "Send an email via Gmail. Interactive sends require approval. Automation-triggered sends require the owner to opt in through Mail settings; otherwise they remain approval-gated.",
   schema: z.object({
     to: z.string().describe("Recipient email(s), comma-separated"),
     subject: z.string().describe("Email subject"),
@@ -122,19 +170,45 @@ export default defineAction({
         "Files to attach. Each entry must reference a previously-uploaded file by its server-side `filename`. The upload must have been created via the media-upload endpoint before calling this action.",
       ),
   }),
-  // Human-in-the-loop gate: actually sending an email is outward-facing and
-  // hard to undo, so the agent can never send without a human approving the
-  // specific call. The loop pauses with `approval_required`; the user approves
-  // before the message goes out. Drafting/queueing is unaffected — only the
-  // real send is gated. This is the canonical (and intentionally rare) use of
-  // `needsApproval` in the framework.
-  needsApproval: true,
-  run: async (args) => {
+  chatUI: {
+    renderer: ACTION_CHAT_UI_RECORD_CHANGE_RENDERER,
+    when: (_args, result) => Boolean(sentMessageId(result)),
+    projectResult: (args, result) => {
+      const messageId = sentMessageId(result);
+      const subject =
+        typeof args.subject === "string" ? args.subject.trim() : "";
+      const to = typeof args.to === "string" ? args.to.trim() : "";
+      if (!messageId || (!subject && !to)) return null;
+      return {
+        change: {
+          verb: "sent",
+          kind: "email",
+          title: (subject || to).slice(0, 180),
+          ...(to ? { detail: to.slice(0, 500) } : {}),
+          url: buildDeepLink({
+            app: "mail",
+            view: "sent",
+            params: { messageId },
+          }),
+        },
+      };
+    },
+  },
+  needsApproval: (_args, ctx?: ActionRunContext) =>
+    requiresEmailSendApproval(ctx),
+  run: async (args, ctx) => {
     const ownerEmail = getRequestUserEmail();
     if (!ownerEmail) throw new Error("no authenticated user");
+    if (
+      ctx?.caller === "automation" &&
+      (await requiresEmailSendApproval(ctx))
+    ) {
+      throw new Error(
+        "Automation email sending is disabled. Enable it in Mail settings to send automatically.",
+      );
+    }
     const settings = await readSettings();
 
-    // Resolve attachments eagerly — fail before touching Gmail if any are missing.
     let resolvedAttachments: Awaited<
       ReturnType<typeof resolveComposeAttachments>
     > = [];
@@ -153,73 +227,86 @@ export default defineAction({
 
     const accounts = await getAccessTokens();
     if (accounts.length === 0) {
-      const data = await getUserSetting(ownerEmail, "local-emails");
-      const emails =
-        data && Array.isArray((data as any).emails) ? (data as any).emails : [];
-      const newEmail = {
-        id: `msg-${nanoid(8)}`,
-        threadId: args.replyToId
-          ? (emails.find((e: any) => e.id === args.replyToId)?.threadId ??
-            `thread-${nanoid(8)}`)
-          : `thread-${nanoid(8)}`,
-        from: { name: settings.name, email: settings.email },
-        to: args.to.split(",").map((value) => {
-          const trimmed = value.trim();
-          return { name: trimmed, email: trimmed };
-        }),
-        ...(args.cc
-          ? {
-              cc: args.cc.split(",").map((value) => {
-                const trimmed = value.trim();
-                return { name: trimmed, email: trimmed };
-              }),
-            }
-          : {}),
-        ...(args.bcc
-          ? {
-              bcc: args.bcc.split(",").map((value) => {
-                const trimmed = value.trim();
-                return { name: trimmed, email: trimmed };
-              }),
-            }
-          : {}),
-        subject: args.subject,
-        snippet: markdownPreviewSnippet(args.body),
-        body: args.body,
-        bodyHtml: bodyToHtml(args.body),
-        date: new Date().toISOString(),
-        isRead: true,
-        isStarred: false,
-        isSent: true,
-        isArchived: false,
-        isTrashed: false,
-        labelIds: ["sent"],
-        ...(resolvedAttachments.length > 0
-          ? {
-              attachments: resolvedAttachments.map((att) => ({
-                id: att.filename,
-                filename: att.originalName,
-                mimeType: att.mimeType,
-                size: att.size,
-                url: att.url,
-              })),
-            }
-          : {}),
-      };
-      emails.push(newEmail);
-      await putUserSetting(ownerEmail, "local-emails", { emails });
-      try {
-        emit(
-          "mail.message.sent",
+      return withLocalEmailMutationLock(ownerEmail, async () => {
+        const emails = await readLocalEmails(ownerEmail);
+        const newEmail = {
+          id: `msg-${nanoid(8)}`,
+          threadId: args.replyToId
+            ? (emails.find((e: any) => e.id === args.replyToId)?.threadId ??
+              `thread-${nanoid(8)}`)
+            : `thread-${nanoid(8)}`,
+          from: { name: settings.name, email: settings.email },
+          to: args.to.split(",").map((value) => {
+            const trimmed = value.trim();
+            return { name: trimmed, email: trimmed };
+          }),
+          ...(args.cc
+            ? {
+                cc: args.cc.split(",").map((value) => {
+                  const trimmed = value.trim();
+                  return { name: trimmed, email: trimmed };
+                }),
+              }
+            : {}),
+          ...(args.bcc
+            ? {
+                bcc: args.bcc.split(",").map((value) => {
+                  const trimmed = value.trim();
+                  return { name: trimmed, email: trimmed };
+                }),
+              }
+            : {}),
+          subject: args.subject,
+          snippet: markdownPreviewSnippet(args.body),
+          body: args.body,
+          bodyHtml: bodyToHtml(args.body),
+          date: new Date().toISOString(),
+          isRead: true,
+          isStarred: false,
+          isSent: true,
+          isArchived: false,
+          isTrashed: false,
+          labelIds: ["sent"],
+          ...(resolvedAttachments.length > 0
+            ? {
+                attachments: resolvedAttachments.map((att) => ({
+                  id: att.filename,
+                  filename: att.originalName,
+                  mimeType: att.mimeType,
+                  size: att.size,
+                  url: att.url,
+                })),
+              }
+            : {}),
+        };
+        emails.push(newEmail);
+        await writeLocalEmails(ownerEmail, emails);
+        try {
+          emit(
+            "mail.message.sent",
+            {
+              messageId: newEmail.id,
+              to: args.to,
+              subject: args.subject,
+            },
+            { owner: ownerEmail },
+          );
+        } catch {}
+        await signalMailRefresh();
+        track(
+          "email_sent",
           {
-            messageId: newEmail.id,
-            to: args.to,
-            subject: args.subject,
+            app_name: "mail",
+            template_name: "mail",
+            output_id: newEmail.id,
+            output_type: "email",
+            recipient_count: countRecipients(args.to, args.cc, args.bcc),
+            attachment_count: args.attachments?.length ?? 0,
           },
-          { owner: ownerEmail },
+          ctx,
         );
-      } catch {}
-      return JSON.stringify(newEmail, null, 2);
+        return JSON.stringify(newEmail, null, 2);
+      });
     }
 
     let selectedToken = accounts[0].accessToken;
@@ -302,7 +389,6 @@ export default defineAction({
           console.error("[send-email] persistTracking failed:", err),
         );
       }
-      // Emit mail.message.sent event (best-effort)
       try {
         emit(
           "mail.message.sent",
@@ -316,6 +402,19 @@ export default defineAction({
       } catch {
         // best-effort — never block the send response
       }
+      await signalMailRefresh();
+      track(
+        "email_sent",
+        {
+          app_name: "mail",
+          template_name: "mail",
+          output_id: sent.id,
+          output_type: "email",
+          recipient_count: countRecipients(args.to, args.cc, args.bcc),
+          attachment_count: args.attachments?.length ?? 0,
+        },
+        ctx,
+      );
 
       return `Email sent successfully (id: ${sent.id})`;
     } catch (err: any) {

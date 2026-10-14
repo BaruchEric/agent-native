@@ -8,21 +8,16 @@ vi.mock("h3", async (importOriginal) => {
   const actual = await importOriginal<typeof import("h3")>();
   return {
     ...actual,
-    // verifyWebhook reads the Telegram secret header through h3.getHeader.
     getHeader: vi.fn(() => hoisted.header),
   };
 });
 
-// telegram.ts reads the request body via the core readBody helper; the parser
-// uses the body cached on event.context.__rawBody when present, so tests set
-// that directly and never need the real h3 stream.
 vi.mock("../../server/h3-helpers.js", () => ({
   readBody: vi.fn(async (event: any) => event.context.__rawBody ?? {}),
 }));
 
 import { telegramAdapter } from "./telegram.js";
 
-/** Event whose pre-cached body is the given Telegram update object. */
 function eventWithBody(body: unknown): any {
   return { context: { __rawBody: body } };
 }
@@ -60,10 +55,11 @@ describe("telegramAdapter parseIncomingMessage", () => {
 
     expect(msg).toMatchObject({
       platform: "telegram",
-      externalThreadId: "555",
+      externalThreadId: "chat:555",
       text: "ship it",
       senderName: "Ada",
       senderId: "777",
+      replyRef: "42",
       timestamp: 1700000000 * 1000,
     });
     expect(msg?.platformContext).toMatchObject({
@@ -74,6 +70,21 @@ describe("telegramAdapter parseIncomingMessage", () => {
       fromId: 777,
       fromUsername: "ada_l",
     });
+  });
+
+  it("uses the Telegram topic as canonical thread identity", async () => {
+    const adapter = telegramAdapter();
+    const msg = await adapter.parseIncomingMessage(
+      eventWithBody(update({ message_thread_id: 99 })),
+    );
+
+    expect(msg).toMatchObject({
+      externalThreadId: "chat:555:thread:99",
+      threadRef: "99",
+      replyRef: "42",
+      platformContext: { messageThreadId: 99 },
+    });
+    expect(adapter.getLegacyExternalThreadIds?.(msg!)).toEqual(["555"]);
   });
 
   it("joins first and last name for senderName", async () => {
@@ -107,7 +118,6 @@ describe("telegramAdapter parseIncomingMessage", () => {
       eventWithBody(update({ text: "/start" })),
     );
     expect(msg?.text).toBe("Hello! I'm ready to chat.");
-    // rawText preserves the original command.
     expect(msg?.platformContext.rawText).toBe("/start");
   });
 
@@ -152,6 +162,49 @@ describe("telegramAdapter parseIncomingMessage", () => {
       eventWithBody(null),
     );
     expect(msg).toBeNull();
+  });
+});
+
+describe("telegramAdapter getStatus", () => {
+  it("requires both the bot token and webhook secret", async () => {
+    process.env.TELEGRAM_BOT_TOKEN = "123:abc";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({ ok: true, result: { username: "example_bot" } }),
+          ),
+      ),
+    );
+
+    const status = await telegramAdapter().getStatus();
+
+    expect(status.configured).toBe(false);
+    expect(status.details).toMatchObject({
+      hasToken: true,
+      hasWebhookSecret: false,
+      botUsername: "example_bot",
+    });
+    expect(status.error).toContain("TELEGRAM_WEBHOOK_SECRET");
+  });
+
+  it("reports configured only when the webhook secret is present", async () => {
+    process.env.TELEGRAM_BOT_TOKEN = "123:abc";
+    process.env.TELEGRAM_WEBHOOK_SECRET = "telegram-webhook-secret-example";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ ok: true }))),
+    );
+
+    const status = await telegramAdapter().getStatus();
+
+    expect(status.configured).toBe(true);
+    expect(status.details).toMatchObject({
+      hasToken: true,
+      hasWebhookSecret: true,
+    });
+    expect(status.error).toBeUndefined();
   });
 });
 
@@ -224,7 +277,7 @@ describe("telegramAdapter verifyWebhook (security)", () => {
 
   it("with a secret set, rejects a same-length mismatched header (timingSafeEqual returns false)", async () => {
     process.env.TELEGRAM_WEBHOOK_SECRET = "s3cr3t-token";
-    hoisted.header = "wrong--token"; // same 12-char length, different content
+    hoisted.header = "wrong--token";
 
     await expect(telegramAdapter().verifyWebhook({} as any)).resolves.toBe(
       false,
@@ -233,7 +286,7 @@ describe("telegramAdapter verifyWebhook (security)", () => {
 
   it("with a secret set, rejects a different-length header (timingSafeEqual throws, caught)", async () => {
     process.env.TELEGRAM_WEBHOOK_SECRET = "s3cr3t-token";
-    hoisted.header = "wrong-token"; // 11 chars vs 12 — length mismatch path
+    hoisted.header = "wrong-token";
 
     await expect(telegramAdapter().verifyWebhook({} as any)).resolves.toBe(
       false,
@@ -315,6 +368,40 @@ describe("telegramAdapter sendResponse", () => {
     });
   });
 
+  it("preserves topic and contextual reply references", async () => {
+    process.env.TELEGRAM_BOT_TOKEN = "example-token";
+    let body: any;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: RequestInit) => {
+        body = JSON.parse(String(init?.body));
+        return Promise.resolve(new Response(JSON.stringify({ ok: true })));
+      }),
+    );
+
+    await telegramAdapter().sendResponse(
+      { text: "reply", platformContext: {} },
+      {
+        platform: "telegram",
+        externalThreadId: "chat:555:thread:99",
+        text: "question",
+        threadRef: "99",
+        replyRef: "42",
+        timestamp: 1,
+        platformContext: { chatId: 555 },
+      },
+    );
+
+    expect(body).toMatchObject({
+      chat_id: 555,
+      message_thread_id: 99,
+      reply_parameters: {
+        message_id: 42,
+        allow_sending_without_reply: true,
+      },
+    });
+  });
+
   it("retries without Markdown when Telegram reports a parse error", async () => {
     process.env.TELEGRAM_BOT_TOKEN = "123:abc";
     const bodies: any[] = [];
@@ -324,7 +411,7 @@ describe("telegramAdapter sendResponse", () => {
       vi.fn((_url: string, init?: RequestInit) => {
         bodies.push(JSON.parse(String(init?.body)));
         call += 1;
-        const ok = call > 1; // first attempt fails with a parse error
+        const ok = call > 1;
         return Promise.resolve(
           new Response(
             JSON.stringify({
@@ -349,7 +436,6 @@ describe("telegramAdapter sendResponse", () => {
 
     expect(bodies).toHaveLength(2);
     expect(bodies[0].parse_mode).toBe("Markdown");
-    // retry strips parse_mode entirely
     expect(bodies[1].parse_mode).toBeUndefined();
     expect(bodies[1].text).toBe("*broken");
   });

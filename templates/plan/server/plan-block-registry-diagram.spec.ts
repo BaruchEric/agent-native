@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
 import {
   BlockRegistry,
   serializeSpecBlock,
   introspect,
 } from "@agent-native/core/blocks/server";
+import { describe, expect, it } from "vitest";
+
 import { registerPlanBlocks } from "../shared/plan-block-registry.js";
 import { planContentSchema, type PlanContent } from "../shared/plan-content.js";
 import {
@@ -28,6 +29,8 @@ const htmlDiagramData = {
   html: '<div class="diagram-panel"><svg viewBox="0 0 100 40"><path d="M5 20 L95 20" /></svg></div>',
   css: ".diagram-panel { padding: 12px; }",
   caption: "The policy module owns the unstable branch.",
+  frame: "hide" as const,
+  renderMode: "design" as const,
 };
 
 function diagramContent(): PlanContent {
@@ -61,8 +64,6 @@ describe("plan block registry — diagram", () => {
       data: diagramData,
     });
 
-    // Exactly the legacy `<Diagram id title summary data={…} />` shape: base
-    // attrs first, then the whole `data` object as one JSON prop, self-closing.
     expect(viaSpec).toBe(
       `<Diagram id="diagram-1" title="Agent flow" summary="End-to-end ingest path."` +
         ` data={${JSON.stringify(diagramData, null, 2)}} />`,
@@ -77,9 +78,6 @@ describe("plan block registry — diagram", () => {
       brief: source.brief,
     });
 
-    // The exported plan.mdx contains a real `<Diagram>` element with the whole
-    // data object as the `data` prop. (Prettier reformats the embedded object
-    // literal on export, so assert on stable substrings, not exact JSON.)
     expect(folder["plan.mdx"]).toContain("<Diagram");
     expect(folder["plan.mdx"]).toContain("data={");
     expect(folder["plan.mdx"]).toContain('"Webhook"');
@@ -92,7 +90,6 @@ describe("plan block registry — diagram", () => {
       expect(diagram.id).toBe("diagram-1");
       expect(diagram.title).toBe("Agent flow");
       expect(diagram.summary).toBe("End-to-end ingest path.");
-      // The whole node/edge/note graph survives the round-trip unchanged.
       expect(diagram.data).toEqual(diagramData);
     }
   });
@@ -118,6 +115,8 @@ describe("plan block registry — diagram", () => {
     });
 
     expect(folder["plan.mdx"]).toContain("<Diagram");
+    expect(folder["plan.mdx"]).toContain('frame="hide"');
+    expect(folder["plan.mdx"]).toContain('renderMode="design"');
     expect(folder["plan.mdx"]).toContain("diagram-panel");
     expect(folder["plan.mdx"]).toContain("<svg");
 

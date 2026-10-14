@@ -1,47 +1,56 @@
+import { usePerAppChatOpen } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { useAppearanceSync } from "@agent-native/core/client/ui";
+import { AgentSidebar } from "@agent-native/toolkit/app/chat";
+import { InvitationBanner } from "@agent-native/toolkit/app/org";
+import type { CalendarEvent, CalendarEventDraft } from "@shared/api";
+import { IconMenu } from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   createContext,
   useContext,
   useState,
   useEffect,
+  useMemo,
+  useCallback,
   type ReactNode,
 } from "react";
 import { useLocation } from "react-router";
-import { useQueryClient } from "@tanstack/react-query";
-import { IconMenu } from "@tabler/icons-react";
-import { Button } from "@/components/ui/button";
-import {
-  AgentSidebar,
-  AgentToggleButton,
-  NotificationsBell,
-  useAppearanceSync,
-} from "@agent-native/core/client";
-import { InvitationBanner } from "@agent-native/core/client/org";
-import { Sidebar } from "./Sidebar";
+
 import { AddCalendarDialog } from "@/components/calendar/AddCalendarDialog";
 import { GoogleConnectBanner } from "@/components/calendar/GoogleConnectBanner";
 import { KeyboardShortcutsHelp } from "@/components/calendar/KeyboardShortcutsHelp";
+import { HeaderActions } from "@/components/layout/HeaderActions";
+import { Button } from "@/components/ui/button";
 import { useGoogleAuthStatus } from "@/hooks/use-google-auth";
-import { useNavigationState } from "@/hooks/use-navigation-state";
 import { useHiddenCalendars } from "@/hooks/use-hidden-calendars";
 import { useIsMobile } from "@/hooks/use-mobile";
+import { useNavigationState } from "@/hooks/use-navigation-state";
 import { prefetchPeopleContacts } from "@/hooks/use-people";
-import type { CalendarEvent, CalendarEventDraft } from "@shared/api";
+import { shouldOfferGoogleOAuthSetup } from "@/lib/google-oauth-setup";
+import { isCalendarShortcutSuppressedTarget } from "@/lib/keyboard-shortcuts";
+
+import { Sidebar } from "./Sidebar";
 
 const EVENT_DETAIL_MODE_KEY = "calendar-event-detail-mode";
+const SIDEBAR_COLLAPSE_KEY = "calendar.sidebar.collapsed";
 
-/** Routes that render without the full AppLayout chrome (sidebar, agent panel). */
 const BARE_ROUTES = new Set(["/event"]);
 
-/**
- * Routes whose page renders its own toolbar (with NotificationsBell + AgentToggleButton).
- * Layout still mounts Sidebar + AgentSidebar, but skips its own header so
- * there's no double-header.
- */
 function pageOwnsToolbar(pathname: string): boolean {
-  if (pathname === "/") return true;
+  if (pathname === "/" || pathname === "/home") return true;
   if (pathname === "/extensions" || pathname.startsWith("/extensions/"))
     return true;
   return false;
+}
+
+function readSidebarCollapsed() {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(SIDEBAR_COLLAPSE_KEY) === "1";
+  } catch {
+    return false;
+  }
 }
 
 export type ViewMode = "month" | "week" | "day";
@@ -55,53 +64,109 @@ interface CalendarContextValue {
   setPeopleSearchOpen: (open: boolean) => void;
   addCalendarOpen: boolean;
   setAddCalendarOpen: (open: boolean) => void;
-  addCalendarDefaultTab: "people" | "url";
-  setAddCalendarDefaultTab: (tab: "people" | "url") => void;
+  addCalendarDefaultTab: "people" | "url" | "google";
+  setAddCalendarDefaultTab: (tab: "people" | "url" | "google") => void;
+  openAddPersonPrefilled: (email: string) => void;
   hiddenCalendars: ReturnType<typeof useHiddenCalendars>["hidden"];
   toggleHiddenCalendar: ReturnType<typeof useHiddenCalendars>["toggle"];
   isHiddenCalendar: ReturnType<typeof useHiddenCalendars>["isHidden"];
-  /** Whether to show event details in sidebar instead of popover */
   eventDetailSidebar: boolean;
   setEventDetailSidebar: (sidebar: boolean) => void;
-  /** The currently selected event for the sidebar panel */
   sidebarEvent: CalendarEvent | null;
   setSidebarEvent: (event: CalendarEvent | null) => void;
-  /** The last-clicked/focused event (for keyboard shortcuts like Delete) */
   focusedEvent: CalendarEvent | null;
   setFocusedEvent: (event: CalendarEvent | null) => void;
-  /** The currently open unsent event draft, if any */
   eventDraft: CalendarEventDraft | null;
   setEventDraft: (draft: CalendarEventDraft | null) => void;
   openSidebar: () => void;
 }
 
-const CalendarContext = createContext<CalendarContextValue>({
-  selectedDate: new Date(),
+interface CalendarSettersValue {
+  setSelectedDate: (date: Date) => void;
+  openAddPersonPrefilled: (email: string) => void;
+  setViewMode: (mode: ViewMode) => void;
+  setPeopleSearchOpen: (open: boolean) => void;
+  setAddCalendarOpen: (open: boolean) => void;
+  setAddCalendarDefaultTab: (tab: "people" | "url" | "google") => void;
+  toggleHiddenCalendar: ReturnType<typeof useHiddenCalendars>["toggle"];
+  setEventDetailSidebar: (sidebar: boolean) => void;
+  setSidebarEvent: (event: CalendarEvent | null) => void;
+  setFocusedEvent: (event: CalendarEvent | null) => void;
+  setEventDraft: (draft: CalendarEventDraft | null) => void;
+  openSidebar: () => void;
+}
+
+interface CalendarRareValuesContextValue {
+  selectedDate: Date;
+  viewMode: ViewMode;
+  peopleSearchOpen: boolean;
+  addCalendarOpen: boolean;
+  addCalendarDefaultTab: "people" | "url" | "google";
+  hiddenCalendars: ReturnType<typeof useHiddenCalendars>["hidden"];
+  isHiddenCalendar: ReturnType<typeof useHiddenCalendars>["isHidden"];
+  eventDetailSidebar: boolean;
+}
+
+interface CalendarHighFrequencyContextValue {
+  sidebarEvent: CalendarEvent | null;
+  focusedEvent: CalendarEvent | null;
+  eventDraft: CalendarEventDraft | null;
+}
+
+const noopSetters: CalendarSettersValue = {
   setSelectedDate: () => {},
-  viewMode: "week",
+  openAddPersonPrefilled: () => {},
   setViewMode: () => {},
-  peopleSearchOpen: false,
   setPeopleSearchOpen: () => {},
-  addCalendarOpen: false,
   setAddCalendarOpen: () => {},
-  addCalendarDefaultTab: "people",
   setAddCalendarDefaultTab: () => {},
-  hiddenCalendars: { people: [], external: [], accounts: [] },
   toggleHiddenCalendar: () => {},
-  isHiddenCalendar: () => false,
-  eventDetailSidebar: false,
   setEventDetailSidebar: () => {},
-  sidebarEvent: null,
   setSidebarEvent: () => {},
-  focusedEvent: null,
   setFocusedEvent: () => {},
-  eventDraft: null,
   setEventDraft: () => {},
   openSidebar: () => {},
-});
+};
 
-export function useCalendarContext() {
-  return useContext(CalendarContext);
+const CalendarSettersContext = createContext<CalendarSettersValue>(noopSetters);
+
+const CalendarRareValuesContext = createContext<CalendarRareValuesContextValue>(
+  {
+    selectedDate: new Date(),
+    viewMode: "week",
+    peopleSearchOpen: false,
+    addCalendarOpen: false,
+    addCalendarDefaultTab: "people",
+    hiddenCalendars: { people: [], external: [], accounts: [] },
+    isHiddenCalendar: () => false,
+    eventDetailSidebar: false,
+  },
+);
+
+const CalendarHighFrequencyContext =
+  createContext<CalendarHighFrequencyContextValue>({
+    sidebarEvent: null,
+    focusedEvent: null,
+    eventDraft: null,
+  });
+
+export function useCalendarContext(): CalendarContextValue {
+  const setters = useContext(CalendarSettersContext);
+  const rare = useContext(CalendarRareValuesContext);
+  const highFrequency = useContext(CalendarHighFrequencyContext);
+  return { ...setters, ...rare, ...highFrequency };
+}
+
+export function useCalendarSetters(): CalendarSettersValue {
+  return useContext(CalendarSettersContext);
+}
+
+export function useCalendarRareValues(): CalendarRareValuesContextValue {
+  return useContext(CalendarRareValuesContext);
+}
+
+export function useCalendarHighFrequency(): CalendarHighFrequencyContextValue {
+  return useContext(CalendarHighFrequencyContext);
 }
 
 type HeaderControls = {
@@ -132,21 +197,46 @@ interface AppLayoutProps {
 }
 
 export function AppLayout({ children }: AppLayoutProps) {
+  const t = useT();
   const isMobile = useIsMobile();
   const location = useLocation();
   const queryClient = useQueryClient();
   const googleStatus = useGoogleAuthStatus();
   const hasAccounts = (googleStatus.data?.accounts?.length ?? 0) > 0;
-  const isSettingsPage = location.pathname === "/settings";
+  const canOfferGoogleOAuthSetup = useMemo(
+    () => shouldOfferGoogleOAuthSetup(),
+    [],
+  );
+  const isSettingsPage =
+    location.pathname === "/settings" ||
+    location.pathname.startsWith("/settings/");
   const isCalendarPage = location.pathname === "/";
+  // The Settings shell brings its own navigation, header, and agent toggle.
+  const settingsOwnsChrome = isSettingsPage;
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] =
+    useState(readSidebarCollapsed);
+  const [sidebarExpandedWhileChatOpen, setSidebarExpandedWhileChatOpen] =
+    useState(false);
+  const perAppChatOpen = usePerAppChatOpen();
+  useEffect(() => {
+    if (!perAppChatOpen) setSidebarExpandedWhileChatOpen(false);
+  }, [perAppChatOpen]);
   const [selectedDate, setSelectedDate] = useState(new Date());
   const [viewMode, setViewMode] = useState<ViewMode>(isMobile ? "day" : "week");
   const [peopleSearchOpen, setPeopleSearchOpen] = useState(false);
   const [addCalendarOpen, setAddCalendarOpen] = useState(false);
   const [addCalendarDefaultTab, setAddCalendarDefaultTab] = useState<
-    "people" | "url"
+    "people" | "url" | "google"
   >("people");
+  const [addPersonPrefillEmail, setAddPersonPrefillEmail] = useState<
+    string | undefined
+  >(undefined);
+  const openAddPersonPrefilled = useCallback((email: string) => {
+    setAddPersonPrefillEmail(email);
+    setAddCalendarDefaultTab("people");
+    setAddCalendarOpen(true);
+  }, []);
   const {
     hidden: hiddenCalendars,
     toggle: toggleHiddenCalendar,
@@ -161,7 +251,6 @@ export function AppLayout({ children }: AppLayoutProps) {
   );
   const [shortcutsHelpOpen, setShortcutsHelpOpen] = useState(false);
 
-  // Load preference from localStorage
   useEffect(() => {
     try {
       const saved = localStorage.getItem(EVENT_DETAIL_MODE_KEY);
@@ -171,24 +260,28 @@ export function AppLayout({ children }: AppLayoutProps) {
 
   useEffect(() => {
     if (!hasAccounts) return;
-    void prefetchPeopleContacts(queryClient);
+    void Promise.all([
+      prefetchPeopleContacts(queryClient),
+      prefetchPeopleContacts(queryClient, "directory"),
+    ]);
   }, [hasAccounts, queryClient]);
 
-  // Global keyboard-shortcuts help: opens via `?` (or shift+/) or the sidebar
-  // button on any page, not just the calendar view. Calendar-specific shortcuts
-  // (j/k/c/etc.) still live in CalendarView.
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        SIDEBAR_COLLAPSE_KEY,
+        sidebarCollapsed ? "1" : "0",
+      );
+    } catch {
+      // Ignore storage failures; the in-memory preference still works.
+    }
+  }, [sidebarCollapsed]);
+
   useEffect(() => {
     const openShortcuts = () => setShortcutsHelpOpen(true);
     window.addEventListener("calendar:open-shortcuts", openShortcuts);
     function handleKey(e: KeyboardEvent) {
-      const target = e.target as HTMLElement;
-      if (
-        target.tagName === "INPUT" ||
-        target.tagName === "TEXTAREA" ||
-        target.isContentEditable
-      ) {
-        return;
-      }
+      if (isCalendarShortcutSuppressedTarget(e.target)) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key === "?" || (e.key === "/" && e.shiftKey)) {
         e.preventDefault();
@@ -202,12 +295,7 @@ export function AppLayout({ children }: AppLayoutProps) {
     };
   }, []);
 
-  // Render chromeless for embed/preview routes — all hooks must be called above
-  if (BARE_ROUTES.has(location.pathname)) {
-    return <>{children}</>;
-  }
-
-  const setEventDetailSidebar = (sidebar: boolean) => {
+  const setEventDetailSidebar = useCallback((sidebar: boolean) => {
     setEventDetailSidebarState(sidebar);
     try {
       localStorage.setItem(
@@ -215,106 +303,178 @@ export function AppLayout({ children }: AppLayoutProps) {
         sidebar ? "sidebar" : "popover",
       );
     } catch {}
-  };
+  }, []);
+
+  const openSidebar = useCallback(() => setSidebarOpen(true), []);
+
+  const settersValue = useMemo<CalendarSettersValue>(
+    () => ({
+      setSelectedDate,
+      openAddPersonPrefilled,
+      setViewMode,
+      setPeopleSearchOpen,
+      setAddCalendarOpen,
+      setAddCalendarDefaultTab,
+      toggleHiddenCalendar,
+      setEventDetailSidebar,
+      setSidebarEvent,
+      setFocusedEvent,
+      setEventDraft,
+      openSidebar,
+    }),
+    [
+      toggleHiddenCalendar,
+      setEventDetailSidebar,
+      openSidebar,
+      openAddPersonPrefilled,
+    ],
+  );
+
+  const rareValuesValue = useMemo<CalendarRareValuesContextValue>(
+    () => ({
+      selectedDate,
+      viewMode,
+      peopleSearchOpen,
+      addCalendarOpen,
+      addCalendarDefaultTab,
+      hiddenCalendars,
+      isHiddenCalendar,
+      eventDetailSidebar,
+    }),
+    [
+      selectedDate,
+      viewMode,
+      peopleSearchOpen,
+      addCalendarOpen,
+      addCalendarDefaultTab,
+      hiddenCalendars,
+      isHiddenCalendar,
+      eventDetailSidebar,
+    ],
+  );
+
+  const highFrequencyValue = useMemo<CalendarHighFrequencyContextValue>(
+    () => ({ sidebarEvent, focusedEvent, eventDraft }),
+    [sidebarEvent, focusedEvent, eventDraft],
+  );
+
+  if (BARE_ROUTES.has(location.pathname)) {
+    return <>{children}</>;
+  }
 
   return (
-    <CalendarContext.Provider
-      value={{
-        selectedDate,
-        setSelectedDate,
-        viewMode,
-        setViewMode,
-        peopleSearchOpen,
-        setPeopleSearchOpen,
-        addCalendarOpen,
-        setAddCalendarOpen,
-        addCalendarDefaultTab,
-        setAddCalendarDefaultTab,
-        hiddenCalendars,
-        toggleHiddenCalendar,
-        isHiddenCalendar,
-        eventDetailSidebar,
-        setEventDetailSidebar,
-        sidebarEvent,
-        setSidebarEvent,
-        focusedEvent,
-        setFocusedEvent,
-        eventDraft,
-        setEventDraft,
-        openSidebar: () => setSidebarOpen(true),
-      }}
-    >
-      <NavigationSync />
-      <AddCalendarDialog
-        open={addCalendarOpen}
-        onOpenChange={setAddCalendarOpen}
-        defaultTab={addCalendarDefaultTab}
-      />
-      <KeyboardShortcutsHelp
-        open={shortcutsHelpOpen}
-        onClose={() => setShortcutsHelpOpen(false)}
-      />
-      <div className="flex h-screen overflow-hidden bg-background">
-        <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
-        <AgentSidebar
-          position="right"
-          defaultOpen
-          emptyStateText="Ask me anything about your calendar"
-          suggestions={[
-            "What's on my calendar today?",
-            "Find a 30-min slot with Alice next week",
-            "Schedule a Zoom with the team Friday",
-          ]}
-        >
-          <div className="flex flex-1 flex-col overflow-hidden">
-            {!pageOwnsToolbar(location.pathname) && (
-              <header className="flex h-12 items-center justify-between gap-3 border-b border-border px-3 shrink-0">
-                <div className="flex min-w-0 flex-1 items-center gap-2">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-10 w-10 shrink-0 lg:hidden"
-                    onClick={() => setSidebarOpen(true)}
-                    aria-label="Open navigation"
-                  >
-                    <IconMenu className="h-5 w-5" />
-                  </Button>
-                  {headerControls?.left ?? (
-                    <span className="text-sm font-semibold lg:hidden">
-                      Calendar
-                    </span>
-                  )}
-                </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  {headerControls?.right}
-                  {!isMobile && (
-                    <NotificationsBell emptyDescription="Calendar can pop browser alerts while this app is open. Clips desktop handles fuller meeting prompts with one-click notes." />
-                  )}
-                  <AgentToggleButton />
-                </div>
-              </header>
+    <CalendarSettersContext.Provider value={settersValue}>
+      <CalendarRareValuesContext.Provider value={rareValuesValue}>
+        <CalendarHighFrequencyContext.Provider value={highFrequencyValue}>
+          <NavigationSync />
+          <AddCalendarDialog
+            open={addCalendarOpen}
+            onOpenChange={(open) => {
+              setAddCalendarOpen(open);
+              if (!open) setAddPersonPrefillEmail(undefined);
+            }}
+            defaultTab={addCalendarDefaultTab}
+            prefillPersonEmail={addPersonPrefillEmail}
+            visibleTabs={
+              addCalendarDefaultTab === "google"
+                ? ["google"]
+                : ["people", "url"]
+            }
+          />
+          <KeyboardShortcutsHelp
+            open={shortcutsHelpOpen}
+            onClose={() => setShortcutsHelpOpen(false)}
+          />
+          <div
+            className="agent-layout-shell flex h-screen overflow-hidden bg-background"
+            data-agent-native-shell-variant="custom"
+          >
+            {settingsOwnsChrome ? null : (
+              <Sidebar
+                open={sidebarOpen}
+                onClose={() => setSidebarOpen(false)}
+                collapsed={
+                  !isMobile &&
+                  (perAppChatOpen
+                    ? !sidebarExpandedWhileChatOpen
+                    : sidebarCollapsed)
+                }
+                onCollapsedChange={
+                  isMobile
+                    ? undefined
+                    : (nextCollapsed) => {
+                        if (perAppChatOpen) {
+                          setSidebarExpandedWhileChatOpen(!nextCollapsed);
+                          return;
+                        }
+                        setSidebarCollapsed(nextCollapsed);
+                      }
+                }
+              />
             )}
+            <AgentSidebar
+              position="right"
+              defaultOpen={false}
+              emptyStateText={t("agentSidebar.emptyState")}
+              agentPageHref="/settings/agent"
+              suggestions={[
+                t("agentSidebar.suggestions.today"),
+                t("agentSidebar.suggestions.findSlot"),
+                t("agentSidebar.suggestions.scheduleZoom"),
+              ]}
+            >
+              <div className="flex flex-1 flex-col overflow-hidden">
+                {!pageOwnsToolbar(location.pathname) && !settingsOwnsChrome && (
+                  <header className="flex h-12 items-center justify-between gap-3 border-b border-border px-3 shrink-0">
+                    <div className="flex min-w-0 flex-1 items-center gap-2">
+                      <Button
+                        variant="ghost"
+                        size="icon-lg"
+                        className="shrink-0 lg:hidden"
+                        onClick={() => setSidebarOpen(true)}
+                        aria-label={t("calendarView.openNavigation")}
+                      >
+                        <IconMenu className="h-5 w-5" />
+                      </Button>
+                      {headerControls?.left ?? (
+                        <span className="text-sm font-semibold lg:hidden">
+                          {t("navigation.calendar")}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {headerControls?.right}
+                      <HeaderActions />
+                    </div>
+                  </header>
+                )}
 
-            <HeaderControlsContext.Provider value={setHeaderControls}>
-              <InvitationBanner />
+                <HeaderControlsContext.Provider value={setHeaderControls}>
+                  <InvitationBanner />
 
-              {/* Show the full-page Google prompt only on the calendar view. */}
-              {!googleStatus.isLoading &&
-              !googleStatus.isError &&
-              !hasAccounts &&
-              !eventDraft &&
-              isCalendarPage &&
-              !isSettingsPage ? (
-                <main className="flex-1 overflow-y-auto">
-                  <GoogleConnectBanner variant="hero" />
-                </main>
-              ) : (
-                <main className="flex-1 overflow-y-auto">{children}</main>
-              )}
-            </HeaderControlsContext.Provider>
+                  {/* Show the full-page Google prompt only on the calendar view. */}
+                  {!googleStatus.isLoading &&
+                  !hasAccounts &&
+                  !eventDraft &&
+                  isCalendarPage &&
+                  !isSettingsPage &&
+                  (googleStatus.data?.configured === true ||
+                    canOfferGoogleOAuthSetup ||
+                    googleStatus.isError) ? (
+                    <main className="agent-native-app-main flex-1 overflow-y-auto">
+                      <GoogleConnectBanner variant="hero" />
+                    </main>
+                  ) : (
+                    <main className="agent-native-app-main flex-1 overflow-y-auto">
+                      {children}
+                    </main>
+                  )}
+                </HeaderControlsContext.Provider>
+              </div>
+            </AgentSidebar>
           </div>
-        </AgentSidebar>
-      </div>
-    </CalendarContext.Provider>
+        </CalendarHighFrequencyContext.Provider>
+      </CalendarRareValuesContext.Provider>
+    </CalendarSettersContext.Provider>
   );
 }

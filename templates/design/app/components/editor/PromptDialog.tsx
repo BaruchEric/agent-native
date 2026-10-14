@@ -1,37 +1,85 @@
-import { useState, useEffect, useCallback, useRef } from "react";
-import { createPortal } from "react-dom";
+import { trackEvent } from "@agent-native/core/client/analytics";
+import { appBasePath } from "@agent-native/core/client/api-path";
+import { useT } from "@agent-native/core/client/i18n";
+import { useOrg } from "@agent-native/core/client/org";
 import {
-  EmbeddedApp,
-  type EmbeddedAppRef,
-} from "@agent-native/embedding/react";
-import {
-  appBasePath,
-  PromptComposer,
+  type AgentChatContextItem,
+  type ComposerContextMenuItem,
+  type ComposerContextSnapshot,
+  type ComposerDraftSnapshot,
+  type PromptComposerProps,
   type PromptComposerSubmitOptions,
-} from "@agent-native/core/client";
+  type TiptapComposerHandle,
+} from "@agent-native/toolkit/app/chat/composer/index";
+import { AgentMark } from "@agent-native/toolkit/app/shared";
+import { LazyChunkErrorBoundary } from "@agent-native/toolkit/app/shared";
+import { LazyChunkRetryFallback } from "@agent-native/toolkit/app/shared";
+import { useEagerFileUploads } from "@agent-native/toolkit/composer/use-eager-file-uploads";
 import {
+  IconApps,
+  IconArtboard,
+  IconBrain,
   IconPalette,
-  IconPhoto,
   IconPlus,
-  IconUpload,
-  IconX,
 } from "@tabler/icons-react";
+import {
+  lazy,
+  Suspense,
+  type ComponentType,
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+  useRef,
+} from "react";
 import { toast } from "sonner";
+
+import {
+  DesignSystemPickerControl,
+  TemplatePickerControl,
+  type PromptDesignSystemOption,
+  type PromptTemplateOption,
+} from "@/components/editor/design-start-pickers";
+import { useDesignSystemWorkflows } from "@/hooks/use-design-system-workflows";
+
+export type {
+  PromptDesignSystemOption,
+  PromptTemplateOption,
+} from "@/components/editor/design-start-pickers";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
   Popover,
+  PopoverAnchor,
   PopoverContent,
-  PopoverTrigger,
 } from "@/components/ui/popover";
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
-  SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
+  isVisualImageAttachment,
+  MissingVisualImagePayloadError,
+} from "@/lib/chat-image-attachments";
+import { createDesignPromptAttachmentAdapter } from "@/lib/prompt-attachment-adapter";
+import { preparePromptImageAttachment } from "@/lib/prompt-image-optimization";
+import {
+  MAX_IMAGE_ATTACHMENT_BYTES,
+  MAX_IMAGE_ATTACHMENT_MB,
+  MAX_TOTAL_IMAGE_ATTACHMENT_BYTES,
+  MAX_TOTAL_IMAGE_ATTACHMENT_MB,
+  MAX_UPLOAD_BYTES,
+  MAX_UPLOAD_FILES_PER_REQUEST,
+  MAX_UPLOAD_MB,
+} from "@/lib/upload-limits";
+import { cn } from "@/lib/utils";
 
 export interface UploadedFile {
   path: string;
@@ -44,181 +92,101 @@ export interface UploadedFile {
   dataUrl?: string;
 }
 
-const DEFAULT_ASSETS_PICKER_URL = "https://assets.agent-native.com/picker";
-const MAX_CHAT_IMAGE_ATTACHMENT_BYTES = 4 * 1024 * 1024;
-const CHAT_IMAGE_ATTACHMENT_TYPES = new Set([
-  "image/gif",
-  "image/jpeg",
-  "image/jpg",
-  "image/png",
-  "image/webp",
-]);
-
-interface PickedAssetImagePayload {
-  url?: unknown;
-  previewUrl?: unknown;
-  downloadUrl?: unknown;
-  embedUrl?: unknown;
-  altText?: unknown;
-  title?: unknown;
-  mimeType?: unknown;
-}
-
-function assetsPickerUrl() {
-  return (
-    import.meta.env.VITE_AGENT_NATIVE_ASSETS_PICKER_URL ||
-    DEFAULT_ASSETS_PICKER_URL
-  );
-}
-
-function pickedAssetString(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function pickedAssetImageSource(payload: unknown): string | null {
-  if (!payload || typeof payload !== "object") return null;
-  const image = payload as PickedAssetImagePayload;
-  return (
-    pickedAssetString(image.url) ??
-    pickedAssetString(image.previewUrl) ??
-    pickedAssetString(image.downloadUrl) ??
-    pickedAssetString(image.embedUrl)
-  );
-}
-
-function pickedAssetFilename(payload: unknown, url: string) {
-  if (payload && typeof payload === "object") {
-    const image = payload as PickedAssetImagePayload;
-    const title = pickedAssetString(image.title);
-    if (title) return title;
-  }
-
-  try {
-    const name = new URL(url).pathname.split("/").filter(Boolean).pop();
-    return name ? decodeURIComponent(name) : "assets-image";
-  } catch {
-    return "assets-image";
-  }
-}
-
-function pickedAssetContext(payload: unknown, url: string) {
-  const lines = [`Remote image URL: ${url}`];
-  if (payload && typeof payload === "object") {
-    const image = payload as PickedAssetImagePayload;
-    const altText = pickedAssetString(image.altText);
-    if (altText) lines.push(`Alt text: ${altText}`);
-  }
-  return lines.join("\n");
-}
-
-function readChatImageAttachment(file: File): Promise<string | null> {
+function promptAttachmentSizeLimit(
+  files: readonly File[],
+): "images" | "attachments" | null {
+  const images = files.filter(isVisualImageAttachment);
   if (
-    file.size > MAX_CHAT_IMAGE_ATTACHMENT_BYTES ||
-    !CHAT_IMAGE_ATTACHMENT_TYPES.has(file.type.toLowerCase())
+    images.some((file) => file.size > MAX_IMAGE_ATTACHMENT_BYTES) ||
+    images.reduce((sum, file) => sum + file.size, 0) >
+      MAX_TOTAL_IMAGE_ATTACHMENT_BYTES
   ) {
-    return Promise.resolve(null);
+    return "images";
   }
-
-  return new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = () =>
-      resolve(typeof reader.result === "string" ? reader.result : null);
-    reader.onerror = () => resolve(null);
-    reader.readAsDataURL(file);
-  });
+  if (
+    files
+      .filter((file) => !isVisualImageAttachment(file))
+      .reduce((sum, file) => sum + file.size, 0) > MAX_UPLOAD_BYTES
+  ) {
+    return "attachments";
+  }
+  return null;
 }
 
-interface AssetsPickerDialogProps {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  url: string;
-  onReady: (payload: unknown, event: MessageEvent, ref: EmbeddedAppRef) => void;
-  onMessage: (name: string, payload: unknown) => void;
+function splitUploadBatches<T extends { file: File }>(
+  files: readonly T[],
+): T[][] {
+  const batches: T[][] = [];
+  let batch: T[] = [];
+  let batchBytes = 0;
+  for (const item of files) {
+    if (
+      batch.length > 0 &&
+      (batch.length >= MAX_UPLOAD_FILES_PER_REQUEST ||
+        batchBytes + item.file.size > MAX_UPLOAD_BYTES)
+    ) {
+      batches.push(batch);
+      batch = [];
+      batchBytes = 0;
+    }
+    batch.push(item);
+    batchBytes += item.file.size;
+  }
+  if (batch.length > 0) batches.push(batch);
+  return batches;
 }
 
-function AssetsPickerDialog({
-  open,
-  onOpenChange,
-  url,
-  onReady,
-  onMessage,
-}: AssetsPickerDialogProps) {
-  const [pickerReady, setPickerReady] = useState(false);
+const MAX_TOTAL_CHAT_IMAGE_DATA_URL_BYTES = 3_000_000;
+const DEFAULT_MAX_CHAT_IMAGE_DATA_URL_BYTES = 1_250_000;
 
-  useEffect(() => {
-    if (open) setPickerReady(false);
-  }, [open, url]);
-
-  const handleReady = useCallback(
-    (payload: unknown, event: MessageEvent, ref: EmbeddedAppRef) => {
-      setPickerReady(true);
-      onReady(payload, event, ref);
-    },
-    [onReady],
-  );
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        data-assets-picker-dialog
-        className="flex h-[min(86vh,760px)] w-[min(96vw,1040px)] max-w-none flex-col gap-0 overflow-hidden p-0"
-      >
-        <div className="flex h-12 shrink-0 items-center border-b px-4">
-          <DialogTitle className="text-base">Assets</DialogTitle>
-        </div>
-        <div className="relative min-h-0 flex-1 overflow-hidden bg-background">
-          {!pickerReady && <AssetsPickerSkeleton />}
-          <EmbeddedApp
-            url={url}
-            title="Assets image picker"
-            className={`absolute inset-0 h-full w-full border-0 bg-background transition-opacity duration-150 ${
-              pickerReady ? "opacity-100" : "pointer-events-none opacity-0"
-            }`}
-            onReady={handleReady}
-            onMessage={onMessage}
-          />
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
+const loadPromptComposer = () =>
+  import("@agent-native/toolkit/composer").then(({ PromptComposer }) => ({
+    default: PromptComposer,
+  }));
+const LazyPromptComposer = lazy(loadPromptComposer);
+export function preloadPromptComposer() {
+  void loadPromptComposer().catch(() => {});
 }
 
-function AssetsPickerSkeleton() {
-  return (
-    <div
-      className="absolute inset-0 flex flex-col gap-5 p-5"
-      role="status"
-      aria-label="Loading Assets picker"
-    >
-      <div className="flex items-center gap-3">
-        <Skeleton className="h-9 flex-1 rounded-md" />
-        <Skeleton className="h-9 w-24 rounded-md" />
-      </div>
-      <div className="grid min-h-0 flex-1 grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
-        {Array.from({ length: 8 }).map((_, index) => (
-          <div key={index} className="flex min-w-0 flex-col gap-2">
-            <Skeleton className="aspect-square w-full rounded-lg" />
-            <Skeleton className="h-3 w-3/4 rounded" />
-            <Skeleton className="h-3 w-1/2 rounded" />
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
+export type PromptCreationMode = "design" | "app";
 
 interface PromptPopoverProps {
+  composerComponent?: ComponentType<PromptComposerProps>;
+  inline?: boolean;
+  submissionIdentity?: string;
+  contextItems?: AgentChatContextItem[];
+  contextMenuItems?: ComposerContextMenuItem[];
+  onRemoveContextItem?: (key: string) => void;
+  onRetryContextItem?: (key: string) => void;
+  onSubmitError?: () => void;
+  beforeSubmitContext?: (
+    snapshot: ComposerContextSnapshot | undefined,
+  ) => Promise<ComposerContextSnapshot | undefined>;
+  composerRef?: React.Ref<TiptapComposerHandle>;
+  initialText?: string;
+  initialTextKey?: number;
+  disabled?: boolean;
+  submissionDisabled?: boolean;
+  showModelSelector?: boolean;
+  modelStatusChecksEnabled?: boolean;
+  requireAgentEngine?: boolean;
+  showMissingApiKeySetup?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   title: string;
   placeholder?: string;
-  onSkip?: () => void;
+  onSkip?: () => void | boolean | Promise<void | boolean>;
   skipLabel?: string;
+  showInlineSkip?: boolean;
+  offerStartChoice?: boolean;
   onSubmit: (
     prompt: string,
     files: UploadedFile[],
     options: PromptComposerSubmitOptions,
-  ) => void;
+  ) => void | Promise<void>;
+  onBeforeSubmit?: (
+    draft?: ComposerDraftSnapshot,
+  ) => boolean | Promise<boolean>;
   loading?: boolean;
   anchorRef?: React.RefObject<HTMLElement | null>;
   centered?: boolean;
@@ -227,23 +195,89 @@ interface PromptPopoverProps {
   selectedDesignSystemId?: string | null;
   onDesignSystemChange?: (id: string | null) => void;
   onCreateDesignSystem?: () => void;
+  creativeContexts?: PromptCreativeContextOption[];
+  creativeContextsLoading?: boolean;
+  selectedCreativeContextId?: string | null;
+  onCreativeContextChange?: (id: string | null) => void;
+  templateOptions?: PromptTemplateOption[];
+  templatesLoading?: boolean;
+  selectedTemplateId?: string | null;
+  onTemplateChange?: (id: string | null) => void;
+  creationMode?: PromptCreationMode;
+  onCreationModeChange?: (mode: PromptCreationMode) => void;
+  /**
+   * Scopes the composer's localStorage draft key so an abandoned draft in
+   * this popover never bleeds into a different popover instance (e.g. the
+   * "generate design" and "tweak" popovers both mount unscoped composers
+   * that would otherwise share the same global draft key). Defaults to a
+   * scope derived from `title`, which is already distinct across the
+   * current call sites; pass an explicit value (e.g. including a design id)
+   * for finer isolation between instances that share the same title. The
+   * popover further suffixes whatever scope it resolves with the active
+   * org id (see `PromptPopover`'s `orgScopedDraftScope`), so an abandoned
+   * draft never survives switching accounts either — callers never need to
+   * fold the org id in themselves.
+   */
+  draftScope?: string;
+  scopeDraftsToOrg?: boolean;
 }
 
-export interface PromptDesignSystemOption {
+export interface PromptCreativeContextOption {
   id: string;
-  title: string;
-  description?: string | null;
-  isDefault?: boolean;
+  name: string;
+}
+
+function isNestedPromptPopoverTarget(target: EventTarget | null) {
+  return (
+    target instanceof Element &&
+    Boolean(
+      target.closest(
+        "[data-agent-native-composer-popover],[data-agent-native-prompt-select],[data-agent-native-template-popover]",
+      ),
+    )
+  );
+}
+
+function hasOpenNestedPromptPopoverSurface() {
+  if (typeof document === "undefined") return false;
+  return Boolean(
+    document.querySelector(
+      '[data-agent-native-composer-popover][data-state="open"],' +
+        '[data-agent-native-prompt-select][data-state="open"],' +
+        '[data-agent-native-template-popover][data-state="open"]',
+    ),
+  );
 }
 
 export default function PromptPopover({
+  composerComponent,
+  inline = false,
+  submissionIdentity,
+  contextItems,
+  contextMenuItems,
+  onRemoveContextItem,
+  onRetryContextItem,
+  onSubmitError,
+  beforeSubmitContext,
+  composerRef,
+  initialText,
+  initialTextKey,
+  disabled = false,
+  submissionDisabled = false,
+  showModelSelector,
+  modelStatusChecksEnabled,
+  requireAgentEngine,
+  showMissingApiKeySetup,
   open,
-  onOpenChange,
+  onOpenChange: onPopoverOpenChange,
   title,
-  placeholder = "Describe what you want...",
+  placeholder,
   onSkip,
-  skipLabel = "Skip prompt",
+  skipLabel,
+  showInlineSkip = false,
+  offerStartChoice = false,
   onSubmit,
+  onBeforeSubmit,
   loading = false,
   anchorRef,
   centered = false,
@@ -252,115 +286,265 @@ export default function PromptPopover({
   selectedDesignSystemId,
   onDesignSystemChange,
   onCreateDesignSystem,
+  creativeContexts = [],
+  creativeContextsLoading = false,
+  selectedCreativeContextId,
+  onCreativeContextChange,
+  templateOptions = [],
+  templatesLoading = false,
+  selectedTemplateId,
+  onTemplateChange,
+  creationMode,
+  onCreationModeChange,
+  draftScope,
+  scopeDraftsToOrg = true,
 }: PromptPopoverProps) {
-  const [uploading, setUploading] = useState(false);
-  const [pickedAssets, setPickedAssets] = useState<UploadedFile[]>([]);
-  const [selectedUploadFiles, setSelectedUploadFiles] = useState<File[]>([]);
-  const [assetsPickerOpen, setAssetsPickerOpen] = useState(false);
-  const panelRef = useRef<HTMLDivElement>(null);
-
+  const t = useT();
+  const systemsEnabled = useDesignSystemWorkflows();
+  const attachmentLimitMessage = t("promptDialog.attachmentsTooLarge", {
+    max: MAX_UPLOAD_MB,
+  });
+  const imageAttachmentLimitMessage = t(
+    "promptDialog.imageAttachmentTooLarge",
+    {
+      perFile: MAX_IMAGE_ATTACHMENT_MB,
+      total: MAX_TOTAL_IMAGE_ATTACHMENT_MB,
+    },
+  );
+  const attachmentAdapter = useMemo(
+    () =>
+      createDesignPromptAttachmentAdapter(
+        attachmentLimitMessage,
+        imageAttachmentLimitMessage,
+      ),
+    [attachmentLimitMessage, imageAttachmentLimitMessage],
+  );
+  const onOpenChange = useCallback(
+    (nextOpen: boolean) => {
+      if (!inline) onPopoverOpenChange(nextOpen);
+    },
+    [inline, onPopoverOpenChange],
+  );
+  const { data: org, isPending: orgPending } = useOrg({
+    enabled: scopeDraftsToOrg,
+  });
+  const baseDraftScope = draftScope ?? title;
+  const orgScopedDraftScope = scopeDraftsToOrg
+    ? orgPending
+      ? `${baseDraftScope}:pending`
+      : `${baseDraftScope}:${org?.orgId ?? "none"}`
+    : `${baseDraftScope}:anonymous`;
+  const recoveryScope = `${orgScopedDraftScope}:${submissionIdentity ?? ""}`;
+  const draftScopeRef = useRef(recoveryScope);
+  draftScopeRef.current = recoveryScope;
+  const [showStartChoice, setShowStartChoice] = useState(offerStartChoice);
+  const [skipInFlight, setSkipInFlight] = useState(false);
+  const skipInFlightRef = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const draftTextRef = useRef<string | undefined>(undefined);
+  const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
+  const [restoredPrompt, setRestoredPrompt] = useState<{
+    text: string;
+    initialTextKey: number | undefined;
+    revision: number;
+    draftScope: string;
+  }>();
+  const restorePromptText = useCallback(
+    (text: string) => {
+      setRestoredPrompt((current) => ({
+        text,
+        initialTextKey,
+        draftScope: recoveryScope,
+        revision: (current?.revision ?? 0) + 1,
+      }));
+    },
+    [initialTextKey, recoveryScope],
+  );
+  const activeRestoredPrompt =
+    restoredPrompt?.initialTextKey === initialTextKey &&
+    restoredPrompt?.draftScope === recoveryScope
+      ? restoredPrompt
+      : undefined;
   useEffect(() => {
     if (open) return;
-    setAssetsPickerOpen(false);
-    setPickedAssets([]);
-    setSelectedUploadFiles([]);
+    if (submittingRef.current) return;
+    setShowStartChoice(offerStartChoice);
+    skipInFlightRef.current = false;
+    setSkipInFlight(false);
   }, [open]);
-
-  // Position the popover after render so we can measure its actual size
-  useEffect(() => {
-    if (!open || !panelRef.current) return;
-    const panel = panelRef.current;
-    const MARGIN = 12;
-
-    if (centered || !anchorRef?.current) {
-      panel.style.top = "50%";
-      panel.style.left = "50%";
-      panel.style.transform = "translate(-50%, -50%)";
-      return;
+  const justClosedNestedSelectRef = useRef(false);
+  const clearJustClosedNestedSelectTimeoutRef = useRef<ReturnType<
+    typeof setTimeout
+  > | null>(null);
+  const markNestedSelectJustClosed = useCallback(() => {
+    justClosedNestedSelectRef.current = true;
+    if (clearJustClosedNestedSelectTimeoutRef.current != null) {
+      clearTimeout(clearJustClosedNestedSelectTimeoutRef.current);
     }
-
-    const anchor = anchorRef.current.getBoundingClientRect();
-    const panelRect = panel.getBoundingClientRect();
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-
-    let top = anchor.bottom + MARGIN;
-    if (top + panelRect.height > vh - MARGIN) {
-      top = Math.max(MARGIN, anchor.top - panelRect.height - MARGIN);
-    }
-
-    const anchorCenterX = anchor.left + anchor.width / 2;
-    let left = anchorCenterX - panelRect.width / 2;
-    if (left + panelRect.width > vw - MARGIN) {
-      left = vw - panelRect.width - MARGIN;
-    }
-    if (left < MARGIN) left = MARGIN;
-
-    panel.style.top = top + "px";
-    panel.style.left = left + "px";
-    panel.style.right = "auto";
-    panel.style.transform = "none";
-  });
-
-  // Close on outside click / escape
-  useEffect(() => {
-    if (!open) return;
-    const handleClick = (e: MouseEvent) => {
-      const target = e.target as Element | null;
-      if (target?.closest("[data-agent-native-composer-popover]")) return;
-      if (target?.closest("[data-assets-picker-dialog]")) return;
-      if (
-        panelRef.current &&
-        !panelRef.current.contains(e.target as Node) &&
-        (!anchorRef?.current || !anchorRef.current.contains(e.target as Node))
-      ) {
-        onOpenChange(false);
-      }
-    };
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !assetsPickerOpen) onOpenChange(false);
-    };
-    document.addEventListener("mousedown", handleClick);
-    document.addEventListener("keydown", handleKey);
-    return () => {
-      document.removeEventListener("mousedown", handleClick);
-      document.removeEventListener("keydown", handleKey);
-    };
-  }, [assetsPickerOpen, open, onOpenChange, anchorRef]);
-
-  const uploadFiles = useCallback(
-    async (files: File[]): Promise<UploadedFile[]> => {
-      if (files.length === 0) return [];
-      setUploading(true);
-      try {
-        const formData = new FormData();
-        files.forEach((f) => formData.append("files", f));
-        const res = await fetch(`${appBasePath()}/api/uploads`, {
-          method: "POST",
-          body: formData,
-        });
-        if (!res.ok) {
-          const body = await res.json().catch(() => null);
-          throw new Error(
-            typeof body?.error === "string"
-              ? body.error
-              : `Upload failed (${res.status})`,
-          );
-        }
-        const uploaded = (await res.json()) as UploadedFile[];
-        const visualAttachments = await Promise.all(
-          files.map((file) => readChatImageAttachment(file)),
-        );
-        return uploaded.map((file, index) =>
-          visualAttachments[index]
-            ? { ...file, dataUrl: visualAttachments[index] }
-            : file,
-        );
-      } finally {
-        setUploading(false);
+    clearJustClosedNestedSelectTimeoutRef.current = setTimeout(() => {
+      justClosedNestedSelectRef.current = false;
+      clearJustClosedNestedSelectTimeoutRef.current = null;
+    }, 300);
+  }, []);
+  useEffect(
+    () => () => {
+      if (clearJustClosedNestedSelectTimeoutRef.current != null) {
+        clearTimeout(clearJustClosedNestedSelectTimeoutRef.current);
       }
     },
     [],
+  );
+
+  useEffect(() => {
+    if (open) return;
+    setTemplatePickerOpen(false);
+    if (submittingRef.current) return;
+    setRestoredPrompt(undefined);
+  }, [open]);
+
+  const deleteUploadedFile = useCallback(async (file: UploadedFile) => {
+    const response = await fetch(`${appBasePath()}/api/uploads`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ path: file.path }),
+    });
+    if (!response.ok) {
+      throw new Error(`Upload cleanup failed (${response.status})`);
+    }
+  }, []);
+  const uploadFilesToServer = useCallback(
+    async (files: File[]): Promise<UploadedFile[]> => {
+      if (files.length === 0) return [];
+      const sizeLimit = promptAttachmentSizeLimit(files);
+      if (sizeLimit === "images") throw new Error(imageAttachmentLimitMessage);
+      if (sizeLimit === "attachments") throw new Error(attachmentLimitMessage);
+      const imageFiles = files.filter(isVisualImageAttachment);
+      const imageFileCount = imageFiles.length || 1;
+      const maxImageDataUrlBytes = Math.min(
+        DEFAULT_MAX_CHAT_IMAGE_DATA_URL_BYTES,
+        Math.floor(MAX_TOTAL_CHAT_IMAGE_DATA_URL_BYTES / imageFileCount),
+      );
+      const preparedFiles: Array<{
+        sourceIndex: number;
+        file: File;
+        dataUrl: string | null;
+      }> = [];
+      for (const [sourceIndex, file] of files.entries()) {
+        if (!isVisualImageAttachment(file)) {
+          preparedFiles.push({ sourceIndex, file, dataUrl: null });
+          continue;
+        }
+        const prepared = await preparePromptImageAttachment(
+          file,
+          maxImageDataUrlBytes,
+        );
+        if (!prepared) throw new MissingVisualImagePayloadError();
+        preparedFiles.push({
+          sourceIndex,
+          file: prepared.file,
+          dataUrl: prepared.dataUrl,
+        });
+      }
+      if (preparedFiles.some(({ file }) => file.size > MAX_UPLOAD_BYTES)) {
+        throw new Error(attachmentLimitMessage);
+      }
+      const uploadedFiles: UploadedFile[] = [];
+      try {
+        for (const batch of splitUploadBatches(preparedFiles)) {
+          const formData = new FormData();
+          batch.forEach(({ file }) => formData.append("files", file));
+          const res = await fetch(`${appBasePath()}/api/uploads`, {
+            method: "POST",
+            body: formData,
+          });
+          if (!res.ok) {
+            // coercion-ok: error responses may be non-JSON; the HTTP status is still thrown below.
+            const body = await res.json().catch(() => null);
+            throw new Error(
+              typeof body?.error === "string"
+                ? body.error
+                : `Upload failed (${res.status})`,
+            );
+          }
+          const uploaded = (await res.json()) as UploadedFile[];
+          if (!Array.isArray(uploaded) || uploaded.length !== batch.length) {
+            throw new Error(t("promptDialog.failedToUploadFile"));
+          }
+          uploadedFiles.push(
+            ...uploaded.map((uploadedFile, batchIndex) => {
+              const prepared = batch[batchIndex]!;
+              const originalFile = files[prepared.sourceIndex];
+              return {
+                ...uploadedFile,
+                ...(originalFile?.type
+                  ? {
+                      type: prepared.file.type || originalFile.type,
+                    }
+                  : {}),
+                ...(prepared.file !== originalFile && originalFile
+                  ? { originalName: originalFile.name }
+                  : {}),
+                ...(prepared.dataUrl ? { dataUrl: prepared.dataUrl } : {}),
+              };
+            }),
+          );
+        }
+        return uploadedFiles;
+      } catch (error) {
+        const cleanupResults = await Promise.allSettled(
+          uploadedFiles.map(deleteUploadedFile),
+        );
+        if (cleanupResults.some((result) => result.status === "rejected")) {
+          console.error(
+            "Prompt attachment upload cleanup failed",
+            cleanupResults,
+          );
+        }
+        throw error;
+      }
+    },
+    [
+      attachmentLimitMessage,
+      deleteUploadedFile,
+      imageAttachmentLimitMessage,
+      t,
+    ],
+  );
+  const handleRetainedFilesAbandoned = useCallback(
+    (_files: readonly File[], discard: () => void) => {
+      if (!submittingRef.current) discard();
+    },
+    [],
+  );
+  const {
+    commitFiles,
+    discardFiles,
+    retainFiles,
+    syncFiles,
+    uploadFiles,
+    uploading,
+    reset: resetEagerUploads,
+  } = useEagerFileUploads(uploadFilesToServer, {
+    onDiscard: deleteUploadedFile,
+    onRetainedFilesAbandoned: handleRetainedFilesAbandoned,
+  });
+
+  useEffect(() => {
+    if (!open) {
+      if (!submitting) {
+        setSubmitting(false);
+        resetEagerUploads();
+      }
+    }
+  }, [open, resetEagerUploads, submitting]);
+
+  const handleAttachmentsChange = useCallback(
+    (files: File[]) => {
+      syncFiles(files);
+    },
+    [syncFiles],
   );
 
   const handleSubmit = useCallback(
@@ -370,308 +554,542 @@ export default function PromptPopover({
       _references: unknown,
       options: PromptComposerSubmitOptions,
     ) => {
+      if (submittingRef.current) return;
+      const recoveryText = inline ? (draftTextRef.current ?? text) : text;
+      const submissionScope = recoveryScope;
+      submittingRef.current = true;
+      setSubmitting(true);
+      onOpenChange(false);
+      let uploaded: UploadedFile[];
+      let submissionOptions = options;
       try {
-        const uploaded = await uploadFiles([...files, ...selectedUploadFiles]);
-        onSubmit(text.trim(), [...uploaded, ...pickedAssets], options);
-        setPickedAssets([]);
-        setSelectedUploadFiles([]);
+        const sizeLimit = promptAttachmentSizeLimit(files);
+        if (sizeLimit === "images")
+          throw new Error(imageAttachmentLimitMessage);
+        if (sizeLimit === "attachments")
+          throw new Error(attachmentLimitMessage);
+        if (beforeSubmitContext)
+          submissionOptions = {
+            ...options,
+            contextItems: await beforeSubmitContext(options.contextItems),
+          };
+        uploaded = await uploadFiles(files);
+        if (
+          uploaded.some(
+            (file) => !Number.isSafeInteger(file.size) || file.size < 0,
+          )
+        ) {
+          throw new Error(t("promptDialog.failedToUploadFile"));
+        }
+        if (uploaded.some((file) => file.size > MAX_UPLOAD_BYTES)) {
+          throw new Error(attachmentLimitMessage);
+        }
+        if (draftScopeRef.current !== submissionScope)
+          throw new Error(t("promptDialog.failedToSubmitPrompt"));
       } catch (error) {
+        discardFiles(files);
+        setSubmitting(false);
+        submittingRef.current = false;
+        onOpenChange(true);
+        if (draftScopeRef.current === submissionScope)
+          restorePromptText(recoveryText);
+        onSubmitError?.();
         toast.error(
-          error instanceof Error ? error.message : "Failed to upload file",
+          error instanceof MissingVisualImagePayloadError
+            ? t("promptDialog.imageAttachmentUnavailable")
+            : error instanceof Error
+              ? error.message
+              : t("promptDialog.failedToUploadFile"),
         );
+        throw error;
+      }
+      try {
+        retainFiles(files);
+        await onSubmit(text, uploaded, submissionOptions);
+        commitFiles(files);
+        setSubmitting(false);
+        submittingRef.current = false;
+      } catch (error) {
+        discardFiles(files);
+        setSubmitting(false);
+        submittingRef.current = false;
+        onOpenChange(true);
+        if (draftScopeRef.current === submissionScope)
+          restorePromptText(recoveryText);
+        onSubmitError?.();
+        toast.error(
+          error instanceof MissingVisualImagePayloadError
+            ? t("promptDialog.imageAttachmentUnavailable")
+            : error instanceof Error
+              ? error.message
+              : t("promptDialog.failedToSubmitPrompt"),
+        );
+        throw error;
       }
     },
-    [onSubmit, pickedAssets, selectedUploadFiles, uploadFiles],
+    [
+      commitFiles,
+      discardFiles,
+      onOpenChange,
+      onSubmit,
+      onSubmitError,
+      beforeSubmitContext,
+      attachmentLimitMessage,
+      imageAttachmentLimitMessage,
+      recoveryScope,
+      inline,
+      retainFiles,
+      restorePromptText,
+      t,
+      uploadFiles,
+    ],
   );
 
-  const handleAssetsPickerReady = useCallback(
-    (_payload: unknown, _event: MessageEvent, ref: EmbeddedAppRef) => {
-      ref.postMessage("configure", {});
+  const hasLiveVirtualAnchor = !centered && Boolean(anchorRef?.current);
+  const anchorModeWhileOpenRef = useRef(hasLiveVirtualAnchor);
+  if (open) {
+    anchorModeWhileOpenRef.current = hasLiveVirtualAnchor;
+  }
+  const hasVirtualAnchor = open
+    ? hasLiveVirtualAnchor
+    : anchorModeWhileOpenRef.current;
+
+  const latestAnchorRef = useRef(anchorRef);
+  latestAnchorRef.current = anchorRef;
+  const lastAnchorRectRef = useRef<DOMRect | null>(null);
+  const [virtualAnchorRef] = useState<
+    React.RefObject<{ getBoundingClientRect: () => DOMRect }>
+  >(() => ({
+    current: {
+      getBoundingClientRect: () => {
+        const el = latestAnchorRef.current?.current;
+        if (el?.isConnected) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width > 0 || rect.height > 0) {
+            lastAnchorRectRef.current = rect;
+            return rect;
+          }
+        }
+        return (
+          lastAnchorRectRef.current ??
+          new DOMRect(window.innerWidth / 2, window.innerHeight / 2, 0, 0)
+        );
+      },
     },
-    [],
+  }));
+  const selectedCreativeContext =
+    creativeContexts.find(
+      (context) => context.id === selectedCreativeContextId,
+    ) ?? null;
+  const showCreativeContextPicker =
+    Boolean(onCreativeContextChange) &&
+    (creativeContextsLoading || creativeContexts.length > 0);
+  const Composer = composerComponent ?? LazyPromptComposer;
+  const promptComposer = (
+    <Composer
+      key={
+        inline ? orgScopedDraftScope : (placeholder ?? t("home.describeBuild"))
+      }
+      autoFocus
+      attachmentsEnabled
+      attachmentAdapter={attachmentAdapter}
+      inlineTextAttachments={false}
+      maxDocumentAttachmentBytes={MAX_UPLOAD_BYTES}
+      disabled={
+        disabled ||
+        loading ||
+        submitting ||
+        (inline && scopeDraftsToOrg && orgPending)
+      }
+      submissionDisabled={submissionDisabled}
+      submitting={submitting}
+      layoutVariant={inline ? "hero" : undefined}
+      className={inline ? "design-home-prompt-composer-area" : undefined}
+      composerRef={composerRef}
+      ariaLabel={placeholder ?? t("home.describeBuild")}
+      showModelSelector={showModelSelector}
+      modelStatusChecksEnabled={modelStatusChecksEnabled}
+      requireAgentEngine={requireAgentEngine}
+      showMissingApiKeySetup={showMissingApiKeySetup}
+      placeholder={placeholder ?? t("home.describeBuild")}
+      onSubmit={handleSubmit}
+      onBeforeSubmit={onBeforeSubmit}
+      onTextChange={(text) => {
+        draftTextRef.current = text;
+      }}
+      contextItems={contextItems}
+      onRemoveContextItem={onRemoveContextItem}
+      onRetryContextItem={onRetryContextItem}
+      onAttachmentsChange={handleAttachmentsChange}
+      draftScope={orgScopedDraftScope}
+      initialText={activeRestoredPrompt?.text ?? initialText}
+      initialTextKey={
+        activeRestoredPrompt
+          ? `restore:${initialTextKey ?? 0}:${activeRestoredPrompt.revision}`
+          : `seed:${initialTextKey ?? 0}`
+      }
+      contextMenuItems={contextMenuItems ?? []}
+    />
   );
 
-  const handleAssetsPickerMessage = useCallback(
-    (name: string, payload: unknown) => {
-      if (name === "close") {
-        setAssetsPickerOpen(false);
-        return;
-      }
-
-      if (name !== "chooseImage") return;
-      const url = pickedAssetImageSource(payload);
-      if (!url) {
-        toast.error("Assets did not return an image URL.");
-        return;
-      }
-
-      const filename = pickedAssetFilename(payload, url);
-      const mimeType =
-        payload && typeof payload === "object"
-          ? pickedAssetString((payload as PickedAssetImagePayload).mimeType)
-          : null;
-      setPickedAssets((current) => [
-        ...current,
-        {
-          path: url,
-          originalName: filename,
-          filename,
-          type: mimeType ?? "image/url",
-          size: 0,
-          textContent: pickedAssetContext(payload, url),
-        },
-      ]);
-      setAssetsPickerOpen(false);
-      toast.success("Asset added");
-    },
-    [],
-  );
-
-  const removePickedAsset = useCallback((path: string) => {
-    setPickedAssets((current) =>
-      current.filter((asset) => asset.path !== path),
-    );
-  }, []);
-
-  const removeSelectedUploadFile = useCallback((index: number) => {
-    setSelectedUploadFiles((current) =>
-      current.filter((_, currentIndex) => currentIndex !== index),
-    );
-  }, []);
-
-  if (!open) return null;
-
-  const popover = (
+  const content = (
     <>
-      {centered && (
-        <div
-          className="fixed inset-0 bg-black/40 z-[199]"
-          onClick={() => onOpenChange(false)}
-        />
+      {(!inline || creationMode) && (
+        <div className="flex items-center justify-between gap-2 px-3.5 pt-3 pb-2">
+          {!inline && (
+            <span className="text-sm font-medium text-foreground/90">
+              {title}
+            </span>
+          )}
+          {creationMode && onCreationModeChange ? (
+            <CreationModeToggle
+              mode={creationMode}
+              onChange={onCreationModeChange}
+              disabled={loading || uploading || submitting}
+            />
+          ) : null}
+        </div>
       )}
-      <div
-        ref={panelRef}
-        className="fixed z-[200] w-[min(420px,calc(100vw-24px))] rounded-xl border border-border bg-popover shadow-2xl shadow-black/60"
-        style={{ top: 0, left: 0, visibility: "visible" }}
-      >
-        <div className="px-3.5 pt-3 pb-2">
-          <span className="text-sm font-medium text-foreground/90">
-            {title}
-          </span>
-        </div>
 
-        <div className="px-2 pb-2">
-          <PromptComposer
-            autoFocus
-            attachmentsEnabled
-            disabled={loading || uploading}
-            placeholder={placeholder}
-            onSubmit={handleSubmit}
-            attachButton={
-              <PromptAttachmentMenu
-                disabled={loading || uploading}
-                onUploadFiles={(files) =>
-                  setSelectedUploadFiles((current) => [...current, ...files])
+      {showStartChoice ? (
+        <div className="grid grid-cols-2 gap-2 px-3.5 pt-1 pb-3.5">
+          <button
+            type="button"
+            data-start-with-ai
+            disabled={loading}
+            onClick={() => {
+              trackEvent("design_start_mode_selected", {
+                app_name: "design",
+                template_name: "design",
+                mode: "ai",
+              });
+              setShowStartChoice(false);
+              requestAnimationFrame(() => {
+                const composer = document.querySelector<HTMLElement>(
+                  "[data-agent-native-prompt-popover] .ProseMirror",
+                );
+                composer?.focus();
+              });
+            }}
+            className="flex cursor-pointer flex-col gap-1.5 rounded-lg border border-transparent bg-[var(--design-editor-accent-color)] px-3 py-3 text-left text-[color:var(--design-editor-accent-contrast-color)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <AgentMark className="size-5 shrink-0" />
+            <span className="text-sm font-medium">
+              {t("promptDialog.startWithAi")}
+            </span>
+            <span className="text-xs leading-snug opacity-80">
+              {t("promptDialog.startWithAiHint")}
+            </span>
+          </button>
+          <button
+            type="button"
+            data-start-blank-canvas
+            disabled={loading || skipInFlight}
+            onClick={() => {
+              if (loading || skipInFlightRef.current) return;
+              trackEvent("design_start_mode_selected", {
+                app_name: "design",
+                template_name: "design",
+                mode: "blank_canvas",
+              });
+              skipInFlightRef.current = true;
+              setSkipInFlight(true);
+              onOpenChange(false);
+              void (async () => {
+                try {
+                  await onSkip?.();
+                } catch {
+                  skipInFlightRef.current = false;
+                  setSkipInFlight(false);
+                  onOpenChange(true);
                 }
-                onPickAsset={() => setAssetsPickerOpen(true)}
-              />
-            }
-          />
+              })();
+            }}
+            className="flex cursor-pointer flex-col gap-1.5 rounded-lg border border-border px-3 py-3 text-left transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <IconArtboard className="size-5 shrink-0 text-muted-foreground" />
+            <span className="text-sm font-medium text-foreground">
+              {t("promptDialog.startBlankCanvas")}
+            </span>
+            <span className="text-xs leading-snug text-muted-foreground">
+              {t("promptDialog.startBlankCanvasHint")}
+            </span>
+          </button>
         </div>
+      ) : null}
 
-        {(onDesignSystemChange || onCreateDesignSystem) && (
-          <div className="flex flex-wrap items-center gap-2 border-t border-border px-3.5 py-2">
-            <div className="flex min-w-0 flex-1 items-center gap-2">
-              <IconPalette className="h-4 w-4 shrink-0 text-muted-foreground" />
-              {designSystems.length > 0 ? (
-                <Select
-                  value={selectedDesignSystemId ?? "none"}
-                  onValueChange={(value) =>
-                    onDesignSystemChange?.(value === "none" ? null : value)
-                  }
-                  disabled={designSystemsLoading}
-                >
-                  <SelectTrigger className="h-8 min-w-0 flex-1 text-xs">
-                    <SelectValue placeholder="Design system" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="none" className="text-xs">
-                      No design system
-                    </SelectItem>
-                    {designSystems.map((system) => (
-                      <SelectItem
-                        key={system.id}
-                        value={system.id}
-                        className="text-xs"
+      <div className={cn(!inline && "px-2 pb-2", showStartChoice && "hidden")}>
+        <LazyChunkErrorBoundary fallback={<LazyChunkRetryFallback />}>
+          <Suspense
+            fallback={
+              <div
+                aria-busy="true"
+                className="flex min-h-36 flex-col justify-between gap-3 rounded-md border border-input p-3"
+              >
+                <Skeleton className="h-16 w-full" />
+                <div className="flex items-center justify-between gap-2">
+                  <Skeleton className="size-8" />
+                  <Skeleton className="h-8 w-24" />
+                </div>
+              </div>
+            }
+          >
+            {promptComposer}
+          </Suspense>
+        </LazyChunkErrorBoundary>
+      </div>
+      {!inline &&
+        !showStartChoice &&
+        (onTemplateChange ||
+          (systemsEnabled &&
+            (onDesignSystemChange || onCreateDesignSystem))) && (
+          <div className="grid grid-cols-[minmax(0,1fr)_2.25rem] gap-2 border-t border-border px-3.5 py-2.5">
+            {onTemplateChange ? (
+              <>
+                <TemplatePickerControl
+                  open={templatePickerOpen}
+                  onOpenChange={setTemplatePickerOpen}
+                  options={templateOptions}
+                  loading={templatesLoading}
+                  selectedId={selectedTemplateId ?? null}
+                  onChange={onTemplateChange}
+                />
+                <span aria-hidden="true" className="size-9" />
+              </>
+            ) : null}
+            {systemsEnabled &&
+            (onDesignSystemChange || onCreateDesignSystem) ? (
+              <>
+                <DesignSystemPickerControl
+                  designSystems={designSystems}
+                  loading={designSystemsLoading}
+                  selectedId={selectedDesignSystemId ?? null}
+                  onChange={(id) => onDesignSystemChange?.(id)}
+                  onSelectClosed={markNestedSelectJustClosed}
+                />
+                {onCreateDesignSystem ? (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        className="shrink-0"
+                        onClick={() => {
+                          trackEvent("design_system_creator_opened", {
+                            app_name: "design",
+                            template_name: "design",
+                          });
+                          onCreateDesignSystem();
+                        }}
+                        aria-label={t("promptDialog.createDesignSystem")}
                       >
-                        {system.title}
-                        {system.isDefault ? " (default)" : ""}
+                        <IconPlus className="size-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      {t("promptDialog.createDesignSystem")}
+                    </TooltipContent>
+                  </Tooltip>
+                ) : (
+                  <span aria-hidden="true" className="size-9" />
+                )}
+              </>
+            ) : null}
+            {showCreativeContextPicker ? (
+              <>
+                {creativeContextsLoading ? (
+                  <Skeleton className="h-9 w-full rounded-md" />
+                ) : (
+                  <Select
+                    value={selectedCreativeContextId ?? "none"}
+                    onValueChange={(value) =>
+                      onCreativeContextChange?.(value === "none" ? null : value)
+                    }
+                    onOpenChange={(nextOpen) => {
+                      if (!nextOpen) markNestedSelectJustClosed();
+                    }}
+                  >
+                    <SelectTrigger className="min-w-0 justify-start gap-2 px-2.5 text-xs [&>svg:last-child]:ms-auto">
+                      <IconBrain className="size-4 shrink-0 text-muted-foreground" />
+                      <span
+                        className="min-w-0 flex-1 truncate text-start"
+                        title={
+                          selectedCreativeContext?.name ??
+                          t("creativeContext.automatic")
+                        }
+                      >
+                        {selectedCreativeContext?.name ??
+                          t("creativeContext.automatic")}
+                      </span>
+                    </SelectTrigger>
+                    <SelectContent data-agent-native-prompt-select>
+                      <SelectItem value="none" className="text-xs">
+                        {t("creativeContext.automatic")}
                       </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              ) : (
-                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-                  No design system
-                </span>
-              )}
-            </div>
-            {onCreateDesignSystem && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-8 shrink-0"
-                onClick={onCreateDesignSystem}
-              >
-                <IconPlus className="h-3.5 w-3.5" />
-                New
-              </Button>
-            )}
+                      {creativeContexts.map((context) => (
+                        <SelectItem
+                          key={context.id}
+                          value={context.id}
+                          className="text-xs"
+                        >
+                          {context.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+                <span aria-hidden="true" className="size-9" />
+              </>
+            ) : null}
           </div>
         )}
 
-        {(selectedUploadFiles.length > 0 || pickedAssets.length > 0) && (
-          <div className="flex flex-wrap items-center gap-2 border-t border-border px-3.5 py-2">
-            {selectedUploadFiles.map((file, index) => (
-              <span
-                key={`${file.name}:${file.lastModified}:${file.size}:${index}`}
-                className="inline-flex h-8 min-w-0 max-w-[220px] items-center gap-1.5 rounded-md border border-border bg-muted/60 pl-2 pr-1 text-xs text-muted-foreground"
-              >
-                <span className="truncate">{file.name}</span>
-                <button
-                  type="button"
-                  className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-background hover:text-foreground"
-                  aria-label={`Remove ${file.name}`}
-                  onClick={() => removeSelectedUploadFile(index)}
-                >
-                  <IconX className="h-3.5 w-3.5" />
-                </button>
-              </span>
-            ))}
-            {pickedAssets.map((asset) => (
-              <span
-                key={asset.path}
-                className="inline-flex h-8 min-w-0 max-w-[220px] items-center gap-1.5 rounded-md border border-border bg-muted/60 pl-2 pr-1 text-xs text-muted-foreground"
-              >
-                <span className="truncate">{asset.originalName}</span>
-                <button
-                  type="button"
-                  className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-background hover:text-foreground"
-                  aria-label={`Remove ${asset.originalName}`}
-                  onClick={() => removePickedAsset(asset.path)}
-                >
-                  <IconX className="h-3.5 w-3.5" />
-                </button>
-              </span>
-            ))}
-          </div>
-        )}
-
-        {onSkip && (
+      {/* The chooser already offers the blank path as a peer, so the corner
+            link would be a second, quieter way to do the same thing. */}
+      {onSkip &&
+        skipLabel &&
+        (!inline || showInlineSkip) &&
+        !offerStartChoice && (
           <div className="flex justify-end border-t border-border px-3.5 py-2">
-            <button
+            <Button
               type="button"
+              variant="link"
+              size="sm"
+              disabled={loading || skipInFlight}
               onClick={() => {
-                onSkip();
-                onOpenChange(false);
+                if (loading || skipInFlightRef.current) return;
+                skipInFlightRef.current = true;
+                setSkipInFlight(true);
+                void (async () => {
+                  try {
+                    const shouldClose = await onSkip();
+                    if (shouldClose !== false) onOpenChange(false);
+                  } catch {
+                    skipInFlightRef.current = false;
+                    setSkipInFlight(false);
+                  }
+                })();
               }}
-              className="cursor-pointer text-xs text-[#609FF8] hover:text-[#7AB2FA]"
             >
               {skipLabel}
-            </button>
+            </Button>
           </div>
         )}
-
-        <AssetsPickerDialog
-          open={assetsPickerOpen}
-          onOpenChange={setAssetsPickerOpen}
-          url={assetsPickerUrl()}
-          onReady={handleAssetsPickerReady}
-          onMessage={handleAssetsPickerMessage}
-        />
-      </div>
     </>
   );
 
-  return createPortal(popover, document.body);
-}
+  if (inline) return <div data-design-inline-prompt>{content}</div>;
 
-function PromptAttachmentMenu({
-  disabled,
-  onUploadFiles,
-  onPickAsset,
-}: {
-  disabled?: boolean;
-  onUploadFiles: (files: File[]) => void;
-  onPickAsset: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <input
-        ref={inputRef}
-        type="file"
-        multiple
-        className="hidden"
-        onChange={(event) => {
-          onUploadFiles(Array.from(event.target.files ?? []));
-          event.target.value = "";
-          setOpen(false);
-        }}
-      />
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          disabled={disabled}
-          className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-accent/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
-          aria-label="Add"
-        >
-          <IconPlus className="h-4 w-4" />
-        </button>
-      </PopoverTrigger>
+    <Popover open={open} onOpenChange={onOpenChange}>
+      {open && centered && (
+        <div
+          className="fixed inset-0 z-[199] bg-black/40"
+          onClick={() => onOpenChange(false)}
+        />
+      )}
+      {hasVirtualAnchor ? (
+        <PopoverAnchor virtualRef={virtualAnchorRef} />
+      ) : (
+        <PopoverAnchor asChild>
+          <span
+            aria-hidden="true"
+            className={
+              centered
+                ? "fixed left-1/2 top-1/2 size-px"
+                : "fixed left-3 top-3 size-px"
+            }
+          />
+        </PopoverAnchor>
+      )}
       <PopoverContent
-        side="top"
-        align="start"
-        sideOffset={8}
-        data-agent-native-composer-popover
-        className="w-52 p-1"
+        side="bottom"
+        align="center"
+        sideOffset={12}
+        collisionPadding={12}
+        onCloseAutoFocus={(event) => event.preventDefault()}
+        onInteractOutside={(event) => {
+          if (
+            isNestedPromptPopoverTarget(event.target) ||
+            hasOpenNestedPromptPopoverSurface() ||
+            justClosedNestedSelectRef.current
+          ) {
+            event.preventDefault();
+          }
+        }}
+        data-agent-native-prompt-popover
+        className="relative z-[200] w-[min(420px,calc(100vw-24px))] rounded-xl border-border p-0 shadow-2xl shadow-black/60"
       >
-        <button
-          type="button"
-          className="flex w-full items-center gap-2.5 rounded-sm px-2.5 py-2 text-left text-xs hover:bg-accent/50"
-          onClick={() => inputRef.current?.click()}
-        >
-          <IconUpload className="h-3.5 w-3.5 text-muted-foreground" />
-          <span>
-            <span className="block font-medium text-foreground">
-              Upload file
-            </span>
-            <span className="block text-[10px] text-muted-foreground">
-              Images, PDFs, text/code
-            </span>
-          </span>
-        </button>
-        <button
-          type="button"
-          className="flex w-full items-center gap-2.5 rounded-sm px-2.5 py-2 text-left text-xs hover:bg-accent/50"
-          onClick={() => {
-            setOpen(false);
-            onPickAsset();
-          }}
-        >
-          <IconPhoto className="h-3.5 w-3.5 text-muted-foreground" />
-          <span>
-            <span className="block font-medium text-foreground">
-              Pick asset
-            </span>
-            <span className="block text-[10px] text-muted-foreground">
-              Browse or generate images
-            </span>
-          </span>
-        </button>
+        {content}
       </PopoverContent>
     </Popover>
+  );
+}
+
+function CreationModeToggle({
+  mode,
+  onChange,
+  disabled,
+}: {
+  mode: "design" | "app";
+  onChange: (mode: "design" | "app") => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label={
+        "Design or full app" /* i18n-ignore compact new-design mode toggle, flag-gated */
+      }
+      className="flex shrink-0 items-center gap-0.5 rounded-full border border-border bg-muted/40 p-0.5"
+    >
+      <button
+        type="button"
+        role="radio"
+        aria-checked={mode === "design"}
+        disabled={disabled}
+        onClick={() => {
+          trackEvent("design_start_mode_selected", {
+            app_name: "design",
+            template_name: "design",
+            mode: "design",
+          });
+          onChange("design");
+        }}
+        className={`flex cursor-pointer items-center gap-1 rounded-full px-2 py-1 !text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+          mode === "design"
+            ? "bg-background text-foreground shadow-sm"
+            : "text-muted-foreground hover:text-foreground/80"
+        }`}
+      >
+        <IconPalette className="h-3 w-3" />
+        {"Design" /* i18n-ignore compact new-design mode toggle, flag-gated */}
+      </button>
+      <button
+        type="button"
+        role="radio"
+        aria-checked={mode === "app"}
+        disabled={disabled}
+        onClick={() => {
+          trackEvent("design_start_mode_selected", {
+            app_name: "design",
+            template_name: "design",
+            mode: "app",
+          });
+          onChange("app");
+        }}
+        className={`flex cursor-pointer items-center gap-1 rounded-full px-2 py-1 !text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+          mode === "app"
+            ? "bg-background text-foreground shadow-sm"
+            : "text-muted-foreground hover:text-foreground/80"
+        }`}
+      >
+        <IconApps className="h-3 w-3" />
+        {
+          "Full app" /* i18n-ignore compact new-design mode toggle, flag-gated */
+        }
+      </button>
+    </div>
   );
 }

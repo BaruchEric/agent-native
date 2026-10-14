@@ -1,31 +1,63 @@
-import { useParams, redirect, type LoaderFunctionArgs } from "react-router";
-import DocsLayout from "../components/DocsLayout";
-import DocContent from "../components/DocContent";
-import { getDoc } from "../components/docs-content";
-import { withDefaultSocialImage, withDocsSocialImage } from "../seo";
+import { withSsrHtmlContentType } from "@agent-native/core/shared";
+import {
+  redirect,
+  useLoaderData,
+  type ClientLoaderFunctionArgs,
+  type LoaderFunctionArgs,
+} from "react-router";
 
-/** Legacy slug → current slug. Keep in sync with any renames in content/. */
-const SLUG_REDIRECTS: Record<string, string> = {
-  resources: "workspace",
-  secrets: "security",
-  // Plans docs consolidated into the single template-plan page.
-  "visual-plans": "template-plan",
-};
+import DocContent from "../components/DocContent";
+import DocDraftBanner from "../components/DocDraftBanner";
+import {
+  loadDocRespectingDraftVisibility,
+  preloadDocBlocksForDoc,
+  type DocEntry,
+} from "../components/docs-content";
+import {
+  DEFAULT_DOCS_LOCALE,
+  docsPathForSlug,
+  docsLocaleFromSegment,
+} from "../components/docs-locale";
+import { docsMarkdownPathForDoc } from "../components/docs-seo";
+import { DOCS_SLUG_REDIRECTS } from "../components/docs-slug-redirects";
+import DocsLayout from "../components/DocsLayout";
+import { withDefaultSocialImage, withDocsSocialImage } from "../seo";
 
 export async function loader({ params }: LoaderFunctionArgs) {
   const slug = params.slug!;
-  const target = SLUG_REDIRECTS[slug];
-  if (target) {
-    throw redirect(`/docs/${target}`, 301);
+  const slugLocale = docsLocaleFromSegment(slug);
+  if (slugLocale) {
+    throw withSsrHtmlContentType(
+      redirect(docsPathForSlug("getting-started", slugLocale), 302),
+    );
   }
-  if (!getDoc(slug)) {
+
+  const target = DOCS_SLUG_REDIRECTS[slug];
+  if (target) {
+    throw withSsrHtmlContentType(
+      redirect(docsPathForSlug(target, DEFAULT_DOCS_LOCALE), 301),
+    );
+  }
+  const doc = await loadDocRespectingDraftVisibility(slug);
+  if (!doc) {
     throw new Response("Not Found", { status: 404 });
   }
-  return null;
+  return doc;
 }
 
-export const meta = ({ params }: { params: { slug: string } }) => {
-  const doc = getDoc(params.slug);
+export async function clientLoader({ serverLoader }: ClientLoaderFunctionArgs) {
+  const doc = (await serverLoader()) as DocEntry;
+  return preloadDocBlocksForDoc(doc);
+}
+
+export const meta = ({
+  data,
+  loaderData,
+}: {
+  data?: DocEntry;
+  loaderData?: DocEntry;
+}) => {
+  const doc = data ?? loaderData;
   if (!doc)
     return withDefaultSocialImage([{ title: "Not Found — Agent-Native" }]);
   return withDocsSocialImage(
@@ -41,12 +73,7 @@ export const meta = ({ params }: { params: { slug: string } }) => {
 };
 
 export default function DocPage() {
-  const { slug } = useParams<{ slug: string }>();
-  const doc = getDoc(slug!);
-
-  // Loader already throws 404 for unknown slugs; this is just a type-narrowing
-  // guard for the TypeScript type — should never be reached at runtime.
-  if (!doc) return null;
+  const doc = useLoaderData<typeof loader>();
 
   const toc = doc.headings.map((h) => ({
     id: h.id,
@@ -55,7 +82,13 @@ export default function DocPage() {
   }));
 
   return (
-    <DocsLayout toc={toc}>
+    <DocsLayout
+      toc={toc}
+      markdownUrl={
+        docsMarkdownPathForDoc(doc.slug, DEFAULT_DOCS_LOCALE) ?? undefined
+      }
+    >
+      {doc.draft && <DocDraftBanner />}
       <DocContent markdown={doc.body} />
     </DocsLayout>
   );

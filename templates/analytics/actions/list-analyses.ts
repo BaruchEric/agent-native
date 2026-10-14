@@ -1,10 +1,11 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
+import { defineAction } from "@agent-native/core/action";
 import {
   getRequestUserEmail,
   getRequestOrgId,
   buildDeepLink,
 } from "@agent-native/core/server";
+import { z } from "zod";
+
 import { listAnalyses } from "../server/lib/dashboards-store";
 
 export default defineAction({
@@ -15,6 +16,7 @@ export default defineAction({
   }),
   http: { method: "GET" },
   readOnly: true,
+  mcpTool: true,
   publicAgent: { expose: true, readOnly: true, requiresAuth: true },
   link: () => ({
     url: buildDeepLink({ app: "analytics", view: "analyses" }),

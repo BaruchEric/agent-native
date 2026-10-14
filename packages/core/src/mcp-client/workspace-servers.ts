@@ -1,11 +1,12 @@
 import crypto from "node:crypto";
+
 import { getDbExec } from "../db/client.js";
+import type { SecretScope } from "../secrets/register.js";
 import { readAppSecret } from "../secrets/storage.js";
 import {
   getRequestOrgId,
   getRequestUserEmail,
 } from "../server/request-context.js";
-import type { SecretScope } from "../secrets/register.js";
 import type { McpHttpServerConfig, McpServerConfig } from "./config.js";
 import {
   hashEmail,
@@ -227,7 +228,7 @@ async function normalizeWorkspaceMcpConfig(
 
 function isMissingWorkspaceResourceTable(error: unknown): boolean {
   const message = String((error as { message?: unknown })?.message ?? error);
-  return /workspace_resources|workspace_resource_grants|no such table|does not exist/i.test(
+  return /workspace_resources|workspace_resource_grants|relation .* does not exist|undefined_table/i.test(
     message,
   );
 }
@@ -264,8 +265,8 @@ async function selectWorkspaceMcpResourceRows(options?: {
         AND wr.scope = ?
         AND wr.path LIKE ?
         AND (
-          (? IS NOT NULL AND wr.org_id = ?)
-          OR (? IS NOT NULL AND wr.org_id IS NULL AND lower(wr.owner_email) = lower(?))
+          (CAST(? AS TEXT) IS NOT NULL AND wr.org_id = ?)
+          OR (CAST(? AS TEXT) IS NOT NULL AND wr.org_id IS NULL AND lower(wr.owner_email) = lower(?))
         )
     `,
     args: [
@@ -303,8 +304,8 @@ async function selectWorkspaceMcpResourceRows(options?: {
         AND wg.status = ?
         AND wg.app_id = ?
         AND (
-          (? IS NOT NULL AND wr.org_id = ?)
-          OR (? IS NOT NULL AND wr.org_id IS NULL AND lower(wr.owner_email) = lower(?))
+          (CAST(? AS TEXT) IS NOT NULL AND wr.org_id = ?)
+          OR (CAST(? AS TEXT) IS NOT NULL AND wr.org_id IS NULL AND lower(wr.owner_email) = lower(?))
         )
         AND (
           (wr.org_id IS NOT NULL AND wg.org_id = wr.org_id)
@@ -330,14 +331,6 @@ async function selectWorkspaceMcpResourceRows(options?: {
   ];
 }
 
-/**
- * Load Dispatch-managed workspace MCP server resources for this app.
- *
- * Resources live in Dispatch's `workspace_resources` table with
- * `kind = "mcp-server"` and paths under `mcp-servers/*.json`. All-app rows
- * are loaded everywhere; selected rows are loaded only when granted to the
- * current `AGENT_NATIVE_WORKSPACE_APP_ID`.
- */
 export async function loadWorkspaceMcpServers(options?: {
   workspaceAppId?: string | null;
   userEmail?: string | null;
@@ -350,7 +343,7 @@ export async function loadWorkspaceMcpServers(options?: {
     if (!isMissingWorkspaceResourceTable(error)) {
       console.warn(
         `[mcp-client] Failed to load workspace MCP server resources: ${
-          (error as { message?: string })?.message ?? error
+          (error as { message?: string })?.message ?? String(error)
         }`,
       );
     }
@@ -368,7 +361,7 @@ export async function loadWorkspaceMcpServers(options?: {
     } catch (error) {
       console.warn(
         `[mcp-client] Skipping workspace MCP server resource ${row.path}: ${
-          (error as { message?: string })?.message ?? error
+          (error as { message?: string })?.message ?? String(error)
         }`,
       );
     }

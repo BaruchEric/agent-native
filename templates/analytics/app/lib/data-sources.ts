@@ -1,4 +1,3 @@
-import type { ComponentType } from "react";
 import {
   IconChartBar,
   IconDatabase,
@@ -20,6 +19,7 @@ import {
   IconCloud,
   IconGauge,
 } from "@tabler/icons-react";
+import type { ComponentType } from "react";
 
 export type DataSourceCategory =
   | "analytics"
@@ -41,7 +41,6 @@ export interface WalkthroughStep {
   inputPlaceholder?: string;
   inputType?: "text" | "password" | "textarea";
   optional?: boolean;
-  /** Allow file upload for this input (e.g. ".json") */
   inputAcceptFile?: string;
 }
 
@@ -52,6 +51,7 @@ export interface DataSource {
   category: DataSourceCategory;
   icon: ComponentType<Record<string, unknown>>;
   envKeys: string[];
+  credentialRequirementMode?: "all" | "any";
   walkthroughSteps: WalkthroughStep[];
   docsUrl: string;
 }
@@ -78,8 +78,19 @@ export const categoryOrder: DataSourceCategory[] = [
   "seo",
 ];
 
+/**
+ * Logo ids in the shared logo table (mcpIntegrationLogo). An id missing from
+ * this map uses its source id as the logo id; no logo there means a Tabler icon.
+ */
+export const DATA_SOURCE_LOGO_IDS: Record<string, string> = {
+  gcloud: "google-cloud",
+  "google-sheets-export": "google-sheets",
+  twitter: "x",
+  builder: "builder-cms",
+  commonroom: "common-room",
+};
+
 export const dataSources: DataSource[] = [
-  // --- Analytics & Product ---
   {
     id: "google-analytics",
     name: "Google Analytics",
@@ -144,9 +155,10 @@ export const dataSources: DataSource[] = [
     description: "Query your data warehouse datasets directly with SQL",
     category: "analytics",
     icon: IconDatabase,
+    credentialRequirementMode: "all",
     envKeys: [
-      "GOOGLE_APPLICATION_CREDENTIALS_JSON",
       "BIGQUERY_PROJECT_ID",
+      "GOOGLE_APPLICATION_CREDENTIALS_JSON",
       "ANALYTICS_BIGQUERY_EVENTS_TABLE",
     ],
     docsUrl: "https://cloud.google.com/bigquery/docs",
@@ -180,6 +192,7 @@ export const dataSources: DataSource[] = [
         inputPlaceholder: '{"type": "service_account", ...}',
         inputType: "textarea",
         inputAcceptFile: ".json",
+        optional: true,
       },
       {
         title: "Enter your BigQuery Project ID",
@@ -314,8 +327,35 @@ export const dataSources: DataSource[] = [
       },
     ],
   },
+  {
+    id: "builder",
+    name: "Builder.io Content",
+    description:
+      "Published Builder.io content for content performance analysis",
+    category: "analytics",
+    icon: IconFileText,
+    envKeys: ["BUILDER_PUBLIC_KEY"],
+    docsUrl: "https://www.builder.io/c/docs/content-api",
+    walkthroughSteps: [
+      {
+        title: "Get your Builder.io public API key",
+        description:
+          "Open Builder.io account settings and copy a public API key.",
+        url: "https://builder.io/account/space",
+        linkText: "Builder.io account settings",
+      },
+      {
+        title: "Enter your public API key",
+        description:
+          "Paste the public API key for the space containing your content.",
+        inputKey: "BUILDER_PUBLIC_KEY",
+        inputLabel: "Public API key",
+        inputPlaceholder: "your-builder-public-key",
+        inputType: "password",
+      },
+    ],
+  },
 
-  // --- IconDatabase ---
   {
     id: "postgresql",
     name: "PostgreSQL",
@@ -344,7 +384,6 @@ export const dataSources: DataSource[] = [
     ],
   },
 
-  // --- Payments ---
   {
     id: "stripe",
     name: "Stripe",
@@ -373,14 +412,14 @@ export const dataSources: DataSource[] = [
     ],
   },
 
-  // --- CRM & Sales ---
   {
     id: "hubspot",
     name: "HubSpot",
     description: "CRM deals, contacts, companies, tickets, and pipelines",
     category: "crm",
     icon: IconShoppingCart,
-    envKeys: ["HUBSPOT_ACCESS_TOKEN"],
+    envKeys: ["HUBSPOT_PRIVATE_APP_TOKEN", "HUBSPOT_ACCESS_TOKEN"],
+    credentialRequirementMode: "any",
     docsUrl: "https://developers.hubspot.com/docs/api/overview",
     walkthroughSteps: [
       {
@@ -391,10 +430,19 @@ export const dataSources: DataSource[] = [
         linkText: "Private Apps",
       },
       {
-        title: "Enter your Access Token",
+        title: "Enter your Private App Token",
         description: "Copy the access token from your private app.",
+        inputKey: "HUBSPOT_PRIVATE_APP_TOKEN",
+        inputLabel: "Private App Token",
+        inputPlaceholder: "pat-na1-...",
+        inputType: "password",
+      },
+      {
+        title: "Legacy access token",
+        description:
+          "Only use this if you already have an older HubSpot access token saved under the legacy key.",
         inputKey: "HUBSPOT_ACCESS_TOKEN",
-        inputLabel: "Access Token",
+        inputLabel: "Legacy Access Token",
         inputPlaceholder: "pat-na1-...",
         inputType: "password",
       },
@@ -470,8 +518,35 @@ export const dataSources: DataSource[] = [
       },
     ],
   },
+  {
+    id: "clay",
+    name: "Clay",
+    description:
+      "GTM search, enrichment routines, and read-only table queries through Clay's Public API",
+    category: "crm",
+    icon: IconUserSearch,
+    envKeys: ["CLAY_PUBLIC_API_KEY"],
+    docsUrl: "https://developers.clay.com/",
+    walkthroughSteps: [
+      {
+        title: "Create a Clay Public API key",
+        description:
+          "In Clay, go to Settings > Account > API keys (beta) and create a key for the user and workspace this connection should access.",
+        url: "https://developers.clay.com/public-api/authentication",
+        linkText: "Clay API authentication",
+      },
+      {
+        title: "Enter your Public API key",
+        description:
+          "This hosted API credential is separate from the optional local clay CLI/MCP browser-login session.",
+        inputKey: "CLAY_PUBLIC_API_KEY",
+        inputLabel: "Public API key",
+        inputPlaceholder: "your-clay-public-api-key",
+        inputType: "password",
+      },
+    ],
+  },
 
-  // --- Engineering ---
   {
     id: "github",
     name: "GitHub",
@@ -705,18 +780,18 @@ export const dataSources: DataSource[] = [
     ],
   },
 
-  // --- Communication ---
   {
     id: "slack",
     name: "Slack",
-    description: "Channel messages and workspace search",
+    description:
+      "Channel history and workspace search. Prefer a Slack workspace integration from Settings > Integrations; a local bot token remains available as a legacy fallback.",
     category: "communication",
     icon: IconMessage,
     envKeys: ["SLACK_BOT_TOKEN"],
     docsUrl: "https://api.slack.com/methods",
     walkthroughSteps: [
       {
-        title: "Create a Slack App",
+        title: "Create a Slack App for local fallback access",
         description:
           "Go to api.slack.com/apps, create a new app, and add OAuth scopes: channels:read, channels:history, search:read.",
         url: "https://api.slack.com/apps",
@@ -728,10 +803,10 @@ export const dataSources: DataSource[] = [
           'Under "OAuth & Permissions", install the app and copy the Bot User OAuth Token.',
       },
       {
-        title: "Enter your Bot Token",
+        title: "Enter your local fallback Bot Token",
         description: 'Paste the Bot User OAuth Token (starts with "xoxb-").',
         inputKey: "SLACK_BOT_TOKEN",
-        inputLabel: "Bot Token",
+        inputLabel: "Bot Token (legacy local fallback)",
         inputPlaceholder: "xoxb-...",
         inputType: "password",
       },
@@ -801,7 +876,6 @@ export const dataSources: DataSource[] = [
     ],
   },
 
-  // --- Support ---
   {
     id: "pylon",
     name: "Pylon",
@@ -850,7 +924,6 @@ export const dataSources: DataSource[] = [
     ],
   },
 
-  // --- SEO ---
   {
     id: "dataforseo",
     name: "DataForSEO",

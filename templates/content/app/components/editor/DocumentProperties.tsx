@@ -1,34 +1,83 @@
+import { emailToName } from "@agent-native/core/client/collab";
+import { useSession } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { useFileUploadStatus } from "@agent-native/core/client/uploads";
 import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type PointerEvent as ReactPointerEvent,
-  type ReactNode,
-} from "react";
+  closestCenter,
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import type {
+  BindContentDatabaseSourceFieldRequest,
+  ContentDatabaseResponse,
+  ContentDatabaseSource,
+  ContentDatabaseSummary,
+  DocumentProperty,
+  DocumentPropertyRelationTarget,
+} from "@shared/api";
+import {
+  CREATABLE_DOCUMENT_PROPERTY_TYPES,
+  DOCUMENT_PROPERTY_TYPE_LABELS,
+  DOCUMENT_PROPERTY_VISIBILITIES,
+  defaultPropertyOptions,
+  documentPropertyDateIncludesTime,
+  documentPropertyDateKey,
+  documentPropertyDatePart,
+  isEmptyPropertyValue,
+  isComputedPropertyType,
+  isOnlyBlocksFieldDeletion,
+  MAX_RELATION_TARGETS,
+  normalizeDatePropertyValue,
+  type DocumentPropertyDateValue,
+  type DocumentPropertyOption,
+  type DocumentPropertyOptionColor,
+  type DocumentPropertyType,
+  type DocumentPropertyVisibility,
+} from "@shared/properties";
 import {
   IconAlignLeft,
+  IconArrowLeft,
+  IconArrowDown,
+  IconArrowRight,
+  IconArrowUp,
+  IconArrowsSort,
   IconAt,
   IconCalendar,
   IconCheck,
   IconCircleChevronDown,
   IconCircleDotted,
   IconClockFilled,
-  IconClock,
   IconCopy,
+  IconDatabase,
   IconEdit,
   IconEye,
   IconEyeOff,
+  IconFileText,
+  IconFilter,
+  IconGripVertical,
   IconHash,
   IconLink,
   IconList,
   IconMapPin,
+  IconMinus,
   IconNumber,
   IconNumber123,
   IconPaperclip,
-  IconPalette,
   IconPhone,
   IconPlus,
+  IconPlugConnected,
   IconSearch,
   IconSquareCheck,
   IconTrash,
@@ -38,11 +87,20 @@ import {
   type Icon,
 } from "@tabler/icons-react";
 import {
-  emailToName,
-  useActionMutation,
-  useSession,
-} from "@agent-native/core/client";
-import { useQueryClient } from "@tanstack/react-query";
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from "react";
+import { Link } from "react-router";
+import { toast } from "sonner";
+
+import { FileStorageStatusGate } from "@/components/editor/FileStorageStatusGate";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -52,13 +110,13 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
-  AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
@@ -68,51 +126,68 @@ import {
 import { Input } from "@/components/ui/input";
 import {
   Popover,
+  PopoverAnchor,
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Spinner } from "@/components/ui/spinner";
-import { cn } from "@/lib/utils";
-import { toast } from "sonner";
+import { Textarea } from "@/components/ui/textarea";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useContentActionMutation } from "@/hooks/use-content-action-mutation";
+import {
+  contentDatabaseConstrainedQueryFilter,
+  useAddContentDatabaseSourceFieldProperty,
+  useAddDatabaseItem,
+  useContentDatabases,
+} from "@/hooks/use-content-database";
+import {
+  documentPropertiesResponseMatchesScope,
   useConfigureDocumentProperty,
+  useContentDatabaseRowSearch,
   useDeleteDocumentProperty,
   useDocumentProperties,
   useDuplicateDocumentProperty,
   useSetDocumentProperty,
 } from "@/hooks/use-document-properties";
-import { applySourceFieldPropertyToDatabaseResponse } from "@/hooks/use-content-database";
+import { cn } from "@/lib/utils";
+
+import { ContentIcon } from "../icons/ContentIcon";
+import { ColumnPresentationMenuItems } from "./database/DatabaseColumnPresentation";
 import {
-  CREATABLE_DOCUMENT_PROPERTY_TYPES,
-  DOCUMENT_PROPERTY_TYPE_LABELS,
-  DOCUMENT_PROPERTY_VISIBILITY_LABELS,
-  DOCUMENT_PROPERTY_VISIBILITIES,
-  defaultPropertyOptions,
-  documentPropertyDateIncludesTime,
-  documentPropertyDateKey,
-  documentPropertyDatePart,
-  isEmptyPropertyValue,
-  isComputedPropertyType,
-  normalizeDatePropertyValue,
-  type DocumentPropertyDateValue,
-  type DocumentPropertyOption,
-  type DocumentPropertyOptionColor,
-  type DocumentPropertyType,
-  type DocumentPropertyVisibility,
-} from "@shared/properties";
-import type {
-  AddContentDatabaseSourceFieldPropertyRequest,
-  ContentDatabaseResponse,
-  ContentDatabaseSourceFieldPropertyResponse,
-  ContentDatabaseSource,
-  DocumentProperty,
-} from "@shared/api";
+  clearDatabaseFiltersForColumn,
+  clearDatabaseSort,
+  databaseQuickFilterOptionsForColumn,
+  upsertDatabaseQuickFilter,
+  upsertDatabaseSort,
+} from "./database/filter-sort";
+import type { DatabaseFilter, DatabaseSort } from "./database/types";
+import { EmojiPicker } from "./EmojiPicker";
 import { imageUploadErrorMessage, uploadImageFile } from "./image-upload";
+
+type TFunction = ReturnType<typeof useT>;
+
+function tWithFallback(
+  t: TFunction | undefined,
+  key: string,
+  fallback: string,
+  options?: Record<string, unknown>,
+) {
+  if (!t) return fallback;
+  const value = t(key, options);
+  return value === key ? fallback : value;
+}
 
 interface DocumentPropertiesProps {
   documentId: string;
+  databaseId: string | null;
+  databaseDocumentId: string | null;
   canEdit: boolean;
   popoversPortalled?: boolean;
+  popoverContainer?: HTMLElement | null;
 }
 
 export const TYPE_ICONS: Record<DocumentPropertyType, Icon> = {
@@ -132,12 +207,32 @@ export const TYPE_ICONS: Record<DocumentPropertyType, Icon> = {
   email: IconAt,
   phone: IconPhone,
   relation: IconLink,
+  blocks: IconFileText,
   id: IconNumber,
   created_time: IconClockFilled,
   created_by: IconUserCircle,
   last_edited_time: IconClockFilled,
   last_edited_by: IconUserCircle,
 };
+
+function PropertyDefinitionIcon({
+  property,
+  className,
+}: {
+  property: DocumentProperty;
+  className?: string;
+}) {
+  const FallbackIcon = TYPE_ICONS[property.definition.type];
+  return property.definition.icon ? (
+    <ContentIcon
+      value={property.definition.icon}
+      size={16}
+      className={className}
+    />
+  ) : (
+    <FallbackIcon className={className} />
+  );
+}
 
 export const OPTION_COLOR_CLASSES: Record<DocumentPropertyOptionColor, string> =
   {
@@ -171,6 +266,7 @@ const PROPERTY_TYPE_SEARCH_ALIASES: Partial<
   formula: ["calculate", "calculation", "computed", "equation"],
   relation: ["relationship", "linked", "link", "database"],
   rollup: ["aggregate", "aggregation", "sum", "count", "relation"],
+  blocks: ["content", "body", "rich text", "rich-text", "page", "notes"],
 };
 
 function slugify(value: string) {
@@ -226,12 +322,15 @@ function formatDateTime(value: string) {
   }).format(date);
 }
 
-function formatPropertyDateDisplayValue(value: DocumentProperty["value"]) {
+function formatPropertyDateDisplayValue(
+  value: DocumentProperty["value"],
+  t?: TFunction,
+) {
   const includeTime = documentPropertyDateIncludesTime(value);
   const formatter = includeTime ? formatDateTime : formatDate;
   const start = documentPropertyDatePart(value, "start");
   const end = documentPropertyDatePart(value, "end");
-  if (!start) return "Empty";
+  if (!start) return tWithFallback(t, "editor.properties.empty", "Empty");
   return end ? `${formatter(start)} - ${formatter(end)}` : formatter(start);
 }
 
@@ -245,37 +344,57 @@ function optionById(property: DocumentProperty, id: string | null) {
   );
 }
 
-export function displayValue(property: DocumentProperty) {
+function propertyText(value: unknown) {
+  return typeof value === "string" ? value : (JSON.stringify(value) ?? "");
+}
+
+export type PropertyValuePresentation = "compact" | "wrapped";
+
+function propertyValueTextClass(presentation: PropertyValuePresentation) {
+  return presentation === "wrapped"
+    ? "whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
+    : "truncate whitespace-nowrap";
+}
+
+export function displayValue(
+  property: DocumentProperty,
+  t?: TFunction,
+  presentation: PropertyValuePresentation = "compact",
+  displayOptions: { interactiveRelations?: boolean } = {},
+) {
   const value = property.value;
   const type = property.definition.type;
+  const empty = tWithFallback(t, "editor.properties.empty", "Empty");
 
   if (value === null || value === undefined || value === "") {
-    return <span className="text-muted-foreground/70">Empty</span>;
+    return <span className="text-muted-foreground/70">{empty}</span>;
   }
 
   if (type === "checkbox") {
     return value ? (
       <span className="inline-flex items-center gap-1.5 text-foreground">
         <IconCheck className="size-3.5" />
-        Checked
+        {tWithFallback(t, "editor.properties.checked", "Checked")}
       </span>
     ) : (
-      <span className="text-muted-foreground/70">Unchecked</span>
+      <span className="text-muted-foreground/70">
+        {tWithFallback(t, "editor.properties.unchecked", "Unchecked")}
+      </span>
     );
   }
 
   if (type === "date") {
-    return <span>{formatPropertyDateDisplayValue(value)}</span>;
+    return <span>{formatPropertyDateDisplayValue(value, t)}</span>;
   }
 
   if (type === "created_time" || type === "last_edited_time") {
-    return <span>{formatDateTime(String(value))}</span>;
+    return <span>{formatDateTime(propertyText(value))}</span>;
   }
 
   if (type === "person") {
     const people = personItems(value);
     if (people.length === 0) {
-      return <span className="text-muted-foreground/70">Empty</span>;
+      return <span className="text-muted-foreground/70">{empty}</span>;
     }
     return (
       <span className="inline-flex max-w-full flex-wrap gap-1">
@@ -287,17 +406,17 @@ export function displayValue(property: DocumentProperty) {
   }
 
   if (type === "created_by" || type === "last_edited_by") {
-    return <PersonPill value={String(value)} />;
+    return <PersonPill value={propertyText(value)} />;
   }
 
   if (type === "place") {
-    return <PlacePill value={String(value)} />;
+    return <PlacePill value={propertyText(value)} />;
   }
 
   if (type === "files_media") {
     const items = filesMediaItems(value);
     if (items.length === 0) {
-      return <span className="text-muted-foreground/70">Empty</span>;
+      return <span className="text-muted-foreground/70">{empty}</span>;
     }
     return (
       <span className="inline-flex max-w-full flex-wrap gap-1">
@@ -309,37 +428,67 @@ export function displayValue(property: DocumentProperty) {
   }
 
   if (type === "relation") {
-    const items = relationItems(value);
-    if (items.length === 0) {
-      return <span className="text-muted-foreground/70">Empty</span>;
+    const ids = relationItems(value);
+    if (ids.length === 0) {
+      return <span className="text-muted-foreground/70">{empty}</span>;
     }
+    const targets = property.relationTargets ?? [];
+    const unavailable = ids.length - targets.length;
     return (
-      <span className="inline-flex max-w-full items-center gap-1.5 rounded bg-muted px-1.5 py-0.5 text-xs font-medium text-foreground">
-        <IconLink className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="truncate">
-          {items.length} page{items.length === 1 ? "" : "s"}
-        </span>
+      <span className="inline-flex max-w-full flex-wrap gap-1">
+        {targets.map((target) => (
+          <RelationPill
+            key={target.documentId}
+            target={target}
+            interactive={!!displayOptions.interactiveRelations}
+            t={t}
+          />
+        ))}
+        {unavailable > 0 ? (
+          <span className="inline-flex max-w-full items-center gap-1.5 rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+            <IconLink className="size-3.5 shrink-0" />
+            <span className="truncate">
+              {tWithFallback(
+                t,
+                "editor.properties.unavailablePageCount",
+                `${unavailable} unavailable`,
+                { count: unavailable },
+              )}
+            </span>
+          </span>
+        ) : null}
       </span>
     );
   }
 
   if (type === "select" || type === "status") {
-    const option = optionById(property, String(value));
+    const option = optionById(property, propertyText(value));
     return option ? (
-      <OptionPill option={option} />
+      <OptionPill option={option} presentation={presentation} />
     ) : (
-      <span>{String(value)}</span>
+      <span className={propertyValueTextClass(presentation)}>
+        {propertyText(value)}
+      </span>
     );
   }
 
   if (type === "multi_select" && Array.isArray(value)) {
     if (value.length === 0)
-      return <span className="text-muted-foreground/70">Empty</span>;
+      return <span className="text-muted-foreground/70">{empty}</span>;
     return (
-      <span className="inline-flex flex-wrap gap-1">
+      <span
+        className={cn(
+          "inline-flex max-w-full min-w-0 gap-1",
+          presentation === "wrapped"
+            ? "flex-wrap"
+            : "flex-nowrap overflow-hidden",
+        )}
+      >
         {value.map((id) => {
           const option = optionById(property, id);
-          return option ? <OptionPill key={id} option={option} /> : null;
+          return option ? (
+            <OptionPill key={id} option={option} presentation={presentation} />
+          ) : null;
         })}
       </span>
     );
@@ -347,24 +496,42 @@ export function displayValue(property: DocumentProperty) {
 
   if (type === "url" && typeof value === "string") {
     return (
-      <span className="underline decoration-muted-foreground/40 underline-offset-2">
+      <span
+        className={cn(
+          "underline decoration-muted-foreground/40 underline-offset-2",
+          propertyValueTextClass(presentation),
+        )}
+      >
         {value}
       </span>
     );
   }
 
-  return <span>{String(value)}</span>;
+  return (
+    <span className={propertyValueTextClass(presentation)}>
+      {propertyText(value)}
+    </span>
+  );
 }
 
-function OptionPill({ option }: { option: DocumentPropertyOption }) {
+function OptionPill({
+  option,
+  presentation = "compact",
+}: {
+  option: DocumentPropertyOption;
+  presentation?: PropertyValuePresentation;
+}) {
   return (
     <span
       className={cn(
-        "inline-flex max-w-full items-center rounded px-1.5 py-0.5 text-xs font-medium",
+        "inline-flex max-w-full min-w-0 items-center rounded px-1.5 py-0.5 text-xs font-medium",
+        presentation === "compact" && "shrink",
         optionClass(option),
       )}
     >
-      <span className="truncate">{option.name}</span>
+      <span className={propertyValueTextClass(presentation)}>
+        {option.name}
+      </span>
     </span>
   );
 }
@@ -406,7 +573,7 @@ function personInitials(value: string) {
   );
 }
 
-function PersonPill({ value }: { value: string }) {
+export function PersonPill({ value }: { value: string }) {
   return (
     <span className="inline-flex max-w-full items-center gap-1.5 rounded bg-muted px-1.5 py-0.5 text-xs font-medium text-foreground">
       <span className="flex size-4 shrink-0 items-center justify-center rounded-full bg-background text-[9px] font-semibold text-muted-foreground">
@@ -447,6 +614,24 @@ export function filesMediaEditorValue(value: DocumentProperty["value"]) {
   return filesMediaItems(value).join("\n");
 }
 
+export function isValidFilesMediaLink(value: string) {
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+export function mergeFilesMediaItems(items: string[], pendingLink: string) {
+  const trimmed = pendingLink.trim();
+  if (!trimmed || !isValidFilesMediaLink(trimmed)) return items;
+  if (items.some((item) => item.toLowerCase() === trimmed.toLowerCase())) {
+    return items;
+  }
+  return [...items, trimmed];
+}
+
 export function filesMediaLabel(value: string) {
   const trimmed = value.trim();
   if (!trimmed) return "File";
@@ -475,6 +660,65 @@ export function relationItems(value: DocumentProperty["value"]) {
     : typeof value === "string" && value.trim()
       ? [value.trim()]
       : [];
+}
+
+export function relationTargetPath(target: DocumentPropertyRelationTarget) {
+  if (!target.databaseId || !target.databaseDocumentId) {
+    return `/page/${target.documentId}`;
+  }
+  const search = new URLSearchParams({
+    databaseId: target.databaseId,
+    databaseDocumentId: target.databaseDocumentId,
+  });
+  return `/page/${target.documentId}?${search.toString()}`;
+}
+
+function RelationPill({
+  target,
+  interactive,
+  t,
+}: {
+  target: DocumentPropertyRelationTarget;
+  interactive: boolean;
+  t?: TFunction;
+}) {
+  const content = (
+    <>
+      {target.icon ? (
+        <span className="shrink-0 text-[0.8rem] leading-none">
+          {target.icon}
+        </span>
+      ) : (
+        <IconFileText className="size-3.5 shrink-0 text-muted-foreground" />
+      )}
+      <span className="truncate">{target.title}</span>
+    </>
+  );
+  const className =
+    "inline-flex max-w-full items-center gap-1.5 rounded bg-muted px-1.5 py-0.5 text-xs font-medium text-foreground";
+  if (!interactive) return <span className={className}>{content}</span>;
+  return (
+    <Link
+      to={relationTargetPath(target)}
+      aria-label={tWithFallback(
+        t,
+        "editor.properties.openPage",
+        `Open ${target.title}`,
+        { name: target.title },
+      )}
+      className={cn(
+        className,
+        "underline-offset-2 hover:bg-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+      )}
+      // Keep the click on the link: the surrounding cell opens the value
+      // editor, and table rows / cards have their own click handlers.
+      onClick={(event) => event.stopPropagation()}
+      onPointerDown={(event) => event.stopPropagation()}
+      onKeyDown={(event) => event.stopPropagation()}
+    >
+      {content}
+    </Link>
+  );
 }
 
 function FilesMediaPill({ value }: { value: string }) {
@@ -515,7 +759,8 @@ export function filterPropertyOptions(
   return options.filter(
     (option) =>
       option.name.toLowerCase().includes(normalizedQuery) ||
-      option.id.toLowerCase().includes(normalizedQuery),
+      option.id.toLowerCase().includes(normalizedQuery) ||
+      option.description?.toLowerCase().includes(normalizedQuery),
   );
 }
 
@@ -576,6 +821,65 @@ export function updatePropertyOptionColor(
   );
 }
 
+export function updatePropertyOptionDescription(
+  options: DocumentPropertyOption[],
+  optionId: string,
+  description: string,
+) {
+  return options.map((option) =>
+    option.id === optionId ? { ...option, description } : option,
+  );
+}
+
+export function createPropertyOptionUpdateQueue(
+  initialOptions: DocumentPropertyOption[],
+  persist: (options: DocumentPropertyOption[]) => Promise<unknown>,
+) {
+  let current = initialOptions;
+  let tail: Promise<unknown> = Promise.resolve();
+
+  return {
+    replace(options: DocumentPropertyOption[]) {
+      current = options;
+    },
+    enqueue(
+      update: (options: DocumentPropertyOption[]) => DocumentPropertyOption[],
+    ) {
+      current = update(current);
+      const snapshot = current;
+      tail = tail.catch(() => undefined).then(() => persist(snapshot));
+      return tail;
+    },
+  };
+}
+
+type PropertyMetadataSnapshot = Pick<
+  DocumentProperty["definition"],
+  "name" | "type" | "description" | "visibility" | "options" | "icon"
+>;
+
+export function createPropertyMetadataUpdateQueue(
+  initialMetadata: PropertyMetadataSnapshot,
+  persist: (metadata: PropertyMetadataSnapshot) => Promise<unknown>,
+) {
+  let current = initialMetadata;
+  let tail: Promise<unknown> = Promise.resolve();
+
+  return {
+    replace(metadata: PropertyMetadataSnapshot) {
+      current = metadata;
+    },
+    enqueue(
+      update: (metadata: PropertyMetadataSnapshot) => PropertyMetadataSnapshot,
+    ) {
+      current = update(current);
+      const snapshot = current;
+      tail = tail.catch(() => undefined).then(() => persist(snapshot));
+      return tail;
+    },
+  };
+}
+
 export function removePropertyOption(
   options: DocumentPropertyOption[],
   optionId: string,
@@ -615,16 +919,16 @@ export function dateInputValueForOffset(baseDate: Date, offsetDays: number) {
   return `${year}-${month}-${day}`;
 }
 
-function scalarPlaceholder(type: DocumentPropertyType) {
+function scalarPlaceholder(type: DocumentPropertyType, t: TFunction) {
   switch (type) {
     case "number":
       return "0";
     case "date":
-      return "Select a date";
+      return t("editor.properties.selectDate");
     case "person":
-      return "Person or email";
+      return t("editor.properties.personOrEmail");
     case "place":
-      return "City, venue, or address";
+      return t("editor.properties.cityVenueOrAddress");
     case "url":
       return "https://example.com";
     case "email":
@@ -632,18 +936,39 @@ function scalarPlaceholder(type: DocumentPropertyType) {
     case "phone":
       return "+1 (555) 123-4567";
     default:
-      return "Empty";
+      return t("editor.properties.empty");
   }
 }
 
 export function DocumentProperties({
   documentId,
+  databaseId,
+  databaseDocumentId,
   canEdit,
   popoversPortalled = true,
+  popoverContainer,
 }: DocumentPropertiesProps) {
-  const { data, isLoading } = useDocumentProperties(documentId);
-  const properties = data?.properties ?? [];
-  const databaseId = data?.databaseId ?? null;
+  const t = useT();
+  const { data, isLoading } = useDocumentProperties(documentId, databaseId);
+  const loaded = documentPropertiesResponseMatchesScope(
+    documentId,
+    databaseId,
+    data,
+  );
+  const canEditValues =
+    canEdit &&
+    loaded &&
+    databaseDocumentId !== null &&
+    data.canEditValues === true;
+  const canManageSchema =
+    canEdit &&
+    loaded &&
+    databaseId !== null &&
+    databaseDocumentId !== null &&
+    data.canManageSchema === true;
+  const properties = (loaded ? data.properties : []).filter(
+    (property) => property.definition.type !== "blocks",
+  );
   const visibleProperties = properties.filter(isPropertyVisible);
   const hiddenProperties = properties.filter(
     (property) => !isPropertyVisible(property),
@@ -651,10 +976,10 @@ export function DocumentProperties({
 
   return (
     <div className="mt-5 border-y border-transparent py-1">
-      {isLoading ? (
+      {isLoading || !loaded ? (
         <div className="flex h-8 items-center gap-2 text-sm text-muted-foreground">
           <Spinner className="size-3.5" />
-          Loading properties
+          {t("editor.properties.loadingProperties")}
         </div>
       ) : visibleProperties.length > 0 ? (
         <div className="grid gap-0.5">
@@ -663,24 +988,35 @@ export function DocumentProperties({
               key={property.definition.id}
               property={property}
               documentId={documentId}
-              canEdit={canEdit}
+              databaseDocumentId={databaseDocumentId ?? documentId}
+              canEditValues={canEditValues}
+              canManageSchema={canManageSchema}
               popoversPortalled={popoversPortalled}
+              popoverContainer={popoverContainer}
+              t={t}
             />
           ))}
         </div>
       ) : null}
 
-      {canEdit && hiddenProperties.length > 0 ? (
+      {loaded && canManageSchema && hiddenProperties.length > 0 ? (
         <HiddenPropertiesMenu
+          databaseDocumentId={databaseDocumentId ?? documentId}
           documentId={documentId}
+          databaseId={databaseId}
           properties={hiddenProperties}
+          popoverContainer={popoverContainer}
+          t={t}
         />
       ) : null}
 
-      {canEdit && databaseId ? (
+      {loaded && canManageSchema && databaseId ? (
         <AddProperty
+          databaseDocumentId={databaseDocumentId ?? documentId}
           documentId={documentId}
+          databaseId={databaseId}
           popoversPortalled={popoversPortalled}
+          popoverContainer={popoverContainer}
         />
       ) : null}
     </div>
@@ -698,12 +1034,24 @@ function isPropertyVisible(property: DocumentProperty) {
 
 function HiddenPropertiesMenu({
   documentId,
+  databaseDocumentId = documentId,
+  databaseId,
   properties,
+  popoverContainer,
+  t,
 }: {
   documentId: string;
+  databaseDocumentId?: string;
+  databaseId: string;
   properties: DocumentProperty[];
+  popoverContainer?: HTMLElement | null;
+  t: TFunction;
 }) {
-  const configure = useConfigureDocumentProperty(documentId);
+  const configure = useConfigureDocumentProperty(
+    documentId,
+    databaseId,
+    databaseDocumentId,
+  );
 
   async function showProperty(property: DocumentProperty) {
     await configure.mutateAsync({
@@ -724,15 +1072,18 @@ function HiddenPropertiesMenu({
           className="mt-1 flex h-8 items-center gap-2 rounded px-1 text-sm text-muted-foreground hover:bg-muted/50 hover:text-foreground"
         >
           <IconEyeOff className="size-4" />
-          Hidden properties
+          {t("editor.properties.hiddenProperties")}
           <span className="text-xs text-muted-foreground/70">
             {properties.length}
           </span>
         </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="w-72">
+      <DropdownMenuContent
+        align="start"
+        className="w-72"
+        container={popoverContainer}
+      >
         {properties.map((property) => {
-          const Icon = TYPE_ICONS[property.definition.type];
           return (
             <DropdownMenuItem
               key={property.definition.id}
@@ -742,11 +1093,16 @@ function HiddenPropertiesMenu({
                 void showProperty(property);
               }}
             >
-              <Icon className="mr-2 size-4 text-muted-foreground" />
+              <PropertyDefinitionIcon
+                property={property}
+                className="mr-2 size-4 text-muted-foreground"
+              />
               <span className="min-w-0 flex-1 truncate">
                 {property.definition.name}
               </span>
-              <span className="ml-2 text-xs text-muted-foreground">Show</span>
+              <span className="ml-2 text-xs text-muted-foreground">
+                {t("editor.properties.show")}
+              </span>
             </DropdownMenuItem>
           );
         })}
@@ -758,40 +1114,72 @@ function HiddenPropertiesMenu({
 function PropertyRow({
   property,
   documentId,
-  canEdit,
+  databaseDocumentId,
+  canEditValues,
+  canManageSchema,
   popoversPortalled,
+  popoverContainer,
+  t,
 }: {
   property: DocumentProperty;
   documentId: string;
-  canEdit: boolean;
+  databaseDocumentId: string;
+  canEditValues: boolean;
+  canManageSchema: boolean;
   popoversPortalled: boolean;
+  popoverContainer?: HTMLElement | null;
+  t: TFunction;
 }) {
   const Icon = TYPE_ICONS[property.definition.type];
   const value = (
-    <div className="min-w-0 flex-1 truncate text-left text-sm">
-      {displayValue(property)}
+    <div className="min-w-0 flex-1 whitespace-normal break-words text-left text-sm max-sm:[&_.truncate]:whitespace-normal max-sm:[&_.truncate]:break-words sm:truncate">
+      {displayValue(property, t, "compact", { interactiveRelations: true })}
     </div>
   );
 
   return (
-    <div className="grid min-h-8 grid-cols-[160px_minmax(0,1fr)] items-start gap-3 rounded px-1 py-1 text-sm hover:bg-muted/40">
-      {canEdit ? (
+    <div className="grid min-h-8 grid-cols-[120px_minmax(0,1fr)] sm:grid-cols-[160px_minmax(0,1fr)] items-start gap-3 rounded px-1 py-1 text-sm hover:bg-muted/40">
+      {canManageSchema && !property.definition.systemRole ? (
         <PropertyManagementPopover
+          databaseDocumentId={databaseDocumentId}
           property={property}
           documentId={documentId}
+          databaseId={property.definition.databaseId!}
           icon={Icon}
+          popoverContainer={popoverContainer}
         />
       ) : (
         <div className="flex min-w-0 items-center gap-2 text-muted-foreground">
-          <Icon className="size-4 shrink-0" />
-          <span className="truncate">{property.definition.name}</span>
+          <PropertyDefinitionIcon
+            property={property}
+            className="size-4 shrink-0"
+          />
+          {property.definition.description ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className="truncate text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {property.definition.name}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent className="max-w-64">
+                {property.definition.description}
+              </TooltipContent>
+            </Tooltip>
+          ) : (
+            <span className="truncate">{property.definition.name}</span>
+          )}
         </div>
       )}
-      {canEdit && property.editable ? (
+      {canEditValues && property.editable ? (
         <PropertyValuePopover
           property={property}
           documentId={documentId}
+          databaseDocumentId={databaseDocumentId}
           portalled={popoversPortalled}
+          container={popoverContainer}
         >
           {value}
         </PropertyValuePopover>
@@ -802,33 +1190,178 @@ function PropertyRow({
   );
 }
 
+export function propertyTypeForSourceFieldType(
+  sourceFieldType: string,
+): DocumentPropertyType {
+  const normalized = sourceFieldType.trim().toLowerCase();
+  if (normalized === "number") return "number";
+  if (normalized === "datetime" || normalized === "date") {
+    return "date";
+  }
+  if (normalized === "url") return "url";
+  if (normalized === "boolean" || normalized === "checkbox") {
+    return "checkbox";
+  }
+  if (normalized === "tags" || normalized === "multi_select") {
+    return "multi_select";
+  }
+  return "text";
+}
+
 export function PropertyManagementPopover({
   property,
   documentId,
+  databaseDocumentId = documentId,
+  databaseId,
   icon: Icon,
   triggerClassName,
-  onTriggerPointerDown,
+  iconClassName,
   triggerTrailing,
   sourceField,
   sourceAttached = false,
+  sources,
+  sorts,
+  filters,
+  onSortsChange,
+  onFiltersChange,
+  onMoveLeft,
+  onMoveRight,
+  onHide,
+  hideDisabled,
+  popoverContainer,
 }: {
   property: DocumentProperty;
   documentId: string;
+  databaseDocumentId?: string;
+  databaseId: string;
   icon: Icon;
   triggerClassName?: string;
-  onTriggerPointerDown?: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+  iconClassName?: string;
   triggerTrailing?: ReactNode;
   sourceField?: ContentDatabaseSource["fields"][number] | null;
   sourceAttached?: boolean;
+  sources?: ContentDatabaseSource[];
+  sorts?: DatabaseSort[];
+  filters?: DatabaseFilter[];
+  onSortsChange?: (sorts: DatabaseSort[]) => void;
+  onFiltersChange?: (filters: DatabaseFilter[]) => void;
+  onMoveLeft?: () => void | Promise<void>;
+  onMoveRight?: () => void | Promise<void>;
+  onHide?: () => void | Promise<void>;
+  hideDisabled?: boolean;
+  popoverContainer?: HTMLElement | null;
 }) {
-  const configure = useConfigureDocumentProperty(documentId);
-  const duplicate = useDuplicateDocumentProperty(documentId);
-  const remove = useDeleteDocumentProperty(documentId);
+  const t = useT();
+  const hasColumnMenu = !!(
+    sorts &&
+    filters &&
+    onSortsChange &&
+    onFiltersChange
+  );
+  const columnKey = property.definition.id;
+  const columnSort =
+    (sorts ?? []).find((sort) => sort.key === columnKey) ?? null;
+  const columnFilterCount = (filters ?? []).filter(
+    (filter) => filter.key === columnKey,
+  ).length;
+  const quickFilters = databaseQuickFilterOptionsForColumn(
+    property.definition.type,
+  );
+  const configure = useConfigureDocumentProperty(
+    documentId,
+    databaseId,
+    databaseDocumentId,
+  );
+  const duplicate = useDuplicateDocumentProperty(documentId, databaseId);
+  const remove = useDeleteDocumentProperty(documentId, databaseId);
+  const { data: propertiesData } = useDocumentProperties(
+    documentId,
+    databaseId,
+  );
+  const bindSourceField = useContentActionMutation<
+    ContentDatabaseResponse,
+    BindContentDatabaseSourceFieldRequest
+  >("bind-content-database-source-field", {
+    invalidates: [
+      ["action", "get-content-database"],
+      ["action", "list-document-properties", { documentId, databaseId }],
+      ["action", "get-content-database-source"],
+      contentDatabaseConstrainedQueryFilter(databaseDocumentId),
+    ],
+  });
+  const allSourceFieldEntries = (sources ?? []).flatMap((src) =>
+    src.fields.map((field) => ({ source: src, field })),
+  );
+  const boundSourceFields = allSourceFieldEntries.filter(
+    (entry) => entry.field.propertyId === property.definition.id,
+  );
+  const boundSourceIds = new Set(boundSourceFields.map((b) => b.source.id));
+  const columnType = property.definition.type;
+  const bindableSourceFields = allSourceFieldEntries.filter((entry) => {
+    if (
+      entry.field.propertyId ||
+      entry.field.mappingType === "title" ||
+      entry.field.mappingType === "system" ||
+      entry.field.writeOwner === "derived" ||
+      boundSourceIds.has(entry.source.id)
+    ) {
+      return false;
+    }
+    const fieldIsMultiValue = [
+      "list",
+      "array",
+      "tags",
+      "multi_select",
+    ].includes(entry.field.sourceFieldType.trim().toLowerCase());
+    return columnType === "text"
+      ? !fieldIsMultiValue
+      : columnType ===
+          propertyTypeForSourceFieldType(entry.field.sourceFieldType);
+  });
+  const showBindingEditor =
+    !isComputedPropertyType(columnType) &&
+    columnType !== "blocks" &&
+    (boundSourceFields.length > 0 || bindableSourceFields.length > 0);
+  const blocksFieldCount = (propertiesData?.properties ?? []).filter(
+    (item) => item.definition.type === "blocks",
+  ).length;
+  const isOnlyBlocksField = isOnlyBlocksFieldDeletion({
+    type: property.definition.type,
+    blocksFieldCount,
+  });
   const [open, setOpen] = useState(false);
+  const [iconPickerOpen, setIconPickerOpen] = useState(false);
+  const propertyMenuTriggerRef = useRef<HTMLButtonElement>(null);
+  const [view, setView] = useState<"quick" | "edit">(
+    hasColumnMenu ? "quick" : "edit",
+  );
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [name, setName] = useState(property.definition.name);
+  const [description, setDescription] = useState(
+    property.definition.description,
+  );
   const [newOption, setNewOption] = useState("");
+  const [optionsDraft, setOptionsDraft] = useState<DocumentPropertyOption[]>(
+    property.definition.options.options ?? [],
+  );
+  const persistMetadataSnapshotRef = useRef<
+    (metadata: PropertyMetadataSnapshot) => Promise<unknown>
+  >(async () => undefined);
+  const metadataUpdateQueueRef = useRef(
+    createPropertyMetadataUpdateQueue(
+      {
+        name: property.definition.name,
+        type: property.definition.type,
+        description: property.definition.description,
+        visibility: property.definition.visibility,
+        options: property.definition.options,
+        icon: property.definition.icon ?? null,
+      },
+      (metadata) => persistMetadataSnapshotRef.current(metadata),
+    ),
+  );
   const propertyNameInputRef = useRef<HTMLInputElement>(null);
+  const menuContentRef = useRef<HTMLDivElement>(null);
   const typeIsLocked = isComputedPropertyType(property.definition.type);
   const typeNeedsOptions =
     property.definition.type === "select" ||
@@ -837,34 +1370,88 @@ export function PropertyManagementPopover({
 
   function resetDraft() {
     setName(property.definition.name);
+    setDescription(property.definition.description);
     setNewOption("");
+    setOptionsDraft(property.definition.options.options ?? []);
+    metadataUpdateQueueRef.current.replace({
+      name: property.definition.name,
+      type: property.definition.type,
+      description: property.definition.description,
+      visibility: property.definition.visibility,
+      options: property.definition.options,
+      icon: property.definition.icon ?? null,
+    });
   }
 
   useEffect(() => {
     if (!open) return;
 
     const frame = requestAnimationFrame(() => {
-      propertyNameInputRef.current?.focus();
-      propertyNameInputRef.current?.select();
+      if (view === "edit") {
+        propertyNameInputRef.current?.focus();
+        propertyNameInputRef.current?.select();
+      } else {
+        menuContentRef.current
+          ?.querySelector<HTMLElement>('[role="menuitem"]')
+          ?.focus();
+      }
     });
 
     return () => cancelAnimationFrame(frame);
-  }, [open]);
+  }, [open, view]);
 
   async function configureProperty(next: {
     name?: string;
     type?: DocumentPropertyType;
     visibility?: DocumentPropertyVisibility;
     options?: DocumentProperty["definition"]["options"];
+    description?: string;
+    icon?: DocumentProperty["definition"]["icon"];
   }) {
-    const nextType = next.type ?? property.definition.type;
-    await configure.mutateAsync({
+    await metadataUpdateQueueRef.current.enqueue((current) => ({
+      name: next.name?.trim() || current.name,
+      type: next.type ?? current.type,
+      description: next.description ?? current.description,
+      visibility: next.visibility ?? current.visibility,
+      options: next.options ?? current.options,
+      icon: next.icon === undefined ? current.icon : next.icon,
+    }));
+  }
+
+  async function updateOptions(
+    update: (options: DocumentPropertyOption[]) => DocumentPropertyOption[],
+  ) {
+    setOptionsDraft((current) => update(current));
+    await metadataUpdateQueueRef.current.enqueue((current) => ({
+      ...current,
+      options: {
+        options: update(current.options.options ?? []),
+      },
+    }));
+  }
+
+  persistMetadataSnapshotRef.current = (metadata) =>
+    configure.mutateAsync({
       id: property.definition.id,
       documentId,
-      name: next.name?.trim() || property.definition.name,
-      type: nextType,
-      visibility: next.visibility,
-      options: next.options ?? property.definition.options,
+      ...metadata,
+    });
+
+  const optionDragSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+
+  function handleOptionDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    void updateOptions((options) => {
+      const fromIndex = options.findIndex((option) => option.id === active.id);
+      const toIndex = options.findIndex((option) => option.id === over.id);
+      if (fromIndex < 0 || toIndex < 0) return options;
+      return arrayMove(options, fromIndex, toIndex);
     });
   }
 
@@ -872,6 +1459,12 @@ export function PropertyManagementPopover({
     const nextName = name.trim();
     if (!nextName || nextName === property.definition.name) return;
     await configureProperty({ name: nextName });
+  }
+
+  async function updateDescription() {
+    const nextDescription = (description ?? "").trim();
+    if (nextDescription === property.definition.description) return;
+    await configureProperty({ description: nextDescription });
   }
 
   async function updateType(nextType: DocumentPropertyType) {
@@ -908,278 +1501,636 @@ export function PropertyManagementPopover({
   async function addOption() {
     const optionName = newOption.trim();
     if (!optionName) return;
-    const existing = property.definition.options.options ?? [];
-    const option = makeOption(
-      optionName,
-      existing.length,
-      existing.map((item) => item.id),
-    );
-    await configureProperty({
-      options: { options: [...existing, option] },
-    });
+    await updateOptions((existing) => [
+      ...existing,
+      makeOption(
+        optionName,
+        existing.length,
+        existing.map((item) => item.id),
+      ),
+    ]);
     setNewOption("");
   }
 
   async function removeOption(id: string) {
-    await configureProperty({
-      options: {
-        options: (property.definition.options.options ?? []).filter(
-          (option) => option.id !== id,
-        ),
-      },
-    });
+    await updateOptions((options) =>
+      options.filter((option) => option.id !== id),
+    );
   }
 
   async function renameOption(id: string, optionName: string) {
-    const options = property.definition.options.options ?? [];
-    const nextOptions = renamePropertyOption(options, id, optionName);
-    if (nextOptions === options) return;
-    await configureProperty({ options: { options: nextOptions } });
+    await updateOptions((options) =>
+      renamePropertyOption(options, id, optionName),
+    );
   }
 
   async function recolorOption(id: string, color: DocumentPropertyOptionColor) {
-    const options = property.definition.options.options ?? [];
-    const nextOptions = updatePropertyOptionColor(options, id, color);
-    await configureProperty({ options: { options: nextOptions } });
+    await updateOptions((options) =>
+      updatePropertyOptionColor(options, id, color),
+    );
+  }
+
+  async function describeOption(id: string, description: string) {
+    await updateOptions((options) =>
+      updatePropertyOptionDescription(options, id, description),
+    );
   }
 
   return (
     <>
       <DropdownMenu
         open={open}
+        modal={false}
         onOpenChange={(nextOpen) => {
-          if (nextOpen) resetDraft();
+          if (nextOpen) {
+            resetDraft();
+            setView(hasColumnMenu ? "quick" : "edit");
+          }
           setOpen(nextOpen);
         }}
       >
         <DropdownMenuTrigger asChild>
           <button
+            ref={propertyMenuTriggerRef}
             type="button"
-            aria-label={`Property menu for ${property.definition.name}`}
+            aria-label={t("editor.properties.propertyMenuFor", {
+              name: property.definition.name,
+            })}
+            title={property.definition.description || undefined}
             className={cn(
               "flex min-w-0 items-center gap-2 rounded px-1 py-0.5 text-left text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
               triggerClassName,
             )}
-            onPointerDown={onTriggerPointerDown}
-            onClick={
-              onTriggerPointerDown
-                ? (event) => {
-                    event.preventDefault();
-                    resetDraft();
-                    setOpen(true);
-                  }
-                : undefined
-            }
           >
-            <Icon className="size-4 shrink-0" />
-            <span className="truncate">{property.definition.name}</span>
+            <PropertyDefinitionIcon
+              property={property}
+              className={cn("size-4 shrink-0", iconClassName)}
+            />
+            <span className="truncate" data-property-label="">
+              {property.definition.name}
+            </span>
             {triggerTrailing}
           </button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="w-72">
-          <div
-            className="flex items-center gap-2 p-1"
-            onKeyDown={(event) => event.stopPropagation()}
-          >
-            <IconEdit className="size-4 shrink-0 text-muted-foreground" />
-            <Input
-              ref={propertyNameInputRef}
-              value={name}
-              aria-label="Property name"
-              onChange={(event) => setName(event.target.value)}
-              onBlur={() => void renameProperty()}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
+        <DropdownMenuContent
+          ref={menuContentRef}
+          align="start"
+          collisionPadding={12}
+          container={popoverContainer}
+          className="relative z-[300] w-72 max-h-[var(--radix-dropdown-menu-content-available-height)] overflow-y-auto"
+        >
+          {view === "quick" && hasColumnMenu ? (
+            <>
+              <DropdownMenuLabel className="truncate text-xs text-muted-foreground">
+                {property.definition.name}
+              </DropdownMenuLabel>
+              <DropdownMenuItem
+                onPointerDown={(event) => event.preventDefault()}
+                onSelect={(event) => {
                   event.preventDefault();
-                  event.currentTarget.blur();
-                }
-              }}
-              className="h-8"
-            />
-          </div>
-
-          <DropdownMenuSub>
-            <DropdownMenuSubTrigger>
-              <Icon className="mr-2 size-4 text-muted-foreground" />
-              <span className="flex-1">Type</span>
-              <span className="mr-2 text-muted-foreground">
-                {DOCUMENT_PROPERTY_TYPE_LABELS[property.definition.type]}
-              </span>
-            </DropdownMenuSubTrigger>
-            <DropdownMenuSubContent className="max-h-80 w-56 overflow-auto">
-              {CREATABLE_DOCUMENT_PROPERTY_TYPES.map((propertyType) => {
-                const TypeIcon = TYPE_ICONS[propertyType];
-                const selected = property.definition.type === propertyType;
-                const disabled = typeIsLocked && !selected;
-                return (
+                  setView("edit");
+                }}
+              >
+                <IconEdit className="mr-2 size-4 text-muted-foreground" />
+                {t("editor.properties.editField")}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <IconFilter className="mr-2 size-4 text-muted-foreground" />
+                  {t("database.filter")}
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent
+                  className="z-[310] w-56"
+                  container={popoverContainer}
+                >
+                  {quickFilters.map((quickFilter) => (
+                    <DropdownMenuItem
+                      key={quickFilter.operator}
+                      onSelect={(event) => {
+                        event.preventDefault();
+                        onFiltersChange?.(
+                          upsertDatabaseQuickFilter(
+                            filters ?? [],
+                            columnKey,
+                            property.definition.name,
+                            quickFilter.operator,
+                          ),
+                        );
+                      }}
+                    >
+                      <IconFilter className="mr-2 size-4 text-muted-foreground" />
+                      {quickFilter.label}
+                    </DropdownMenuItem>
+                  ))}
+                  {columnFilterCount > 0 ? (
+                    <DropdownMenuItem
+                      onSelect={(event) => {
+                        event.preventDefault();
+                        onFiltersChange?.(
+                          clearDatabaseFiltersForColumn(
+                            filters ?? [],
+                            columnKey,
+                          ),
+                        );
+                      }}
+                    >
+                      <IconX className="mr-2 size-4 text-muted-foreground" />
+                      {t("editor.properties.clearFilters", {
+                        count: columnFilterCount,
+                      })}
+                    </DropdownMenuItem>
+                  ) : null}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <IconArrowsSort className="mr-2 size-4 text-muted-foreground" />
+                  {t("database.sort")}
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent
+                  className="z-[310] w-56"
+                  container={popoverContainer}
+                >
                   <DropdownMenuItem
-                    key={propertyType}
-                    disabled={disabled}
                     onSelect={(event) => {
                       event.preventDefault();
-                      void updateType(propertyType);
+                      onSortsChange?.(
+                        upsertDatabaseSort(
+                          sorts ?? [],
+                          columnKey,
+                          property.definition.name,
+                          "asc",
+                        ),
+                      );
                     }}
                   >
-                    <TypeIcon className="mr-2 size-4 text-muted-foreground" />
-                    <span className="flex-1">
-                      {DOCUMENT_PROPERTY_TYPE_LABELS[propertyType]}
+                    <IconArrowUp className="mr-2 size-4 text-muted-foreground" />
+                    <span className="min-w-0 flex-1">
+                      {t("database.sortAscending")}
                     </span>
-                    {selected ? (
+                    {columnSort?.direction === "asc" ? (
                       <IconCheck className="size-4 text-muted-foreground" />
                     ) : null}
                   </DropdownMenuItem>
-                );
-              })}
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
-
-          <DropdownMenuSub>
-            <DropdownMenuSubTrigger>
-              <IconEye className="mr-2 size-4 text-muted-foreground" />
-              <span className="flex-1">Visibility</span>
-              <span className="mr-2 text-muted-foreground">
-                {
-                  DOCUMENT_PROPERTY_VISIBILITY_LABELS[
-                    property.definition.visibility
-                  ]
-                }
-              </span>
-            </DropdownMenuSubTrigger>
-            <DropdownMenuSubContent className="w-56">
-              {DOCUMENT_PROPERTY_VISIBILITIES.map((visibility) => (
+                  <DropdownMenuItem
+                    onSelect={(event) => {
+                      event.preventDefault();
+                      onSortsChange?.(
+                        upsertDatabaseSort(
+                          sorts ?? [],
+                          columnKey,
+                          property.definition.name,
+                          "desc",
+                        ),
+                      );
+                    }}
+                  >
+                    <IconArrowDown className="mr-2 size-4 text-muted-foreground" />
+                    <span className="min-w-0 flex-1">
+                      {t("database.sortDescending")}
+                    </span>
+                    {columnSort?.direction === "desc" ? (
+                      <IconCheck className="size-4 text-muted-foreground" />
+                    ) : null}
+                  </DropdownMenuItem>
+                  {columnSort ? (
+                    <DropdownMenuItem
+                      onSelect={(event) => {
+                        event.preventDefault();
+                        onSortsChange?.(
+                          clearDatabaseSort(sorts ?? [], columnKey),
+                        );
+                      }}
+                    >
+                      <IconX className="mr-2 size-4 text-muted-foreground" />
+                      {t("database.clearSort")}
+                    </DropdownMenuItem>
+                  ) : null}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+              <ColumnPresentationMenuItems columnId={columnKey} />
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                disabled={!onMoveLeft}
+                onSelect={() => void onMoveLeft?.()}
+              >
+                <IconArrowLeft className="mr-2 size-4 text-muted-foreground" />
+                {t("editor.properties.moveColumnLeft")}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={!onMoveRight}
+                onSelect={() => void onMoveRight?.()}
+              >
+                <IconArrowRight className="mr-2 size-4 text-muted-foreground" />
+                {t("editor.properties.moveColumnRight")}
+              </DropdownMenuItem>
+              {onHide ? (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    disabled={hideDisabled}
+                    onSelect={(event) => {
+                      event.preventDefault();
+                      void onHide();
+                    }}
+                  >
+                    <IconEyeOff className="mr-2 size-4 text-muted-foreground" />
+                    {t("database.hideInView")}
+                  </DropdownMenuItem>
+                </>
+              ) : null}
+            </>
+          ) : (
+            <>
+              {hasColumnMenu ? (
                 <DropdownMenuItem
-                  key={visibility}
                   onSelect={(event) => {
                     event.preventDefault();
-                    void updateVisibility(visibility);
+                    setView("quick");
+                  }}
+                  className="gap-1.5 py-1 text-xs text-muted-foreground focus:text-foreground"
+                >
+                  <IconArrowLeft className="size-3.5" />
+                  {t("editor.properties.backToColumnMenu")}
+                </DropdownMenuItem>
+              ) : null}
+              <div
+                className="flex items-center gap-2 p-1"
+                onKeyDown={(event) => event.stopPropagation()}
+              >
+                <button
+                  type="button"
+                  aria-label={t("editor.emojiChangeIcon")}
+                  className="flex size-9 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent/50"
+                  onClick={() => {
+                    setOpen(false);
+                    setIconPickerOpen(true);
                   }}
                 >
-                  <span className="flex-1">
-                    {DOCUMENT_PROPERTY_VISIBILITY_LABELS[visibility]}
-                  </span>
-                  {property.definition.visibility === visibility ? (
-                    <IconCheck className="size-4 text-muted-foreground" />
-                  ) : null}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
-
-          {typeNeedsOptions ? (
-            <div className="grid gap-2 px-1 py-2">
-              <div className="px-1 text-xs font-medium text-muted-foreground">
-                Options
-              </div>
-              <div className="grid gap-1">
-                {(property.definition.options.options ?? []).map((option) => (
-                  <PropertyOptionSettingsRow
-                    key={option.id}
-                    option={option}
-                    disabled={configure.isPending}
-                    onRename={(name) => void renameOption(option.id, name)}
-                    onColorChange={(color) =>
-                      void recolorOption(option.id, color)
-                    }
-                    onRemove={() => void removeOption(option.id)}
+                  <PropertyDefinitionIcon
+                    property={property}
+                    className="size-4"
                   />
-                ))}
+                </button>
+                <Input
+                  size="sm"
+                  ref={propertyNameInputRef}
+                  value={name}
+                  aria-label={t("editor.properties.propertyName")}
+                  onChange={(event) => setName(event.target.value)}
+                  onBlur={() => void renameProperty()}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      event.currentTarget.blur();
+                    }
+                  }}
+                />
               </div>
-              <form
-                className="flex gap-2"
-                onSubmit={(event) => {
+
+              <div
+                className="px-2 pb-2 pt-1"
+                onKeyDown={(event) => event.stopPropagation()}
+              >
+                <Textarea
+                  rows={1}
+                  value={description}
+                  aria-label={t("editor.properties.description")}
+                  placeholder={t("editor.properties.addPropertyDescription")}
+                  onChange={(event) => setDescription(event.target.value)}
+                  onBlur={() => void updateDescription()}
+                  className="block min-h-0 w-full resize-none rounded border border-transparent bg-muted/30 px-2 py-1.5 text-xs leading-5 text-muted-foreground outline-none placeholder:text-muted-foreground/60 focus:resize-y focus:border-input focus:bg-background focus:ring-1 focus:ring-ring"
+                />
+              </div>
+
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <Icon className="mr-2 size-4 text-muted-foreground" />
+                  <span className="flex-1">{t("editor.properties.type")}</span>
+                  <span className="mr-2 text-muted-foreground">
+                    {t(`editor.propertyTypes.${property.definition.type}`)}
+                  </span>
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent
+                  className="z-[310] max-h-80 w-56 overflow-auto"
+                  container={popoverContainer}
+                >
+                  {CREATABLE_DOCUMENT_PROPERTY_TYPES.filter(
+                    // Converting into a relation needs a target database;
+                    // relations are added from "Add property" instead.
+                    (propertyType) =>
+                      propertyType !== "relation" ||
+                      property.definition.type === "relation",
+                  ).map((propertyType) => {
+                    const TypeIcon = TYPE_ICONS[propertyType];
+                    const selected = property.definition.type === propertyType;
+                    const disabled = typeIsLocked && !selected;
+                    return (
+                      <DropdownMenuItem
+                        key={propertyType}
+                        disabled={disabled}
+                        onSelect={(event) => {
+                          event.preventDefault();
+                          void updateType(propertyType);
+                        }}
+                      >
+                        <TypeIcon className="mr-2 size-4 text-muted-foreground" />
+                        <span className="flex-1">
+                          {t(`editor.propertyTypes.${propertyType}`)}
+                        </span>
+                        {selected ? (
+                          <IconCheck className="size-4 text-muted-foreground" />
+                        ) : null}
+                      </DropdownMenuItem>
+                    );
+                  })}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <IconEye className="mr-2 size-4 text-muted-foreground" />
+                  <span className="flex-1">
+                    {t("editor.properties.visibility")}
+                  </span>
+                  <span className="mr-2 text-muted-foreground">
+                    {t(
+                      `editor.propertyVisibility.${property.definition.visibility}`,
+                    )}
+                  </span>
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent
+                  className="z-[310] w-56"
+                  container={popoverContainer}
+                >
+                  {DOCUMENT_PROPERTY_VISIBILITIES.map((visibility) => (
+                    <DropdownMenuItem
+                      key={visibility}
+                      onSelect={(event) => {
+                        event.preventDefault();
+                        void updateVisibility(visibility);
+                      }}
+                    >
+                      <span className="flex-1">
+                        {t(`editor.propertyVisibility.${visibility}`)}
+                      </span>
+                      {property.definition.visibility === visibility ? (
+                        <IconCheck className="size-4 text-muted-foreground" />
+                      ) : null}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+
+              {typeNeedsOptions ? (
+                <div className="grid gap-2 px-1 py-2">
+                  <div className="px-1 text-xs font-medium text-muted-foreground">
+                    {t("editor.properties.options")}
+                  </div>
+                  <div className="grid gap-1">
+                    <DndContext
+                      sensors={optionDragSensors}
+                      collisionDetection={closestCenter}
+                      onDragEnd={handleOptionDragEnd}
+                    >
+                      <SortableContext
+                        items={optionsDraft.map((option) => option.id)}
+                        strategy={verticalListSortingStrategy}
+                      >
+                        {optionsDraft.map((option) => (
+                          <PropertyOptionSettingsRow
+                            key={option.id}
+                            option={option}
+                            disabled={configure.isPending}
+                            popoverContainer={popoverContainer}
+                            onRename={(name) =>
+                              void renameOption(option.id, name)
+                            }
+                            onDescriptionChange={(description) =>
+                              void describeOption(option.id, description)
+                            }
+                            onColorChange={(color) =>
+                              void recolorOption(option.id, color)
+                            }
+                            onRemove={() => void removeOption(option.id)}
+                          />
+                        ))}
+                      </SortableContext>
+                    </DndContext>
+                  </div>
+                  <form
+                    className="flex gap-2"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void addOption();
+                    }}
+                  >
+                    <Input
+                      size="sm"
+                      value={newOption}
+                      placeholder={t("editor.properties.addOption")}
+                      onChange={(event) => setNewOption(event.target.value)}
+                      onKeyDown={(event) => event.stopPropagation()}
+                    />
+                    <Button
+                      type="submit"
+                      size="sm"
+                      variant="secondary"
+                      disabled={!newOption.trim() || configure.isPending}
+                    >
+                      {t("editor.properties.add")}
+                    </Button>
+                  </form>
+                </div>
+              ) : null}
+
+              {showBindingEditor ? (
+                <>
+                  <DropdownMenuSeparator />
+                  <div className="grid gap-1.5 px-2 py-1.5 text-xs">
+                    <div className="font-medium text-foreground">
+                      {t("database.sourcesFeedingThisColumn")}
+                    </div>
+                    {boundSourceFields.length > 0 ? (
+                      <div className="grid gap-1">
+                        {boundSourceFields.map(({ source: src, field }) => (
+                          <div
+                            key={field.id}
+                            className="flex min-w-0 items-center gap-1.5"
+                          >
+                            <IconLink className="size-3.5 shrink-0 text-muted-foreground" />
+                            <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                              <span className="text-foreground">
+                                {src.sourceName}
+                              </span>{" "}
+                              · {field.sourceFieldLabel}
+                            </span>
+                            <button
+                              type="button"
+                              aria-label={`Unbind ${field.sourceFieldLabel} from ${src.sourceName}`}
+                              disabled={bindSourceField.isPending}
+                              className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+                              onClick={() =>
+                                void bindSourceField.mutateAsync({
+                                  documentId,
+                                  sourceFieldId: field.id,
+                                  propertyId: null,
+                                })
+                              }
+                            >
+                              <IconX className="size-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-muted-foreground">
+                        {t("database.noSourceFieldsBoundYet")}
+                      </div>
+                    )}
+                    {bindableSourceFields.length > 0 ? (
+                      <DropdownMenuSub>
+                        <DropdownMenuSubTrigger className="mt-0.5 rounded px-1.5 py-1 text-xs">
+                          <IconPlus className="mr-1.5 size-3.5 text-muted-foreground" />
+                          {t("database.bindAFieldFromASource")}
+                        </DropdownMenuSubTrigger>
+                        <DropdownMenuSubContent
+                          className="z-[310] max-h-80 w-64 overflow-auto"
+                          container={popoverContainer}
+                        >
+                          {bindableSourceFields.map(
+                            ({ source: src, field }) => (
+                              <DropdownMenuItem
+                                key={field.id}
+                                disabled={bindSourceField.isPending}
+                                onSelect={(event) => {
+                                  event.preventDefault();
+                                  void bindSourceField.mutateAsync({
+                                    documentId,
+                                    sourceFieldId: field.id,
+                                    propertyId: property.definition.id,
+                                  });
+                                }}
+                              >
+                                <IconLink className="mr-2 size-3.5 shrink-0 text-muted-foreground" />
+                                <span className="min-w-0 flex-1 truncate">
+                                  {field.sourceFieldLabel}
+                                </span>
+                                <span className="ml-2 shrink-0 truncate text-[11px] text-muted-foreground">
+                                  {src.sourceName}
+                                </span>
+                              </DropdownMenuItem>
+                            ),
+                          )}
+                        </DropdownMenuSubContent>
+                      </DropdownMenuSub>
+                    ) : null}
+                  </div>
+                </>
+              ) : sourceAttached ? (
+                <>
+                  <DropdownMenuSeparator />
+                  <div className="grid gap-1 px-2 py-1.5 text-xs">
+                    <div className="font-medium text-foreground">
+                      {t("editor.properties.source")}
+                    </div>
+                    {sourceField ? (
+                      <>
+                        <div className="min-w-0 break-words text-muted-foreground">
+                          {sourceField.sourceFieldLabel} (
+                          {sourceField.sourceFieldKey})
+                        </div>
+                        <div className="text-muted-foreground">
+                          {sourceField.readOnly
+                            ? t("editor.properties.readOnly")
+                            : sourceField.writeOwner === "source"
+                              ? t("editor.properties.sourceOwned")
+                              : t("editor.properties.localEditsAllowed")}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="text-muted-foreground">
+                        {t("editor.properties.notMappedToBuilder")}
+                      </div>
+                    )}
+                  </div>
+                </>
+              ) : null}
+
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                disabled={duplicate.isPending}
+                onSelect={(event) => {
                   event.preventDefault();
-                  void addOption();
+                  void duplicateProperty();
                 }}
               >
-                <Input
-                  value={newOption}
-                  placeholder="Add option"
-                  onChange={(event) => setNewOption(event.target.value)}
-                  onKeyDown={(event) => event.stopPropagation()}
-                  className="h-8"
-                />
-                <Button
-                  type="submit"
-                  size="sm"
-                  variant="secondary"
-                  disabled={!newOption.trim() || configure.isPending}
-                >
-                  Add
-                </Button>
-              </form>
-            </div>
-          ) : null}
-
-          {sourceAttached ? (
-            <>
-              <DropdownMenuSeparator />
-              <div className="grid gap-1 px-2 py-1.5 text-xs">
-                <div className="font-medium text-foreground">Source</div>
-                {sourceField ? (
-                  <>
-                    <div className="min-w-0 break-words text-muted-foreground">
-                      {sourceField.sourceFieldLabel} (
-                      {sourceField.sourceFieldKey})
-                    </div>
-                    <div className="text-muted-foreground">
-                      {sourceField.readOnly
-                        ? "Read-only"
-                        : sourceField.writeOwner === "source"
-                          ? "Source-owned"
-                          : "Local edits allowed"}
-                    </div>
-                  </>
-                ) : (
-                  <div className="text-muted-foreground">
-                    Not mapped to Builder.
-                  </div>
-                )}
-              </div>
+                <IconCopy className="mr-2 size-4 text-muted-foreground" />
+                {t("editor.properties.duplicateProperty")}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={remove.isPending}
+                className="text-destructive focus:bg-destructive/10 focus:text-destructive"
+                onSelect={(event) => {
+                  event.preventDefault();
+                  setOpen(false);
+                  setConfirmDeleteOpen(true);
+                }}
+              >
+                <IconTrash className="mr-2 size-4" />
+                {t("editor.properties.deleteProperty")}
+              </DropdownMenuItem>
             </>
-          ) : null}
-
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            disabled={duplicate.isPending}
-            onSelect={(event) => {
-              event.preventDefault();
-              void duplicateProperty();
-            }}
-          >
-            <IconCopy className="mr-2 size-4 text-muted-foreground" />
-            Duplicate property
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            disabled={remove.isPending}
-            className="text-destructive focus:bg-destructive/10 focus:text-destructive"
-            onSelect={(event) => {
-              event.preventDefault();
-              setOpen(false);
-              setConfirmDeleteOpen(true);
-            }}
-          >
-            <IconTrash className="mr-2 size-4" />
-            Delete property
-          </DropdownMenuItem>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
 
+      <EmojiPicker
+        icon={property.definition.icon ?? null}
+        assetScopeDocumentId={databaseDocumentId}
+        open={iconPickerOpen}
+        onOpenChange={setIconPickerOpen}
+        anchored
+        anchorElement={propertyMenuTriggerRef.current}
+        container={popoverContainer}
+        contentClassName="z-[310]"
+        onSelect={(icon) => configureProperty({ icon })}
+      />
+
       <AlertDialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete property?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This removes "{property.definition.name}" and its values from
-              every document in this workspace.
+        <AlertDialogContent className="max-w-sm gap-0 rounded-lg p-5">
+          <AlertDialogHeader className="space-y-0 gap-1.5 text-start">
+            <AlertDialogTitle className="text-base leading-tight tracking-tight">
+              {t("editor.properties.deletePropertyQuestion")}
+            </AlertDialogTitle>
+            <AlertDialogDescription className="leading-normal [text-wrap:pretty]">
+              {t("editor.properties.deletePropertyDescriptionPrefix")}
+              <span className="font-medium text-foreground">
+                {property.definition.name}
+              </span>
+              {t("editor.properties.deletePropertyDescriptionSuffix")}
             </AlertDialogDescription>
           </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+          {isOnlyBlocksField ? (
+            <div className="rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-800 dark:text-yellow-200">
+              {t("editor.properties.onlyBlocksPropertyWarning")}
+            </div>
+          ) : null}
+          <AlertDialogFooter className="mt-4 flex-row items-center justify-end gap-2 sm:space-x-0">
+            <AlertDialogCancel
+              size="sm"
+              className="mt-0 focus-visible:ring-1 focus-visible:ring-muted-foreground/40 focus-visible:ring-offset-1"
+            >
+              {t("editor.properties.cancel")}
+            </AlertDialogCancel>
             <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              variant="destructive"
+              size="sm"
+              className="focus-visible:ring-1 focus-visible:ring-muted-foreground/40 focus-visible:ring-offset-1"
               onClick={() => void deleteProperty()}
             >
-              Delete property
+              {t("editor.properties.deleteProperty")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -1192,20 +2143,37 @@ function PropertyOptionSettingsRow({
   option,
   disabled,
   onRename,
+  onDescriptionChange,
   onColorChange,
   onRemove,
+  popoverContainer,
 }: {
   option: DocumentPropertyOption;
   disabled: boolean;
   onRename: (name: string) => void;
+  onDescriptionChange: (description: string) => void;
   onColorChange: (color: DocumentPropertyOptionColor) => void;
   onRemove: () => void;
+  popoverContainer?: HTMLElement | null;
 }) {
+  const t = useT();
   const [draftName, setDraftName] = useState(option.name);
+  const [draftDescription, setDraftDescription] = useState(
+    option.description ?? "",
+  );
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: option.id, disabled });
 
   useEffect(() => {
     setDraftName(option.name);
-  }, [option.name]);
+    setDraftDescription(option.description ?? "");
+  }, [option.description, option.name]);
 
   function submitRename() {
     const nextName = draftName.trim();
@@ -1219,16 +2187,71 @@ function PropertyOptionSettingsRow({
   }
 
   return (
-    <div className="grid gap-1 rounded px-2 py-1 hover:bg-muted/50">
+    <div
+      ref={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
+      className={cn(
+        "grid gap-1 rounded px-2 py-1 hover:bg-muted/50",
+        isDragging && "relative z-10 bg-muted/50",
+      )}
+    >
       <div className="flex items-center gap-2">
-        <span
-          aria-hidden
-          className={cn("size-3 shrink-0 rounded-full", optionClass(option))}
-        />
+        <button
+          type="button"
+          disabled={disabled}
+          aria-label={t("editor.properties.reorderOption", {
+            name: option.name,
+          })}
+          className="size-5 shrink-0 cursor-grab touch-none rounded text-muted-foreground/60 hover:text-muted-foreground active:cursor-grabbing disabled:opacity-50"
+          {...attributes}
+          {...listeners}
+        >
+          <IconGripVertical className="size-3.5" />
+        </button>
+        <DropdownMenuSub>
+          <DropdownMenuSubTrigger
+            disabled={disabled}
+            aria-label={t("editor.properties.color")}
+            className="size-5 shrink-0 justify-center rounded-full p-0 [&_svg]:hidden"
+          >
+            <span
+              aria-hidden
+              className={cn("block size-3 rounded-full", optionClass(option))}
+            />
+          </DropdownMenuSubTrigger>
+          <DropdownMenuSubContent
+            className="z-[310] w-44"
+            container={popoverContainer}
+          >
+            {OPTION_COLORS.map((color) => (
+              <DropdownMenuItem
+                key={color}
+                onSelect={(event) => {
+                  event.preventDefault();
+                  onColorChange(color);
+                }}
+              >
+                <span
+                  className={cn(
+                    "inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium capitalize",
+                    OPTION_COLOR_CLASSES[color],
+                  )}
+                >
+                  {t(`editor.propertyOptionColors.${color}`)}
+                </span>
+                {option.color === color ? (
+                  <IconCheck className="ml-auto size-4 shrink-0 text-muted-foreground" />
+                ) : null}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
         <Input
           value={draftName}
           disabled={disabled}
-          aria-label={`Rename option ${option.name}`}
+          aria-label={t("editor.properties.renameOption", {
+            name: option.name,
+          })}
           onChange={(event) => setDraftName(event.target.value)}
           onBlur={submitRename}
           onKeyDown={(event) => {
@@ -1245,50 +2268,33 @@ function PropertyOptionSettingsRow({
           }}
           className="h-7 min-w-0 flex-1 border-0 bg-transparent px-1 text-sm shadow-none focus-visible:bg-background focus-visible:ring-1"
         />
-      </div>
-      <div className="flex items-center justify-between gap-2 pl-5">
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger
-            disabled={disabled}
-            className="h-7 rounded px-1.5 text-xs text-muted-foreground"
-          >
-            <IconPalette className="mr-1.5 size-3.5" />
-            Color
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent className="w-44">
-            {OPTION_COLORS.map((color) => (
-              <DropdownMenuItem
-                key={color}
-                onSelect={(event) => {
-                  event.preventDefault();
-                  onColorChange(color);
-                }}
-              >
-                <span
-                  aria-hidden
-                  className={cn(
-                    "mr-2 size-3 rounded-full",
-                    OPTION_COLOR_CLASSES[color],
-                  )}
-                />
-                <span className="flex-1 capitalize">{color}</span>
-                {option.color === color ? (
-                  <IconCheck className="size-4 text-muted-foreground" />
-                ) : null}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
         <button
           type="button"
-          aria-label={`Remove option ${option.name}`}
+          aria-label={t("editor.properties.removeOption", {
+            name: option.name,
+          })}
           disabled={disabled}
-          className="h-7 rounded px-1.5 text-xs text-muted-foreground hover:text-destructive disabled:opacity-50"
+          className="h-7 shrink-0 rounded px-1.5 text-muted-foreground hover:text-destructive disabled:opacity-50"
           onClick={onRemove}
         >
-          Remove
+          <IconX className="size-3.5" />
         </button>
       </div>
+      <Textarea
+        rows={1}
+        value={draftDescription}
+        disabled={disabled}
+        aria-label={`${t("editor.properties.description")}: ${option.name}`}
+        placeholder={t("editor.properties.addOptionDescription")}
+        onChange={(event) => setDraftDescription(event.target.value)}
+        onBlur={() => {
+          const nextDescription = draftDescription.trim();
+          if (nextDescription !== (option.description ?? "")) {
+            onDescriptionChange(nextDescription);
+          }
+        }}
+        className="block min-h-0 w-full resize-none rounded border-0 bg-transparent px-1 text-xs leading-5 text-muted-foreground shadow-none placeholder:text-muted-foreground/60 focus:resize-y focus:bg-background focus:ring-1 focus:ring-ring"
+      />
     </div>
   );
 }
@@ -1296,31 +2302,73 @@ function PropertyOptionSettingsRow({
 export function PropertyValuePopover({
   property,
   documentId,
+  databaseDocumentId = documentId,
   children,
   portalled = true,
+  container,
 }: {
   property: DocumentProperty;
   documentId: string;
+  databaseDocumentId?: string;
   children: React.ReactNode;
   portalled?: boolean;
+  container?: HTMLElement | null;
 }) {
+  const t = useT();
   const [open, setOpen] = useState(false);
+
+  const editLabel = t("editor.properties.editProperty", {
+    name: property.definition.name,
+  });
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          aria-label={`Edit ${property.definition.name}`}
-          className="flex min-h-6 w-full min-w-0 items-center rounded px-1 text-left hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          {children}
-        </button>
-      </PopoverTrigger>
-      <PopoverContent align="start" portalled={portalled} className="w-80 p-2">
+      {property.definition.type === "relation" ? (
+        // Relation values render links, so the picker gets its own trigger
+        // button beside them rather than wrapping them in button semantics.
+        <PopoverAnchor asChild>
+          <div
+            className="group flex min-h-6 w-full min-w-0 cursor-pointer items-center gap-1 rounded px-1 hover:bg-accent"
+            onClick={(event) => {
+              // Mouse convenience only: keyboard and assistive tech use the
+              // trigger button, and the links keep their own behaviour.
+              if ((event.target as HTMLElement).closest("a, button")) return;
+              setOpen(true);
+            }}
+          >
+            <div className="min-w-0 flex-1">{children}</div>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                aria-label={editLabel}
+                className="shrink-0 rounded p-0.5 text-muted-foreground opacity-0 hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100 aria-expanded:opacity-100"
+              >
+                <IconEdit className="size-3.5" />
+              </button>
+            </PopoverTrigger>
+          </div>
+        </PopoverAnchor>
+      ) : (
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            aria-label={editLabel}
+            className="flex min-h-6 w-full min-w-0 items-center rounded px-1 text-left hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {children}
+          </button>
+        </PopoverTrigger>
+      )}
+      <PopoverContent
+        align="start"
+        portalled={portalled}
+        container={container}
+        className="w-80 p-2"
+      >
         <PropertyValueEditor
           property={property}
           documentId={documentId}
+          databaseDocumentId={databaseDocumentId}
           onDone={() => setOpen(false)}
         />
       </PopoverContent>
@@ -1331,10 +2379,12 @@ export function PropertyValuePopover({
 function PropertyValueEditor({
   property,
   documentId,
+  databaseDocumentId,
   onDone,
 }: {
   property: DocumentProperty;
   documentId: string;
+  databaseDocumentId: string;
   onDone: () => void;
 }) {
   const type = property.definition.type;
@@ -1343,6 +2393,7 @@ function PropertyValueEditor({
       <OptionValueEditor
         property={property}
         documentId={documentId}
+        databaseDocumentId={databaseDocumentId}
         onDone={onDone}
       />
     );
@@ -1353,6 +2404,7 @@ function PropertyValueEditor({
       <CheckboxValueEditor
         property={property}
         documentId={documentId}
+        databaseDocumentId={databaseDocumentId}
         onDone={onDone}
       />
     );
@@ -1363,6 +2415,7 @@ function PropertyValueEditor({
       <DateValueEditor
         property={property}
         documentId={documentId}
+        databaseDocumentId={databaseDocumentId}
         onDone={onDone}
       />
     );
@@ -1373,6 +2426,18 @@ function PropertyValueEditor({
       <PersonValueEditor
         property={property}
         documentId={documentId}
+        databaseDocumentId={databaseDocumentId}
+        onDone={onDone}
+      />
+    );
+  }
+
+  if (type === "relation") {
+    return (
+      <RelationValueEditor
+        property={property}
+        documentId={documentId}
+        databaseDocumentId={databaseDocumentId}
         onDone={onDone}
       />
     );
@@ -1383,6 +2448,7 @@ function PropertyValueEditor({
       <FilesMediaValueEditor
         property={property}
         documentId={documentId}
+        databaseDocumentId={databaseDocumentId}
         onDone={onDone}
       />
     );
@@ -1392,6 +2458,7 @@ function PropertyValueEditor({
     <ScalarValueEditor
       property={property}
       documentId={documentId}
+      databaseDocumentId={databaseDocumentId}
       onDone={onDone}
     />
   );
@@ -1400,21 +2467,25 @@ function PropertyValueEditor({
 function PersonValueEditor({
   property,
   documentId,
+  databaseDocumentId,
   onDone,
 }: {
   property: DocumentProperty;
   documentId: string;
+  databaseDocumentId: string;
   onDone: () => void;
 }) {
-  const mutation = useSetDocumentProperty(documentId);
+  const t = useT();
+  const mutation = useSetDocumentProperty(
+    documentId,
+    property.definition.databaseId!,
+    databaseDocumentId,
+  );
   const { session } = useSession();
   const [people, setPeople] = useState(() => personItems(property.value));
   const [query, setQuery] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const currentUserEmail = session?.email?.trim() ?? "";
-  const currentUserLabel = currentUserEmail
-    ? personLabel(currentUserEmail)
-    : "";
 
   useEffect(() => {
     const frame = requestAnimationFrame(() => inputRef.current?.focus());
@@ -1490,7 +2561,9 @@ function PersonValueEditor({
             <PersonPill value={person} />
             <button
               type="button"
-              aria-label={`Remove ${personLabel(person)}`}
+              aria-label={t("editor.properties.removePerson", {
+                name: personLabel(person),
+              })}
               className="text-muted-foreground hover:text-foreground"
               onClick={() => removePerson(person)}
             >
@@ -1500,9 +2573,15 @@ function PersonValueEditor({
         ))}
         <input
           ref={inputRef}
-          aria-label={`Add ${property.definition.name} person`}
+          aria-label={t("editor.properties.addPropertyPerson", {
+            name: property.definition.name,
+          })}
           value={query}
-          placeholder={people.length === 0 ? "Search or add person" : "Add"}
+          placeholder={
+            people.length === 0
+              ? t("editor.properties.searchOrAddPerson")
+              : t("editor.properties.add")
+          }
           onChange={(event) => setQuery(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Escape") {
@@ -1526,12 +2605,14 @@ function PersonValueEditor({
                 {currentUserEmail}
               </span>
             </span>
-            <span className="text-xs text-muted-foreground">Me</span>
+            <span className="text-xs text-muted-foreground">
+              {t("editor.properties.me")}
+            </span>
           </button>
         ) : null}
         {filteredPeople.length > 0 && query.trim() ? (
           <div className="px-2 pt-1 text-xs text-muted-foreground">
-            Selected
+            {t("editor.properties.selected")}
           </div>
         ) : null}
         {query.trim()
@@ -1553,7 +2634,9 @@ function PersonValueEditor({
             onClick={() => addPerson(query)}
           >
             <IconPlus className="size-4 text-muted-foreground" />
-            <span>Add "{query.trim()}"</span>
+            <span>
+              {t("editor.properties.addQuoted", { value: query.trim() })}
+            </span>
           </button>
         ) : null}
       </div>
@@ -1565,10 +2648,10 @@ function PersonValueEditor({
           onClick={() => void clear()}
           disabled={mutation.isPending}
         >
-          Clear
+          {t("editor.properties.clear")}
         </Button>
         <Button type="button" variant="ghost" size="sm" onClick={onDone}>
-          Cancel
+          {t("editor.properties.cancel")}
         </Button>
         <Button
           type="button"
@@ -1576,28 +2659,465 @@ function PersonValueEditor({
           disabled={mutation.isPending}
           onClick={() => void save()}
         >
-          Save
+          {t("editor.properties.save")}
         </Button>
       </div>
     </form>
   );
 }
 
-function FilesMediaValueEditor({
+function RelationValueEditor({
   property,
   documentId,
+  databaseDocumentId,
   onDone,
 }: {
   property: DocumentProperty;
   documentId: string;
+  databaseDocumentId: string;
   onDone: () => void;
 }) {
-  const mutation = useSetDocumentProperty(documentId);
+  const t = useT();
+  const mutation = useSetDocumentProperty(
+    documentId,
+    property.definition.databaseId!,
+    databaseDocumentId,
+  );
+  const targetDatabaseId = property.definition.options.relation?.databaseId;
+  // Every pick and removal saves at once. Saves run one at a time and always
+  // send the latest list, so a slow or failed save can't undo a newer one.
+  // `savedRef` is the last value the server accepted, for rolling back.
+  const [selected, setSelected] = useState(() => relationItems(property.value));
+  const selectedRef = useRef(selected);
+  const savedRef = useRef(selected);
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const changeSeqRef = useRef(0);
+  const savingRef = useRef(false);
+  const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [known, setKnown] = useState(
+    () =>
+      new Map(
+        (property.relationTargets ?? []).map((target) => [
+          target.documentId,
+          { title: target.title, icon: target.icon },
+        ]),
+      ),
+  );
+  const knownRef = useRef(known);
+  knownRef.current = known;
+  const inputRef = useRef<HTMLInputElement>(null);
+  const search = useContentDatabaseRowSearch(
+    targetDatabaseId,
+    debouncedQuery,
+    true,
+  );
+  const firstPage = search.data?.pages[0];
+  const rows = useMemo(
+    () => search.data?.pages.flatMap((page) => page.rows) ?? [],
+    [search.data?.pages],
+  );
+  // Results kept from the previous search stay visible but can't be picked.
+  const searchIsCurrent = query === debouncedQuery && !search.isPlaceholderData;
+  const addRow = useAddDatabaseItem(firstPage?.databaseDocumentId ?? "");
+  const rowDragSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => inputRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, []);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQuery(query), 150);
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  useEffect(() => {
+    if (rows.length === 0) return;
+    setKnown((current) => {
+      const next = new Map(current);
+      for (const row of rows) {
+        next.set(row.documentId, { title: row.title, icon: row.icon });
+      }
+      return next;
+    });
+  }, [rows]);
+
+  // Adopt a newer value from the server (polling or another editor) while
+  // no save of ours is waiting to run.
+  const serverValueKey = relationItems(property.value).join("\n");
+  useEffect(() => {
+    if (savingRef.current) return;
+    const serverValue = serverValueKey ? serverValueKey.split("\n") : [];
+    if (serverValue.join("\n") === savedRef.current.join("\n")) return;
+    savedRef.current = serverValue;
+    selectedRef.current = serverValue;
+    setSelected(serverValue);
+  }, [serverValueKey]);
+
+  useEffect(() => {
+    const targets = property.relationTargets ?? [];
+    if (targets.length === 0) return;
+    setKnown((current) => {
+      const changed = targets.some((target) => {
+        const row = current.get(target.documentId);
+        return row?.title !== target.title || row?.icon !== target.icon;
+      });
+      if (!changed) return current;
+      const next = new Map(current);
+      for (const target of targets) {
+        next.set(target.documentId, { title: target.title, icon: target.icon });
+      }
+      return next;
+    });
+  }, [property.relationTargets]);
+
+  function save(value: string[]) {
+    return mutation.mutateAsync({
+      documentId,
+      propertyId: property.definition.id,
+      value: value.length > 0 ? value : null,
+      relationTargets: value.flatMap((id) => {
+        const row = knownRef.current.get(id);
+        return row
+          ? [
+              {
+                documentId: id,
+                title: row.title,
+                icon: row.icon,
+                databaseId: null,
+                databaseDocumentId: null,
+              },
+            ]
+          : [];
+      }),
+    });
+  }
+
+  function commit(next: string[]) {
+    selectedRef.current = next;
+    setSelected(next);
+    const seq = ++changeSeqRef.current;
+    savingRef.current = true;
+    saveQueueRef.current = saveQueueRef.current.then(async () => {
+      // A newer change is queued behind this one and will send the latest list.
+      if (seq !== changeSeqRef.current) return;
+      const value = selectedRef.current;
+      try {
+        await save(value);
+        savedRef.current = value;
+      } catch {
+        // coercion-ok: the mutation hook already shows the error.
+        if (seq === changeSeqRef.current) {
+          selectedRef.current = savedRef.current;
+          setSelected(savedRef.current);
+        }
+      } finally {
+        if (seq === changeSeqRef.current) savingRef.current = false;
+      }
+    });
+  }
+
+  function add(id: string) {
+    const current = selectedRef.current;
+    if (current.includes(id) || current.length >= MAX_RELATION_TARGETS) {
+      return;
+    }
+    commit([...current, id]);
+  }
+
+  function remove(id: string) {
+    commit(selectedRef.current.filter((selectedId) => selectedId !== id));
+  }
+
+  function handleRowDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const current = selectedRef.current;
+    const fromIndex = current.indexOf(String(active.id));
+    const toIndex = current.indexOf(String(over.id));
+    if (fromIndex < 0 || toIndex < 0) return;
+    commit(arrayMove(current, fromIndex, toIndex));
+  }
+
+  async function createRow(title: string) {
+    const rowCreation = firstPage?.rowCreation;
+    if (!rowCreation || addRow.isPending) return;
+    try {
+      const result = await addRow.mutateAsync({
+        target: rowCreation.target,
+        expectedSchemaRevision: rowCreation.schemaRevision,
+        idempotencyKey: `relation-create-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+        title,
+      });
+      const newId = result.receipt.row.documentId;
+      setKnown((current) => new Map(current).set(newId, { title, icon: null }));
+      setQuery("");
+      // Build on the latest list: other rows may have been picked meanwhile.
+      add(newId);
+    } catch {
+      // coercion-ok: useActionMutation surfaces the failure; keep the typed title.
+    }
+  }
+
+  if (!targetDatabaseId) {
+    return (
+      <div className="px-2 py-3 text-sm text-muted-foreground">
+        {t("editor.properties.noRelatedDatabase")}
+      </div>
+    );
+  }
+
+  const unselectedRows = rows.filter(
+    (row) => !selected.includes(row.documentId),
+  );
+  const needle = query.trim().toLowerCase();
+  const canCreate =
+    searchIsCurrent &&
+    !!firstPage?.rowCreation &&
+    !!needle &&
+    selected.length < MAX_RELATION_TARGETS &&
+    !rows.some((row) => row.title.trim().toLowerCase() === needle);
+  const visibleSelected = selected.filter((id) => {
+    if (!needle) return true;
+    const title = known.get(id)?.title ?? "";
+    return title.toLowerCase().includes(needle);
+  });
+
+  return (
+    <div className="grid gap-1">
+      <div className="flex h-8 items-center gap-1 border-b border-border px-1 pb-1">
+        <IconSearch className="size-3.5 shrink-0 text-muted-foreground" />
+        <input
+          ref={inputRef}
+          aria-label={t("editor.properties.searchPages")}
+          value={query}
+          placeholder={t("editor.properties.linkAPage")}
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              onDone();
+            }
+            if (!searchIsCurrent && event.key === "Enter") {
+              event.preventDefault();
+            } else if (event.key === "Enter" && unselectedRows[0]) {
+              event.preventDefault();
+              add(unselectedRows[0].documentId);
+              setQuery("");
+            } else if (event.key === "Enter" && canCreate) {
+              event.preventDefault();
+              void createRow(query.trim());
+            }
+          }}
+          className="h-7 min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+        />
+      </div>
+      <div className="max-h-80 overflow-auto">
+        {visibleSelected.length > 0 ? (
+          <>
+            <div className="px-2 pb-1 pt-2 text-xs font-medium text-muted-foreground">
+              {t("editor.properties.selectedCount", {
+                count: selected.length,
+              })}
+            </div>
+            <DndContext
+              sensors={rowDragSensors}
+              collisionDetection={closestCenter}
+              onDragEnd={handleRowDragEnd}
+            >
+              <SortableContext
+                items={visibleSelected}
+                strategy={verticalListSortingStrategy}
+              >
+                {visibleSelected.map((id) => {
+                  const row = known.get(id);
+                  return (
+                    <SortableRelationRow
+                      key={id}
+                      id={id}
+                      title={
+                        row?.title ?? t("editor.properties.unavailablePage")
+                      }
+                      icon={row?.icon ?? null}
+                      // Reordering a filtered list would be ambiguous.
+                      dragDisabled={!!needle}
+                      onRemove={() => remove(id)}
+                    />
+                  );
+                })}
+              </SortableContext>
+            </DndContext>
+          </>
+        ) : null}
+        {selected.length > 0 &&
+        !needle &&
+        !search.isLoading &&
+        unselectedRows.length === 0 ? null : (
+          <>
+            <div className="px-2 pb-1 pt-2 text-xs font-medium text-muted-foreground">
+              {selected.length > 0
+                ? t("editor.properties.selectMore")
+                : t("editor.properties.selectAPage")}
+            </div>
+            {canCreate ? (
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-accent disabled:opacity-50"
+                disabled={addRow.isPending}
+                onClick={() => void createRow(query.trim())}
+              >
+                {addRow.isPending ? (
+                  <Spinner className="size-4 shrink-0 text-muted-foreground" />
+                ) : (
+                  <IconPlus className="size-4 shrink-0 text-muted-foreground" />
+                )}
+                <span className="min-w-0 flex-1 truncate">
+                  {t("editor.properties.createPage", { name: query.trim() })}
+                </span>
+              </button>
+            ) : null}
+            {search.isLoading ? (
+              <div className="flex items-center px-2 py-3 text-muted-foreground">
+                <Spinner className="size-4" />
+              </div>
+            ) : unselectedRows.length === 0 ? (
+              canCreate ? null : (
+                <div className="px-2 py-2 text-sm text-muted-foreground">
+                  {t("editor.properties.noMatchingPages")}
+                </div>
+              )
+            ) : (
+              unselectedRows.map((row) => (
+                <button
+                  type="button"
+                  key={row.documentId}
+                  className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-accent disabled:opacity-50"
+                  disabled={
+                    !searchIsCurrent || selected.length >= MAX_RELATION_TARGETS
+                  }
+                  onClick={() => add(row.documentId)}
+                >
+                  <RelationRowIcon icon={row.icon} />
+                  <span className="min-w-0 flex-1 truncate">{row.title}</span>
+                </button>
+              ))
+            )}
+            {search.hasNextPage ? (
+              <button
+                type="button"
+                disabled={!searchIsCurrent || search.isFetchingNextPage}
+                onClick={() => void search.fetchNextPage()}
+                className="flex w-full items-center justify-center gap-2 rounded px-2 py-1.5 text-sm text-muted-foreground hover:bg-accent disabled:opacity-50"
+              >
+                {search.isFetchingNextPage ? (
+                  <Spinner className="size-4 shrink-0" />
+                ) : null}
+                {t("sidebar.showMore")}
+              </button>
+            ) : null}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SortableRelationRow({
+  id,
+  title,
+  icon,
+  dragDisabled,
+  onRemove,
+}: {
+  id: string;
+  title: string;
+  icon: string | null;
+  dragDisabled: boolean;
+  onRemove: () => void;
+}) {
+  const t = useT();
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id, disabled: dragDisabled });
+  return (
+    <div
+      ref={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
+      className={cn(
+        "group flex items-center gap-1.5 rounded px-1 py-1 text-sm hover:bg-accent",
+        isDragging && "relative z-10 bg-accent",
+      )}
+    >
+      <button
+        type="button"
+        disabled={dragDisabled}
+        aria-label={t("editor.properties.reorderRelation", { name: title })}
+        className="flex size-5 shrink-0 cursor-grab touch-none items-center justify-center rounded text-muted-foreground/60 hover:text-muted-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-30"
+        {...attributes}
+        {...listeners}
+      >
+        <IconGripVertical className="size-3.5" />
+      </button>
+      <RelationRowIcon icon={icon} />
+      <span className="min-w-0 flex-1 truncate">{title}</span>
+      <button
+        type="button"
+        aria-label={t("editor.properties.removeRelation", { name: title })}
+        className="flex size-6 shrink-0 items-center justify-center rounded border border-border text-muted-foreground opacity-0 hover:bg-background hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100 max-sm:opacity-100"
+        onClick={onRemove}
+      >
+        <IconMinus className="size-3.5" />
+      </button>
+    </div>
+  );
+}
+
+function RelationRowIcon({ icon }: { icon: string | null }) {
+  return icon ? (
+    <span className="w-4 shrink-0 text-center leading-none">{icon}</span>
+  ) : (
+    <IconFileText className="size-4 shrink-0 text-muted-foreground" />
+  );
+}
+
+function FilesMediaValueEditor({
+  property,
+  documentId,
+  databaseDocumentId,
+  onDone,
+}: {
+  property: DocumentProperty;
+  documentId: string;
+  databaseDocumentId: string;
+  onDone: () => void;
+}) {
+  const t = useT();
+  const fileUploadStatus = useFileUploadStatus();
+  const fileStorageConfigured =
+    fileUploadStatus.isSuccess && fileUploadStatus.data?.configured === true;
+  const mutation = useSetDocumentProperty(
+    documentId,
+    property.definition.databaseId!,
+    databaseDocumentId,
+  );
   const [items, setItems] = useState(() => filesMediaItems(property.value));
   const [linkValue, setLinkValue] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [storageSetupOpen, setStorageSetupOpen] = useState(false);
   const linkInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const pendingUploadFilesRef = useRef<File[] | null>(null);
 
   useEffect(() => {
     const frame = requestAnimationFrame(() => {
@@ -1607,16 +3127,8 @@ function FilesMediaValueEditor({
   }, []);
 
   function addItem(value: string) {
-    const trimmed = value.trim();
-    if (!trimmed) return;
-    setItems((current) => {
-      if (
-        current.some((item) => item.toLowerCase() === trimmed.toLowerCase())
-      ) {
-        return current;
-      }
-      return [...current, trimmed];
-    });
+    if (!isValidFilesMediaLink(value)) return;
+    setItems((current) => mergeFilesMediaItems(current, value));
     setLinkValue("");
   }
 
@@ -1642,43 +3154,64 @@ function FilesMediaValueEditor({
     onDone();
   }
 
-  async function uploadFiles(files: FileList | null) {
-    const selectedFiles = Array.from(files ?? []);
-    if (selectedFiles.length === 0) return;
-    setUploading(true);
-    try {
-      const uploadedUrls: string[] = [];
-      for (const file of selectedFiles) {
-        uploadedUrls.push(await uploadImageFile(file));
+  const uploadFiles = useCallback(
+    async (files: FileList | File[] | null) => {
+      const selectedFiles = Array.from(files ?? []);
+      if (selectedFiles.length === 0) return;
+      if (!fileStorageConfigured) {
+        pendingUploadFilesRef.current = selectedFiles;
+        setStorageSetupOpen(true);
+        return;
       }
-      setItems((current) => [...current, ...uploadedUrls]);
-      toast.success(
-        uploadedUrls.length === 1 ? "Image uploaded" : "Images uploaded",
-      );
-    } catch (error) {
-      toast.error(imageUploadErrorMessage(error));
-    } finally {
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
-    }
-  }
+      setUploading(true);
+      try {
+        const uploadedUrls: string[] = [];
+        for (const file of selectedFiles) {
+          uploadedUrls.push(await uploadImageFile(file));
+        }
+        setItems((current) => [...current, ...uploadedUrls]);
+        toast.success(
+          t(
+            uploadedUrls.length === 1
+              ? "editor.properties.imageUploaded_one"
+              : "editor.properties.imageUploaded_other",
+            { count: uploadedUrls.length },
+          ),
+        );
+      } catch (error) {
+        toast.error(imageUploadErrorMessage(error));
+      } finally {
+        setUploading(false);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+      }
+    },
+    [fileStorageConfigured, t],
+  );
+
+  useEffect(() => {
+    if (!fileStorageConfigured) return;
+    setStorageSetupOpen(false);
+    const pendingFiles = pendingUploadFilesRef.current;
+    pendingUploadFilesRef.current = null;
+    if (pendingFiles) void uploadFiles(pendingFiles);
+  }, [fileStorageConfigured, uploadFiles]);
 
   return (
     <form
       className="grid gap-3"
       onSubmit={(event) => {
         event.preventDefault();
-        if (linkValue.trim()) {
-          addItem(linkValue);
+        if (linkValue.trim() && !isValidFilesMediaLink(linkValue)) {
+          linkInputRef.current?.reportValidity();
           return;
         }
-        void save();
+        void save(mergeFilesMediaItems(items, linkValue));
       }}
     >
       <div className="grid max-h-48 gap-1 overflow-auto">
         {items.length === 0 ? (
           <div className="rounded-md border border-dashed px-3 py-6 text-center text-sm text-muted-foreground">
-            No files or media
+            {t("editor.properties.noFilesOrMedia")}
           </div>
         ) : (
           items.map((item) => (
@@ -1694,12 +3227,16 @@ function FilesMediaValueEditor({
                   {filesMediaLabel(item)}
                 </div>
                 <div className="truncate text-xs text-muted-foreground">
-                  {filesMediaKind(item)}
+                  {t(
+                    `editor.properties.filesMediaKinds.${filesMediaKind(item).toLowerCase()}`,
+                  )}
                 </div>
               </div>
               <button
                 type="button"
-                aria-label={`Remove ${filesMediaLabel(item)}`}
+                aria-label={t("editor.properties.removeFileOrMedia", {
+                  name: filesMediaLabel(item),
+                })}
                 className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
                 onClick={() => removeItem(item)}
               >
@@ -1712,9 +3249,13 @@ function FilesMediaValueEditor({
       <div className="flex gap-1">
         <Input
           ref={linkInputRef}
-          aria-label={`Add ${property.definition.name} link`}
+          aria-label={t("editor.properties.editValue", {
+            name: property.definition.name,
+          })}
+          type="url"
+          pattern="[hH][tT][tT][pP][sS]?://.*"
           value={linkValue}
-          placeholder="Paste file or media link"
+          placeholder={t("editor.properties.pasteFileOrMediaLink")}
           onChange={(event) => setLinkValue(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Escape") {
@@ -1729,10 +3270,10 @@ function FilesMediaValueEditor({
           size="sm"
           className="shrink-0"
           onClick={() => addItem(linkValue)}
-          disabled={!linkValue.trim() || mutation.isPending}
+          disabled={!isValidFilesMediaLink(linkValue) || mutation.isPending}
         >
           <IconPlus className="size-3.5" />
-          Add
+          {t("editor.properties.add")}
         </Button>
       </div>
       <input
@@ -1740,19 +3281,36 @@ function FilesMediaValueEditor({
         type="file"
         accept="image/*"
         multiple
+        disabled={!fileStorageConfigured}
         className="sr-only"
         onChange={(event) => void uploadFiles(event.currentTarget.files)}
+      />
+      <FileStorageStatusGate
+        status={fileUploadStatus}
+        open={storageSetupOpen}
+        onOpenChange={(open, reason) => {
+          if (!open && reason === "dismiss") {
+            pendingUploadFilesRef.current = null;
+          }
+          setStorageSetupOpen(open);
+        }}
       />
       <div className="flex justify-end gap-2">
         <Button
           type="button"
           variant="secondary"
           size="sm"
-          onClick={() => fileInputRef.current?.click()}
+          onClick={() => {
+            if (fileStorageConfigured) {
+              fileInputRef.current?.click();
+            } else {
+              setStorageSetupOpen(true);
+            }
+          }}
           disabled={mutation.isPending || uploading}
         >
           <IconUpload className="size-3.5" />
-          Upload
+          {t("editor.properties.upload")}
         </Button>
         <Button
           type="button"
@@ -1761,17 +3319,17 @@ function FilesMediaValueEditor({
           onClick={() => void clear()}
           disabled={mutation.isPending || uploading}
         >
-          Clear
+          {t("editor.properties.clear")}
         </Button>
         <Button type="button" variant="ghost" size="sm" onClick={onDone}>
-          Cancel
+          {t("editor.properties.cancel")}
         </Button>
         <Button
           type="submit"
           size="sm"
           disabled={mutation.isPending || uploading}
         >
-          Save
+          {t("editor.properties.save")}
         </Button>
       </div>
     </form>
@@ -1781,13 +3339,20 @@ function FilesMediaValueEditor({
 function DateValueEditor({
   property,
   documentId,
+  databaseDocumentId,
   onDone,
 }: {
   property: DocumentProperty;
   documentId: string;
+  databaseDocumentId: string;
   onDone: () => void;
 }) {
-  const mutation = useSetDocumentProperty(documentId);
+  const t = useT();
+  const mutation = useSetDocumentProperty(
+    documentId,
+    property.definition.databaseId!,
+    databaseDocumentId,
+  );
   const [includeTime, setIncludeTime] = useState(
     documentPropertyDateIncludesTime(property.value),
   );
@@ -1846,7 +3411,17 @@ function DateValueEditor({
       className="grid gap-2"
       onSubmit={(event) => {
         event.preventDefault();
-        void save();
+        const formData = new FormData(event.currentTarget);
+        const submittedStartValue = formData.get("property-start-value");
+        const submittedEndValue = formData.get("property-end-value");
+
+        void save(
+          buildValue(
+            typeof submittedStartValue === "string" ? submittedStartValue : "",
+            typeof submittedEndValue === "string" ? submittedEndValue : "",
+            formData.has("property-include-time"),
+          ),
+        );
       }}
     >
       <div className="grid grid-cols-2 gap-1">
@@ -1854,7 +3429,7 @@ function DateValueEditor({
           type="button"
           variant="secondary"
           size="sm"
-          className="h-8 justify-start gap-1.5"
+          className="justify-start gap-1.5"
           disabled={mutation.isPending}
           onClick={() =>
             void save({
@@ -1866,13 +3441,13 @@ function DateValueEditor({
           }
         >
           <IconCalendar className="size-3.5" />
-          Today
+          {t("editor.properties.today")}
         </Button>
         <Button
           type="button"
           variant="secondary"
           size="sm"
-          className="h-8 justify-start gap-1.5"
+          className="justify-start gap-1.5"
           disabled={mutation.isPending}
           onClick={() =>
             void save({
@@ -1884,19 +3459,21 @@ function DateValueEditor({
           }
         >
           <IconCalendar className="size-3.5" />
-          Tomorrow
+          {t("editor.properties.tomorrow")}
         </Button>
       </div>
       <label className="grid gap-1 text-xs font-medium text-muted-foreground">
-        Start
+        {t("editor.properties.start")}
         <Input
           ref={dateValueInputRef}
-          aria-label={`Edit ${property.definition.name} start date`}
+          aria-label={t("editor.properties.editStartDate", {
+            name: property.definition.name,
+          })}
           autoFocus
           name="property-start-value"
           type={includeTime ? "datetime-local" : "date"}
           value={startValue}
-          placeholder="Select a date"
+          placeholder={t("editor.properties.selectDate")}
           onChange={(event) => setStartValue(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Escape") {
@@ -1907,14 +3484,16 @@ function DateValueEditor({
         />
       </label>
       <label className="grid gap-1 text-xs font-medium text-muted-foreground">
-        End
+        {t("editor.properties.end")}
         <div className="flex gap-1">
           <Input
-            aria-label={`Edit ${property.definition.name} end date`}
+            aria-label={t("editor.properties.editEndDate", {
+              name: property.definition.name,
+            })}
             name="property-end-value"
             type={includeTime ? "datetime-local" : "date"}
             value={endValue}
-            placeholder="Optional"
+            placeholder={t("editor.properties.optional")}
             onChange={(event) => setEndValue(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Escape") {
@@ -1931,12 +3510,13 @@ function DateValueEditor({
             onClick={() => setEndValue("")}
             disabled={!endValue || mutation.isPending}
           >
-            Clear
+            {t("editor.properties.clear")}
           </Button>
         </div>
       </label>
       <label className="flex items-center gap-2 rounded-md border px-2.5 py-2 text-sm">
         <input
+          name="property-include-time"
           type="checkbox"
           checked={includeTime}
           onChange={(event) => {
@@ -1963,7 +3543,7 @@ function DateValueEditor({
             }
           }}
         />
-        Include time
+        {t("editor.properties.includeTime")}
       </label>
       <div className="flex justify-end gap-2">
         <Button
@@ -1973,13 +3553,13 @@ function DateValueEditor({
           onClick={() => void clear()}
           disabled={mutation.isPending}
         >
-          Clear
+          {t("editor.properties.clear")}
         </Button>
         <Button type="button" variant="ghost" size="sm" onClick={onDone}>
-          Cancel
+          {t("editor.properties.cancel")}
         </Button>
         <Button type="submit" size="sm" disabled={mutation.isPending}>
-          Save
+          {t("editor.properties.save")}
         </Button>
       </div>
     </form>
@@ -1989,17 +3569,25 @@ function DateValueEditor({
 function ScalarValueEditor({
   property,
   documentId,
+  databaseDocumentId,
   onDone,
 }: {
   property: DocumentProperty;
   documentId: string;
+  databaseDocumentId: string;
   onDone: () => void;
 }) {
-  const mutation = useSetDocumentProperty(documentId);
+  const t = useT();
+  const mutation = useSetDocumentProperty(
+    documentId,
+    property.definition.databaseId!,
+    databaseDocumentId,
+  );
   const type = property.definition.type;
+  const isMultilineText = type === "text";
   const inputType =
     type === "number"
-      ? "number"
+      ? "text"
       : type === "date"
         ? "date"
         : type === "email"
@@ -2014,25 +3602,47 @@ function ScalarValueEditor({
       ? property.value.slice(0, 10)
       : property.value === null || Array.isArray(property.value)
         ? ""
-        : String(property.value);
+        : propertyText(property.value);
   const [value, setValue] = useState(initialValue);
+  const errorId = useId();
+  const invalidNumber =
+    type === "number" && value.trim() !== "" && !Number.isFinite(Number(value));
   const scalarValueInputRef = useRef<HTMLInputElement>(null);
+  const scalarValueTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const saveInFlightRef = useRef(false);
 
   useEffect(() => {
     const frame = requestAnimationFrame(() => {
-      scalarValueInputRef.current?.focus();
-      scalarValueInputRef.current?.select();
+      const control = isMultilineText
+        ? scalarValueTextareaRef.current
+        : scalarValueInputRef.current;
+      control?.focus();
+      control?.select();
     });
     return () => cancelAnimationFrame(frame);
-  }, []);
+  }, [isMultilineText]);
 
   async function save(nextValue = value) {
-    await mutation.mutateAsync({
-      documentId,
-      propertyId: property.definition.id,
-      value: nextValue,
-    });
-    onDone();
+    if (saveInFlightRef.current) return;
+    if (
+      type === "number" &&
+      nextValue.trim() !== "" &&
+      !Number.isFinite(Number(nextValue))
+    ) {
+      scalarValueInputRef.current?.focus();
+      return;
+    }
+    saveInFlightRef.current = true;
+    try {
+      await mutation.mutateAsync({
+        documentId,
+        propertyId: property.definition.id,
+        value: type === "number" && nextValue.trim() === "" ? null : nextValue,
+      });
+      onDone();
+    } finally {
+      saveInFlightRef.current = false;
+    }
   }
 
   async function clear() {
@@ -2054,22 +3664,70 @@ function ScalarValueEditor({
         void save(typeof formValue === "string" ? formValue : value);
       }}
     >
-      <Input
-        ref={scalarValueInputRef}
-        aria-label={`Edit ${property.definition.name} value`}
-        autoFocus
-        name="property-value"
-        type={inputType}
-        value={value}
-        placeholder={scalarPlaceholder(type)}
-        onChange={(event) => setValue(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Escape") {
-            event.preventDefault();
-            onDone();
-          }
-        }}
-      />
+      {isMultilineText ? (
+        <Textarea
+          ref={scalarValueTextareaRef}
+          aria-label={t("editor.properties.editValue", {
+            name: property.definition.name,
+          })}
+          autoFocus
+          name="property-value"
+          rows={3}
+          value={value}
+          placeholder={scalarPlaceholder(type, t)}
+          onChange={(event) => setValue(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return;
+            if (event.key === "Escape") {
+              event.preventDefault();
+              event.stopPropagation();
+              onDone();
+              return;
+            }
+            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+              event.preventDefault();
+              event.stopPropagation();
+              event.currentTarget.form?.requestSubmit();
+            }
+          }}
+          className="resize-y whitespace-pre-wrap"
+        />
+      ) : (
+        <Input
+          ref={scalarValueInputRef}
+          aria-label={t("editor.properties.editValue", {
+            name: property.definition.name,
+          })}
+          autoFocus
+          name="property-value"
+          type={inputType}
+          inputMode={type === "number" ? "decimal" : undefined}
+          aria-invalid={invalidNumber || undefined}
+          aria-describedby={invalidNumber ? errorId : undefined}
+          value={value}
+          placeholder={scalarPlaceholder(type, t)}
+          onChange={(event) => setValue(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return;
+            if (event.key === "Escape") {
+              event.preventDefault();
+              event.stopPropagation();
+              onDone();
+              return;
+            }
+            if (event.key === "Enter") {
+              event.preventDefault();
+              event.stopPropagation();
+              event.currentTarget.form?.requestSubmit();
+            }
+          }}
+        />
+      )}
+      {invalidNumber ? (
+        <p id={errorId} role="alert" className="text-xs text-destructive">
+          {t("database.enterAValidNumber")}
+        </p>
+      ) : null}
       <div className="flex justify-end gap-2">
         <Button
           type="button"
@@ -2078,13 +3736,13 @@ function ScalarValueEditor({
           onClick={() => void clear()}
           disabled={mutation.isPending}
         >
-          Clear
+          {t("editor.properties.clear")}
         </Button>
         <Button type="button" variant="ghost" size="sm" onClick={onDone}>
-          Cancel
+          {t("editor.properties.cancel")}
         </Button>
         <Button type="submit" size="sm" disabled={mutation.isPending}>
-          Save
+          {t("editor.properties.save")}
         </Button>
       </div>
     </form>
@@ -2094,13 +3752,20 @@ function ScalarValueEditor({
 function CheckboxValueEditor({
   property,
   documentId,
+  databaseDocumentId,
   onDone,
 }: {
   property: DocumentProperty;
   documentId: string;
+  databaseDocumentId: string;
   onDone: () => void;
 }) {
-  const mutation = useSetDocumentProperty(documentId);
+  const t = useT();
+  const mutation = useSetDocumentProperty(
+    documentId,
+    property.definition.databaseId!,
+    databaseDocumentId,
+  );
   const checked = Boolean(property.value);
 
   return (
@@ -2124,7 +3789,7 @@ function CheckboxValueEditor({
       >
         {checked ? <IconCheck className="size-3" /> : null}
       </span>
-      {checked ? "Uncheck" : "Check"}
+      {checked ? t("editor.properties.uncheck") : t("editor.properties.check")}
     </button>
   );
 }
@@ -2132,14 +3797,25 @@ function CheckboxValueEditor({
 function OptionValueEditor({
   property,
   documentId,
+  databaseDocumentId,
   onDone,
 }: {
   property: DocumentProperty;
   documentId: string;
+  databaseDocumentId: string;
   onDone: () => void;
 }) {
-  const setValue = useSetDocumentProperty(documentId);
-  const configure = useConfigureDocumentProperty(documentId);
+  const t = useT();
+  const setValue = useSetDocumentProperty(
+    documentId,
+    property.definition.databaseId!,
+    databaseDocumentId,
+  );
+  const configure = useConfigureDocumentProperty(
+    documentId,
+    property.definition.databaseId!,
+    databaseDocumentId,
+  );
   const options = property.definition.options.options ?? [];
   const [optionQuery, setOptionQuery] = useState("");
   const filteredOptions = filterPropertyOptions(options, optionQuery);
@@ -2219,8 +3895,10 @@ function OptionValueEditor({
           ref={optionSearchInputRef}
           autoFocus
           value={optionQuery}
-          placeholder="Search or create option"
-          aria-label={`Search ${property.definition.name} options`}
+          placeholder={t("editor.properties.searchOrCreateOption")}
+          aria-label={t("editor.properties.searchPropertyOptions", {
+            name: property.definition.name,
+          })}
           onChange={(event) => setOptionQuery(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter") {
@@ -2242,7 +3920,7 @@ function OptionValueEditor({
       <div className="max-h-52 overflow-auto">
         {filteredOptions.length === 0 && !canCreateOption ? (
           <div className="px-2 py-3 text-sm text-muted-foreground">
-            No matching options
+            {t("editor.properties.noMatchingOptions")}
           </div>
         ) : null}
         {filteredOptions.map((option) => {
@@ -2254,7 +3932,14 @@ function OptionValueEditor({
               className="flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-accent"
               onClick={() => void chooseOption(option)}
             >
-              <OptionPill option={option} />
+              <span className="min-w-0 flex-1">
+                <OptionPill option={option} />
+                {option.description ? (
+                  <span className="mt-0.5 block truncate text-xs text-muted-foreground">
+                    {option.description}
+                  </span>
+                ) : null}
+              </span>
               {checked ? (
                 <IconCheck className="size-4 text-muted-foreground" />
               ) : null}
@@ -2272,7 +3957,7 @@ function OptionValueEditor({
           onClick={() => void addOption()}
         >
           <IconPlus className="mr-1.5 size-3.5" />
-          Create &ldquo;{optionQuery.trim()}&rdquo;
+          {t("editor.properties.createQuoted", { value: optionQuery.trim() })}
         </Button>
       ) : null}
       <Button
@@ -2287,7 +3972,7 @@ function OptionValueEditor({
           )
         }
       >
-        Clear value
+        {t("editor.properties.clearValue")}
       </Button>
     </div>
   );
@@ -2295,43 +3980,51 @@ function OptionValueEditor({
 
 export function AddProperty({
   documentId,
+  databaseDocumentId = documentId,
+  databaseId,
   variant = "default",
-  label = "Add property",
+  label,
   popoversPortalled = true,
+  popoverContainer,
   source,
   sources,
+  onConnectSource,
+  openRequestId = 0,
+  onOpenRequestHandled,
 }: {
   documentId: string;
+  databaseDocumentId?: string;
+  databaseId: string;
   variant?: "default" | "header" | "icon";
   label?: string;
   popoversPortalled?: boolean;
+  popoverContainer?: HTMLElement | null;
   source?: ContentDatabaseSource | null;
   sources?: ContentDatabaseSource[];
+  onConnectSource?: () => void;
+  openRequestId?: number;
+  onOpenRequestHandled?: (requestId: number) => void;
 }) {
-  const configure = useConfigureDocumentProperty(documentId);
-  const queryClient = useQueryClient();
-  const addSourceFieldProperty = useActionMutation<
-    ContentDatabaseSourceFieldPropertyResponse,
-    AddContentDatabaseSourceFieldPropertyRequest
-  >("add-content-database-source-field-property", {
-    onSuccess: (data) => {
-      queryClient.setQueriesData<ContentDatabaseResponse>(
-        { queryKey: ["action", "get-content-database"] },
-        (current) => applySourceFieldPropertyToDatabaseResponse(current, data),
-      );
-      queryClient.invalidateQueries({
-        queryKey: ["action", "list-document-properties", { documentId }],
-      });
-    },
-  });
+  const t = useT();
+  const configure = useConfigureDocumentProperty(
+    documentId,
+    databaseId,
+    databaseDocumentId,
+  );
+  const addSourceFieldProperty =
+    useAddContentDatabaseSourceFieldProperty(documentId);
   const [open, setOpen] = useState(false);
-  const [name, setName] = useState("");
+  const [sourceHandoffClosing, setSourceHandoffClosing] = useState(false);
+  const handledOpenRequestId = useRef(0);
   const [typeQuery, setTypeQuery] = useState("");
   const filteredPropertyTypes = filterDocumentPropertyTypes(typeQuery);
   const firstFilteredPropertyType = filteredPropertyTypes[0] ?? null;
   const allSources =
     sources && sources.length > 0 ? sources : source ? [source] : [];
   const query = typeQuery.trim().toLowerCase();
+  const connectSourceLabel = t("editor.properties.connectASource");
+  const connectSourceMatches =
+    !!onConnectSource && matchesConnectSourceQuery(connectSourceLabel, query);
   const sourceFieldGroups = allSources
     .map((src) => ({
       source: src,
@@ -2353,40 +4046,156 @@ export function AddProperty({
         }),
     }))
     .filter((group) => group.fields.length > 0);
-  const addPropertyNameInputRef = useRef<HTMLInputElement>(null);
+  const addPropertySearchInputRef = useRef<HTMLInputElement>(null);
+  const addActivationRef = useRef<{ key: string; at: number } | null>(null);
+  const [pendingPropertyType, setPendingPropertyType] =
+    useState<DocumentPropertyType | null>(null);
+  const [pendingSourceFieldId, setPendingSourceFieldId] = useState<
+    string | null
+  >(null);
+  const [addPropertyError, setAddPropertyError] = useState<string | null>(null);
+  const [relationStep, setRelationStep] = useState(false);
+  const [relationDatabaseQuery, setRelationDatabaseQuery] = useState("");
+  const relationDatabases = useContentDatabases({
+    enabled: open && relationStep,
+  });
+  const relationDatabaseChoices = relationDatabaseChoicesFor(
+    relationDatabases.data?.databases ?? [],
+    databaseId,
+    relationDatabaseQuery,
+  );
+  const isAddingProperty =
+    configure.isPending ||
+    addSourceFieldProperty.isPending ||
+    pendingPropertyType !== null ||
+    pendingSourceFieldId !== null;
 
   useEffect(() => {
     if (!open) return;
     const frame = requestAnimationFrame(() => {
-      addPropertyNameInputRef.current?.focus();
-      addPropertyNameInputRef.current?.select();
+      addPropertySearchInputRef.current?.focus();
+      addPropertySearchInputRef.current?.select();
     });
     return () => cancelAnimationFrame(frame);
   }, [open]);
 
-  function closeAddPropertyPicker() {
-    setName("");
+  useEffect(() => {
+    if (openRequestId === 0 || openRequestId === handledOpenRequestId.current)
+      return;
+    handledOpenRequestId.current = openRequestId;
     setTypeQuery("");
+    setAddPropertyError(null);
+    setSourceHandoffClosing(false);
+    setOpen(true);
+    onOpenRequestHandled?.(openRequestId);
+  }, [onOpenRequestHandled, openRequestId]);
+
+  function closeAddPropertyPicker() {
+    if (isAddingProperty) return;
+    setTypeQuery("");
+    setAddPropertyError(null);
+    setRelationStep(false);
+    setRelationDatabaseQuery("");
     setOpen(false);
   }
 
-  async function add(type: DocumentPropertyType) {
-    const label = DOCUMENT_PROPERTY_TYPE_LABELS[type];
-    await configure.mutateAsync({
-      documentId,
-      name: name.trim() || label,
-      type,
-      options: defaultPropertyOptions(type),
-    });
-    closeAddPropertyPicker();
+  function connectSource() {
+    if (!onConnectSource || isAddingProperty) return;
+    setTypeQuery("");
+    setAddPropertyError(null);
+    setSourceHandoffClosing(true);
+    setOpen(false);
+    onConnectSource();
+  }
+
+  async function add(
+    type: DocumentPropertyType,
+    relationTarget?: { databaseId: string; title: string },
+  ) {
+    if (type === "relation" && !relationTarget) {
+      // A relation needs its target database before it can be created.
+      setAddPropertyError(null);
+      setRelationDatabaseQuery("");
+      setRelationStep(true);
+      return;
+    }
+    const label = relationTarget
+      ? relationTarget.title
+      : t(`editor.propertyTypes.${type}`);
+    setPendingPropertyType(type);
+    setPendingSourceFieldId(null);
+    setAddPropertyError(null);
+    try {
+      await configure.mutateAsync({
+        documentId,
+        name: label,
+        type,
+        options: relationTarget
+          ? { relation: { databaseId: relationTarget.databaseId } }
+          : type === "blocks"
+            ? undefined
+            : defaultPropertyOptions(type),
+      });
+      setTypeQuery("");
+      setRelationStep(false);
+      setRelationDatabaseQuery("");
+      setOpen(false);
+    } catch (error) {
+      setAddPropertyError(error instanceof Error ? error.message : "");
+    } finally {
+      setPendingPropertyType(null);
+    }
   }
 
   async function addFromSourceField(sourceFieldId: string) {
-    await addSourceFieldProperty.mutateAsync({
-      documentId,
-      sourceFieldId,
-    });
-    closeAddPropertyPicker();
+    setPendingSourceFieldId(sourceFieldId);
+    setPendingPropertyType(null);
+    setAddPropertyError(null);
+    try {
+      await addSourceFieldProperty.mutateAsync({
+        documentId,
+        sourceFieldId,
+      });
+      setTypeQuery("");
+      setOpen(false);
+    } catch (error) {
+      setAddPropertyError(error instanceof Error ? error.message : "");
+    } finally {
+      setPendingSourceFieldId(null);
+    }
+  }
+
+  function runAddPropertyActivation(key: string, action: () => void) {
+    const now = Date.now();
+    const previous = addActivationRef.current;
+    if (previous?.key === key && now - previous.at < 750) return;
+    addActivationRef.current = { key, at: now };
+    action();
+  }
+
+  function activateAddPropertyItem(
+    event: Pick<
+      ReactMouseEvent<HTMLButtonElement>,
+      "button" | "preventDefault" | "stopPropagation"
+    >,
+    key: string,
+    action: () => void,
+  ) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    runAddPropertyActivation(key, action);
+  }
+
+  function activateAddPropertyItemFromKeyboard(
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    key: string,
+    action: () => void,
+  ) {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    event.stopPropagation();
+    runAddPropertyActivation(key, action);
   }
 
   return (
@@ -2394,8 +4203,9 @@ export function AddProperty({
       open={open}
       onOpenChange={(nextOpen) => {
         if (nextOpen) {
+          setSourceHandoffClosing(false);
           setOpen(true);
-        } else {
+        } else if (!isAddingProperty) {
           closeAddPropertyPicker();
         }
       }}
@@ -2403,7 +4213,7 @@ export function AddProperty({
       <PopoverTrigger asChild>
         <button
           type="button"
-          aria-label={label}
+          aria-label={label ?? t("editor.properties.addProperty")}
           className={cn(
             "flex h-8 items-center gap-2 rounded text-muted-foreground hover:bg-muted/50 hover:text-foreground",
             variant === "icon" && "size-7 justify-center px-0",
@@ -2412,113 +4222,317 @@ export function AddProperty({
           )}
         >
           <IconPlus className="size-4" />
-          {variant === "default" || variant === "header" ? label : null}
+          {variant === "default" || variant === "header"
+            ? (label ?? t("editor.properties.addProperty"))
+            : null}
         </button>
       </PopoverTrigger>
       <PopoverContent
-        align="start"
+        align={variant === "default" ? "start" : "end"}
+        collisionPadding={12}
         portalled={popoversPortalled}
-        className="w-80 p-2"
+        container={popoverContainer}
+        className={cn(
+          "relative z-[300] w-80 p-2",
+          sourceHandoffClosing &&
+            "data-[state=closed]:hidden data-[state=closed]:animate-none",
+        )}
       >
-        <div className="grid gap-2">
-          <Input
-            ref={addPropertyNameInputRef}
-            aria-label="New property name"
-            autoFocus
-            value={name}
-            placeholder="Property name"
-            onChange={(event) => setName(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                event.preventDefault();
-                closeAddPropertyPicker();
-              }
-            }}
-          />
-          <div className="flex h-8 items-center gap-1 rounded border border-border bg-background px-2">
-            <IconSearch className="size-3.5 shrink-0 text-muted-foreground" />
-            <Input
-              value={typeQuery}
-              placeholder="Search property types"
-              aria-label="Search property types"
-              onChange={(event) => setTypeQuery(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && firstFilteredPropertyType) {
-                  event.preventDefault();
-                  void add(firstFilteredPropertyType);
-                }
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  closeAddPropertyPicker();
-                }
-              }}
-              className="h-7 border-0 bg-transparent px-0 text-xs shadow-none focus-visible:ring-0"
-            />
-          </div>
-          <div className="max-h-80 overflow-auto rounded border p-1">
-            {sourceFieldGroups.map((group) => (
-              <div
-                key={group.source.id}
-                className="mb-1 border-b border-border pb-1"
+        {relationStep ? (
+          <div className="grid gap-2">
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                aria-label={t("editor.properties.back")}
+                className="flex size-7 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                disabled={isAddingProperty}
+                onClick={() => {
+                  setRelationStep(false);
+                  setAddPropertyError(null);
+                }}
               >
-                <div className="truncate px-2 py-1 text-xs font-medium text-muted-foreground">
-                  From {group.source.sourceName}
+                <IconArrowLeft className="size-4" />
+              </button>
+              <span className="text-sm font-medium">
+                {t("editor.properties.relatedDatabase")}
+              </span>
+            </div>
+            <div className="flex h-8 items-center gap-1 rounded border border-border bg-background px-2">
+              <IconSearch className="size-3.5 shrink-0 text-muted-foreground" />
+              <Input
+                autoFocus
+                value={relationDatabaseQuery}
+                placeholder={t("editor.properties.searchDatabases")}
+                aria-label={t("editor.properties.searchDatabases")}
+                onChange={(event) =>
+                  setRelationDatabaseQuery(event.target.value)
+                }
+                onKeyDown={(event) => {
+                  const first = relationDatabaseChoices[0];
+                  if (event.key === "Enter" && first) {
+                    event.preventDefault();
+                    void add("relation", first);
+                  }
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    closeAddPropertyPicker();
+                  }
+                }}
+                className="h-7 border-0 bg-transparent px-0 text-xs shadow-none focus-visible:ring-0"
+              />
+            </div>
+            <div className="max-h-80 overflow-auto rounded border p-1">
+              {relationDatabases.isLoading ? (
+                <div className="flex items-center gap-2 px-2 py-3 text-sm text-muted-foreground">
+                  <Spinner className="size-4" />
                 </div>
-                {group.fields.map((field) => (
+              ) : relationDatabaseChoices.length === 0 ? (
+                <div className="px-2 py-3 text-sm text-muted-foreground">
+                  {t("editor.properties.noDatabases")}
+                </div>
+              ) : (
+                relationDatabaseChoices.map((choice) => (
                   <button
-                    key={field.id}
+                    key={choice.databaseId}
                     type="button"
-                    aria-label={`Source field ${field.sourceFieldLabel}`}
-                    disabled={addSourceFieldProperty.isPending}
                     className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-accent disabled:opacity-50"
-                    onClick={() => void addFromSourceField(field.id)}
+                    disabled={isAddingProperty}
+                    onClick={() => void add("relation", choice)}
                   >
-                    <IconLink className="size-4 shrink-0 text-muted-foreground" />
+                    {pendingPropertyType === "relation" ? (
+                      <Spinner className="size-4 shrink-0 text-muted-foreground" />
+                    ) : (
+                      <IconDatabase className="size-4 shrink-0 text-muted-foreground" />
+                    )}
                     <span className="min-w-0 flex-1 truncate">
-                      {field.sourceFieldLabel}
+                      {choice.title}
                     </span>
-                    <span className="shrink-0 text-xs text-muted-foreground">
-                      {group.source.metadata.federation?.role === "secondary"
-                        ? "Federated"
-                        : "Source"}
-                    </span>
+                    {choice.isCurrent ? (
+                      <span className="shrink-0 text-xs text-muted-foreground">
+                        {t("editor.properties.thisDatabase")}
+                      </span>
+                    ) : null}
                   </button>
-                ))}
-              </div>
-            ))}
-            {filteredPropertyTypes.length === 0 ? (
-              <div className="px-2 py-3 text-sm text-muted-foreground">
-                No matching property types
-              </div>
-            ) : null}
-            {filteredPropertyTypes.map((type) => {
-              const Icon = TYPE_ICONS[type];
-              return (
-                <button
-                  key={type}
-                  type="button"
-                  aria-label={`Add ${DOCUMENT_PROPERTY_TYPE_LABELS[type]} property`}
-                  className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-accent"
-                  disabled={configure.isPending}
-                  onClick={() => void add(type)}
+                ))
+              )}
+              {addPropertyError !== null ? (
+                <div
+                  role="alert"
+                  className="px-2 py-1.5 text-xs text-destructive"
                 >
-                  <Icon className="size-4 text-muted-foreground" />
-                  <span className="flex-1">
-                    {DOCUMENT_PROPERTY_TYPE_LABELS[type]}
-                  </span>
-                  {isComputedPropertyType(type) ? (
-                    <span className="text-xs text-muted-foreground">
-                      Computed
-                    </span>
-                  ) : null}
-                </button>
-              );
-            })}
+                  {t("editor.properties.addPropertyFailed")}
+                  {addPropertyError ? ` ${addPropertyError}` : null}
+                </div>
+              ) : null}
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="grid gap-2">
+            <div className="flex h-8 items-center gap-1 rounded border border-border bg-background px-2">
+              <IconSearch className="size-3.5 shrink-0 text-muted-foreground" />
+              <Input
+                ref={addPropertySearchInputRef}
+                autoFocus
+                value={typeQuery}
+                placeholder={t("editor.properties.searchPropertyTypes")}
+                aria-label={t("editor.properties.searchPropertyTypes")}
+                onChange={(event) => setTypeQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && firstFilteredPropertyType) {
+                    event.preventDefault();
+                    void add(firstFilteredPropertyType);
+                  } else if (event.key === "Enter" && connectSourceMatches) {
+                    event.preventDefault();
+                    connectSource();
+                  }
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    closeAddPropertyPicker();
+                  }
+                }}
+                className="h-7 border-0 bg-transparent px-0 text-xs shadow-none focus-visible:ring-0"
+              />
+            </div>
+            <div className="max-h-80 overflow-auto rounded border p-1">
+              {connectSourceMatches ? (
+                <button
+                  type="button"
+                  className="mb-1 flex w-full items-center gap-2 rounded px-2 py-1.5 text-start text-sm hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={connectSource}
+                >
+                  <IconPlugConnected className="size-4 shrink-0 text-muted-foreground" />
+                  <span className="flex-1">{connectSourceLabel}</span>
+                </button>
+              ) : null}
+              {sourceFieldGroups.map((group) => (
+                <div
+                  key={group.source.id}
+                  className="mb-1 border-b border-border pb-1"
+                >
+                  <div className="truncate px-2 py-1 text-xs font-medium text-muted-foreground">
+                    {t("editor.properties.fromSource", {
+                      name: group.source.sourceName,
+                    })}
+                  </div>
+                  {group.fields.map((field) => {
+                    const SourceFieldIcon =
+                      TYPE_ICONS[
+                        propertyTypeForSourceFieldType(field.sourceFieldType)
+                      ];
+                    return (
+                      <button
+                        key={field.id}
+                        type="button"
+                        aria-label={t("editor.properties.sourceField", {
+                          name: field.sourceFieldLabel,
+                        })}
+                        disabled={isAddingProperty}
+                        aria-busy={pendingSourceFieldId === field.id}
+                        className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-accent disabled:opacity-50"
+                        onPointerDownCapture={(event) =>
+                          activateAddPropertyItem(
+                            event,
+                            `source:${field.id}`,
+                            () => {
+                              void addFromSourceField(field.id);
+                            },
+                          )
+                        }
+                        onClick={(event) =>
+                          activateAddPropertyItem(
+                            event,
+                            `source:${field.id}`,
+                            () => {
+                              void addFromSourceField(field.id);
+                            },
+                          )
+                        }
+                        onKeyDown={(event) =>
+                          activateAddPropertyItemFromKeyboard(
+                            event,
+                            `source:${field.id}`,
+                            () => {
+                              void addFromSourceField(field.id);
+                            },
+                          )
+                        }
+                      >
+                        {pendingSourceFieldId === field.id ? (
+                          <Spinner className="size-4 shrink-0 text-muted-foreground" />
+                        ) : (
+                          <SourceFieldIcon className="size-4 shrink-0 text-muted-foreground" />
+                        )}
+                        <span className="min-w-0 flex-1 truncate">
+                          {field.sourceFieldLabel}
+                        </span>
+                        <span className="shrink-0 text-xs text-muted-foreground">
+                          {group.source.metadata.federation?.role ===
+                          "secondary"
+                            ? t("editor.properties.federated")
+                            : t("editor.properties.source")}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
+              {filteredPropertyTypes.length === 0 && !connectSourceMatches ? (
+                <div className="px-2 py-3 text-sm text-muted-foreground">
+                  {t("editor.properties.noMatchingPropertyTypes")}
+                </div>
+              ) : null}
+              {filteredPropertyTypes.map((type) => {
+                const Icon = TYPE_ICONS[type];
+                return (
+                  <button
+                    key={type}
+                    type="button"
+                    aria-label={t("editor.properties.addPropertyType", {
+                      type: t(`editor.propertyTypes.${type}`),
+                    })}
+                    className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-accent"
+                    disabled={isAddingProperty}
+                    aria-busy={pendingPropertyType === type}
+                    onPointerDownCapture={(event) =>
+                      activateAddPropertyItem(event, `type:${type}`, () => {
+                        void add(type);
+                      })
+                    }
+                    onClick={(event) =>
+                      activateAddPropertyItem(event, `type:${type}`, () => {
+                        void add(type);
+                      })
+                    }
+                    onKeyDown={(event) =>
+                      activateAddPropertyItemFromKeyboard(
+                        event,
+                        `type:${type}`,
+                        () => {
+                          void add(type);
+                        },
+                      )
+                    }
+                  >
+                    {pendingPropertyType === type ? (
+                      <Spinner className="size-4 text-muted-foreground" />
+                    ) : (
+                      <Icon className="size-4 text-muted-foreground" />
+                    )}
+                    <span className="flex-1">
+                      {t(`editor.propertyTypes.${type}`)}
+                    </span>
+                    {isComputedPropertyType(type) ? (
+                      <span className="text-xs text-muted-foreground">
+                        {t("editor.properties.computed")}
+                      </span>
+                    ) : null}
+                  </button>
+                );
+              })}
+              {addPropertyError !== null ? (
+                <div
+                  role="alert"
+                  className="px-2 py-1.5 text-xs text-destructive"
+                >
+                  {t("editor.properties.addPropertyFailed")}
+                  {addPropertyError ? ` ${addPropertyError}` : null}
+                </div>
+              ) : null}
+            </div>
+          </div>
+        )}
       </PopoverContent>
     </Popover>
   );
+}
+
+/**
+ * Databases a new relation property may target: those in the same space as
+ * the current database (the server enforces this too), current one first.
+ */
+export function relationDatabaseChoicesFor(
+  databases: readonly ContentDatabaseSummary[],
+  currentDatabaseId: string,
+  query: string,
+) {
+  const current = databases.find(
+    (database) => database.databaseId === currentDatabaseId,
+  );
+  const needle = query.trim().toLowerCase();
+  return databases
+    .filter(
+      (database) =>
+        !current || (database.spaceId ?? null) === (current.spaceId ?? null),
+    )
+    .filter(
+      (database) => !needle || database.title.toLowerCase().includes(needle),
+    )
+    .map((database) => ({
+      databaseId: database.databaseId,
+      title: database.title || "Untitled",
+      isCurrent: database.databaseId === currentDatabaseId,
+    }))
+    .sort((a, b) => Number(b.isCurrent) - Number(a.isCurrent));
 }
 
 export function filterDocumentPropertyTypes(
@@ -2538,4 +4552,12 @@ export function filterDocumentPropertyTypes(
       aliases.some((alias) => alias.includes(normalizedQuery))
     );
   });
+}
+
+export function matchesConnectSourceQuery(label: string, query: string) {
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  return (
+    normalizedQuery.length === 0 ||
+    label.toLocaleLowerCase().includes(normalizedQuery)
+  );
 }

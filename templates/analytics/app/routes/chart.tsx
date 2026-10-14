@@ -1,5 +1,8 @@
-import { useMemo } from "react";
+import { useT } from "@agent-native/core/client/i18n";
+import { normalizeDocumentTitle } from "@agent-native/core/shared";
+import { useEffect, useMemo } from "react";
 import { useSearchParams } from "react-router";
+
 import { SqlChart } from "@/components/dashboard/SqlChart";
 import type { SqlPanel } from "@/pages/adhoc/sql-dashboard/types";
 
@@ -14,9 +17,10 @@ const VALID_CHART_TYPES = new Set([
   "metric",
   "table",
   "pie",
+  "funnel",
+  "heatmap",
+  "callout",
 ]);
-// Embed URLs accept external sources plus the restricted first-party analytics
-// source. They intentionally do not expose arbitrary app database querying.
 const VALID_SOURCES = new Set([
   "bigquery",
   "ga4",
@@ -66,16 +70,24 @@ function decodePanel(raw: string): SqlPanel | { error: string } {
         : undefined) as SqlPanel["config"],
     };
   } catch (e) {
-    return { error: e instanceof Error ? e.message : "Failed to decode panel" };
+    return { error: e instanceof Error ? e.message : "failedToDecodePanel" };
   }
 }
 
 function ChartError({ message }: { message: string }) {
+  const t = useT();
+  const displayMessage =
+    message === "failedToDecodePanel"
+      ? t("common.failedToDecodePanel")
+      : message;
+
   return (
     <div className="flex h-full w-full items-center justify-center p-4">
       <div className="text-xs text-muted-foreground text-center max-w-md">
-        <div className="font-medium text-foreground">Chart unavailable</div>
-        <div className="mt-1">{message}</div>
+        <div className="font-medium text-foreground">
+          {t("common.chartUnavailable")}
+        </div>
+        <div className="mt-1">{displayMessage}</div>
       </div>
     </div>
   );
@@ -90,12 +102,23 @@ export default function ChartRoute() {
     return decodePanel(raw);
   }, [raw]);
 
+  const panelTitle = "error" in result ? undefined : result.title;
+  useEffect(() => {
+    if (!panelTitle) return;
+    const nextTitle = `${normalizeDocumentTitle(panelTitle, "Chart")} — Analytics`;
+    const previousTitle = document.title;
+    document.title = nextTitle;
+    return () => {
+      if (document.title === nextTitle) document.title = previousTitle;
+    };
+  }, [panelTitle]);
+
   if ("error" in result) {
     return <ChartError message={result.error} />;
   }
 
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden bg-transparent p-2">
+    <div className="flex h-screen w-screen flex-col overflow-visible bg-transparent p-2">
       {result.title && (
         <div className="mb-1 px-1 text-xs font-medium text-muted-foreground">
           {result.title}

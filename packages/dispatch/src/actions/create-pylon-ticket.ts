@@ -1,5 +1,8 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
+import { resolveSecret } from "@agent-native/core/server";
 import { z } from "zod";
+
+import { authorizeDispatchAdmin } from "../server/lib/app-roles.js";
 import { recordAudit } from "../server/lib/dispatch-store.js";
 
 const PYLON_API_BASE =
@@ -8,6 +11,7 @@ const PYLON_API_BASE =
 export default defineAction({
   description:
     "Create a Pylon ticket. Use to escalate blockers from client meetings, route unmatched #customer-* posts that have no Slack channel, or open a follow-up that needs tracking. Requires PYLON_API_KEY in the Vault.",
+  authorize: authorizeDispatchAdmin,
   schema: z.object({
     title: z.string().min(1).describe("Short ticket title"),
     bodyHtml: z
@@ -32,7 +36,7 @@ export default defineAction({
     teamId: z.string().optional(),
   }),
   run: async (input) => {
-    const apiKey = process.env.PYLON_API_KEY;
+    const apiKey = await resolveSecret("PYLON_API_KEY");
     if (!apiKey) {
       throw new Error(
         "PYLON_API_KEY is not set. Add it to the Dispatch Vault.",

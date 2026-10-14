@@ -1,9 +1,17 @@
-/**
- * Data access for bookings + their attendees, references, and notes.
- */
-import { eq, and, gte, lt, or, desc, asc, isNotNull } from "drizzle-orm";
-import { nanoid } from "nanoid";
 import { accessFilter } from "@agent-native/core/sharing";
+import {
+  eq,
+  and,
+  gte,
+  lt,
+  or,
+  desc,
+  asc,
+  isNotNull,
+  isNull,
+} from "drizzle-orm";
+import { nanoid } from "nanoid";
+
 import type {
   Booking,
   Attendee,
@@ -23,6 +31,8 @@ function rowToBooking(
     uid: row.uid,
     eventTypeId: row.eventTypeId,
     hostEmail: row.hostEmail,
+    ownerEmail: row.ownerEmail ?? row.hostEmail,
+    orgId: row.orgId ?? null,
     title: row.title,
     description: row.description ?? undefined,
     startTime: row.startTime,
@@ -76,6 +86,7 @@ function parseJson<T = any>(s: string | null | undefined): T | undefined {
 export async function getBookingByUid(uid: string): Promise<Booking | null> {
   const { getDb, schema } = getSchedulingContext();
   const db = getDb();
+  // guard:allow-unscoped — opaque booking UID is an authorization lookup; all public callers verify host or bearer token before exposing or mutating the row
   const rows = await db
     .select()
     .from(schema.bookings)
@@ -97,16 +108,9 @@ export interface ListBookingsFilter {
   eventTypeId?: string;
   status?: BookingStatus | "upcoming" | "past" | "unconfirmed" | "recurring";
   attendeeEmail?: string;
-  /** Inclusive start (ISO) */
   from?: string;
-  /** Exclusive end (ISO) */
   to?: string;
   limit?: number;
-  /**
-   * If true, admit any booking the current user owns, has been shared on, or
-   * matches via org-visibility — in addition to the explicit `hostEmail`
-   * filter (which still narrows further when set).
-   */
   useAccessFilter?: boolean;
 }
 
@@ -176,9 +180,11 @@ export async function listBookings(
 }
 
 export async function countBookingsByHostInRange(
+  eventTypeId: string,
   hostEmail: string,
   fromIso: string,
   toIso: string,
+  orgId?: string | null,
 ): Promise<number> {
   const { getDb, schema } = getSchedulingContext();
   const rows = await getDb()
@@ -187,6 +193,11 @@ export async function countBookingsByHostInRange(
     .where(
       and(
         eq(schema.bookings.hostEmail, hostEmail),
+        eq(schema.bookings.ownerEmail, hostEmail),
+        orgId
+          ? eq(schema.bookings.orgId, orgId)
+          : isNull(schema.bookings.orgId),
+        eq(schema.bookings.eventTypeId, eventTypeId),
         gte(schema.bookings.startTime, fromIso),
         lt(schema.bookings.startTime, toIso),
         eq(schema.bookings.status, "confirmed"),
@@ -224,56 +235,62 @@ export async function insertBooking(
   const id = nanoid();
   const uid = nanoid(12);
   const iCalUid = input.iCalUid ?? `${uid}@agent-native-scheduling`;
-  await db.insert(schema.bookings).values({
-    id,
-    uid,
-    eventTypeId: input.eventTypeId,
-    hostEmail: input.hostEmail,
-    title: input.title,
-    description: input.description ?? null,
-    startTime: input.startTime,
-    endTime: input.endTime,
-    timezone: input.timezone,
-    status: input.status ?? "confirmed",
-    location: input.location ? JSON.stringify(input.location) : null,
-    customResponses: input.customResponses
-      ? JSON.stringify(input.customResponses)
-      : null,
-    cancelToken: nanoid(24),
-    rescheduleToken: nanoid(24),
-    fromReschedule: input.fromReschedule ?? null,
-    iCalUid,
-    iCalSequence: input.iCalSequence ?? 0,
-    paid: false,
-    createdAt: now,
-    updatedAt: now,
-    ownerEmail: input.ownerEmail,
-    orgId: input.orgId ?? null,
+  await db.transaction(async (tx: any) => {
+    await tx.insert(schema.bookings).values({
+      id,
+      uid,
+      eventTypeId: input.eventTypeId,
+      hostEmail: input.hostEmail,
+      title: input.title,
+      description: input.description ?? null,
+      startTime: input.startTime,
+      endTime: input.endTime,
+      timezone: input.timezone,
+      status: input.status ?? "confirmed",
+      location: input.location ? JSON.stringify(input.location) : null,
+      customResponses: input.customResponses
+        ? JSON.stringify(input.customResponses)
+        : null,
+      cancelToken: nanoid(24),
+      rescheduleToken: nanoid(24),
+      fromReschedule: input.fromReschedule ?? null,
+      iCalUid,
+      iCalSequence: input.iCalSequence ?? 0,
+      paid: false,
+      createdAt: now,
+      updatedAt: now,
+      ownerEmail: input.ownerEmail,
+      orgId: input.orgId ?? null,
+    });
+    if (input.attendees.length > 0) {
+      await tx.insert(schema.bookingAttendees).values(
+        input.attendees.map((a) => ({
+          id: nanoid(),
+          bookingId: id,
+          email: a.email,
+          name: a.name,
+          timezone: a.timezone ?? null,
+          locale: a.locale ?? null,
+          noShow: false,
+          createdAt: now,
+        })),
+      );
+    }
+    if (input.references && input.references.length > 0) {
+      await tx.insert(schema.bookingReferences).values(
+        input.references.map((r) => ({
+          id: nanoid(),
+          bookingId: id,
+          type: r.type,
+          externalId: r.externalId,
+          meetingUrl: r.meetingUrl ?? null,
+          meetingPassword: r.meetingPassword ?? null,
+          credentialId: r.credentialId ?? null,
+          createdAt: now,
+        })),
+      );
+    }
   });
-  for (const a of input.attendees) {
-    await db.insert(schema.bookingAttendees).values({
-      id: nanoid(),
-      bookingId: id,
-      email: a.email,
-      name: a.name,
-      timezone: a.timezone ?? null,
-      locale: a.locale ?? null,
-      noShow: false,
-      createdAt: now,
-    });
-  }
-  for (const r of input.references ?? []) {
-    await db.insert(schema.bookingReferences).values({
-      id: nanoid(),
-      bookingId: id,
-      type: r.type,
-      externalId: r.externalId,
-      meetingUrl: r.meetingUrl ?? null,
-      meetingPassword: r.meetingPassword ?? null,
-      credentialId: r.credentialId ?? null,
-      createdAt: now,
-    });
-  }
   const created = await getBookingByUid(uid);
   if (!created) throw new Error("Failed to create booking");
   return created;

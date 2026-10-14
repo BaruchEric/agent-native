@@ -4,8 +4,12 @@ import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 import { SIDEBAR_OPEN_KEY } from "./agent-sidebar-state.js";
-import { consumeAgentChatHomeHandoff } from "./chat-view-transition.js";
+import {
+  consumeAgentChatHomeHandoff,
+  markAgentChatHomeHandoff,
+} from "./chat-view-transition.js";
 import { useAgentChatHomeHandoffLinks } from "./use-agent-chat-home-handoff.js";
 
 function installMatchMedia() {
@@ -32,6 +36,12 @@ function Probe() {
       <a href="/dashboard" data-testid="chrome-link">
         Dashboard
       </a>
+      <a href="/documents/home" data-testid="sibling-app-link">
+        Documents
+      </a>
+      <a href="/settings/integrations" data-testid="settings-link">
+        Settings
+      </a>
       <a href="/api/export.csv" data-testid="api-link">
         API
       </a>
@@ -51,7 +61,25 @@ function Probe() {
   );
 }
 
-function renderProbe() {
+function RecentOnlyProbe() {
+  useAgentChatHomeHandoffLinks({
+    storageKey: "chat",
+    chatPath: "/",
+    ttlMs: 5_000,
+    requireActiveHandoff: true,
+  });
+  const location = useLocation();
+  return (
+    <div>
+      <a href="/dashboard" data-testid="chrome-link">
+        Dashboard
+      </a>
+      <output data-testid="pathname">{location.pathname}</output>
+    </div>
+  );
+}
+
+function renderProbe(element: React.ReactElement = <Probe />) {
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
@@ -59,7 +87,7 @@ function renderProbe() {
     root.render(
       <MemoryRouter initialEntries={["/"]}>
         <Routes>
-          <Route path="*" element={<Probe />} />
+          <Route path="*" element={element} />
         </Routes>
       </MemoryRouter>,
     );
@@ -105,9 +133,12 @@ describe("useAgentChatHomeHandoffLinks", () => {
     container?.remove();
     root = null;
     container = null;
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     window.sessionStorage.clear();
     window.localStorage.clear();
-    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    window.history.replaceState({}, "", "/");
   });
 
   it("intercepts app chrome links from the chat route", () => {
@@ -115,22 +146,91 @@ describe("useAgentChatHomeHandoffLinks", () => {
 
     const event = clickLink(container, "chrome-link");
 
+    expect(event.defaultPrevented).toBe(false);
+    expect(pathname(container)).toBe("/");
+    expect(window.localStorage.getItem(SIDEBAR_OPEN_KEY)).toBeNull();
+    expect(consumeAgentChatHomeHandoff("chat")).toBe(false);
+  });
+
+  it("intercepts app chrome links after chat activity marks a handoff", () => {
+    markAgentChatHomeHandoff("chat");
+    ({ container, root } = renderProbe());
+
+    const event = clickLink(container, "chrome-link");
+
     expect(event.defaultPrevented).toBe(true);
     expect(pathname(container)).toBe("/dashboard");
-    expect(window.localStorage.getItem(SIDEBAR_OPEN_KEY)).toBe("true");
+    expect(window.localStorage.getItem(SIDEBAR_OPEN_KEY)).toBeNull();
     expect(consumeAgentChatHomeHandoff("chat")).toBe(true);
   });
 
-  it.each(["api-link", "framework-link", "asset-link", "chat-content-link"])(
-    "leaves %s alone",
-    (testId) => {
-      ({ container, root } = renderProbe());
+  it.each([
+    "api-link",
+    "framework-link",
+    "asset-link",
+    "settings-link",
+    "chat-content-link",
+  ])("leaves %s alone", (testId) => {
+    ({ container, root } = renderProbe());
 
-      const event = clickLink(container, testId);
+    const event = clickLink(container, testId);
 
-      expect(event.defaultPrevented).toBe(false);
-      expect(pathname(container)).toBe("/");
-      expect(consumeAgentChatHomeHandoff("chat")).toBe(false);
-    },
-  );
+    expect(event.defaultPrevented).toBe(false);
+    expect(pathname(container)).toBe("/");
+    expect(consumeAgentChatHomeHandoff("chat")).toBe(false);
+  });
+
+  it("can require a recent chat marker before intercepting chrome links", () => {
+    ({ container, root } = renderProbe(<RecentOnlyProbe />));
+
+    const event = clickLink(container, "chrome-link");
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(pathname(container)).toBe("/");
+    expect(consumeAgentChatHomeHandoff("chat")).toBe(false);
+  });
+
+  it("intercepts recent-only links when a chat marker exists", () => {
+    markAgentChatHomeHandoff("chat");
+    ({ container, root } = renderProbe(<RecentOnlyProbe />));
+
+    const event = clickLink(container, "chrome-link");
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(pathname(container)).toBe("/dashboard");
+    expect(consumeAgentChatHomeHandoff("chat", { ttlMs: 5_000 })).toBe(true);
+  });
+
+  it("leaves sibling workspace app links for the browser", () => {
+    vi.stubEnv("VITE_AGENT_NATIVE_WORKSPACE", "1");
+    vi.stubEnv(
+      "VITE_AGENT_NATIVE_WORKSPACE_APPS_JSON",
+      JSON.stringify([
+        { id: "chat", path: "/chat" },
+        { id: "documents", path: "/documents" },
+      ]),
+    );
+    window.history.replaceState({}, "", "/chat/_agent-native/poll");
+    markAgentChatHomeHandoff("chat");
+    ({ container, root } = renderProbe());
+
+    const event = clickLink(container, "sibling-app-link");
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(pathname(container)).toBe("/");
+  });
+
+  it("does not intercept recent-only links after the marker expires", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    markAgentChatHomeHandoff("chat");
+    vi.setSystemTime(6_001);
+    ({ container, root } = renderProbe(<RecentOnlyProbe />));
+
+    const event = clickLink(container, "chrome-link");
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(pathname(container)).toBe("/");
+    expect(consumeAgentChatHomeHandoff("chat", { ttlMs: 5_000 })).toBe(false);
+  });
 });

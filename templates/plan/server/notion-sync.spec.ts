@@ -1,9 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  applyPlanContentPatches,
-  planContentSchema,
-  type PlanContent,
-} from "../shared/plan-content.js";
+
 import {
   describeIncompatibleBlocks,
   getIncompatibleBlockCounts,
@@ -11,14 +7,14 @@ import {
   NOTION_COMPATIBLE_BLOCK_TYPES,
 } from "../shared/notion-compat.js";
 import {
+  applyPlanContentPatches,
+  planContentSchema,
+  type PlanContent,
+} from "../shared/plan-content.js";
+import {
   exportPlanContentToMdxFolder,
   parsePlanMdxFolder,
 } from "./plan-mdx.js";
-
-/**
- * Coverage for the per-plan "Sync to Notion" setting: the compatibility
- * helpers, the `set-notion-sync` patch op, schema survival, and MDX round-trip.
- */
 
 function planWith(blocks: PlanContent["blocks"]): PlanContent {
   return planContentSchema.parse({ version: 2, title: "P", blocks });
@@ -83,7 +79,6 @@ describe("notion-compat helpers", () => {
 
     const counts = getIncompatibleBlockCounts(content.blocks);
     const byType = Object.fromEntries(counts.map((c) => [c.type, c.count]));
-    // 2 wireframes + the tabs block itself + the nested diagram.
     expect(byType.wireframe).toBe(2);
     expect(byType.tabs).toBe(1);
     expect(byType.diagram).toBe(1);

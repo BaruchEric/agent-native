@@ -1,16 +1,4 @@
-/**
- * Invite an email address to the active organization.
- *
- * Creates an `org_invitations` row with status `pending`. Clips role mapping:
- * `admin` → `admin`, everything else → `member`. Returns the invitation id
- * (which is the accept token). Sends an email via the framework email helper
- * when a provider is configured.
- *
- * Usage:
- *   pnpm action invite-member --email=alice@example.com --role=admin
- */
-
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { emit } from "@agent-native/core/event-bus";
 import { organizations, orgInvitations } from "@agent-native/core/org";
@@ -20,22 +8,22 @@ import {
   renderEmail,
   emailStrong,
 } from "@agent-native/core/server";
+import { track } from "@agent-native/core/tracking";
+import { and, eq, sql } from "drizzle-orm";
 import { z } from "zod";
+
+import { getDb } from "../server/db/index.js";
+import { CLIPS_ORGANIZATION_INVITE_EMAIL_ID } from "../server/lib/emails.js";
 import {
   getCurrentOwnerEmail,
   nanoid,
   requireOrganizationAccess,
 } from "../server/lib/recordings.js";
-import { and, eq, sql } from "drizzle-orm";
-import { getDb } from "../server/db/index.js";
 
 function getAppName(): string {
   return process.env.APP_NAME || "Clips";
 }
 
-// Accept the current admin/member surface plus legacy Clips roles for
-// backwards-compatible CLI/agent calls. Legacy non-admin roles collapse to
-// `member`.
 const ClipsRoleEnum = z.enum([
   "viewer",
   "creator-lite",
@@ -66,6 +54,36 @@ async function fetchOrgName(orgId: string): Promise<string> {
   return row?.name ?? "Organization";
 }
 
+export function renderClipsInviteEmail({
+  appName,
+  orgName,
+  inviter,
+  role,
+  inviteUrl,
+}: {
+  appName: string;
+  orgName: string;
+  inviter: string;
+  role: "admin" | "member";
+  inviteUrl: string;
+}) {
+  return {
+    subject: `You're invited to ${orgName} on ${appName}`,
+    ...renderEmail({
+      brandName: appName,
+      preheader: `${inviter} invited you to ${orgName} on ${appName}.`,
+      heading: `You're invited to join ${orgName}`,
+      paragraphs: [
+        `${emailStrong(inviter)} invited you to the ${emailStrong(orgName)} organization on ${emailStrong(appName)} as ${emailStrong(role)}.`,
+        `Click the button below to accept the invite and start collaborating.`,
+      ],
+      cta: { label: "Accept invite", url: inviteUrl },
+      // guard:allow-raw-color - email HTML cannot reference CSS theme tokens.
+      brandColor: "#18181B",
+    }),
+  };
+}
+
 export default defineAction({
   description:
     "Invite someone to the active organization by email. Creates a pending invitation. Role 'admin' maps to admin; all other Clips roles collapse to 'member'. Sends an email when a provider is configured.",
@@ -85,8 +103,6 @@ export default defineAction({
     const role = mapRole(args.role);
     const inviteeEmail = args.email.trim().toLowerCase();
 
-    // Rotate any existing pending invite for this email so the latest one is
-    // the only live token.
     const [existing] = await db
       .select({ id: orgInvitations.id })
       .from(orgInvitations)
@@ -121,28 +137,42 @@ export default defineAction({
 
     const orgName = await fetchOrgName(organizationId);
     const inviteUrl = `${baseUrl()}/invite/${token}`;
+    const emailConfigured = await isEmailConfigured();
+    let notified = false;
 
-    const appName = getAppName();
-    const { html, text } = renderEmail({
-      preheader: `${inviter} invited you to ${orgName} on ${appName}.`,
-      heading: `You're invited to join ${orgName}`,
-      paragraphs: [
-        `${emailStrong(inviter)} invited you to the ${emailStrong(orgName)} organization on ${emailStrong(appName)} as ${emailStrong(role)}.`,
-        `Click the button below to accept the invite and start collaborating.`,
-      ],
-      cta: { label: "Accept invite", url: inviteUrl },
-      brandColor: "#18181B",
-    });
-    try {
-      await sendEmail({
-        to: args.email,
-        subject: `You're invited to ${orgName} on ${appName}`,
-        html,
-        text,
-      });
-    } catch (err) {
-      console.warn("[invite-member] email send failed:", err);
+    if (emailConfigured) {
+      try {
+        await sendEmail({
+          ...renderClipsInviteEmail({
+            appName: getAppName(),
+            orgName,
+            inviter,
+            role,
+            inviteUrl,
+          }),
+          to: args.email,
+          templateId: CLIPS_ORGANIZATION_INVITE_EMAIL_ID,
+          authCritical: true,
+        });
+        notified = true;
+      } catch (err) {
+        console.warn("[invite-member] email send failed:", err);
+      }
     }
+
+    track(
+      "share_invite_sent",
+      {
+        app: "clips",
+        template: "clips",
+        resource_type: "organization",
+        resource_id: organizationId,
+        principal_type: "user",
+        role,
+        notified,
+      },
+      { userId: inviter },
+    );
 
     await writeAppState("refresh-signal", { ts: Date.now() });
 
@@ -166,7 +196,7 @@ export default defineAction({
       status: "pending" as const,
       token,
       inviteUrl,
-      emailConfigured: isEmailConfigured(),
+      emailConfigured,
     };
   },
 });

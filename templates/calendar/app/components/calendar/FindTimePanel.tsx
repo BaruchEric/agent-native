@@ -1,4 +1,20 @@
-import { useEffect, useMemo, useState } from "react";
+import { useActionQuery } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import type {
+  FindTimeBusyBlock,
+  FindTimeResult,
+  FindTimeSlot,
+} from "@shared/api";
+import { getWeekStartsOn } from "@shared/calendar-week";
+import {
+  IconAlertCircle,
+  IconCalendarTime,
+  IconChevronLeft,
+  IconChevronRight,
+  IconLoader2,
+  IconX,
+  IconUsers,
+} from "@tabler/icons-react";
 import {
   addDays,
   differenceInMinutes,
@@ -7,38 +23,28 @@ import {
   parseISO,
   startOfWeek,
 } from "date-fns";
-import { useActionQuery } from "@agent-native/core/client";
+import { useEffect, useMemo, useState } from "react";
+
 import {
-  IconAlertCircle,
-  IconCalendarTime,
-  IconChevronLeft,
-  IconChevronRight,
-  IconLoader2,
-  IconUsers,
-} from "@tabler/icons-react";
-import type {
-  FindTimeBusyBlock,
-  FindTimeResult,
-  FindTimeSlot,
-} from "@shared/api";
-import { Button } from "@/components/ui/button";
+  AttendeeAutocomplete,
+  type AttendeeRecipient,
+} from "@/components/calendar/AttendeeAutocomplete";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
-import { cn } from "@/lib/utils";
+import { useSettings } from "@/hooks/use-settings";
 import { dateTimeInTimezoneToIso } from "@/lib/event-form-utils";
-import {
-  AttendeeAutocomplete,
-  type AttendeeRecipient,
-} from "@/components/calendar/AttendeeAutocomplete";
+import { cn } from "@/lib/utils";
 
 const START_HOUR = 7;
-const END_HOUR = 19;
+const END_HOUR = 24;
 const HOUR_HEIGHT = 44;
 const PARTICIPANT_COLORS = [
   "hsl(var(--primary))",
@@ -100,6 +106,7 @@ function sameMinute(a?: string, b?: string) {
 }
 
 function attendeeLabel(
+  t: ReturnType<typeof useT>,
   email: string,
   attendees: AttendeeRecipient[],
   role?: string,
@@ -108,7 +115,7 @@ function attendeeLabel(
     (attendee) => attendee.email.toLowerCase() === email.toLowerCase(),
   );
   if (match?.displayName) return match.displayName;
-  if (role === "organizer") return "You";
+  if (role === "organizer") return t("findTime.you");
   return email;
 }
 
@@ -184,6 +191,9 @@ export function FindTimePanel({
   className,
   isTakeover = false,
 }: FindTimePanelProps) {
+  const t = useT();
+  const { data: settings } = useSettings();
+  const weekStartsOn = getWeekStartsOn(settings?.weekStart);
   const [anchorDate, setAnchorDate] = useState(() => parseDateOnly(date));
 
   useEffect(() => {
@@ -216,7 +226,10 @@ export function FindTimePanel({
     return () => window.removeEventListener("keydown", handleKeyDown, true);
   }, [isTakeover]);
 
-  const weekStart = useMemo(() => startOfWeek(anchorDate), [anchorDate]);
+  const weekStart = useMemo(
+    () => startOfWeek(anchorDate, { weekStartsOn }),
+    [anchorDate, weekStartsOn],
+  );
   const days = useMemo(
     () =>
       eachDayOfInterval({
@@ -308,7 +321,7 @@ export function FindTimePanel({
             className="h-7 px-2 text-xs"
             onClick={() => setAnchorDate(new Date())}
           >
-            Today
+            {t("calendarView.today")}
           </Button>
           <Button
             type="button"
@@ -326,13 +339,13 @@ export function FindTimePanel({
         <div className="space-y-1.5">
           <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
             <IconUsers className="h-3.5 w-3.5" />
-            Guests
+            {t("eventForm.addGuests")}
           </div>
           <AttendeeAutocomplete
             attendees={attendees}
             onAdd={onAddAttendee}
             onRemove={onRemoveAttendee}
-            placeholder="Search contacts or type an email"
+            placeholder={t("eventForm.attendeesPlaceholder")}
           />
         </div>
       )}
@@ -357,9 +370,10 @@ export function FindTimePanel({
       )}
 
       <div
+        data-takeover={isTakeover ? "true" : undefined}
         className={cn(
-          "grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px]",
-          isTakeover && "xl:grid-cols-[minmax(0,1fr)_280px]",
+          "calendar-find-time-panel-grid grid gap-3",
+          isTakeover && "calendar-find-time-panel-grid-takeover",
         )}
       >
         <div className="min-w-0 overflow-x-auto rounded-md border border-border">
@@ -519,15 +533,20 @@ export function FindTimePanel({
                               borderLeft: `3px solid ${color}`,
                             }}
                             title={`${attendeeLabel(
+                              t,
                               block.participantEmail,
                               attendees,
-                            )}: ${block.title || "Busy"}`}
+                            )}: ${block.title || t("findTime.busy")}`}
                           >
                             <div className="truncate font-medium text-foreground">
-                              {block.title || "Busy"}
+                              {block.title || t("findTime.busy")}
                             </div>
                             <div className="truncate text-muted-foreground">
-                              {attendeeLabel(block.participantEmail, attendees)}
+                              {attendeeLabel(
+                                t,
+                                block.participantEmail,
+                                attendees,
+                              )}
                             </div>
                           </div>
                         );
@@ -542,7 +561,7 @@ export function FindTimePanel({
         <div className="min-w-0 space-y-3">
           <div className="space-y-1.5">
             <div className="text-xs font-medium text-muted-foreground">
-              Suggested Times
+              {t("findTime.suggestedTimes")}
             </div>
             {isWeekLoading ? (
               <div className="space-y-2">
@@ -580,7 +599,7 @@ export function FindTimePanel({
               </div>
             ) : (
               <div className="rounded-md border border-border px-3 py-6 text-center text-xs text-muted-foreground">
-                No matching slots
+                {t("findTime.noMatchingSlots")}
               </div>
             )}
           </div>
@@ -588,7 +607,7 @@ export function FindTimePanel({
           {participants.length > 0 && (
             <div className="space-y-1.5">
               <div className="text-xs font-medium text-muted-foreground">
-                Guests
+                {t("eventForm.addGuests")}
               </div>
               <div className="space-y-1">
                 {participants.map((participant) => (
@@ -607,6 +626,7 @@ export function FindTimePanel({
                     />
                     <span className="truncate">
                       {attendeeLabel(
+                        t,
                         participant.email,
                         attendees,
                         participant.role,
@@ -621,7 +641,7 @@ export function FindTimePanel({
           {findTime.isFetching && !isWeekLoading && (
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
               <IconLoader2 className="h-3.5 w-3.5 animate-spin" />
-              Refreshing
+              {t("findTime.refreshing")}
             </div>
           )}
         </div>
@@ -640,30 +660,47 @@ interface FindTimeTakeoverProps extends FindTimePanelProps {
 export function FindTimeTakeover({
   open,
   onOpenChange,
-  title = "Find a time",
+  title,
   subtitle,
   className,
   ...panelProps
 }: FindTimeTakeoverProps) {
+  const t = useT();
+  const dialogTitle = title ?? t("eventForm.findTime");
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         data-find-time-takeover
-        className="flex h-[100dvh] max-h-[100dvh] w-screen max-w-none translate-x-[-50%] translate-y-[-50%] flex-col gap-0 overflow-hidden border-0 p-0 shadow-xl sm:rounded-none"
+        hideClose
+        overlayClassName="z-[310]"
+        className="z-[320] flex h-[100dvh] max-h-[100dvh] w-screen max-w-none translate-x-[-50%] translate-y-[-50%] flex-col gap-0 overflow-hidden border-0 p-0 shadow-xl sm:rounded-none"
       >
-        <header className="flex h-14 shrink-0 items-center border-b border-border px-4 pr-12 md:px-6">
+        <header className="flex h-14 shrink-0 items-center border-b border-border px-4 md:px-6">
           <div className="min-w-0">
-            <DialogTitle className="truncate text-base">{title}</DialogTitle>
+            <DialogTitle className="truncate text-base">
+              {dialogTitle}
+            </DialogTitle>
             <DialogDescription
               className={cn(
                 "mt-1 truncate text-xs text-muted-foreground",
                 !subtitle && "sr-only",
               )}
             >
-              {subtitle ||
-                "Review shared availability and choose a meeting time."}
+              {subtitle || t("findTime.takeoverDescription")}
             </DialogDescription>
           </div>
+          <DialogClose asChild>
+            <button
+              type="button"
+              aria-label={t("eventDialog.close")}
+              title={t("eventDialog.close")}
+              className="ml-auto flex h-10 shrink-0 items-center gap-2 rounded-md px-3 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            >
+              <IconX className="h-4 w-4" />
+              <span>{t("eventDialog.close")}</span>
+            </button>
+          </DialogClose>
         </header>
         <div className="min-h-0 flex-1 overflow-auto p-4 md:p-6">
           <FindTimePanel

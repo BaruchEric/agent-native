@@ -1,107 +1,74 @@
-/**
- * Client-side hook for collaborative document editing via Yjs.
- *
- * Creates a STABLE Y.Doc per docId that never changes identity. This allows
- * TipTap's Collaboration extension to bind once without editor recreation.
- * Server state is applied to the existing doc when it arrives.
- *
- * Also manages Yjs Awareness for cursor positions and user presence,
- * synced via polling to the server's awareness endpoint.
- *
- * Transport improvements (vs previous version):
- * - Local update POSTs are debounced and coalesced with Y.mergeUpdates (~80ms)
- *   to avoid per-keystroke requests. The batch is flushed immediately on
- *   visibilitychange/pagehide and before each poll/awareness cycle.
- * - GET state?stateVector= is NOT fetched on every poll cycle. It is fetched:
- *   (a) on (re)connect / initial load, (b) when a poll response indicates a
- *   gap (version jump > ring-buffer size), (c) after applying an update fails,
- *   and (d) as a low-frequency safety net every STATE_VECTOR_FETCH_INTERVAL
- *   poll cycles (~15×).
- * - Network errors use exponential backoff with jitter (cap ~15s), reset on
- *   success.
- * - SSE fast-path: collab events are received push-style from
- *   /_agent-native/events (the framework SSE stream). While SSE is
- *   healthy the poll loop relaxes to a slow cadence (10–15s). If SSE is
- *   unavailable the 2s poll resumes automatically.
- */
-
-import { useEffect, useRef, useState, useMemo } from "react";
-import * as Y from "yjs";
+import { useEffect, useMemo, useState } from "react";
 import { Awareness } from "y-protocols/awareness";
-import { agentNativePath } from "../client/api-path.js";
-import { AGENT_CLIENT_ID } from "./agent-identity.js";
+import * as Y from "yjs";
 
-export interface CollabUser {
-  name: string;
-  email: string;
-  color: string;
-}
+import { agentNativePath } from "../client/api-path.js";
+import { useAvatarUrl } from "../client/use-avatar.js";
+import {
+  acquireCollabPollBoost,
+  noteCollabPollActivity,
+  registerCollabActivityResource,
+  subscribeSyncEvents,
+  type SyncEvent,
+} from "../client/use-db-sync.js";
+import {
+  REALTIME_CAP_NO_AWARENESS,
+  REALTIME_CAP_POLL_LIVE,
+} from "../realtime-protocol.js";
+import { dedupeCollabUsersByEmail, type CollabUser } from "./types.js";
+export {
+  dedupeCollabUsersByEmail,
+  emailToColor,
+  emailToName,
+  type CollabUser,
+} from "./types.js";
+export { isReconcileLeadClient } from "./lead-client.js";
 
 export interface UseCollaborativeDocOptions {
-  /** Document ID to collaborate on. Pass null to disable. */
   docId: string | null;
-  /** Poll interval in ms when SSE is unavailable. Default: 2000 */
   pollInterval?: number;
-  /** Poll interval in ms while SSE is healthy. Default: 12000 */
   pollIntervalWithSse?: number;
-  /** Pause remote update/presence polling while the tab is hidden. Default: true */
   pauseWhenHidden?: boolean;
-  /** Base URL for collab endpoints. Default: "/_agent-native/collab" */
   baseUrl?: string;
-  /** Request source ID for jitter prevention (e.g., tab ID). */
   requestSource?: string;
-  /** Current user info for cursor labels. */
   user?: CollabUser;
+  activityResource?: { resourceType: string; resourceId: string };
 }
+
+export type CollabInitializationErrorCategory =
+  | "forbidden-or-not-found"
+  | "server"
+  | "network"
+  | "invalid-payload";
+
+export type CollabInitializationState =
+  | { status: "loading" }
+  | { status: "ready" }
+  | { status: "error"; category: CollabInitializationErrorCategory };
+
+export type CollaborativeDocSyncResult =
+  | { status: "synced" }
+  | { status: "failed"; error: Error }
+  | { status: "unavailable" };
 
 export interface UseCollaborativeDocResult {
-  /** The Yjs document instance. Stable per docId — never changes identity. */
   ydoc: Y.Doc | null;
-  /** Yjs Awareness instance for cursor/presence sync. */
   awareness: Awareness | null;
-  /** Whether the initial state is still loading from the server. */
   isLoading: boolean;
-  /** Whether the doc is synced with the server. */
   isSynced: boolean;
-  /** Active users on this document (from awareness). */
+  initialization: CollabInitializationState;
+  retry: () => void;
+  requestSync: () => Promise<CollaborativeDocSyncResult>;
+  /**
+   * Sends every local edit the server has not yet acknowledged. Resolves `true`
+   * once none are outstanding and `false` when delivery failed (offline), so a
+   * caller that saves the same content elsewhere can wait until collaborators
+   * can already receive it through the document instead of inserting it twice.
+   */
+  flushUpdates: () => Promise<boolean>;
   activeUsers: CollabUser[];
-  /** True briefly when the AI agent makes an edit (for presence indicator). */
   agentActive: boolean;
-  /** True when the AI agent has an active awareness entry (durable presence). */
   agentPresent: boolean;
-}
-
-// Consistent color palette for user cursors
-const CURSOR_COLORS = [
-  "#f87171",
-  "#fb923c",
-  "#fbbf24",
-  "#a3e635",
-  "#34d399",
-  "#22d3ee",
-  "#60a5fa",
-  "#14b8a6",
-  "#f472b6",
-  "#e879f9",
-];
-
-/** Hash a string to a consistent color from the palette. */
-export function emailToColor(email: string): string {
-  let hash = 0;
-  for (let i = 0; i < email.length; i++) {
-    hash = ((hash << 5) - hash + email.charCodeAt(i)) | 0;
-  }
-  return CURSOR_COLORS[Math.abs(hash) % CURSOR_COLORS.length];
-}
-
-/** Derive a display name from an email address. */
-export function emailToName(email: string): string {
-  const local = email.split("@")[0] || email;
-  return local.charAt(0).toUpperCase() + local.slice(1);
-}
-
-function normalizeCollabEmail(email: string): string {
-  return email.trim().toLowerCase();
 }
 
 function isDocumentHidden(): boolean {
@@ -110,69 +77,22 @@ function isDocumentHidden(): boolean {
   );
 }
 
-export function dedupeCollabUsersByEmail(users: CollabUser[]): CollabUser[] {
-  const byEmail = new Map<string, CollabUser>();
-  for (const user of users) {
-    const email = normalizeCollabEmail(user.email);
-    if (!email || byEmail.has(email)) continue;
-    byEmail.set(email, {
-      name: user.name || emailToName(email),
-      email,
-      color: user.color || emailToColor(email),
-    });
+function collabUsersEqual(a: CollabUser[], b: CollabUser[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const left = a[i]!;
+    const right = b[i]!;
+    if (
+      left.email !== right.email ||
+      left.name !== right.name ||
+      left.color !== right.color ||
+      left.avatarUrl !== right.avatarUrl
+    ) {
+      return false;
+    }
   }
-  return Array.from(byEmail.values());
-}
-
-/**
- * Leader election for applying authoritative external snapshots into a shared
- * collaborative document.
- *
- * When the agent (or a Notion pull, or any full-document rewrite) writes new
- * content to SQL, the open editor reconciles it into the live Y.Doc with
- * `setContent`. If EVERY connected client did that independently, each would
- * diff the same snapshot into the CRDT and the changed region would be inserted
- * N times (concurrent inserts at the same position → duplicated text). So only
- * ONE client — the "lead" — applies the snapshot; every other client receives
- * the result through normal Yjs sync.
- *
- * The lead is the present client with the lowest Yjs `clientID`. The agent's
- * awareness entry uses `AGENT_CLIENT_ID` (max int) so it can never be the lead,
- * and a client editing alone is always the lead. This is deterministic across
- * clients with no coordination round-trip.
- */
-export function isReconcileLeadClient(
-  awareness: Awareness | null | undefined,
-  localClientId: number | null | undefined,
-): boolean {
-  if (localClientId == null) return false;
-  if (!awareness) return true; // standalone / tests — act alone
-
-  let hasPeer = false;
-  let minVisible = localClientId;
-  awareness.getStates().forEach((state, clientId) => {
-    if (clientId === AGENT_CLIENT_ID) return; // agent never leads
-    if (clientId === localClientId) return;
-    const s = state as { user?: unknown; visible?: boolean };
-    if (!s || !s.user) return; // skip empty/stale entries
-    hasPeer = true;
-    // Only VISIBLE peers can act; a peer published `visible: false` (backgrounded)
-    // is skipped. A peer that hasn't published the field is treated as visible.
-    if (s.visible !== false && clientId < minVisible) minVisible = clientId;
-  });
-
-  // Sole client: always the applier — no other client can duplicate the edit,
-  // so single-user agent edits apply even if this tab reports hidden.
-  if (!hasPeer) return true;
-
-  // With peers present, exactly one VISIBLE client applies (the lowest clientId
-  // among visible ones). A backgrounded tab pauses its poll and can't reliably
-  // act, so it yields — otherwise an agent edit would never reach the tab the
-  // user is actually looking at. The caller re-elects on visibility change.
-  const localHidden =
-    typeof document !== "undefined" && document.visibilityState === "hidden";
-  if (localHidden) return false;
-  return localClientId <= minVisible;
+  return true;
 }
 
 export interface RemoteAwarenessSnapshot {
@@ -213,7 +133,6 @@ export function reconcileRemoteAwarenessStates(
   return { added, updated, removed };
 }
 
-// Base64 helpers
 function uint8ArrayToBase64(arr: Uint8Array): string {
   let binary = "";
   for (let i = 0; i < arr.length; i++) {
@@ -231,36 +150,48 @@ function base64ToUint8Array(b64: string): Uint8Array {
   return arr;
 }
 
-/** Debounce delay for coalescing local Yjs update POSTs (ms). */
 const UPDATE_DEBOUNCE_MS = 80;
 
-/** Fetch state-vector every N poll cycles as a low-frequency safety net. */
 const STATE_VECTOR_FETCH_INTERVAL = 15;
 
-/** Poll ring-buffer size on the server (MAX_BUFFER in poll.ts). */
+const STATE_VECTOR_FETCH_TIMEOUT_MS = 15_000;
+
 const POLL_RING_BUFFER_SIZE = 200;
 
-/** Exponential backoff: base delay (ms), multiplier, cap (ms). */
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_MAX_MS = 15_000;
 
 function calcBackoff(consecutiveErrors: number): number {
   const exp = Math.min(consecutiveErrors, 10);
   const delay = BACKOFF_BASE_MS * Math.pow(2, exp);
-  // Add jitter: ±25%
   const jitter = delay * 0.25 * (Math.random() * 2 - 1);
   return Math.min(delay + jitter, BACKOFF_MAX_MS);
 }
-
-// ---------------------------------------------------------------------------
-// Fast awareness helper — throttled per (docId, ydocId) pair so multiple
-// setLocalStateField calls within a 150ms window are coalesced into one POST.
-// ---------------------------------------------------------------------------
 
 const _awarenessThrottleTimers = new Map<
   string,
   ReturnType<typeof setTimeout>
 >();
+
+function awarenessThrottleKey(
+  baseUrl: string,
+  docId: string,
+  clientId: number,
+): string {
+  return `${baseUrl}::${docId}::${clientId}`;
+}
+
+function cancelAwarenessPush(
+  baseUrl: string,
+  docId: string,
+  clientId: number,
+): void {
+  const key = awarenessThrottleKey(baseUrl, docId, clientId);
+  const timer = _awarenessThrottleTimers.get(key);
+  if (timer === undefined) return;
+  clearTimeout(timer);
+  _awarenessThrottleTimers.delete(key);
+}
 
 function scheduleAwarenessPush(
   baseUrl: string,
@@ -269,21 +200,1072 @@ function scheduleAwarenessPush(
   getState: () => Record<string, unknown> | null,
 ): void {
   if (typeof window === "undefined") return;
-  const key = `${docId}::${clientId}`;
-  if (_awarenessThrottleTimers.has(key)) return; // already scheduled
+  const key = awarenessThrottleKey(baseUrl, docId, clientId);
+  if (_awarenessThrottleTimers.has(key)) return;
 
   const timer = setTimeout(() => {
     _awarenessThrottleTimers.delete(key);
     const state = getState();
-    if (!state) return;
     fetch(`${baseUrl}/${docId}/awareness`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clientId, state: JSON.stringify(state) }),
-    }).catch(() => {}); // best-effort; poll cycle is the baseline fallback
+      body: JSON.stringify({
+        clientId,
+        state: state ? JSON.stringify(state) : null,
+      }),
+    }).catch(() => {});
   }, 150);
 
   _awarenessThrottleTimers.set(key, timer);
+}
+
+interface CollabDocSnapshot {
+  isLoading: boolean;
+  isSynced: boolean;
+  initialization: CollabInitializationState;
+  activeUsers: CollabUser[];
+  agentActive: boolean;
+  agentPresent: boolean;
+}
+
+interface CollabDocSubscription {
+  pollInterval: number;
+  pollIntervalWithSse: number;
+  pauseWhenHidden: boolean;
+  requestSource?: string;
+  onSnapshot: (snapshot: CollabDocSnapshot) => void;
+}
+
+const EMPTY_SNAPSHOT: CollabDocSnapshot = Object.freeze({
+  isLoading: false,
+  isSynced: false,
+  initialization: { status: "loading" as const },
+  activeUsers: [],
+  agentActive: false,
+  agentPresent: false,
+});
+
+const requestSyncUnavailable = (): Promise<CollaborativeDocSyncResult> =>
+  Promise.resolve({ status: "unavailable" });
+
+// Nothing is outstanding without a connection.
+const flushUpdatesUnavailable = (): Promise<boolean> => Promise.resolve(true);
+
+const DISPOSE_LINGER_MS = 1000;
+
+class CollabDocConnection {
+  readonly ydoc: Y.Doc;
+  readonly awareness: Awareness;
+  snapshot: CollabDocSnapshot;
+  disposed = false;
+
+  private subscribers = new Map<symbol, CollabDocSubscription>();
+  private disposeTimer: ReturnType<typeof setTimeout> | null = null;
+  private started = false;
+  private docMissing = false;
+  private requestSource: string | undefined;
+  private lastSetUser: CollabUser | null = null;
+
+  private pendingUpdates: Uint8Array[] = [];
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private updateInFlight = false;
+  private keepaliveInFlight = false;
+  private updateErrors = 0;
+  private updateAbortController: AbortController | null = null;
+  private updateHandlerAttached = false;
+
+  private syncActive = false;
+  private pollTimer: ReturnType<typeof setTimeout> | null = null;
+  private consecutiveErrors = 0;
+  private pollCycleCount = 0;
+  private pollVersion = 0;
+  private lastPolledVersion = 0;
+  private pollCursor: string | null = null;
+  private pollActivityBaselineReady = false;
+  private stateVectorFetch: Promise<CollaborativeDocSyncResult> | null = null;
+  private stateVectorAbortControllers = new Set<AbortController>();
+  private sseActive = false;
+  private sseAwarenessCovered = false;
+  private ssePollLive = false;
+  private sseSubscribedWithPause: boolean | null = null;
+  private unsubscribeCollabEvents: (() => void) | null = null;
+  private unsubscribeAwarenessEvents: (() => void) | null = null;
+  private agentTimer: ReturnType<typeof setTimeout> | null = null;
+  private releaseCollabPollBoost: (() => void) | null = null;
+
+  constructor(
+    readonly docId: string,
+    private readonly baseUrl: string,
+    readonly detached = false,
+  ) {
+    this.ydoc = new Y.Doc();
+    this.awareness = new Awareness(this.ydoc);
+    this.snapshot = {
+      isLoading: true,
+      isSynced: false,
+      initialization: { status: "loading" },
+      activeUsers: [],
+      agentActive: false,
+      agentPresent: false,
+    };
+
+    this.awareness.on("change", this.handleAwarenessChange);
+
+    if (!detached) this.scheduleDispose();
+  }
+
+  private get registryKey(): string {
+    return collabRegistryKey(this.docId, this.baseUrl);
+  }
+
+  private get retiredUpdatesKey(): string | null {
+    const email = this.lastSetUser?.email?.trim().toLowerCase();
+    return email
+      ? `${this.registryKey}\0${email}\0${this.requestSource ?? ""}`
+      : null;
+  }
+
+  add(id: symbol, sub: CollabDocSubscription): void {
+    this.subscribers.set(id, sub);
+    if (this.disposeTimer) {
+      clearTimeout(this.disposeTimer);
+      this.disposeTimer = null;
+    }
+    if (!this.requestSource && sub.requestSource) {
+      this.requestSource = sub.requestSource;
+    }
+    if (!this.started) {
+      this.started = true;
+      this.start();
+    } else {
+      this.resubscribeCollabEventsIfPauseChanged();
+      this.reschedulePoll();
+    }
+  }
+
+  remove(id: symbol): void {
+    this.subscribers.delete(id);
+    if (this.subscribers.size === 0) {
+      cancelAwarenessPush(this.baseUrl, this.docId, this.ydoc.clientID);
+      this.scheduleDispose();
+    } else {
+      this.resubscribeCollabEventsIfPauseChanged();
+      this.reschedulePoll();
+    }
+  }
+
+  private scheduleDispose(): void {
+    if (this.disposeTimer) clearTimeout(this.disposeTimer);
+    this.disposeTimer = setTimeout(() => {
+      this.disposeTimer = null;
+      this.dispose();
+    }, DISPOSE_LINGER_MS);
+  }
+
+  /**
+   * Tear the connection down: stop all loops and listeners, flush any pending
+   * local updates, clear awareness local state (via destroy), and destroy the
+   * Y.Doc. Also used by the test-only registry reset. @internal
+   */
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const controller of this.stateVectorAbortControllers) {
+      controller.abort();
+    }
+    this.stateVectorAbortControllers.clear();
+    if (this.disposeTimer) {
+      clearTimeout(this.disposeTimer);
+      this.disposeTimer = null;
+    }
+    this.stopSync();
+    this.unsubscribeAwarenessEvents?.();
+    this.unsubscribeAwarenessEvents = null;
+    this.updateAbortController?.abort();
+    if (this.pendingUpdates.length && this.retiredUpdatesKey) {
+      retiredCollabUpdates.set(this.retiredUpdatesKey, this.pendingUpdates);
+    }
+    void this.flushPendingUpdates(true);
+    this.detachUpdateHandler();
+    if (this.agentTimer) {
+      clearTimeout(this.agentTimer);
+      this.agentTimer = null;
+    }
+    this.awareness.off("change", this.handleAwarenessChange);
+    cancelAwarenessPush(this.baseUrl, this.docId, this.ydoc.clientID);
+    this.awareness.destroy();
+    this.ydoc.destroy();
+    if (collabConnectionRegistry.get(this.registryKey) === this) {
+      collabConnectionRegistry.delete(this.registryKey);
+    }
+  }
+
+  private get effectivePollInterval(): number {
+    let min = Infinity;
+    for (const sub of this.subscribers.values()) {
+      if (sub.pollInterval < min) min = sub.pollInterval;
+    }
+    return isFinite(min) ? min : 2000;
+  }
+
+  private get effectivePollIntervalWithSse(): number {
+    let min = Infinity;
+    for (const sub of this.subscribers.values()) {
+      if (sub.pollIntervalWithSse < min) min = sub.pollIntervalWithSse;
+    }
+    return isFinite(min) ? min : 12_000;
+  }
+
+  private get effectivePauseWhenHidden(): boolean {
+    for (const sub of this.subscribers.values()) {
+      if (!sub.pauseWhenHidden) return false;
+    }
+    return true;
+  }
+
+  private setSnapshot(patch: Partial<CollabDocSnapshot>): void {
+    this.snapshot = { ...this.snapshot, ...patch };
+    for (const sub of this.subscribers.values()) {
+      sub.onSnapshot(this.snapshot);
+    }
+  }
+
+  private markAgentActive(): void {
+    this.setSnapshot({ agentActive: true });
+    if (this.agentTimer) clearTimeout(this.agentTimer);
+    this.agentTimer = setTimeout(() => {
+      this.agentTimer = null;
+      this.setSnapshot({ agentActive: false });
+    }, 3000);
+  }
+
+  setUser(user: CollabUser): void {
+    if (this.disposed) return;
+    const prev = this.lastSetUser;
+    if (prev && prev.email !== user.email) {
+      if (this.pendingUpdates.length && this.retiredUpdatesKey) {
+        retiredCollabUpdates.set(this.retiredUpdatesKey, this.pendingUpdates);
+      }
+      this.pendingUpdates = [];
+      this.updateAbortController?.abort();
+      if (this.flushTimer) clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+      this.updateErrors = 0;
+    }
+    if (
+      prev &&
+      prev.name === user.name &&
+      prev.email === user.email &&
+      prev.color === user.color &&
+      prev.avatarUrl === user.avatarUrl
+    ) {
+      return;
+    }
+    const avatarUrl =
+      typeof user.avatarUrl === "string" && user.avatarUrl.trim()
+        ? user.avatarUrl
+        : undefined;
+    this.lastSetUser = {
+      name: user.name,
+      email: user.email,
+      color: user.color,
+      ...(avatarUrl ? { avatarUrl } : {}),
+    };
+    const retiredKey = this.retiredUpdatesKey;
+    const retired = retiredKey
+      ? retiredCollabUpdates.get(retiredKey)
+      : undefined;
+    if (retired && retiredKey) {
+      retiredCollabUpdates.delete(retiredKey);
+      this.pendingUpdates.push(...retired);
+      if (this.snapshot.initialization.status === "ready") {
+        for (const update of retired)
+          Y.applyUpdate(this.ydoc, update, "remote");
+        void this.flushPendingUpdates();
+      }
+    }
+    this.awareness.setLocalStateField("user", {
+      name: user.name,
+      email: user.email,
+      color: user.color,
+      ...(avatarUrl ? { avatarUrl } : {}),
+    });
+    this.awareness.setLocalStateField("visible", !isDocumentHidden());
+  }
+
+  private handleAwarenessChange = (
+    _changes?: { added: number[]; updated: number[]; removed: number[] },
+    origin?: unknown,
+  ): void => {
+    const users: CollabUser[] = [];
+    let hasAgent = false;
+    let hasVisibleHuman = false;
+    this.awareness.getStates().forEach((state, clientId) => {
+      if (clientId === this.ydoc.clientID) return;
+      if (state.user) {
+        users.push(state.user as CollabUser);
+        if ((state.user as CollabUser).email === "agent@system") {
+          hasAgent = true;
+        } else if (state.visible !== false) {
+          hasVisibleHuman = true;
+        }
+      }
+    });
+    this.setCollabPollBoost(hasVisibleHuman);
+    const nextActiveUsers = dedupeCollabUsersByEmail(users);
+    const activeUsers = collabUsersEqual(
+      this.snapshot.activeUsers,
+      nextActiveUsers,
+    )
+      ? this.snapshot.activeUsers
+      : nextActiveUsers;
+    if (
+      activeUsers !== this.snapshot.activeUsers ||
+      hasAgent !== this.snapshot.agentPresent
+    ) {
+      this.setSnapshot({ activeUsers, agentPresent: hasAgent });
+    }
+
+    if (
+      this.lastSetUser &&
+      this.snapshot.isSynced &&
+      origin === "local" &&
+      !this.disposed
+    ) {
+      scheduleAwarenessPush(
+        this.baseUrl,
+        this.docId,
+        this.ydoc.clientID,
+        () => this.awareness.getLocalState() as Record<string, unknown> | null,
+      );
+    }
+  };
+
+  // Presence is discovered by this connection's own ~12 s poll, which is also
+  // what ends the boost: a collaborator who leaves drops out of awareness after
+  // the server's 30 s row TTL.
+  private setCollabPollBoost(othersPresent: boolean): void {
+    const want = othersPresent && this.syncActive && !this.disposed;
+    if (want && !this.releaseCollabPollBoost) {
+      this.releaseCollabPollBoost = acquireCollabPollBoost();
+    } else if (!want && this.releaseCollabPollBoost) {
+      this.releaseCollabPollBoost();
+      this.releaseCollabPollBoost = null;
+    }
+  }
+
+  private start(): void {
+    this.fetchInitialState();
+  }
+
+  private startTransport(): void {
+    this.attachUpdateHandler();
+    this.startSync();
+
+    this.unsubscribeAwarenessEvents = subscribeSyncEvents({
+      onEvents: (events) => {
+        if (this.disposed) return;
+        for (const data of events) this.applyAwarenessEvent(data);
+      },
+    });
+  }
+
+  private fetchInitialState(): void {
+    fetch(`${this.baseUrl}/${this.docId}/state`, {
+      headers: { "X-Agent-Native-Poll-Baseline": "1" },
+    }).then(
+      async (res) => {
+        if (this.disposed) return;
+        if (res.status === 404 || res.status === 403) {
+          this.markInitializationFailed("forbidden-or-not-found");
+          return;
+        }
+        if (!res.ok) {
+          this.markInitializationFailed("server");
+          return;
+        }
+        const data = (await res.json().catch(() => null)) as {
+          state?: string;
+          activityBaseline?: {
+            status?: unknown;
+            version?: unknown;
+            cursor?: unknown;
+          };
+        } | null;
+        if (this.disposed) return;
+        if (typeof data?.state !== "string" || data.state.length === 0) {
+          this.markInitializationFailed("invalid-payload");
+          return;
+        }
+        const baseline = data.activityBaseline;
+        if (
+          baseline?.status === "ready" &&
+          Number.isSafeInteger(baseline.version) &&
+          (baseline.version as number) >= 0 &&
+          typeof baseline.cursor === "string" &&
+          baseline.cursor.length > 0
+        ) {
+          this.pollVersion = baseline.version as number;
+          this.lastPolledVersion = baseline.version as number;
+          this.pollCursor = baseline.cursor;
+          this.pollActivityBaselineReady = true;
+        }
+        if (data.state) {
+          try {
+            const binary = base64ToUint8Array(data.state);
+            const validationDoc = new Y.Doc();
+            try {
+              Y.applyUpdate(validationDoc, binary, "remote");
+            } finally {
+              validationDoc.destroy();
+            }
+            Y.applyUpdate(this.ydoc, binary, "remote");
+            for (const update of this.pendingUpdates) {
+              Y.applyUpdate(this.ydoc, update, "remote");
+            }
+          } catch {
+            this.markInitializationFailed("invalid-payload");
+            return;
+          }
+        }
+        this.setSnapshot({
+          isLoading: false,
+          isSynced: true,
+          initialization: { status: "ready" },
+        });
+        this.startTransport();
+      },
+      () => {
+        if (this.disposed) return;
+        this.markInitializationFailed("network");
+      },
+    );
+  }
+
+  private markInitializationFailed(
+    category: CollabInitializationErrorCategory,
+  ): void {
+    this.docMissing = true;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.detachUpdateHandler();
+    this.stopSync();
+    this.unsubscribeAwarenessEvents?.();
+    this.unsubscribeAwarenessEvents = null;
+    this.setSnapshot({
+      isLoading: false,
+      isSynced: false,
+      initialization: { status: "error", category },
+    });
+  }
+
+  private retryInitialization(): void {
+    if (this.disposed) return;
+    this.detachUpdateHandler();
+    this.stopSync();
+    this.unsubscribeAwarenessEvents?.();
+    this.unsubscribeAwarenessEvents = null;
+    this.docMissing = false;
+    this.setSnapshot({
+      isLoading: true,
+      isSynced: false,
+      initialization: { status: "loading" },
+    });
+    this.fetchInitialState();
+  }
+
+  retry = (): void => {
+    this.retryInitialization();
+  };
+
+  requestSync = (): Promise<CollaborativeDocSyncResult> => {
+    if (
+      this.disposed ||
+      this.subscribers.size === 0 ||
+      this.snapshot.initialization.status !== "ready"
+    ) {
+      return Promise.resolve({ status: "unavailable" });
+    }
+
+    return this.performStateVectorFetch();
+  };
+
+  flushUpdates = async (): Promise<boolean> => {
+    while (!this.disposed && this.pendingUpdates.length > 0) {
+      if (this.updateInFlight) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        continue;
+      }
+      if (this.flushTimer) {
+        clearTimeout(this.flushTimer);
+        this.flushTimer = null;
+      }
+      await this.flushPendingUpdates();
+      if (this.updateErrors > 0) return false;
+    }
+    return this.pendingUpdates.length === 0;
+  };
+
+  private handleDocUpdate = (update: Uint8Array, origin: unknown): void => {
+    if (origin === "remote") return;
+    this.pendingUpdates.push(update);
+    if (this.updateErrors && this.flushTimer) return;
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      void this.flushPendingUpdates();
+    }, UPDATE_DEBOUNCE_MS);
+  };
+
+  private handlePageHide = (): void => {
+    this.flushPendingUpdates(true);
+  };
+
+  private attachUpdateHandler(): void {
+    if (this.updateHandlerAttached || this.docMissing) return;
+    this.updateHandlerAttached = true;
+    this.ydoc.on("update", this.handleDocUpdate);
+    if (typeof window !== "undefined") {
+      window.addEventListener("pagehide", this.handlePageHide);
+    }
+  }
+
+  private detachUpdateHandler(): void {
+    if (!this.updateHandlerAttached) return;
+    this.updateHandlerAttached = false;
+    this.ydoc.off("update", this.handleDocUpdate);
+    if (typeof window !== "undefined") {
+      window.removeEventListener("pagehide", this.handlePageHide);
+    }
+  }
+
+  private async flushPendingUpdates(keepalive = false): Promise<void> {
+    if (
+      keepalive
+        ? this.keepaliveInFlight
+        : this.disposed ||
+          this.updateInFlight ||
+          (this.updateErrors > 0 && this.flushTimer !== null)
+    )
+      return;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.pendingUpdates.length === 0) return;
+    const toSend = this.pendingUpdates.slice();
+    const retiredKey = this.retiredUpdatesKey;
+    const merged = toSend.length === 1 ? toSend[0] : Y.mergeUpdates(toSend);
+    const controller = new AbortController();
+    if (keepalive) this.keepaliveInFlight = true;
+    else {
+      this.updateInFlight = true;
+      this.updateAbortController = controller;
+    }
+    const timeout = setTimeout(
+      () => controller.abort(),
+      STATE_VECTOR_FETCH_TIMEOUT_MS,
+    );
+    try {
+      const response = await fetch(`${this.baseUrl}/${this.docId}/update`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          update: uint8ArrayToBase64(merged),
+          requestSource: this.requestSource,
+        }),
+        signal: controller.signal,
+        ...(keepalive ? { keepalive: true } : {}),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const previous = this.pendingUpdates;
+      const acknowledged = new Set(toSend);
+      this.pendingUpdates = previous.filter(
+        (update) => !acknowledged.has(update),
+      );
+      const retired = retiredKey
+        ? retiredCollabUpdates.get(retiredKey)
+        : undefined;
+      if (retired && retiredKey) {
+        const remaining = retired.filter((update) => !acknowledged.has(update));
+        if (remaining.length) {
+          retiredCollabUpdates.set(retiredKey, remaining);
+        } else {
+          retiredCollabUpdates.delete(retiredKey);
+        }
+      }
+      this.updateErrors = 0;
+    } catch {
+      this.updateErrors++;
+    } finally {
+      clearTimeout(timeout);
+      if (keepalive) this.keepaliveInFlight = false;
+      else {
+        this.updateInFlight = false;
+        this.updateAbortController = null;
+      }
+      if (!this.disposed && this.pendingUpdates.length && !this.flushTimer) {
+        this.flushTimer = setTimeout(
+          () => {
+            this.flushTimer = null;
+            void this.flushPendingUpdates();
+          },
+          this.updateErrors
+            ? calcBackoff(this.updateErrors)
+            : UPDATE_DEBOUNCE_MS,
+        );
+      }
+    }
+  }
+
+  private startSync(): void {
+    if (this.syncActive || this.docMissing || this.disposed) return;
+    this.syncActive = true;
+
+    this.subscribeCollabEvents();
+
+    if (!this.effectivePauseWhenHidden || !isDocumentHidden()) {
+      void this.poll();
+    }
+    window.addEventListener("focus", this.handleFocus);
+    document.addEventListener("visibilitychange", this.handleVisibilityChange);
+  }
+
+  private stopSync(): void {
+    if (!this.syncActive) return;
+    this.syncActive = false;
+    this.setCollabPollBoost(false);
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.unsubscribeCollabEvents?.();
+    this.unsubscribeCollabEvents = null;
+    this.sseSubscribedWithPause = null;
+    window.removeEventListener("focus", this.handleFocus);
+    document.removeEventListener(
+      "visibilitychange",
+      this.handleVisibilityChange,
+    );
+  }
+
+  private subscribeCollabEvents(): void {
+    const pauseWhenHidden = this.effectivePauseWhenHidden;
+    this.sseSubscribedWithPause = pauseWhenHidden;
+    this.unsubscribeCollabEvents = subscribeSyncEvents({
+      onEvents: (events) => {
+        if (this.disposed || !this.syncActive) return;
+        for (const change of events) this.handleSharedEvent(change);
+      },
+      onSseStateChange: (connected, capabilities) => {
+        const wasActive = this.sseActive;
+        this.sseActive = connected;
+        const awarenessCovered =
+          connected && !capabilities?.includes(REALTIME_CAP_NO_AWARENESS);
+        const coverageFlipped = awarenessCovered !== this.sseAwarenessCovered;
+        this.sseAwarenessCovered = awarenessCovered;
+        const pollLive =
+          capabilities?.includes(REALTIME_CAP_POLL_LIVE) === true;
+        const pollLiveFlipped = pollLive !== this.ssePollLive;
+        this.ssePollLive = pollLive;
+        if ((coverageFlipped || pollLiveFlipped) && connected === wasActive) {
+          this.reschedulePoll();
+        }
+        if (connected) this.consecutiveErrors = 0;
+      },
+      pauseWhenHidden,
+    });
+  }
+
+  private resubscribeCollabEventsIfPauseChanged(): void {
+    if (!this.syncActive) return;
+    if (this.sseSubscribedWithPause === this.effectivePauseWhenHidden) return;
+    this.unsubscribeCollabEvents?.();
+    this.subscribeCollabEvents();
+  }
+
+  private handleSharedEvent(change: SyncEvent): void {
+    if (
+      change.source === "collab" &&
+      change.docId === this.docId &&
+      typeof change.update === "string"
+    ) {
+      if (this.requestSource && change.requestSource === this.requestSource) {
+        return;
+      }
+      try {
+        Y.applyUpdate(this.ydoc, base64ToUint8Array(change.update), "remote");
+      } catch {
+        // Malformed update — trigger state-vector fetch on next poll
+      }
+
+      if (change.requestSource === "agent") {
+        this.markAgentActive();
+      }
+    }
+
+    if (typeof change.version === "number") {
+      this.pollVersion = Math.max(this.pollVersion, change.version);
+    }
+  }
+
+  private getActivePollInterval(): number {
+    return (this.sseActive && this.sseAwarenessCovered) || this.ssePollLive
+      ? this.effectivePollIntervalWithSse
+      : this.effectivePollInterval;
+  }
+
+  private schedulePoll(): void {
+    if (!this.syncActive || this.disposed) return;
+    if (this.effectivePauseWhenHidden && isDocumentHidden()) return;
+    this.pollTimer = setTimeout(() => {
+      this.pollTimer = null;
+      void this.poll();
+    }, this.getActivePollInterval());
+  }
+
+  private reschedulePoll(): void {
+    if (this.pollTimer === null) return;
+    clearTimeout(this.pollTimer);
+    this.pollTimer = null;
+    this.schedulePoll();
+  }
+
+  private fetchStateVector(): Promise<CollaborativeDocSyncResult> {
+    if (this.stateVectorFetch) return this.stateVectorFetch;
+    if (this.disposed || this.snapshot.initialization.status !== "ready") {
+      return Promise.resolve({ status: "unavailable" });
+    }
+
+    return this.startStateVectorFetch();
+  }
+
+  private startStateVectorFetch(): Promise<CollaborativeDocSyncResult> {
+    const request = this.performStateVectorFetch();
+    this.stateVectorFetch = request;
+    void request.finally(() => {
+      if (this.stateVectorFetch === request) this.stateVectorFetch = null;
+    });
+    return request;
+  }
+
+  private async performStateVectorFetch(): Promise<CollaborativeDocSyncResult> {
+    const controller = new AbortController();
+    this.stateVectorAbortControllers.add(controller);
+    const timeout = setTimeout(
+      () => controller.abort(),
+      STATE_VECTOR_FETCH_TIMEOUT_MS,
+    );
+    try {
+      const stateVector = uint8ArrayToBase64(Y.encodeStateVector(this.ydoc));
+      const stateRes = await fetch(
+        `${this.baseUrl}/${this.docId}/state?stateVector=${encodeURIComponent(stateVector)}`,
+        { cache: "no-store", signal: controller.signal },
+      );
+      if (!stateRes.ok) {
+        return {
+          status: "failed",
+          error: new Error(
+            `State-vector request failed: HTTP ${stateRes.status}`,
+          ),
+        };
+      }
+      const stateData = (await stateRes.json()) as {
+        state?: string;
+      };
+      if (
+        this.disposed ||
+        this.subscribers.size === 0 ||
+        this.snapshot.initialization.status !== "ready"
+      ) {
+        return { status: "unavailable" };
+      }
+      if (
+        typeof stateData?.state !== "string" ||
+        stateData.state.length === 0
+      ) {
+        return {
+          status: "failed",
+          error: new Error("State-vector response did not contain state"),
+        };
+      }
+      const binary = base64ToUint8Array(stateData.state);
+      Y.applyUpdate(this.ydoc, binary, "remote");
+      return { status: "synced" };
+    } catch (error) {
+      if (
+        this.disposed ||
+        this.subscribers.size === 0 ||
+        this.snapshot.initialization.status !== "ready"
+      ) {
+        return { status: "unavailable" };
+      }
+      return {
+        status: "failed",
+        error:
+          error instanceof Error
+            ? error
+            : new Error("State-vector request failed"),
+      };
+    } finally {
+      clearTimeout(timeout);
+      this.stateVectorAbortControllers.delete(controller);
+    }
+  }
+
+  private async poll(): Promise<void> {
+    if (!this.syncActive || this.disposed) return;
+
+    this.flushPendingUpdates();
+
+    try {
+      const pollUrl = this.pollCursor
+        ? `/_agent-native/poll?cursor=${encodeURIComponent(this.pollCursor)}`
+        : `/_agent-native/poll?since=${this.pollVersion}`;
+      const res = await fetch(agentNativePath(pollUrl));
+      if (!res.ok) throw new Error("HTTP " + res.status);
+
+      const data = await res.json();
+      if (!this.syncActive || this.disposed) return;
+      const hadActivityBaseline = this.pollActivityBaselineReady;
+      const { version, events } = data as {
+        version: number;
+        cursor?: string;
+        events: Array<{
+          version: number;
+          source: string;
+          docId?: string;
+          update?: string;
+          requestSource?: string;
+          resourceType?: string;
+          resourceId?: string;
+        }>;
+      };
+
+      const versionGap = version - this.lastPolledVersion;
+      const hadGap = versionGap > POLL_RING_BUFFER_SIZE;
+
+      for (const evt of events) {
+        if (evt.source === "collab" && evt.docId === this.docId && evt.update) {
+          if (this.requestSource && evt.requestSource === this.requestSource) {
+            continue;
+          }
+          try {
+            Y.applyUpdate(this.ydoc, base64ToUint8Array(evt.update), "remote");
+          } catch {
+            await this.fetchStateVector();
+          }
+
+          if (evt.requestSource === "agent") {
+            this.markAgentActive();
+          }
+        }
+      }
+
+      if (hadActivityBaseline) {
+        noteCollabPollActivity(events);
+      } else {
+        const reconciliation = await this.fetchStateVector();
+        if (reconciliation.status !== "synced") {
+          throw reconciliation.status === "failed"
+            ? reconciliation.error
+            : new Error(
+                "Could not reconcile state without an activity baseline",
+              );
+        }
+      }
+      this.pollActivityBaselineReady = true;
+      if (typeof data.cursor === "string") this.pollCursor = data.cursor;
+      this.pollVersion = version;
+      this.lastPolledVersion = version;
+      this.pollCycleCount++;
+      this.consecutiveErrors = 0;
+
+      const shouldFetchStateVector =
+        hadGap || this.pollCycleCount % STATE_VECTOR_FETCH_INTERVAL === 0;
+
+      if (shouldFetchStateVector) {
+        await this.fetchStateVector();
+      }
+
+      const localState = this.awareness.getLocalState();
+      if (localState && !this.disposed) {
+        try {
+          const awarenessRes = await fetch(
+            `${this.baseUrl}/${this.docId}/awareness`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                clientId: this.ydoc.clientID,
+                state: JSON.stringify(localState),
+              }),
+            },
+          );
+          if (awarenessRes.ok && !this.disposed) {
+            const awarenessData = await awarenessRes.json();
+            const remoteStates: RemoteAwarenessSnapshot[] = [];
+            for (const remote of awarenessData.states || []) {
+              try {
+                const remoteState = JSON.parse(remote.state);
+                remoteStates.push({
+                  clientId: Number(remote.clientId),
+                  state: remoteState,
+                });
+              } catch {
+                // Invalid state — skip
+              }
+            }
+            if (this.disposed) return;
+            const changes = reconcileRemoteAwarenessStates(
+              this.awareness.getStates() as Map<number, unknown>,
+              this.ydoc.clientID,
+              remoteStates,
+            );
+            if (
+              changes.added.length ||
+              changes.updated.length ||
+              changes.removed.length
+            ) {
+              this.awareness.emit("change", [changes, "remote"]);
+            }
+          }
+        } catch {
+          // Awareness sync failure is non-fatal
+        }
+      }
+    } catch {
+      this.consecutiveErrors++;
+      const backoff = calcBackoff(this.consecutiveErrors);
+      if (this.syncActive && !this.disposed) {
+        this.pollTimer = setTimeout(() => {
+          this.pollTimer = null;
+          void this.poll();
+        }, backoff);
+      }
+      return;
+    }
+
+    this.schedulePoll();
+  }
+
+  private pollNow(): void {
+    if (!this.syncActive || this.disposed) return;
+    if (this.effectivePauseWhenHidden && isDocumentHidden()) return;
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+    }
+    void this.poll();
+  }
+
+  private publishVisibility(visible: boolean): void {
+    this.awareness.setLocalStateField("visible", visible);
+    const localState = this.awareness.getLocalState();
+    if (!localState) return;
+    fetch(`${this.baseUrl}/${this.docId}/awareness`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        clientId: this.ydoc.clientID,
+        state: JSON.stringify(localState),
+      }),
+      keepalive: true,
+    }).catch(() => {});
+  }
+
+  private handleVisibilityChange = (): void => {
+    const visible = document.visibilityState === "visible";
+    this.publishVisibility(visible);
+    if (visible) {
+      this.flushPendingUpdates();
+      this.pollNow();
+    } else if (this.effectivePauseWhenHidden && this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+    }
+  };
+
+  private handleFocus = (): void => {
+    this.pollNow();
+  };
+
+  private applyAwarenessEvent(data: SyncEvent): void {
+    if (
+      data.source !== "awareness" ||
+      data.type !== "awareness-change" ||
+      data.docId !== this.docId
+    ) {
+      return;
+    }
+    const states = Array.isArray(data.states)
+      ? (data.states as Array<{ clientId: number; state: string }>)
+      : [];
+    const remoteStates: RemoteAwarenessSnapshot[] = [];
+    for (const remote of states) {
+      try {
+        remoteStates.push({
+          clientId: Number(remote.clientId),
+          state: JSON.parse(remote.state),
+        });
+      } catch {
+        // Invalid state entry — skip
+      }
+    }
+    const changes = reconcileRemoteAwarenessStates(
+      this.awareness.getStates() as Map<number, unknown>,
+      this.ydoc.clientID,
+      remoteStates,
+    );
+    if (
+      changes.added.length ||
+      changes.updated.length ||
+      changes.removed.length
+    ) {
+      this.awareness.emit("change", [changes, "remote"]);
+    }
+  }
+}
+
+const collabConnectionRegistry = new Map<string, CollabDocConnection>();
+// ponytail: in-memory retention survives component remounts; use a durable
+// outbox if offline reload recovery becomes supported. No retired retry loop.
+const retiredCollabUpdates = new Map<string, Uint8Array[]>();
+
+function collabRegistryKey(docId: string, baseUrl: string): string {
+  return `${baseUrl}\0${docId}`;
+}
+
+function getOrCreateCollabConnection(
+  docId: string,
+  baseUrl: string,
+): CollabDocConnection {
+  const key = collabRegistryKey(docId, baseUrl);
+  let conn = collabConnectionRegistry.get(key);
+  if (!conn || conn.disposed) {
+    conn = new CollabDocConnection(docId, baseUrl);
+    collabConnectionRegistry.set(key, conn);
+  }
+  return conn;
+}
+
+// ---------------------------------------------------------------------------
+// Internal test helpers — reset/inspect the connection registry between tests.
+// ---------------------------------------------------------------------------
+/** @internal */
+export function _resetCollabDocRegistryForTests(): void {
+  for (const conn of Array.from(collabConnectionRegistry.values())) {
+    conn.dispose();
+  }
+  collabConnectionRegistry.clear();
+  retiredCollabUpdates.clear();
+}
+
+/** @internal — current registry size, for leak assertions in tests. */
+export function _collabDocRegistrySizeForTests(): number {
+  return collabConnectionRegistry.size;
 }
 
 export function useCollaborativeDoc(
@@ -297,651 +1279,88 @@ export function useCollaborativeDoc(
     baseUrl = agentNativePath("/_agent-native/collab"),
     requestSource,
     user,
+    activityResource,
   } = options;
+  useEffect(() => {
+    if (!docId || !activityResource) return;
+    return registerCollabActivityResource(activityResource);
+  }, [activityResource?.resourceId, activityResource?.resourceType, docId]);
+  const storedAvatarUrl = useAvatarUrl(user?.email);
+  const resolvedUser = useMemo(() => {
+    if (!user || !storedAvatarUrl || storedAvatarUrl === user.avatarUrl) {
+      return user;
+    }
+    return { ...user, avatarUrl: storedAvatarUrl };
+  }, [storedAvatarUrl, user]);
 
-  // Stable Y.Doc per docId
-  const ydoc = useMemo(() => {
+  const [generation, setGeneration] = useState(0);
+
+  const conn = useMemo(() => {
+    void generation;
     if (!docId) return null;
-    return new Y.Doc();
-  }, [docId]);
+    if (typeof window === "undefined") {
+      return new CollabDocConnection(docId, baseUrl, true);
+    }
+    return getOrCreateCollabConnection(docId, baseUrl);
+  }, [docId, baseUrl, generation]);
 
-  // Stable Awareness per ydoc
-  const awareness = useMemo(() => {
-    if (!ydoc) return null;
-    return new Awareness(ydoc);
-  }, [ydoc]);
+  const [snapshot, setSnapshot] = useState<CollabDocSnapshot>(() =>
+    conn ? conn.snapshot : EMPTY_SNAPSHOT,
+  );
 
-  const [isLoading, setIsLoading] = useState(!!docId);
-  const [isSynced, setIsSynced] = useState(false);
-  const [activeUsers, setActiveUsers] = useState<CollabUser[]>([]);
-  const [agentActive, setAgentActive] = useState(false);
-  const [agentPresent, setAgentPresent] = useState(false);
-  // Set when the initial state fetch returns 404/403 — stops the awareness
-  // poll so we don't spam the console with errors against a doc that doesn't
-  // exist or isn't accessible.
-  const [docMissing, setDocMissing] = useState(false);
-  const agentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pollVersionRef = useRef(0);
+  const [prevConn, setPrevConn] = useState(conn);
+  if (prevConn !== conn) {
+    setPrevConn(conn);
+    setSnapshot(conn ? conn.snapshot : EMPTY_SNAPSHOT);
+  }
 
-  // Set local awareness state (user info for cursor labels). Also publish this
-  // tab's visibility so peers can elect a VISIBLE client to apply external
-  // snapshots (see isReconcileLeadClient) — a backgrounded tab pauses its poll
-  // and must not hold that role.
   useEffect(() => {
-    if (!awareness || !user) return;
-    awareness.setLocalStateField("user", {
-      name: user.name,
-      email: user.email,
-      color: user.color,
+    if (!conn || conn.detached) return;
+    if (conn.disposed) {
+      setGeneration((g) => g + 1);
+      return;
+    }
+    const id = Symbol("useCollaborativeDoc");
+    conn.add(id, {
+      pollInterval,
+      pollIntervalWithSse,
+      pauseWhenHidden,
+      requestSource,
+      onSnapshot: setSnapshot,
     });
-    awareness.setLocalStateField("visible", !isDocumentHidden());
-  }, [awareness, user?.name, user?.email, user?.color]);
-
-  // Fast awareness push: whenever local state changes (e.g. cursor moves,
-  // setPresence() calls), schedule a throttled POST so peers receive updates
-  // at ~150ms instead of waiting for the next 2s poll cycle. The poll cycle
-  // remains the authoritative baseline (cursors degrade gracefully without SSE).
-  useEffect(() => {
-    if (!awareness || !ydoc || !docId || !user) return;
-    const clientId = ydoc.clientID;
-
-    const onLocalStateChange = () => {
-      scheduleAwarenessPush(
-        baseUrl,
-        docId,
-        clientId,
-        () => awareness.getLocalState() as Record<string, unknown> | null,
-      );
-    };
-
-    // awareness emits "change" for local state changes too (when origin is "local").
-    awareness.on("change", onLocalStateChange);
+    setSnapshot(conn.snapshot);
     return () => {
-      awareness.off("change", onLocalStateChange);
+      conn.remove(id);
     };
-  }, [awareness, ydoc, docId, baseUrl, user]);
+  }, [conn, pollInterval, pollIntervalWithSse, pauseWhenHidden, requestSource]);
 
-  // Track active users from awareness changes
   useEffect(() => {
-    if (!awareness) return;
-
-    const updateUsers = () => {
-      const users: CollabUser[] = [];
-      let hasAgent = false;
-      awareness.getStates().forEach((state, clientId) => {
-        if (clientId === ydoc?.clientID) return; // Skip self
-        if (state.user) {
-          users.push(state.user as CollabUser);
-          if ((state.user as CollabUser).email === "agent@system") {
-            hasAgent = true;
-          }
-        }
-      });
-      setActiveUsers(dedupeCollabUsersByEmail(users));
-      setAgentPresent(hasAgent);
-    };
-
-    awareness.on("change", updateUsers);
-    return () => {
-      awareness.off("change", updateUsers);
-    };
-  }, [awareness, ydoc]);
-
-  // Clean up on unmount or docId change
-  useEffect(() => {
-    return () => {
-      awareness?.destroy();
-      ydoc?.destroy();
-    };
-  }, [ydoc, awareness]);
-
-  // Fetch server state and apply to existing doc
-  useEffect(() => {
-    if (!ydoc || !docId) {
-      setIsLoading(false);
-      return;
-    }
-
-    let cancelled = false;
-    setIsLoading(true);
-    setIsSynced(false);
-    setDocMissing(false);
-
-    fetch(`${baseUrl}/${docId}/state`)
-      .then(async (res) => {
-        if (cancelled) return;
-        if (res.status === 404 || res.status === 403) {
-          setDocMissing(true);
-          setIsLoading(false);
-          setIsSynced(true);
-          return;
-        }
-        const data = (await res.json().catch(() => null)) as {
-          state?: string;
-        } | null;
-        if (data?.state) {
-          const binary = base64ToUint8Array(data.state);
-          if (binary.length > 4) {
-            Y.applyUpdate(ydoc, binary, "remote");
-          }
-        }
-        setIsLoading(false);
-        setIsSynced(true);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setIsLoading(false);
-        setIsSynced(true);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [ydoc, docId, baseUrl]);
-
-  // Send local updates to server — debounced and coalesced with Y.mergeUpdates.
-  //
-  // Instead of firing one POST per Yjs update (one per keystroke), we accumulate
-  // updates in a buffer for UPDATE_DEBOUNCE_MS then merge them into a single
-  // request. The buffer is also flushed immediately on visibilitychange/pagehide
-  // and before each poll/awareness cycle so we don't hold stale local state.
-  useEffect(() => {
-    if (!ydoc || !docId || docMissing) return;
-
-    let pendingUpdates: Uint8Array[] = [];
-    let flushTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const flushPendingUpdates = (keepalive = false) => {
-      if (flushTimer) {
-        clearTimeout(flushTimer);
-        flushTimer = null;
-      }
-      if (pendingUpdates.length === 0) return;
-      const toSend = pendingUpdates;
-      pendingUpdates = [];
-
-      const merged = toSend.length === 1 ? toSend[0] : Y.mergeUpdates(toSend);
-      fetch(`${baseUrl}/${docId}/update`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          update: uint8ArrayToBase64(merged),
-          requestSource,
-        }),
-        ...(keepalive ? { keepalive: true } : {}),
-      }).catch(() => {});
-    };
-
-    // Expose flush to the poll loop via a ref so it can flush before each cycle.
-    // We store the flusher in a closure-captured variable; the poll effect
-    // below reads it through the shared `pendingFlushRef`.
-    (ydoc as any).__collabFlush = flushPendingUpdates;
-
-    const handler = (update: Uint8Array, origin: unknown) => {
-      if (origin === "remote") return;
-      pendingUpdates.push(update);
-      if (flushTimer) clearTimeout(flushTimer);
-      flushTimer = setTimeout(flushPendingUpdates, UPDATE_DEBOUNCE_MS);
-    };
-
-    const handlePageHide = () => {
-      flushPendingUpdates(true /* keepalive */);
-    };
-
-    ydoc.on("update", handler);
-    if (typeof window !== "undefined") {
-      window.addEventListener("pagehide", handlePageHide);
-    }
-
-    return () => {
-      ydoc.off("update", handler);
-      delete (ydoc as any).__collabFlush;
-      if (typeof window !== "undefined") {
-        window.removeEventListener("pagehide", handlePageHide);
-      }
-      // Flush any remaining updates on teardown
-      flushPendingUpdates(true);
-    };
-  }, [ydoc, docId, baseUrl, requestSource, docMissing]);
-
-  // Poll for remote doc updates + awareness sync, with SSE fast-path.
-  useEffect(() => {
-    if (!ydoc || !docId || docMissing) return;
-    // Non-null capture: null branch returned early above; async closures lose
-    // the narrowing on the outer ydoc variable.
-    const doc: Y.Doc = ydoc;
-
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    let consecutiveErrors = 0;
-    let pollCycleCount = 0;
-    // Track the last version we successfully polled. Used to detect ring-buffer
-    // overflow (version gap larger than the ring buffer).
-    let lastPolledVersion = pollVersionRef.current;
-
-    // SSE connection state. When SSE is healthy, poll interval is relaxed.
-    let sseActive = false;
-    let sseEventSource: EventSource | null = null;
-
-    // ── SSE fast-path ────────────────────────────────────────────────
-    // Wire into the framework /_agent-native/events SSE stream.
-    // Collab update events arrive push-style; we apply them immediately,
-    // avoiding ~2s polling latency for peer edits.
-    //
-    // NOTE: SSE events are subject to the same server-side access scoping as
-    // polling — the server only pushes events that canSeeChangeForUser allows.
-    // The server tags collab events with owner/orgId (security commit).
-    function initSSE() {
-      if (typeof EventSource === "undefined") return;
-      try {
-        const es = new EventSource(agentNativePath("/_agent-native/events"));
-        sseEventSource = es;
-
-        es.onopen = () => {
-          sseActive = true;
-          consecutiveErrors = 0;
-        };
-
-        es.onmessage = (ev) => {
-          try {
-            const change = JSON.parse(ev.data) as {
-              source?: string;
-              docId?: string;
-              update?: string;
-              requestSource?: string;
-              version?: number;
-            };
-
-            if (
-              change.source === "collab" &&
-              change.docId === docId &&
-              change.update
-            ) {
-              if (requestSource && change.requestSource === requestSource)
-                return;
-              try {
-                Y.applyUpdate(doc, base64ToUint8Array(change.update), "remote");
-              } catch {
-                // Malformed update — trigger state-vector fetch on next poll
-              }
-
-              if (change.requestSource === "agent") {
-                setAgentActive(true);
-                if (agentTimerRef.current) clearTimeout(agentTimerRef.current);
-                agentTimerRef.current = setTimeout(
-                  () => setAgentActive(false),
-                  3000,
-                );
-              }
-            }
-
-            // Keep pollVersionRef updated from SSE events so the poll loop
-            // starts from the right version when SSE drops.
-            if (typeof change.version === "number") {
-              pollVersionRef.current = Math.max(
-                pollVersionRef.current,
-                change.version,
-              );
-            }
-          } catch {
-            // Ignore malformed events
-          }
-        };
-
-        es.onerror = () => {
-          sseActive = false;
-          es.close();
-          sseEventSource = null;
-          // Retry SSE after a short delay
-          if (!stopped) {
-            setTimeout(initSSE, 5_000 + Math.random() * 5_000);
-          }
-        };
-      } catch {
-        // SSE not available (edge runtime, etc.) — fall back to polling only
-        sseActive = false;
-      }
-    }
-
-    // Only set up SSE in browser environments that support it.
-    if (typeof EventSource !== "undefined") {
-      initSSE();
-    }
-
-    // ── Poll loop ───────────────────────────────────────────────────
-    function getActivePollInterval(): number {
-      return sseActive ? pollIntervalWithSse : pollInterval;
-    }
-
-    function schedulePoll() {
-      if (stopped) return;
-      if (pauseWhenHidden && isDocumentHidden()) return;
-      timer = setTimeout(poll, getActivePollInterval());
-    }
-
-    async function fetchStateVector(): Promise<void> {
-      try {
-        const stateVector = uint8ArrayToBase64(Y.encodeStateVector(doc));
-        const stateRes = await fetch(
-          `${baseUrl}/${docId}/state?stateVector=${encodeURIComponent(stateVector)}`,
-        );
-        if (stateRes.ok) {
-          const stateData = (await stateRes.json().catch(() => null)) as {
-            state?: string;
-          } | null;
-          if (stateData?.state) {
-            const binary = base64ToUint8Array(stateData.state);
-            if (binary.length > 2) {
-              Y.applyUpdate(doc, binary, "remote");
-            }
-          }
-        }
-      } catch {
-        // Non-fatal; the next poll cycle will retry
-      }
-    }
-
-    async function poll() {
-      if (stopped) return;
-
-      // Flush any pending local updates before polling so the server has the
-      // latest state before we read remote changes.
-      const flush = (ydoc as any).__collabFlush as
-        | ((keepalive?: boolean) => void)
-        | undefined;
-      flush?.();
-
-      try {
-        const res = await fetch(
-          agentNativePath(
-            `/_agent-native/poll?since=${pollVersionRef.current}`,
-          ),
-        );
-        if (!res.ok) throw new Error("HTTP " + res.status);
-
-        const data = await res.json();
-        const { version, events } = data as {
-          version: number;
-          events: Array<{
-            source: string;
-            docId?: string;
-            update?: string;
-            requestSource?: string;
-          }>;
-        };
-
-        // Detect ring-buffer overflow: if the version jumped by more than the
-        // ring buffer size, some events were evicted and we need a state-vector
-        // fetch to reconcile the gap.
-        const versionGap = version - lastPolledVersion;
-        const hadGap = versionGap > POLL_RING_BUFFER_SIZE;
-
-        for (const evt of events) {
-          if (evt.source === "collab" && evt.docId === docId && evt.update) {
-            if (requestSource && evt.requestSource === requestSource) continue;
-            try {
-              Y.applyUpdate(doc, base64ToUint8Array(evt.update), "remote");
-            } catch {
-              // Failed to apply — fetch full state-vector below
-              await fetchStateVector();
-            }
-
-            if (evt.requestSource === "agent") {
-              setAgentActive(true);
-              if (agentTimerRef.current) clearTimeout(agentTimerRef.current);
-              agentTimerRef.current = setTimeout(
-                () => setAgentActive(false),
-                3000,
-              );
-            }
-          }
-        }
-
-        pollVersionRef.current = version;
-        lastPolledVersion = version;
-        pollCycleCount++;
-        consecutiveErrors = 0;
-
-        // Fetch state-vector only when needed:
-        //   1. Ring-buffer overflow detected (missed events).
-        //   2. Low-frequency safety net every STATE_VECTOR_FETCH_INTERVAL cycles.
-        //   3. NOT on every cycle (the previous behavior causing 3 requests/cycle).
-        const shouldFetchStateVector =
-          hadGap || pollCycleCount % STATE_VECTOR_FETCH_INTERVAL === 0;
-
-        if (shouldFetchStateVector) {
-          await fetchStateVector();
-        }
-
-        // Sync awareness (cursor positions)
-        if (awareness) {
-          const localState = awareness.getLocalState();
-          if (localState) {
-            try {
-              const awarenessRes = await fetch(
-                `${baseUrl}/${docId}/awareness`,
-                {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    clientId: doc.clientID,
-                    state: JSON.stringify(localState),
-                  }),
-                },
-              );
-              if (awarenessRes.ok) {
-                const awarenessData = await awarenessRes.json();
-                const remoteStates: RemoteAwarenessSnapshot[] = [];
-                for (const remote of awarenessData.states || []) {
-                  try {
-                    const remoteState = JSON.parse(remote.state);
-                    remoteStates.push({
-                      clientId: Number(remote.clientId),
-                      state: remoteState,
-                    });
-                  } catch {
-                    // Invalid state — skip
-                  }
-                }
-                const changes = reconcileRemoteAwarenessStates(
-                  awareness.getStates() as Map<number, unknown>,
-                  doc.clientID,
-                  remoteStates,
-                );
-                if (
-                  changes.added.length ||
-                  changes.updated.length ||
-                  changes.removed.length
-                ) {
-                  awareness.emit("change", [changes, "remote"]);
-                }
-              }
-            } catch {
-              // Awareness sync failure is non-fatal
-            }
-          }
-        }
-      } catch {
-        // Network error — exponential backoff
-        consecutiveErrors++;
-        const backoff = calcBackoff(consecutiveErrors);
-        if (!stopped) {
-          timer = setTimeout(poll, backoff);
-          return;
-        }
-      }
-
-      schedulePoll();
-    }
-
-    function pollNow() {
-      if (pauseWhenHidden && isDocumentHidden()) return;
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      void poll();
-    }
-
-    // Publish this tab's visibility to peers. A hidden tab pauses its poll, so
-    // we push the state immediately (keepalive) instead of waiting for the next
-    // cycle — otherwise peers keep treating a backgrounded tab as the visible
-    // lead and an agent edit never lands on the tab the user is actually viewing.
-    function publishVisibility(visible: boolean) {
-      if (!awareness) return;
-      awareness.setLocalStateField("visible", visible);
-      const localState = awareness.getLocalState();
-      if (!localState) return;
-      fetch(`${baseUrl}/${docId}/awareness`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          clientId: doc.clientID,
-          state: JSON.stringify(localState),
-        }),
-        keepalive: true,
-      }).catch(() => {});
-    }
-
-    function handleVisibilityChange() {
-      const visible = document.visibilityState === "visible";
-      publishVisibility(visible);
-      if (visible) {
-        // Also flush any pending updates when coming back into view
-        const flush = (ydoc as any).__collabFlush as
-          | ((keepalive?: boolean) => void)
-          | undefined;
-        flush?.();
-        pollNow();
-      } else if (pauseWhenHidden && timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    }
-
-    if (!pauseWhenHidden || !isDocumentHidden()) {
-      void poll();
-    }
-    window.addEventListener("focus", pollNow);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-
-    return () => {
-      stopped = true;
-      if (timer) clearTimeout(timer);
-      if (sseEventSource) {
-        sseEventSource.close();
-        sseEventSource = null;
-      }
-      window.removeEventListener("focus", pollNow);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-    };
-  }, [
-    ydoc,
-    awareness,
-    docId,
-    pollInterval,
-    pollIntervalWithSse,
-    pauseWhenHidden,
-    requestSource,
-    baseUrl,
-    docMissing,
-  ]);
-
-  // SSE fast-path for awareness: subscribe to the framework events stream and
-  // apply any awareness-change events immediately so peers receive cursor
-  // moves push-style without waiting for the next poll cycle.
-  // Polling fallback keeps working when SSE is unavailable.
-  useEffect(() => {
-    if (!ydoc || !docId || !awareness || typeof EventSource === "undefined") {
-      return;
-    }
-    // Non-null captures for closures: null branches returned early above.
-    const capturedYdoc = ydoc;
-    const capturedAwareness = awareness;
-    const sseUrl = agentNativePath("/_agent-native/events");
-    let source: EventSource | null = null;
-    let stopped = false;
-
-    function connect() {
-      if (stopped || source) return;
-      source = new EventSource(sseUrl);
-      source.onmessage = (msg) => {
-        if (stopped) return;
-        try {
-          const data = JSON.parse(msg.data as string) as {
-            source?: string;
-            type?: string;
-            docId?: string;
-            states?: Array<{ clientId: number; state: string }>;
-          };
-          if (
-            data.source !== "awareness" ||
-            data.type !== "awareness-change" ||
-            data.docId !== docId
-          ) {
-            return;
-          }
-          const remoteStates: RemoteAwarenessSnapshot[] = [];
-          for (const remote of data.states ?? []) {
-            try {
-              remoteStates.push({
-                clientId: Number(remote.clientId),
-                state: JSON.parse(remote.state),
-              });
-            } catch {
-              // Invalid state entry — skip
-            }
-          }
-          const changes = reconcileRemoteAwarenessStates(
-            capturedAwareness.getStates() as Map<number, unknown>,
-            capturedYdoc.clientID,
-            remoteStates,
-          );
-          if (
-            changes.added.length ||
-            changes.updated.length ||
-            changes.removed.length
-          ) {
-            capturedAwareness.emit("change", [changes, "remote"]);
-          }
-        } catch {
-          // Ignore malformed SSE frames; poll cycle is the safety net.
-        }
-      };
-      source.onerror = () => {
-        // On permanent close let go of the ref so re-focus can reconnect.
-        if (source && source.readyState === EventSource.CLOSED) {
-          source = null;
-        }
-      };
-    }
-
-    connect();
-
-    function onFocus() {
-      if (!source || source.readyState === EventSource.CLOSED) {
-        source?.close();
-        source = null;
-        connect();
-      }
-    }
-
-    window.addEventListener("focus", onFocus);
-    return () => {
-      stopped = true;
-      source?.close();
-      source = null;
-      window.removeEventListener("focus", onFocus);
-    };
-  }, [ydoc, docId, awareness]);
+    if (!conn || conn.detached || !resolvedUser) return;
+    conn.setUser(resolvedUser);
+  }, [conn, resolvedUser]);
 
   return {
-    ydoc,
-    awareness,
-    isLoading,
-    isSynced,
-    activeUsers,
-    agentActive,
-    agentPresent,
+    ydoc: conn && snapshot.initialization.status === "ready" ? conn.ydoc : null,
+    awareness:
+      conn && snapshot.initialization.status === "ready"
+        ? conn.awareness
+        : null,
+    isLoading: snapshot.isLoading,
+    isSynced: snapshot.isSynced,
+    initialization: snapshot.initialization,
+    retry: conn
+      ? () => {
+          if (conn.disposed) {
+            setGeneration((current) => current + 1);
+            return;
+          }
+          conn.retry();
+        }
+      : () => {},
+    requestSync: conn ? conn.requestSync : requestSyncUnavailable,
+    flushUpdates: conn ? conn.flushUpdates : flushUpdatesUnavailable,
+    activeUsers: snapshot.activeUsers,
+    agentActive: snapshot.agentActive,
+    agentPresent: snapshot.agentPresent,
   };
 }

@@ -1,11 +1,5 @@
 import { test, expect, type Page, type APIResponse } from "@playwright/test";
 
-/*
- * QUESTION FORM RENDERING — plan editor should show the respondent-facing
- * question UI in the document. The schema/config form is still available from
- * the corner edit button, but it must not replace the block body inline.
- */
-
 const CREATE_ACTION = "/_agent-native/actions/create-visual-plan";
 
 type PlanBlock = {
@@ -157,12 +151,10 @@ test.describe("question blocks render answer UI in the plan editor", () => {
         node.getByRole("button", { name: "Send to agent" }),
       ).toBeVisible();
 
-      // The inline body must not be the admin/config editor.
       await expect(node.getByText("SUBMIT BUTTON")).toHaveCount(0);
       await expect(node.getByText("QUESTION 1")).toHaveCount(0);
       await expect(node.getByText("MODE")).toHaveCount(0);
 
-      // The config editor still exists, but only behind the explicit panel.
       await node.hover();
       await node
         .getByRole("button", {
@@ -178,4 +170,64 @@ test.describe("question blocks render answer UI in the plan editor", () => {
       await expect(popover.getByText("Mode")).toBeVisible();
     });
   }
+
+  test("copying a question prompt collapses the answered form and allows reopening", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: {
+          writeText: async (text: string) => {
+            (
+              globalThis as typeof globalThis & {
+                __copiedQuestionPrompt?: string;
+              }
+            ).__copiedQuestionPrompt = text;
+          },
+        },
+      });
+    });
+
+    const { blockId, content } = questionContent("question-form");
+    const planId = await createPlanFixture(page, content);
+    await openPlanForEditing(page, planId);
+
+    const node = blockNode(page, blockId);
+    await expect(node).toBeVisible({ timeout: 20_000 });
+    await node.getByRole("button", { name: /Tables/ }).click();
+    await expect(node.getByText("1/1 answered")).toBeVisible();
+
+    await node.getByRole("button", { name: "Send to agent" }).click();
+    const menu = page.locator(".an-block-menu-popover").last();
+    await expect(menu).toBeVisible({ timeout: 10_000 });
+    await menu.getByRole("button", { name: /Copy for your agent/ }).click();
+
+    await expect(node.getByText("Answers copied for your agent")).toBeVisible();
+    await expect(node.getByText("1/1 answered")).toBeVisible();
+    await expect(
+      node.getByText(
+        "Which inline/container editing surface should get the next polish pass?",
+      ),
+    ).toHaveCount(0);
+
+    const copied = await page.evaluate(
+      () =>
+        (
+          globalThis as typeof globalThis & {
+            __copiedQuestionPrompt?: string;
+          }
+        ).__copiedQuestionPrompt ?? "",
+    );
+    expect(copied).toContain("Tables");
+    expect(copied).toContain("Question block:");
+
+    await node.getByRole("button", { name: "Edit answers" }).click();
+    await expect(
+      node.getByText(
+        "Which inline/container editing surface should get the next polish pass?",
+      ),
+    ).toBeVisible();
+    await expect(node.getByText("1/1 answered")).toBeVisible();
+  });
 });

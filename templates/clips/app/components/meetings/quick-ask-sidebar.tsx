@@ -1,32 +1,28 @@
-/**
- * Cmd+J "Ask about this meeting" sidebar.
- *
- * Granola's signature pattern (from `granola-ux.md` §6):
- *
- *   "During recording, empty state on right pane: literally blank — the point
- *    is to NOT fill the canvas with AI noise mid-meeting. Mid-meeting AI is
- *    accessed only via Cmd+J chat sidebar."
- *
- * Implementation:
- *   - 320px slide-in panel on the right (shadcn `Sheet`).
- *   - Header + 3 quick-prompt buttons + free-form composer.
- *   - All AI work delegates to the agent chat via `sendToAgentChat` (per the
- *     `delegate-to-agent` skill). Never inline LLM calls.
- *   - The keyboard handler is mounted ONCE per page-mount (single
- *     `keydown` listener with cleanup) so toggling open/close doesn't leak
- *     listeners. Esc and Cmd+J both close the sheet.
- */
-
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  sendToAgentChat,
+  useAgentEngineConfigured,
+  useChatModels,
+} from "@agent-native/core/client/agent-chat";
+import { useT } from "@agent-native/core/client/i18n";
+import { BuilderSetupCard } from "@agent-native/toolkit/app/chat/chat/run-recovery";
+import { isLocalRuntimeEngine } from "@agent-native/toolkit/composer";
 import {
   IconCommand,
   IconNotes,
   IconSend,
   IconWand,
 } from "@tabler/icons-react";
-import { sendToAgentChat } from "@agent-native/core/client";
+import { useCallback, useEffect, useRef, useState } from "react";
+
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import {
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+} from "@/components/ui/empty";
+import { Kbd } from "@/components/ui/kbd";
 import {
   Sheet,
   SheetContent,
@@ -36,16 +32,26 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 
-const QUICK_PROMPTS: Array<{ label: string; prompt: string }> = [
-  { label: "What did I miss?", prompt: "What did I miss?" },
+const QUICK_PROMPTS: Array<{ labelKey: string; promptKey: string }> = [
   {
-    label: "Summarize the last 5 minutes",
-    prompt: "Summarize the last 5 minutes of this meeting in 3-5 bullets.",
+    labelKey: "quickAsk.whatDidIMiss",
+    promptKey: "quickAsk.whatDidIMissPrompt",
   },
   {
-    label: "Action items for me",
-    prompt:
-      "List the action items from this meeting that are assigned to me. Use checkbox bullets.",
+    labelKey: "quickAsk.suggestQuestions",
+    promptKey: "quickAsk.suggestQuestionsPrompt",
+  },
+  {
+    labelKey: "quickAsk.summarizeLastFive",
+    promptKey: "quickAsk.summarizeLastFivePrompt",
+  },
+  {
+    labelKey: "quickAsk.makeMeSoundSmart",
+    promptKey: "quickAsk.makeMeSoundSmartPrompt",
+  },
+  {
+    labelKey: "quickAsk.actionItemsForMe",
+    promptKey: "quickAsk.actionItemsForMePrompt",
   },
 ];
 
@@ -69,25 +75,23 @@ interface QuickAskSidebarProps {
   segments?: TranscriptSegment[] | null;
 }
 
-/**
- * Mounts the Cmd+J keybinding on the meeting detail page. The toggle is
- * idempotent: pressing Cmd+J while open closes the sheet (and vice versa).
- *
- * IMPORTANT: we register exactly one keydown handler. The `useEffect` cleanup
- * unsubscribes — so route changes / unmounts never leave a stale listener.
- */
 export function QuickAskSidebar({
   meetingId,
   meetingTitle,
   segments,
 }: QuickAskSidebarProps) {
+  const t = useT();
+  const models = useChatModels({ enabled: false });
+  const checkProviderStatus = !isLocalRuntimeEngine(models.selectedEngine);
+  const providerStatus = useAgentEngineConfigured(checkProviderStatus);
+  const readiness = checkProviderStatus ? providerStatus.state : "configured";
+  const chatReady = readiness === "configured";
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState("");
   const [history, setHistory] = useState<ChatTurn[]>([]);
+  const [pendingAsk, setPendingAsk] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Single global keydown listener; toggles on Cmd/Ctrl+J. Esc is handled
-  // natively by `Sheet` (Radix Dialog).
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const cmdOrCtrl = e.metaKey || e.ctrlKey;
@@ -100,7 +104,22 @@ export function QuickAskSidebar({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  // Focus the composer whenever the sheet opens.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const askParam = params.get("ask")?.trim();
+    if (params.get("chat") !== "1" && !askParam) return;
+    setOpen(true);
+    if (askParam) setPendingAsk(askParam);
+    params.delete("chat");
+    params.delete("ask");
+    const nextQuery = params.toString();
+    window.history.replaceState(
+      window.history.state,
+      "",
+      `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ""}${window.location.hash}`,
+    );
+  }, []);
+
   useEffect(() => {
     if (open) {
       const t = setTimeout(() => textareaRef.current?.focus(), 60);
@@ -111,9 +130,7 @@ export function QuickAskSidebar({
   const send = useCallback(
     (prompt: string) => {
       const trimmed = prompt.trim();
-      if (!trimmed) return;
-      // Build a compact context object: meeting id + last 200 segments.
-      // Agent chat is the single source of truth — no inline LLM calls.
+      if (!trimmed || !chatReady) return;
       const tail = (segments ?? []).slice(-200);
       const turn: ChatTurn = {
         id: `t_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -134,19 +151,33 @@ export function QuickAskSidebar({
         openSidebar: false,
         background: false,
       });
-      // Optimistic placeholder so the user sees we received the prompt.
       setHistory((prev) => [
         ...prev,
         {
           id: `${turn.id}-ack`,
           role: "system",
-          text: "Sent to chat — see the agent sidebar for the reply.",
+          text: t("quickAsk.sentToChat"),
           ts: Date.now(),
         },
       ]);
     },
-    [meetingId, meetingTitle, segments],
+    [chatReady, meetingId, meetingTitle, segments, t],
   );
+
+  useEffect(() => {
+    if (!pendingAsk) return;
+    if (readiness === "unknown" || readiness === "unavailable") return;
+    setPendingAsk(null);
+    if (readiness === "missing") {
+      setDraft((previous) => previous || pendingAsk);
+      return;
+    }
+    send(pendingAsk);
+  }, [pendingAsk, readiness, send]);
+
+  const retryProviderStatus = () => {
+    window.dispatchEvent(new Event("agent-engine:configured-changed"));
+  };
 
   return (
     <Sheet open={open} onOpenChange={setOpen}>
@@ -157,30 +188,50 @@ export function QuickAskSidebar({
         <SheetHeader className="px-4 py-3 border-b border-border">
           <SheetTitle className="flex items-center gap-2 text-sm font-semibold">
             <IconWand className="h-4 w-4 text-primary" />
-            Ask about this meeting
+            {t("quickAsk.title")}
           </SheetTitle>
           <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-            <kbd className="inline-flex items-center gap-0.5 rounded border border-border bg-muted/50 px-1 py-px font-mono">
+            <Kbd className="h-auto min-w-0 gap-0.5 rounded border border-border bg-muted/50 px-1 py-px font-mono">
               <IconCommand className="h-3 w-3" />J
-            </kbd>
-            <span>to toggle · Esc to close</span>
+            </Kbd>
+            <span>{t("quickAsk.toggleHint")}</span>
           </div>
         </SheetHeader>
 
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {readiness === "missing" ? (
+            <BuilderSetupCard layout="sidebar" />
+          ) : readiness === "unavailable" ? (
+            <div
+              className="flex items-center justify-between gap-3 rounded-md border border-border bg-muted/50 px-3 py-2 text-sm text-muted-foreground"
+              role="status"
+            >
+              <span>{t("agentChat.setup.providerStatusUnavailable")}</span>
+              {readiness === "unavailable" ? (
+                <button
+                  type="button"
+                  className="shrink-0 font-medium text-foreground underline-offset-4 hover:underline"
+                  onClick={retryProviderStatus}
+                >
+                  {t("agentChat.common.retry")}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
           <div className="space-y-1.5">
             <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-              Quick prompts
+              {t("quickAsk.quickPrompts")}
             </p>
             <div className="flex flex-col gap-1.5">
               {QUICK_PROMPTS.map((q) => (
                 <button
-                  key={q.label}
+                  key={q.labelKey}
                   type="button"
-                  onClick={() => send(q.prompt)}
-                  className="text-left text-xs rounded-md border border-border bg-background px-2.5 py-2 hover:bg-accent/40 cursor-pointer"
+                  onClick={() => send(t(q.promptKey))}
+                  disabled={!chatReady}
+                  className="text-start text-xs rounded-md border border-border bg-background px-2.5 py-2 hover:bg-accent/40 cursor-pointer"
                 >
-                  {q.label}
+                  {t(q.labelKey)}
                 </button>
               ))}
             </div>
@@ -189,7 +240,7 @@ export function QuickAskSidebar({
           {history.length > 0 && (
             <div className="space-y-2">
               <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                History
+                {t("quickAsk.history")}
               </p>
               <div className="space-y-2">
                 {history.map((t) => (
@@ -210,13 +261,16 @@ export function QuickAskSidebar({
           )}
 
           {history.length === 0 && (
-            <div className="flex flex-col items-center justify-center text-center gap-2 py-6 text-muted-foreground">
-              <IconNotes className="h-5 w-5" />
-              <p className="text-xs">
-                Ask anything. The agent has the full transcript and meeting
-                context.
-              </p>
-            </div>
+            <Empty className="flex-none gap-2 rounded-none py-6 md:p-6">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <IconNotes />
+                </EmptyMedia>
+                <EmptyDescription className="text-xs">
+                  {t("quickAsk.emptyDescription")}
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
           )}
         </div>
 
@@ -231,8 +285,9 @@ export function QuickAskSidebar({
             ref={textareaRef}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            placeholder="Ask anything…"
+            placeholder={t("quickAsk.placeholder")}
             className="min-h-[44px] max-h-32 resize-none text-sm"
+            disabled={!chatReady && readiness !== "unknown"}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
@@ -243,11 +298,11 @@ export function QuickAskSidebar({
           <Button
             type="submit"
             size="icon"
-            disabled={!draft.trim()}
-            className="cursor-pointer h-9 w-9 shrink-0"
-            aria-label="Send"
+            disabled={!draft.trim() || !chatReady}
+            className="cursor-pointer shrink-0"
+            aria-label={t("quickAsk.send")}
           >
-            <IconSend className="h-4 w-4" />
+            <IconSend className="h-4 w-4 rtl:-scale-x-100" />
           </Button>
         </form>
       </SheetContent>

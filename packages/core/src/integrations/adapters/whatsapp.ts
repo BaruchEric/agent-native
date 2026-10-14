@@ -1,20 +1,25 @@
 import type { H3Event } from "h3";
-import { getQuery, getHeader, readRawBody as h3ReadRawBody } from "h3";
+import {
+  getMethod,
+  getQuery,
+  getHeader,
+  readRawBody as h3ReadRawBody,
+} from "h3";
+
+import { getAppConfig } from "../../app-config/index.js";
+import type { EnvKeyConfig } from "../../server/create-server.js";
+import { resolveSecret } from "../../server/credential-provider.js";
 import type {
   PlatformAdapter,
   IncomingMessage,
   OutgoingMessage,
   IntegrationStatus,
+  PlatformDeliveryReceipt,
 } from "../types.js";
-import type { EnvKeyConfig } from "../../server/create-server.js";
 
-/** WhatsApp's max message length */
 const WHATSAPP_MAX_LENGTH = 4096;
+const WHATSAPP_GRAPH_API_VERSION = "v25.0";
 
-/**
- * One-shot warning flag — log once per process when accepting unverified
- * webhooks (M6 in the webhook security audit).
- */
 let _whatsappUnverifiedWarned = false;
 
 /**
@@ -24,25 +29,22 @@ let _whatsappUnverifiedWarned = false;
  * be verified (C2 in the webhook security audit).
  */
 function shouldRefuseWhenSecretMissing(): boolean {
-  if (process.env.AGENT_NATIVE_ALLOW_UNVERIFIED_WEBHOOKS === "1") return false;
+  if (getAppConfig().integrations.allowUnverifiedWebhooks) return false;
   return process.env.NODE_ENV === "production";
 }
 
-/**
- * Create a WhatsApp Cloud API platform adapter.
- *
- * Required env vars:
- * - WHATSAPP_ACCESS_TOKEN — Permanent access token from Meta
- * - WHATSAPP_VERIFY_TOKEN — Custom token for webhook verification
- * - WHATSAPP_PHONE_NUMBER_ID — Phone number ID from Meta dashboard
- *
- * Optional env vars:
- * - WHATSAPP_APP_SECRET — App secret for signature verification
- */
 export function whatsappAdapter(): PlatformAdapter {
   return {
     platform: "whatsapp",
     label: "WhatsApp",
+    capabilities: {
+      replyText: true,
+      proactiveMessages: false,
+      nativeThreads: false,
+      contextualReplies: true,
+      deferredWebhookResponse: false,
+      interactionOnly: false,
+    },
 
     getRequiredEnvKeys(): EnvKeyConfig[] {
       return [
@@ -70,9 +72,9 @@ export function whatsappAdapter(): PlatformAdapter {
         {
           key: "WHATSAPP_APP_SECRET",
           label: "WhatsApp App Secret",
-          required: false,
+          required: true,
           helpText:
-            "Optional. From Meta App Dashboard → Basic Settings → App Secret. Enables HMAC signature verification on inbound webhooks.",
+            "From Meta App Dashboard → Basic Settings → App Secret. Used for HMAC verification on every inbound webhook.",
         },
       ];
     },
@@ -80,7 +82,7 @@ export function whatsappAdapter(): PlatformAdapter {
     async handleVerification(
       event: H3Event,
     ): Promise<{ handled: boolean; response?: unknown }> {
-      const method = event.node?.req?.method || "POST";
+      const method = getMethod(event);
 
       // For POST flows, pre-cache the raw body so verifyWebhook (HMAC) and
       // parseIncomingMessage don't both try to consume the request body
@@ -97,12 +99,11 @@ export function whatsappAdapter(): PlatformAdapter {
         return { handled: false };
       }
 
-      // GET: WhatsApp's challenge handshake.
       const query = getQuery(event);
       const mode = query["hub.mode"];
       const token = query["hub.verify_token"];
       const challenge = query["hub.challenge"];
-      const expected = process.env.WHATSAPP_VERIFY_TOKEN;
+      const expected = await resolveSecret("WHATSAPP_VERIFY_TOKEN");
 
       if (mode === "subscribe" && expected && typeof token === "string") {
         // Timing-safe compare so an attacker can't measure character-wise
@@ -125,7 +126,7 @@ export function whatsappAdapter(): PlatformAdapter {
     },
 
     async verifyWebhook(event: H3Event): Promise<boolean> {
-      const appSecret = process.env.WHATSAPP_APP_SECRET;
+      const appSecret = await resolveSecret("WHATSAPP_APP_SECRET");
       if (!appSecret) {
         if (shouldRefuseWhenSecretMissing()) {
           if (!_whatsappUnverifiedWarned) {
@@ -144,7 +145,7 @@ export function whatsappAdapter(): PlatformAdapter {
           );
         }
         // Dev mode: still require the access token to be configured at all.
-        return !!process.env.WHATSAPP_ACCESS_TOKEN;
+        return !!(await resolveSecret("WHATSAPP_ACCESS_TOKEN"));
       }
 
       const signature = getHeader(event, "x-hub-signature-256");
@@ -169,9 +170,6 @@ export function whatsappAdapter(): PlatformAdapter {
     async parseIncomingMessage(
       event: H3Event,
     ): Promise<IncomingMessage | null> {
-      // Always read via the cached raw body so HMAC and parse see identical
-      // bytes — h3 v2's body stream is consume-once, and re-stringifying a
-      // parsed body breaks Meta's signature check (M2/M3 in the audit).
       const raw = await readRawBody(event);
       if (!raw) return null;
       let body: any;
@@ -182,7 +180,6 @@ export function whatsappAdapter(): PlatformAdapter {
       }
       if (!body) return null;
 
-      // WhatsApp Cloud API webhook payload structure
       const entry = body.entry?.[0];
       if (!entry) return null;
 
@@ -193,22 +190,24 @@ export function whatsappAdapter(): PlatformAdapter {
       const message = value?.messages?.[0];
       if (!message) return null;
 
-      // Only handle text messages
       if (message.type !== "text") return null;
       const text = message.text?.body?.trim();
       if (!text) return null;
 
       const contact = value.contacts?.[0];
-      const from = message.from; // Phone number
+      const from = message.from;
+      const phoneNumberId = value.metadata?.phone_number_id;
+      if (!from || !phoneNumberId || !message.id) return null;
 
       return {
         platform: "whatsapp",
-        externalThreadId: from,
+        externalThreadId: `phone:${String(phoneNumberId)}:user:${String(from)}`,
         text,
         senderName: contact?.profile?.name,
         senderId: from,
+        replyRef: String(message.id),
         platformContext: {
-          phoneNumberId: value.metadata?.phone_number_id,
+          phoneNumberId,
           displayPhoneNumber: value.metadata?.display_phone_number,
           messageId: message.id,
           from,
@@ -218,12 +217,19 @@ export function whatsappAdapter(): PlatformAdapter {
       };
     },
 
+    getLegacyExternalThreadIds(incoming: IncomingMessage): string[] {
+      const from = incoming.platformContext.from ?? incoming.senderId;
+      return typeof from === "string" || typeof from === "number"
+        ? [String(from)]
+        : [];
+    },
+
     async sendResponse(
       message: OutgoingMessage,
       context: IncomingMessage,
-    ): Promise<void> {
-      const accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
-      const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+    ): Promise<void | PlatformDeliveryReceipt> {
+      const accessToken = await resolveSecret("WHATSAPP_ACCESS_TOKEN");
+      const phoneNumberId = await resolveSecret("WHATSAPP_PHONE_NUMBER_ID");
       if (!accessToken || !phoneNumberId) {
         console.error(
           "[whatsapp] WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID not configured",
@@ -234,33 +240,40 @@ export function whatsappAdapter(): PlatformAdapter {
       const to = context.senderId;
       const chunks = splitMessage(message.text, WHATSAPP_MAX_LENGTH);
 
-      for (const chunk of chunks) {
+      for (const [index, chunk] of chunks.entries()) {
         try {
+          const body: Record<string, unknown> = {
+            messaging_product: "whatsapp",
+            recipient_type: "individual",
+            to,
+            type: "text",
+            text: { body: chunk },
+          };
+          if (index === 0 && context.replyRef) {
+            body.context = { message_id: context.replyRef };
+          }
           const res = await fetch(
-            `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`,
+            `https://graph.facebook.com/${WHATSAPP_GRAPH_API_VERSION}/${phoneNumberId}/messages`,
             {
               method: "POST",
               headers: {
                 Authorization: `Bearer ${accessToken}`,
                 "Content-Type": "application/json",
               },
-              body: JSON.stringify({
-                messaging_product: "whatsapp",
-                recipient_type: "individual",
-                to,
-                type: "text",
-                text: { body: chunk },
-              }),
+              body: JSON.stringify(body),
             },
           );
           if (!res.ok) {
             const data = await res.json().catch(() => ({}));
             console.error("[whatsapp] sendMessage error:", data);
+            throw new Error(`WhatsApp sendMessage failed (HTTP ${res.status})`);
           }
         } catch (err) {
           console.error("[whatsapp] Failed to send message:", err);
+          throw err;
         }
       }
+      return { status: "delivered" };
     },
 
     formatAgentResponse(text: string): OutgoingMessage {
@@ -268,10 +281,14 @@ export function whatsappAdapter(): PlatformAdapter {
     },
 
     async getStatus(_baseUrl?: string): Promise<IntegrationStatus> {
-      const hasAccessToken = !!process.env.WHATSAPP_ACCESS_TOKEN;
-      const hasVerifyToken = !!process.env.WHATSAPP_VERIFY_TOKEN;
-      const hasPhoneNumberId = !!process.env.WHATSAPP_PHONE_NUMBER_ID;
-      const configured = hasAccessToken && hasVerifyToken && hasPhoneNumberId;
+      const hasAccessToken = !!(await resolveSecret("WHATSAPP_ACCESS_TOKEN"));
+      const hasVerifyToken = !!(await resolveSecret("WHATSAPP_VERIFY_TOKEN"));
+      const hasPhoneNumberId = !!(await resolveSecret(
+        "WHATSAPP_PHONE_NUMBER_ID",
+      ));
+      const hasAppSecret = !!(await resolveSecret("WHATSAPP_APP_SECRET"));
+      const configured =
+        hasAccessToken && hasVerifyToken && hasPhoneNumberId && hasAppSecret;
 
       return {
         platform: "whatsapp",
@@ -282,9 +299,10 @@ export function whatsappAdapter(): PlatformAdapter {
           hasAccessToken,
           hasVerifyToken,
           hasPhoneNumberId,
+          hasAppSecret,
         },
         error: !configured
-          ? "Set WHATSAPP_ACCESS_TOKEN, WHATSAPP_VERIFY_TOKEN, and WHATSAPP_PHONE_NUMBER_ID"
+          ? "Save WHATSAPP_ACCESS_TOKEN, WHATSAPP_VERIFY_TOKEN, WHATSAPP_PHONE_NUMBER_ID, and WHATSAPP_APP_SECRET in settings"
           : undefined,
       };
     },

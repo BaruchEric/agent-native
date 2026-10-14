@@ -1,10 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-// Mocked building blocks. getRun is the synchronous in-memory lookup;
-// getRunById is the SQL fallback; getThread resolves owner from thread_id.
 const getRun = vi.fn();
 const getRunById = vi.fn();
 const getThread = vi.fn();
+const hasThreadAccess = vi.fn();
 
 vi.mock("./run-manager.js", () => ({ getRun: (...a: any[]) => getRun(...a) }));
 vi.mock("./run-store.js", () => ({
@@ -12,12 +11,15 @@ vi.mock("./run-store.js", () => ({
 }));
 vi.mock("../chat-threads/store.js", () => ({
   getThread: (...a: any[]) => getThread(...a),
+  hasThreadAccess: (...a: any[]) => hasThreadAccess(...a),
 }));
 
 import {
   resolveRunThreadId,
   callerOwnsThread,
   callerOwnsRun,
+  callerHasThreadAccess,
+  callerHasRunAccess,
 } from "./run-ownership.js";
 
 afterEach(() => {
@@ -93,6 +95,32 @@ describe("run-ownership", () => {
       getRunById.mockResolvedValue({ threadId: "t-sql" });
       getThread.mockResolvedValue({ ownerEmail: "a@x.com" });
       expect(await callerOwnsRun("a@x.com", "r1")).toBe(true);
+    });
+  });
+
+  describe("callerHasThreadAccess", () => {
+    it("true when the caller has the requested shared role", async () => {
+      hasThreadAccess.mockResolvedValue(true);
+      expect(await callerHasThreadAccess("b@x.com", "t1", "editor")).toBe(true);
+      expect(hasThreadAccess).toHaveBeenCalledWith(
+        "b@x.com",
+        "t1",
+        "editor",
+        {},
+      );
+    });
+
+    it("false when the caller lacks shared access", async () => {
+      hasThreadAccess.mockResolvedValue(false);
+      expect(await callerHasThreadAccess("b@x.com", "t1")).toBe(false);
+    });
+  });
+
+  describe("callerHasRunAccess", () => {
+    it("checks shared access on the run's thread", async () => {
+      getRun.mockReturnValue({ threadId: "t1" });
+      hasThreadAccess.mockResolvedValue(true);
+      expect(await callerHasRunAccess("b@x.com", "r1", "viewer")).toBe(true);
     });
   });
 });

@@ -1,6 +1,6 @@
-import type { A2AConfig, AgentCard } from "./types.js";
 import { withConfiguredAppBasePath } from "../server/app-base-path.js";
 import { shouldAdvertiseJwtA2AAuth } from "./auth-policy.js";
+import type { A2AConfig, AgentCard } from "./types.js";
 
 export function generateAgentCard(
   config: A2AConfig,
@@ -19,6 +19,7 @@ export function generateAgentCard(
       streaming: config.streaming ?? false,
       pushNotifications: false,
       stateTransitionHistory: true,
+      ...(config.connect ? { connect: true } : {}),
     },
     skills: config.skills,
   };

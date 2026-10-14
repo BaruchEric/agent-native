@@ -1,21 +1,39 @@
-import { useParams, Navigate, useSearchParams } from "react-router";
+import { callActionWithRetry } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { normalizeDocumentTitle } from "@agent-native/core/shared";
 import { useEffect, useState } from "react";
+import { useParams, Navigate, useSearchParams } from "react-router";
+
+import PresentationView from "@/components/presentation/PresentationView";
+import PresenterView from "@/components/presentation/PresenterView";
 import { useDecks } from "@/context/DeckContext";
 import type { Deck } from "@/context/DeckContext";
-import PresentationView from "@/components/presentation/PresentationView";
-import { callAction } from "@agent-native/core/client";
+import { useDeckDesignSystem } from "@/hooks/use-deck-design-system";
 
 export default function Presentation() {
   const { id } = useParams<{ id: string }>();
+  const t = useT();
   const { getDeck, loading } = useDecks();
   const [fallbackDeck, setFallbackDeck] = useState<Deck | null>(null);
   const [fallbackState, setFallbackState] = useState<
-    "idle" | "loading" | "missing"
+    "idle" | "loading" | "missing" | "failed"
   >("idle");
+  const [reloadKey, setReloadKey] = useState(0);
 
   const [searchParams] = useSearchParams();
   const contextDeck = getDeck(id || "");
   const deck = contextDeck ?? fallbackDeck;
+  const { designSystem } = useDeckDesignSystem(deck?.designSystemId);
+
+  useEffect(() => {
+    if (!deck) return;
+    const nextTitle = `${normalizeDocumentTitle(deck.title, "Presentation")} — Slides`;
+    const previousTitle = document.title;
+    document.title = nextTitle;
+    return () => {
+      if (document.title === nextTitle) document.title = previousTitle;
+    };
+  }, [deck]);
 
   useEffect(() => {
     if (!id || loading || contextDeck) {
@@ -28,26 +46,50 @@ export default function Presentation() {
 
     let cancelled = false;
     setFallbackState("loading");
-    callAction<Deck>("get-deck", { id }, { method: "GET" })
+    callActionWithRetry<Deck>("get-deck", { id }, { method: "GET" })
       .then((data) => {
         if (!cancelled) {
           setFallbackDeck(data);
           setFallbackState("idle");
         }
       })
-      .catch(() => {
-        if (!cancelled) setFallbackState("missing");
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        const status = (err as { status?: number } | undefined)?.status;
+        setFallbackState(status === 404 ? "missing" : "failed");
       });
 
     return () => {
       cancelled = true;
     };
-  }, [contextDeck, id, loading]);
+  }, [contextDeck, id, loading, reloadKey]);
 
-  if (loading || fallbackState === "loading") {
+  if (!id) return <Navigate to="/" replace />;
+  if (!deck && fallbackState === "failed") {
+    const viewport =
+      "flex h-screen flex-col items-center justify-center gap-4 bg-black text-white"; // guard:allow-raw-color — deliberate presentation surface
+    const retry =
+      "cursor-pointer rounded-md border border-white/30 px-4 py-2 text-sm hover:bg-white/10"; // guard:allow-raw-color — reads on that surface
+    return (
+      <div className={viewport}>
+        <p className="text-sm opacity-80">{t("presentation.loadFailed")}</p>
+        <button
+          type="button"
+          className={retry}
+          onClick={() => {
+            setFallbackState("loading");
+            setReloadKey((key) => key + 1);
+          }}
+        >
+          {t("presentation.tryAgain")}
+        </button>
+      </div>
+    );
+  }
+  if (!deck && fallbackState !== "missing") {
     return <div className="h-screen bg-black" />;
   }
-  if (!deck || !id || fallbackState === "missing") {
+  if (!deck) {
     return <Navigate to="/" replace />;
   }
 
@@ -57,12 +99,16 @@ export default function Presentation() {
     ? Math.max(0, parsedSlide - 1)
     : 0;
 
+  const View =
+    searchParams.get("presenter") === "1" ? PresenterView : PresentationView;
+
   return (
-    <PresentationView
+    <View
       slides={Array.isArray(deck.slides) ? deck.slides : []}
       deckId={id}
       startIndex={startSlide}
       aspectRatio={deck.aspectRatio}
+      designSystem={designSystem}
     />
   );
 }

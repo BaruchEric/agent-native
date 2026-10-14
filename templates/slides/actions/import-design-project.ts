@@ -1,7 +1,8 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
+import { defineAction } from "@agent-native/core/action";
 import { resolveAccess, assertAccess } from "@agent-native/core/sharing";
-import "../server/db/index.js"; // ensure registerShareableResource runs
+import { z } from "zod";
+
+import "../server/db/index.js";
 
 export default defineAction({
   description:

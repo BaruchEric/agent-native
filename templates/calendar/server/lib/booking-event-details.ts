@@ -1,5 +1,11 @@
 function stripCrlf(value: unknown): string {
-  return String(value ?? "")
+  return (
+    typeof value === "string"
+      ? value
+      : value == null
+        ? ""
+        : JSON.stringify(value)
+  )
     .replace(/[\r\n]+/g, " ")
     .trim();
 }
@@ -58,25 +64,39 @@ export function buildBookingEventTitle({
 }
 
 export function buildBookingEventAttendees({
+  organizerEmail,
   attendeeEmail,
   attendeeName,
   hostEmails = [],
+  additionalGuestEmails = [],
 }: {
+  organizerEmail: string;
   attendeeEmail: string;
   attendeeName: string;
   hostEmails?: string[];
+  additionalGuestEmails?: string[];
 }) {
+  const organizer = stripCrlf(organizerEmail).toLowerCase();
   const attendee = stripCrlf(attendeeEmail).toLowerCase();
+  const guests = uniqueEmails([
+    attendee,
+    ...additionalGuestEmails,
+    ...hostEmails,
+  ])
+    .filter((email) => email !== organizer)
+    .map((email) => ({
+      email,
+      displayName:
+        email === attendee ? attendeeName : displayNameFromEmail(email),
+    }));
+
   return [
     {
-      email: attendee,
-      displayName: attendeeName,
+      email: organizer,
+      organizer: true,
+      self: true,
+      responseStatus: "accepted" as const,
     },
-    ...uniqueEmails(hostEmails)
-      .filter((email) => email !== attendee)
-      .map((email) => ({
-        email,
-        displayName: displayNameFromEmail(email),
-      })),
+    ...guests,
   ];
 }

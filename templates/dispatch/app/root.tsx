@@ -1,30 +1,45 @@
 import {
+  configureTracking,
+  trackEvent,
+} from "@agent-native/core/client/analytics";
+import { appPath } from "@agent-native/core/client/api-path";
+import {
+  createAgentNativeQueryClient,
+  getBrowserTabId,
+  useDbSync,
+} from "@agent-native/core/client/hooks";
+import { getLocaleInitScript, useT } from "@agent-native/core/client/i18n";
+import { getThemeInitScript } from "@agent-native/core/client/ui";
+import {
+  Layout as AppLayout,
+  RequireDispatchAccess,
+} from "@agent-native/dispatch/components";
+import { AppProviders } from "@agent-native/toolkit/app/providers";
+import { useCommandMenuShortcut } from "@agent-native/toolkit/app/shared";
+import { CommandMenu } from "@agent-native/toolkit/app/shared";
+import { IconHierarchy2, IconSun, IconMoon } from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useTheme } from "next-themes";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
   Links,
   Meta,
   Outlet,
   Scripts,
   ScrollRestoration,
+  useLocation,
   useNavigate,
 } from "react-router";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useNavigationState } from "@/hooks/use-navigation-state";
-import { Toaster } from "sonner";
-import {
-  AppProviders,
-  CommandMenu,
-  configureTracking,
-  createAgentNativeQueryClient,
-  getThemeInitScript,
-  useCommandMenuShortcut,
-  useDbSync,
-  appPath,
-} from "@agent-native/core/client";
-import { useQueryClient } from "@tanstack/react-query";
-import { IconSun, IconMoon } from "@tabler/icons-react";
-import { useTheme } from "next-themes";
-import { Layout as AppLayout } from "@agent-native/dispatch/components";
 import type { LinksFunction } from "react-router";
+import { Toaster } from "sonner";
+
+import { AppToolkitProvider } from "@/components/ui/toolkit-provider";
+import { useNavigationState } from "@/hooks/use-navigation-state";
+
+import changelog from "../CHANGELOG.md?raw";
 import { dispatchExtensions } from "./dispatch-extensions";
+import { i18nCatalog } from "./i18n";
+
 import stylesheet from "./global.css?url";
 
 configureTracking({
@@ -39,6 +54,7 @@ export const links: LinksFunction = () => [
 ];
 
 const THEME_INIT_SCRIPT = getThemeInitScript();
+const LOCALE_INIT_SCRIPT = getLocaleInitScript();
 
 export function Layout({ children }: { children: React.ReactNode }) {
   return (
@@ -53,7 +69,11 @@ export function Layout({ children }: { children: React.ReactNode }) {
           suppressHydrationWarning
           dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }}
         />
-        <link rel="manifest" href={appPath("/manifest.json")} />
+        <script
+          data-agent-native-locale-init
+          suppressHydrationWarning
+          dangerouslySetInnerHTML={{ __html: LOCALE_INIT_SCRIPT }}
+        />
         <meta name="theme-color" content="#0f172a" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta
@@ -75,7 +95,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
   );
 }
 
-const TAB_ID = Math.random().toString(36).slice(2, 10);
+const TAB_ID = getBrowserTabId();
 
 function DbSyncSetup() {
   const qc = useQueryClient();
@@ -112,10 +132,6 @@ function DbSyncSetup() {
   return null;
 }
 
-/**
- * Reads ?thread=<id> from the URL on mount and opens that thread in the
- * full-page chat route.
- */
 function useThreadDeepLink() {
   const navigate = useNavigate();
   const handled = useRef(false);
@@ -127,7 +143,7 @@ function useThreadDeepLink() {
     handled.current = true;
 
     params.delete("thread");
-    navigate(
+    void navigate(
       {
         pathname: "/chat",
         search: params.toString() ? `?${params.toString()}` : "",
@@ -148,6 +164,7 @@ function useThreadDeepLink() {
 
 function ThemeToggleItem() {
   const { resolvedTheme, setTheme } = useTheme();
+  const t = useT();
   const isDark = resolvedTheme === "dark";
   return (
     <CommandMenu.Item
@@ -155,26 +172,83 @@ function ThemeToggleItem() {
       keywords={["theme", "dark", "light", "mode"]}
     >
       {isDark ? <IconSun size={16} /> : <IconMoon size={16} />}
-      Toggle theme
+      {t("root.toggleTheme")}
     </CommandMenu.Item>
   );
 }
 
-function AppContent() {
+function PrivateAppContent() {
+  return (
+    <RequireDispatchAccess>
+      <PrivateAppShell />
+    </RequireDispatchAccess>
+  );
+}
+
+function PrivateAppShell() {
   const [cmdkOpen, setCmdkOpen] = useState(false);
-  useCommandMenuShortcut(useCallback(() => setCmdkOpen(true), []));
+  const t = useT();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const commandMenuOpenRef = useRef(false);
+  const openCommandMenu = useCallback(() => {
+    if (!commandMenuOpenRef.current) {
+      trackEvent("dispatch_command_menu_opened", {
+        app_name: "dispatch",
+        template_name: "dispatch",
+      });
+      commandMenuOpenRef.current = true;
+    }
+    setCmdkOpen(true);
+  }, []);
+  useCommandMenuShortcut(openCommandMenu);
+  const handleCommandMenuOpenChange = useCallback(
+    (open: boolean) => {
+      if (open) openCommandMenu();
+      else commandMenuOpenRef.current = false;
+      setCmdkOpen(open);
+    },
+    [openCommandMenu],
+  );
   return (
     <>
       <DbSyncSetup />
-      <CommandMenu open={cmdkOpen} onOpenChange={setCmdkOpen}>
-        <CommandMenu.Group heading="Actions">
-          <CommandMenu.Item onSelect={() => {}}>Search</CommandMenu.Item>
+      <CommandMenu
+        open={cmdkOpen}
+        onOpenChange={handleCommandMenuOpenChange}
+        changelog={changelog}
+        changelogKey="dispatch"
+      >
+        <CommandMenu.Group heading={t("root.commandActions")}>
+          {location.pathname === "/home" ||
+          location.pathname === "/overview" ? (
+            <CommandMenu.Item onSelect={() => navigate("/automations")}>
+              {t("settings.openAutomations")}
+            </CommandMenu.Item>
+          ) : null}
+          {location.pathname.startsWith("/automations") ? (
+            <CommandMenu.Item onSelect={() => navigate("/destinations")}>
+              {t("settings.openDelivery")}
+            </CommandMenu.Item>
+          ) : null}
+          {location.pathname.startsWith("/destinations") ? (
+            <CommandMenu.Item onSelect={() => navigate("/automations")}>
+              {t("settings.openAutomations")}
+            </CommandMenu.Item>
+          ) : null}
+          <CommandMenu.Item onSelect={() => navigate("/settings/agent")}>
+            <IconHierarchy2 size={16} />
+            {t("root.openAgent")}
+          </CommandMenu.Item>
         </CommandMenu.Group>
-        <CommandMenu.Group heading="Appearance">
+        <CommandMenu.Group heading={t("root.commandAppearance")}>
           <ThemeToggleItem />
         </CommandMenu.Group>
       </CommandMenu>
-      <AppLayout extensions={dispatchExtensions}>
+      <AppLayout
+        extensions={dispatchExtensions}
+        agentPageHref="/settings/agent"
+      >
         <Outlet />
       </AppLayout>
     </>
@@ -184,13 +258,25 @@ function AppContent() {
 export default function Root() {
   const [queryClient] = useState(() => createAgentNativeQueryClient());
   return (
-    <AppProviders
-      queryClient={queryClient}
-      toaster={<Toaster richColors position="bottom-left" closeButton />}
-    >
-      <AppContent />
-    </AppProviders>
+    <AppToolkitProvider>
+      <AppProviders
+        queryClient={queryClient}
+        skeletonLayout="launchpad"
+        toaster={
+          <Toaster
+            richColors
+            position="bottom-left"
+            closeButton
+            offset={{ bottom: 44, left: 32 }}
+            mobileOffset={{ bottom: 44, left: 16 }}
+          />
+        }
+        i18n={{ catalog: i18nCatalog }}
+      >
+        <PrivateAppContent />
+      </AppProviders>
+    </AppToolkitProvider>
   );
 }
 
-export { ErrorBoundary } from "@agent-native/core/client";
+export { ErrorBoundary } from "@agent-native/toolkit/app/shared";

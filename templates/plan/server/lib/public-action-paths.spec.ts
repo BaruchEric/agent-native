@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+
 import { PUBLIC_PLAN_ACTION_PATHS } from "./public-action-paths.js";
 
 describe("PUBLIC_PLAN_ACTION_PATHS", () => {
@@ -32,6 +33,15 @@ describe("PUBLIC_PLAN_ACTION_PATHS", () => {
     );
     expect(PUBLIC_PLAN_ACTION_PATHS).not.toContain(
       "/_agent-native/actions/convert-visual-plan-to-prototype",
+    );
+  });
+
+  it("does not expose plan history snapshots to signed-out HTTP callers", () => {
+    expect(PUBLIC_PLAN_ACTION_PATHS).not.toContain(
+      "/_agent-native/actions/get-plan-version",
+    );
+    expect(PUBLIC_PLAN_ACTION_PATHS).not.toContain(
+      "/_agent-native/actions/list-plan-versions",
     );
   });
 

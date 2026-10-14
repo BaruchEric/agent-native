@@ -1,23 +1,25 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { BlockRegistry, registerBlocks } from "./registry.js";
-import { defineBlock, type BlockSpec } from "./types.js";
-import { markdown, introspect } from "./schema-form/introspect.js";
+
+import {
+  describeBlocksForAgent,
+  renderBlockVocabularyReference,
+} from "./agent.js";
 import {
   prop,
   serializeSpecBlock,
   createAttrReader,
   parseSpecBlock,
   attributeValue,
+  childCodeFenceFields,
+  serializeChildCodeFenceFields,
   type MdxAttrNode,
   type MdxJsxNode,
 } from "./mdx.js";
-import {
-  describeBlocksForAgent,
-  renderBlockVocabularyReference,
-} from "./agent.js";
+import { BlockRegistry, registerBlocks } from "./registry.js";
+import { markdown, introspect } from "./schema-form/introspect.js";
+import { defineBlock, type BlockSpec } from "./types.js";
 
-/** A callout-shaped spec mirroring the plan callout, sans React Read. */
 function calloutSpec(): BlockSpec<{ tone?: "info" | "risk"; body: string }> {
   return defineBlock({
     type: "callout",
@@ -55,15 +57,12 @@ describe("block registry", () => {
   it("overrides on re-registration (last wins) instead of throwing", () => {
     const registry = new BlockRegistry();
     registerBlocks(registry, [calloutSpec()]);
-    // Re-registering the same type must not throw; it replaces the prior spec.
     expect(() =>
       registry.register({ ...calloutSpec(), label: "Callout v2" }),
     ).not.toThrow();
     expect(registry.get("callout")?.label).toBe("Callout v2");
-    // Still a single tag entry (no orphan) after the override.
     expect([...registry.tags()]).toEqual(["Callout"]);
 
-    // Re-registering with a changed MDX tag drops the stale tag mapping.
     registry.register({
       ...calloutSpec(),
       mdx: { ...calloutSpec().mdx, tag: "Note" },
@@ -99,9 +98,7 @@ describe("prop encoder", () => {
     expect(prop("editable", true)).toBe(" editable");
     expect(prop("editable", false)).toBe(" editable={false}");
     expect(prop("count", 3)).toBe(" count={3}");
-    // Strings with characters outside the safe charset become JSON expressions.
     expect(prop("body", 'has "quotes"')).toBe(' body={"has \\"quotes\\""}');
-    // Arrays/objects always serialize as a pretty-printed JSON expression.
     expect(prop("items", ["a"])).toContain("items={");
   });
 });
@@ -113,7 +110,6 @@ describe("schema introspection", () => {
     expect(byKey.tone.kind).toBe("enum");
     expect(byKey.tone.optional).toBe(true);
     expect(byKey.tone.enumValues).toEqual(["info", "risk"]);
-    // markdown() survives even though the field is required.
     expect(byKey.body.kind).toBe("markdown");
     expect(byKey.body.optional).toBe(false);
   });
@@ -176,10 +172,46 @@ describe("registry MDX round-trip", () => {
     expect(parsed?.data).toEqual({ tone: "risk", body: "Be **careful**." });
   });
 
-  // Build an `mdxJsxAttributeValueExpression` whose `data.estree` mirrors the
-  // shape remark-mdx emits at runtime. The estree-walking branch of
-  // `attributeValue` is what the wireframe/plan parsers rely on, so the test
-  // exercises that exact path.
+  it("maps named child code fences into data fields", () => {
+    expect(
+      childCodeFenceFields<{ html?: string; css?: string }>(
+        [
+          { type: "code", lang: "html", value: "<div>Hi</div>" },
+          { type: "code", lang: "css live", value: ".x { color: red; }" },
+          { type: "code", lang: "json", value: "{}" },
+        ],
+        { html: "html", css: "css" },
+      ),
+    ).toEqual({
+      html: "<div>Hi</div>",
+      css: ".x { color: red; }",
+    });
+  });
+
+  it("serializes named data fields as child code fences", () => {
+    expect(
+      serializeChildCodeFenceFields(
+        {
+          html: "<div>`tick`</div>",
+          css: ".x { color: red; }",
+        },
+        { html: "html", css: "css" },
+      ),
+    ).toBe(
+      [
+        "",
+        "```html",
+        "<div>`tick`</div>",
+        "```",
+        "",
+        "```css",
+        ".x { color: red; }",
+        "```",
+        "",
+      ].join("\n"),
+    );
+  });
+
   function exprAttr(
     name: string,
     source: string,
@@ -283,7 +315,6 @@ describe("agent schema export", () => {
     });
     expect(ref).toContain("## Blocks");
     expect(ref).toContain("| type | mdx tag | placement |");
-    // The callout row carries its type, MDX tag, placement, key fields, and desc.
     expect(ref).toContain("`callout`");
     expect(ref).toContain("`<Callout>`");
     expect(ref).toContain("block");

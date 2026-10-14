@@ -1,6 +1,9 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { appApiPath } from "@agent-native/core/client/api-path";
+import { callAction } from "@agent-native/core/client/hooks";
+import { aiFilterRuleMode } from "@shared/ai-filter-rules";
 import type { AutomationRule, AutomationAction } from "@shared/types";
-import { appApiPath } from "@agent-native/core/client";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+
 import { TAB_ID } from "@/lib/tab-id";
 
 async function apiFetch<T>(url: string, options?: RequestInit): Promise<T> {
@@ -18,11 +21,12 @@ async function apiFetch<T>(url: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
-export function useAutomations() {
+export function useAutomations(options?: { enabled?: boolean }) {
   return useQuery<AutomationRule[]>({
     queryKey: ["automations"],
-    queryFn: () => apiFetch("/api/automations"),
+    queryFn: () => callAction("list-email-rules", {}, { method: "GET" }),
     staleTime: 60_000,
+    enabled: options?.enabled ?? true,
   });
 }
 
@@ -33,33 +37,38 @@ export function useCreateAutomation() {
       name: string;
       condition: string;
       actions: AutomationAction[];
-      domain?: string;
-    }) =>
-      apiFetch<AutomationRule>("/api/automations", {
-        method: "POST",
-        body: JSON.stringify(data),
-      }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["automations"] }),
+      domain?: AutomationRule["domain"];
+      kind?: AutomationRule["kind"];
+    }) => callAction("create-email-rule", data) as Promise<AutomationRule>,
+    onSuccess: (_rule, data) => {
+      const invalidations = [
+        qc.invalidateQueries({ queryKey: ["automations"] }),
+      ];
+      if (
+        (data.domain ?? "mail") === "mail" &&
+        data.kind === "ai-filter" &&
+        aiFilterRuleMode(data) === "filtered"
+      ) {
+        invalidations.push(qc.invalidateQueries({ queryKey: ["settings"] }));
+      }
+      return Promise.all(invalidations);
+    },
   });
 }
 
 export function useUpdateAutomation() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({
-      id,
-      ...data
-    }: {
+    mutationFn: (data: {
       id: string;
       name?: string;
       condition?: string;
       actions?: AutomationAction[];
       enabled?: boolean;
     }) =>
-      apiFetch<AutomationRule>(`/api/automations/${id}`, {
-        method: "PATCH",
-        body: JSON.stringify(data),
-      }),
+      callAction("update-email-rule", data, {
+        method: "PUT",
+      }) as Promise<AutomationRule>,
     onMutate: async ({ id, ...data }) => {
       await qc.cancelQueries({ queryKey: ["automations"] });
       const previous = qc.getQueryData<AutomationRule[]>(["automations"]);
@@ -80,7 +89,18 @@ export function useUpdateAutomation() {
         qc.setQueryData(["automations"], context.previous);
       }
     },
-    onSettled: () => qc.invalidateQueries({ queryKey: ["automations"] }),
+    onSettled: (_rule, _error, data) => {
+      const invalidations = [
+        qc.invalidateQueries({ queryKey: ["automations"] }),
+      ];
+      if (
+        data.actions &&
+        aiFilterRuleMode({ actions: data.actions }) === "filtered"
+      ) {
+        invalidations.push(qc.invalidateQueries({ queryKey: ["settings"] }));
+      }
+      return Promise.all(invalidations);
+    },
   });
 }
 
@@ -88,8 +108,55 @@ export function useDeleteAutomation() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) =>
-      apiFetch<void>(`/api/automations/${id}`, { method: "DELETE" }),
+      callAction("delete-email-rule", { id }, { method: "DELETE" }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["automations"] }),
+  });
+}
+
+export function useConsolidateAiFilterRules() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: {
+      id: string;
+      duplicateIds: string[];
+      expectedRules: {
+        id: string;
+        name: string;
+        condition: string;
+        actions: AutomationAction[];
+      }[];
+      name: string;
+      condition: string;
+      actions: AutomationAction[];
+    }) =>
+      callAction("consolidate-ai-filter-rules", data, {
+        method: "PUT",
+      }) as Promise<{ saved: boolean }>,
+    onSettled: () => qc.invalidateQueries({ queryKey: ["automations"] }),
+  });
+}
+
+export function useClearAiFilterRules() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (ids: string[]) =>
+      callAction("manage-ai-filter-rule-undo", {
+        operation: "clear",
+        ids,
+      }) as Promise<{ undoId: string }>,
+    onSettled: () => qc.invalidateQueries({ queryKey: ["automations"] }),
+  });
+}
+
+export function useRestoreAiFilterRules() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (undoId: string) =>
+      callAction("manage-ai-filter-rule-undo", {
+        operation: "undo",
+        undoId,
+      }) as Promise<{ restored: true }>,
+    onSettled: () => qc.invalidateQueries({ queryKey: ["automations"] }),
   });
 }
 

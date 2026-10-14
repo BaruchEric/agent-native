@@ -1,66 +1,104 @@
-import { ReactNode, useEffect, useMemo, useState } from "react";
-import { NavLink, useLocation, useParams } from "react-router";
+import { appPath } from "@agent-native/core/client/api-path";
+import { getBrowserTabId } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { useLab } from "@agent-native/core/client/labs";
+import { useOrgRole } from "@agent-native/core/client/org";
+import {
+  AgentSidebar,
+  AgentToggleButton,
+} from "@agent-native/toolkit/app/chat";
+import { InvitationBanner, OrgSwitcher } from "@agent-native/toolkit/app/org";
+import {
+  AppSidebarFooter,
+  AppSidebarHeader,
+} from "@agent-native/toolkit/app/shared";
+import { CLIPS_MEETINGS, CLIPS_WISPRFLOW } from "@shared/labs";
 import {
   IconInbox,
+  IconPhoto,
   IconArchive,
   IconCalendar,
   IconMicrophone2,
   IconTrash,
   IconUsersGroup,
-  IconFolderPlus,
-  IconPlayerRecord,
-  IconAppWindow,
-  IconX,
+  IconBrandChrome,
+  IconDownload,
+  IconChevronDown,
   IconMenu2,
   IconLayoutSidebarLeftCollapse,
   IconLayoutSidebarLeftExpand,
-  IconPlus,
+  IconShare,
+  IconDots,
+  IconEdit,
 } from "@tabler/icons-react";
+import { ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { NavLink, useLocation, useNavigate, useParams } from "react-router";
+
 import {
-  AgentSidebar,
-  AgentToggleButton,
-  DevDatabaseLink,
-  FeedbackButton,
-  appPath,
-} from "@agent-native/core/client";
-import { OrgSwitcher, RequireActiveOrg } from "@agent-native/core/client/org";
-import { cn } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import {
-  useFolders,
-  useSpaces,
-  useOrganizations,
-  useCreateFolder,
-} from "@/hooks/use-library";
-import { useIsMobile } from "@/hooks/use-mobile";
-import { useDesktopPromo } from "@/hooks/use-desktop-promo";
-import { usePrefetchVideoStorageStatus } from "@/hooks/use-video-storage-status";
-import { FolderTree, type FolderNode } from "./folder-tree";
-import { SearchBar } from "./search-bar";
-import { PageHeaderSlotProvider } from "./page-header";
-import { CreateSpaceDialog } from "./create-space-dialog";
-import { ExtensionsSidebarSection } from "@agent-native/core/client/extensions";
-import { toast } from "sonner";
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useDesktopPromo } from "@/hooks/use-desktop-promo";
+import {
+  useFolders,
+  useSpaces,
+  useOrganizations,
+  useRecordingsCount,
+} from "@/hooks/use-library";
+import { useIsMobile } from "@/hooks/use-mobile";
+import { usePrefetchVideoStorageStatus } from "@/hooks/use-video-storage-status";
+import {
+  clipsChromeExtensionUrl,
+  useClipsChromeExtensionEnabled,
+} from "@/lib/capture-install-options";
+import { useRecordingSection } from "@/lib/recording-section";
+import { cn } from "@/lib/utils";
+
+import { FolderTree, type FolderNode } from "./folder-tree";
+import { PageHeaderSlotProvider } from "./page-header";
+import { SidebarFeedbackButton } from "./sidebar-feedback-button";
+import { SpaceDialogs } from "./space-dialogs";
 
 interface LibraryLayoutProps {
   children: ReactNode;
 }
 
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "clips:left-sidebar-collapsed";
+type SidebarGroupKey = "library" | "spaces";
+
+function isSidebarGroupActive(
+  pathname: string,
+  group: SidebarGroupKey,
+  matchesRoute: boolean,
+) {
+  if (!matchesRoute) return false;
+  if (group === "library" && pathname.startsWith("/library/folder/")) {
+    return false;
+  }
+  if (group === "spaces" && pathname.startsWith("/spaces/")) {
+    return false;
+  }
+  return true;
+}
 
 function readSidebarCollapsedPreference() {
   if (typeof window === "undefined") return false;
@@ -75,16 +113,91 @@ function readSidebarCollapsedPreference() {
 }
 
 function ClipsAgentToggleButton() {
-  return <AgentToggleButton />;
+  return <AgentToggleButton showWhenOpen />;
+}
+
+interface ExpandedSidebarNavGroupProps {
+  to: string;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+  active: boolean;
+  count?: number;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  children: ReactNode;
+}
+
+function ExpandedSidebarNavGroup({
+  to,
+  label,
+  icon: Icon,
+  active,
+  count,
+  open,
+  onOpenChange,
+  children,
+}: ExpandedSidebarNavGroupProps) {
+  const t = useT();
+
+  return (
+    <Collapsible
+      open={open}
+      onOpenChange={onOpenChange}
+      className="group/sidebar-nav"
+    >
+      <div
+        className={cn(
+          "group flex items-center rounded",
+          active
+            ? "bg-primary/10 font-medium text-primary"
+            : "text-primary hover:bg-accent/60",
+        )}
+      >
+        <NavLink
+          to={to}
+          className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-xs text-primary"
+        >
+          <Icon className="size-4 shrink-0 text-primary" />
+          <span className="flex-1 truncate text-primary">{label}</span>
+          {count !== undefined && count > 0 && (
+            <span className="shrink-0 tabular-nums text-[11px] text-primary/80">
+              {count}
+            </span>
+          )}
+        </NavLink>
+        <CollapsibleTrigger asChild>
+          <button
+            type="button"
+            aria-label={`${t(open ? "settings.collapse" : "settings.expand")}: ${label}`}
+            className="me-1 flex size-7 shrink-0 items-center justify-center rounded text-primary hover:bg-accent hover:text-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          >
+            <IconChevronDown
+              className={cn(
+                "size-3.5 transition-transform motion-reduce:transition-none",
+                open && "rotate-180",
+              )}
+            />
+          </button>
+        </CollapsibleTrigger>
+      </div>
+      <CollapsibleContent className="clips-collapsible-content">
+        <div className="ms-3.5 border-s border-border/70 ps-2">{children}</div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
 }
 
 export function LibraryLayout({ children }: LibraryLayoutProps) {
   const location = useLocation();
-  // Bind chat to the currently-open recording (`/r/:id`). Library, spaces,
-  // meetings, dictate, and settings stay unscoped — those are list-y views
-  // where deck-style "this recording" framing doesn't apply.
+  // A recording page says which section it belongs to; see recording-section.
+  const recordingSection = useRecordingSection();
+  const navigate = useNavigate();
+  const t = useT();
+  const isRecordingRoute = location.pathname.startsWith("/r/");
+  const meetingsLabEnabled = useLab(CLIPS_MEETINGS);
+  const wisprFlowLabEnabled = useLab(CLIPS_WISPRFLOW);
   const recordingScope = useMemo(() => {
-    const match = location.pathname.match(/^\/r\/([^/]+)/);
+    const match = location.pathname.match(/^\/(?:r|share)\/([^/]+)/);
     const recordingId = match?.[1];
     if (!recordingId) return null;
     return { type: "recording" as const, id: recordingId };
@@ -95,17 +208,80 @@ export function LibraryLayout({ children }: LibraryLayoutProps) {
     spaceId?: string;
   }>();
 
-  const { shouldShowPromo, shouldShowSidebarLink, dismiss } = useDesktopPromo();
+  const { shouldShowSidebarLink } = useDesktopPromo();
+  const chromeExtensionEnabled = useClipsChromeExtensionEnabled();
   usePrefetchVideoStorageStatus();
 
-  const { data: organizations } = useOrganizations();
+  const { org, canManageOrg } = useOrgRole();
+  const hasActiveOrg = Boolean(org?.orgId);
+  const { data: organizations } = useOrganizations({ enabled: hasActiveOrg });
   const currentOrganizationId =
     organizations?.currentId ?? organizations?.organizations?.[0]?.id;
 
-  const { data: spaces } = useSpaces(currentOrganizationId);
-  const { data: libFolders } = useFolders({
-    organizationId: currentOrganizationId,
+  const { data: spaces, refetch: refetchSpaces } = useSpaces(
+    currentOrganizationId,
+    {
+      enabled: hasActiveOrg && Boolean(currentOrganizationId),
+    },
+  );
+  const { data: libFolders } = useFolders(
+    {
+      organizationId: currentOrganizationId,
+    },
+    { enabled: hasActiveOrg && Boolean(currentOrganizationId) },
+  );
+
+  // Clip count for the "Library" nav item — count-only, no row payload or
+  // title polling across the app shell.
+  // Counts match what each section actually lists: clips in Library,
+  // screenshots in Screenshots.
+  const { data: libraryCount } = useRecordingsCount({
+    view: "library",
+    kind: "video",
   });
+  const { data: screenshotCount } = useRecordingsCount({
+    view: "library",
+    kind: "image",
+  });
+  const { data: sharedCount } = useRecordingsCount({ view: "shared" });
+  const suggestionCountArgs = useMemo(() => {
+    if (recordingScope) return null;
+    if (location.pathname === "/library") {
+      return { view: "library" as const, kind: "video" as const };
+    }
+    if (location.pathname.startsWith("/library/folder/")) {
+      return {
+        view: "library" as const,
+        kind: "all" as const,
+        folderId: folderId ?? null,
+      };
+    }
+    if (location.pathname === "/screenshots") {
+      return {
+        view: "library" as const,
+        kind: "image" as const,
+      };
+    }
+    if (location.pathname === "/shared") return { view: "shared" as const };
+    if (location.pathname === "/archive") return { view: "archive" as const };
+    if (location.pathname === "/trash") return { view: "trash" as const };
+    if (spaceId && location.pathname.startsWith(`/spaces/${spaceId}`)) {
+      return {
+        view: "space" as const,
+        spaceId,
+        folderId: folderId ?? null,
+      };
+    }
+    return null;
+  }, [folderId, location.pathname, recordingScope, spaceId]);
+  const { data: suggestionRecordingCount } = useRecordingsCount(
+    suggestionCountArgs ?? {},
+    { enabled: suggestionCountArgs !== null },
+  );
+  const hasKnownEmptyList =
+    suggestionCountArgs !== null &&
+    typeof suggestionRecordingCount === "number" &&
+    suggestionRecordingCount === 0;
 
   const libFolderList: FolderNode[] = useMemo(
     () =>
@@ -116,28 +292,160 @@ export function LibraryLayout({ children }: LibraryLayoutProps) {
           parentId: f.parentId ?? null,
           spaceId: f.spaceId ?? null,
           name: f.name,
+          recordingCount: Number(f.recordingCount ?? 0),
         })),
     [libFolders],
   );
+  const spaceFolderLists = useMemo(() => {
+    const foldersBySpace = new Map<string, FolderNode[]>();
+    for (const folder of libFolders?.folders ?? []) {
+      if (!folder.spaceId) continue;
+      const folders = foldersBySpace.get(folder.spaceId) ?? [];
+      folders.push({
+        id: folder.id,
+        parentId: folder.parentId ?? null,
+        spaceId: folder.spaceId,
+        name: folder.name,
+        recordingCount: Number(folder.recordingCount ?? 0),
+      });
+      foldersBySpace.set(folder.spaceId, folders);
+    }
+    return foldersBySpace;
+  }, [libFolders]);
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const mobileSidebarRef = useRef<HTMLElement | null>(null);
+  const mobileMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     readSidebarCollapsedPreference,
   );
+  const [expandedSidebarGroups, setExpandedSidebarGroups] = useState<
+    Record<SidebarGroupKey, boolean>
+  >(() => ({
+    library:
+      location.pathname.startsWith("/library") ||
+      location.pathname.startsWith("/r/") ||
+      location.pathname.startsWith("/share/"),
+    spaces: location.pathname.startsWith("/spaces"),
+  }));
   const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null);
   const showCollapsedSidebar = sidebarCollapsed && !isMobile;
-
-  // Routes whose page renders its own h-12 toolbar (with NotificationsBell +
-  // AgentToggleButton). Layout still mounts Sidebar + AgentSidebar, but skips
-  // its own header so there's no double-header.
+  const workspaceUtilityLinks = [
+    ...(chromeExtensionEnabled && clipsChromeExtensionUrl
+      ? [
+          {
+            id: "chrome-extension",
+            label: t("captureInstall.chromeTitle"),
+            href: clipsChromeExtensionUrl,
+            icon: <IconBrandChrome />,
+            external: true,
+          },
+        ]
+      : []),
+    ...(shouldShowSidebarLink
+      ? [
+          {
+            id: "desktop-app",
+            label: t("navigation.desktopCta"),
+            href: appPath("/download"),
+            icon: <IconDownload />,
+          },
+        ]
+      : []),
+  ];
+  const collapseButton = !isMobile ? (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={
+            showCollapsedSidebar
+              ? t("navigation.expandSidebar")
+              : t("navigation.collapseSidebar")
+          }
+          className="flex size-9 shrink-0 items-center justify-center rounded-md bg-transparent text-primary hover:bg-accent/60 hover:text-primary"
+          onClick={() => setSidebarCollapsed((value) => !value)}
+        >
+          {showCollapsedSidebar ? (
+            <IconLayoutSidebarLeftExpand className="size-4" />
+          ) : (
+            <IconLayoutSidebarLeftCollapse className="size-4" />
+          )}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="right">
+        {showCollapsedSidebar
+          ? t("navigation.expandSidebar")
+          : t("navigation.collapseSidebar")}
+      </TooltipContent>
+    </Tooltip>
+  ) : null;
   const pageOwnsToolbar =
     location.pathname === "/extensions" ||
     location.pathname.startsWith("/extensions/");
-
+  // The Settings shell brings its own navigation, header, and agent toggle.
+  const settingsOwnsChrome =
+    location.pathname === "/settings" ||
+    location.pathname.startsWith("/settings/");
   useEffect(() => {
     setSidebarOpen(false);
   }, [location.pathname]);
+  useEffect(() => {
+    setExpandedSidebarGroups((groups) => ({
+      library:
+        groups.library ||
+        location.pathname.startsWith("/library") ||
+        location.pathname.startsWith("/r/") ||
+        location.pathname.startsWith("/share/"),
+      spaces: groups.spaces || location.pathname.startsWith("/spaces"),
+    }));
+  }, [location.pathname]);
+  useEffect(() => {
+    if (!isMobile || !sidebarOpen) return;
 
+    const sidebar = mobileSidebarRef.current;
+    if (!sidebar) return;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const focusableSelector =
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const focusFirstControl = () => {
+      sidebar.querySelector<HTMLElement>(focusableSelector)?.focus();
+    };
+    requestAnimationFrame(focusFirstControl);
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSidebarOpen(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+
+      const focusable = Array.from(
+        sidebar.querySelectorAll<HTMLElement>(focusableSelector),
+      ).filter((element) => !element.hasAttribute("disabled"));
+      if (focusable.length === 0) {
+        event.preventDefault();
+        sidebar.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      (previouslyFocused ?? mobileMenuTriggerRef.current)?.focus();
+    };
+  }, [isMobile, sidebarOpen]);
   useEffect(() => {
     try {
       window.localStorage.setItem(
@@ -145,462 +453,526 @@ export function LibraryLayout({ children }: LibraryLayoutProps) {
         sidebarCollapsed ? "true" : "false",
       );
     } catch {
-      // Ignore browsers that block localStorage; the toggle still works.
+      // coercion-ok: Sidebar preference is optional when storage is unavailable.
     }
   }, [sidebarCollapsed]);
 
-  const [newFolderOpen, setNewFolderOpen] = useState(false);
-  const [newFolderName, setNewFolderName] = useState("");
-  const [newSpaceOpen, setNewSpaceOpen] = useState(false);
-  const createFolder = useCreateFolder();
-
+  const [deleteSpaceId, setDeleteSpaceId] = useState<string | null>(null);
+  const [deleteSpaceName, setDeleteSpaceName] = useState("");
+  const [renameSpaceId, setRenameSpaceId] = useState<string | null>(null);
+  const [renameSpaceValue, setRenameSpaceValue] = useState("");
   const navItems: {
     to: string;
     label: string;
     icon: React.ComponentType<{ className?: string }>;
     match: (path: string) => boolean;
+    count?: number;
   }[] = [
     {
       to: "/library",
-      label: "Library",
+      label: t("navigation.library"),
       icon: IconInbox,
-      match: (p) => p.startsWith("/library"),
+      match: (p) =>
+        p === "/home" ||
+        p.startsWith("/library") ||
+        (p.startsWith("/r/") &&
+          (recordingSection ?? "library") === "library") ||
+        p.startsWith("/share/"),
+      count: libraryCount,
+    },
+    {
+      to: "/screenshots",
+      label: t("navigation.screenshots"),
+      icon: IconPhoto,
+      match: (p) =>
+        p.startsWith("/screenshots") ||
+        (p.startsWith("/r/") && recordingSection === "screenshots"),
+      count: screenshotCount,
+    },
+    {
+      to: "/shared",
+      label: t("navigation.sharedWithMe"),
+      icon: IconShare,
+      match: (p) => p === "/shared",
+      count: sharedCount,
     },
     {
       to: "/spaces",
-      label: "Spaces",
+      label: t("navigation.spaces"),
       icon: IconUsersGroup,
-      match: (p) => p.startsWith("/spaces"),
+      match: (p) =>
+        p === "/spaces" ||
+        p.startsWith("/spaces/") ||
+        (p.startsWith("/r/") && recordingSection === "spaces"),
     },
-    {
-      to: "/meetings",
-      label: "Meetings",
-      icon: IconCalendar,
-      match: (p) => p.startsWith("/meetings"),
-    },
-    {
-      to: "/dictate",
-      label: "Dictate",
-      icon: IconMicrophone2,
-      match: (p) => p.startsWith("/dictate"),
-    },
+    ...(meetingsLabEnabled
+      ? [
+          {
+            to: "/meetings",
+            label: t("navigation.meetings"),
+            icon: IconCalendar,
+            match: (p: string) => p.startsWith("/meetings"),
+          },
+        ]
+      : []),
+    ...(wisprFlowLabEnabled
+      ? [
+          {
+            to: "/dictate",
+            label: t("navigation.dictate"),
+            icon: IconMicrophone2,
+            match: (p: string) => p.startsWith("/dictate"),
+          },
+        ]
+      : []),
     {
       to: "/archive",
-      label: "Archive",
+      label: t("navigation.archive"),
       icon: IconArchive,
       match: (p) => p.startsWith("/archive"),
     },
     {
       to: "/trash",
-      label: "Trash",
+      label: t("navigation.trash"),
       icon: IconTrash,
-      match: (p) => p.startsWith("/trash"),
+      match: (p) =>
+        p.startsWith("/trash") ||
+        (p.startsWith("/r/") && recordingSection === "trash"),
     },
   ];
 
-  return (
-    <div className="flex h-screen overflow-hidden bg-background">
-      <AgentSidebar
-        position="right"
-        defaultOpen={!isMobile}
-        emptyStateText="How can I help with your recordings?"
-        suggestions={[
-          "Summarize my last recording",
-          "Find where I mentioned pricing",
-          "Remove filler words from this clip",
-        ]}
-        scope={recordingScope}
-      >
-        <RequireActiveOrg
-          title="Create your organization"
-          description="Clips organizes recordings by team. Create an organization to continue — you can invite teammates afterward."
-        >
-          <div className="flex h-full w-full">
-            {/* Mobile backdrop */}
-            {sidebarOpen && (
-              <div
-                className="fixed inset-0 z-40 bg-black/50 md:hidden"
-                onClick={() => setSidebarOpen(false)}
-              />
-            )}
+  const primaryNavItems = navItems.filter(
+    ({ to }) => to !== "/archive" && to !== "/trash",
+  );
+  const lifecycleNavItems = navItems.filter(
+    ({ to }) => to === "/archive" || to === "/trash",
+  );
 
-            {/* Left sidebar */}
-            <aside
+  const renderExpandedNavItem = ({
+    to,
+    label,
+    icon: Icon,
+    match,
+    count,
+  }: (typeof navItems)[number]) => {
+    const active = match(location.pathname);
+
+    return (
+      <div
+        key={to}
+        className={cn(
+          "group flex items-center rounded",
+          active
+            ? "bg-primary/10 font-medium text-primary"
+            : "text-primary hover:bg-accent/60",
+        )}
+      >
+        <NavLink
+          to={to}
+          className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-xs text-primary"
+        >
+          <Icon className="size-4 shrink-0 text-primary" />
+          <span className="flex-1 truncate text-primary">{label}</span>
+          {count !== undefined && count > 0 && (
+            <span
               className={cn(
-                "fixed inset-y-0 left-0 z-50 flex h-full w-[260px] flex-col overflow-hidden border-r border-border bg-sidebar transition-[width,transform] duration-200 ease-out md:static md:z-auto",
-                showCollapsedSidebar && "md:w-14",
-                sidebarOpen
-                  ? "translate-x-0"
-                  : "-translate-x-full md:translate-x-0",
+                "shrink-0 tabular-nums text-[11px]",
+                "text-primary/80",
               )}
             >
-              <div
-                className={cn(
-                  "flex h-12 shrink-0 items-center border-b border-border",
-                  showCollapsedSidebar ? "justify-center px-2" : "px-4",
-                )}
-              >
-                <div
-                  className={cn(
-                    "flex min-w-0 items-center gap-2",
-                    !showCollapsedSidebar && "flex-1",
-                  )}
-                >
-                  {!showCollapsedSidebar && (
-                    <>
-                      <img
-                        src={appPath("/agent-native-icon-light.svg")}
-                        alt=""
-                        aria-hidden="true"
-                        className="block h-4 w-auto shrink-0 dark:hidden"
-                      />
-                      <img
-                        src={appPath("/agent-native-icon-dark.svg")}
-                        alt=""
-                        aria-hidden="true"
-                        className="hidden h-4 w-auto shrink-0 dark:block"
-                      />
-                      <span className="truncate text-sm font-semibold text-foreground">
-                        Clips
-                      </span>
-                    </>
-                  )}
-                </div>
+              {count}
+            </span>
+          )}
+        </NavLink>
+      </div>
+    );
+  };
 
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      className="hidden h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground md:inline-flex"
-                      aria-label={
-                        showCollapsedSidebar
-                          ? "Expand sidebar"
-                          : "Collapse sidebar"
-                      }
-                      aria-expanded={!showCollapsedSidebar}
-                      onClick={() => setSidebarCollapsed((value) => !value)}
-                    >
-                      {showCollapsedSidebar ? (
-                        <IconLayoutSidebarLeftExpand className="h-4 w-4" />
-                      ) : (
-                        <IconLayoutSidebarLeftCollapse className="h-4 w-4" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="right">
-                    {showCollapsedSidebar
-                      ? "Expand sidebar"
-                      : "Collapse sidebar"}
-                  </TooltipContent>
-                </Tooltip>
+  const renderCollapsedNavItem = ({
+    to,
+    label,
+    icon: Icon,
+    match,
+  }: (typeof navItems)[number]) => {
+    const active = match(location.pathname);
+
+    return (
+      <Tooltip key={to}>
+        <TooltipTrigger asChild>
+          <NavLink
+            to={to}
+            aria-label={label}
+            className={cn(
+              "flex size-9 items-center justify-center rounded-md text-primary hover:bg-accent/60 hover:text-primary",
+              active &&
+                "bg-primary/10 text-primary hover:bg-primary/10 hover:text-primary",
+            )}
+          >
+            <Icon className="size-4 text-primary" />
+          </NavLink>
+        </TooltipTrigger>
+        <TooltipContent side="right">{label}</TooltipContent>
+      </Tooltip>
+    );
+  };
+
+  const renderExpandedNavGroup = (
+    item: (typeof navItems)[number],
+    group: SidebarGroupKey,
+    children: ReactNode,
+  ) => (
+    <ExpandedSidebarNavGroup
+      key={item.to}
+      to={item.to}
+      label={item.label}
+      icon={item.icon}
+      active={isSidebarGroupActive(
+        location.pathname,
+        group,
+        item.match(location.pathname),
+      )}
+      count={item.count}
+      open={expandedSidebarGroups[group]}
+      onOpenChange={(open) =>
+        setExpandedSidebarGroups((groups) => ({ ...groups, [group]: open }))
+      }
+    >
+      {children}
+    </ExpandedSidebarNavGroup>
+  );
+
+  const pageContent = (
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <InvitationBanner />
+      <main className="agent-native-app-main flex min-h-0 flex-1 flex-col overflow-y-auto">
+        <PageHeaderSlotProvider slot={headerSlot}>
+          {children}
+        </PageHeaderSlotProvider>
+      </main>
+    </div>
+  );
+
+  return (
+    <div className="agent-layout-shell flex h-screen overflow-hidden bg-background">
+      {/* Mobile backdrop */}
+      {sidebarOpen && (
+        <div
+          aria-hidden="true"
+          className="fixed inset-0 z-40 bg-black/50 md:hidden"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+
+      {/* Left sidebar */}
+      <aside
+        ref={mobileSidebarRef}
+        id="clips-primary-navigation"
+        role={isMobile ? "dialog" : undefined}
+        aria-modal={isMobile ? true : undefined}
+        aria-label={isMobile ? t("navigation.brand") : undefined}
+        tabIndex={isMobile ? -1 : undefined}
+        aria-hidden={isMobile && !sidebarOpen ? true : undefined}
+        inert={isMobile && !sidebarOpen ? true : undefined}
+        className={cn(
+          "agent-layout-left-drawer fixed inset-y-0 start-0 z-50 flex h-full w-[260px] flex-col overflow-hidden border-e border-border bg-sidebar transition-[width,transform] duration-200 ease-out md:static md:z-auto",
+          showCollapsedSidebar && "md:w-14",
+          sidebarOpen
+            ? "translate-x-0"
+            : "-translate-x-full rtl:translate-x-full md:translate-x-0",
+          settingsOwnsChrome && "hidden",
+        )}
+      >
+        <AppSidebarHeader
+          brandName={t("navigation.brand")}
+          appId="clips"
+          brandHref="/library"
+          collapsed={showCollapsedSidebar}
+        />
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {showCollapsedSidebar ? (
+            <nav className="flex flex-col items-center gap-1 px-2 py-3">
+              {primaryNavItems.map(renderCollapsedNavItem)}
+              <div className="mt-2 flex flex-col items-center gap-1 border-t border-border/70 pt-2">
+                {lifecycleNavItems.map(renderCollapsedNavItem)}
               </div>
-              <div className="min-h-0 flex-1 overflow-y-auto">
-                {showCollapsedSidebar ? (
-                  <>
-                    <div className="flex justify-center px-2 py-3">
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <NavLink
-                            to="/record"
-                            aria-label="New recording"
-                            className="flex h-9 w-9 items-center justify-center rounded-md bg-primary text-primary-foreground shadow-sm hover:bg-primary/90"
-                          >
-                            <IconPlayerRecord className="h-4 w-4" />
-                          </NavLink>
-                        </TooltipTrigger>
-                        <TooltipContent side="right">
-                          New recording
-                        </TooltipContent>
-                      </Tooltip>
-                    </div>
+            </nav>
+          ) : (
+            <nav className="space-y-0.5 px-2 py-3">
+              {primaryNavItems.map((item) => {
+                if (item.to === "/library" && libFolderList.length > 0) {
+                  return renderExpandedNavGroup(
+                    item,
+                    "library",
+                    <FolderTree
+                      compact
+                      folders={libFolderList}
+                      organizationId={currentOrganizationId}
+                      spaceId={null}
+                      buildPath={(id) => `/library/folder/${id}`}
+                      activeFolderId={folderId ?? null}
+                    />,
+                  );
+                }
 
-                    <nav className="mt-3 flex flex-col items-center gap-1 px-2">
-                      {navItems.map(({ to, label, icon: Icon, match }) => {
-                        const active = match(location.pathname);
+                if (
+                  item.to === "/spaces" &&
+                  (spaces?.spaces ?? []).length > 0
+                ) {
+                  return renderExpandedNavGroup(
+                    item,
+                    "spaces",
+                    <ul className="space-y-0.5">
+                      {(spaces?.spaces ?? []).map((s: any) => {
+                        const active = spaceId === s.id;
+                        const spaceFolders = spaceFolderLists.get(s.id) ?? [];
                         return (
-                          <Tooltip key={to}>
-                            <TooltipTrigger asChild>
-                              <NavLink
-                                to={to}
-                                aria-label={label}
-                                className={cn(
-                                  "flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground hover:bg-accent/60 hover:text-foreground",
-                                  active &&
-                                    "bg-primary/10 text-primary hover:bg-primary/10 hover:text-primary",
-                                )}
-                              >
-                                <Icon className="h-4 w-4" />
-                              </NavLink>
-                            </TooltipTrigger>
-                            <TooltipContent side="right">
-                              {label}
-                            </TooltipContent>
-                          </Tooltip>
-                        );
-                      })}
-                    </nav>
-                  </>
-                ) : (
-                  <>
-                    <div className="px-3 py-3">
-                      <Button
-                        className="w-full gap-1.5 bg-primary text-primary-foreground shadow-sm hover:bg-primary/90"
-                        size="sm"
-                        asChild
-                      >
-                        <NavLink to="/record">
-                          <IconPlayerRecord className="h-4 w-4" />
-                          New recording
-                        </NavLink>
-                      </Button>
-                    </div>
-
-                    <nav className="mt-3 space-y-0.5 px-2">
-                      {navItems.map(({ to, label, icon: Icon, match }) => {
-                        const active = match(location.pathname);
-                        return (
-                          <NavLink
-                            key={to}
-                            to={to}
-                            className={cn(
-                              "flex items-center gap-2 rounded px-2 py-1.5 text-xs",
-                              active
-                                ? "bg-primary/10 font-medium text-primary"
-                                : "text-foreground hover:bg-accent/60",
-                            )}
-                          >
-                            <Icon className="h-4 w-4" />
-                            {label}
-                          </NavLink>
-                        );
-                      })}
-                    </nav>
-
-                    <div className="mt-4 space-y-4 px-2 pb-3">
-                      <div>
-                        <div className="flex items-center justify-between px-2 pb-1">
-                          <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                            Folders
-                          </span>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <button
-                                type="button"
-                                aria-label="New folder"
-                                className="rounded p-1 text-muted-foreground hover:bg-accent"
-                                onClick={() => setNewFolderOpen(true)}
-                              >
-                                <IconFolderPlus className="h-3.5 w-3.5" />
-                              </button>
-                            </TooltipTrigger>
-                            <TooltipContent>New folder</TooltipContent>
-                          </Tooltip>
-                        </div>
-                        <FolderTree
-                          folders={libFolderList}
-                          organizationId={currentOrganizationId}
-                          spaceId={null}
-                          buildPath={(id) => `/library/folder/${id}`}
-                          activeFolderId={folderId ?? null}
-                        />
-                      </div>
-
-                      <div>
-                        <div className="flex items-center justify-between px-2 pb-1">
-                          <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                            Spaces
-                          </span>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <button
-                                type="button"
-                                aria-label="New space"
-                                className="rounded p-1 text-muted-foreground hover:bg-accent"
-                                onClick={() => setNewSpaceOpen(true)}
-                              >
-                                <IconPlus className="h-3.5 w-3.5" />
-                              </button>
-                            </TooltipTrigger>
-                            <TooltipContent>New space</TooltipContent>
-                          </Tooltip>
-                        </div>
-                        <ul className="space-y-0.5">
-                          {(spaces?.spaces ?? []).map((s: any) => {
-                            const active = spaceId === s.id;
-                            return (
-                              <li key={s.id}>
-                                <NavLink
-                                  to={`/spaces/${s.id}`}
+                          <li key={s.id}>
+                            <ContextMenu>
+                              <ContextMenuTrigger asChild>
+                                <div
                                   className={cn(
-                                    "flex items-center gap-2 rounded px-2 py-1 text-xs",
+                                    "group flex items-center gap-2 rounded px-1.5 py-1 text-xs",
                                     active
                                       ? "bg-primary/10 text-primary"
-                                      : "text-foreground hover:bg-accent/60",
+                                      : "text-primary hover:bg-accent/60",
                                   )}
                                 >
-                                  <div
-                                    className="flex h-4 w-4 items-center justify-center rounded text-[10px]"
-                                    style={{
-                                      background:
-                                        s.color ?? "hsl(var(--primary))",
-                                      color: "white",
-                                    }}
+                                  <NavLink
+                                    to={`/spaces/${s.id}`}
+                                    className="flex min-w-0 flex-1 items-center gap-2 text-primary"
                                   >
-                                    {s.iconEmoji ??
-                                      s.name.slice(0, 1).toUpperCase()}
-                                  </div>
-                                  <span className="truncate">{s.name}</span>
-                                </NavLink>
-                              </li>
-                            );
-                          })}
-                          {(spaces?.spaces ?? []).length === 0 && (
-                            <li className="px-2 py-1 text-[11px] text-muted-foreground/70">
-                              No spaces yet
-                            </li>
-                          )}
-                        </ul>
-                      </div>
-                    </div>
-                  </>
-                )}
+                                    <div
+                                      className="flex size-4 shrink-0 items-center justify-center rounded text-[10px]"
+                                      style={{
+                                        background:
+                                          s.color ?? "hsl(var(--primary))",
+                                        color: "hsl(var(--primary-foreground))",
+                                      }}
+                                    >
+                                      {s.iconEmoji ??
+                                        s.name.slice(0, 1).toUpperCase()}
+                                    </div>
+                                    <span className="truncate text-primary">
+                                      {s.name}
+                                    </span>
+                                  </NavLink>
+                                  {canManageOrg && (
+                                    <DropdownMenu>
+                                      <DropdownMenuTrigger asChild>
+                                        <button
+                                          type="button"
+                                          aria-label={`${s.name}: ${t("root.commandActions")}`}
+                                          title={`${s.name}: ${t("root.commandActions")}`}
+                                          className="rounded p-0.5 text-primary opacity-0 transition-opacity hover:bg-accent hover:text-primary focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100"
+                                        >
+                                          <IconDots className="size-3.5" />
+                                        </button>
+                                      </DropdownMenuTrigger>
+                                      <DropdownMenuContent
+                                        align="start"
+                                        side="right"
+                                      >
+                                        <DropdownMenuItem
+                                          onSelect={() => {
+                                            setTimeout(() => {
+                                              setRenameSpaceValue(s.name);
+                                              setRenameSpaceId(s.id);
+                                            }, 0);
+                                          }}
+                                        >
+                                          <IconEdit className="me-2 size-3.5" />
+                                          {t("spaceDialog.renameSpace")}
+                                        </DropdownMenuItem>
+                                        <DropdownMenuItem
+                                          onSelect={() => {
+                                            setTimeout(() => {
+                                              setDeleteSpaceId(s.id);
+                                              setDeleteSpaceName(s.name);
+                                            }, 0);
+                                          }}
+                                          className="text-destructive"
+                                        >
+                                          <IconTrash className="me-2 size-3.5" />
+                                          {t("spaceDialog.deleteSpace")}
+                                        </DropdownMenuItem>
+                                      </DropdownMenuContent>
+                                    </DropdownMenu>
+                                  )}
+                                </div>
+                              </ContextMenuTrigger>
+                              <ContextMenuContent>
+                                <ContextMenuItem asChild>
+                                  <NavLink to={`/spaces/${s.id}`}>
+                                    <IconUsersGroup className="me-2 size-3.5" />
+                                    {t("clipsFinalRaw.view")}
+                                  </NavLink>
+                                </ContextMenuItem>
+                                {canManageOrg && (
+                                  <>
+                                    <ContextMenuSeparator />
+                                    <ContextMenuItem
+                                      onSelect={() => {
+                                        setTimeout(() => {
+                                          setRenameSpaceValue(s.name);
+                                          setRenameSpaceId(s.id);
+                                        }, 0);
+                                      }}
+                                    >
+                                      <IconEdit className="me-2 size-3.5" />
+                                      {t("spaceDialog.renameSpace")}
+                                    </ContextMenuItem>
+                                    <ContextMenuItem
+                                      onSelect={() => {
+                                        setTimeout(() => {
+                                          setDeleteSpaceId(s.id);
+                                          setDeleteSpaceName(s.name);
+                                        }, 0);
+                                      }}
+                                      className="text-destructive focus:text-destructive"
+                                    >
+                                      <IconTrash className="me-2 size-3.5" />
+                                      {t("spaceDialog.deleteSpace")}
+                                    </ContextMenuItem>
+                                  </>
+                                )}
+                              </ContextMenuContent>
+                            </ContextMenu>
+                            {spaceFolders.length > 0 && (
+                              <div className="ms-3 border-s border-border/70 ps-2">
+                                <FolderTree
+                                  compact
+                                  folders={spaceFolders}
+                                  organizationId={currentOrganizationId}
+                                  spaceId={s.id}
+                                  buildPath={(id) =>
+                                    `/spaces/${s.id}/folder/${id}`
+                                  }
+                                  activeFolderId={folderId ?? null}
+                                />
+                              </div>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>,
+                  );
+                }
+
+                return renderExpandedNavItem(item);
+              })}
+
+              <div className="mt-3 space-y-0.5 border-t border-border/70 pt-3">
+                {lifecycleNavItems.map(renderExpandedNavItem)}
               </div>
+            </nav>
+          )}
+        </div>
 
-              {!showCollapsedSidebar && (
-                <>
-                  <div className="shrink-0 space-y-1.5 border-t border-border px-2 py-1.5">
-                    {shouldShowSidebarLink && (
-                      <NavLink
-                        to="/download"
-                        className="flex items-center gap-2 rounded px-2 py-1.5 text-xs text-foreground hover:bg-accent/60"
-                      >
-                        <IconAppWindow className="h-4 w-4" />
-                        Get desktop app
-                      </NavLink>
-                    )}
-                    <SearchBar />
-                  </div>
-
-                  <div className="shrink-0 border-t border-border px-1 py-1">
-                    <ExtensionsSidebarSection />
-                  </div>
-
-                  <div className="shrink-0 space-y-2 border-t border-border px-3 py-2">
-                    <OrgSwitcher settingsPath="/settings/organization" />
-                    <DevDatabaseLink />
-                    <FeedbackButton />
-                  </div>
-                </>
+        <AppSidebarFooter
+          collapsed={showCollapsedSidebar}
+          collapsible={false}
+          feedback={<SidebarFeedbackButton collapsed={showCollapsedSidebar} />}
+          orgSwitcher={
+            <OrgSwitcher
+              compact={showCollapsedSidebar}
+              className={cn(
+                "!bg-transparent !text-primary hover:!bg-accent/60 hover:!text-primary",
+                showCollapsedSidebar
+                  ? "!size-9 !p-0 [&>svg]:!size-4"
+                  : "min-w-0 flex-1",
               )}
-            </aside>
+              currentAppId="clips"
+              utilityLinks={workspaceUtilityLinks}
+            />
+          }
+          footerExtras={collapseButton}
+        />
+      </aside>
 
-            {/* Main content area */}
-            <div className="flex min-w-0 flex-1 flex-col">
-              {!pageOwnsToolbar && (
-                <header className="flex shrink-0 items-center gap-3 border-b border-border px-5 py-3">
-                  <button
-                    onClick={() => setSidebarOpen(true)}
-                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border bg-background text-muted-foreground hover:text-foreground md:hidden"
-                  >
-                    <IconMenu2 className="h-4 w-4" />
-                  </button>
-                  <div
-                    ref={setHeaderSlot}
-                    className="flex min-w-0 flex-1 items-center gap-3 overflow-hidden"
-                  />
-                  <div className="ml-auto flex items-center gap-2">
-                    <ClipsAgentToggleButton />
-                  </div>
-                </header>
-              )}
-              {shouldShowPromo && (
-                <div className="flex items-center gap-3 border-b border-border bg-primary/5 px-5 py-2.5 text-sm">
-                  <IconAppWindow className="h-4 w-4 shrink-0 text-primary" />
-                  <div className="min-w-0 flex-1">
-                    <span className="font-medium">
-                      Get the Clips desktop app.
-                    </span>{" "}
-                    <span className="text-muted-foreground">
-                      Record from the menu bar, global shortcut, auto-updates.
-                    </span>
-                  </div>
-                  <Button asChild size="sm" className="shrink-0">
-                    <NavLink to="/download">Download</NavLink>
-                  </Button>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
-                        onClick={dismiss}
-                      >
-                        <IconX className="h-4 w-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>I already have it</TooltipContent>
-                  </Tooltip>
+      <AgentSidebar
+        position="right"
+        defaultOpen={false}
+        enabled={!isRecordingRoute}
+        animateDesktop={false}
+        showCollapseButton={isMobile}
+        emptyStateText={
+          recordingScope
+            ? t("recordingPage.askAboutClip")
+            : t("navigation.agentEmptyState")
+        }
+        suggestions={
+          recordingScope
+            ? [
+                t("recordingPage.summarizeClip"),
+                t("recordingPage.findKeyMoments"),
+                t("recordingPage.listFollowUpActions"),
+                t("recordingPage.draftQuestions"),
+              ]
+            : hasKnownEmptyList
+              ? []
+              : location.pathname === "/screenshots"
+                ? [
+                    t("navigation.agentScreenshotSuggestionSummary"),
+                    t("navigation.agentScreenshotSuggestionText"),
+                    t("navigation.agentScreenshotSuggestionCompare"),
+                  ]
+                : [
+                    t("navigation.agentSuggestionSummary"),
+                    t("navigation.agentSuggestionPricing"),
+                    t("navigation.agentSuggestionFiller"),
+                  ]
+        }
+        dynamicSuggestions={false}
+        agentPageHref="/settings/agent"
+        scope={recordingScope}
+        browserTabId={getBrowserTabId()}
+      >
+        <div className="agent-layout-main-surface flex min-h-0 min-w-0 flex-1 flex-col">
+          {!pageOwnsToolbar && !settingsOwnsChrome && (
+            <header className="flex shrink-0 items-center gap-3 border-b border-border px-5 py-3">
+              <button
+                ref={mobileMenuTriggerRef}
+                type="button"
+                aria-label={t("navigation.expandSidebar")}
+                aria-expanded={sidebarOpen}
+                aria-controls="clips-primary-navigation"
+                onClick={() => setSidebarOpen(true)}
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border bg-background text-muted-foreground hover:text-foreground md:hidden"
+              >
+                <IconMenu2 className="h-4 w-4" />
+              </button>
+              <div
+                ref={setHeaderSlot}
+                className="flex min-w-0 flex-1 items-center gap-3 overflow-hidden"
+              />
+              {!isRecordingRoute ? (
+                <div className="ms-1 flex items-center border-s border-border ps-2">
+                  <ClipsAgentToggleButton />
                 </div>
-              )}
-              <main className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-                <PageHeaderSlotProvider slot={headerSlot}>
-                  {children}
-                </PageHeaderSlotProvider>
-              </main>
-            </div>
+              ) : null}
+            </header>
+          )}
+          <div className="flex min-h-0 flex-1 overflow-hidden [--agent-native-viewport-height:100%]">
+            {pageContent}
           </div>
-        </RequireActiveOrg>
+        </div>
       </AgentSidebar>
 
-      {/* New folder dialog (library root) */}
-      <AlertDialog open={newFolderOpen} onOpenChange={setNewFolderOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>New folder</AlertDialogTitle>
-          </AlertDialogHeader>
-          <input
-            autoFocus
-            value={newFolderName}
-            onChange={(e) => setNewFolderName(e.target.value)}
-            placeholder="Folder name"
-            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/30"
-          />
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                const name = newFolderName.trim();
-                if (!name) return;
-                createFolder.mutate(
-                  {
-                    name,
-                    ...(currentOrganizationId
-                      ? { organizationId: currentOrganizationId }
-                      : {}),
-                    parentId: null,
-                  },
-                  {
-                    onSuccess: () => toast.success("Folder created"),
-                    onError: (err: any) =>
-                      toast.error(err?.message ?? "Create failed"),
-                  },
-                );
-                setNewFolderName("");
-                setNewFolderOpen(false);
-              }}
-            >
-              Create
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      <CreateSpaceDialog
-        open={newSpaceOpen}
-        onOpenChange={setNewSpaceOpen}
-        organizationId={currentOrganizationId}
+      <SpaceDialogs
+        renameSpaceId={renameSpaceId}
+        renameSpaceName=""
+        setRenameSpaceId={setRenameSpaceId}
+        renameValue={renameSpaceValue}
+        setRenameValue={setRenameSpaceValue}
+        deleteSpaceId={deleteSpaceId}
+        deleteSpaceName={deleteSpaceName}
+        setDeleteSpaceId={setDeleteSpaceId}
+        onMutationSuccess={(deletedSpaceId) => {
+          if (deletedSpaceId && spaceId === deletedSpaceId) {
+            void navigate("/spaces");
+          }
+          void refetchSpaces?.();
+        }}
       />
     </div>
   );

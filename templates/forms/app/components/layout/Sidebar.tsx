@@ -1,66 +1,66 @@
-import { useState, useRef, useEffect, type MouseEvent } from "react";
-import { Link, useLocation, useNavigate } from "react-router";
+import { navigateWithAgentChatViewTransition } from "@agent-native/core/client/agent-chat";
+import { useT } from "@agent-native/core/client/i18n";
+import { focusAgentChat } from "@agent-native/toolkit/app/chat";
+import { useSendToAgentChat } from "@agent-native/toolkit/app/chat";
+import { FeedbackButton } from "@agent-native/toolkit/app/feedback";
+import { OrgSwitcher } from "@agent-native/toolkit/app/org";
+import { openCommandMenu } from "@agent-native/toolkit/app/shared";
 import {
-  IconUsers,
+  AppSidebar,
+  type AppSidebarItemDefinition,
+} from "@agent-native/toolkit/app/shared";
+import {
   IconArrowUp,
-  IconPlus,
+  IconForms,
   IconMenu2,
-  IconX,
   IconMessageCircle,
+  IconPlus,
+  IconSearch,
 } from "@tabler/icons-react";
-import { OrgSwitcher } from "@agent-native/core/client/org";
+import { useEffect, useRef, useState, type MouseEvent } from "react";
+import { useLocation, useNavigate } from "react-router";
+
 import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { Skeleton } from "@/components/ui/skeleton";
-import { ThemeToggle } from "@/components/ThemeToggle";
 import {
   Popover,
-  PopoverTrigger,
   PopoverContent,
+  PopoverTrigger,
 } from "@/components/ui/popover";
-import { useForms, useCreateForm } from "@/hooks/use-forms";
-import { useAgentPromptRun } from "@/hooks/use-agent-prompt-run";
-import {
-  useSendToAgentChat,
-  DevDatabaseLink,
-  FeedbackButton,
-  appPath,
-  focusAgentChat,
-  navigateWithAgentChatViewTransition,
-} from "@agent-native/core/client";
-import { ExtensionsSidebarSection } from "@agent-native/core/client/extensions";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Tooltip,
   TooltipContent,
-  TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useAgentPromptRun } from "@/hooks/use-agent-prompt-run";
+import { useCreateForm } from "@/hooks/use-forms";
 import { useIsMobile } from "@/hooks/use-mobile";
-import { cn } from "@/lib/utils";
+import { isFormsAskPath } from "@/lib/chat-route";
 
-const statusDots: Record<string, string> = {
-  draft: "bg-amber-500",
-  published: "bg-emerald-500",
-  closed: "bg-muted-foreground/50",
-};
+const SIDEBAR_COLLAPSE_KEY = "forms.sidebar.collapsed";
 
 export function Sidebar() {
   const location = useLocation();
   const navigate = useNavigate();
-  const { data: formsData, isLoading: formsLoading } = useForms();
-  const forms = Array.isArray(formsData) ? formsData : [];
+  const t = useT();
   const createForm = useCreateForm();
   const { send } = useSendToAgentChat();
   const promptRun = useAgentPromptRun({
-    staleMessage:
-      "Form generation is taking longer than expected. You can try again.",
+    staleMessage: t("sidebar.formGenerationStale"),
   });
   const [popoverOpen, setPopoverOpen] = useState(false);
   const [prompt, setPrompt] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isMobile = useIsMobile();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return window.localStorage.getItem(SIDEBAR_COLLAPSE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
 
   useEffect(() => {
     if (popoverOpen) {
@@ -69,15 +69,14 @@ export function Sidebar() {
     }
   }, [popoverOpen]);
 
-  function handleSkip() {
-    setPopoverOpen(false);
-    const tempId = crypto.randomUUID().replace(/-/g, "").slice(0, 10);
-    navigate(`/forms/${tempId}`);
-    createForm.mutate(
-      { title: "Untitled Form" },
-      { onSuccess: (form) => navigate(`/forms/${form.id}`, { replace: true }) },
-    );
-  }
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(SIDEBAR_COLLAPSE_KEY, collapsed ? "1" : "0");
+    } catch {
+      // coercion-ok: storage failures are tolerated; fallback to in-memory preference
+    }
+  }, [collapsed]);
 
   function handleSubmitPrompt() {
     const trimmed = prompt.trim();
@@ -91,37 +90,57 @@ export function Sidebar() {
     promptRun.trackRun(trimmed, tabId);
   }
 
-  function navigateHomeChat(event: MouseEvent<HTMLAnchorElement>) {
+  function handleSkip() {
+    setPopoverOpen(false);
+    createForm.mutate(
+      { title: t("sidebar.untitledForm") },
+      { onSuccess: (form) => navigate(`/forms/${form.id}`) },
+    );
+  }
+
+  function navigateHomeChat(event: MouseEvent) {
+    if (
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey ||
+      event.button !== 0
+    ) {
+      return;
+    }
     event.preventDefault();
     if (isMobile) setMobileOpen(false);
     focusAgentChat();
-    navigateWithAgentChatViewTransition(navigate, "/");
+    navigateWithAgentChatViewTransition(navigate, "/ask");
   }
 
-  function toggleLogoView() {
-    if (isMobile) setMobileOpen(false);
-    focusAgentChat();
-    navigateWithAgentChatViewTransition(navigate, "/");
-  }
+  const items: AppSidebarItemDefinition[] = [
+    {
+      to: "/ask",
+      label: t("navigation.askForms"),
+      icon: IconMessageCircle,
+      active:
+        isFormsAskPath(location.pathname) || location.pathname === "/home",
+      onClick: navigateHomeChat,
+    },
+    {
+      to: "/forms",
+      label: t("navigation.allForms"),
+      icon: IconForms,
+      active: location.pathname.startsWith("/forms"),
+      onClick: () => isMobile && setMobileOpen(false),
+    },
+  ];
 
-  const newFormButton = (
-    <PopoverTrigger asChild>
-      <button className="cursor-pointer flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-accent/50 hover:text-foreground min-h-[44px]">
-        <IconPlus size={14} className="shrink-0" />
-        <span>New form</span>
-      </button>
-    </PopoverTrigger>
-  );
-
-  const newFormPopover = (
+  const newFormPopoverContent = (
     <PopoverContent
       side="right"
       align="start"
       sideOffset={8}
-      className="w-80 p-0 rounded-xl"
+      className="forms-new-form-popover w-80 rounded-2xl p-0"
     >
       <div className="p-4 pb-3">
-        <p className="text-sm font-semibold">New form</p>
+        <p className="text-sm font-semibold">{t("sidebar.newForm")}</p>
         <Textarea
           ref={textareaRef}
           value={prompt}
@@ -132,33 +151,33 @@ export function Sidebar() {
               handleSubmitPrompt();
             }
           }}
-          placeholder="Describe your form..."
+          placeholder={t("sidebar.describeFormPlaceholder")}
           className="mt-2 w-full resize-none bg-transparent text-sm placeholder:text-muted-foreground/50 border-none shadow-none"
-          rows={4}
+          rows={3}
         />
-      </div>
-      <div className="flex items-center justify-between border-t border-border px-4 py-2.5">
-        <div />
-        <div className="flex items-center gap-3">
+        <div className="mt-3 flex items-center justify-between">
           <Button
-            variant="link"
+            variant="ghost"
             size="sm"
-            className="h-auto p-0 text-xs text-muted-foreground"
+            className="text-xs text-muted-foreground hover:text-foreground"
             onClick={handleSkip}
           >
-            Skip prompt
+            {t("sidebar.skipPrompt")}
           </Button>
-          <span className="text-[11px] text-muted-foreground/70">
-            {/Mac|iPhone|iPad/.test(navigator.userAgent) ? "⌘" : "Ctrl"}
-            +Enter to submit
+          <span className="text-[11px] text-muted-foreground/50">
+            {typeof navigator !== "undefined" &&
+            /Mac|iPod|iPhone|iPad/.test(navigator.platform)
+              ? "⌘"
+              : "Ctrl"}{" "}
+            {t("sidebar.submitShortcutSuffix")}
           </span>
           <Button
             variant="secondary"
-            size="icon"
-            className="h-7 w-7"
+            size="icon-lg"
+            className="rounded-lg transition-[background-color,box-shadow,transform] active:scale-[0.96] motion-reduce:active:scale-100"
             onClick={handleSubmitPrompt}
             disabled={!prompt.trim() || promptRun.isActivePrompt(prompt)}
-            aria-label="Send prompt"
+            aria-label={t("sidebar.sendPrompt")}
           >
             <IconArrowUp size={14} />
           </Button>
@@ -167,188 +186,113 @@ export function Sidebar() {
     </PopoverContent>
   );
 
-  const sidebarContent = (
-    <div
-      className={cn(
-        "flex h-screen w-60 min-w-0 shrink-0 flex-col overflow-hidden border-r border-border bg-muted/30",
-        isMobile && "w-full",
-      )}
-    >
-      {/* Header */}
-      <div className="flex h-12 shrink-0 items-center justify-between border-b border-border px-4">
-        <TooltipProvider delayDuration={700}>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                aria-label="Open Ask Forms full screen"
-                className="flex min-w-0 items-center gap-2 rounded-md text-base font-semibold tracking-tight text-foreground transition-colors hover:text-foreground/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                onClick={toggleLogoView}
-              >
-                <img
-                  src={appPath("/agent-native-icon-light.svg")}
-                  alt=""
-                  aria-hidden="true"
-                  className="block h-4 w-auto shrink-0 dark:hidden"
-                />
-                <img
-                  src={appPath("/agent-native-icon-dark.svg")}
-                  alt=""
-                  aria-hidden="true"
-                  className="hidden h-4 w-auto shrink-0 dark:block"
-                />
-                <span className="truncate">Forms</span>
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="right">
-              Open Ask Forms full screen
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-        {isMobile && (
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8"
-            onClick={() => setMobileOpen(false)}
+  const effectiveCollapsed = collapsed && !isMobile;
+
+  const newFormItem = effectiveCollapsed ? (
+    <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              aria-label={t("sidebar.newForm")}
+              className="flex size-9 items-center justify-center rounded-md text-primary hover:bg-accent/60 hover:text-primary"
+            >
+              <IconPlus className="size-4 shrink-0 text-primary" />
+            </button>
+          </PopoverTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="right">{t("sidebar.newForm")}</TooltipContent>
+      </Tooltip>
+      {newFormPopoverContent}
+    </Popover>
+  ) : (
+    <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
+      <PopoverTrigger asChild>
+        <div className="group flex items-center rounded text-primary hover:bg-accent/60 cursor-pointer">
+          <button
+            type="button"
+            className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-xs text-primary"
           >
-            <IconX size={18} />
-          </Button>
-        )}
-      </div>
-
-      <ScrollArea className="min-h-0 min-w-0 flex-1">
-        <div
-          className={cn(
-            "min-w-0 max-w-full overflow-hidden py-2",
-            isMobile ? "w-full" : "w-60",
-          )}
-        >
-          <Link
-            to="/"
-            onClick={navigateHomeChat}
-            className={cn(
-              "flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-3 py-2 text-sm min-h-[44px]",
-              location.pathname === "/"
-                ? "bg-accent text-accent-foreground"
-                : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-            )}
-          >
-            <IconMessageCircle size={14} className="shrink-0" />
-            <span className="min-w-0 flex-1 basis-0 truncate">Ask Forms</span>
-          </Link>
-
-          {formsLoading && forms.length === 0
-            ? Array.from({ length: 5 }).map((_, i) => (
-                <div
-                  key={i}
-                  className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 min-h-[44px]"
-                >
-                  <Skeleton className="h-1.5 w-1.5 shrink-0 rounded-full" />
-                  <Skeleton
-                    className="h-3.5"
-                    style={{ width: `${50 + ((i * 17) % 40)}%` }}
-                  />
-                </div>
-              ))
-            : null}
-          {forms.map((form) => {
-            const isActive =
-              location.pathname === `/forms/${form.id}` ||
-              location.pathname === `/forms/${form.id}/responses`;
-            return (
-              <Link
-                key={form.id}
-                to={`/forms/${form.id}`}
-                onClick={() => isMobile && setMobileOpen(false)}
-                className={cn(
-                  "flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-3 py-2 text-sm min-h-[44px]",
-                  isActive
-                    ? "bg-accent text-accent-foreground"
-                    : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-                )}
-                title={form.title || "Untitled Form"}
-              >
-                <span
-                  className={cn(
-                    "h-1.5 w-1.5 shrink-0 rounded-full",
-                    isActive ? "bg-accent-foreground" : statusDots[form.status],
-                  )}
-                />
-                <span className="min-w-0 flex-1 basis-0 truncate">
-                  {form.title || "Untitled Form"}
-                </span>
-              </Link>
-            );
-          })}
-
-          <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
-            {newFormButton}
-            {newFormPopover}
-          </Popover>
+            <IconPlus className="size-4 shrink-0 text-primary" />
+            <span className="flex-1 truncate text-start text-primary">
+              {t("sidebar.newForm")}
+            </span>
+          </button>
         </div>
-      </ScrollArea>
-
-      {/* Pinned nav + footer */}
-      <div className="shrink-0 border-t border-border px-3 py-1.5">
-        <Link
-          to="/team"
-          onClick={() => isMobile && setMobileOpen(false)}
-          className={cn(
-            "flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-sm min-h-[44px]",
-            location.pathname === "/team"
-              ? "bg-accent text-accent-foreground"
-              : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-          )}
-        >
-          <IconUsers size={14} className="shrink-0" />
-          <span>Team</span>
-        </Link>
-      </div>
-
-      {/* Tools */}
-      <div className="shrink-0 border-t border-border px-1.5 py-1.5">
-        <ExtensionsSidebarSection />
-      </div>
-
-      {/* Footer */}
-      <div className="shrink-0 space-y-2 border-t border-border px-3 py-2">
-        <OrgSwitcher />
-        <DevDatabaseLink />
-        <div className="flex items-center gap-2">
-          <FeedbackButton className="min-w-0 flex-1" />
-          <ThemeToggle className="h-9 w-9 shrink-0" />
-        </div>
-      </div>
-    </div>
+      </PopoverTrigger>
+      {newFormPopoverContent}
+    </Popover>
   );
 
-  if (isMobile) {
-    return (
-      <>
+  const feedbackButton = (
+    <FeedbackButton
+      variant={effectiveCollapsed ? "icon" : "sidebar"}
+      side="right"
+    />
+  );
+
+  const orgSwitcher = <OrgSwitcher compact={effectiveCollapsed} />;
+
+  const searchButton = (
+    <Tooltip>
+      <TooltipTrigger asChild>
         <Button
+          type="button"
           variant="ghost"
           size="icon"
-          className="fixed top-2 left-2 z-40 h-10 w-10 md:hidden"
+          className="shrink-0 text-primary hover:bg-accent/60 hover:text-primary"
+          onClick={openCommandMenu}
+          aria-label={t("root.searchForms")}
+        >
+          <IconSearch className="size-4" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="right">{t("root.searchForms")}</TooltipContent>
+    </Tooltip>
+  );
+
+  const sidebarElement = (
+    <AppSidebar
+      collapsed={effectiveCollapsed}
+      onCollapsedChange={setCollapsed}
+      brandName={t("navigation.brand")}
+      appId="forms"
+      brandHref="/forms"
+      items={items}
+      feedback={feedbackButton}
+      orgSwitcher={orgSwitcher}
+      footerExtras={searchButton}
+      isMobile={isMobile}
+      mobileOpen={mobileOpen}
+    >
+      {newFormItem}
+    </AppSidebar>
+  );
+
+  return (
+    <>
+      <div className="fixed top-2.5 start-2.5 z-40 md:hidden">
+        <Button
+          variant="ghost"
+          size="icon-lg"
+          className="rounded-lg active:scale-[0.96] transition-[background-color,box-shadow,transform]"
           onClick={() => setMobileOpen(true)}
-          aria-label="Open sidebar"
+          aria-label={t("sidebar.openSidebar")}
         >
           <IconMenu2 size={20} />
         </Button>
-        {mobileOpen && (
-          <>
-            <div
-              className="fixed inset-0 z-40 bg-black/40"
-              onClick={() => setMobileOpen(false)}
-            />
-            <div className="fixed inset-y-0 left-0 z-50 w-72 max-w-[85vw]">
-              {sidebarContent}
-            </div>
-          </>
-        )}
-      </>
-    );
-  }
+      </div>
 
-  return sidebarContent;
+      {mobileOpen && (
+        <div
+          // guard:allow-raw-color — backdrop overlay
+          className="fixed inset-0 z-40 bg-black/50 md:hidden"
+          onClick={() => setMobileOpen(false)}
+        />
+      )}
+
+      {sidebarElement}
+    </>
+  );
 }

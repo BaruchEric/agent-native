@@ -1,86 +1,90 @@
+import { callAction, useSession } from "@agent-native/core/client/hooks";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { getIdToken } from "@/lib/auth";
-import { appApiPath } from "@agent-native/core/client";
+
+import { dashboardCacheScope } from "@/lib/prefetch-keys";
 
 export interface DashboardView {
   id: string;
   name: string;
   filters: Record<string, string>;
+  isDefault?: boolean;
   createdBy?: string;
   createdAt?: string;
 }
 
-async function fetchWithAuth(url: string, options?: RequestInit) {
-  const token = await getIdToken();
-  return fetch(appApiPath(url), {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...(token && { Authorization: `Bearer ${token}` }),
-      ...options?.headers,
-    },
-  });
+async function loadViews(dashboardId: string): Promise<DashboardView[]> {
+  const data = await callAction(
+    "list-dashboard-views",
+    { dashboardId },
+    { method: "GET" },
+  );
+  return (data?.views ?? []) as DashboardView[];
 }
 
 export function useDashboardViews(dashboardId: string | undefined) {
   const queryClient = useQueryClient();
-  const queryKey = ["dashboard-views", dashboardId];
+  const { session } = useSession();
+  const queryKey = [
+    "dashboard-views",
+    dashboardId,
+    dashboardCacheScope(session),
+  ];
 
-  const { data: views = [], isLoading } = useQuery({
+  const viewsQuery = useQuery({
     queryKey,
     queryFn: async (): Promise<DashboardView[]> => {
       if (!dashboardId) return [];
-      const res = await fetchWithAuth(
-        `/api/dashboard-views/${encodeURIComponent(dashboardId)}`,
-      );
-      if (!res.ok) return [];
-      const data = await res.json();
-      return data.views ?? [];
+      return await loadViews(dashboardId);
     },
     enabled: !!dashboardId,
     staleTime: 30_000,
   });
+  const views = viewsQuery.data ?? [];
 
   const { mutateAsync: saveView } = useMutation({
     mutationFn: async (view: DashboardView) => {
       if (!dashboardId) return;
-      await fetchWithAuth(
-        `/api/dashboard-views/${encodeURIComponent(dashboardId)}`,
-        {
-          method: "POST",
-          body: JSON.stringify(view),
-        },
-      );
+      await callAction("save-dashboard-view", {
+        dashboardId,
+        id: view.id,
+        name: view.name,
+        filters: view.filters,
+        isDefault: view.isDefault,
+      });
     },
     onSettled: () => {
-      queryClient.invalidateQueries({ queryKey });
-      // Also invalidate the sidebar views query
-      queryClient.invalidateQueries({ queryKey: ["all-dashboard-views"] });
+      void queryClient.invalidateQueries({ queryKey });
+      void queryClient.invalidateQueries({ queryKey: ["all-dashboard-views"] });
     },
   });
 
   const { mutateAsync: deleteView } = useMutation({
     mutationFn: async (viewId: string) => {
       if (!dashboardId) return;
-      await fetchWithAuth(
-        `/api/dashboard-views/${encodeURIComponent(dashboardId)}/${encodeURIComponent(viewId)}`,
+      await callAction(
+        "delete-dashboard-view",
+        { dashboardId, viewId },
         { method: "DELETE" },
       );
     },
     onSettled: () => {
-      queryClient.invalidateQueries({ queryKey });
-      queryClient.invalidateQueries({ queryKey: ["all-dashboard-views"] });
+      void queryClient.invalidateQueries({ queryKey });
+      void queryClient.invalidateQueries({ queryKey: ["all-dashboard-views"] });
     },
   });
 
-  return { views, isLoading, saveView, deleteView };
+  return {
+    views,
+    isLoading: viewsQuery.isLoading,
+    isSuccess: viewsQuery.isSuccess,
+    isSettled: viewsQuery.isSuccess || viewsQuery.isError,
+    error: viewsQuery.error,
+    refetch: viewsQuery.refetch,
+    saveView,
+    deleteView,
+  };
 }
 
-/**
- * Standalone delete mutation — lets sidebar rows call delete without
- * subscribing to the per-dashboard views query (which would double-fetch
- * what `useAllDashboardViews` already loads).
- */
 export function useDeleteDashboardView() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -91,39 +95,34 @@ export function useDeleteDashboardView() {
       dashboardId: string;
       viewId: string;
     }) => {
-      const res = await fetchWithAuth(
-        `/api/dashboard-views/${encodeURIComponent(dashboardId)}/${encodeURIComponent(viewId)}`,
+      await callAction(
+        "delete-dashboard-view",
+        { dashboardId, viewId },
         { method: "DELETE" },
       );
-      if (!res.ok) throw new Error(`Delete failed: ${res.status}`);
     },
     onSettled: (_data, _err, { dashboardId }) => {
-      queryClient.invalidateQueries({
+      void queryClient.invalidateQueries({
         queryKey: ["dashboard-views", dashboardId],
       });
-      queryClient.invalidateQueries({ queryKey: ["all-dashboard-views"] });
+      void queryClient.invalidateQueries({ queryKey: ["all-dashboard-views"] });
     },
   });
 }
 
-/**
- * Fetch views for all dashboards at once (for sidebar).
- * Returns a map of dashboardId -> DashboardView[].
- */
 export function useAllDashboardViews(dashboardIds: string[]) {
+  const { session } = useSession();
   return useQuery({
-    queryKey: ["all-dashboard-views", dashboardIds.join(",")],
+    queryKey: [
+      "all-dashboard-views",
+      dashboardIds.join(","),
+      dashboardCacheScope(session),
+    ],
     queryFn: async (): Promise<Record<string, DashboardView[]>> => {
       const results: Record<string, DashboardView[]> = {};
       await Promise.all(
         dashboardIds.map(async (id) => {
-          const res = await fetchWithAuth(
-            `/api/dashboard-views/${encodeURIComponent(id)}`,
-          );
-          if (res.ok) {
-            const data = await res.json();
-            results[id] = data.views ?? [];
-          }
+          results[id] = await loadViews(id);
         }),
       );
       return results;

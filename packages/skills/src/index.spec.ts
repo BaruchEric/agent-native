@@ -1,9 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runSkills as runCoreSkills } from "@agent-native/core/cli/skills";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   installSkills,
@@ -43,12 +43,17 @@ function workspaceRoot(): string {
   throw new Error("Could not locate workspace root.");
 }
 
-function writeSkill(repo: string, name: string, body = "Body"): void {
+function writeSkill(
+  repo: string,
+  name: string,
+  body = "Body",
+  installerGroup?: string,
+): void {
   const dir = path.join(repo, "skills", name);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
     path.join(dir, "SKILL.md"),
-    `---\nname: ${name}\ndescription: Use when testing ${name}.\n---\n\n# ${name}\n\n${body}\n`,
+    `---\nname: ${name}\n${installerGroup ? `installer-group: ${installerGroup}\n` : ""}description: Use when testing ${name}.\n---\n\n# ${name}\n\n${body}\n`,
     "utf-8",
   );
 }
@@ -95,6 +100,17 @@ describe("@agent-native/skills", () => {
       clients: ["codex", "cowork"],
       scope: "project",
       updateInstructions: true,
+    });
+  });
+
+  it("parses scaffold update commands for generated workspaces", () => {
+    expect(
+      parseSkillsCliArgs(["update", "scaffold", "--project"]),
+    ).toMatchObject({
+      command: "update",
+      source: "scaffold",
+      scope: "project",
+      scopeExplicit: true,
     });
   });
 
@@ -194,6 +210,17 @@ describe("@agent-native/skills", () => {
     ).toBe(false);
   });
 
+  it("forwards scaffold update commands through the shared core flow", async () => {
+    await runSkillsCli(["update", "scaffold", "--project"], {
+      isInteractive: () => false,
+    });
+
+    expect(runCoreSkills).toHaveBeenCalledWith(
+      ["update", "scaffold", "--scope", "project"],
+      expect.objectContaining({ catalogMode: "all" }),
+    );
+  });
+
   it("installs every plain source skill directly when no skill is explicit", async () => {
     const repo = tmpDir();
     const project = tmpDir();
@@ -272,7 +299,10 @@ describe("@agent-native/skills", () => {
     const project = tmpDir();
     writeSkill(repo, "quick-recap");
     writeSkill(repo, "efficient-fable");
+    writeSkill(repo, "factory", "Body", "factory");
+    writeSkill(repo, "factory-review-prs", "Body", "factory");
     let skillContext: SkillsPromptContext | undefined;
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
     await runSkillsCli(["add", "--copy", repo], {
       baseDir: project,
@@ -294,7 +324,9 @@ describe("@agent-native/skills", () => {
       catalogMode: "all",
       hiddenBuiltInSkillTargets: [
         "assets",
+        "content",
         "design-exploration",
+        "visual-edit",
         "context-xray",
       ],
       publicSkillSource: repo,
@@ -304,6 +336,16 @@ describe("@agent-native/skills", () => {
           description: "Use when testing efficient-fable.",
         },
         {
+          name: "factory",
+          description: "Use when testing factory.",
+          installerGroup: "factory",
+        },
+        {
+          name: "factory-review-prs",
+          description: "Use when testing factory-review-prs.",
+          installerGroup: "factory",
+        },
+        {
           name: "quick-recap",
           description: "Use when testing quick-recap.",
         },
@@ -311,14 +353,78 @@ describe("@agent-native/skills", () => {
     });
 
     const selected = await (options as any).promptSkills({
-      initialTargets: ["visual-plan", "visual-recap"],
+      message: "Choose a Factory subset.",
+      initialTargets: ["visual-plan", "visual-recap", "visualize-repo"],
+      required: false,
       options: [{ value: "quick-recap", label: "quick-recap", hint: "Recap" }],
     });
     expect(selected).toEqual(["quick-recap"]);
     expect(skillContext).toMatchObject({
-      initialSkills: ["visual-plan", "visual-recap"],
+      message: "Choose a Factory subset.",
+      initialSkills: ["visual-plan", "visual-recap", "visualize-repo"],
+      required: false,
       options: [{ value: "quick-recap" }],
     });
+  });
+
+  it("prints startup progress before interactive delegated installs", async () => {
+    const repo = tmpDir();
+    const project = tmpDir();
+    writeSkill(repo, "quick-recap");
+    const stderr: string[] = [];
+    const previousDirect = process.env.AGENT_NATIVE_SKILLS_DIRECT;
+    delete process.env.AGENT_NATIVE_SKILLS_DIRECT;
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+
+    try {
+      await runSkillsCli(["add", "--copy", repo], {
+        baseDir: project,
+        isInteractive: () => true,
+      });
+    } finally {
+      if (previousDirect === undefined)
+        delete process.env.AGENT_NATIVE_SKILLS_DIRECT;
+      else process.env.AGENT_NATIVE_SKILLS_DIRECT = previousDirect;
+    }
+
+    expect(stderr.join("")).toContain("Preparing Agent-Native skills");
+  });
+
+  it("keeps delegated startup progress out of machine-readable and non-interactive output", async () => {
+    const repo = tmpDir();
+    const project = tmpDir();
+    writeSkill(repo, "quick-recap");
+    const stderr: string[] = [];
+    const previousDirect = process.env.AGENT_NATIVE_SKILLS_DIRECT;
+    delete process.env.AGENT_NATIVE_SKILLS_DIRECT;
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+
+    try {
+      await runSkillsCli(["add", "--copy", repo, "--json"], {
+        baseDir: project,
+        isInteractive: () => true,
+      });
+      await runSkillsCli(["add", "--copy", repo, "--quiet"], {
+        baseDir: project,
+        isInteractive: () => true,
+      });
+      await runSkillsCli(["add", "--copy", repo], {
+        baseDir: project,
+        isInteractive: () => false,
+      });
+    } finally {
+      if (previousDirect === undefined)
+        delete process.env.AGENT_NATIVE_SKILLS_DIRECT;
+      else process.env.AGENT_NATIVE_SKILLS_DIRECT = previousDirect;
+    }
+
+    expect(stderr.join("")).toBe("");
   });
 
   it("installs copied source skills headlessly in direct mode", async () => {
@@ -661,6 +767,165 @@ describe("@agent-native/skills", () => {
     );
   });
 
+  it("delegates Rewind installs to the core local Screen Memory flow", async () => {
+    const project = tmpDir();
+    const previousDirect = process.env.AGENT_NATIVE_SKILLS_DIRECT;
+    delete process.env.AGENT_NATIVE_SKILLS_DIRECT;
+
+    try {
+      await runSkillsCli(
+        [
+          "add",
+          "--skill",
+          "rewind",
+          "--client",
+          "codex",
+          "--scope",
+          "user",
+          "--yes",
+          "--json",
+        ],
+        { baseDir: project, isInteractive: () => false },
+      );
+    } finally {
+      if (previousDirect === undefined)
+        delete process.env.AGENT_NATIVE_SKILLS_DIRECT;
+      else process.env.AGENT_NATIVE_SKILLS_DIRECT = previousDirect;
+    }
+
+    expect(runCoreSkills).toHaveBeenCalledWith(
+      [
+        "add",
+        "rewind",
+        "--client",
+        "codex",
+        "--scope",
+        "user",
+        "--yes",
+        "--json",
+      ],
+      expect.objectContaining({
+        baseDir: project,
+        catalogMode: "all",
+        isInteractive: expect.any(Function),
+        publicSkillEntries: [],
+        publicSkillSource: "BuilderIO/skills",
+      }),
+    );
+  });
+
+  it("surfaces Core's rejection when Rewind MCP setup is disabled", async () => {
+    const project = tmpDir();
+    vi.mocked(runCoreSkills).mockRejectedValueOnce(
+      new Error(
+        "Rewind requires the local Clips Screen Memory MCP and cannot be installed with --no-mcp.",
+      ),
+    );
+
+    await expect(
+      runSkillsCli(
+        [
+          "add",
+          "--skill",
+          "rewind",
+          "--client",
+          "codex",
+          "--scope",
+          "user",
+          "--no-mcp",
+          "--yes",
+        ],
+        { baseDir: project, isInteractive: () => false },
+      ),
+    ).rejects.toThrow("cannot be installed with --no-mcp");
+
+    expect(runCoreSkills).toHaveBeenCalledWith(
+      expect.arrayContaining(["rewind", "--no-mcp"]),
+      expect.objectContaining({ baseDir: project }),
+    );
+  });
+
+  it.each(["screen-memory", "clips-rewind", "agent-native-rewind"])(
+    "delegates the Rewind alias %s directly to Core",
+    async (alias) => {
+      const project = tmpDir();
+
+      await runSkillsCli(
+        [
+          "add",
+          "--skill",
+          alias,
+          "--client",
+          "codex",
+          "--scope",
+          "user",
+          "--yes",
+        ],
+        { baseDir: project, isInteractive: () => false },
+      );
+
+      expect(runCoreSkills).toHaveBeenCalledWith(
+        expect.arrayContaining([alias]),
+        expect.objectContaining({
+          baseDir: project,
+          publicSkillEntries: [],
+        }),
+      );
+    },
+  );
+
+  it("delegates content local-files installs to agent-native core", async () => {
+    const project = tmpDir();
+    const previousDirect = process.env.AGENT_NATIVE_SKILLS_DIRECT;
+    delete process.env.AGENT_NATIVE_SKILLS_DIRECT;
+
+    try {
+      await runSkillsCli(
+        [
+          "add",
+          "--skill",
+          "content",
+          "--client",
+          "codex",
+          "--scope",
+          "project",
+          "--mode",
+          "local-files",
+          "--yes",
+          "--json",
+        ],
+        { baseDir: project, isInteractive: () => false },
+      );
+    } finally {
+      if (previousDirect === undefined)
+        delete process.env.AGENT_NATIVE_SKILLS_DIRECT;
+      else process.env.AGENT_NATIVE_SKILLS_DIRECT = previousDirect;
+    }
+
+    expect(runCoreSkills).toHaveBeenCalledWith(
+      [
+        "add",
+        "content",
+        "--client",
+        "codex",
+        "--scope",
+        "project",
+        "--yes",
+        "--json",
+        "--mode",
+        "local-files",
+      ],
+      expect.objectContaining({
+        baseDir: project,
+        catalogMode: "all",
+        hiddenBuiltInSkillTargets: expect.arrayContaining(["content"]),
+        isInteractive: expect.any(Function),
+        publicSkillEntries: [],
+        publicSkillSource: "BuilderIO/skills",
+      }),
+    );
+  });
+
   it("skips MCP registration for direct visual-plan local-files mode", async () => {
     const repo = tmpDir();
     const project = tmpDir();
@@ -698,7 +963,7 @@ describe("@agent-native/skills", () => {
       scope: "project",
       baseDir: project,
       planMode: "self-hosted",
-      mcpUrl: "https://plans.example.com/team",
+      mcpUrl: "https://plans.example.com/team/_agent-native/mcp",
       updateInstructions: false,
       connect: false,
       yes: true,
@@ -708,7 +973,7 @@ describe("@agent-native/skills", () => {
     expect(result.mcpServers).toHaveLength(1);
     expect(result.mcpServers[0]).toMatchObject({
       serverName: "plan",
-      mcpUrl: "https://plans.example.com/team/_agent-native/mcp",
+      mcpUrl: "https://plans.example.com/team/mcp",
     });
   });
 
@@ -991,7 +1256,6 @@ describe("@agent-native/skills", () => {
         source: repo,
         skillNames: ["quick-recap"],
         clients: ["claude-code"],
-        // scope intentionally omitted so resolveSelectedScope picks a default
         baseDir: project,
         updateInstructions: false,
         yes: true,
@@ -1029,6 +1293,21 @@ describe("@agent-native/skills", () => {
     );
     expect(fs.readFileSync(result.githubActionPath!, "utf-8")).toContain(
       "pr-visual-recap-reusable.yml@main",
+    );
+    expect(fs.readFileSync(result.githubActionPath!, "utf-8")).toContain(
+      "types: [opened, synchronize, reopened, ready_for_review, labeled, closed]",
+    );
+    expect(fs.readFileSync(result.githubActionPath!, "utf-8")).toContain(
+      "if: github.event.action != 'labeled' || vars.VISUAL_RECAP_REQUIRED_LABELS != ''",
+    );
+    expect(fs.readFileSync(result.githubActionPath!, "utf-8")).toContain(
+      `runs-on: \${{ vars.VISUAL_RECAP_RUNS_ON || '"ubuntu-latest"' }}`,
+    );
+    expect(fs.readFileSync(result.githubActionPath!, "utf-8")).toContain(
+      `gate-runs-on: \${{ vars.VISUAL_RECAP_GATE_RUNS_ON || 'ubuntu-latest' }}`,
+    );
+    expect(fs.readFileSync(result.githubActionPath!, "utf-8")).toContain(
+      `required-labels: \${{ vars.VISUAL_RECAP_REQUIRED_LABELS || '' }}`,
     );
   });
 });

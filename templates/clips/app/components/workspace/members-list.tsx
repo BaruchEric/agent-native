@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { useActionMutation } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
 import { IconCrown, IconUserX } from "@tabler/icons-react";
-import { useActionMutation } from "@agent-native/core/client";
 import { useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 import { toast } from "sonner";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+
+import { ClipsAvatar } from "@/components/clips-avatar";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -16,6 +16,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Empty, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import {
   Select,
   SelectContent,
@@ -37,6 +40,7 @@ export type MemberRole = "owner" | "admin" | "member";
 export interface MemberRow {
   id: string;
   email: string;
+  name?: string | null;
   role: MemberRole;
   joinedAt: string | null;
   invitedAt: string | null;
@@ -50,14 +54,14 @@ interface MembersListProps {
   disabled?: boolean;
 }
 
-function initials(email: string): string {
-  const [name] = email.split("@");
-  return (name || email).slice(0, 2).toUpperCase();
+function initials(nameOrEmail: string): string {
+  const [name] = nameOrEmail.split("@");
+  return (name || nameOrEmail).slice(0, 2).toUpperCase();
 }
 
-const ROLE_OPTIONS: { value: MemberRole; label: string }[] = [
-  { value: "member", label: "Member" },
-  { value: "admin", label: "Admin" },
+const ROLE_OPTIONS: { value: MemberRole; labelKey: string }[] = [
+  { value: "member", labelKey: "membersList.memberRole" },
+  { value: "admin", labelKey: "membersList.adminRole" },
 ];
 
 export function MembersList({
@@ -67,6 +71,7 @@ export function MembersList({
   currentUserRole,
   disabled,
 }: MembersListProps) {
+  const t = useT();
   const isAdmin = !disabled && currentUserRole === "admin";
   const [pendingRemove, setPendingRemove] = useState<MemberRow | null>(null);
   const qc = useQueryClient();
@@ -87,12 +92,16 @@ export function MembersList({
         email: member.email,
         role,
       });
-      toast.success(`Updated ${member.email}'s role to ${role}`);
-      qc.invalidateQueries({
+      toast.success(
+        t("membersList.roleUpdated", { email: member.email, role }),
+      );
+      void qc.invalidateQueries({
         queryKey: ["action", "list-organization-state"],
       });
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to update role");
+      toast.error(
+        err instanceof Error ? err.message : t("membersList.updateFailed"),
+      );
     }
   }
 
@@ -103,13 +112,13 @@ export function MembersList({
         organizationId,
         email: pendingRemove.email,
       });
-      toast.success(`Removed ${pendingRemove.email} from the organization`);
-      qc.invalidateQueries({
+      toast.success(t("membersList.removed", { email: pendingRemove.email }));
+      void qc.invalidateQueries({
         queryKey: ["action", "list-organization-state"],
       });
     } catch (err) {
       toast.error(
-        err instanceof Error ? err.message : "Failed to remove member",
+        err instanceof Error ? err.message : t("membersList.removeFailed"),
       );
     } finally {
       setPendingRemove(null);
@@ -118,9 +127,13 @@ export function MembersList({
 
   if (!members.length) {
     return (
-      <div className="py-6 text-center text-sm text-muted-foreground">
-        No members yet.
-      </div>
+      <Empty className="gap-2 border py-6 md:p-6">
+        <EmptyHeader>
+          <EmptyTitle className="text-sm font-medium text-muted-foreground">
+            {t("membersList.noMembers")}
+          </EmptyTitle>
+        </EmptyHeader>
+      </Empty>
     );
   }
 
@@ -130,36 +143,46 @@ export function MembersList({
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>Member</TableHead>
-              <TableHead className="w-40">Role</TableHead>
-              <TableHead className="w-32">Joined</TableHead>
+              <TableHead>{t("membersList.member")}</TableHead>
+              <TableHead className="w-40">
+                {t("organizationSettings.role")}
+              </TableHead>
+              <TableHead className="w-32">{t("membersList.joined")}</TableHead>
               {isAdmin ? <TableHead className="w-20"></TableHead> : null}
             </TableRow>
           </TableHeader>
           <TableBody>
             {members.map((m) => {
               const isSelf = m.email === currentUserEmail;
+              const displayName = m.name?.trim() || m.email;
               return (
                 <TableRow key={m.id}>
                   <TableCell>
                     <div className="flex items-center gap-2 min-w-0">
-                      <Avatar className="h-8 w-8 flex-shrink-0">
-                        <AvatarFallback className="text-xs bg-primary text-primary-foreground">
-                          {initials(m.email)}
-                        </AvatarFallback>
-                      </Avatar>
+                      <ClipsAvatar
+                        email={m.email}
+                        alt={displayName}
+                        fallback={initials(displayName)}
+                        className="h-8 w-8 flex-shrink-0"
+                        fallbackClassName="text-xs bg-primary text-primary-foreground"
+                      />
                       <div className="min-w-0">
                         <div className="truncate font-medium flex items-center gap-1.5">
-                          {m.email}
+                          {displayName}
                           {m.role === "admin" ? (
                             <IconCrown className="size-3.5 text-amber-500" />
                           ) : null}
                           {isSelf ? (
                             <span className="text-xs text-muted-foreground">
-                              (you)
+                              {t("membersList.you")}
                             </span>
                           ) : null}
                         </div>
+                        {displayName !== m.email ? (
+                          <div className="truncate text-xs text-muted-foreground">
+                            {m.email}
+                          </div>
+                        ) : null}
                       </div>
                     </div>
                   </TableCell>
@@ -171,13 +194,13 @@ export function MembersList({
                           handleRoleChange(m, v as MemberRole)
                         }
                       >
-                        <SelectTrigger className="h-8 w-36">
+                        <SelectTrigger size="sm" className="w-36">
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
                           {ROLE_OPTIONS.map((opt) => (
                             <SelectItem key={opt.value} value={opt.value}>
-                              {opt.label}
+                              {t(opt.labelKey)}
                             </SelectItem>
                           ))}
                         </SelectContent>
@@ -198,10 +221,12 @@ export function MembersList({
                       {!isSelf ? (
                         <Button
                           variant="ghost"
-                          size="icon"
-                          className="h-8 w-8 text-muted-foreground hover:text-red-600"
+                          size="icon-sm"
+                          className="text-muted-foreground hover:text-destructive"
                           onClick={() => setPendingRemove(m)}
-                          aria-label={`Remove ${m.email}`}
+                          aria-label={t("membersList.removeMemberLabel", {
+                            email: m.email,
+                          })}
                         >
                           <IconUserX className="size-4" />
                         </Button>
@@ -221,20 +246,22 @@ export function MembersList({
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Remove member?</AlertDialogTitle>
+            <AlertDialogTitle>{t("membersList.removeTitle")}</AlertDialogTitle>
             <AlertDialogDescription>
               {pendingRemove
-                ? `${pendingRemove.email} will lose access to this organization. You can always invite them back.`
+                ? t("membersList.removeDescription", {
+                    email: pendingRemove.email,
+                  })
                 : ""}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
             <AlertDialogAction
               onClick={handleRemove}
               className="bg-red-600 hover:bg-red-700"
             >
-              Remove
+              {t("membersList.remove")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

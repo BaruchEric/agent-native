@@ -1,43 +1,19 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { IconWand } from "@tabler/icons-react";
-import { Textarea } from "@/components/ui/textarea";
-import { cn } from "@/lib/utils";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
+import { useT } from "@agent-native/core/client/i18n";
+import { SharedRichEditor } from "@agent-native/toolkit/editor";
+import { useEffect, useRef, useState } from "react";
 
-function useAutoGrow(
-  ref: React.RefObject<HTMLTextAreaElement | null>,
-  dep: unknown,
-) {
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
-  }, [ref, dep]);
-}
+import { cn } from "@/lib/utils";
 
 interface CanvasEditorProps {
-  /** Which content this canvas renders. */
   view: "user" | "ai";
-  /** User's own notes (renders bold black). Required for the "user" view. */
   userNotesMd?: string;
-  /** Save user notes. Called on blur after edit. */
   onUserNotesChange?: (next: string) => void;
-  /** AI-generated summary (renders muted-gray). For the "ai" view. */
   summaryMd?: string;
-  /** AI-generated bullets (renders muted-gray). For the "ai" view. */
   bullets?: string[];
-  /** Save AI summary when the user edits the summary section. */
   onSummaryChange?: (next: string) => void;
-  /** Render bullets with magnifier (BulletLink) wrappers. */
   renderBullet?: (bullet: string, index: number) => React.ReactNode;
-  /** When true, notes render as read-only (viewer-role access). */
   readOnly?: boolean;
+  className?: string;
 }
 
 export function CanvasEditor({
@@ -49,13 +25,15 @@ export function CanvasEditor({
   onSummaryChange,
   renderBullet,
   readOnly = false,
+  className,
 }: CanvasEditorProps) {
+  const t = useT();
   const showUser = view === "user";
   const showAi = view === "ai";
   const hasAi = summaryMd || bullets.length > 0;
 
   return (
-    <div className="px-6 py-6 space-y-6 max-w-2xl">
+    <div className={cn("px-6 py-6 space-y-6 max-w-2xl", className)}>
       {/* User notes block */}
       {showUser && (
         <UserNotesBlock
@@ -82,14 +60,12 @@ export function CanvasEditor({
       {/* Empty state when AI notes haven't been generated yet */}
       {showAi && !hasAi && (
         <p className="text-sm leading-relaxed text-muted-foreground/50 italic">
-          No AI notes yet. Generate notes from a finished transcript.
+          {t("meetingCanvas.noAiNotes")}
         </p>
       )}
     </div>
   );
 }
-
-/* -------------------------------------------------------------------------- */
 
 function UserNotesBlock({
   value,
@@ -100,49 +76,27 @@ function UserNotesBlock({
   onChange: (next: string) => void;
   readOnly?: boolean;
 }) {
-  const ref = useRef<HTMLTextAreaElement>(null);
-  const [draft, setDraft] = useState(value);
-  const focusedRef = useRef(false);
+  const t = useT();
 
-  // Sync external updates (live polling, desktop-app sync) into the editor —
-  // but only while it's not focused, so we never clobber what's being typed.
-  useEffect(() => {
-    if (!focusedRef.current) setDraft(value);
-  }, [value]);
-
-  useAutoGrow(ref, draft);
-
-  if (readOnly) {
-    return value ? (
-      <p className="text-base leading-relaxed text-foreground font-medium whitespace-pre-wrap">
-        {value}
-      </p>
-    ) : (
+  if (readOnly && !value) {
+    return (
       <p className="text-sm leading-relaxed text-muted-foreground/50 italic">
-        No notes.
+        {t("meetingCanvas.noNotes")}
       </p>
     );
   }
 
   return (
-    <Textarea
-      ref={ref}
-      value={draft}
-      placeholder="Your notes…"
-      onChange={(e) => setDraft(e.target.value)}
-      onFocus={() => {
-        focusedRef.current = true;
-      }}
-      onBlur={(e) => {
-        focusedRef.current = false;
-        if (e.target.value !== value) onChange(e.target.value);
-      }}
-      className="min-h-[80px] resize-none overflow-hidden text-base leading-relaxed text-foreground font-medium border-none shadow-none focus-visible:ring-0 px-0"
+    <RichContentBlock
+      value={value}
+      onChange={onChange}
+      readOnly={readOnly}
+      placeholder={t("meetingCanvas.yourNotes")}
+      ariaLabel={t("meetingDetail.myNotes")}
+      editorClassName="text-base leading-relaxed font-medium"
     />
   );
 }
-
-/* -------------------------------------------------------------------------- */
 
 function AiSummaryBlock({
   value,
@@ -153,98 +107,73 @@ function AiSummaryBlock({
   onChange: (next: string) => void;
   readOnly?: boolean;
 }) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(value);
-  const ref = useRef<HTMLTextAreaElement>(null);
-
-  useEffect(() => {
-    if (!editing) setDraft(value);
-  }, [value, editing]);
-
-  useEffect(() => {
-    if (editing) {
-      const el = ref.current;
-      if (el) {
-        el.focus();
-        el.setSelectionRange(el.value.length, el.value.length);
-      }
-    }
-  }, [editing]);
-
-  useAutoGrow(ref, editing ? draft : null);
-
-  if (readOnly) {
-    return (
-      <div className="space-y-1.5">
-        <AiTabIndicator />
-        <p className="text-sm leading-relaxed whitespace-pre-wrap text-muted-foreground">
-          {value}
-        </p>
-      </div>
-    );
-  }
-
-  const commit = () => {
-    setEditing(false);
-    const next = draft;
-    if (next === value) return;
-    onChange(next);
-  };
-
-  if (editing) {
-    return (
-      <div className="space-y-1.5">
-        <AiTabIndicator />
-        <Textarea
-          ref={ref}
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onBlur={commit}
-          onKeyDown={(e) => {
-            if (e.key === "Escape") {
-              setDraft(value);
-              setEditing(false);
-            }
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-              e.preventDefault();
-              commit();
-            }
-          }}
-          // Once the user starts typing, it visually flips to foreground.
-          className="min-h-[100px] resize-none overflow-hidden text-sm leading-relaxed text-foreground border-none shadow-none focus-visible:ring-0 px-0"
-        />
-      </div>
-    );
-  }
+  const t = useT();
 
   return (
-    <TooltipProvider delayDuration={200}>
-      <div className="group relative space-y-1.5">
-        <AiTabIndicator />
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              onClick={() => setEditing(true)}
-              className="block w-full text-left cursor-text"
-            >
-              <p
-                className={cn(
-                  "text-sm leading-relaxed whitespace-pre-wrap text-muted-foreground rounded -mx-1 px-1 group-hover:bg-accent/30",
-                )}
-              >
-                {value}
-              </p>
-            </button>
-          </TooltipTrigger>
-          <TooltipContent>Click to edit</TooltipContent>
-        </Tooltip>
-      </div>
-    </TooltipProvider>
+    <div className="space-y-1.5">
+      <AiTabIndicator />
+      <RichContentBlock
+        value={value}
+        onChange={onChange}
+        readOnly={readOnly}
+        placeholder={t("meetingCanvas.clickToEdit")}
+        ariaLabel={t("meetingDetail.aiNotes")}
+        editorClassName="text-sm leading-relaxed text-muted-foreground"
+      />
+    </div>
   );
 }
 
-/* -------------------------------------------------------------------------- */
+function RichContentBlock({
+  value,
+  onChange,
+  readOnly,
+  placeholder,
+  ariaLabel,
+  editorClassName,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+  readOnly: boolean;
+  placeholder: string;
+  ariaLabel: string;
+  editorClassName?: string;
+}) {
+  const [draft, setDraft] = useState(value);
+  const draftRef = useRef(value);
+  const focusedRef = useRef(false);
+
+  useEffect(() => {
+    if (focusedRef.current) return;
+    draftRef.current = value;
+    setDraft(value);
+  }, [value]);
+
+  const commit = () => {
+    focusedRef.current = false;
+    const next = draftRef.current;
+    if (next !== value) onChange(next);
+  };
+
+  return (
+    <SharedRichEditor
+      value={draft}
+      onChange={(next) => {
+        focusedRef.current = true;
+        draftRef.current = next;
+        setDraft(next);
+      }}
+      onBlur={commit}
+      editable={!readOnly}
+      dialect="nfm"
+      preset="content"
+      placeholder={placeholder}
+      ariaLabel={ariaLabel}
+      className="-mx-1 rounded-md px-1"
+      editorClassName={cn("min-h-[2rem]", editorClassName)}
+    />
+  );
+}
 
 function AiBulletsBlock({
   bullets,
@@ -271,13 +200,6 @@ function AiBulletsBlock({
   );
 }
 
-/* -------------------------------------------------------------------------- */
-
 function AiTabIndicator() {
-  return (
-    <div className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-muted-foreground/60 opacity-0 group-hover:opacity-100 transition-opacity">
-      <IconWand className="h-3 w-3" />
-      <span>AI</span>
-    </div>
-  );
+  return null;
 }

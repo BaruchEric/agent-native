@@ -1,5 +1,5 @@
 import { defineAction } from "@agent-native/core/action";
-import { writeAppState } from "@agent-native/core/application-state";
+import { writeAppStateForCurrentTab } from "@agent-native/core/application-state";
 import { z } from "zod";
 
 export default defineAction({
@@ -12,13 +12,13 @@ export default defineAction({
   http: false,
   run: async (args) => {
     if (!args.view && !args.path) {
-      return "Error: At least --view or --path is required.";
+      throw new Error("At least --view or --path is required.");
     }
     const nav: Record<string, string> = {};
     if (args.view) nav.view = args.view;
     if (args.path) nav.path = args.path;
     nav._writeId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    await writeAppState("navigate", nav);
+    await writeAppStateForCurrentTab("navigate", nav);
     return `Navigating to ${args.view || args.path}`;
   },
 });

@@ -1,9 +1,8 @@
 {
-  "name": "Agent Native App",
-  "short_name": "App",
-  "description": "Agent-native application",
-  "start_url": "/",
-  "display": "standalone",
+  "name": "{{APP_TITLE}}",
+  "short_name": "{{APP_TITLE}}",
+  "description": "Agent-Native application",
+  "start_url": "./home",
   "background_color": "#111111",
   "theme_color": "#111111",
   "icons": [

@@ -1,4 +1,8 @@
-import { useActionMutation, useActionQuery } from "@agent-native/core/client";
+import {
+  useActionMutation,
+  useActionQuery,
+} from "@agent-native/core/client/hooks";
+
 import type { DeckVersion, DeckVersionListResponse } from "../../shared/api";
 
 export function useDeckVersions(deckId: string | null) {
@@ -7,7 +11,6 @@ export function useDeckVersions(deckId: string | null) {
     deckId ? { deckId } : undefined,
     {
       enabled: !!deckId,
-      placeholderData: (prev: any) => prev,
     } as any,
   );
 }
@@ -21,7 +24,6 @@ export function useDeckVersion(
     deckId && versionId ? { deckId, versionId } : undefined,
     {
       enabled: !!(deckId && versionId),
-      placeholderData: (prev: any) => prev,
     } as any,
   );
 }

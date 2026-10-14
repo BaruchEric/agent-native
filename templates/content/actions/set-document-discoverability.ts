@@ -1,8 +1,9 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { assertAccess } from "@agent-native/core/sharing";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 
 const booleanArg = z.preprocess((value) => {
@@ -13,7 +14,7 @@ const booleanArg = z.preprocess((value) => {
   return value;
 }, z.boolean());
 
-async function collectDocumentSubtreeIds({
+export async function collectDocumentSubtreeIds({
   db,
   rootId,
   ownerEmail,

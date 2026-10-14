@@ -1,17 +1,12 @@
-/**
- * Add an emoji reaction to a recording at a specific video timestamp.
- *
- * Usage:
- *   pnpm action react-to-recording --recordingId=<id> --emoji="🔥" --videoTimestampMs=12000
- */
-
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { getDb, schema } from "../server/db/index.js";
-import { nanoid } from "../server/lib/recordings.js";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { getRequestUserEmail } from "@agent-native/core/server/request-context";
 import { assertAccess } from "@agent-native/core/sharing";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
+import { notifyRecordingReaction } from "../server/lib/activity-notifications.js";
+import { nanoid } from "../server/lib/recordings.js";
 
 export default defineAction({
   description:
@@ -49,8 +44,16 @@ export default defineAction({
       createdAt: now,
     });
 
+    const notified = await notifyRecordingReaction({
+      recordingId: args.recordingId,
+      emoji: args.emoji,
+      viewerEmail,
+      viewerName: args.viewerName,
+      videoTimestampMs: args.videoTimestampMs,
+    });
+
     await writeAppState("refresh-signal", { ts: Date.now() });
 
-    return { id };
+    return { id, notified };
   },
 });

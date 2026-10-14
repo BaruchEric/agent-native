@@ -1,18 +1,17 @@
-# React Router generated types
 .react-router/
 
-# Logs
 logs
 *.log
 npm-debug.log*
 pnpm-debug.log*
 
 node_modules
+build/
 dist
 dist-ssr
+.output/
 *.local
 
-# Editor directories and files
 .vscode/*
 !.vscode/extensions.json
 .idea
@@ -23,17 +22,17 @@ dist-ssr
 *.sln
 *.sw?
 
-# Environment
 .env
 .env.*
 !.env.example
+.tmp/
 
-# Data
+**/data/
 data/uploads/
 data/settings.json
 data/.sessions.json
 
-# Learnings (personal preferences and memory — use learnings.defaults.md for tracked defaults)
 learnings.md
 
 .vercel/
+.agent-native/

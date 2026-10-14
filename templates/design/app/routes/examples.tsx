@@ -1,11 +1,8 @@
+import { withSsrHtmlContentType } from "@agent-native/core/shared";
 import { redirect } from "react-router";
 
 export function loader() {
-  return redirect("/templates", 301);
-}
-
-export function meta() {
-  return [{ title: "Design Templates" }];
+  return withSsrHtmlContentType(redirect("/", 302));
 }
 
 export default function ExamplesRedirect() {

@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
 import {
   DEFAULT_PLAN_HOSTED_URL,
   planConnectCommand,
@@ -29,8 +31,6 @@ describe("plan-publish auth resolution", () => {
       fs.mkdtempSync(path.join(os.tmpdir(), "plan-pub-")),
       "plan-publish.json",
     );
-    // Point the config path at a file that does not exist by default so the
-    // resolver does not read the real user's ~/.agent-native config.
     process.env.PLAN_PUBLISH_CONFIG_PATH = tmpFile;
   });
 

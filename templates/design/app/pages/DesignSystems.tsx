@@ -1,33 +1,46 @@
+import { appApiPath } from "@agent-native/core/client/api-path";
 import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-  type ReactNode,
-} from "react";
-import { Link, useNavigate, useSearchParams } from "react-router";
+  isDesignSystemTierAtMax,
+  type DesignSystemTierLimit,
+} from "@agent-native/core/client/design-system-tier-limit";
+import {
+  useActionQuery,
+  useActionMutation,
+} from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { withBuilderUtmTrackingParams } from "@agent-native/core/shared";
+import {
+  useSetHeaderActions,
+  useSetPageTitle,
+} from "@agent-native/toolkit/app-shell";
+import { ShareButton } from "@agent-native/toolkit/app/sharing";
+import { VisibilityBadge } from "@agent-native/toolkit/sharing";
 import {
   IconCheckbox,
   IconChecks,
+  IconComponents,
   IconDots,
-  IconPlus,
+  IconExternalLink,
   IconPalette,
+  IconPlus,
   IconStar,
   IconStarFilled,
   IconTrash,
   IconX,
 } from "@tabler/icons-react";
-import {
-  ShareButton,
-  VisibilityBadge,
-  useActionQuery,
-  useActionMutation,
-} from "@agent-native/core/client";
 import { useQueryClient } from "@tanstack/react-query";
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from "react";
+import { Link, useNavigate, useSearchParams } from "react-router";
+import { toast } from "sonner";
+
 import {
   AlertDialog,
   AlertDialogAction,
@@ -38,12 +51,17 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { afterBodyPointerUnlock } from "@/components/ui/pointer-lock";
 import {
   Sheet,
   SheetContent,
@@ -54,15 +72,28 @@ import {
 } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  useSetHeaderActions,
-  useSetPageTitle,
-} from "@/components/layout/HeaderActions";
-import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { toast } from "sonner";
+import {
+  useDesignSystemWorkflows,
+  useDesignSystemWorkflowsState,
+} from "@/hooks/use-design-system-workflows";
+import {
+  formatDesignTokenValue,
+  getCssColorToken,
+} from "@/lib/design-system-preview";
+
+import { JoinDesignSystemWaitlistButton } from "../components/design-system/JoinDesignSystemWaitlistButton";
+import { QueryErrorState } from "../components/QueryErrorState";
+import {
+  builderRefreshKey,
+  isTrustedBuilderPreviewUrl,
+  parseDesignSystemData,
+  shouldRefreshBuilderDesignSystem,
+  type DesignSystemData,
+} from "../lib/design-system-data";
 
 interface DesignSystem {
   id: string;
@@ -73,55 +104,108 @@ interface DesignSystem {
   customInstructions?: string | null;
   isDefault: boolean;
   visibility?: "private" | "org" | "public" | null;
-  accessRole?: "owner" | "viewer" | "editor" | "admin";
+  accessRole?: "owner" | "viewer" | "commenter" | "editor" | "admin";
   canManage?: boolean;
   createdAt: string;
   updatedAt?: string;
 }
 
-interface DesignSystemData {
-  colors?: {
-    primary?: string;
-    secondary?: string;
-    accent?: string;
-    background?: string;
-    surface?: string;
-    text?: string;
-    textMuted?: string;
-  };
-  typography?: {
-    headingFont?: string;
-    bodyFont?: string;
-    headingWeight?: string;
-    bodyWeight?: string;
-  };
-  spacing?: Record<string, string | undefined>;
-  borders?: Record<string, string | undefined>;
-  logos?: Array<{ url?: string; name?: string; variant?: string }>;
-  defaults?: Record<string, string | undefined>;
-  notes?: string;
+type BuilderRefreshResult = {
+  synced: boolean;
+  status?: string;
+  docCount?: number;
+  rejectedTokenCount?: number;
+};
+
+function isSettledBuilderRefresh(result: BuilderRefreshResult): boolean {
+  if (typeof result.docCount === "number" && result.docCount > 0) return true;
+  return (
+    result.status === "error" ||
+    result.status === "failed" ||
+    result.status === "cancelled"
+  );
+}
+
+function getDesignSystemsPageMode({
+  designSystems,
+  systemsEnabled,
+  systemsFlagStatus,
+  isLoading,
+  isError,
+}: {
+  designSystems: DesignSystem[];
+  systemsEnabled: boolean;
+  systemsFlagStatus: "loading" | "ready" | "unavailable";
+  isLoading: boolean;
+  isError: boolean;
+}): "loading" | "error" | "comingSoon" | "empty" | "systems" {
+  if (designSystems.length > 0) return "systems";
+  if (isError || systemsFlagStatus === "unavailable") return "error";
+  if (systemsFlagStatus === "loading") return "loading";
+  if (!systemsEnabled) return "comingSoon";
+  if (isLoading) return "loading";
+  return "empty";
 }
 
 export default function DesignSystems() {
+  const workflowsState = useDesignSystemWorkflowsState();
+  const systemsEnabled =
+    workflowsState.status === "ready" && workflowsState.enabled;
+  const showWaitlist =
+    workflowsState.status === "ready" && !workflowsState.enabled;
+  const t = useT();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [tierLimitDialogOpen, setTierLimitDialogOpen] = useState(false);
+  const { data: tierLimit } = useActionQuery<DesignSystemTierLimit>(
+    "get-design-system-tier-limit",
+  );
+  const atMax = isDesignSystemTierAtMax(tierLimit);
+  const handleCreateClick = useCallback(
+    (event: ReactMouseEvent) => {
+      if (!atMax) return;
+      event.preventDefault();
+      setTierLimitDialogOpen(true);
+    },
+    [atMax],
+  );
   const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [selectedSystemIds, setSelectedSystemIds] = useState<Set<string>>(
     () => new Set(),
   );
-
-  const { data, isLoading } = useActionQuery<{
+  const { data, isLoading, isError, isFetching, refetch } = useActionQuery<{
     designSystems: DesignSystem[];
   }>("list-design-systems");
 
   const setDefaultMutation = useActionMutation("set-default-design-system");
   const deleteMutation = useActionMutation("delete-design-system");
   const updateMutation = useActionMutation("update-design-system");
+  const refreshBuilderSystemMutation = useActionMutation<
+    BuilderRefreshResult,
+    { id: string }
+  >("refresh-design-system-with-builder", {
+    skipActionQueryInvalidation: true,
+  });
+  const refreshBuilderSystemRef = useRef(
+    refreshBuilderSystemMutation.mutateAsync,
+  );
+  refreshBuilderSystemRef.current = refreshBuilderSystemMutation.mutateAsync;
+  const settledBuilderRefreshesRef = useRef(new Set<string>());
+  const stoppedBuilderRefreshesRef = useRef(new Set<string>());
+  const activeBuilderRefreshesRef = useRef(new Set<string>());
 
   const designSystems = data?.designSystems ?? [];
+  const pageMode = getDesignSystemsPageMode({
+    designSystems,
+    systemsEnabled,
+    systemsFlagStatus: workflowsState.status,
+    isLoading,
+    isError,
+  });
   const selectedDesignSystemId = searchParams.get("designSystemId");
   const selectedDesignSystem = useMemo(
     () =>
@@ -138,18 +222,18 @@ export default function DesignSystems() {
 
   const openDesignSystemDetails = useCallback(
     (id: string) => {
-      navigate(`/design-systems?designSystemId=${encodeURIComponent(id)}`);
+      void navigate(`/design-systems?designSystemId=${encodeURIComponent(id)}`);
     },
     [navigate],
   );
 
   const closeDesignSystemDetails = useCallback(() => {
-    navigate("/design-systems", { replace: true });
+    void navigate("/design-systems", { replace: true });
   }, [navigate]);
 
   const openSetupFromDesignSystem = useCallback(
     (id: string) => {
-      navigate(`/design-systems/setup?source=${encodeURIComponent(id)}`);
+      void navigate(`/design-systems/setup?source=${encodeURIComponent(id)}`);
     },
     [navigate],
   );
@@ -206,8 +290,7 @@ export default function DesignSystems() {
   }, []);
 
   const handleSetDefault = useCallback(
-    (id: string) => {
-      // Optimistic update
+    (id: string, isDefault: boolean) => {
       queryClient.setQueryData(
         ["action", "list-design-systems", undefined],
         (old: any) => {
@@ -216,15 +299,19 @@ export default function DesignSystems() {
             ...old,
             designSystems: old.designSystems.map((ds: DesignSystem) => ({
               ...ds,
-              isDefault: ds.id === id,
+              isDefault: isDefault
+                ? ds.id === id
+                : ds.id === id
+                  ? false
+                  : ds.isDefault,
             })),
           };
         },
       );
 
-      setDefaultMutation.mutate({ id } as any, {
+      setDefaultMutation.mutate({ id, isDefault } as any, {
         onError: () => {
-          queryClient.invalidateQueries({
+          void queryClient.invalidateQueries({
             queryKey: ["action", "list-design-systems"],
           });
         },
@@ -252,16 +339,16 @@ export default function DesignSystems() {
 
     deleteMutation.mutate({ id } as any, {
       onError: (error) => {
-        queryClient.invalidateQueries({
+        void queryClient.invalidateQueries({
           queryKey: ["action", "list-design-systems"],
         });
-        toast.error("Could not delete design system", {
+        toast.error(t("designSystems.deleteError"), {
           description:
-            error instanceof Error ? error.message : "Something went wrong",
+            error instanceof Error ? error.message : t("common.genericError"),
         });
       },
     });
-  }, [deleteId, queryClient, deleteMutation]);
+  }, [deleteId, queryClient, deleteMutation, t]);
 
   const handleUpdateDetails = useCallback(
     (
@@ -293,21 +380,21 @@ export default function DesignSystems() {
 
       updateMutation.mutate({ id, ...updates } as any, {
         onSuccess: () => {
-          toast.success("Design system updated");
+          toast.success(t("designSystems.updateSuccess"));
         },
         onError: (error) => {
           queryClient.setQueryData(
             ["action", "list-design-systems", undefined],
             previous,
           );
-          toast.error("Could not update design system", {
+          toast.error(t("designSystems.updateError"), {
             description:
-              error instanceof Error ? error.message : "Something went wrong",
+              error instanceof Error ? error.message : t("common.genericError"),
           });
         },
       });
     },
-    [queryClient, updateMutation],
+    [queryClient, updateMutation, t],
   );
 
   const handleBulkDelete = useCallback(() => {
@@ -336,25 +423,119 @@ export default function DesignSystems() {
     void Promise.all(ids.map((id) => deleteMutation.mutateAsync({ id } as any)))
       .then(() => undefined)
       .catch((error) => {
-        queryClient.invalidateQueries({
+        void queryClient.invalidateQueries({
           queryKey: ["action", "list-design-systems"],
         });
-        toast.error("Could not delete selected design systems", {
+        toast.error(t("designSystems.bulkDeleteError"), {
           description:
-            error instanceof Error ? error.message : "Something went wrong",
+            error instanceof Error ? error.message : t("common.genericError"),
         });
       });
-  }, [selectedSystemIds, queryClient, exitSelectionMode, deleteMutation]);
+  }, [selectedSystemIds, queryClient, exitSelectionMode, deleteMutation, t]);
 
-  const parseData = (dataStr: string): DesignSystemData | null => {
-    try {
-      return JSON.parse(dataStr);
-    } catch {
-      return null;
+  useEffect(() => {
+    const builderSystemEntries = designSystems
+      .filter(shouldRefreshBuilderDesignSystem)
+      .map((system) => ({
+        id: system.id,
+        key: builderRefreshKey(system),
+      }))
+      .filter(
+        ({ key }) =>
+          !settledBuilderRefreshesRef.current.has(key) &&
+          !stoppedBuilderRefreshesRef.current.has(key) &&
+          !activeBuilderRefreshesRef.current.has(key),
+      );
+    if (builderSystemEntries.length === 0) return;
+
+    let disposed = false;
+    const timers: Array<ReturnType<typeof setTimeout>> = [];
+    const maxAttempts = 5;
+    const maxPolls = 3;
+    const retryDelayMs = 5_000;
+    const retryPollDelayMs = 30_000;
+
+    const scheduleRetry = (
+      entry: { id: string; key: string },
+      delayMs: number,
+      attempt: number,
+      pollCount: number,
+    ): void => {
+      if (disposed) return;
+      timers.push(
+        setTimeout(() => {
+          void refresh(entry, attempt, pollCount);
+        }, delayMs),
+      );
+    };
+
+    const refresh = async (
+      entry: { id: string; key: string },
+      attempt: number,
+      pollCount: number,
+    ): Promise<void> => {
+      try {
+        const result = await refreshBuilderSystemRef.current({ id: entry.id });
+        if (disposed) return;
+        if (result.synced) {
+          activeBuilderRefreshesRef.current.delete(entry.key);
+          settledBuilderRefreshesRef.current.add(entry.key);
+          await queryClient.invalidateQueries({
+            queryKey: ["action", "list-design-systems"],
+          });
+          return;
+        }
+        if (result.status === "conflict") {
+          activeBuilderRefreshesRef.current.delete(entry.key);
+          stoppedBuilderRefreshesRef.current.add(entry.key);
+          await queryClient.invalidateQueries({
+            queryKey: ["action", "list-design-systems"],
+          });
+          return;
+        }
+        if (result.status === "incomplete" || result.rejectedTokenCount) {
+          activeBuilderRefreshesRef.current.delete(entry.key);
+          stoppedBuilderRefreshesRef.current.add(entry.key);
+          return;
+        }
+        if (isSettledBuilderRefresh(result)) {
+          activeBuilderRefreshesRef.current.delete(entry.key);
+          settledBuilderRefreshesRef.current.add(entry.key);
+          return;
+        }
+      } catch {
+        if (disposed) return;
+      }
+      if (disposed) return;
+      const exhausted = attempt >= maxAttempts;
+      if (exhausted && pollCount >= maxPolls) {
+        activeBuilderRefreshesRef.current.delete(entry.key);
+        stoppedBuilderRefreshesRef.current.add(entry.key);
+        return;
+      }
+      scheduleRetry(
+        entry,
+        exhausted ? retryPollDelayMs : retryDelayMs,
+        exhausted ? 0 : attempt + 1,
+        exhausted ? pollCount + 1 : pollCount,
+      );
+    };
+
+    for (const entry of builderSystemEntries) {
+      activeBuilderRefreshesRef.current.add(entry.key);
+      void refresh(entry, 0, 0);
     }
-  };
 
-  useSetPageTitle("Design Systems");
+    return () => {
+      disposed = true;
+      for (const timer of timers) clearTimeout(timer);
+      for (const entry of builderSystemEntries) {
+        activeBuilderRefreshesRef.current.delete(entry.key);
+      }
+    };
+  }, [designSystems, queryClient]);
+
+  useSetPageTitle(t("navigation.designSystems"));
 
   useSetHeaderActions(
     <div className="flex items-center gap-2">
@@ -366,17 +547,23 @@ export default function DesignSystems() {
           className="cursor-pointer"
         >
           <IconCheckbox className="w-3.5 h-3.5" />
-          {isSelectionMode ? "Done" : "Select"}
+          {isSelectionMode
+            ? t("designSystems.actions.done")
+            : t("designSystems.actions.select")}
         </Button>
       ) : null}
-      <Button
-        size="sm"
-        onClick={() => navigate("/design-systems/setup")}
-        className="cursor-pointer"
-      >
-        <IconPlus className="w-3.5 h-3.5" />
-        New Design System
-      </Button>
+      {designSystems.length > 0 ? (
+        systemsEnabled ? (
+          <Button asChild size="sm" className="cursor-pointer">
+            <Link to="/design-systems/setup" onClick={handleCreateClick}>
+              <IconPlus className="w-3.5 h-3.5" />
+              {t("designSystems.actions.new")}
+            </Link>
+          </Button>
+        ) : showWaitlist ? (
+          <JoinDesignSystemWaitlistButton compact />
+        ) : null
+      ) : null}
     </div>,
   );
 
@@ -384,10 +571,25 @@ export default function DesignSystems() {
     <>
       <div className="flex-1 overflow-y-auto">
         <main className="max-w-6xl mx-auto px-4 sm:px-6 py-6 sm:py-10">
-          {isLoading ? (
+          {pageMode === "error" ? (
+            <QueryErrorState
+              onRetry={() => {
+                if (workflowsState.status === "unavailable") {
+                  window.location.reload();
+                  return;
+                }
+                void refetch();
+              }}
+              retrying={
+                workflowsState.status === "unavailable" ? false : isFetching
+              }
+            />
+          ) : pageMode === "comingSoon" ? (
+            <ComingSoonState />
+          ) : pageMode === "loading" ? (
             <LoadingSkeleton />
-          ) : designSystems.length === 0 ? (
-            <EmptyState />
+          ) : pageMode === "empty" ? (
+            <EmptyState onCreateClick={handleCreateClick} />
           ) : (
             <>
               {isSelectionMode ? (
@@ -396,38 +598,40 @@ export default function DesignSystems() {
                     <span className="font-medium text-foreground">
                       {selectedSystemCount}
                     </span>{" "}
-                    selected
+                    {t("designSystems.selectedLabel")}
                   </div>
                   <div className="flex items-center gap-1">
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <Button
                           variant="ghost"
-                          size="icon"
+                          size="icon-sm"
                           onClick={toggleAllSystems}
-                          className="h-8 w-8 cursor-pointer"
+                          className="cursor-pointer"
                         >
                           <IconChecks className="w-4 h-4" />
                         </Button>
                       </TooltipTrigger>
                       <TooltipContent>
                         {allSystemsSelected
-                          ? "Clear all design systems"
-                          : "Select all design systems"}
+                          ? t("designSystems.actions.clearAll")
+                          : t("designSystems.actions.selectAll")}
                       </TooltipContent>
                     </Tooltip>
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <Button
                           variant="ghost"
-                          size="icon"
+                          size="icon-sm"
                           onClick={clearSelection}
-                          className="h-8 w-8 cursor-pointer"
+                          className="cursor-pointer"
                         >
                           <IconX className="w-4 h-4" />
                         </Button>
                       </TooltipTrigger>
-                      <TooltipContent>Clear selection</TooltipContent>
+                      <TooltipContent>
+                        {t("designSystems.actions.clearSelection")}
+                      </TooltipContent>
                     </Tooltip>
                     <Button
                       variant="destructive"
@@ -437,191 +641,232 @@ export default function DesignSystems() {
                       className="cursor-pointer"
                     >
                       <IconTrash className="w-3.5 h-3.5" />
-                      Delete
+                      {t("designSystems.actions.delete")}
                     </Button>
                   </div>
                 </div>
               ) : null}
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                {/* New design system card */}
-                <button
-                  onClick={() => navigate("/design-systems/setup")}
-                  className="group relative rounded-xl border border-dashed border-border bg-card hover:border-foreground/15 overflow-hidden text-left cursor-pointer"
-                >
-                  <div className="aspect-video flex items-center justify-center bg-muted/30">
-                    <div className="w-12 h-12 rounded-xl bg-accent/50 flex items-center justify-center group-hover:bg-accent">
-                      <IconPlus className="w-6 h-6 text-muted-foreground/70 group-hover:text-muted-foreground" />
-                    </div>
-                  </div>
-                  <div className="p-4">
-                    <h3 className="font-medium text-sm text-muted-foreground group-hover:text-foreground/70">
-                      New Design System
-                    </h3>
-                    <div className="text-xs text-muted-foreground/70 mt-1">
-                      Set up your brand
-                    </div>
-                  </div>
-                </button>
-
-                {/* Design system cards */}
-                {designSystems.map((ds) => {
-                  const parsed = parseData(ds.data);
-                  const colors = parsed?.colors;
-                  const isSelected = selectedSystemIds.has(ds.id);
-                  return (
-                    <div
-                      key={ds.id}
-                      aria-selected={isSelected}
-                      className={`group relative rounded-xl border bg-card overflow-hidden ${
-                        isSelected
-                          ? "border-[#609FF8]/70 ring-2 ring-[#609FF8]/40"
-                          : "border-border"
-                      }`}
+              <section aria-label={t("designSystems.yoursTitle")}>
+                <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] gap-3">
+                  {/* New design system card */}
+                  {systemsEnabled && (
+                    <Link
+                      to="/design-systems/setup"
+                      onClick={handleCreateClick}
+                      className="group relative rounded-xl border border-dashed border-border bg-card hover:border-foreground/15 overflow-hidden text-start cursor-pointer"
                     >
-                      <button
-                        onClick={() => {
-                          if (isSelectionMode) {
-                            if (ds.canManage) toggleSystemSelection(ds.id);
-                            return;
-                          }
-                          openDesignSystemDetails(ds.id);
-                        }}
-                        aria-pressed={isSelectionMode ? isSelected : undefined}
-                        className="block w-full text-left cursor-pointer"
-                      >
-                        {/* Color preview */}
-                        <div className="aspect-video bg-muted/50 flex items-center justify-center gap-2 p-4">
-                          {colors?.primary && (
-                            <div
-                              className="w-10 h-10 rounded-lg"
-                              style={{ backgroundColor: colors.primary }}
-                            />
-                          )}
-                          {colors?.secondary && (
-                            <div
-                              className="w-10 h-10 rounded-lg"
-                              style={{ backgroundColor: colors.secondary }}
-                            />
-                          )}
-                          {colors?.accent && (
-                            <div
-                              className="w-10 h-10 rounded-lg"
-                              style={{ backgroundColor: colors.accent }}
-                            />
-                          )}
-                          {!colors?.primary &&
-                            !colors?.secondary &&
-                            !colors?.accent && (
-                              <IconPalette className="w-8 h-8 text-muted-foreground/40" />
-                            )}
+                      <div className="aspect-video flex items-center justify-center bg-muted/30">
+                        <div className="w-12 h-12 rounded-xl bg-accent/50 flex items-center justify-center group-hover:bg-accent">
+                          <IconPlus className="w-6 h-6 text-muted-foreground/70 group-hover:text-muted-foreground" />
                         </div>
-                        <div className="p-4 pb-3">
-                          <div className="flex items-center gap-2 mb-1">
-                            <h3 className="font-medium text-sm text-foreground/90 truncate flex-1">
-                              {ds.title}
-                            </h3>
-                            {ds.isDefault && (
-                              <span className="text-[10px] text-[#609FF8] font-medium">
-                                Default
-                              </span>
+                      </div>
+                      <div className="p-3">
+                        <h3 className="font-medium text-sm text-muted-foreground group-hover:text-foreground/70">
+                          {t("designSystems.actions.new")}
+                        </h3>
+                      </div>
+                    </Link>
+                  )}
+
+                  {/* Design system cards */}
+                  {designSystems.map((ds) => {
+                    const parsed = parseDesignSystemData(ds.data);
+                    const colors = parsed?.colors;
+                    const primaryColor = getCssColorToken(colors?.primary);
+                    const secondaryColor = getCssColorToken(colors?.secondary);
+                    const accentColor = getCssColorToken(colors?.accent);
+                    const headingFont = formatDesignTokenValue(
+                      parsed?.typography?.headingFont,
+                    );
+                    const isSelected = selectedSystemIds.has(ds.id);
+                    return (
+                      <div
+                        key={ds.id}
+                        aria-selected={isSelected}
+                        className={`group relative rounded-xl border bg-card overflow-hidden ${
+                          isSelected
+                            ? "border-[#609FF8]/70 ring-2 ring-[#609FF8]/40"
+                            : "border-border"
+                        }`}
+                      >
+                        <button
+                          onClick={() => {
+                            if (isSelectionMode) {
+                              if (ds.canManage) toggleSystemSelection(ds.id);
+                              return;
+                            }
+                            openDesignSystemDetails(ds.id);
+                          }}
+                          aria-pressed={
+                            isSelectionMode ? isSelected : undefined
+                          }
+                          className="block w-full text-start cursor-pointer"
+                        >
+                          {/* Color preview */}
+                          <div className="aspect-video bg-muted/50 flex items-center justify-center gap-2 p-4">
+                            {primaryColor && (
+                              <div
+                                className="w-10 h-10 rounded-lg"
+                                style={{ backgroundColor: primaryColor }}
+                              />
+                            )}
+                            {secondaryColor && (
+                              <div
+                                className="w-10 h-10 rounded-lg"
+                                style={{ backgroundColor: secondaryColor }}
+                              />
+                            )}
+                            {accentColor && (
+                              <div
+                                className="w-10 h-10 rounded-lg"
+                                style={{ backgroundColor: accentColor }}
+                              />
+                            )}
+                            {!primaryColor &&
+                              !secondaryColor &&
+                              !accentColor && (
+                                <IconComponents className="w-8 h-8 text-muted-foreground/40" />
+                              )}
+                          </div>
+                          <div className="p-4 pb-3">
+                            <div className="flex items-center gap-2 mb-1">
+                              <h3 className="font-medium text-sm text-foreground/90 truncate flex-1">
+                                {ds.title}
+                              </h3>
+                              {ds.isDefault && (
+                                <span className="text-[10px] text-[#609FF8] font-medium">
+                                  {t("designSystems.defaultBadge")}
+                                </span>
+                              )}
+                            </div>
+                            {headingFont && (
+                              <div className="text-xs text-muted-foreground/70">
+                                {headingFont}
+                              </div>
                             )}
                           </div>
-                          {parsed?.typography?.headingFont && (
-                            <div className="text-xs text-muted-foreground/70">
-                              {parsed.typography.headingFont}
-                            </div>
-                          )}
+                        </button>
+                        <div className="flex flex-wrap items-center justify-between gap-2 px-4 pb-4">
+                          <VisibilityBadge
+                            visibility={ds.visibility}
+                            className="!text-[11px]"
+                          />
+                          <ShareButton
+                            resourceType="design-system"
+                            resourceId={ds.id}
+                            allowedRoles={["viewer", "editor", "admin"]}
+                            resourceTitle={ds.title}
+                          />
                         </div>
-                      </button>
-                      <div className="flex flex-wrap items-center justify-between gap-2 px-4 pb-4">
-                        <VisibilityBadge
-                          visibility={ds.visibility}
-                          className="text-[11px]"
-                        />
-                        <ShareButton
-                          resourceType="design-system"
-                          resourceId={ds.id}
-                          resourceTitle={ds.title}
-                        />
-                      </div>
-                      {isSelectionMode && ds.canManage ? (
-                        <div className="absolute top-2 left-2 z-10">
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Checkbox
-                                checked={isSelected}
-                                onCheckedChange={() =>
-                                  toggleSystemSelection(ds.id)
-                                }
-                                onClick={(event) => event.stopPropagation()}
-                                aria-label={`Select ${ds.title}`}
-                                className="h-5 w-5 border-white/60 bg-black/60 text-white data-[state=checked]:border-[#609FF8] data-[state=checked]:bg-[#609FF8]"
-                              />
-                            </TooltipTrigger>
-                            <TooltipContent>{`Select ${ds.title}`}</TooltipContent>
-                          </Tooltip>
-                        </div>
-                      ) : (
-                        <>
-                          {/* Star button */}
-                          {ds.accessRole === "owner" && (
+                        {isSelectionMode && ds.canManage ? (
+                          <div className="absolute top-2 start-2 z-10">
                             <Tooltip>
                               <TooltipTrigger asChild>
-                                <button
-                                  onClick={() => handleSetDefault(ds.id)}
-                                  className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 w-7 h-7 flex items-center justify-center rounded-md bg-black/60 hover:bg-black/80 cursor-pointer"
-                                >
-                                  {ds.isDefault ? (
-                                    <IconStarFilled className="w-3.5 h-3.5 text-yellow-400" />
-                                  ) : (
-                                    <IconStar className="w-3.5 h-3.5 text-muted-foreground" />
-                                  )}
-                                </button>
+                                <Checkbox
+                                  checked={isSelected}
+                                  onCheckedChange={() =>
+                                    toggleSystemSelection(ds.id)
+                                  }
+                                  onClick={(event) => event.stopPropagation()}
+                                  aria-label={t("designSystems.selectAria", {
+                                    title: ds.title,
+                                  })}
+                                  className="h-5 w-5 border-white/60 bg-black/60 text-white data-[state=checked]:border-[#609FF8] data-[state=checked]:bg-[#609FF8]"
+                                />
                               </TooltipTrigger>
                               <TooltipContent>
-                                {ds.isDefault
-                                  ? "Currently default"
-                                  : "Set as default"}
+                                {t("designSystems.selectAria", {
+                                  title: ds.title,
+                                })}
                               </TooltipContent>
                             </Tooltip>
-                          )}
-                          {ds.canManage && (
-                            <div
-                              className={`absolute top-2 z-10 opacity-0 group-hover:opacity-100 ${
-                                ds.accessRole === "owner"
-                                  ? "right-10"
-                                  : "right-2"
-                              }`}
-                            >
-                              <DropdownMenu>
-                                <DropdownMenuTrigger asChild>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    className="h-7 w-7 bg-black/60 hover:bg-black/80 cursor-pointer"
-                                    aria-label={`More actions for ${ds.title}`}
+                          </div>
+                        ) : (
+                          <>
+                            {/* Star button */}
+                            {ds.accessRole === "owner" && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <button
+                                    type="button"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      handleSetDefault(ds.id, !ds.isDefault);
+                                    }}
+                                    disabled={setDefaultMutation.isPending}
+                                    aria-label={
+                                      ds.isDefault
+                                        ? t("designSystems.currentlyDefault")
+                                        : t("designSystems.actions.setDefault")
+                                    }
+                                    className="absolute top-2 end-2 flex h-7 w-7 cursor-pointer items-center justify-center rounded-md bg-foreground/60 text-background hover:bg-foreground/80 disabled:pointer-events-none disabled:opacity-50"
                                   >
-                                    <IconDots className="w-3.5 h-3.5 text-foreground/70" />
-                                  </Button>
-                                </DropdownMenuTrigger>
-                                <DropdownMenuContent align="end">
-                                  <DropdownMenuItem
-                                    onClick={() => setDeleteId(ds.id)}
-                                    className="text-red-400 focus:text-red-400 cursor-pointer"
-                                  >
-                                    <IconTrash className="w-3.5 h-3.5 mr-2" />
-                                    Delete
-                                  </DropdownMenuItem>
-                                </DropdownMenuContent>
-                              </DropdownMenu>
-                            </div>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
+                                    {ds.isDefault ? (
+                                      <IconStarFilled className="w-3.5 h-3.5 text-yellow-400" />
+                                    ) : (
+                                      <IconStar className="w-3.5 h-3.5 text-muted-foreground" />
+                                    )}
+                                  </button>
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  {ds.isDefault
+                                    ? t("designSystems.currentlyDefault")
+                                    : t("designSystems.actions.setDefault")}
+                                </TooltipContent>
+                              </Tooltip>
+                            )}
+                            {ds.canManage && (
+                              <div
+                                className={`absolute top-2 z-10 ${
+                                  openMenuId === ds.id
+                                    ? "opacity-100"
+                                    : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+                                } ${
+                                  ds.accessRole === "owner" ? "end-10" : "end-2"
+                                }`}
+                              >
+                                <DropdownMenu
+                                  open={openMenuId === ds.id}
+                                  onOpenChange={(open) =>
+                                    setOpenMenuId(open ? ds.id : null)
+                                  }
+                                >
+                                  <DropdownMenuTrigger asChild>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      className="h-7 w-7 bg-foreground/60 hover:bg-foreground/80 cursor-pointer"
+                                      aria-label={t(
+                                        "designSystems.moreActionsAria",
+                                        { title: ds.title },
+                                      )}
+                                    >
+                                      <IconDots className="w-3.5 h-3.5 text-background" />
+                                    </Button>
+                                  </DropdownMenuTrigger>
+                                  <DropdownMenuContent align="end">
+                                    <DropdownMenuItem
+                                      onClick={() =>
+                                        afterBodyPointerUnlock(() =>
+                                          setDeleteId(ds.id),
+                                        )
+                                      }
+                                      className="text-red-400 focus:text-red-400 cursor-pointer"
+                                    >
+                                      <IconTrash className="w-3.5 h-3.5 me-2" />
+                                      {t("designSystems.actions.delete")}
+                                    </DropdownMenuItem>
+                                  </DropdownMenuContent>
+                                </DropdownMenu>
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
             </>
           )}
         </main>
@@ -640,32 +885,71 @@ export default function DesignSystems() {
           <AlertDialogHeader>
             <AlertDialogTitle>
               {bulkDeleteOpen
-                ? `Delete ${selectedSystemCount} ${
-                    selectedSystemCount === 1
-                      ? "Design System"
-                      : "Design Systems"
-                  }?`
-                : "Delete Design System?"}
+                ? t("designSystems.deleteDialog.bulkTitle", {
+                    count: selectedSystemCount,
+                  })
+                : t("designSystems.deleteDialog.title")}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {bulkDeleteOpen
-                ? `This will permanently delete ${
-                    selectedSystemCount === 1
-                      ? "this design system and unlink it from any designs that use it"
-                      : `these ${selectedSystemCount} design systems and unlink them from any designs that use them`
-                  }. This action cannot be undone.`
-                : "This will permanently delete this design system and unlink it from any designs that use it. This action cannot be undone."}
+                ? t("designSystems.deleteDialog.bulkDescription", {
+                    count: selectedSystemCount,
+                  })
+                : t("designSystems.deleteDialog.description")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel className="cursor-pointer">
-              Cancel
+              {t("designSystems.actions.cancel")}
             </AlertDialogCancel>
             <AlertDialogAction
               onClick={bulkDeleteOpen ? handleBulkDelete : handleDelete}
-              className="bg-red-600 hover:bg-red-700 cursor-pointer"
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90 cursor-pointer"
             >
-              Delete
+              {t("designSystems.actions.delete")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={tierLimitDialogOpen}
+        onOpenChange={setTierLimitDialogOpen}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t("designSystems.tierLimitTitle")}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {tierLimit?.current != null &&
+              tierLimit?.max != null &&
+              tierLimit?.plan
+                ? t("designSystems.tierLimitDescriptionWithCount", {
+                    current: tierLimit.current,
+                    max: tierLimit.max,
+                    plan: tierLimit.plan,
+                  })
+                : t("designSystems.tierLimitDescription")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="cursor-pointer">
+              {t("designSystems.actions.cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction asChild>
+              <a
+                href={
+                  tierLimit?.upgradeUrl ??
+                  "https://builder.io/account/subscription"
+                }
+                target="_blank"
+                rel="noopener noreferrer"
+                className="cursor-pointer"
+              >
+                <IconExternalLink className="w-3.5 h-3.5" />
+                {t("designSystems.tierLimitUpgrade")}
+              </a>
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -678,7 +962,7 @@ export default function DesignSystems() {
         onOpenChange={(open) => {
           if (!open) closeDesignSystemDetails();
         }}
-        onUseAsSource={openSetupFromDesignSystem}
+        onUseAsSource={systemsEnabled ? openSetupFromDesignSystem : undefined}
         onSave={handleUpdateDetails}
       />
     </>
@@ -697,7 +981,7 @@ function DesignSystemDetailsSheet({
   open: boolean;
   isSaving?: boolean;
   onOpenChange: (open: boolean) => void;
-  onUseAsSource: (id: string) => void;
+  onUseAsSource?: (id: string) => void;
   onSave: (
     id: string,
     updates: {
@@ -707,6 +991,7 @@ function DesignSystemDetailsSheet({
     },
   ) => void;
 }) {
+  const t = useT();
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [customInstructions, setCustomInstructions] = useState("");
@@ -726,8 +1011,8 @@ function DesignSystemDetailsSheet({
     [designSystem],
   );
   const assets = useMemo(
-    () => parseDesignSystemAssets(designSystem?.assets),
-    [designSystem?.assets],
+    () => parseDesignSystemAssets(designSystem && designSystem.assets),
+    [designSystem],
   );
 
   if (!designSystem) {
@@ -750,8 +1035,7 @@ function DesignSystemDetailsSheet({
         <SheetHeader className="pr-8">
           <SheetTitle>{designSystem.title}</SheetTitle>
           <SheetDescription>
-            Review the saved tokens and update the details agents use when they
-            apply this design system.
+            {t("designSystems.details.description")}
           </SheetDescription>
         </SheetHeader>
 
@@ -759,7 +1043,9 @@ function DesignSystemDetailsSheet({
           <section className="space-y-3">
             <div className="grid gap-4">
               <div className="grid gap-2">
-                <Label htmlFor="design-system-title">Title</Label>
+                <Label htmlFor="design-system-title">
+                  {t("designSystems.details.titleLabel")}
+                </Label>
                 <Input
                   id="design-system-title"
                   value={title}
@@ -769,7 +1055,9 @@ function DesignSystemDetailsSheet({
                 />
               </div>
               <div className="grid gap-2">
-                <Label htmlFor="design-system-description">Description</Label>
+                <Label htmlFor="design-system-description">
+                  {t("designSystems.details.descriptionLabel")}
+                </Label>
                 <Textarea
                   id="design-system-description"
                   value={description}
@@ -782,16 +1070,19 @@ function DesignSystemDetailsSheet({
             </div>
           </section>
 
-          <TokenPreview data={parsed} assets={assets} />
+          <DesignSystemPreview
+            id={designSystem.id}
+            data={parsed}
+            assets={assets}
+          />
 
           <section className="space-y-3 border-t border-border pt-6">
             <div>
               <h3 className="text-sm font-medium text-foreground">
-                Custom instructions
+                {t("designSystems.details.customInstructionsTitle")}
               </h3>
               <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                Durable guidance the agent reuses whenever this system is linked
-                to a design.
+                {t("designSystems.details.customInstructionsDescription")}
               </p>
             </div>
             <Textarea
@@ -799,21 +1090,23 @@ function DesignSystemDetailsSheet({
               onChange={(event) => setCustomInstructions(event.target.value)}
               readOnly={!canEdit}
               rows={5}
-              placeholder="No custom instructions saved yet."
+              placeholder={t("designSystems.details.noCustomInstructions")}
               className="bg-accent/50"
             />
           </section>
         </div>
 
         <SheetFooter className="gap-2 border-t border-border pt-4 sm:space-x-0">
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => onUseAsSource(designSystem.id)}
-            className="cursor-pointer"
-          >
-            Use as starting point
-          </Button>
+          {onUseAsSource && (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onUseAsSource(designSystem.id)}
+              className="cursor-pointer"
+            >
+              {t("designSystems.details.useAsStartingPoint")}
+            </Button>
+          )}
           {canEdit ? (
             <Button
               type="button"
@@ -827,12 +1120,100 @@ function DesignSystemDetailsSheet({
               disabled={!trimmedTitle || !hasChanges || isSaving}
               className="cursor-pointer"
             >
-              {isSaving ? "Saving..." : "Save changes"}
+              {isSaving
+                ? t("designSystems.details.saving")
+                : t("designSystems.details.saveChanges")}
             </Button>
           ) : null}
         </SheetFooter>
       </SheetContent>
     </Sheet>
+  );
+}
+
+function DesignSystemPreview({
+  id,
+  data,
+  assets,
+}: {
+  id: string;
+  data: DesignSystemData | null;
+  assets: Array<{ name?: string; url?: string; variant?: string }>;
+}) {
+  return data?.source === "builder" ? (
+    <DesignSystemPreviewLink id={id} data={data} />
+  ) : (
+    <TokenPreview data={data} assets={assets} />
+  );
+}
+
+function DesignSystemPreviewLink({
+  id,
+  data,
+}: {
+  id: string;
+  data: DesignSystemData;
+}) {
+  const t = useT();
+  const [resolvedBuilderUrl, setResolvedBuilderUrl] = useState<string | null>(
+    null,
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    setResolvedBuilderUrl(null);
+    void fetch(
+      appApiPath(
+        `/api/design-system-builder-link?id=${encodeURIComponent(id)}`,
+      ),
+    )
+      .then((res) => (res.ok ? res.json() : null))
+      .then((json: { builderUrl?: string | null } | null) => {
+        if (!cancelled) setResolvedBuilderUrl(json?.builderUrl ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setResolvedBuilderUrl(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  const persistedBuilderUrl =
+    data.builderUrl && isTrustedBuilderPreviewUrl(data.builderUrl)
+      ? data.builderUrl
+      : undefined;
+  const trustedBuilderUrl =
+    (resolvedBuilderUrl && isTrustedBuilderPreviewUrl(resolvedBuilderUrl)
+      ? resolvedBuilderUrl
+      : undefined) ?? persistedBuilderUrl;
+
+  return (
+    <section className="space-y-3 border-t border-border pt-6">
+      <div>
+        <h3 className="text-sm font-medium text-foreground">
+          {t("designSystems.preview.title")}
+        </h3>
+        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+          {t("designSystems.preview.description")}
+        </p>
+      </div>
+      {trustedBuilderUrl ? (
+        <Button asChild className="cursor-pointer">
+          <a
+            href={withBuilderUtmTrackingParams(trustedBuilderUrl, {
+              campaign: "product",
+              content: "design_system_intelligence",
+            })}
+            target="_blank"
+            rel="noreferrer"
+          >
+            <IconExternalLink className="size-4" />
+            {"Open in Builder" /* i18n-ignore Builder link action */}
+          </a>
+        </Button>
+      ) : null}
+    </section>
   );
 }
 
@@ -843,22 +1224,25 @@ function TokenPreview({
   data: DesignSystemData | null;
   assets: Array<{ name?: string; url?: string; variant?: string }>;
 }) {
-  const colors = getColorTokens(data);
-  const typeTokens = getTypographyTokens(data);
-  const detailTokens = getDetailTokens(data, assets);
+  const t = useT();
+  const colors = getColorTokens(data, t);
+  const typeTokens = getTypographyTokens(data, t);
+  const detailTokens = getDetailTokens(data, assets, t);
 
   return (
     <section className="space-y-6 border-t border-border pt-6">
       <div>
-        <h3 className="text-sm font-medium text-foreground">Token preview</h3>
+        <h3 className="text-sm font-medium text-foreground">
+          {t("designSystems.tokenPreview.title")}
+        </h3>
         <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-          A snapshot of the colors, type, spacing, and assets currently stored.
+          {t("designSystems.tokenPreview.description")}
         </p>
       </div>
 
       <div className="space-y-3">
         <h4 className="text-xs font-medium uppercase text-muted-foreground">
-          Colors
+          {t("designSystems.tokenPreview.colors")}
         </h4>
         {colors.length > 0 ? (
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
@@ -867,15 +1251,17 @@ function TokenPreview({
                 key={color.label}
                 className="flex min-w-0 items-center gap-3 rounded-lg border border-border bg-muted/30 p-2"
               >
-                <div
-                  className="h-9 w-9 shrink-0 rounded-md border border-border"
-                  style={{ backgroundColor: color.value }}
-                />
+                {color.swatch ? (
+                  <div
+                    className="h-9 w-9 shrink-0 rounded-md border border-border"
+                    style={{ backgroundColor: color.swatch }}
+                  />
+                ) : null}
                 <div className="min-w-0">
                   <div className="text-xs font-medium text-foreground">
                     {color.label}
                   </div>
-                  <div className="truncate font-mono text-[11px] text-muted-foreground">
+                  <div className="truncate font-mono !text-[11px] text-muted-foreground">
                     {color.value}
                   </div>
                 </div>
@@ -884,16 +1270,22 @@ function TokenPreview({
           </div>
         ) : (
           <EmptyPreviewLine icon={<IconPalette className="h-4 w-4" />}>
-            No color tokens saved.
+            {t("designSystems.tokenPreview.noColors")}
           </EmptyPreviewLine>
         )}
       </div>
 
       {typeTokens.length > 0 ? (
-        <PreviewList title="Typography" items={typeTokens} />
+        <PreviewList
+          title={t("designSystems.tokenPreview.typography")}
+          items={typeTokens}
+        />
       ) : null}
       {detailTokens.length > 0 ? (
-        <PreviewList title="Details" items={detailTokens} />
+        <PreviewList
+          title={t("designSystems.tokenPreview.details")}
+          items={detailTokens}
+        />
       ) : null}
     </section>
   );
@@ -945,18 +1337,6 @@ function EmptyPreviewLine({
   );
 }
 
-function parseDesignSystemData(dataStr: string): DesignSystemData | null {
-  try {
-    const parsed = JSON.parse(dataStr);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return null;
-    }
-    return parsed as DesignSystemData;
-  } catch {
-    return null;
-  }
-}
-
 function parseDesignSystemAssets(
   assetsStr?: string | null,
 ): Array<{ name?: string; url?: string; variant?: string }> {
@@ -969,30 +1349,78 @@ function parseDesignSystemAssets(
   }
 }
 
-function getColorTokens(data: DesignSystemData | null) {
+type DesignT = ReturnType<typeof useT>;
+
+function getColorTokens(data: DesignSystemData | null, t: DesignT) {
   const colors = data?.colors;
   if (!colors) return [];
   return [
-    { label: "Primary", value: colors.primary },
-    { label: "Secondary", value: colors.secondary },
-    { label: "Accent", value: colors.accent },
-    { label: "Background", value: colors.background },
-    { label: "Surface", value: colors.surface },
-    { label: "Text", value: colors.text },
-    { label: "Muted text", value: colors.textMuted },
-  ].filter((item): item is { label: string; value: string } =>
-    Boolean(item.value),
+    {
+      label: t("designSystems.tokenPreview.colorLabels.primary"),
+      value: formatDesignTokenValue(colors.primary),
+      swatch: getCssColorToken(colors.primary),
+    },
+    {
+      label: t("designSystems.tokenPreview.colorLabels.secondary"),
+      value: formatDesignTokenValue(colors.secondary),
+      swatch: getCssColorToken(colors.secondary),
+    },
+    {
+      label: t("designSystems.tokenPreview.colorLabels.accent"),
+      value: formatDesignTokenValue(colors.accent),
+      swatch: getCssColorToken(colors.accent),
+    },
+    {
+      label: t("designSystems.tokenPreview.colorLabels.background"),
+      value: formatDesignTokenValue(colors.background),
+      swatch: getCssColorToken(colors.background),
+    },
+    {
+      label: t("designSystems.tokenPreview.colorLabels.surface"),
+      value: formatDesignTokenValue(colors.surface),
+      swatch: getCssColorToken(colors.surface),
+    },
+    {
+      label: t("designSystems.tokenPreview.colorLabels.text"),
+      value: formatDesignTokenValue(colors.text),
+      swatch: getCssColorToken(colors.text),
+    },
+    {
+      label: t("designSystems.tokenPreview.colorLabels.mutedText"),
+      value: formatDesignTokenValue(colors.textMuted),
+      swatch: getCssColorToken(colors.textMuted),
+    },
+  ].filter(
+    (
+      item,
+    ): item is {
+      label: string;
+      value: string;
+      swatch: string | undefined;
+    } => Boolean(item.value),
   );
 }
 
-function getTypographyTokens(data: DesignSystemData | null) {
+function getTypographyTokens(data: DesignSystemData | null, t: DesignT) {
   const typography = data?.typography;
   if (!typography) return [];
   return [
-    { label: "Heading font", value: typography.headingFont },
-    { label: "Body font", value: typography.bodyFont },
-    { label: "Heading weight", value: typography.headingWeight },
-    { label: "Body weight", value: typography.bodyWeight },
+    {
+      label: t("designSystems.tokenPreview.typeLabels.headingFont"),
+      value: formatDesignTokenValue(typography.headingFont),
+    },
+    {
+      label: t("designSystems.tokenPreview.typeLabels.bodyFont"),
+      value: formatDesignTokenValue(typography.bodyFont),
+    },
+    {
+      label: t("designSystems.tokenPreview.typeLabels.headingWeight"),
+      value: formatDesignTokenValue(typography.headingWeight),
+    },
+    {
+      label: t("designSystems.tokenPreview.typeLabels.bodyWeight"),
+      value: formatDesignTokenValue(typography.bodyWeight),
+    },
   ].filter((item): item is { label: string; value: string } =>
     Boolean(item.value),
   );
@@ -1001,30 +1429,48 @@ function getTypographyTokens(data: DesignSystemData | null) {
 function getDetailTokens(
   data: DesignSystemData | null,
   assets: Array<{ name?: string; url?: string; variant?: string }>,
+  t: DesignT,
 ) {
   const spacing = data?.spacing ?? {};
   const borders = data?.borders ?? {};
   const defaults = data?.defaults ?? {};
   const logos = data?.logos ?? [];
+  const namedTokenCount = Array.isArray(data?.tokens) ? data.tokens.length : 0;
   return [
-    ...objectPreviewItems("Spacing", spacing),
-    ...objectPreviewItems("Borders", borders),
-    ...objectPreviewItems("Defaults", defaults),
+    ...objectPreviewItems(t("designSystems.tokenPreview.spacing"), spacing),
+    ...objectPreviewItems(t("designSystems.tokenPreview.borders"), borders),
+    ...objectPreviewItems(t("designSystems.tokenPreview.defaults"), defaults),
+    namedTokenCount > 0
+      ? {
+          label: t("designSystems.tokenPreview.namedTokens"),
+          value: t("designSystems.tokenPreview.savedCount", {
+            count: namedTokenCount,
+          }),
+        }
+      : null,
     logos.length > 0
-      ? { label: "Logos", value: `${logos.length} saved` }
+      ? {
+          label: t("designSystems.tokenPreview.logos"),
+          value: t("designSystems.tokenPreview.savedCount", {
+            count: logos.length,
+          }),
+        }
       : null,
     assets.length > 0
-      ? { label: "Assets", value: `${assets.length} saved` }
+      ? {
+          label: t("designSystems.tokenPreview.assets"),
+          value: t("designSystems.tokenPreview.savedCount", {
+            count: assets.length,
+          }),
+        }
       : null,
   ].filter((item): item is { label: string; value: string } => Boolean(item));
 }
 
-function objectPreviewItems(
-  prefix: string,
-  values: Record<string, string | undefined>,
-) {
+function objectPreviewItems(prefix: string, values: Record<string, unknown>) {
   return Object.entries(values)
-    .filter((entry): entry is [string, string] => Boolean(entry[1]))
+    .map(([key, value]) => [key, formatDesignTokenValue(value)] as const)
+    .filter((entry): entry is readonly [string, string] => Boolean(entry[1]))
     .slice(0, 4)
     .map(([key, value]) => ({
       label: `${prefix}: ${labelizeKey(key)}`,
@@ -1046,7 +1492,7 @@ function LoadingSkeleton() {
         <div className="h-5 w-40 rounded-md bg-muted animate-pulse" />
         <div className="h-3 w-16 rounded bg-muted animate-pulse" />
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+      <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] gap-3">
         {Array.from({ length: 4 }).map((_, i) => (
           <div
             key={i}
@@ -1064,25 +1510,49 @@ function LoadingSkeleton() {
   );
 }
 
-function EmptyState() {
+function EmptyState({
+  onCreateClick,
+}: {
+  onCreateClick: (event: ReactMouseEvent) => void;
+}) {
+  const t = useT();
+  const systemsEnabled = useDesignSystemWorkflows();
   return (
-    <div className="flex flex-col items-center justify-center min-h-[60vh] text-center">
-      <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-[#609FF8]/20 to-[#4080E0]/20 border border-[#609FF8]/20 flex items-center justify-center mb-6">
-        <IconPalette className="w-7 h-7 text-[#609FF8]" />
+    <div className="flex flex-col items-center justify-center py-10 sm:py-14 text-center">
+      <div className="mb-6 flex size-16 items-center justify-center rounded-2xl border border-primary/20 bg-primary/10">
+        <IconComponents className="w-7 h-7 text-primary" />
       </div>
       <h2 className="text-xl font-semibold text-foreground mb-2">
-        Create your first design system
+        {t("designSystems.empty.title")}
       </h2>
-      <p className="text-sm text-muted-foreground max-w-sm mb-8 leading-relaxed">
-        Maintain consistent branding across all your designs with shared colors,
-        typography, and assets.
-      </p>
-      <Button asChild className="cursor-pointer">
-        <Link to="/design-systems/setup">
-          <IconPlus className="w-4 h-4" />
-          New Design System
-        </Link>
-      </Button>
+      {systemsEnabled && (
+        <p className="text-sm text-muted-foreground max-w-sm mb-8 leading-relaxed">
+          {t("designSystems.empty.description")}
+        </p>
+      )}
+      {systemsEnabled && (
+        <Button asChild className="cursor-pointer">
+          <Link to="/design-systems/setup" onClick={onCreateClick}>
+            <IconPlus className="w-4 h-4" />
+            {t("designSystems.actions.new")}
+          </Link>
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function ComingSoonState() {
+  const t = useT();
+  return (
+    <div className="flex flex-col items-center justify-center py-10 sm:py-14 text-center">
+      <div className="mb-6 flex size-16 items-center justify-center rounded-2xl border border-primary/20 bg-primary/10">
+        <IconComponents className="w-7 h-7 text-primary" />
+      </div>
+      <h2 className="text-xl font-semibold text-foreground mb-2">
+        {t("designSystems.comingSoonTitle")}
+      </h2>
+      <JoinDesignSystemWaitlistButton />
     </div>
   );
 }

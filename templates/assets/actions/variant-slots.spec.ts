@@ -14,28 +14,39 @@ vi.mock("../server/lib/json.js", () => ({
   nowIso: vi.fn(() => "2026-05-28T00:00:00.000Z"),
 }));
 
-import { upsertVariantSlot, wasVariantSlotDismissed } from "./variant-slots.js";
+import {
+  failMissingVariantRun,
+  resolveLiveBatchContinuation,
+  upsertVariantSlot,
+  wasVariantSlotDismissed,
+} from "./variant-slots.js";
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));
 
 describe("variant slot state", () => {
   let appState: Record<string, unknown> | null;
+  let appStateByKey: Record<string, Record<string, unknown>>;
 
   beforeEach(() => {
     vi.clearAllMocks();
     appState = null;
+    appStateByKey = {};
     readAppStateMock.mockImplementation(async (key: string) => {
-      if (key !== "asset-variants") return null;
-      return appState ? clone(appState) : null;
+      if (key === "asset-variants" && appState) return clone(appState);
+      return appStateByKey[key] ? clone(appStateByKey[key]) : null;
     });
     writeAppStateMock.mockImplementation(
       async (key: string, value: Record<string, unknown>) => {
-        if (key !== "asset-variants") return;
         await new Promise((resolve) => setTimeout(resolve, 0));
-        appState = clone(value);
+        appStateByKey[key] = clone(value);
+        if (key === "asset-variants") appState = clone(value);
       },
     );
-    deleteAppStateMock.mockResolvedValue(false);
+    deleteAppStateMock.mockImplementation(async (key: string) => {
+      delete appStateByKey[key];
+      if (key === "asset-variants") appState = null;
+      return true;
+    });
   });
 
   it("keeps every slot when a batch writes live candidates in parallel", async () => {
@@ -64,6 +75,30 @@ describe("variant slot state", () => {
       false,
     );
     await expect(wasVariantSlotDismissed("lib-1", "slot-3")).resolves.toBe(
+      false,
+    );
+  });
+
+  it("keeps unscoped slots when another process overwrites the shared row", async () => {
+    await upsertVariantSlot({
+      runId: "run-1",
+      batchId: "batch-1",
+      libraryId: "lib-1",
+      prompt: "Batch prompt",
+      slotId: "slot-1",
+      status: "pending",
+    });
+
+    await upsertVariantSlot({
+      runId: "run-2",
+      batchId: "batch-2",
+      libraryId: "lib-1",
+      prompt: "Concurrent solo prompt",
+      slotId: "other-slot",
+      status: "pending",
+    });
+
+    await expect(wasVariantSlotDismissed("lib-1", "slot-1")).resolves.toBe(
       false,
     );
   });
@@ -104,6 +139,163 @@ describe("variant slot state", () => {
       }),
       expect.objectContaining({ slotId: "slot-2", status: "pending" }),
     ]);
+  });
+
+  it("fails only a stale pending slot for the requested run", async () => {
+    await Promise.all(
+      ["stale-run", "other-run"].map((runId, index) =>
+        upsertVariantSlot({
+          runId,
+          batchId: "batch-1",
+          libraryId: "lib-1",
+          prompt: "Generate a diagram",
+          slotId: `slot-${index + 1}`,
+          status: "pending",
+          threadId: "thread-1",
+        }),
+      ),
+    );
+
+    await expect(
+      failMissingVariantRun({
+        runId: "stale-run",
+        libraryId: "lib-1",
+        scopeId: "thread-1",
+        staleBefore: Date.parse("2026-05-28T00:01:00.000Z"),
+        error: "Image generation was interrupted.",
+      }),
+    ).resolves.toBe(true);
+
+    expect((appStateByKey["asset-variants:thread-1"] as any).slots).toEqual([
+      expect.objectContaining({
+        slotId: "slot-1",
+        status: "failed",
+        error: "Image generation was interrupted.",
+      }),
+      expect.objectContaining({ slotId: "slot-2", status: "pending" }),
+    ]);
+  });
+
+  it("does not fail a recent pending run", async () => {
+    await upsertVariantSlot({
+      runId: "recent-run",
+      batchId: "batch-1",
+      libraryId: "lib-1",
+      prompt: "Generate a diagram",
+      slotId: "slot-1",
+      status: "pending",
+      threadId: "thread-1",
+    });
+
+    await expect(
+      failMissingVariantRun({
+        runId: "recent-run",
+        libraryId: "lib-1",
+        scopeId: "thread-1",
+        staleBefore: Date.parse("2026-05-27T23:59:00.000Z"),
+        error: "Image generation was interrupted.",
+      }),
+    ).resolves.toBe(false);
+    expect(
+      (appStateByKey["asset-variants:thread-1"] as any).slots[0].status,
+    ).toBe("pending");
+  });
+
+  it("starts a fresh age window when a slot id is reused for a new run", async () => {
+    await upsertVariantSlot({
+      runId: "old-run",
+      batchId: "batch-1",
+      libraryId: "lib-1",
+      prompt: "Generate a diagram",
+      slotId: "slot-1",
+      status: "pending",
+    });
+    (appState as any).slots[0].createdAt = "2026-05-27T00:00:00.000Z";
+
+    await upsertVariantSlot({
+      runId: "new-run",
+      batchId: "batch-1",
+      libraryId: "lib-1",
+      prompt: "Generate a revised diagram",
+      slotId: "slot-1",
+      status: "pending",
+    });
+
+    expect((appState as any).slots[0]).toEqual(
+      expect.objectContaining({
+        runId: "new-run",
+        status: "pending",
+        createdAt: "2026-05-28T00:00:00.000Z",
+      }),
+    );
+    await expect(
+      failMissingVariantRun({
+        runId: "new-run",
+        libraryId: "lib-1",
+        staleBefore: Date.parse("2026-05-27T23:59:00.000Z"),
+        error: "Image generation was interrupted.",
+      }),
+    ).resolves.toBe(false);
+  });
+
+  it("records thread candidates in isolated state while mirroring the latest stage", async () => {
+    await upsertVariantSlot({
+      runId: "run-1",
+      batchId: "batch-1",
+      libraryId: "lib-1",
+      prompt: "Generate a diagram",
+      slotId: "slot-1",
+      status: "pending",
+      threadId: "thread-1",
+    });
+
+    expect((appState as any).threadId).toBe("thread-1");
+    expect((appStateByKey["asset-variants:thread-1"] as any).threadId).toBe(
+      "thread-1",
+    );
+
+    await upsertVariantSlot({
+      runId: "run-2",
+      batchId: "batch-2",
+      libraryId: "lib-1",
+      prompt: "Generate another diagram",
+      slotId: "slot-2",
+      status: "pending",
+      threadId: "thread-2",
+    });
+
+    expect((appState as any).threadId).toBe("thread-2");
+    expect((appStateByKey["asset-variants:thread-1"] as any).slots).toEqual([
+      expect.objectContaining({ slotId: "slot-1", status: "pending" }),
+    ]);
+    expect((appStateByKey["asset-variants:thread-2"] as any).slots).toEqual([
+      expect.objectContaining({ slotId: "slot-2", status: "pending" }),
+    ]);
+    await expect(
+      wasVariantSlotDismissed("lib-1", "slot-1", "thread-1"),
+    ).resolves.toBe(false);
+    await expect(
+      wasVariantSlotDismissed("lib-1", "slot-1", "thread-2"),
+    ).resolves.toBe(true);
+  });
+
+  it("keeps slots visible within their own picker scope", async () => {
+    await upsertVariantSlot({
+      runId: "run-1",
+      batchId: "batch-1",
+      libraryId: "lib-1",
+      prompt: "Generate a diagram",
+      slotId: "slot-1",
+      status: "ready",
+      assetId: "asset-1",
+      variantScopeId: "picker:tab-1",
+    });
+
+    await expect(
+      wasVariantSlotDismissed("lib-1", "slot-1", {
+        variantScopeId: "picker:tab-1",
+      }),
+    ).resolves.toBe(false);
   });
 
   it("starts a fresh live panel when a new prompt begins", async () => {
@@ -213,5 +405,70 @@ describe("variant slot state", () => {
     expect((appState as any).slots).toEqual([
       expect.objectContaining({ slotId: "slot-2", status: "pending" }),
     ]);
+  });
+
+  it("appends a refined candidate to the thread's live batch instead of replacing it", async () => {
+    await upsertVariantSlot({
+      runId: "run-1",
+      batchId: "batch-1",
+      libraryId: "lib-1",
+      prompt: "Generate a diagram",
+      slotId: "slot-1",
+      status: "ready",
+      assetId: "asset-1",
+      threadId: "thread-1",
+    });
+
+    const continuation = await resolveLiveBatchContinuation({
+      threadId: "thread-1",
+      libraryId: "lib-1",
+    });
+    expect(continuation?.variantBatchId).toBe("batch-1");
+
+    await upsertVariantSlot({
+      runId: "run-2",
+      batchId: continuation?.variantBatchId,
+      libraryId: "lib-1",
+      presetId: continuation?.presetId ?? undefined,
+      prompt: "Reduce the text",
+      slotId: "slot-2",
+      status: "ready",
+      assetId: "asset-2",
+      threadId: "thread-1",
+    });
+
+    expect(
+      (appStateByKey["asset-variants:thread-1"] as any).slots.map(
+        (slot: any) => slot.slotId,
+      ),
+    ).toEqual(["slot-1", "slot-2"]);
+  });
+
+  it("resolves no continuation when there is no live tray for the thread", async () => {
+    await expect(
+      resolveLiveBatchContinuation({
+        threadId: "thread-1",
+        libraryId: "lib-1",
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("resolves no continuation when the live tray belongs to a different library", async () => {
+    await upsertVariantSlot({
+      runId: "run-1",
+      libraryId: "lib-1",
+      prompt: "Generate a diagram",
+      slotId: "slot-1",
+      status: "ready",
+      assetId: "asset-1",
+      threadId: "thread-1",
+    });
+
+    await expect(
+      resolveLiveBatchContinuation({
+        threadId: "thread-1",
+        libraryId: "lib-2",
+      }),
+    ).resolves.toBeNull();
   });
 });

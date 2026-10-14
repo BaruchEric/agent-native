@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+
 import {
   defineEventHandler,
   getMethod,
@@ -6,14 +7,44 @@ import {
   setResponseHeader,
   type H3Event,
 } from "h3";
-import { readBody } from "../server/h3-helpers.js";
+
+import { getDbExec } from "../db/client.js";
+import { getOrgContext } from "../org/context.js";
+import {
+  resolveKeyReferencesWithRequestScopes,
+  validateUrlAllowlist,
+  getResolvedKeyAllowlist,
+  type ResolvedKeyReference,
+} from "../secrets/substitution.js";
 import { getSession } from "../server/auth.js";
+import { readBody } from "../server/h3-helpers.js";
 import {
   runWithRequestContext,
   getRequestOrgId,
 } from "../server/request-context.js";
-import { getOrgContext } from "../org/context.js";
-import { getDbExec, isPostgres } from "../db/client.js";
+import { ForbiddenError, resolveAccess } from "../sharing/access.js";
+import { ROLE_RANK, type ShareRole } from "../sharing/schema.js";
+import { ExtensionContentEditError } from "./content-patch.js";
+import { buildExtensionHtml } from "./html-shell.js";
+import {
+  buildExtensionIframeCsp,
+  buildExtensionIframeMetaCsp,
+  getExtensionIframeDisplaySources,
+} from "./iframe-csp.js";
+import {
+  getLocalExtension,
+  isLocalExtensionRow,
+  listLocalExtensions,
+  type LocalExtensionRow,
+} from "./local.js";
+import {
+  collectSecretValues,
+  normalizeExtensionProxyMethod,
+  readResponseTextWithLimit,
+  redactSecrets,
+  redactString,
+  sanitizeOutboundHeaders,
+} from "./proxy-security.js";
 import {
   listExtensions,
   getExtension,
@@ -31,36 +62,19 @@ import {
   ensureExtensionsTables,
   type ExtensionRow,
 } from "./store.js";
-import {
-  getLocalExtension,
-  isLocalExtensionRow,
-  listLocalExtensions,
-  type LocalExtensionRow,
-} from "./local.js";
-import { buildExtensionHtml, EXTENSION_IFRAME_CSP } from "./html-shell.js";
 import { getThemeVars } from "./theme.js";
-import {
-  resolveKeyReferencesWithRequestScopes,
-  validateUrlAllowlist,
-  getResolvedKeyAllowlist,
-  type ResolvedKeyReference,
-} from "../secrets/substitution.js";
-import {
-  collectSecretValues,
-  normalizeExtensionProxyMethod,
-  readResponseTextWithLimit,
-  redactSecrets,
-  redactString,
-  sanitizeOutboundHeaders,
-} from "./proxy-security.js";
 import {
   createSsrfSafeDispatcher,
   isBlockedExtensionUrlWithDns,
 } from "./url-safety.js";
-import { ForbiddenError, resolveAccess } from "../sharing/access.js";
-import type { ShareRole } from "../sharing/schema.js";
 
-export function createExtensionsHandler() {
+export interface ExtensionsHandlerOptions {
+  extensionTools?: boolean;
+}
+
+export function createExtensionsHandler(
+  options: ExtensionsHandlerOptions = {},
+) {
   return defineEventHandler(async (event: H3Event) => {
     const method = getMethod(event);
     const pathname = (event.url?.pathname || "")
@@ -83,11 +97,36 @@ export function createExtensionsHandler() {
     }
 
     const orgCtx = await getOrgContext(event).catch(() => null);
-    const userEmail = session.email;
+    const userEmail = normalizeExtensionUserEmail(session.email);
+    if (!userEmail) {
+      setResponseStatus(event, 401);
+      return { error: "Authentication required" };
+    }
     const orgId = orgCtx?.orgId ?? session.orgId ?? undefined;
 
     try {
       return await runWithRequestContext({ userEmail, orgId }, async () => {
+        if (
+          method === "POST" &&
+          parts.length === 0 &&
+          options.extensionTools !== true
+        ) {
+          setResponseStatus(event, 403);
+          return { error: "Extension creation is disabled for this app" };
+        }
+        // The configured img-src / media-src for client-rendered srcDoc frames
+        // (EXTENSION_IFRAME_DISPLAY_SOURCES_PATH). It only reads validated app
+        // config, so it is answered before the extension tables are set up.
+        // Two segments, and no extension route uses `display-sources`, so this
+        // cannot shadow an extension id.
+        if (
+          method === "GET" &&
+          parts.length === 2 &&
+          parts[0] === "iframe" &&
+          parts[1] === "display-sources"
+        ) {
+          return getExtensionIframeDisplaySources();
+        }
         await ensureExtensionsTables();
         return dispatch(event, method, parts, userEmail);
       });
@@ -96,9 +135,19 @@ export function createExtensionsHandler() {
         setResponseStatus(event, 403);
         return { error: err.message };
       }
+      if (err instanceof ExtensionContentEditError) {
+        setResponseStatus(event, 400);
+        return { error: err.message, errorCode: err.code };
+      }
       throw err;
     }
   });
+}
+
+const MAX_EXTENSION_DATA_BYTES = 1024 * 1024;
+
+function normalizeExtensionUserEmail(email: string): string {
+  return email.trim().toLowerCase();
 }
 
 async function dispatch(
@@ -107,7 +156,6 @@ async function dispatch(
   parts: string[],
   userEmail: string,
 ): Promise<unknown> {
-  // POST /sql/query — read-only SQL for extension iframes
   if (
     method === "POST" &&
     parts.length === 2 &&
@@ -117,7 +165,6 @@ async function dispatch(
     return handleSqlQuery(event);
   }
 
-  // POST /sql/exec — write SQL for extension iframes
   if (
     method === "POST" &&
     parts.length === 2 &&
@@ -127,17 +174,14 @@ async function dispatch(
     return handleSqlExec(event);
   }
 
-  // GET /data/:extensionId/:collection — list items in a collection
   if (method === "GET" && parts.length === 3 && parts[0] === "data") {
     return handleExtensionDataList(event, parts[1], parts[2], userEmail);
   }
 
-  // POST /data/:extensionId/:collection — create/upsert an item
   if (method === "POST" && parts.length === 3 && parts[0] === "data") {
     return handleExtensionDataUpsert(event, parts[1], parts[2], userEmail);
   }
 
-  // DELETE /data/:extensionId/:collection/:itemId — delete an item
   if (method === "DELETE" && parts.length === 4 && parts[0] === "data") {
     return handleExtensionDataDelete(
       event,
@@ -148,19 +192,19 @@ async function dispatch(
     );
   }
 
-  // POST /proxy
   if (method === "POST" && parts.length === 1 && parts[0] === "proxy") {
     return handleProxy(event, userEmail);
   }
 
-  // GET / — list. `?includeGloballyHidden=true` surfaces extensions an
-  // admin/owner has globally hidden (so they can be unhidden for everyone).
   if (method === "GET" && parts.length === 0) {
     const includeGloballyHidden =
       event.url?.searchParams?.get("includeGloballyHidden") === "true";
     const includeContent =
       event.url?.searchParams?.get("includeContent") === "true";
-    const rows = await listExtensions({ includeGloballyHidden });
+    const rows = await listExtensions({
+      includeGloballyHidden,
+      includeContent,
+    });
     const localRows = includeGloballyHidden ? [] : await listLocalExtensions();
     return Promise.all(
       [...rows, ...localRows].map((row) =>
@@ -169,7 +213,6 @@ async function dispatch(
     );
   }
 
-  // POST / — create
   if (method === "POST" && parts.length === 0) {
     const body = await readBody(event);
     if (!body.name) {
@@ -181,7 +224,6 @@ async function dispatch(
     return extension;
   }
 
-  // GET /:id/render
   if (method === "GET" && parts.length === 2 && parts[1] === "render") {
     const localExtension = await getLocalExtension(parts[0]);
     if (localExtension) {
@@ -201,27 +243,30 @@ async function dispatch(
           source: "local-files",
           permissions: localExtension.source.permissions,
         },
+        buildExtensionIframeMetaCsp(),
       );
       setResponseHeader(event, "Content-Type", "text/html; charset=utf-8");
-      setResponseHeader(event, "Content-Security-Policy", EXTENSION_IFRAME_CSP);
+      setResponseHeader(
+        event,
+        "Content-Security-Policy",
+        buildExtensionIframeCsp(),
+      );
       setResponseHeader(event, "X-Content-Type-Options", "nosniff");
       setResponseHeader(event, "Referrer-Policy", "no-referrer");
       return html;
     }
 
     const access = await resolveAccess("extension", parts[0]);
-    const extension = access?.resource;
-    if (!extension) {
+    const extension = access?.resource as ExtensionRow | undefined;
+    if (!access || !extension || extension.archivedAt) {
       setResponseStatus(event, 404);
       return { error: "Extension not found" };
     }
     const search = event.url?.search || "";
     const isDark = search.includes("dark=1") || search.includes("dark=true");
     const themeVars = getThemeVars(isDark);
-    // Compute viewer-vs-author binding so the iframe can warn when the
-    // viewer is NOT the author. The role is plumbed through to gate
-    // dangerous bridge helpers in iframe-bridge.ts (audit H4).
     const isAuthor = extension.ownerEmail === userEmail;
+    const renderRole = access.role === "commenter" ? "viewer" : access.role;
 
     const html = buildExtensionHtml(
       extension.content,
@@ -232,19 +277,23 @@ async function dispatch(
         authorEmail: extension.ownerEmail,
         viewerEmail: userEmail,
         isAuthor,
-        role: access.role,
+        role: renderRole,
       },
+      buildExtensionIframeMetaCsp(),
     );
     // Security headers per render. `frame-ancestors` in the CSP must be set as
     // an HTTP header to be enforced; meta-CSP can't set it per spec.
     setResponseHeader(event, "Content-Type", "text/html; charset=utf-8");
-    setResponseHeader(event, "Content-Security-Policy", EXTENSION_IFRAME_CSP);
+    setResponseHeader(
+      event,
+      "Content-Security-Policy",
+      buildExtensionIframeCsp(),
+    );
     setResponseHeader(event, "X-Content-Type-Options", "nosniff");
     setResponseHeader(event, "Referrer-Policy", "no-referrer");
     return html;
   }
 
-  // GET /:id/history — list saved snapshots for an extension
   if (method === "GET" && parts.length === 2 && parts[1] === "history") {
     const localResponse = await localExtensionSqlOnlyResponse(event, parts[0]);
     if (localResponse) return localResponse;
@@ -263,7 +312,6 @@ async function dispatch(
     };
   }
 
-  // GET /:id/history/:version — fetch one snapshot plus its previous-version diff
   if (method === "GET" && parts.length === 3 && parts[1] === "history") {
     const localResponse = await localExtensionSqlOnlyResponse(event, parts[0]);
     if (localResponse) return localResponse;
@@ -275,7 +323,6 @@ async function dispatch(
     return detail;
   }
 
-  // POST /:id/history/:version/restore — restore display metadata + content
   if (
     method === "POST" &&
     parts.length === 4 &&
@@ -292,7 +339,6 @@ async function dispatch(
     return extensionResponse(restored);
   }
 
-  // GET /:id
   if (method === "GET" && parts.length === 1) {
     const localExtension = await getLocalExtension(parts[0]);
     if (localExtension) {
@@ -300,15 +346,14 @@ async function dispatch(
     }
 
     const access = await resolveAccess("extension", parts[0]);
-    if (!access) {
+    const extension = access?.resource as ExtensionRow | undefined;
+    if (!access || !extension || extension.archivedAt) {
       setResponseStatus(event, 404);
       return { error: "Extension not found" };
     }
-    return extensionResponse(access.resource as ExtensionRow, access.role);
+    return extensionResponse(extension, access.role);
   }
 
-  // POST /:id/hide — remove from the current user's Extensions list/sidebar
-  // without deleting the underlying extension for teammates or shared slots.
   if (method === "POST" && parts.length === 2 && parts[1] === "hide") {
     const localResponse = await localExtensionSqlOnlyResponse(event, parts[0]);
     if (localResponse) return localResponse;
@@ -320,7 +365,6 @@ async function dispatch(
     return { ok: true, hidden: true };
   }
 
-  // POST /:id/unhide — restore an extension hidden by the current user.
   if (method === "POST" && parts.length === 2 && parts[1] === "unhide") {
     const localResponse = await localExtensionSqlOnlyResponse(event, parts[0]);
     if (localResponse) return localResponse;
@@ -332,7 +376,6 @@ async function dispatch(
     return { ok: true, hidden: false };
   }
 
-  // POST /:id/global-hide — admin/owner hides the extension from EVERYONE.
   if (method === "POST" && parts.length === 2 && parts[1] === "global-hide") {
     const localResponse = await localExtensionSqlOnlyResponse(event, parts[0]);
     if (localResponse) return localResponse;
@@ -344,7 +387,6 @@ async function dispatch(
     return { ok: true, globallyHidden: true };
   }
 
-  // POST /:id/global-unhide — admin/owner reverses a global hide.
   if (method === "POST" && parts.length === 2 && parts[1] === "global-unhide") {
     const localResponse = await localExtensionSqlOnlyResponse(event, parts[0]);
     if (localResponse) return localResponse;
@@ -356,11 +398,20 @@ async function dispatch(
     return { ok: true, globallyHidden: false };
   }
 
-  // PUT /:id
   if (method === "PUT" && parts.length === 1) {
     const localResponse = await localExtensionSqlOnlyResponse(event, parts[0]);
     if (localResponse) return localResponse;
     const body = await readBody(event);
+    if (
+      typeof body.visibility === "string" &&
+      body.visibility.trim().toLowerCase() === "public"
+    ) {
+      setResponseStatus(event, 403);
+      return {
+        error:
+          "Extensions cannot be made public — use private or org visibility instead. No content changes were applied.",
+      };
+    }
     const hasContentUpdate =
       body.content !== undefined ||
       body.patches !== undefined ||
@@ -376,6 +427,9 @@ async function dispatch(
     if (hasContentUpdate) {
       result = await updateExtensionContent(parts[0], {
         content: body.content,
+        allowFullReplacement:
+          body.allowFullReplacement === true ||
+          body.allowFullReplacement === "true",
         patches: body.patches,
         edits: body.edits,
         format: body.format === true || body.format === "true",
@@ -394,7 +448,6 @@ async function dispatch(
     return result;
   }
 
-  // DELETE /:id
   if (method === "DELETE" && parts.length === 1) {
     const localResponse = await localExtensionSqlOnlyResponse(event, parts[0]);
     if (localResponse) return localResponse;
@@ -403,7 +456,7 @@ async function dispatch(
       setResponseStatus(event, 404);
       return { error: "Extension not found" };
     }
-    return { ok: true };
+    return { ok: true, archived: true };
   }
 
   setResponseStatus(event, 404);
@@ -446,7 +499,7 @@ async function extensionResponse(
 async function localExtensionSqlOnlyResponse(
   event: H3Event,
   extensionId: string,
-): Promise<unknown | null> {
+): Promise<unknown> {
   const localExtension = await getLocalExtension(extensionId);
   if (!localExtension) return null;
   setResponseStatus(event, 400);
@@ -464,14 +517,9 @@ async function handleExtensionDataList(
   userEmail: string,
 ): Promise<unknown> {
   await ensureExtensionsTables();
-  const extension = await getExtension(extensionId);
-  const localExtension = extension
-    ? null
-    : await getLocalExtension(extensionId);
-  if (!extension && !localExtension) {
-    setResponseStatus(event, 404);
-    return { error: "Extension not found" };
-  }
+  const access = await requireExtensionDataAccess(event, extensionId, "viewer");
+  if (!access.ok) return access.response;
+
   const client = getDbExec();
   const url = event.url;
   const limitParam = url?.searchParams?.get("limit");
@@ -502,7 +550,7 @@ async function handleExtensionDataList(
       sql: `SELECT COALESCE(item_id, id) AS id, tool_id, collection, data, owner_email, scope, org_id, created_at, updated_at
         FROM tool_data
         WHERE tool_id = ? AND collection = ?
-          AND ((scope = 'user' AND owner_email = ?) OR (scope = 'org' AND org_id = ?))
+          AND ((scope = 'user' AND lower(owner_email) = ?) OR (scope = 'org' AND org_id = ?))
         ORDER BY created_at DESC
         LIMIT ?`,
       args: [extensionId, collection, userEmail, orgId ?? "", limit],
@@ -513,7 +561,7 @@ async function handleExtensionDataList(
   const result = await client.execute({
     sql: `SELECT COALESCE(item_id, id) AS id, tool_id, collection, data, owner_email, scope, org_id, created_at, updated_at
       FROM tool_data
-      WHERE tool_id = ? AND collection = ? AND scope = 'user' AND owner_email = ?
+      WHERE tool_id = ? AND collection = ? AND scope = 'user' AND lower(owner_email) = ?
       ORDER BY updated_at DESC
       LIMIT ?`,
     args: [extensionId, collection, userEmail, limit],
@@ -528,14 +576,9 @@ async function handleExtensionDataUpsert(
   userEmail: string,
 ): Promise<unknown> {
   await ensureExtensionsTables();
-  const extension = await getExtension(extensionId);
-  const localExtension = extension
-    ? null
-    : await getLocalExtension(extensionId);
-  if (!extension && !localExtension) {
-    setResponseStatus(event, 404);
-    return { error: "Extension not found" };
-  }
+  const access = await requireExtensionDataAccess(event, extensionId, "editor");
+  if (!access.ok) return access.response;
+
   const body = await readBody(event);
   if (body.data === undefined) {
     setResponseStatus(event, 400);
@@ -544,6 +587,14 @@ async function handleExtensionDataUpsert(
   const itemId = String(body.id || randomUUID());
   const data =
     typeof body.data === "string" ? body.data : JSON.stringify(body.data);
+  if (Buffer.byteLength(data, "utf8") > MAX_EXTENSION_DATA_BYTES) {
+    setResponseStatus(event, 413);
+    return {
+      error:
+        "Extension data is too large for SQL storage. Store large files, base64, or blobs in file storage and save only a URL or handle.",
+      maxBytes: MAX_EXTENSION_DATA_BYTES,
+    };
+  }
   const now = new Date().toISOString();
   const scope = body.scope === "org" ? "org" : "user";
   const orgId = getRequestOrgId();
@@ -555,7 +606,7 @@ async function handleExtensionDataUpsert(
 
   const scopeKey = scope === "org" ? `org:${orgId}` : userEmail;
   const client = getDbExec();
-  const pg = isPostgres();
+  const pg = true;
   const conflictClause = pg
     ? `ON CONFLICT (tool_id, collection, scope_key, item_id)
        DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at`
@@ -601,14 +652,9 @@ async function handleExtensionDataDelete(
   userEmail: string,
 ): Promise<unknown> {
   await ensureExtensionsTables();
-  const extension = await getExtension(extensionId);
-  const localExtension = extension
-    ? null
-    : await getLocalExtension(extensionId);
-  if (!extension && !localExtension) {
-    setResponseStatus(event, 404);
-    return { error: "Extension not found" };
-  }
+  const access = await requireExtensionDataAccess(event, extensionId, "editor");
+  if (!access.ok) return access.response;
+
   const url = event.url;
   const scope = url?.searchParams?.get("scope") || "user";
   const orgId = getRequestOrgId();
@@ -627,10 +673,49 @@ async function handleExtensionDataDelete(
   }
 
   await client.execute({
-    sql: `DELETE FROM tool_data WHERE COALESCE(item_id, id) = ? AND tool_id = ? AND collection = ? AND scope = 'user' AND owner_email = ?`,
+    sql: `DELETE FROM tool_data WHERE COALESCE(item_id, id) = ? AND tool_id = ? AND collection = ? AND scope = 'user' AND lower(owner_email) = ?`,
     args: [itemId, extensionId, collection, userEmail],
   });
   return { ok: true };
+}
+
+async function requireExtensionDataAccess(
+  event: H3Event,
+  extensionId: string,
+  minRole: ShareRole,
+): Promise<{ ok: true } | { ok: false; response: unknown }> {
+  const access = await resolveAccess("extension", extensionId);
+  if (access?.resource && (access.resource as ExtensionRow).archivedAt) {
+    setResponseStatus(event, 404);
+    return { ok: false, response: { error: "Extension not found" } };
+  }
+  if (access) {
+    if (ROLE_RANK[access.role] < ROLE_RANK[minRole]) {
+      setResponseStatus(event, 403);
+      return {
+        ok: false,
+        response: {
+          error: `Requires ${minRole} role on extension ${extensionId} (have ${access.role})`,
+        },
+      };
+    }
+    return { ok: true };
+  }
+
+  const localExtension = await getLocalExtension(extensionId);
+  if (localExtension) {
+    if (!localExtension.source.permissions.extensionData) {
+      setResponseStatus(event, 403);
+      return {
+        ok: false,
+        response: { error: "extensionData is disabled for this extension" },
+      };
+    }
+    return { ok: true };
+  }
+
+  setResponseStatus(event, 404);
+  return { ok: false, response: { error: "Extension not found" } };
 }
 
 async function handleProxy(
@@ -656,10 +741,6 @@ async function handleProxy(
   const rawBody = body.body;
 
   let resolvedUrl = rawUrl;
-  // Resolve secret references per header value rather than over a single
-  // JSON.stringify(headers) blob. A secret value containing a double-quote
-  // would corrupt that JSON, the later JSON.parse would throw, and the request
-  // would silently fall back to the *unresolved* headers (placeholders intact).
   const parsedHeaders: Record<string, string> = {};
   let resolvedBody = rawBody;
   const allSecretValues: string[] = [];
@@ -725,12 +806,6 @@ async function handleProxy(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15_000);
 
-  // Best-effort connect-time SSRF guard. When undici is available (it ships
-  // with Node 18+ but is not always exposed as an importable module), the
-  // dispatcher re-checks the resolved IP at TCP-connect time, closing the
-  // TOCTOU between the pre-flight `isBlockedExtensionUrlWithDns` lookup and the
-  // actual fetch lookup. If undici is not importable, fall through to plain
-  // fetch — the pre-flight remains the primary protection.
   const dispatcher = (await createSsrfSafeDispatcher()) ?? undefined;
 
   try {
@@ -746,10 +821,6 @@ async function handleProxy(
       fetchOpts.body = isStringBody
         ? resolvedBody
         : JSON.stringify(resolvedBody);
-      // Only inject Content-Type when (a) the caller didn't set one and
-      // (b) the body is actually JSON-shaped (object or stringified JSON).
-      // Otherwise leave it unset so the runtime fetch picks an appropriate
-      // default and we don't misrepresent text/plain bodies as JSON.
       const hasContentType = Object.keys(headers).some(
         (k) => k.toLowerCase() === "content-type",
       );
@@ -793,12 +864,16 @@ async function handleProxy(
       };
     }
 
-    const { text } = await readResponseTextWithLimit(response);
+    const responseText = await readResponseTextWithLimit(response);
+    if (responseText.truncated) {
+      setResponseStatus(event, 502);
+      return { error: responseText.text };
+    }
     let responseBody: unknown;
     try {
-      responseBody = JSON.parse(text);
+      responseBody = JSON.parse(responseText.text);
     } catch {
-      responseBody = text;
+      responseBody = responseText.text;
     }
 
     return {
@@ -822,10 +897,6 @@ async function handleProxy(
   }
 }
 
-/**
- * Capture console output from a CLI script that uses console.log for results.
- * Same technique as wrapCliScript in agent-chat-plugin.ts.
- */
 let captureCliOutputQueue: Promise<void> = Promise.resolve();
 
 async function captureCliOutput(
@@ -840,9 +911,9 @@ async function captureCliOutput(
   await previousCapture;
 
   const logs: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  const origStdoutWrite = process.stdout.write;
+  const origLog = console.log.bind(console);
+  const origError = console.error.bind(console);
+  const origStdoutWrite = process.stdout.write.bind(process.stdout);
   console.log = (...a: unknown[]) => {
     logs.push(a.map(String).join(" "));
   };
@@ -910,26 +981,12 @@ async function handleSqlQuery(event: H3Event): Promise<unknown> {
   }
 }
 
-// TODO(security): replace this regex blocklist with a SQL parser + an explicit
-// allowlist of tables a extension may read/write (e.g. only `tool_data`, plus a
-// per-template list). The current blocklist is best-effort defense in depth
-// and is by design bypassable via SQL constructions that don't include the
-// blocklisted token literally (string concat, dynamic SQL, etc). The temp-
-// view scoping in scripts/db/scoping.ts is the actual ownership boundary.
 export const DESTRUCTIVE_SQL_RE =
-  /\b(CREATE\s+(?:(?:LOCAL|GLOBAL)\s+)?(?:TEMPORARY|TEMP)?\s*(TABLE|INDEX|VIEW|SCHEMA|DATABASE|TRIGGER|FUNCTION|EXTENSION|ROLE|TABLESPACE|PUBLICATION|SUBSCRIPTION)|DROP\s+(TABLE|INDEX|VIEW|SCHEMA|DATABASE|TRIGGER|FUNCTION|EXTENSION|ROLE)|TRUNCATE|DELETE\s+FROM\s+(?!tool_data\b)|ALTER\s+(TABLE|VIEW|SCHEMA|DATABASE|FUNCTION|ROLE|EXTENSION|PUBLICATION)\s+(?!tool_data\b)|ATTACH|DETACH|VACUUM|REINDEX|PRAGMA|GRANT|REVOKE|SET\s+ROLE|RESET\s+ROLE|COPY)\b/i;
+  /\b(CREATE\s+(?:(?:LOCAL|GLOBAL)\s+)?(?:TEMPORARY|TEMP)?\s*(TABLE|INDEX|VIEW|SCHEMA|DATABASE|TRIGGER|FUNCTION|EXTENSION|ROLE|TABLESPACE|PUBLICATION|SUBSCRIPTION)|DROP\s+(TABLE|INDEX|VIEW|SCHEMA|DATABASE|TRIGGER|FUNCTION|EXTENSION|ROLE)|TRUNCATE|DELETE\s+FROM\s+(?!tool_data\b)|ALTER\s+(TABLE|VIEW|SCHEMA|DATABASE|FUNCTION|ROLE|EXTENSION|PUBLICATION)\s+(?!tool_data\b)|ATTACH|DETACH|VACUUM|REINDEX|GRANT|REVOKE|SET\s+ROLE|RESET\s+ROLE|COPY)\b/i;
 
-// Sensitive tables that extensions must not touch directly. Includes Better Auth
-// identity tables, framework infrastructure (tracing, evals, automations,
-// integrations, notifications, scheduling, sharing/orgs), and Postgres
-// catalogs that would let a extension enumerate or read internals.
 export const SENSITIVE_SQL_RE =
-  /\b(app_secrets|user|users|session|sessions|account|accounts|verification|oauth_tokens|tools|extensions|tool_shares|tool_slots|tool_slot_installs|tool_hidden_extensions|tool_history|member|organization|invitation|jwks|agent_trace_spans|agent_trace_summaries|agent_feedback|agent_satisfaction_scores|agent_evals|agent_runs|agent_run_events|notifications|progress_runs|integration_configs|integration_pending_tasks|integration_thread_mappings|resources|org_members|org_invitations|bigquery_cache|dashboard_views|pg_catalog|information_schema|pg_class|pg_proc|pg_namespace|pg_user|pg_roles|pg_authid|pg_shadow)\b/i;
+  /\b(app_secrets|settings|user|users|session|sessions|account|accounts|verification|oauth_tokens|tools|extensions|tool_shares|tool_slots|tool_slot_installs|tool_hidden_extensions|tool_history|member|organization|invitation|jwks|agent_trace_spans|agent_trace_summaries|agent_feedback|agent_satisfaction_scores|agent_evals|agent_runs|agent_run_events|notifications|progress_runs|integration_configs|integration_pending_tasks|integration_thread_mappings|resources|org_members|org_invitations|bigquery_cache|dashboard_views|pg_catalog|information_schema|pg_class|pg_proc|pg_namespace|pg_user|pg_roles|pg_authid|pg_shadow)\b/i;
 
-// Refuses positional INSERTs (no column list). `INSERT INTO recordings VALUES
-// (...)` would let a extension stuff arbitrary owner_email values into a row.
-// `INSERT INTO recordings (col1, col2) VALUES (...)` is required so the
-// downstream injectOwnership helper can append owner_email.
 export const POSITIONAL_INSERT_RE =
   /\bINSERT\s+INTO\s+["'`]?\w+["'`]?\s+VALUES\b/i;
 

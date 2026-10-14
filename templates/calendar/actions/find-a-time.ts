@@ -1,17 +1,16 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
+import type { ActionRunContext } from "@agent-native/core/action";
+import {
+  ACTION_CHAT_UI_RECORD_CHANGE_RENDERER,
+  normalizeActionChangeResult,
+} from "@agent-native/core/action-ui";
 import {
   getRequestTimezone,
   getRequestUserEmail,
 } from "@agent-native/core/server";
 import { getUserSetting, readSetting } from "@agent-native/core/settings";
 import { z } from "zod";
-import type {
-  CalendarEvent,
-  FindTimeBusyBlock,
-  FindTimeParticipant,
-  FindTimeResult,
-} from "../shared/api.js";
-import * as googleCalendar from "../server/lib/google-calendar.js";
+
 import { eventBlocksAvailability } from "../server/lib/calendar-availability.js";
 import {
   computeFindTimeSlots,
@@ -19,6 +18,16 @@ import {
   normalizeTimezone,
   resolveFindTimeRange,
 } from "../server/lib/find-time.js";
+import * as googleCalendar from "../server/lib/google-calendar.js";
+import type {
+  CalendarEvent,
+  FindTimeBusyBlock,
+  FindTimeParticipant,
+} from "../shared/api.js";
+import {
+  calendarTimeChoiceChange,
+  resolveCalendarActionLocale,
+} from "./action-chat-ui.js";
 import { listCalendarEvents } from "./list-events.js";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -141,6 +150,11 @@ function addCalendarEventBusyBlocks(
   }
 }
 
+function projectTimeChoice(result: unknown) {
+  const projected = normalizeActionChangeResult(result);
+  return projected?.change.kind === "calendar-time-choice" ? projected : null;
+}
+
 export default defineAction({
   description:
     "Find shared available time slots for a calendar event organizer and attendees using Google free/busy plus local calendar conflicts.",
@@ -194,9 +208,18 @@ export default defineAction({
   }),
   http: { method: "GET" },
   readOnly: true,
-  run: async (args): Promise<FindTimeResult> => {
+  chatUI: {
+    renderer: ACTION_CHAT_UI_RECORD_CHANGE_RENDERER,
+    when: (_args, result) => projectTimeChoice(result) !== null,
+    projectResult: (_args, result) => projectTimeChoice(result),
+  },
+  run: async (args, actionContext?: ActionRunContext) => {
     const ownerEmail = getRequestUserEmail();
     if (!ownerEmail) throw new Error("no authenticated user");
+    const locale = await resolveCalendarActionLocale(
+      ownerEmail,
+      actionContext?.requestHeaders,
+    );
 
     const requestTimezone = normalizeTimezone(
       args.timezone ?? getRequestTimezone(),
@@ -250,15 +273,22 @@ export default defineAction({
     const busyByKey = new Map<string, FindTimeBusyBlock>();
     const errors: Array<{ email: string; error: string }> = [];
 
-    if (googleConnected) {
-      const freeBusy = await googleCalendar.getFreeBusy(
-        range.from,
-        range.to,
-        participantEmails,
-        ownerEmail,
-        timezone,
-        organizerEmail,
-      );
+    const [freeBusyOutcome, eventsOutcome] = await Promise.allSettled([
+      googleConnected
+        ? googleCalendar.getFreeBusy(
+            range.from,
+            range.to,
+            participantEmails,
+            ownerEmail,
+            timezone,
+            organizerEmail,
+          )
+        : Promise.resolve(null),
+      listCalendarEvents({ from: range.from, to: range.to }),
+    ]);
+
+    if (freeBusyOutcome.status === "fulfilled" && freeBusyOutcome.value) {
+      const freeBusy = freeBusyOutcome.value;
       errors.push(...freeBusy.errors);
       for (const [email, calendar] of Object.entries(freeBusy.calendars)) {
         for (const busy of calendar.busy) {
@@ -275,13 +305,17 @@ export default defineAction({
           );
         }
       }
+    } else if (freeBusyOutcome.status === "rejected") {
+      errors.push({
+        email: organizerEmail,
+        error:
+          freeBusyOutcome.reason?.message ||
+          "Unable to load free/busy availability",
+      });
     }
 
-    try {
-      const eventResult = await listCalendarEvents({
-        from: range.from,
-        to: range.to,
-      });
+    if (eventsOutcome.status === "fulfilled") {
+      const eventResult = eventsOutcome.value;
       errors.push(...eventResult.errors);
       addCalendarEventBusyBlocks(
         busyByKey,
@@ -291,10 +325,12 @@ export default defineAction({
         args.ignoreStart,
         args.ignoreEnd,
       );
-    } catch (error: any) {
+    } else {
       errors.push({
         email: organizerEmail,
-        error: error?.message || "Unable to load local calendar conflicts",
+        error:
+          eventsOutcome.reason?.message ||
+          "Unable to load local calendar conflicts",
       });
     }
 
@@ -315,6 +351,15 @@ export default defineAction({
       durationMinutes,
       slotStepMinutes,
     });
+    const timeChoice =
+      googleConnected && !errors.length && slots[0]
+        ? calendarTimeChoiceChange(
+            slots[0].start,
+            slots[0].end,
+            timezone,
+            locale,
+          )
+        : null;
 
     return {
       range: {
@@ -332,6 +377,7 @@ export default defineAction({
       message: googleConnected
         ? undefined
         : "Google Calendar is not connected, so suggestions only use local calendar conflicts.",
+      ...(timeChoice ?? {}),
     };
   },
 });

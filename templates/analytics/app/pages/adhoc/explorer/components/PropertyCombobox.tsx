@@ -1,8 +1,8 @@
-import { useState, useMemo } from "react";
+import { useT } from "@agent-native/core/client/i18n";
 import { IconCheck, IconSelector } from "@tabler/icons-react";
-import { cn } from "@/lib/utils";
+import { useState, useMemo } from "react";
+
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
 import {
   Command,
   CommandEmpty,
@@ -16,6 +16,10 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { Skeleton } from "@/components/ui/skeleton";
+import { cn } from "@/lib/utils";
+
+import { formatExplorerPropertyLabel } from "../property-label";
 import { KNOWN_PROPERTIES, ENRICHED_PROPERTY_MAP } from "../types";
 import { useDynamicProperties } from "../use-dynamic-schema";
 
@@ -23,7 +27,6 @@ interface PropertyComboboxProps {
   value: string;
   onChange: (value: string) => void;
   triggerLabel?: string;
-  /** If true, the popover opens automatically on mount */
   autoOpen?: boolean;
 }
 
@@ -33,6 +36,7 @@ export function PropertyCombobox({
   triggerLabel,
   autoOpen,
 }: PropertyComboboxProps) {
+  const t = useT();
   const [open, setOpen] = useState(autoOpen ?? false);
   const { properties: dynamicProps, isLoading } = useDynamicProperties();
   const [search, setSearch] = useState("");
@@ -50,7 +54,6 @@ export function PropertyCombobox({
     [dynamicProps, knownSet],
   );
 
-  // Allow selecting a custom typed value not in the list
   const allKnown = useMemo(() => {
     const set = new Set(knownSet);
     for (const p of dynamicProps) set.add(p.name);
@@ -61,6 +64,11 @@ export function PropertyCombobox({
     onChange(v);
     setOpen(false);
   };
+
+  const displayLabel = useMemo(() => {
+    if (!value) return null;
+    return formatExplorerPropertyLabel(value);
+  }, [value]);
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -73,20 +81,19 @@ export function PropertyCombobox({
           size="sm"
         >
           <span className="truncate">
-            {value || triggerLabel || "Select property..."}
+            {displayLabel || triggerLabel || t("explorer.selectProperty")}
           </span>
           <IconSelector className="ml-1 h-3 w-3 shrink-0 opacity-50" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-[280px] p-0" align="start">
+      <PopoverContent className="w-[320px] p-0" align="start">
         <Command shouldFilter={true}>
           <CommandInput
-            placeholder="Search or type property..."
+            placeholder={t("explorer.searchOrTypeProperty")}
             value={search}
             onValueChange={setSearch}
             onKeyDown={(e) => {
               if (e.key === "Enter" && search.trim()) {
-                // If the search term isn't in the list, allow using it as custom
                 const trimmed = search.trim();
                 if (!allKnown.has(trimmed)) {
                   handleSelect(trimmed);
@@ -111,10 +118,10 @@ export function PropertyCombobox({
                     setSearch("");
                   }}
                 >
-                  Use "<strong>{search.trim()}</strong>"
+                  {t("explorer.useValue", { value: search.trim() })}
                 </button>
               ) : (
-                "No properties found."
+                t("explorer.noPropertiesFound")
               )}
             </CommandEmpty>
             {KNOWN_PROPERTIES.map((group) => (
@@ -133,10 +140,10 @@ export function PropertyCombobox({
                           value === prop ? "opacity-100" : "opacity-0",
                         )}
                       />
-                      {enriched?.label ?? prop}
+                      {enriched?.label ?? formatExplorerPropertyLabel(prop)}
                       {enriched && (
                         <span className="ml-auto text-[9px] bg-primary/10 text-primary px-1.5 py-0.5 rounded">
-                          joined
+                          {t("explorer.joined")}
                         </span>
                       )}
                     </CommandItem>
@@ -145,7 +152,11 @@ export function PropertyCombobox({
               </CommandGroup>
             ))}
             {extraProps.length > 0 && (
-              <CommandGroup heading={`Data Properties (${extraProps.length})`}>
+              <CommandGroup
+                heading={t("explorer.dataProperties", {
+                  count: extraProps.length,
+                })}
+              >
                 {extraProps.map((p) => (
                   <CommandItem
                     key={p.name}
@@ -158,7 +169,9 @@ export function PropertyCombobox({
                         value === p.name ? "opacity-100" : "opacity-0",
                       )}
                     />
-                    <span className="truncate">{p.name}</span>
+                    <span className="truncate">
+                      {formatExplorerPropertyLabel(p.name)}
+                    </span>
                     <span className="ml-auto text-[10px] text-muted-foreground">
                       {p.count.toLocaleString()}
                     </span>

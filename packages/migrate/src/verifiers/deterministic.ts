@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+
 import type { Verifier, VerifierResult } from "../types.js";
 
 export const outputFileVerifier: Verifier = {
@@ -62,7 +63,7 @@ export const routeParityVerifier: Verifier = {
 
 export const agentNativeConformanceVerifier: Verifier = {
   id: "agent-native-conformance-summary",
-  label: "Agent-native conformance summary",
+  label: "Agent-Native conformance summary",
   async run(context): Promise<VerifierResult> {
     const checks = [
       {

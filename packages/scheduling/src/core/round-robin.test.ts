@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { assignRoundRobin, type HostMetrics } from "./round-robin.js";
+
 import type { Host } from "../shared/index.js";
+import { assignRoundRobin, type HostMetrics } from "./round-robin.js";
 
 const host = (email: string, overrides: Partial<Host> = {}): Host => ({
   userEmail: email,
@@ -52,7 +53,6 @@ describe("assignRoundRobin", () => {
       metrics,
       strategy: "lowest-recent-bookings",
     });
-    // priority 1 > priority 2; within priority 1, weight 5 > weight 1
     expect(result?.userEmail).toBe("c@x.com");
   });
 

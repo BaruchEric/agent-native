@@ -1,6 +1,9 @@
-import { useActionQuery } from "@agent-native/core/client";
-import { Badge } from "@/components/ui/badge";
-import { cn } from "@/lib/utils";
+import { useActionQuery } from "@agent-native/core/client/hooks";
+
+import { cn } from "../lib/utils";
+import { ActionQueryError } from "./action-query-error";
+import { Badge } from "./ui/badge";
+import { Skeleton } from "./ui/skeleton";
 
 export function appAvailabilityLabel(value?: string) {
   switch (value) {
@@ -53,11 +56,12 @@ export function AppResourceEffectiveStack({
   appId: string;
   resource: any;
 }) {
-  const { data: context, isLoading } = useActionQuery(
+  const query = useActionQuery(
     "get-workspace-resource-effective-context",
     { resourceId: resource.id, appId },
     { enabled: !!resource.id },
   );
+  const { data: context, isLoading } = query;
   const layers = ((context as any)?.layers ?? []) as any[];
   const active = (context as any)?.effectiveResource;
   const availability = (context as any)?.availability;
@@ -65,13 +69,23 @@ export function AppResourceEffectiveStack({
   if (isLoading && !context) {
     return (
       <div className="mt-3 rounded-lg border bg-muted/20 p-3">
-        <div className="h-3 w-44 animate-pulse rounded bg-muted-foreground/10" />
+        <Skeleton className="h-3 w-44" />
         <div className="mt-3 grid gap-2 sm:grid-cols-3">
-          <div className="h-20 animate-pulse rounded-md bg-muted-foreground/10" />
-          <div className="h-20 animate-pulse rounded-md bg-muted-foreground/10" />
-          <div className="h-20 animate-pulse rounded-md bg-muted-foreground/10" />
+          <Skeleton className="h-20 rounded-md" />
+          <Skeleton className="h-20 rounded-md" />
+          <Skeleton className="h-20 rounded-md" />
         </div>
       </div>
+    );
+  }
+
+  if (query.isError) {
+    return (
+      <ActionQueryError
+        className="mt-3"
+        error={query.error}
+        onRetry={() => void query.refetch()}
+      />
     );
   }
 
@@ -86,7 +100,11 @@ export function AppResourceEffectiveStack({
             {resource.path}
           </div>
         </div>
-        <Badge variant="outline">{appAvailabilityLabel(availability)}</Badge>
+        {isLoading ? (
+          <Skeleton className="h-6 w-24 rounded-full" />
+        ) : (
+          <Badge variant="outline">{appAvailabilityLabel(availability)}</Badge>
+        )}
       </div>
 
       <div className="mt-3 grid gap-2 sm:grid-cols-3">

@@ -1,141 +1,79 @@
 ---
 name: performance
 description: >-
-  Keep apps and templates loading fast. Read when adding a data model, a
-  list/read action, a page or sidebar that loads data, or when something loads
-  slowly. Covers column projection, indexing hot-path queries, avoiding N+1 and
-  round-trip waterfalls, cheap polling, and not recomputing on every read.
-metadata:
-  internal: true
+  Keep app loads and interactions responsive as data grows. Use when a page
+  feels slow, jumps, or lags, or when changing a data read, list, polling path,
+  startup path, or performance-sensitive UI.
+scope: dev
 ---
 
-# Performance — Keep Loads Fast
+# Performance
 
-## Rule
+Find the cost that users actually wait on, then reduce it without weakening
+the result. A slow screen may be waiting on the server, moving too much data,
+serial reads, repeated computation, or browser rendering; measure before adding
+caches or extra complexity.
 
-Treat every list, every read, and every page load as a latency budget. Two
-things dominate it: **how much data crosses the wire**, and **how many
-round-trips and table scans it takes**. On a hosted/serverless SQL backend each
-query is a network round-trip, and an unindexed filter scans the whole — often
-shared and growing — table. So default to **projected columns**, **indexed
-hot-path queries**, and **parallel/batched** fetches. These rules are
-provider-agnostic: they hold on SQLite, Postgres, or any managed SQL backend.
+## Load only what the current view needs
 
-This skill is about the data and load path. See the `storing-data` skill for the schema
-and migration mechanics it references, and the `real-time-sync` skill for how updates
-already reach the UI without polling.
+- Shape list reads around the fields the list displays. Keep large document
+  bodies, histories, rendered output, and other rarely viewed data on a detail
+  or on-demand path. Return a small preview when the list needs one.
+- Paginate or window unbounded histories and activity feeds. Start with the
+  recent or visible range and load more as the user asks for it.
+- Batch related reads instead of issuing one query per row. Compute counts and
+  other aggregates in the database when the result can be much smaller than
+  the source rows.
+- Start independent reads together. Do not make the first useful content wait
+  for unrelated settings, below-the-fold panels, or secondary details.
+- Index fields used by frequent filters, joins, and sorts when the data and
+  observed query cost justify it. Keep indexes aligned with real query shapes.
 
-## 1. Project columns — never `SELECT *` on a list
+For action-backed screens, shape the action response for the screen's current
+need and keep the UI on the app's existing action and query hooks. Do not add a
+second fetch path that duplicates the same read.
 
-A list/index query should select only the columns the list actually renders.
+## Keep repeated work cheap
 
-- **Never return heavy columns in a list**: large JSON/text blobs such as
-  document bodies, rendered HTML, `config`/`layout`/`spec`/`data`/`tracks`,
-  tool results, or base64 attachments. Pulling them for every row is the single
-  most common cause of a slow list.
-- Heavy/full columns belong on the **single-item GET/detail** path only.
-- Need a preview from a big column? Select a **truncated substring at the DB**,
-  not the whole column — and it stays portable:
+- Keep list and frequently refreshed reads inexpensive. Avoid parsing,
+  reformatting, or rebuilding large values on every read when the result can be
+  prepared once or computed only for the view that needs it.
+- Use the app's existing live-update path when fresh data must reach an open
+  screen. Poll only when needed, and keep polled reads bounded and cheap.
+- Keep large file contents and long records out of list responses. Load them
+  when the user opens the relevant item rather than sending them on every list
+  refresh.
+- Defer nonessential data and expensive child views until after the main
+  content is usable. Window a rendered list when rendering all rows makes
+  scrolling or updates slow.
 
-  ```ts
-  // Drizzle — project, and truncate the heavy column for the preview
-  const rows = await db
-    .select({
-      id: docs.id,
-      title: docs.title,
-      updatedAt: docs.updatedAt,
-      // substr/length work on both SQLite and Postgres
-      preview: sql<string>`substr(${docs.content}, 1, 400)`,
-    })
-    .from(docs)
-    .where(accessFilter(docs, docShares))
-    .orderBy(desc(docs.updatedAt));
-  ```
+## Protect startup and the first paint
 
-- After narrowing the projection, update the row mapper and its return type so a
-  dropped column is provably unused on the list path. If the list genuinely
-  renders a heavy column (a thumbnail, an inline preview the UI shows), keep it —
-  don't break behavior to chase a payload win.
+- Keep migrations, backfills, data scans, aggregations, provider handshakes,
+  and cache warming out of module evaluation and application startup. Hosted
+  serverless instances can restart, so startup work can repeat on user
+  requests. Use the app's deliberate migration, job, or on-demand path.
+- Keep optional heavy runtimes out of modules loaded by ordinary page requests.
+  Load a browser, media processor, or other large dependency only in the
+  feature or job that needs it, and inspect the deployed bundle when adding
+  one.
+- Keep the server-rendered shell public and independent of a visitor's session.
+  Resolve user-specific state after the shell loads through the app's
+  authenticated client data path. Reads that must reflect a recent mutation
+  should not depend on cached server-rendered loader data.
+- Give loading placeholders the final content's basic geometry. Reserve space
+  for content whose size is known; avoid showing a temporary layout that shifts
+  the user's reading position when data arrives.
 
-## 2. Index the hot paths
+## Keep interactions responsive
 
-Indexes are added through the **versioned migration array** in
-`server/plugins/db.ts` as `CREATE INDEX IF NOT EXISTS …` — not through a
-schema-level `index()` helper (the framework applies indexes via migrations; see
-the `storing-data` skill). Add an index for any column a hot query **filters or sorts**
-on. The recurring ones:
+Show that an interaction registered as soon as it happens, aiming for 100 ms.
+If the work needs the network or takes longer, acknowledge it before waiting
+and show a focused pending state within 400 ms. Use an optimistic update when
+it is safe, then confirm or roll back on failure.
 
-- **Ownable tables** → `(owner_email, org_id, <the list's ORDER BY column>)`.
-  Access scoping filters by owner/org and lists sort by `updated_at`/`created_at`.
-- **Shares tables** (`{resource}_shares`) → `(resource_id, principal_type, principal_id)`.
-  Access checks run correlated `EXISTS` subqueries against these on every list.
-- **Child / foreign-key columns** used to load children (e.g. `responses.form_id`,
-  `comments.parent_id`, an events log's `*_id`) → index the FK, plus its sort
-  column when the children are ordered. An unindexed FK means a full scan of the
-  child table on every parent open. **A foreign-key reference does not create an
-  index automatically** — add it explicitly.
-- **Status-filtered lists** → match the real `WHERE`, e.g. `(owner_email, status)`
-  or `(status, <sort>)`.
-
-Keep index DDL **dialect-agnostic and idempotent**:
-
-```sql
-CREATE INDEX IF NOT EXISTS forms_owner_org_updated_idx ON forms (owner_email, org_id, updated_at)
-```
-
-No `DESC`, no partial `WHERE`, no provider-specific syntax — it then runs on
-SQLite and Postgres alike, is safe to re-run, and applies on next startup.
-Indexes mostly bite **as data grows** and on **unbounded child tables** (a
-seq-scan of 10 rows is instant; of a shared, ever-growing log it is not), so
-index the growing tables first.
-
-## 3. Don't fan out queries — batch and parallelize
-
-- **No N+1.** Never loop issuing one query per item. Load children for many
-  parents in one `inArray(child.parentId, ids)` query, then group in memory.
-- **Count in SQL** (`count()`), never "select all rows then `.length`".
-- **Parallelize independent queries** with `Promise.all` rather than sequential
-  `await`s — each `await` is another round-trip.
-- Prefer **one composed endpoint** over several dependent calls.
-
-## 4. Avoid client-side waterfalls
-
-- Don't gate query B on query A's result unless B truly needs it. Fire
-  independent `useActionQuery` / `useQuery` hooks **in parallel**; never make the
-  loading skeleton wait on a serial chain.
-- Load the visible page from one read where possible, and **lazy-load**
-  secondary / below-the-fold data after first paint.
-
-## 5. Poll cheaply; compute once
-
-- Updates already reach the UI through the `real-time-sync` skill (`useDbSync` / SSE).
-  Don't add an aggressive `refetchInterval` that re-runs a heavy list/read every
-  couple of seconds. If you must poll, use a **wide interval** and a **cheap**
-  endpoint.
-- **Never do expensive per-request work on a read that runs on every load/poll**:
-  re-rendering HTML/markdown, pretty-printing, re-parsing / migrating /
-  normalizing / sanitizing stored JSON. Do that work at **write time** (store the
-  result) or compute it **lazily only for the caller that needs it**. Reads on
-  the hot path must be cheap.
-- Data the UI doesn't display (export formats, alternate renderings) belongs in a
-  separate on-demand action, not baked into the hot read.
-
-## 6. Big payloads and long lists
-
-- **Paginate or window** unbounded lists (messages, responses, events, activity).
-  Don't load the entire history on open; load a recent window and fetch older on
-  demand.
-- Don't store **unbounded blobs inline** in a row that a list/load pulls.
-  Reference large content separately so opening the parent stays cheap.
-- **Virtualize** very long rendered lists on the client so off-screen rows aren't
-  parsed/rendered every update.
-
-## Checklist — run before shipping a list/read or a new table
-
-- [ ] List selects only displayed columns; heavy blobs excluded or `substr`-truncated.
-- [ ] Every hot-path `WHERE` / `ORDER BY` column is indexed (owner/org/sort,
-      shares `resource_id`, child FKs, status filters) via a `db.ts` migration.
-- [ ] No N+1; independent queries parallelized; counts via SQL `count()`.
-- [ ] Client fires independent queries in parallel, not a waterfall.
-- [ ] No heavy recompute on every read; no aggressive polling of heavy endpoints.
-- [ ] Unbounded lists are paginated/windowed; large blobs aren't inlined on the hot path.
+When investigating a slow experience, separate server response time, data
+transfer, serial waits, rendering, layout movement, and long interaction work.
+Use representative data and the production build when development tooling
+changes the cost. Verify that the user-visible action completed before
+comparing timings or memory.

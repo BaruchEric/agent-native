@@ -1,30 +1,79 @@
-import { useState, useRef, useCallback, useEffect } from "react";
-import { useNavigate, Link } from "react-router";
-import { nanoid } from "nanoid";
 import {
+  requireAgentEngineConfiguredForDispatch,
+  useAgentEngineConfigured,
+} from "@agent-native/core/client/agent-chat";
+import { emailToColor, emailToName } from "@agent-native/core/client/collab";
+import {
+  useActionQuery,
+  useActionMutation,
+  useAvatarUrl,
+  useSession,
+} from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { useLab } from "@agent-native/core/client/labs";
+import {
+  CreativeContextShareSheet,
+  parseCreativeContexts,
+  useCreativeContextLab,
+  useCreativeContexts,
+  useCreativeContextState,
+} from "@agent-native/creative-context/client";
+import {
+  AgentSuggestionBar,
+  agentSuggestionPrompt,
+} from "@agent-native/toolkit/agentkit";
+import {
+  PromptHome,
+  TemplateLibraryGrid,
+  useHomeSearchShortcut,
+  useSetPageTitle,
+} from "@agent-native/toolkit/app-shell";
+import { BuilderSetupCard } from "@agent-native/toolkit/app/chat/chat/run-recovery";
+import {
+  PromptComposer,
+  snapshotComposerContextItems,
+  type PromptComposerSubmitOptions,
+  type TiptapComposerHandle,
+} from "@agent-native/toolkit/app/chat/composer/index";
+import { ClientOnly } from "@agent-native/toolkit/app/shared";
+import { designTemplateRetryKey } from "@shared/design-template-retry";
+import { FULL_APP_BUILDING_LAB } from "@shared/labs";
+import { derivePromptTitle } from "@shared/prompt-title";
+import {
+  IconArrowRight,
   IconChecks,
+  IconChevronDown,
+  IconChevronLeft,
+  IconChevronRight,
   IconPlus,
-  IconPalette,
   IconSearch,
   IconDots,
   IconTrash,
   IconCopy,
-  IconCode,
   IconX,
   IconPencil,
 } from "@tabler/icons-react";
-import { useActionQuery, useActionMutation } from "@agent-native/core/client";
 import { useQueryClient } from "@tanstack/react-query";
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
-import { Badge } from "@/components/ui/badge";
+import { nanoid } from "nanoid";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { useNavigate, Link, useSearchParams } from "react-router";
+import { toast } from "sonner";
+
+import { trace } from "@/components/design/design-trace";
+import { DesignThumbnail } from "@/components/design/DesignThumbnail";
+import { designSystemPickerOptions } from "@/components/editor/design-start-pickers";
+import { useHomePromptContext } from "@/components/editor/HomePromptContext";
+import PromptPopover from "@/components/editor/PromptDialog";
+import type {
+  PromptTemplateOption,
+  UploadedFile,
+} from "@/components/editor/PromptDialog";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+  DesignHomeLibrary,
+  type DesignHomeLibraryTab,
+} from "@/components/home/DesignHomeLibrary";
+import { QueryErrorState } from "@/components/QueryErrorState";
+import { DesignTemplateLibrary } from "@/components/templates/DesignTemplateLibrary";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -35,23 +84,41 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import PromptPopover from "@/components/editor/PromptDialog";
-import type { UploadedFile } from "@/components/editor/PromptDialog";
-import type { PromptComposerSubmitOptions } from "@agent-native/core/client";
-import { useDesignSystems } from "@/hooks/use-design-systems";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
-  useSetHeaderActions,
-  useSetPageTitle,
-} from "@/components/layout/HeaderActions";
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Spinner } from "@/components/ui/spinner";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useDesignSystemWorkflows } from "@/hooks/use-design-system-workflows";
+import { useDesignSystems } from "@/hooks/use-design-systems";
+import { sendToDesignAgentChat } from "@/lib/agent-chat";
+import {
+  readStoredDesignFilter,
+  writeStoredDesignFilter,
+  type DesignFilter,
+} from "@/lib/design-filter";
+import {
+  designPromptReferenceTypes,
+  trackDesignPromptSubmitted,
+} from "@/lib/design-funnel-tracking";
 import {
   clearPendingGeneration,
   writePendingGeneration,
 } from "@/lib/pending-generation";
+import { cn } from "@/lib/utils";
 
 type ProjectType = "prototype" | "other";
 interface Design {
@@ -60,98 +127,573 @@ interface Design {
   description?: string;
   projectType: ProjectType;
   designSystemId?: string | null;
+  ownerEmail?: string | null;
+  ownerName?: string | null;
   createdAt?: string;
   updatedAt?: string;
-  /** Preview HTML for the thumbnail. Only present when the list query asks
-   *  for `includePreview: 'true'`. Truncated server-side. */
   previewHtml?: string | null;
 }
 
+interface DesignListResult {
+  count: number;
+  totalCount: number;
+  hasMore: boolean;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  designs: Design[];
+}
+
+const DESIGN_PAGE_SIZE = 50;
+const HOME_LIBRARY_HAS_RECENTS_STORAGE_KEY = "design-home-has-recents";
+
+function readHomeLibraryHasRecents():
+  | { status: "available"; value: boolean | null }
+  | { status: "unavailable" } {
+  if (typeof window === "undefined") return { status: "unavailable" };
+
+  try {
+    const value = window.localStorage.getItem(
+      HOME_LIBRARY_HAS_RECENTS_STORAGE_KEY,
+    );
+    return {
+      status: "available",
+      value: value === "true" ? true : value === "false" ? false : null,
+    };
+  } catch {
+    return { status: "unavailable" };
+  }
+}
+
+function writeHomeLibraryHasRecents(
+  value: boolean,
+): { status: "available" } | { status: "unavailable" } {
+  if (typeof window === "undefined") return { status: "unavailable" };
+  try {
+    window.localStorage.setItem(
+      HOME_LIBRARY_HAS_RECENTS_STORAGE_KEY,
+      String(value),
+    );
+    return { status: "available" };
+  } catch {
+    return { status: "unavailable" };
+  }
+}
+
+interface HomeSuggestion {
+  id?: string;
+  label: string;
+  prompt: string;
+}
+
+type HomeSuggestionsResult =
+  | { status: "ready"; suggestions: HomeSuggestion[] }
+  | {
+      status: "unavailable";
+      reason:
+        | "missing_credentials"
+        | "timeout"
+        | "agent_engine_settings_unavailable";
+      suggestions: [];
+    };
+
+const HOME_SUGGESTIONS_UI_TIMEOUT_MS = 12_000;
+
+function isReadyHomeSuggestions(
+  result: HomeSuggestionsResult | undefined,
+): result is Extract<HomeSuggestionsResult, { status: "ready" }> {
+  return result?.status === "ready" && result.suggestions.length === 3;
+}
+
 export default function Index() {
+  const t = useT();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const [search, setSearch] = useState("");
+  const [designFilter, setDesignFilter] = useState<DesignFilter>(
+    () => readStoredDesignFilter() ?? "mine",
+  );
+  const [page, setPage] = useState(1);
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
   const [selectedDesignIds, setSelectedDesignIds] = useState<Set<string>>(
     () => new Set(),
   );
-  const [showNewPrompt, setShowNewPrompt] = useState(false);
-  const [newDesignSystemId, setNewDesignSystemId] = useState<
-    string | null | undefined
-  >(undefined);
+  const [storedHasAccessibleDesigns] = useState(readHomeLibraryHasRecents);
+  const [homeSection, setHomeSection] = useState<DesignHomeLibraryTab>(
+    storedHasAccessibleDesigns.status === "available" &&
+      storedHasAccessibleDesigns.value === true
+      ? "recent"
+      : "templates",
+  );
+  const homeLibraryTabWasSelectedRef = useRef(false);
+  const designFilterWasSelectedRef = useRef(false);
+  const composerRef = useRef<TiptapComposerHandle>(null);
+  const [quickStartPending, setQuickStartPending] = useState(false);
+  const quickStartRef = useRef(false);
+  const submissionErrorRef = useRef(false);
+  const fullAppBuildingEnabled = useLab(FULL_APP_BUILDING_LAB);
+  const systemsEnabled = useDesignSystemWorkflows();
+  const [newDesignHandoffPending, setNewDesignHandoffPending] = useState(false);
+  const [chosenDesignSystemId, setNewDesignSystemId] = useState<string | null>(
+    null,
+  );
+  const [newTemplateId, setNewTemplateId] = useState<string | null>(null);
+  const [newDesignMode, setNewDesignMode] = useState<"design" | "app">(
+    "design",
+  );
   const [renameId, setRenameId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+  const [contextDesigns, setContextDesigns] = useState<Design[]>([]);
 
-  const anchorElRef = useRef<HTMLElement | null>(null);
-  const anchorRef = useRef<HTMLElement | null>(null);
-  // Keep anchorRef.current in sync so PromptPopover can read it
-  anchorRef.current = anchorElRef.current;
+  const skipToEditorPendingRef = useRef(false);
+  const newDesignSystemWasChosenRef = useRef(false);
+  const templateCopyIdsRef = useRef(
+    new Map<string, { key: string; id: string }>(),
+  );
 
-  const { data: designsData, isLoading } = useActionQuery<{
-    count: number;
-    designs: Design[];
-  }>("list-designs", { includePreview: "true" });
+  const normalizedSearch = search.trim();
+  const listDesignsParams = useMemo(
+    () => ({
+      page,
+      pageSize: DESIGN_PAGE_SIZE,
+      createdBy:
+        designFilter === "mine"
+          ? "me"
+          : designFilter === "not-mine"
+            ? "not-me"
+            : "all",
+      search: normalizedSearch || undefined,
+      includePreview: "true",
+    }),
+    [designFilter, normalizedSearch, page],
+  );
 
+  const {
+    data: designsData,
+    isLoading,
+    isError,
+    isFetching,
+    refetch,
+  } = useActionQuery<DesignListResult>("list-designs", listDesignsParams);
+  const accessibleDesignsSummary = useActionQuery<
+    Pick<DesignListResult, "totalCount">
+  >("list-designs", {
+    page: 1,
+    pageSize: 1,
+    createdBy: "all",
+    compact: "true",
+    includePreview: "false",
+  });
+  const accessibleDesignCount = accessibleDesignsSummary.data?.totalCount;
+  const hasAccessibleDesigns =
+    accessibleDesignsSummary.isSuccess &&
+    accessibleDesignCount !== undefined &&
+    accessibleDesignCount > 0;
+  const ownedDesignsSummary = useActionQuery<
+    Pick<DesignListResult, "totalCount">
+  >("list-designs", {
+    page: 1,
+    pageSize: 1,
+    createdBy: "me",
+    compact: "true",
+    includePreview: "false",
+  });
+  const hasSearchResultsSection = normalizedSearch.length > 0;
+  const revealRecentSearch = useCallback(() => {
+    homeLibraryTabWasSelectedRef.current = true;
+    setHomeSection("recent");
+    return true;
+  }, []);
+  useHomeSearchShortcut(true, revealRecentSearch);
+  useEffect(() => {
+    if (
+      !accessibleDesignsSummary.isSuccess ||
+      accessibleDesignCount === undefined
+    ) {
+      return;
+    }
+
+    writeHomeLibraryHasRecents(hasAccessibleDesigns);
+    if (!hasAccessibleDesigns) {
+      setHomeSection("templates");
+      homeLibraryTabWasSelectedRef.current = false;
+      return;
+    }
+    if (homeLibraryTabWasSelectedRef.current) return;
+
+    setHomeSection("recent");
+    homeLibraryTabWasSelectedRef.current = true;
+  }, [
+    accessibleDesignCount,
+    accessibleDesignsSummary.isSuccess,
+    hasAccessibleDesigns,
+  ]);
+  useEffect(() => {
+    if (hasSearchResultsSection) setHomeSection("recent");
+  }, [hasSearchResultsSection]);
+  const {
+    data: templatesData,
+    isLoading: templatesLoading,
+    isError: templatesError,
+    isFetching: templatesFetching,
+    refetch: refetchTemplates,
+  } = useActionQuery("list-design-templates", {
+    includePreview: "true",
+    includeSavedPreview: "false",
+  });
   const createMutation = useActionMutation("create-design");
+  const createFromTemplateMutation = useActionMutation(
+    "create-design-from-template",
+  );
+  const createFusionAppMutation = useActionMutation("create-fusion-app");
   const deleteMutation = useActionMutation("delete-design");
   const duplicateMutation = useActionMutation("duplicate-design");
   const updateMutation = useActionMutation("update-design");
+  const generateTitleMutation = useActionMutation("generate-design-title");
+  const userRenamedDesignIdsRef = useRef<Set<string>>(new Set());
   const {
     designSystems,
-    defaultSystem,
     isLoading: designSystemsLoading,
-  } = useDesignSystems();
+    error: designSystemsError,
+    refetch: refetchDesignSystems,
+  } = useDesignSystems(systemsEnabled);
+  const agentEngine = useAgentEngineConfigured();
+  const agentEngineConfigured = agentEngine.canChat;
+  const agentEngineMissing = agentEngine.missing;
+  const [setupCardBouncePulse, setSetupCardBouncePulse] = useState(0);
+  const bounceSetupCard = () => {
+    if (agentEngineMissing) setSetupCardBouncePulse((pulse) => pulse + 1);
+  };
+  const retryAgentEngineStatus = useCallback(() => {
+    window.dispatchEvent(new Event("agent-engine:configured-changed"));
+  }, []);
+  const quickActionsEnabled = agentEngineConfigured;
+  const { session: suggestionSession } = useSession();
+  const homeSuggestionsIdentity = [
+    suggestionSession?.authUserId ??
+      suggestionSession?.userId ??
+      suggestionSession?.email ??
+      "anonymous",
+    suggestionSession?.orgId ?? "",
+  ];
+  const homeSuggestionsIdentityScope = JSON.stringify(homeSuggestionsIdentity);
+  const homeSuggestionsProfile = useActionQuery<{
+    onboardingRole?: string | null;
+  }>(
+    "get-user-profile",
+    {},
+    {
+      enabled: quickActionsEnabled,
+      queryKeyScope: [homeSuggestionsIdentityScope],
+      staleTime: 0,
+    },
+  );
+  const homeSuggestionsProfileReady =
+    quickActionsEnabled &&
+    (homeSuggestionsProfile.data !== undefined ||
+      homeSuggestionsProfile.isError);
+  const homeSuggestionsCacheScope = JSON.stringify([
+    ...homeSuggestionsIdentity,
+    homeSuggestionsProfile.data?.onboardingRole ?? null,
+  ]);
+  const fallbackHomeSuggestions = useMemo(
+    () =>
+      [
+        t("chat.suggestionLandingPage"),
+        t("chat.suggestionBrandMatch"),
+        t("chat.suggestionMobile"),
+      ].map((prompt, index) => ({
+        id: `design-home-generic-${index}`,
+        label: prompt,
+        prompt,
+      })),
+    [t],
+  );
+  const [homeSuggestionsSnapshotState, setHomeSuggestionsSnapshotState] =
+    useState<{
+      scope: string;
+      suggestions: HomeSuggestion[];
+    } | null>(null);
+  const homeSuggestionsSnapshot =
+    homeSuggestionsProfileReady &&
+    homeSuggestionsSnapshotState?.scope === homeSuggestionsIdentityScope
+      ? homeSuggestionsSnapshotState.suggestions
+      : null;
+  const homeSuggestionsQuery = useActionQuery<HomeSuggestionsResult>(
+    "generate-home-suggestions",
+    {},
+    {
+      enabled: homeSuggestionsProfileReady && homeSuggestionsSnapshot === null,
+      queryKeyScope: [homeSuggestionsCacheScope],
+      retry: false,
+      staleTime: (query) =>
+        isReadyHomeSuggestions(query.state.data) ? Number.POSITIVE_INFINITY : 0,
+      gcTime: Number.POSITIVE_INFINITY,
+      refetchOnMount: (query) => !isReadyHomeSuggestions(query.state.data),
+      refetchOnWindowFocus: (query) =>
+        !isReadyHomeSuggestions(query.state.data),
+      refetchOnReconnect: (query) => !isReadyHomeSuggestions(query.state.data),
+    },
+  );
+  const readyHomeSuggestions =
+    homeSuggestionsProfileReady &&
+    homeSuggestionsQuery.data?.status === "ready" &&
+    homeSuggestionsQuery.data.suggestions.length === 3
+      ? homeSuggestionsQuery.data.suggestions
+      : null;
+  const homeSuggestionsQueryUnavailable =
+    !homeSuggestionsQuery.isFetching &&
+    quickActionsEnabled &&
+    (homeSuggestionsQuery.isError ||
+      homeSuggestionsQuery.data?.status === "unavailable" ||
+      (homeSuggestionsQuery.data?.status === "ready" &&
+        homeSuggestionsQuery.data.suggestions.length !== 3));
+  const [homeSuggestionsTimeout, setHomeSuggestionsTimeout] = useState({
+    scope: homeSuggestionsIdentityScope,
+    timedOut: false,
+  });
+  if (homeSuggestionsTimeout.scope !== homeSuggestionsIdentityScope) {
+    setHomeSuggestionsTimeout({
+      scope: homeSuggestionsIdentityScope,
+      timedOut: false,
+    });
+  }
+  const homeSuggestionsTimedOut =
+    quickActionsEnabled &&
+    homeSuggestionsTimeout.scope === homeSuggestionsIdentityScope &&
+    homeSuggestionsTimeout.timedOut;
+  useEffect(() => {
+    if (
+      !quickActionsEnabled ||
+      homeSuggestionsSnapshot !== null ||
+      readyHomeSuggestions !== null ||
+      homeSuggestionsQueryUnavailable
+    ) {
+      setHomeSuggestionsTimeout({
+        scope: homeSuggestionsIdentityScope,
+        timedOut: false,
+      });
+      return;
+    }
+    const timer = window.setTimeout(
+      () =>
+        setHomeSuggestionsTimeout({
+          scope: homeSuggestionsIdentityScope,
+          timedOut: true,
+        }),
+      HOME_SUGGESTIONS_UI_TIMEOUT_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [
+    quickActionsEnabled,
+    homeSuggestionsSnapshot,
+    readyHomeSuggestions,
+    homeSuggestionsQueryUnavailable,
+    homeSuggestionsIdentityScope,
+  ]);
+  const homeSuggestionsUnavailable =
+    homeSuggestionsQueryUnavailable || homeSuggestionsTimedOut;
+  useEffect(() => {
+    if (homeSuggestionsSnapshot !== null) return;
+    const result = homeSuggestionsQuery.data;
+    if (
+      quickActionsEnabled &&
+      homeSuggestionsProfileReady &&
+      result?.status === "ready" &&
+      result.suggestions.length === 3
+    ) {
+      setHomeSuggestionsSnapshotState({
+        scope: homeSuggestionsIdentityScope,
+        suggestions: result.suggestions,
+      });
+    } else if (
+      quickActionsEnabled &&
+      homeSuggestionsProfileReady &&
+      homeSuggestionsQueryUnavailable
+    ) {
+      setHomeSuggestionsSnapshotState({
+        scope: homeSuggestionsIdentityScope,
+        suggestions: fallbackHomeSuggestions,
+      });
+    }
+  }, [
+    homeSuggestionsQuery.data,
+    homeSuggestionsSnapshot,
+    homeSuggestionsCacheScope,
+    homeSuggestionsIdentityScope,
+    quickActionsEnabled,
+    homeSuggestionsProfileReady,
+    homeSuggestionsQueryUnavailable,
+    fallbackHomeSuggestions,
+  ]);
+  const homeSuggestions =
+    homeSuggestionsSnapshot ??
+    readyHomeSuggestions ??
+    (homeSuggestionsUnavailable ? fallbackHomeSuggestions : []);
+  const homeSuggestionsLoading =
+    homeSuggestionsSnapshot === null &&
+    readyHomeSuggestions === null &&
+    !homeSuggestionsTimedOut &&
+    (homeSuggestionsQuery.isFetching || !homeSuggestionsUnavailable);
+  const designSystemOptions = useMemo(
+    () => designSystemPickerOptions(designSystems),
+    [designSystems],
+  );
 
-  const designs = designsData?.designs ?? [];
+  const designs = useMemo(
+    () => designsData?.designs ?? [],
+    [designsData?.designs],
+  );
+  const templateOptions = useMemo<PromptTemplateOption[]>(
+    () =>
+      (templatesData?.templates ?? []).map((template) => ({
+        id: template.id,
+        title: template.title,
+        description: template.description,
+        category: template.category,
+        width: template.width,
+        height: template.height,
+        previewHtml: template.previewHtml,
+        designSystemId: template.designSystemId,
+        isBuiltIn: template.isBuiltIn,
+      })),
+    [templatesData?.templates],
+  );
+  const creativeContextEnabled = useCreativeContextLab();
+  const creativeContextsQuery = useCreativeContexts(
+    {},
+    { enabled: creativeContextEnabled },
+  );
+  const creativeContextState = useCreativeContextState({
+    enabled: creativeContextEnabled,
+  });
+  const creativeContextOptions = useMemo(
+    () =>
+      parseCreativeContexts(creativeContextsQuery.data)
+        .filter((context) => context.memberCount > 0)
+        .map((context) => ({ id: context.id, name: context.name })),
+    [creativeContextsQuery.data],
+  );
+  const creativeContextPersistRef = useRef<Promise<unknown> | null>(null);
+  const handleCreativeContextChange = useCallback(
+    (contextId: string | null) => {
+      creativeContextPersistRef.current = creativeContextState
+        .setState({
+          ...creativeContextState.state,
+          contextMode: "auto",
+          selectedContextId: contextId,
+          pinnedPackId: null,
+        })
+        .catch((error) => {
+          toast.error(t("creativeContext.stateSaveFailed"));
+          throw error;
+        });
+    },
+    [creativeContextState, t],
+  );
+  const selectedTemplate =
+    templateOptions.find((template) => template.id === newTemplateId) ?? null;
+  const templateDesignSystemId =
+    selectedTemplate?.designSystemId &&
+    designSystems.some(
+      (system) => system.id === selectedTemplate.designSystemId,
+    )
+      ? selectedTemplate.designSystemId
+      : null;
+  const newDesignSystemId = !systemsEnabled
+    ? null
+    : newDesignSystemWasChosenRef.current
+      ? chosenDesignSystemId
+      : templateDesignSystemId;
 
-  const filtered = search
-    ? designs.filter(
-        (d) =>
-          d.title.toLowerCase().includes(search.toLowerCase()) ||
-          d.projectType.toLowerCase().includes(search.toLowerCase()),
-      )
-    : designs;
+  const ownerFilterLabels: Record<DesignFilter, string> = {
+    all: t("home.ownedByAnyone"),
+    mine: t("home.ownedByMe"),
+    "not-mine": t("home.sharedWithMe"),
+  };
+  const showAuthors = designFilter !== "mine";
   const selectedDesignCount = selectedDesignIds.size;
   const isSelectingDesigns = selectedDesignCount > 0;
   const allVisibleSelected =
-    filtered.length > 0 &&
-    filtered.every((design) => selectedDesignIds.has(design.id));
-
-  const resolveDefaultDesignSystemId = useCallback(
-    () => defaultSystem?.id ?? designSystems[0]?.id ?? null,
-    [defaultSystem?.id, designSystems],
-  );
-
-  const openNewDesign = useCallback(
-    (e: React.MouseEvent<HTMLElement>) => {
-      anchorElRef.current = e.currentTarget;
-      setNewDesignSystemId(
-        designSystemsLoading ? undefined : resolveDefaultDesignSystemId(),
-      );
-      setShowNewPrompt(true);
-    },
-    [designSystemsLoading, resolveDefaultDesignSystemId],
-  );
-
-  const handleNewPromptOpenChange = useCallback((open: boolean) => {
-    setShowNewPrompt(open);
-    if (!open) setNewDesignSystemId(undefined);
-  }, []);
+    designs.length > 0 &&
+    designs.every((design) => selectedDesignIds.has(design.id));
+  const totalPages = Math.max(1, designsData?.totalPages ?? 1);
 
   useEffect(() => {
+    if (!designsData || page <= totalPages) return;
+    setPage(totalPages);
+    setSelectedDesignIds(new Set());
+  }, [designsData, page, totalPages]);
+
+  const syncSelectedTemplate = useCallback(
+    (templateId: string | null) => {
+      setNewTemplateId(templateId);
+      const next = new URLSearchParams(searchParams);
+      if (templateId) next.set("templateId", templateId);
+      else next.delete("templateId");
+      setSearchParams(next, { replace: true });
+    },
+    [searchParams, setSearchParams],
+  );
+
+  const handleTemplateChange = useCallback(
+    (templateId: string | null) => {
+      syncSelectedTemplate(templateId);
+    },
+    [syncSelectedTemplate],
+  );
+
+  const handleNewDesignSystemChange = useCallback(
+    (designSystemId: string | null) => {
+      newDesignSystemWasChosenRef.current = true;
+      setNewDesignSystemId(designSystemId);
+    },
+    [],
+  );
+  const homeContext = useHomePromptContext({
+    systems: designSystemOptions,
+    systemId: newDesignSystemId,
+    onSystemChange: handleNewDesignSystemChange,
+    templates: templateOptions,
+    templateId: newTemplateId,
+    onTemplateChange: handleTemplateChange,
+    systemsLoading: designSystemsLoading,
+    systemsError: designSystemsError,
+    retrySystems: () => void refetchDesignSystems(),
+  });
+
+  const resolveAppDesignSystemId = useCallback(async () => {
+    const linkedSystemId = selectedTemplate?.designSystemId;
     if (
-      !showNewPrompt ||
-      newDesignSystemId !== undefined ||
-      designSystemsLoading
+      !linkedSystemId ||
+      newDesignMode !== "app" ||
+      !systemsEnabled ||
+      newDesignSystemWasChosenRef.current ||
+      (!designSystemsLoading && !designSystemsError)
+    ) {
+      return newDesignSystemId;
+    }
+
+    const result = await refetchDesignSystems();
+    if (!result.isSuccess || !result.data) {
+      throw result.error ?? new Error(t("home.failedToCreateDesign"));
+    }
+    return result.data.designSystems.some(
+      (system) => system.id === linkedSystemId,
     )
-      return;
-    setNewDesignSystemId(resolveDefaultDesignSystemId());
+      ? linkedSystemId
+      : null;
   }, [
+    designSystemsError,
     designSystemsLoading,
+    newDesignMode,
     newDesignSystemId,
-    resolveDefaultDesignSystemId,
-    showNewPrompt,
+    refetchDesignSystems,
+    selectedTemplate,
+    systemsEnabled,
+    t,
   ]);
 
   const toggleDesignSelection = useCallback((id: string) => {
@@ -170,9 +712,9 @@ export default function Index() {
     setSelectedDesignIds((current) => {
       const next = new Set(current);
       const shouldClear =
-        filtered.length > 0 && filtered.every((design) => next.has(design.id));
+        designs.length > 0 && designs.every((design) => next.has(design.id));
 
-      filtered.forEach((design) => {
+      designs.forEach((design) => {
         if (shouldClear) {
           next.delete(design.id);
         } else {
@@ -182,7 +724,61 @@ export default function Index() {
 
       return next;
     });
-  }, [filtered]);
+  }, [designs]);
+
+  const handleSearchChange = useCallback((query: string) => {
+    setSearch(query);
+    if (query.trim()) setHomeSection("recent");
+    setPage(1);
+    setSelectedDesignIds((current) =>
+      current.size === 0 ? current : new Set(),
+    );
+  }, []);
+
+  const handleDesignFilterChange = useCallback((next: string) => {
+    if (next !== "all" && next !== "mine" && next !== "not-mine") return;
+    designFilterWasSelectedRef.current = true;
+    const nextFilter: DesignFilter = next;
+    setDesignFilter(nextFilter);
+    writeStoredDesignFilter(nextFilter);
+    setPage(1);
+    setSelectedDesignIds((current) =>
+      current.size === 0 ? current : new Set(),
+    );
+  }, []);
+
+  useEffect(() => {
+    if (
+      designFilterWasSelectedRef.current ||
+      designFilter !== "mine" ||
+      !accessibleDesignsSummary.isSuccess ||
+      !ownedDesignsSummary.isSuccess ||
+      accessibleDesignsSummary.data.totalCount === 0 ||
+      ownedDesignsSummary.data.totalCount !== 0
+    ) {
+      return;
+    }
+    designFilterWasSelectedRef.current = true;
+    setDesignFilter("all");
+    writeStoredDesignFilter("all");
+    setPage(1);
+  }, [
+    accessibleDesignsSummary.data?.totalCount,
+    accessibleDesignsSummary.isSuccess,
+    designFilter,
+    ownedDesignsSummary.data?.totalCount,
+    ownedDesignsSummary.isSuccess,
+  ]);
+
+  const handlePageChange = useCallback(
+    (nextPage: number) => {
+      setPage(Math.min(Math.max(nextPage, 1), totalPages));
+      setSelectedDesignIds((current) =>
+        current.size === 0 ? current : new Set(),
+      );
+    },
+    [totalPages],
+  );
 
   const clearSelection = useCallback(() => {
     setSelectedDesignIds(new Set());
@@ -191,17 +787,18 @@ export default function Index() {
   const createDesign = useCallback(
     (
       title: string,
-      designSystemId?: string | null,
-    ): { id: string; title: string } => {
+      designSystemId: string | null | undefined,
+      creationMethod: "prompt" | "blank",
+    ): { id: string; title: string; ready: Promise<void> } => {
       const id = nanoid();
       const projectType: ProjectType = "prototype";
       const finalTitle = title.trim() || "Untitled Design";
       const linkedDesignSystemId = designSystemId ?? null;
 
-      // Optimistic update
       queryClient.setQueryData(
-        ["action", "list-designs", { includePreview: "true" }],
+        ["action", "list-designs", listDesignsParams],
         (old: any) => {
+          if (!old) return old;
           const newDesign: Design = {
             id,
             title: finalTitle,
@@ -210,88 +807,421 @@ export default function Index() {
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           };
+          const matchesSearch =
+            !normalizedSearch ||
+            finalTitle.toLowerCase().includes(normalizedSearch.toLowerCase());
+          if (!matchesSearch) return old;
+
+          const totalCount = (old.totalCount ?? old.count ?? 0) + 1;
+          const pageSize = old.pageSize ?? DESIGN_PAGE_SIZE;
+          const totalPages = Math.max(Math.ceil(totalCount / pageSize), 1);
+          const nextDesigns =
+            page === 1
+              ? [newDesign, ...(old.designs ?? [])].slice(0, pageSize)
+              : (old.designs ?? []);
           return {
-            count: (old?.count ?? 0) + 1,
-            designs: [newDesign, ...(old?.designs ?? [])],
+            ...old,
+            count: totalCount,
+            totalCount,
+            totalPages,
+            hasMore: page < totalPages,
+            designs: nextDesigns,
           };
         },
       );
 
-      // Fire mutation in background; keep the optimistic navigation instant.
-      void createMutation
+      const ready = createMutation
         .mutateAsync({
           id,
           title: finalTitle,
           projectType,
-          ...(linkedDesignSystemId
-            ? { designSystemId: linkedDesignSystemId }
-            : {}),
+          ...(designSystemId !== undefined ? { designSystemId } : {}),
+          creationMethod,
         } as any)
-        .catch(() => {
-          clearPendingGeneration(id);
-          queryClient.invalidateQueries({
+        .then(() => {
+          void queryClient.invalidateQueries({
             queryKey: ["action", "list-designs"],
           });
+        })
+        .catch((error) => {
+          clearPendingGeneration(id);
+          void queryClient.invalidateQueries({
+            queryKey: ["action", "list-designs"],
+          });
+          throw error;
         });
-      return { id, title: finalTitle };
+      void ready.catch(() => {});
+      return { id, title: finalTitle, ready };
     },
-    [queryClient, createMutation],
+    [listDesignsParams, normalizedSearch, page, queryClient, createMutation],
+  );
+
+  const handleGenerateDesignTitle = useCallback(
+    (designId: string, prompt: string, previousTitle: string) => {
+      generateTitleMutation
+        .mutateAsync({ designId, prompt, previousTitle } as any)
+        .then((result: any) => {
+          if (!result?.updated || !result.title) return;
+          if (userRenamedDesignIdsRef.current.has(designId)) return;
+          queryClient.setQueriesData(
+            { queryKey: ["action", "list-designs"] },
+            (old: any) => {
+              if (!old || typeof old !== "object") return old;
+              return {
+                ...old,
+                count: old.count ?? (old.designs ?? []).length,
+                designs: (old.designs ?? []).map((d: Design) =>
+                  d.id === designId ? { ...d, title: result.title } : d,
+                ),
+              };
+            },
+          );
+        })
+        .catch(() => {
+          // Best-effort background enhancement — the placeholder title
+          // already saved at creation time stays as the final title.
+        });
+    },
+    [generateTitleMutation, queryClient],
   );
 
   const handleSubmitPrompt = useCallback(
-    (
+    async (
       prompt: string,
       files: UploadedFile[],
       options: PromptComposerSubmitOptions,
+      pendingOptions?: { skipQuestions?: boolean; fromSkip?: boolean },
     ) => {
-      // Derive a short title from the prompt — first line, ~40 chars max,
-      // word-boundary truncated. The full prompt still drives generation;
-      // the title is just a label, so longer is worse.
-      const derivedTitle = derivePromptTitle(prompt);
-      const designSystemId =
-        newDesignSystemId === undefined
-          ? resolveDefaultDesignSystemId()
+      const promptSource = quickStartRef.current
+        ? "suggestion_chip"
+        : "composer";
+      await creativeContextPersistRef.current?.catch(() => {});
+      const trimmedPrompt = prompt.trim();
+      const templateCopyDesignSystemId =
+        selectedTemplate &&
+        newDesignMode === "design" &&
+        !newDesignSystemWasChosenRef.current
+          ? undefined
           : newDesignSystemId;
+      const designSystemId =
+        newDesignMode === "app"
+          ? await resolveAppDesignSystemId()
+          : templateCopyDesignSystemId;
+      const reportPromptSubmitted = (outputId: string) => {
+        if (pendingOptions?.fromSkip) return;
+        try {
+          trackDesignPromptSubmitted({
+            outputId,
+            source: promptSource,
+            prompt,
+            referenceTypes: designPromptReferenceTypes({
+              contextItems: options.contextItems,
+              files,
+              templateSelected: Boolean(selectedTemplate),
+              designSystemId,
+            }),
+            startMode: selectedTemplate ? "template" : newDesignMode,
+          });
+        } catch {
+          // coercion-ok: analytics must never block opening the new design.
+        }
+      };
 
-      const { id, title } = createDesign(derivedTitle, designSystemId);
+      if (selectedTemplate && newDesignMode === "design") {
+        setNewDesignHandoffPending(true);
+        const title = trimmedPrompt
+          ? derivePromptTitle(trimmedPrompt)
+          : selectedTemplate.title;
+        const retryKey = designTemplateRetryKey({
+          templateId: selectedTemplate.id,
+          title,
+          designSystemId,
+          prompt,
+        });
+        const previousRetry = templateCopyIdsRef.current.get(
+          selectedTemplate.id,
+        );
+        const newId =
+          previousRetry?.key === retryKey ? previousRetry.id : nanoid();
+        templateCopyIdsRef.current.set(selectedTemplate.id, {
+          key: retryKey,
+          id: newId,
+        });
+        try {
+          const result = await createFromTemplateMutation.mutateAsync({
+            templateId: selectedTemplate.id,
+            title,
+            newId,
+            retryKey,
+            ...(designSystemId !== undefined ? { designSystemId } : {}),
+            ...(trimmedPrompt ? { prompt } : {}),
+          });
+          if (!result.id) {
+            throw new Error("Template copy did not return a design ID");
+          }
+          const currentRetry = templateCopyIdsRef.current.get(
+            selectedTemplate.id,
+          );
+          if (currentRetry?.id === newId && currentRetry.key === retryKey) {
+            templateCopyIdsRef.current.delete(selectedTemplate.id);
+          }
+          const effectiveDesignSystemId = result.designSystemId ?? null;
+          if (result.adaptationPending) {
+            const effectiveSystemTitle =
+              designSystems.find(
+                (system) => system.id === effectiveDesignSystemId,
+              )?.title ?? t("promptDialog.designSystem");
+            writePendingGeneration(result.id, {
+              prompt:
+                prompt.trim() ||
+                t("promptDialog.reskinTemplatePrompt", {
+                  title: selectedTemplate.title,
+                  system: effectiveSystemTitle,
+                }),
+              files,
+              title: result.title ?? title,
+              source: selectedTemplate.title,
+              templateId: selectedTemplate.id,
+              templateBaselineFiles: result.templateBaselineFiles,
+              designSystemId: effectiveDesignSystemId,
+              skipQuestions: true,
+              ...options,
+            });
+          }
+          if (trimmedPrompt) {
+            handleGenerateDesignTitle(
+              result.id,
+              trimmedPrompt,
+              result.title ?? title,
+            );
+          }
+          void queryClient
+            .invalidateQueries({
+              queryKey: ["action", "list-designs"],
+            })
+            .catch(() => {});
+          reportPromptSubmitted(result.id);
+          void navigate(`/design/${result.id}`);
+          return;
+        } catch (error) {
+          setNewDesignHandoffPending(false);
+          toast.error(
+            error instanceof Error
+              ? error.message
+              : t("templatesPage.createFailed"),
+          );
+          throw error;
+        }
+      }
 
-      writePendingGeneration(id, {
-        prompt,
-        files,
-        title,
+      const derivedTitle = derivePromptTitle(prompt);
+
+      const { id, title, ready } = createDesign(
+        derivedTitle,
         designSystemId,
-        ...options,
-      });
+        "prompt",
+      );
+      handleGenerateDesignTitle(id, prompt, title);
 
-      setShowNewPrompt(false);
-      navigate(`/design/${id}`);
+      if (fullAppBuildingEnabled && newDesignMode === "app") {
+        try {
+          await ready;
+        } catch (error) {
+          setNewDesignHandoffPending(false);
+          trace("persist", "create-design-failed", {
+            id,
+            designSystemId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          toast.error(t("home.failedToCreateDesign"));
+          throw error;
+        }
+        void createFusionAppMutation
+          .mutateAsync({
+            designId: id,
+            prompt,
+          } as any)
+          .then((result: any) => {
+            if (result?.status !== "not-configured") return;
+            sendToDesignAgentChat({
+              message: prompt,
+              context:
+                `The user's request is to build this design as a full app. ` +
+                `create-fusion-app returned status "not-configured" for design ` +
+                `${id}. ${result?.message ?? ""} Help the user connect ` +
+                `Builder.io (see connect-builder-app), then retry ` +
+                `create-fusion-app with the user's prompt.`,
+              submit: true,
+            });
+          })
+          .catch((error) => {
+            const message =
+              error instanceof Error && error.message
+                ? error.message
+                : String(error);
+            sendToDesignAgentChat({
+              message: prompt,
+              context:
+                `The user's request is to build this design as a full app. ` +
+                `Starting the full-app build for design ${id} failed: ` +
+                `${message}. Check whether the design row exists, Builder is ` +
+                `connected, and create-fusion-app can be retried safely.`,
+              submit: true,
+            });
+          });
+      } else {
+        writePendingGeneration(id, {
+          prompt,
+          files,
+          title,
+          designSystemId,
+          skipQuestions: pendingOptions?.skipQuestions ?? quickStartRef.current,
+          ...options,
+        });
+        try {
+          await ready;
+        } catch (error) {
+          clearPendingGeneration(id);
+          setNewDesignHandoffPending(false);
+          trace("persist", "create-design-failed", {
+            id,
+            designSystemId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          toast.error(t("home.failedToCreateDesign"));
+          throw error;
+        }
+      }
+
+      reportPromptSubmitted(id);
+      trace("persist", "new-design-handoff", { id, designSystemId });
+      setNewDesignHandoffPending(true);
+      void navigate(`/design/${id}`);
     },
-    [createDesign, navigate, newDesignSystemId, resolveDefaultDesignSystemId],
+    [
+      createDesign,
+      createFromTemplateMutation,
+      createFusionAppMutation,
+      designSystems,
+      fullAppBuildingEnabled,
+      handleGenerateDesignTitle,
+      navigate,
+      newDesignMode,
+      newDesignSystemId,
+      queryClient,
+      resolveAppDesignSystemId,
+      selectedTemplate,
+      t,
+    ],
   );
+
+  const startBlankDesign = useCallback(async () => {
+    if (skipToEditorPendingRef.current) return;
+    skipToEditorPendingRef.current = true;
+    setNewDesignHandoffPending(true);
+
+    try {
+      const designSystemId =
+        newDesignMode === "app"
+          ? await resolveAppDesignSystemId()
+          : newDesignSystemId;
+      const { id, ready } = createDesign(
+        t("home.untitledDesign"),
+        designSystemId,
+        "blank",
+      );
+      await ready;
+      void navigate(`/design/${id}`);
+    } catch (error) {
+      skipToEditorPendingRef.current = false;
+      setNewDesignHandoffPending(false);
+      toast.error(t("home.failedToCreateDesign"));
+      throw error;
+    }
+  }, [
+    createDesign,
+    navigate,
+    newDesignMode,
+    newDesignSystemId,
+    resolveAppDesignSystemId,
+    t,
+  ]);
+
+  const handleSkipToEditor = useCallback(async () => {
+    if (selectedTemplate && newDesignMode === "design") {
+      try {
+        await requireAgentEngineConfiguredForDispatch();
+      } catch {
+        if (agentEngine.missing) {
+          setSetupCardBouncePulse((pulse) => pulse + 1);
+        }
+        return false;
+      }
+      await handleSubmitPrompt(
+        "",
+        [],
+        {
+          contextItems: await homeContext.prepareSubmission(
+            snapshotComposerContextItems(homeContext.contextItems),
+          ),
+        },
+        { fromSkip: true },
+      );
+      return false;
+    }
+    await startBlankDesign();
+    return false;
+  }, [
+    handleSubmitPrompt,
+    agentEngine.missing,
+    homeContext.contextItems,
+    newDesignMode,
+    selectedTemplate,
+    startBlankDesign,
+  ]);
 
   const handleDelete = useCallback(() => {
     if (!deleteId) return;
     const id = deleteId;
 
-    // Optimistic update
     queryClient.setQueryData(
-      ["action", "list-designs", { includePreview: "true" }],
-      (old: any) => ({
-        count: Math.max((old?.count ?? 1) - 1, 0),
-        designs: (old?.designs ?? []).filter((d: Design) => d.id !== id),
-      }),
+      ["action", "list-designs", listDesignsParams],
+      (old: any) => {
+        if (!old) return old;
+        const designs = old.designs ?? [];
+        if (!designs.some((design: Design) => design.id === id)) return old;
+        const totalCount = Math.max(
+          (old.totalCount ?? old.count ?? designs.length) - 1,
+          0,
+        );
+        const pageSize = old.pageSize ?? DESIGN_PAGE_SIZE;
+        const totalPages = Math.max(Math.ceil(totalCount / pageSize), 1);
+        return {
+          ...old,
+          count: totalCount,
+          totalCount,
+          totalPages,
+          hasMore: page < totalPages,
+          designs: designs.filter((design: Design) => design.id !== id),
+        };
+      },
     );
 
     setDeleteId(null);
 
     deleteMutation.mutate({ id } as any, {
+      onSuccess: () => {
+        void queryClient.invalidateQueries({
+          queryKey: ["action", "list-designs"],
+        });
+      },
       onError: () => {
-        queryClient.invalidateQueries({
+        void queryClient.invalidateQueries({
           queryKey: ["action", "list-designs"],
         });
       },
     });
-  }, [deleteId, queryClient, deleteMutation]);
+  }, [deleteId, listDesignsParams, page, queryClient, deleteMutation]);
 
   const handleBulkDelete = useCallback(() => {
     const ids = Array.from(selectedDesignIds);
@@ -300,39 +1230,53 @@ export default function Index() {
     const idsToDelete = new Set(ids);
 
     queryClient.setQueryData(
-      ["action", "list-designs", { includePreview: "true" }],
-      (old: any) => ({
-        count: Math.max(
-          (old?.count ?? (old?.designs ?? []).length) - ids.length,
+      ["action", "list-designs", listDesignsParams],
+      (old: any) => {
+        if (!old) return old;
+        const designs = old.designs ?? [];
+        const nextDesigns = designs.filter(
+          (design: Design) => !idsToDelete.has(design.id),
+        );
+        const deletedCount = designs.length - nextDesigns.length;
+        if (deletedCount === 0) return old;
+        const totalCount = Math.max(
+          (old.totalCount ?? old.count ?? designs.length) - deletedCount,
           0,
-        ),
-        designs: (old?.designs ?? []).filter(
-          (d: Design) => !idsToDelete.has(d.id),
-        ),
-      }),
+        );
+        const pageSize = old.pageSize ?? DESIGN_PAGE_SIZE;
+        const totalPages = Math.max(Math.ceil(totalCount / pageSize), 1);
+        return {
+          ...old,
+          count: totalCount,
+          totalCount,
+          totalPages,
+          hasMore: page < totalPages,
+          designs: nextDesigns,
+        };
+      },
     );
 
     setBulkDeleteOpen(false);
     setSelectedDesignIds(new Set());
 
-    void Promise.all(ids.map((id) => deleteMutation.mutateAsync({ id } as any)))
-      .then(() => undefined)
-      .catch(() => {
-        queryClient.invalidateQueries({
-          queryKey: ["action", "list-designs"],
-        });
+    void Promise.allSettled(
+      ids.map((id) => deleteMutation.mutateAsync({ id } as any)),
+    ).then(() => {
+      void queryClient.invalidateQueries({
+        queryKey: ["action", "list-designs"],
       });
-  }, [selectedDesignIds, queryClient, deleteMutation]);
+    });
+  }, [listDesignsParams, page, selectedDesignIds, queryClient, deleteMutation]);
 
   const handleDuplicate = useCallback(
     (id: string) => {
       duplicateMutation.mutate({ id } as any, {
         onSuccess: (data: any) => {
-          queryClient.invalidateQueries({
+          void queryClient.invalidateQueries({
             queryKey: ["action", "list-designs"],
           });
           if (data?.id) {
-            navigate(`/design/${data.id}`);
+            void navigate(`/design/${data.id}`);
           }
         },
       });
@@ -352,36 +1296,35 @@ export default function Index() {
     setRenameId(null);
     if (!next) return;
 
-    queryClient.setQueryData(
-      ["action", "list-designs", { includePreview: "true" }],
-      (old: any) => ({
-        count: old?.count ?? 0,
-        designs: (old?.designs ?? []).map((d: Design) =>
-          d.id === id ? { ...d, title: next } : d,
-        ),
-      }),
+    userRenamedDesignIdsRef.current.add(id);
+
+    queryClient.setQueriesData(
+      { queryKey: ["action", "list-designs"] },
+      (old: any) => {
+        if (!old || typeof old !== "object") return old;
+        return {
+          ...old,
+          count: old.count ?? (old.designs ?? []).length,
+          designs: (old.designs ?? []).map((d: Design) =>
+            d.id === id ? { ...d, title: next } : d,
+          ),
+        };
+      },
     );
 
     updateMutation.mutate({ id, title: next } as any, {
+      onSuccess: () => {
+        void queryClient.invalidateQueries({
+          queryKey: ["action", "list-designs"],
+        });
+      },
       onError: () => {
-        queryClient.invalidateQueries({
+        void queryClient.invalidateQueries({
           queryKey: ["action", "list-designs"],
         });
       },
     });
   }, [renameId, renameDraft, queryClient, updateMutation]);
-
-  const projectTypeBadge = (type: ProjectType) => {
-    const labels: Record<ProjectType, string> = {
-      prototype: "Prototype",
-      other: "Other",
-    };
-    return (
-      <Badge variant="secondary" className="text-[10px] font-medium">
-        {labels[type] ?? type}
-      </Badge>
-    );
-  };
 
   const formatDate = (dateStr?: string) => {
     if (!dateStr) return "";
@@ -393,236 +1336,528 @@ export default function Index() {
     });
   };
 
-  useSetPageTitle("Designs");
+  useSetPageTitle(t("home.pageTitle"));
 
-  useSetHeaderActions(
-    <div className="flex items-center gap-3">
-      {designs.length > 0 ? (
-        <div className="relative">
-          <IconSearch className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground/70" />
-          <Input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search designs..."
-            className="pl-8 h-8 w-48 bg-accent/50 border-border text-sm text-foreground/90 placeholder:text-muted-foreground/70"
-          />
-        </div>
-      ) : null}
-      <Button size="sm" onClick={openNewDesign} className="cursor-pointer">
-        <IconPlus className="w-3.5 h-3.5" />
-        New Design
-      </Button>
-    </div>,
+  const searchInput = (
+    <div className="relative w-full min-w-0 sm:w-64 sm:shrink-0">
+      <IconSearch className="pointer-events-none absolute start-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+      <Input
+        size="sm"
+        value={search}
+        onChange={(event) => handleSearchChange(event.target.value)}
+        placeholder={t("home.searchPlaceholder")}
+        aria-label={t("home.searchPlaceholder")}
+        data-home-search="true"
+        className="h-9 w-full pe-3 ps-8"
+      />
+    </div>
   );
 
   return (
     <>
-      <main className="px-4 sm:px-6 py-6 sm:py-10">
-        {isLoading ? (
-          <LoadingSkeleton />
-        ) : designs.length === 0 ? (
-          <EmptyState
-            onCreateDesign={openNewDesign}
-            onStarterPrompt={(prompt) => handleSubmitPrompt(prompt, [], {})}
+      {newDesignHandoffPending ? <NewDesignHandoffOverlay /> : null}
+      <PromptHome
+        title={t("home.designPromptTitle")}
+        connectionAttached={agentEngineMissing}
+        connection={
+          agentEngineConfigured ? null : agentEngineMissing ? (
+            <BuilderSetupCard
+              attached
+              fullWidth
+              layout="sidebar"
+              bouncePulse={setupCardBouncePulse}
+              onConnected={retryAgentEngineStatus}
+            />
+          ) : null
+        }
+        composer={
+          <div
+            data-design-home-composer
+            className={
+              agentEngineMissing
+                ? "agent-composer-area--attached-above"
+                : undefined
+            }
+            onFocusCapture={bounceSetupCard}
+            onPointerDownCapture={bounceSetupCard}
+          >
+            <PromptPopover
+              inline
+              open
+              onOpenChange={() => {}}
+              composerComponent={PromptComposer}
+              composerRef={composerRef}
+              showModelSelector={agentEngineConfigured}
+              modelStatusChecksEnabled={agentEngineConfigured}
+              requireAgentEngine
+              showMissingApiKeySetup={false}
+              title={t("home.newDesignLower")}
+              draftScope="design:new:0"
+              placeholder={
+                selectedTemplate
+                  ? t("promptDialog.templatePromptPlaceholder", {
+                      title: selectedTemplate.title,
+                    })
+                  : t("home.describeBuild")
+              }
+              onSkip={handleSkipToEditor}
+              showInlineSkip={!selectedTemplate}
+              skipLabel={
+                selectedTemplate
+                  ? t("templatesPage.useTemplate")
+                  : t("promptDialog.skipPrompt")
+              }
+              onSubmit={handleSubmitPrompt}
+              onSubmitError={() => {
+                submissionErrorRef.current = true;
+              }}
+              beforeSubmitContext={homeContext.prepareSubmission}
+              submissionIdentity={homeContext.identity}
+              contextItems={homeContext.contextItems}
+              contextMenuItems={homeContext.menuItems}
+              onRemoveContextItem={homeContext.remove}
+              onRetryContextItem={homeContext.retry}
+              templateOptions={templateOptions}
+              templatesLoading={templatesLoading}
+              selectedTemplateId={newTemplateId}
+              onTemplateChange={handleTemplateChange}
+              designSystems={designSystemOptions}
+              designSystemsLoading={designSystemsLoading}
+              selectedDesignSystemId={newDesignSystemId ?? null}
+              onDesignSystemChange={handleNewDesignSystemChange}
+              creativeContexts={
+                creativeContextEnabled ? creativeContextOptions : []
+              }
+              creativeContextsLoading={
+                creativeContextEnabled && creativeContextsQuery.isLoading
+              }
+              selectedCreativeContextId={
+                creativeContextEnabled
+                  ? (creativeContextState.state.selectedContextId ?? null)
+                  : undefined
+              }
+              onCreativeContextChange={
+                creativeContextEnabled ? handleCreativeContextChange : undefined
+              }
+              loading={newDesignHandoffPending}
+              creationMode={fullAppBuildingEnabled ? newDesignMode : undefined}
+              onCreationModeChange={
+                fullAppBuildingEnabled ? setNewDesignMode : undefined
+              }
+            />
+          </div>
+        }
+        quickActions={
+          homeSuggestionsLoading ||
+          homeSuggestionsUnavailable ||
+          readyHomeSuggestions !== null ||
+          homeSuggestionsSnapshot !== null ? (
+            <AgentSuggestionBar
+              loading={homeSuggestionsLoading}
+              announceUpdates
+              layout="single-line"
+              suggestions={homeSuggestions.map((suggestion, index) => ({
+                ...suggestion,
+                id: suggestion.id ?? `design-home-${index}`,
+                disabled:
+                  !quickActionsEnabled ||
+                  newDesignHandoffPending ||
+                  quickStartPending,
+              }))}
+              ariaLabel={t("home.suggestedPrompts")}
+              className="px-0 py-0"
+              onSelect={async (suggestion) => {
+                if (
+                  !quickActionsEnabled ||
+                  quickStartRef.current ||
+                  !composerRef.current
+                )
+                  return;
+                quickStartRef.current = true;
+                submissionErrorRef.current = false;
+                setQuickStartPending(true);
+                try {
+                  const accepted = await composerRef.current.submitWithText(
+                    agentSuggestionPrompt(suggestion),
+                  );
+                  if (!accepted && !submissionErrorRef.current) {
+                    toast.error(t("homeContext.notReady"));
+                  }
+                } finally {
+                  quickStartRef.current = false;
+                  setQuickStartPending(false);
+                }
+              }}
+            />
+          ) : null
+        }
+      >
+        {accessibleDesignsSummary.isError ? (
+          <QueryErrorState
+            onRetry={() => void accessibleDesignsSummary.refetch()}
+            retrying={accessibleDesignsSummary.isFetching}
           />
-        ) : (
-          <>
-            {isSelectingDesigns ? (
-              <div className="-mt-4 mb-3 flex flex-wrap items-center justify-between gap-3 px-1 py-1 sm:-mt-6">
-                <div className="text-sm text-muted-foreground">
-                  <span className="font-medium text-foreground">
-                    {selectedDesignCount}
-                  </span>{" "}
-                  selected
-                </div>
-                <div className="flex items-center gap-1">
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        onClick={toggleVisibleSelection}
-                        aria-label={
-                          allVisibleSelected
-                            ? "Clear visible selection"
-                            : "Select visible designs"
-                        }
-                        className="h-8 w-8 cursor-pointer"
-                      >
-                        <IconChecks className="w-4 h-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      {allVisibleSelected
-                        ? "Clear visible selection"
-                        : "Select visible designs"}
-                    </TooltipContent>
-                  </Tooltip>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        onClick={clearSelection}
-                        aria-label="Clear selection"
-                        className="h-8 w-8 cursor-pointer"
-                      >
-                        <IconX className="w-4 h-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>Clear selection</TooltipContent>
-                  </Tooltip>
+        ) : null}
+        <ClientOnly>
+          <DesignHomeLibrary
+            value={
+              hasAccessibleDesigns && !homeLibraryTabWasSelectedRef.current
+                ? "recent"
+                : homeSection
+            }
+            onValueChange={(value) => {
+              homeLibraryTabWasSelectedRef.current = true;
+              setHomeSection(value);
+            }}
+            labels={{
+              templates: t("navigation.templates"),
+              recent: t("home.recent"),
+            }}
+            browseAll={
+              <Button variant="ghost" size="sm" asChild>
+                <Link to="/templates">
+                  {t("home.browseAllTemplates")}
+                  <IconArrowRight />
+                </Link>
+              </Button>
+            }
+            search={searchInput}
+            recentActions={
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
                   <Button
-                    variant="destructive"
+                    type="button"
+                    variant="outline"
                     size="sm"
-                    onClick={() => setBulkDeleteOpen(true)}
-                    className="cursor-pointer"
+                    aria-label={ownerFilterLabels[designFilter]}
+                    className="h-9 shrink-0 gap-2"
                   >
-                    <IconTrash className="w-3.5 h-3.5" />
-                    Delete
+                    <span className="grid">
+                      {Object.entries(ownerFilterLabels).map(
+                        ([filter, label]) => (
+                          <span
+                            key={filter}
+                            aria-hidden="true"
+                            className="invisible col-start-1 row-start-1 whitespace-nowrap"
+                          >
+                            {label}
+                          </span>
+                        ),
+                      )}
+                      <span className="col-start-1 row-start-1 whitespace-nowrap">
+                        {ownerFilterLabels[designFilter]}
+                      </span>
+                    </span>
+                    <IconChevronDown className="size-4" aria-hidden="true" />
                   </Button>
-                </div>
-              </div>
-            ) : null}
-            {/* Grid */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-              {/* New design card */}
-              <button
-                onClick={openNewDesign}
-                className="group relative rounded-xl border border-dashed border-border bg-card hover:border-foreground/15 overflow-hidden text-left cursor-pointer"
-              >
-                <div className="aspect-video flex items-center justify-center bg-muted/30">
-                  <div className="w-12 h-12 rounded-xl bg-accent/50 flex items-center justify-center group-hover:bg-accent">
-                    <IconPlus className="w-6 h-6 text-muted-foreground/70 group-hover:text-muted-foreground" />
-                  </div>
-                </div>
-                <div className="p-4">
-                  <h3 className="font-medium text-sm text-muted-foreground group-hover:text-foreground/70">
-                    New Design
-                  </h3>
-                  <div className="text-xs text-muted-foreground/70 mt-1">
-                    Create a design project
-                  </div>
-                </div>
-              </button>
-
-              {/* Design cards */}
-              {filtered.map((design) => {
-                const isSelected = selectedDesignIds.has(design.id);
-                const cardContent = (
-                  <>
-                    <DesignThumbnail html={design.previewHtml ?? null} />
-                    <div className="p-4">
-                      <div className="flex items-center gap-2 mb-1">
-                        <h3 className="font-medium text-sm text-foreground/90 truncate flex-1">
-                          {design.title}
-                        </h3>
-                        {projectTypeBadge(design.projectType)}
-                      </div>
-                      <div className="text-xs text-muted-foreground/70">
-                        {formatDate(design.updatedAt || design.createdAt)}
-                      </div>
-                    </div>
-                  </>
-                );
-
-                return (
-                  <div
-                    key={design.id}
-                    aria-selected={isSelected}
-                    className={`group relative rounded-xl border bg-card overflow-hidden ${
-                      isSelected
-                        ? "border-[#609FF8]/70 ring-2 ring-[#609FF8]/40"
-                        : "border-border"
-                    }`}
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start">
+                  <DropdownMenuRadioGroup
+                    value={designFilter}
+                    onValueChange={handleDesignFilterChange}
                   >
-                    <Link to={`/design/${design.id}`} className="block">
-                      {cardContent}
-                    </Link>
-                    <div
-                      className={`absolute left-2 top-2 z-10 transition-opacity ${
-                        isSelected || isSelectingDesigns
-                          ? "pointer-events-auto opacity-100"
-                          : "pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100"
-                      }`}
-                    >
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Checkbox
-                            checked={isSelected}
-                            onCheckedChange={() =>
-                              toggleDesignSelection(design.id)
-                            }
-                            onClick={(event) => event.stopPropagation()}
-                            aria-label={`Select ${design.title}`}
-                            className="h-5 w-5 border-white/70 bg-black/65 text-white shadow-sm data-[state=checked]:border-[#609FF8] data-[state=checked]:bg-[#609FF8]"
-                          />
-                        </TooltipTrigger>
-                        <TooltipContent>{`Select ${design.title}`}</TooltipContent>
-                      </Tooltip>
+                    <DropdownMenuRadioItem value="all" indicator="check">
+                      {ownerFilterLabels.all}
+                    </DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="mine" indicator="check">
+                      {ownerFilterLabels.mine}
+                    </DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem value="not-mine" indicator="check">
+                      {ownerFilterLabels["not-mine"]}
+                    </DropdownMenuRadioItem>
+                  </DropdownMenuRadioGroup>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            }
+            templates={
+              templatesError ? (
+                <QueryErrorState
+                  onRetry={() => void refetchTemplates()}
+                  retrying={templatesFetching}
+                />
+              ) : (
+                <DesignTemplateLibrary
+                  templates={templateOptions.filter(
+                    (template) => template.isBuiltIn,
+                  )}
+                  loading={templatesLoading}
+                />
+              )
+            }
+            recent={
+              <>
+                {isLoading || (isFetching && designs.length === 0) ? (
+                  <LoadingSkeleton />
+                ) : isError ? (
+                  <QueryErrorState
+                    onRetry={() => void refetch()}
+                    retrying={isFetching}
+                  />
+                ) : designs.length === 0 ? (
+                  normalizedSearch ? (
+                    <SearchEmptyState />
+                  ) : (
+                    <div className="rounded-xl bg-card p-6 text-center text-sm text-muted-foreground">
+                      {t("home.noDesignsMatchFilter")}
                     </div>
-                    {/* Three-dot menu */}
-                    <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
+                  )
+                ) : (
+                  <>
+                    {isSelectingDesigns ? (
+                      <div className="mb-3 flex w-full flex-wrap items-center justify-between gap-3 px-1 py-1">
+                        <div className="text-sm text-muted-foreground">
+                          <span className="font-medium text-foreground">
+                            {t("home.selected", { count: selectedDesignCount })}
+                          </span>
+                        </div>
+                        <div className="flex min-w-0 flex-wrap items-center justify-end gap-1">
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
+                                onClick={toggleVisibleSelection}
+                                aria-label={
+                                  allVisibleSelected
+                                    ? t("home.clearVisibleSelection")
+                                    : t("home.selectVisibleDesigns")
+                                }
+                                className="cursor-pointer"
+                              >
+                                <IconChecks className="w-4 h-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              {allVisibleSelected
+                                ? t("home.clearVisibleSelection")
+                                : t("home.selectVisibleDesigns")}
+                            </TooltipContent>
+                          </Tooltip>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
+                                onClick={clearSelection}
+                                aria-label={t("home.clearSelection")}
+                                className="cursor-pointer"
+                              >
+                                <IconX className="w-4 h-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              {t("home.clearSelection")}
+                            </TooltipContent>
+                          </Tooltip>
+                          {creativeContextEnabled ? (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() =>
+                                setContextDesigns(
+                                  designs.filter((design) =>
+                                    selectedDesignIds.has(design.id),
+                                  ),
+                                )
+                              }
+                              className="cursor-pointer"
+                            >
+                              <IconPlus className="w-3.5 h-3.5" />
+                              {t(
+                                "creativeContext.addToContext" /* i18n-key-ignore */,
+                              )}
+                            </Button>
+                          ) : null}
                           <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label={`Actions for ${design.title}`}
-                            className="h-7 w-7 bg-black/60 hover:bg-black/80 cursor-pointer"
+                            variant="destructive"
+                            size="sm"
+                            onClick={() => setBulkDeleteOpen(true)}
+                            className="cursor-pointer"
                           >
-                            <IconDots className="w-3.5 h-3.5 text-foreground/70" />
+                            <IconTrash className="w-3.5 h-3.5" />
+                            {t("home.delete")}
                           </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end">
-                          <DropdownMenuItem
-                            onClick={() => startRename(design)}
-                            className="cursor-pointer"
-                          >
-                            <IconPencil className="w-3.5 h-3.5 mr-2" />
-                            Rename
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            onClick={() => handleDuplicate(design.id)}
-                            className="cursor-pointer"
-                          >
-                            <IconCopy className="w-3.5 h-3.5 mr-2" />
-                            Duplicate
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            onClick={() => setDeleteId(design.id)}
-                            className="text-red-400 focus:text-red-400 cursor-pointer"
-                          >
-                            <IconTrash className="w-3.5 h-3.5 mr-2" />
-                            Delete
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </>
-        )}
-      </main>
+                        </div>
+                      </div>
+                    ) : null}
+                    <TemplateLibraryGrid
+                      items={designs}
+                      isSelected={(design) => selectedDesignIds.has(design.id)}
+                      actionsVisible={() => isSelectingDesigns}
+                      labels={{
+                        loading: t("templatesPage.loading"),
+                        empty: t("home.searchNoResultsTitle"),
+                        retry: t("homeContext.retry"),
+                      }}
+                      renderLink={(design, children) => (
+                        <Link to={`/design/${design.id}`}>{children}</Link>
+                      )}
+                      renderPreview={(design) => (
+                        <div className="design-library-card-preview">
+                          <DesignThumbnail
+                            html={design.previewHtml ?? null}
+                            designId={design.id}
+                            className="h-full w-full"
+                          />
+                        </div>
+                      )}
+                      renderMetadata={(design) => (
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <span className="shrink-0">
+                            {formatDate(design.updatedAt || design.createdAt)}
+                          </span>
+                          {showAuthors && design.ownerEmail ? (
+                            <>
+                              <span aria-hidden>·</span>
+                              <DesignAuthorByline
+                                email={design.ownerEmail}
+                                name={design.ownerName}
+                              />
+                            </>
+                          ) : null}
+                        </div>
+                      )}
+                      renderActions={(design) => {
+                        const isSelected = selectedDesignIds.has(design.id);
+                        return (
+                          <>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Checkbox
+                                  checked={isSelected}
+                                  onCheckedChange={() =>
+                                    toggleDesignSelection(design.id)
+                                  }
+                                  aria-label={t("home.selectDesign", {
+                                    title: design.title,
+                                  })}
+                                  className={cn(
+                                    "h-5 w-5",
+                                    isSelectingDesigns && "!opacity-100",
+                                  )}
+                                />
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                {t("home.selectDesign", {
+                                  title: design.title,
+                                })}
+                              </TooltipContent>
+                            </Tooltip>
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  aria-label={t("home.actionsForDesign", {
+                                    title: design.title,
+                                  })}
+                                >
+                                  <IconDots />
+                                </Button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end">
+                                <DropdownMenuItem
+                                  onClick={() =>
+                                    setTimeout(() => startRename(design))
+                                  }
+                                >
+                                  <IconPencil />
+                                  {t("home.rename")}
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                  onClick={() => handleDuplicate(design.id)}
+                                >
+                                  <IconCopy />
+                                  {t("home.duplicate")}
+                                </DropdownMenuItem>
+                                {creativeContextEnabled ? (
+                                  <DropdownMenuItem
+                                    onSelect={(event) => {
+                                      event.preventDefault();
+                                      setContextDesigns([design]);
+                                    }}
+                                  >
+                                    <IconPlus />
+                                    {t(
+                                      "creativeContext.addToContext" /* i18n-key-ignore */,
+                                    )}
+                                  </DropdownMenuItem>
+                                ) : null}
+                                <DropdownMenuItem
+                                  onClick={() =>
+                                    setTimeout(() => setDeleteId(design.id))
+                                  }
+                                  className="text-destructive focus:text-destructive"
+                                >
+                                  <IconTrash />
+                                  {t("home.delete")}
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          </>
+                        );
+                      }}
+                    />
+                    {totalPages > 1 ? (
+                      <nav
+                        aria-label={t("home.paginationPage", {
+                          page,
+                          totalPages,
+                        })}
+                        className="mt-6 flex items-center justify-between gap-3 border-t border-border px-1 pt-3"
+                      >
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => handlePageChange(page - 1)}
+                          disabled={page <= 1 || isFetching}
+                          className="cursor-pointer"
+                        >
+                          <IconChevronLeft className="size-3.5" />
+                          {t("home.paginationPrevious")}
+                        </Button>
+                        <span
+                          aria-live="polite"
+                          className="text-xs text-muted-foreground"
+                        >
+                          {t("home.paginationPage", { page, totalPages })}
+                        </span>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => handlePageChange(page + 1)}
+                          disabled={page >= totalPages || isFetching}
+                          className="cursor-pointer"
+                        >
+                          {t("home.paginationNext")}
+                          <IconChevronRight className="size-3.5" />
+                        </Button>
+                      </nav>
+                    ) : null}
+                  </>
+                )}
+              </>
+            }
+          />
+        </ClientOnly>
+      </PromptHome>
 
-      <PromptPopover
-        open={showNewPrompt}
-        onOpenChange={handleNewPromptOpenChange}
-        title="New design"
-        placeholder="Describe what you want to build..."
-        onSubmit={handleSubmitPrompt}
-        anchorRef={anchorRef}
-        designSystems={designSystems}
-        designSystemsLoading={designSystemsLoading}
-        selectedDesignSystemId={newDesignSystemId ?? null}
-        onDesignSystemChange={setNewDesignSystemId}
-        onCreateDesignSystem={() => {
-          handleNewPromptOpenChange(false);
-          navigate("/design-systems/setup");
-        }}
-      />
+      {creativeContextEnabled ? (
+        <CreativeContextShareSheet
+          open={contextDesigns.length > 0}
+          onOpenChange={(open) => {
+            if (!open) setContextDesigns([]);
+          }}
+          resources={contextDesigns.map((design) => ({
+            appId: "design",
+            resourceType: "design",
+            resourceId: design.id,
+            title: design.title,
+            updatedAt: design.updatedAt ?? design.createdAt,
+            preview: { kind: "document", label: "Design" },
+          }))}
+        />
+      ) : null}
 
       {/* Delete Confirmation */}
       <AlertDialog
@@ -638,30 +1873,34 @@ export default function Index() {
           <AlertDialogHeader>
             <AlertDialogTitle>
               {bulkDeleteOpen
-                ? `Delete ${selectedDesignCount} ${
-                    selectedDesignCount === 1 ? "Design" : "Designs"
-                  }?`
-                : "Delete Design?"}
+                ? selectedDesignCount === 1
+                  ? t("home.deleteSingleDesignsTitle", {
+                      count: selectedDesignCount,
+                    })
+                  : t("home.deleteDesignsTitle", {
+                      count: selectedDesignCount,
+                    })
+                : t("home.deleteDesignTitle")}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {bulkDeleteOpen
-                ? `This will permanently delete ${
-                    selectedDesignCount === 1
-                      ? "this design and all its files"
-                      : `these ${selectedDesignCount} designs and all their files`
-                  }. This action cannot be undone.`
-                : "This will permanently delete this design and all its files. This action cannot be undone."}
+                ? selectedDesignCount === 1
+                  ? t("home.deleteDesignDescription")
+                  : t("home.deleteDesignsDescription", {
+                      count: selectedDesignCount,
+                    })
+                : t("home.deleteDesignDescription")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel className="cursor-pointer">
-              Cancel
+              {t("home.cancel")}
             </AlertDialogCancel>
             <AlertDialogAction
               onClick={bulkDeleteOpen ? handleBulkDelete : handleDelete}
-              className="bg-red-600 hover:bg-red-700 cursor-pointer"
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90 cursor-pointer"
             >
-              Delete
+              {t("home.delete")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -676,7 +1915,7 @@ export default function Index() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Rename design</AlertDialogTitle>
+            <AlertDialogTitle>{t("home.renameDesign")}</AlertDialogTitle>
           </AlertDialogHeader>
           <Input
             value={renameDraft}
@@ -688,19 +1927,20 @@ export default function Index() {
                 commitRename();
               }
             }}
-            placeholder="Design name"
-            className="h-9 text-sm"
+            placeholder={t("home.designName")}
+            aria-label={t("home.designName")}
+            className="text-sm"
           />
           <AlertDialogFooter>
             <AlertDialogCancel className="cursor-pointer">
-              Cancel
+              {t("home.cancel")}
             </AlertDialogCancel>
             <AlertDialogAction
               onClick={commitRename}
               disabled={!renameDraft.trim()}
               className="cursor-pointer"
             >
-              Save
+              {t("home.save")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -709,90 +1949,45 @@ export default function Index() {
   );
 }
 
-/**
- * Derive a short, friendly title from a prompt. The full prompt still drives
- * generation — the title is just a label that shows up in the editor header
- * and the design card, so longer is worse.
- *
- * Strategy: take the first line, strip trailing punctuation, then truncate
- * at the nearest word boundary near 40 chars (with an ellipsis when cut).
- */
-function derivePromptTitle(prompt: string): string {
-  const firstLine = prompt
-    .split("\n")[0]
-    ?.trim()
-    .replace(/[.!?]+$/, "");
-  if (!firstLine) return "Untitled Design";
-  const MAX = 40;
-  if (firstLine.length <= MAX) return firstLine;
-  const slice = firstLine.slice(0, MAX);
-  const lastSpace = slice.lastIndexOf(" ");
-  const trimmed = lastSpace > 20 ? slice.slice(0, lastSpace) : slice;
-  return `${trimmed.trim()}…`;
-}
-
-/**
- * Render the design's index.html as a non-interactive thumbnail. The iframe
- * renders at a fixed natural size (so designs that assume a desktop viewport
- * still look right) and is then scaled to fill the card via a transform.
- *
- * The size is recomputed via ResizeObserver so the same component works in
- * 1, 2, 3 and 4-column grid layouts. We use a sandboxed iframe with only
- * allow-scripts (no allow-same-origin) so Tailwind/Alpine CDN render without
- * granting arbitrary design HTML access to the host origin.
- */
-function DesignThumbnail({ html }: { html: string | null }) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [scale, setScale] = useState(0.25);
-
-  // Designs are generated for a desktop-ish viewport. Render at 1280×720 then
-  // shrink — close enough to 16:10 for the aspect-video card without leaving
-  // a sliver of letterbox at the bottom.
-  const NATURAL_WIDTH = 1280;
-  const NATURAL_HEIGHT = 720;
-
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    const update = () => {
-      const w = el.clientWidth;
-      if (w > 0) setScale(w / NATURAL_WIDTH);
-    };
-    update();
-    const observer = new ResizeObserver(update);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-
-  if (!html) {
-    return (
-      <div className="aspect-video bg-muted/50 flex items-center justify-center">
-        <IconCode className="w-8 h-8 text-muted-foreground/40" />
-      </div>
-    );
-  }
+function DesignAuthorByline({
+  email,
+  name: profileName,
+}: {
+  email: string;
+  name?: string | null;
+}) {
+  const name = profileName?.trim() || emailToName(email);
+  const avatarUrl = useAvatarUrl(email);
 
   return (
+    <span className="flex min-w-0 items-center gap-1.5" title={email}>
+      <Avatar className="size-4 shrink-0">
+        {avatarUrl ? <AvatarImage src={avatarUrl} alt="" /> : null}
+        <AvatarFallback
+          /* guard:allow-raw-color — emailToColor ignores the theme, so the initial stays white in both. */
+          className="text-[8px] font-semibold text-white"
+          style={{ backgroundColor: emailToColor(email) }}
+        >
+          {name.trim().charAt(0).toUpperCase() || "?"}
+        </AvatarFallback>
+      </Avatar>
+      <span className="truncate">{name}</span>
+    </span>
+  );
+}
+
+function NewDesignHandoffOverlay() {
+  const t = useT();
+  return (
     <div
-      ref={containerRef}
-      className="aspect-video relative overflow-hidden bg-white"
+      className="fixed inset-0 z-[180] flex items-center justify-center bg-background/70 backdrop-blur-sm"
+      aria-live="polite"
+      aria-busy="true"
     >
-      <iframe
-        srcDoc={html}
-        sandbox="allow-scripts"
-        loading="lazy"
-        tabIndex={-1}
-        aria-hidden
-        title="Design preview"
-        style={{
-          width: `${NATURAL_WIDTH}px`,
-          height: `${NATURAL_HEIGHT}px`,
-          transform: `scale(${scale})`,
-          transformOrigin: "top left",
-          border: 0,
-          pointerEvents: "none",
-        }}
-      />
+      <div className="flex items-center gap-2 rounded-lg border border-border bg-popover px-3 py-2 text-sm font-medium text-foreground shadow-lg">
+        <Spinner className="size-4 text-muted-foreground" />
+        {t("home.openingDesign")}
+      </div>
     </div>
   );
 }
@@ -818,74 +2013,19 @@ function LoadingSkeleton() {
   );
 }
 
-// Starter prompt chips shown on the empty home state. Each one is a fully
-// formed prompt that the user can run with one click instead of staring at
-// an empty composer. Keep these distinct enough that the four results would
-// all look meaningfully different — same approach as Phase 2 variant
-// generation in the design agent.
-const STARTER_PROMPTS: { label: string; prompt: string }[] = [
-  {
-    label: "SaaS landing page",
-    prompt:
-      "A modern SaaS landing page with a dark theme, hero section, three feature cards, and a final CTA section.",
-  },
-  {
-    label: "Dashboard",
-    prompt:
-      "A clean analytics dashboard with a sidebar nav, four KPI tiles, a chart, and a recent-activity table.",
-  },
-  {
-    label: "Mobile app",
-    prompt:
-      "A mobile app prototype shown on a phone frame, with a tab bar at the bottom and three list cards on the home screen.",
-  },
-  {
-    label: "Pricing page",
-    prompt:
-      "A three-tier pricing page with a monthly/annual toggle, feature checklists, and a highlighted recommended tier.",
-  },
-];
-
-function EmptyState({
-  onCreateDesign,
-  onStarterPrompt,
-}: {
-  onCreateDesign: (e: React.MouseEvent<HTMLElement>) => void;
-  onStarterPrompt: (prompt: string) => void;
-}) {
+function SearchEmptyState() {
+  const t = useT();
   return (
-    <div className="flex flex-col items-center justify-center min-h-[60vh] text-center">
-      <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-[#609FF8]/20 to-[#4080E0]/20 border border-[#609FF8]/20 flex items-center justify-center mb-6">
-        <IconPalette className="w-7 h-7 text-[#609FF8]" />
-      </div>
+    <div
+      aria-live="polite"
+      className="flex flex-col items-center justify-center min-h-[60vh] text-center"
+    >
       <h2 className="text-xl font-semibold text-foreground mb-2">
-        Create your first design
+        {t("home.searchNoResultsTitle")}
       </h2>
       <p className="text-sm text-muted-foreground max-w-sm mb-6 leading-relaxed">
-        Pick a starting point or write your own prompt.
+        {t("home.searchNoResultsDescription")}
       </p>
-      <div className="flex flex-wrap items-center justify-center gap-2 max-w-md mb-6">
-        {STARTER_PROMPTS.map((s) => (
-          <button
-            key={s.label}
-            type="button"
-            onClick={() => onStarterPrompt(s.prompt)}
-            className="cursor-pointer rounded-full border border-border bg-card px-3 py-1.5 text-xs text-foreground/80 hover:border-foreground/30 hover:text-foreground/95 transition-colors"
-          >
-            {s.label}
-          </button>
-        ))}
-      </div>
-      <Button
-        variant="outline"
-        onClick={(e: React.MouseEvent<HTMLButtonElement>) =>
-          onCreateDesign(e as React.MouseEvent<HTMLElement>)
-        }
-        className="cursor-pointer"
-      >
-        <IconPlus className="w-4 h-4" />
-        New Design
-      </Button>
     </div>
   );
 }

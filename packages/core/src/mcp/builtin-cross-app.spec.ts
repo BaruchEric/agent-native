@@ -1,13 +1,17 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createServer } from "node:net";
-import { verifyAuth } from "./build-server.js";
-import { getBuiltinCrossAppTools } from "./builtin-tools.js";
-import type { MCPConfig } from "./build-server.js";
-import * as orgDirectory from "./org-directory.js";
-import * as a2aClient from "../a2a/client.js";
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 import * as callerAuth from "../a2a/caller-auth.js";
+import * as a2aClient from "../a2a/client.js";
+import * as orgContext from "../org/context.js";
+import { toAbsoluteOpenUrl } from "../server/deep-link.js";
 import * as embedSession from "../server/embed-session.js";
 import { runWithRequestContext } from "../server/request-context.js";
+import { verifyAuth } from "./build-server.js";
+import type { MCPConfig } from "./build-server.js";
+import { getBuiltinCrossAppTools } from "./builtin-tools.js";
+import * as orgDirectory from "./org-directory.js";
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -26,12 +30,9 @@ function resetEnv() {
 beforeEach(resetEnv);
 afterEach(() => {
   process.env = ORIGINAL_ENV;
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
-
-// ---------------------------------------------------------------------------
-// Issue 1 — ACCESS_TOKEN auth must not lose caller identity
-// ---------------------------------------------------------------------------
 
 describe("verifyAuth — static-token caller identity", () => {
   it("dev-open with no owner hint has no identity (unchanged behavior)", async () => {
@@ -93,6 +94,14 @@ describe("verifyAuth — static-token caller identity", () => {
 
   it("a valid JWT identity is not overridden by the owner header", async () => {
     process.env.A2A_SECRET = "jwt-secret";
+    vi.spyOn(
+      orgContext,
+      "resolveA2AOrganizationCredentialsByDomain",
+    ).mockResolvedValue(null);
+    vi.spyOn(
+      orgContext,
+      "resolveA2AOrganizationMetadataByDomain",
+    ).mockResolvedValue({ orgId: "org-acme", orgDomain: "acme.com" });
     const jose = await import("jose");
     const token = await new jose.SignJWT({
       sub: "jwt-user@example.com",
@@ -108,12 +117,6 @@ describe("verifyAuth — static-token caller identity", () => {
     expect(res.identity?.orgDomain).toBe("acme.com");
   });
 });
-
-// ---------------------------------------------------------------------------
-// Issue 2 / 3 — open_app + ask_app honesty for same-app / standalone
-// (cross-app workspace resolution needs a real workspace dir and is covered
-//  by the workspace-resolve path; here we lock the deterministic behavior.)
-// ---------------------------------------------------------------------------
 
 function baseConfig(over: Partial<MCPConfig> = {}): MCPConfig {
   return {
@@ -168,7 +171,7 @@ describe("open_app — same-app / standalone keeps a relative deep link", () => 
     expect(result.embed).toBe(true);
   });
 
-  it("uses a direct app route for embedded view links", async () => {
+  it("deep-links embedded view links instead of guessing /<view>", async () => {
     const tools = getBuiltinCrossAppTools(baseConfig());
     const result: any = await tools.open_app.run({
       app: "mail",
@@ -176,11 +179,32 @@ describe("open_app — same-app / standalone keeps a relative deep link", () => 
       params: { threadId: "abc" },
       embed: true,
     });
-    expect(result.url).toBe("/inbox?threadId=abc");
+    expect(result.url).toBe(
+      "/_agent-native/open?app=mail&view=inbox&threadId=abc&agentSidebar=closed",
+    );
     expect(result.embedStartUrl).toBeUndefined();
     expect(result.deepLinkUrl).toBeUndefined();
     expect(result.embed).toBe(true);
   });
+
+  it.each([
+    ["design", "editor"],
+    ["slides", "editor"],
+    ["content", "editor"],
+    ["brain", "capture"],
+    ["analytics", "adhoc"],
+  ])(
+    "never fabricates an origin-relative route for %s view %s",
+    async (app, view) => {
+      const tools = getBuiltinCrossAppTools(baseConfig({ appId: app }));
+      for (const embed of [true, false]) {
+        const result: any = await tools.open_app.run({ app, view, embed });
+        expect(result.url).not.toBe(`/${view}`);
+        expect(result.url.split("?")[0]).toBe("/_agent-native/open");
+        expect(result.url).toContain(`view=${view}`);
+      }
+    },
+  );
 
   it("mints a same-app embed start URL for authenticated MCP app callers", async () => {
     const createTicket = vi
@@ -206,18 +230,20 @@ describe("open_app — same-app / standalone keeps a relative deep link", () => 
         }),
     );
 
-    expect(result.url).toBe("/inbox?threadId=abc");
+    const targetPath =
+      "/_agent-native/open?app=mail&view=inbox&threadId=abc&agentSidebar=closed&__an_mcp_chat_bridge=1";
+    expect(result.url).toBe(
+      "/_agent-native/open?app=mail&view=inbox&threadId=abc&agentSidebar=closed",
+    );
     expect(result.embedStartUrl).toBe(
       "https://mail.example.com/_agent-native/embed/start?ticket=ticket-123",
     );
-    expect(result.embedTargetPath).toBe(
-      "/inbox?threadId=abc&__an_mcp_chat_bridge=1",
-    );
+    expect(result.embedTargetPath).toBe(targetPath);
     expect(result.embedExpiresAt).toBe(123456);
     expect(createTicket).toHaveBeenCalledWith({
       ownerEmail: "owner@example.com",
       orgId: "org-123",
-      targetPath: "/inbox?threadId=abc&__an_mcp_chat_bridge=1",
+      targetPath,
       scope: "minimal",
     });
   });
@@ -242,7 +268,9 @@ describe("open_app — same-app / standalone keeps a relative deep link", () => 
       params: { threadId: "abc" },
       embed: "true",
     });
-    expect(result.url).toBe("/inbox?threadId=abc");
+    expect(result.url).toBe(
+      "/_agent-native/open?app=mail&view=inbox&threadId=abc&agentSidebar=closed",
+    );
     expect(result.embed).toBe(true);
   });
 
@@ -272,7 +300,9 @@ describe("open_app — same-app / standalone keeps a relative deep link", () => 
         }),
     );
 
-    expect(result.url).toBe("/inbox?threadId=abc");
+    expect(result.url).toBe(
+      "/_agent-native/open?app=mail&view=inbox&threadId=abc&agentSidebar=closed",
+    );
     expect(result.embed).toBe(true);
     expect(result.embedStartUrl).toBe(
       "https://mail.example.com/_agent-native/embed/start?ticket=ticket-params",
@@ -280,7 +310,8 @@ describe("open_app — same-app / standalone keeps a relative deep link", () => 
     expect(createTicket).toHaveBeenCalledWith({
       ownerEmail: "owner@example.com",
       orgId: "org-123",
-      targetPath: "/inbox?threadId=abc&__an_mcp_chat_bridge=1",
+      targetPath:
+        "/_agent-native/open?app=mail&view=inbox&threadId=abc&agentSidebar=closed&__an_mcp_chat_bridge=1",
       scope: "minimal",
     });
   });
@@ -298,22 +329,48 @@ describe("open_app — same-app / standalone keeps a relative deep link", () => 
     expect(result.embed).toBe(true);
   });
 
+  it("keeps bare-view deep links base-relative while the open link carries the base path", async () => {
+    process.env.APP_BASE_PATH = "/mail";
+    const deepLink =
+      "/_agent-native/open?app=mail&view=inbox&threadId=abc&agentSidebar=closed";
+    const tools = getBuiltinCrossAppTools(baseConfig());
+
+    const result: any = await tools.open_app.run({
+      app: "mail",
+      view: "inbox",
+      params: { threadId: "abc" },
+      embed: true,
+    });
+
+    expect(result.url).toBe(deepLink);
+    expect(toAbsoluteOpenUrl(result.url, "https://mail.example.com")).toBe(
+      `https://mail.example.com/mail${deepLink}`,
+    );
+    expect(
+      embedSession.normalizeEmbedTargetPath(
+        result.url,
+        "https://mail.example.com",
+      ),
+    ).toBe(deepLink);
+  });
+
   it("defaults to the app's home page when neither view nor path is given", async () => {
-    // Bare `open_app({app:"mail"})` should land on `/`, not throw — otherwise
-    // hosts (ChatGPT/Claude) waste a turn on the model's first-attempt retry
-    // when it omits view/path on initial call. See PR #884 chrome agent
-    // findings: "first open_app({app:'dispatch'}) returns parameter error".
     const tools = getBuiltinCrossAppTools(baseConfig());
     const result: any = await tools.open_app.run({ app: "mail" });
     expect(result.url).toMatch(/^\/$/);
     expect(result.app).toBe("mail");
   });
 
-  it("still rejects open_app calls without an app id", async () => {
+  it("opens the current app home when an entrypoint has no arguments", async () => {
     const tools = getBuiltinCrossAppTools(baseConfig());
-    await expect(tools.open_app.run({} as any)).rejects.toThrow(
-      /requires 'app'/,
-    );
+    const result: any = await tools.open_app.run({});
+    expect(result).toMatchObject({ app: "mail", url: "/", embed: true });
+  });
+
+  it("honors embed false when an entrypoint opens the current app home", async () => {
+    const tools = getBuiltinCrossAppTools(baseConfig());
+    const result: any = await tools.open_app.run({ embed: false });
+    expect(result).toMatchObject({ app: "mail", url: "/", embed: false });
   });
 });
 
@@ -336,10 +393,6 @@ describe("create_embed_session", () => {
 });
 
 describe("list_apps — reports the live request origin for the current app", () => {
-  // Bug #2: a single-app dev server reached over `connect` was reporting a
-  // guessed `PORT || 5173` URL + `running:false` (wrong whenever the dev
-  // server picked another port, e.g. `agent-native dev` on :8080). The MCP
-  // request is served BY the app, so the inbound origin is authoritative.
   it("uses requestMeta.origin and running:true for the served app", async () => {
     const tools = getBuiltinCrossAppTools(baseConfig({ appId: "content" }), {
       origin: "http://localhost:8080",
@@ -347,6 +400,7 @@ describe("list_apps — reports the live request origin for the current app", ()
     const result: any = await tools.list_apps.run({});
     expect(result.workspace).toBe(false);
     expect(result.apps).toHaveLength(1);
+    expect(result.apps[0].id).toBe("content");
     expect(result.apps[0].url).toBe("http://localhost:8080");
     expect(result.apps[0].port).toBe(8080);
     expect(result.apps[0].running).toBe(true);
@@ -357,14 +411,185 @@ describe("list_apps — reports the live request origin for the current app", ()
     const tools = getBuiltinCrossAppTools(baseConfig({ appId: "content" }));
     const result: any = await tools.list_apps.run({});
     expect(result.apps).toHaveLength(1);
-    // No live origin → keep the resolver's URL (not overridden to a bogus
-    // live origin) and its real TCP-probe running state.
     expect(result.apps[0].url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
     expect(result.apps[0].running).toBe(false);
   });
 });
 
 describe("ask_app — honest routing metadata", () => {
+  it("recovers typed local 503 status failures while keeping 403 terminal", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const unavailable = Object.assign(
+      new Error("service principal lookup unavailable"),
+      { statusCode: 503 },
+    );
+    const localAgentTaskClient = {
+      send: vi.fn(),
+      getTask: vi.fn().mockRejectedValue(unavailable),
+    };
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com", localAgentTaskClient },
+    );
+    const readStatus = () =>
+      runWithRequestContext(
+        { userEmail: "alice@example.test", orgId: "org-1" },
+        () => tools.ask_app_status.run({ taskId: "local-task" }),
+      );
+    const pending = readStatus();
+    await expect(pending).resolves.toMatchObject({
+      taskId: "local-task",
+      statusRead: "unavailable",
+      errorCategory: "upstream_5xx",
+      retryable: true,
+      attempts: 4,
+    });
+    expect(localAgentTaskClient.getTask).toHaveBeenCalledTimes(4);
+    localAgentTaskClient.getTask.mockClear().mockRejectedValue(
+      Object.assign(new Error("service principal suspended"), {
+        statusCode: 403,
+      }),
+    );
+    await expect(readStatus()).rejects.toThrow("suspended");
+    expect(localAgentTaskClient.getTask).toHaveBeenCalledOnce();
+  });
+  it("uses the local durable client for same-app submit and both status formats", async () => {
+    const authSpy = vi.spyOn(callerAuth, "resolveA2ACallerAuth");
+    const task = {
+      id: "local-mcp-task",
+      status: {
+        state: "working" as const,
+        timestamp: new Date().toISOString(),
+      },
+    };
+    const localAgentTaskClient = {
+      send: vi.fn().mockResolvedValue(task),
+      getTask: vi.fn().mockResolvedValue({
+        ...task,
+        status: {
+          ...task.status,
+          state: "completed",
+          message: {
+            role: "agent",
+            parts: [{ type: "text", text: "local authenticated answer" }],
+          },
+        },
+      }),
+    };
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com", localAgentTaskClient },
+    );
+    await runWithRequestContext(
+      { userEmail: "alice@example.test", orgId: "org-1" },
+      async () => {
+        const submitted: any = await tools.ask_app.run({
+          message: "read only",
+          async: true,
+        });
+        expect(submitted).toMatchObject({
+          taskId: task.id,
+          routedVia: "local",
+        });
+        expect(submitted.taskHandle).toBeTruthy();
+        expect(localAgentTaskClient.send).toHaveBeenCalledWith(
+          { role: "user", parts: [{ type: "text", text: "read only" }] },
+          expect.objectContaining({
+            async: true,
+            idempotencyKey: expect.any(String),
+          }),
+        );
+        for (const args of [
+          { taskHandle: submitted.taskHandle },
+          { app: "mail", taskId: task.id },
+        ]) {
+          await expect(tools.ask_app_status.run(args)).resolves.toMatchObject({
+            status: "completed",
+            response: "local authenticated answer",
+          });
+        }
+      },
+    );
+    expect(localAgentTaskClient.getTask).toHaveBeenCalledTimes(2);
+    expect(authSpy).not.toHaveBeenCalled();
+  });
+
+  it("preserves organization-only A2A submission and both status formats", async () => {
+    process.env.A2A_SECRET = "test-deployment-secret";
+    vi.spyOn(orgContext, "getOrgDomain").mockResolvedValue("acme.test");
+    vi.spyOn(orgContext, "getOrgA2ASecret").mockResolvedValue(
+      "test-org-secret",
+    );
+    const authSpy = vi.spyOn(callerAuth, "resolveA2ACallerAuth");
+    const task = {
+      id: "org-only-task",
+      status: {
+        state: "working" as const,
+        timestamp: new Date().toISOString(),
+      },
+    };
+    const send = vi
+      .spyOn(a2aClient.A2AClient.prototype, "send")
+      .mockResolvedValue(task);
+    const getTask = vi
+      .spyOn(a2aClient.A2AClient.prototype, "getTask")
+      .mockResolvedValue({
+        ...task,
+        status: { ...task.status, state: "completed" },
+      });
+    const localAgentTaskClient = { send: vi.fn(), getTask: vi.fn() };
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com", localAgentTaskClient },
+    );
+    await runWithRequestContext({ orgId: "org-1" }, async () => {
+      const submitted: any = await tools.ask_app.run({
+        message: "read only",
+        async: true,
+      });
+      expect(submitted.taskId).toBe(task.id);
+      expect(submitted.taskHandle).toBeTruthy();
+      for (const args of [
+        { taskHandle: submitted.taskHandle },
+        { app: "mail", taskId: task.id },
+      ]) {
+        await expect(tools.ask_app_status.run(args)).resolves.toMatchObject({
+          status: "completed",
+        });
+      }
+    });
+    expect(localAgentTaskClient.send).not.toHaveBeenCalled();
+    expect(localAgentTaskClient.getTask).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+    expect(getTask).toHaveBeenCalledTimes(2);
+    expect(authSpy).toHaveBeenCalledTimes(3);
+    const auth = await authSpy.mock.results[0].value;
+    expect(auth.userEmail).toBeUndefined();
+    expect(auth.orgId).toBe("org-1");
+    expect(auth.apiKey).toBeTruthy();
+    expect(send).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        metadata: {
+          orgDomain: "acme.test",
+          requestOrigin: "https://mail.example.com",
+        },
+      }),
+    );
+  });
+  it("describes direct tools as preferred and ask_app as the fallback", () => {
+    const tools = getBuiltinCrossAppTools(baseConfig({ appId: "mail" }));
+    expect(tools.ask_app.tool.description).toMatch(
+      /Prefer host page WebMCP or cataloged direct action tools for known, bounded current-app work/i,
+    );
+    expect(tools.ask_app.tool.description).toMatch(
+      /when direct tools are unavailable or the task needs the app agent's interpretation/i,
+    );
+    expect(tools.ask_app.tool.description).toMatch(
+      /full skills, instructions, tools, and context/i,
+    );
+  });
+
   it("answers locally and reports routedVia:local for the current app", async () => {
     let received: string | undefined;
     const tools = getBuiltinCrossAppTools(
@@ -383,6 +608,7 @@ describe("ask_app — honest routing metadata", () => {
     expect(result.routedVia).toBe("local");
     expect(result.app).toBe("mail");
     expect(result.response).toBe("local-answer");
+    expect(result.verification).toBe("unverified");
     expect(result.note).toBeUndefined();
   });
 
@@ -420,10 +646,16 @@ describe("ask_app — honest routing metadata", () => {
     expect(askAgent).not.toHaveBeenCalled();
     expect(sendSpy).toHaveBeenCalledWith(
       { role: "user", parts: [{ type: "text", text: "hello" }] },
-      {
+      expect.objectContaining({
         async: true,
-        metadata: { userEmail: "caller@acme.com", orgDomain: "acme.com" },
-      },
+        deadlineMs: expect.any(Number),
+        idempotencyKey: expect.stringMatching(/^ask-app:/),
+        metadata: {
+          userEmail: "caller@acme.com",
+          orgDomain: "acme.com",
+          requestOrigin: "https://mail.example.com",
+        },
+      }),
     );
     expect(result).toMatchObject({
       app: "mail",
@@ -435,6 +667,52 @@ describe("ask_app — honest routing metadata", () => {
         arguments: { app: "mail", taskId: "task-1" },
       },
     });
+  });
+
+  it("reuses the MCP request idempotency key across transport retries", async () => {
+    vi.spyOn(callerAuth, "resolveA2ACallerAuth").mockResolvedValue({
+      apiKey: "signed-org-jwt",
+      userEmail: "caller@acme.com",
+      orgId: "org-1",
+      orgDomain: "acme.com",
+      orgSecret: "org-secret",
+      metadata: {},
+    });
+    const sendSpy = vi
+      .spyOn(a2aClient.A2AClient.prototype, "send")
+      .mockResolvedValue({
+        id: "task-1",
+        status: { state: "working", timestamp: "2026-06-15T00:00:00Z" },
+        history: [],
+        artifacts: [],
+      } as any);
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ appId: "mail", askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com" },
+    );
+    const input = { app: "mail", message: "retry me", async: true };
+
+    await runWithRequestContext(
+      {
+        userEmail: "caller@acme.com",
+        orgId: "org-1",
+        mcpRequestId: "session-1:42",
+      },
+      () => tools.ask_app.run(input),
+    );
+    await runWithRequestContext(
+      {
+        userEmail: "caller@acme.com",
+        orgId: "org-1",
+        mcpRequestId: "session-1:42",
+      },
+      () => tools.ask_app.run(input),
+    );
+
+    expect(sendSpy).toHaveBeenCalledTimes(2);
+    expect(sendSpy.mock.calls[0]?.[1]?.idempotencyKey).toBe(
+      sendSpy.mock.calls[1]?.[1]?.idempotencyKey,
+    );
   });
 
   it("polls hosted ask_app tasks by task id", async () => {
@@ -478,25 +756,204 @@ describe("ask_app — honest routing metadata", () => {
       taskId: "task-1",
       status: "completed",
       response: "local answer",
+      verification: "unverified",
     });
   });
 
-  it("does not falsely claim delegation when the target is unreachable", async () => {
+  it("retries transient hosted ask_app status fetch failures", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(callerAuth, "resolveA2ACallerAuth").mockResolvedValue({
+      apiKey: "signed-org-jwt",
+      userEmail: "caller@acme.com",
+      orgId: "org-1",
+      orgDomain: "acme.com",
+      orgSecret: "org-secret",
+      metadata: {},
+    });
+    const getTaskSpy = vi
+      .spyOn(a2aClient.A2AClient.prototype, "getTask")
+      .mockRejectedValueOnce(new TypeError("fetch failed"))
+      .mockResolvedValue({
+        id: "task-1",
+        status: {
+          state: "completed",
+          timestamp: "2026-06-15T00:00:01.000Z",
+          message: {
+            role: "agent",
+            parts: [{ type: "text", text: "local answer after retry" }],
+          },
+        },
+        history: [],
+        artifacts: [],
+      } as any);
+
     const tools = getBuiltinCrossAppTools(
-      baseConfig({
-        askAgent: async () => "local-answer",
+      baseConfig({ askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com" },
+    );
+    const result: any = await tools.ask_app_status.run({
+      app: "mail",
+      taskId: "task-1",
+    });
+
+    expect(getTaskSpy).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      app: "mail",
+      routedVia: "local",
+      taskId: "task-1",
+      status: "completed",
+      response: "local answer after retry",
+      verification: "unverified",
+    });
+  });
+
+  it("returns a recoverable polling envelope when transient hosted status reads exhaust their retries", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(callerAuth, "resolveA2ACallerAuth").mockResolvedValue({
+      apiKey: "signed-org-jwt",
+      userEmail: "caller@acme.com",
+      orgId: "org-1",
+      orgDomain: "acme.com",
+      orgSecret: "org-secret",
+      metadata: {},
+    });
+    const sendSpy = vi.spyOn(a2aClient.A2AClient.prototype, "send");
+    const getTaskSpy = vi
+      .spyOn(a2aClient.A2AClient.prototype, "getTask")
+      .mockRejectedValue(new TypeError("fetch failed"));
+
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com" },
+    );
+    const resultPromise = tools.ask_app_status.run({
+      app: "mail",
+      taskId: "task-1",
+    });
+
+    await vi.advanceTimersByTimeAsync(2_500);
+
+    await expect(resultPromise).resolves.toMatchObject({
+      app: "mail",
+      routedVia: "local",
+      taskId: "task-1",
+      status: "unknown",
+      statusRead: "unavailable",
+      retryable: true,
+      errorCategory: "transport",
+      attempts: 4,
+      pollAfterMs: 1_500,
+      poll: {
+        tool: "ask_app_status",
+        arguments: { app: "mail", taskId: "task-1" },
+      },
+      message: expect.stringMatching(
+        /status could not be read.*may still be running or completed.*retry.*ask_app_status.*do not resubmit ask_app/i,
+      ),
+    });
+    expect(getTaskSpy).toHaveBeenCalledTimes(4);
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledTimes(4);
+    expect(warnSpy).toHaveBeenLastCalledWith(
+      "[ask_app_status] tasks/get attempt failed",
+      expect.objectContaining({
+        app: "mail",
+        routedVia: "local",
+        taskId: "task-1",
+        originHost: "mail.example.com",
+        attempt: 4,
+        maxAttempts: 4,
+        errorCategory: "transport",
+        errorName: "TypeError",
+        willRetry: false,
       }),
     );
-    // "calendar" is not a resolvable workspace app in this test env, so it
-    // falls back to local but must say so honestly.
-    const result: any = await tools.ask_app.run({
-      app: "calendar",
-      message: "hi",
+  });
+
+  it.each([
+    ["rate_limited", new Error("A2A request failed (429): retry later")],
+    ["upstream_5xx", new Error("A2A request failed (503): unavailable")],
+    [
+      "timeout",
+      Object.assign(new TypeError("fetch failed"), {
+        cause: { code: "UND_ERR_CONNECT_TIMEOUT" },
+      }),
+    ],
+  ])(
+    "classifies exhausted hosted ask_app status reads as %s",
+    async (errorCategory, error) => {
+      vi.useFakeTimers();
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      vi.spyOn(callerAuth, "resolveA2ACallerAuth").mockResolvedValue({
+        apiKey: "signed-org-jwt",
+        userEmail: "caller@acme.com",
+        orgId: "org-1",
+        orgDomain: "acme.com",
+        orgSecret: "org-secret",
+        metadata: {},
+      });
+      vi.spyOn(a2aClient.A2AClient.prototype, "getTask").mockRejectedValue(
+        error,
+      );
+
+      const tools = getBuiltinCrossAppTools(
+        baseConfig({ askAgent: async () => "unused" }),
+        { origin: "https://mail.example.com" },
+      );
+      const resultPromise = tools.ask_app_status.run({
+        app: "mail",
+        taskId: "task-1",
+      });
+
+      await vi.advanceTimersByTimeAsync(2_500);
+
+      await expect(resultPromise).resolves.toMatchObject({
+        statusRead: "unavailable",
+        retryable: true,
+        errorCategory,
+        attempts: 4,
+      });
+    },
+  );
+
+  it("does not retry permanent hosted ask_app status read errors", async () => {
+    vi.spyOn(callerAuth, "resolveA2ACallerAuth").mockResolvedValue({
+      apiKey: "signed-org-jwt",
+      userEmail: "caller@acme.com",
+      orgId: "org-1",
+      orgDomain: "acme.com",
+      orgSecret: "org-secret",
+      metadata: {},
     });
-    expect(result.routedVia).toBe("local");
-    expect(result.app).toBe("mail");
-    expect(typeof result.note).toBe("string");
-    expect(result.note).toContain("calendar");
+    const sendSpy = vi.spyOn(a2aClient.A2AClient.prototype, "send");
+    const getTaskSpy = vi
+      .spyOn(a2aClient.A2AClient.prototype, "getTask")
+      .mockRejectedValue(new Error("A2A request failed (404): Not Found"));
+
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com" },
+    );
+
+    await expect(
+      tools.ask_app_status.run({ app: "mail", taskId: "task-missing" }),
+    ).rejects.toThrow(/404.*Not Found/i);
+    expect(getTaskSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unreachable target before invoking the local agent", async () => {
+    const askAgent = vi.fn(async () => "local-answer");
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({
+        askAgent,
+      }),
+    );
+    await expect(
+      tools.ask_app.run({ app: "calendar", message: "hi" }),
+    ).rejects.toThrow(/No reachable ask_app route for app "calendar"/);
+    expect(askAgent).not.toHaveBeenCalled();
   });
 
   it("throws when no agent handler exists and target is local", async () => {
@@ -507,14 +964,289 @@ describe("ask_app — honest routing metadata", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Phase 3b — org-directory auto-discovery merged into list_apps / ask_app
-// ---------------------------------------------------------------------------
+describe("ask_app — bounded deadline & retry behavior for the hosted A2A poll loop", () => {
+  function mockCallerAuth() {
+    return vi.spyOn(callerAuth, "resolveA2ACallerAuth").mockResolvedValue({
+      apiKey: "signed-org-jwt",
+      userEmail: "caller@acme.com",
+      orgId: "org-1",
+      orgDomain: "acme.com",
+      orgSecret: "org-secret",
+      metadata: {},
+    });
+  }
+
+  it("bounds a still-working hosted task to the inline wait deadline before returning a poll payload", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    mockCallerAuth();
+    vi.spyOn(a2aClient.A2AClient.prototype, "send").mockResolvedValue({
+      id: "task-deadline",
+      status: { state: "working" },
+      history: [],
+      artifacts: [],
+    } as any);
+    const getTaskSpy = vi
+      .spyOn(a2aClient.A2AClient.prototype, "getTask")
+      .mockImplementation(() => new Promise(() => undefined));
+
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com" },
+    );
+
+    const resultPromise = tools.ask_app.run({
+      app: "mail",
+      message: "hello",
+      maxWaitMs: 5_000,
+    });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    await expect(resultPromise).resolves.toMatchObject({
+      app: "mail",
+      routedVia: "local",
+      taskId: "task-deadline",
+      status: "working",
+      pollAfterMs: 1_500,
+      poll: {
+        tool: "ask_app_status",
+        arguments: { app: "mail", taskId: "task-deadline" },
+      },
+    });
+    expect(Date.now()).toBe(5_000);
+    expect(getTaskSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("clamps a negative maxWaitMs to 0 and returns the initial task without polling", async () => {
+    mockCallerAuth();
+    const sendSpy = vi
+      .spyOn(a2aClient.A2AClient.prototype, "send")
+      .mockResolvedValue({
+        id: "task-neg",
+        status: { state: "working" },
+        history: [],
+        artifacts: [],
+      } as any);
+    const getTaskSpy = vi.spyOn(a2aClient.A2AClient.prototype, "getTask");
+
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com" },
+    );
+    const result: any = await tools.ask_app.run({
+      app: "mail",
+      message: "hello",
+      maxWaitMs: -5_000,
+    });
+
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(getTaskSpy).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ taskId: "task-neg", status: "working" });
+  });
+
+  it("clamps maxWaitMs above the 20s ceiling down to 20000", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    mockCallerAuth();
+    vi.spyOn(a2aClient.A2AClient.prototype, "send").mockResolvedValue({
+      id: "task-clamped-high",
+      status: { state: "working" },
+      history: [],
+      artifacts: [],
+    } as any);
+    const getTaskSpy = vi
+      .spyOn(a2aClient.A2AClient.prototype, "getTask")
+      .mockImplementation(() => new Promise(() => undefined));
+
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com" },
+    );
+    const resultPromise = tools.ask_app.run({
+      app: "mail",
+      message: "hello",
+      maxWaitMs: 999_999,
+    });
+
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    await expect(resultPromise).resolves.toMatchObject({
+      taskId: "task-clamped-high",
+      status: "working",
+    });
+    expect(Date.now()).toBe(20_000);
+    expect(getTaskSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the 20000ms default when maxWaitMs is not a finite number", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    mockCallerAuth();
+    vi.spyOn(a2aClient.A2AClient.prototype, "send").mockResolvedValue({
+      id: "task-default",
+      status: { state: "working" },
+      history: [],
+      artifacts: [],
+    } as any);
+    const getTaskSpy = vi
+      .spyOn(a2aClient.A2AClient.prototype, "getTask")
+      .mockImplementation(() => new Promise(() => undefined));
+
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com" },
+    );
+    const resultPromise = tools.ask_app.run({
+      app: "mail",
+      message: "hello",
+      maxWaitMs: "not-a-number",
+    });
+
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    await expect(resultPromise).resolves.toMatchObject({
+      taskId: "task-default",
+      status: "working",
+    });
+    expect(Date.now()).toBe(20_000);
+    expect(getTaskSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a single transient 503 poll error and completes within the deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    mockCallerAuth();
+    vi.spyOn(a2aClient.A2AClient.prototype, "send").mockResolvedValue({
+      id: "task-transient",
+      status: { state: "working" },
+      history: [],
+      artifacts: [],
+    } as any);
+    const getTaskSpy = vi
+      .spyOn(a2aClient.A2AClient.prototype, "getTask")
+      .mockRejectedValueOnce(new Error("A2A request failed (503): retry"))
+      .mockResolvedValueOnce({
+        id: "task-transient",
+        status: {
+          state: "completed",
+          message: {
+            role: "agent",
+            parts: [{ type: "text", text: "The report is ready." }],
+          },
+        },
+        history: [],
+        artifacts: [],
+      } as any);
+
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com" },
+    );
+    const resultPromise = tools.ask_app.run({
+      app: "mail",
+      message: "hello",
+      maxWaitMs: 20_000,
+    });
+
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    await expect(resultPromise).resolves.toMatchObject({
+      taskId: "task-transient",
+      status: "completed",
+      response: "The report is ready.",
+      verification: "unverified",
+    });
+    expect(getTaskSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces a permanent 401 poll error immediately instead of waiting for the deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    mockCallerAuth();
+    vi.spyOn(a2aClient.A2AClient.prototype, "send").mockResolvedValue({
+      id: "task-401",
+      status: { state: "working" },
+      history: [],
+      artifacts: [],
+    } as any);
+    const getTaskSpy = vi
+      .spyOn(a2aClient.A2AClient.prototype, "getTask")
+      .mockRejectedValueOnce(
+        new Error("A2A request failed (401): Unauthorized"),
+      );
+
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com" },
+    );
+    const resultPromise = tools.ask_app.run({
+      app: "mail",
+      message: "hello",
+      maxWaitMs: 20_000,
+    });
+    const rejection = resultPromise.catch((err) => err);
+
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    await expect(rejection).resolves.toEqual(
+      expect.objectContaining({
+        message: expect.stringMatching(/401.*Unauthorized/i),
+      }),
+    );
+    expect(Date.now()).toBe(1_500);
+    expect(getTaskSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ask_app — in-process inline fallback when no app origin is derivable", () => {
+  it("returns a working payload within the bound, then completes via ask_app_status once the slow askAgent settles", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let resolveAgent: ((value: string) => void) | undefined;
+    const askAgent = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveAgent = resolve;
+        }),
+    );
+    const tools = getBuiltinCrossAppTools(baseConfig({ askAgent }));
+
+    const resultPromise = tools.ask_app.run({
+      message: "hello",
+      maxWaitMs: 1_000,
+    });
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    const result: any = await resultPromise;
+
+    expect(result.status).toBe("working");
+    expect(result.routedVia).toBe("local");
+    expect(typeof result.taskId).toBe("string");
+    expect(result.poll).toEqual({
+      tool: "ask_app_status",
+      arguments: { app: "mail", taskId: result.taskId },
+    });
+
+    resolveAgent?.("slow answer");
+    await vi.advanceTimersByTimeAsync(0);
+
+    const statusResult: any = await tools.ask_app_status.run({
+      taskId: result.taskId,
+    });
+    expect(statusResult).toMatchObject({
+      app: "mail",
+      routedVia: "local",
+      taskId: result.taskId,
+      status: "completed",
+      response: "slow answer",
+      verification: "unverified",
+    });
+  });
+});
 
 describe("list_apps — org-directory merge", () => {
   it("no directory env ⇒ fetchOrgApps()=[] and list_apps unchanged", async () => {
-    // No directory env configured: the real fetchOrgApps short-circuits to []
-    // so list_apps must report only the local/workspace app(s).
     const tools = getBuiltinCrossAppTools(baseConfig());
     const result: any = await tools.list_apps.run({});
     expect(Array.isArray(result.apps)).toBe(true);
@@ -532,7 +1264,6 @@ describe("list_apps — org-directory merge", () => {
         a2aUrl: "https://calendar.acme.com/_agent-native/a2a",
       },
       {
-        // Duplicate id of the current app — must be deduped out.
         id: "mail",
         name: "Mail",
         url: "https://mail.acme.com",
@@ -546,12 +1277,69 @@ describe("list_apps — org-directory merge", () => {
     expect(calendar).toBeDefined();
     expect(calendar.source).toBe("org-directory");
     expect(calendar.url).toBe("https://calendar.acme.com");
-    // Only one "mail" entry — the workspace one wins, the directory dup drops.
     expect(result.apps.filter((a: any) => a.id === "mail").length).toBe(1);
   });
 });
 
 describe("ask_app — org-directory routing", () => {
+  it("keeps remote durable tasks on A2A when a local client is available", async () => {
+    vi.spyOn(orgDirectory, "fetchOrgApps").mockResolvedValue([
+      {
+        id: "calendar",
+        name: "Calendar",
+        url: "https://calendar.acme.com",
+        a2aUrl: "https://calendar.acme.com/_agent-native/a2a",
+      },
+    ]);
+    const auth = vi
+      .spyOn(callerAuth, "resolveA2ACallerAuth")
+      .mockResolvedValue({
+        apiKey: "signed-org-jwt",
+        userEmail: "caller@acme.com",
+        orgId: "org-1",
+        metadata: {},
+      });
+    const task = {
+      id: "peer-task",
+      status: {
+        state: "working" as const,
+        timestamp: new Date().toISOString(),
+      },
+    };
+    const send = vi
+      .spyOn(a2aClient.A2AClient.prototype, "send")
+      .mockResolvedValue(task);
+    const getTask = vi
+      .spyOn(a2aClient.A2AClient.prototype, "getTask")
+      .mockResolvedValue(task);
+    const localAgentTaskClient = { send: vi.fn(), getTask: vi.fn() };
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ askAgent: async () => "unused" }),
+      { origin: "https://mail.example.com", localAgentTaskClient },
+    );
+    await runWithRequestContext(
+      { userEmail: "caller@acme.com", orgId: "org-1" },
+      async () => {
+        const submitted: any = await tools.ask_app.run({
+          app: "calendar",
+          message: "read only",
+          async: true,
+        });
+        expect(submitted).toMatchObject({
+          taskId: "peer-task",
+          routedVia: "a2a",
+        });
+        await tools.ask_app_status.run({ taskHandle: submitted.taskHandle });
+      },
+    );
+    expect(auth).toHaveBeenCalledWith({
+      audience: "https://calendar.acme.com",
+    });
+    expect(send).toHaveBeenCalledOnce();
+    expect(getTask).toHaveBeenCalledWith("peer-task");
+    expect(localAgentTaskClient.send).not.toHaveBeenCalled();
+    expect(localAgentTaskClient.getTask).not.toHaveBeenCalled();
+  });
   it("routes an org-directory-only app over A2A and reports it honestly", async () => {
     vi.spyOn(orgDirectory, "fetchOrgApps").mockResolvedValue([
       {
@@ -581,7 +1369,6 @@ describe("ask_app — org-directory routing", () => {
       message: "what's on my schedule?",
     });
 
-    // Routed over A2A against the directory's a2aUrl — not answered locally.
     expect(callAgentSpy).toHaveBeenCalledTimes(1);
     expect(callAgentSpy.mock.calls[0][0]).toBe(
       "https://calendar.acme.com/_agent-native/a2a",
@@ -591,30 +1378,150 @@ describe("ask_app — org-directory routing", () => {
       userEmail: "caller@acme.com",
       orgDomain: "acme.com",
       orgSecret: "org-secret",
+      requestOrigin: "https://calendar.acme.com",
     });
     expect(result.routedVia).toBe("a2a");
     expect(result.app).toBe("calendar");
     expect(result.response).toBe("calendar-says-hi");
+    expect(result.verification).toBe("unverified");
     expect(result.note).toBeUndefined();
   });
 
-  it("directory error ⇒ silent [] ⇒ falls back to honest local answer", async () => {
+  it("directory error ⇒ unknown target fails closed before the local agent", async () => {
     vi.spyOn(orgDirectory, "fetchOrgApps").mockResolvedValue([]);
     const callAgentSpy = vi.spyOn(a2aClient, "callAgent");
+    const askAgent = vi.fn(async () => "local-answer");
 
-    const tools = getBuiltinCrossAppTools(
-      baseConfig({ askAgent: async () => "local-answer" }),
-    );
-    const result: any = await tools.ask_app.run({
-      app: "calendar",
-      message: "hi",
-    });
+    const tools = getBuiltinCrossAppTools(baseConfig({ askAgent }));
+    await expect(
+      tools.ask_app.run({ app: "calendar", message: "hi" }),
+    ).rejects.toThrow(/No reachable ask_app route for app "calendar"/);
 
     expect(callAgentSpy).not.toHaveBeenCalled();
-    expect(result.routedVia).toBe("local");
-    expect(result.app).toBe("mail");
-    expect(typeof result.note).toBe("string");
-    expect(result.note).toContain("calendar");
-    expect(result.response).toBe("local-answer");
+    expect(askAgent).not.toHaveBeenCalled();
+  });
+
+  it("polls a durable org task from its signed handle after discovery disappears", async () => {
+    vi.spyOn(orgDirectory, "fetchOrgApps")
+      .mockResolvedValueOnce([
+        {
+          id: "content",
+          name: "Content",
+          url: "https://content.acme.com",
+          a2aUrl: "https://content.acme.com/_agent-native/a2a",
+        },
+      ])
+      .mockResolvedValue([]);
+    vi.spyOn(callerAuth, "resolveA2ACallerAuth").mockResolvedValue({
+      apiKey: "signed-org-jwt",
+      userEmail: "caller@acme.com",
+      orgId: "org-1",
+      orgDomain: "acme.com",
+      orgSecret: "org-secret",
+      metadata: {},
+    });
+    const sendSpy = vi
+      .spyOn(a2aClient.A2AClient.prototype, "send")
+      .mockResolvedValue({
+        id: "content-task-1",
+        status: { state: "working" },
+        history: [],
+        artifacts: [],
+      } as any);
+    const getTaskSpy = vi
+      .spyOn(a2aClient.A2AClient.prototype, "getTask")
+      .mockResolvedValue({
+        id: "content-task-1",
+        status: {
+          state: "completed",
+          message: {
+            role: "agent",
+            parts: [{ type: "text", text: "content answer" }],
+          },
+        },
+        history: [],
+        artifacts: [],
+      } as any);
+    const tools = getBuiltinCrossAppTools(
+      baseConfig({ askAgent: async () => "local-answer" }),
+      { origin: "https://mail.acme.com" },
+    );
+
+    const submitted: any = await runWithRequestContext(
+      { userEmail: "caller@acme.com", orgId: "org-1" },
+      () =>
+        tools.ask_app.run({
+          app: "content",
+          message: "recover this document",
+          async: true,
+        }),
+    );
+    expect(submitted.taskHandle).toEqual(expect.any(String));
+    expect(submitted.poll).toMatchObject({
+      tool: "ask_app_status",
+      arguments: { taskHandle: submitted.taskHandle },
+    });
+
+    await expect(
+      runWithRequestContext(
+        { userEmail: "other@acme.com", orgId: "org-1" },
+        () => tools.ask_app_status.run({ taskHandle: submitted.taskHandle }),
+      ),
+    ).rejects.toThrow(/^Invalid or expired ask_app task handle\.$/);
+    await expect(
+      runWithRequestContext(
+        { userEmail: "caller@acme.com", orgId: "org-2" },
+        () => tools.ask_app_status.run({ taskHandle: submitted.taskHandle }),
+      ),
+    ).rejects.toThrow(/^Invalid or expired ask_app task handle\.$/);
+    const otherDeployment = getBuiltinCrossAppTools(
+      baseConfig({ appId: "mail", askAgent: async () => "unused" }),
+      { origin: "https://mail-preview.acme.com" },
+    );
+    await expect(
+      runWithRequestContext(
+        { userEmail: "caller@acme.com", orgId: "org-1" },
+        () =>
+          otherDeployment.ask_app_status.run({
+            taskHandle: submitted.taskHandle,
+          }),
+      ),
+    ).rejects.toThrow(/^Invalid or expired ask_app task handle\.$/);
+    const otherConnector = getBuiltinCrossAppTools(
+      baseConfig({ appId: "calendar", askAgent: async () => "unused" }),
+      { origin: "https://calendar.acme.com" },
+    );
+    await expect(
+      runWithRequestContext(
+        { userEmail: "caller@acme.com", orgId: "org-1" },
+        () =>
+          otherConnector.ask_app_status.run({
+            taskHandle: submitted.taskHandle,
+          }),
+      ),
+    ).rejects.toThrow(/^Invalid or expired ask_app task handle\.$/);
+    expect(getTaskSpy).not.toHaveBeenCalled();
+
+    const completed: any = await runWithRequestContext(
+      { userEmail: "caller@acme.com", orgId: "org-1" },
+      () => tools.ask_app_status.run({ taskHandle: submitted.taskHandle }),
+    );
+
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(getTaskSpy).toHaveBeenCalledWith("content-task-1");
+    expect(completed).toMatchObject({
+      app: "content",
+      routedVia: "a2a",
+      taskId: "content-task-1",
+      status: "completed",
+      response: "content answer",
+      verification: "unverified",
+    });
+    await runWithRequestContext(
+      { userEmail: "caller@acme.com", orgId: "org-1" },
+      () => tools.ask_app_status.run({ taskHandle: submitted.taskHandle }),
+    );
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(getTaskSpy).toHaveBeenCalledTimes(2);
   });
 });

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -59,7 +60,6 @@ describe("isFirstPartyPlanHost", () => {
   it("rejects custom, look-alike, and invalid hosts", () => {
     expect(isFirstPartyPlanHost("https://my-app.ngrok-free.dev")).toBe(false);
     expect(isFirstPartyPlanHost("http://localhost:8100")).toBe(false);
-    // Look-alike domain must not match the suffix check.
     expect(isFirstPartyPlanHost("https://evil-agent-native.com")).toBe(false);
     expect(isFirstPartyPlanHost("not-a-url")).toBe(false);
   });

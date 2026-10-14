@@ -1,11 +1,16 @@
 import type { ActionMcpAppResourceConfig } from "../action.js";
 import { MCP_APP_CHAT_BRIDGE_QUERY_PARAM } from "../shared/embed-auth.js";
+import {
+  MCP_APP_HOST_FILL_ATTRIBUTE,
+  MCP_APP_PANE_FILL_MAX_HEIGHT,
+} from "../shared/mcp-app-display.js";
 
 const MCP_APP_IMPORT =
-  "https://esm.sh/@modelcontextprotocol/ext-apps@1.7.2/app-with-deps";
+  "https://esm.sh/@modelcontextprotocol/ext-apps@1.7.5/app-with-deps";
 
 export const MCP_APP_REQUEST_ORIGIN_CSP_SOURCE = "$requestOrigin";
 const MCP_APP_WRAPPER_CHROME_HEIGHT = 44;
+const MCP_APP_INLINE_LAUNCHER_HEIGHT = 56;
 export const DEFAULT_MCP_APP_SHELL_HEIGHT = 560;
 export const DEFAULT_MCP_APP_VIEWPORT_HEIGHT =
   DEFAULT_MCP_APP_SHELL_HEIGHT - MCP_APP_WRAPPER_CHROME_HEIGHT;
@@ -36,7 +41,7 @@ export function embedApp(
   options: EmbedAppOptions = {},
 ): ActionMcpAppResourceConfig {
   const title = options.title ?? "Open app";
-  const iframeTitle = options.iframeTitle ?? "Agent Native app";
+  const iframeTitle = options.iframeTitle ?? "Agent-Native app";
   const openLabel = options.openLabel ?? "Open in app";
   const startToolName = options.startToolName ?? "create_embed_session";
   const embedByDefault = options.embedByDefault !== false;
@@ -53,7 +58,10 @@ export function embedApp(
   return {
     title,
     ...(options.description ? { description: options.description } : {}),
-    html: () => `<!doctype html>
+    html: (ctx) => {
+      const remoteBridgeFallbackEnabled = ctx.catalogMode !== "directory";
+      const fillsPane = ctx.catalogMode === "directory";
+      return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -67,22 +75,37 @@ export function embedApp(
     .title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 700; color: color-mix(in srgb, CanvasText 72%, Canvas); }
     .actions { display: flex; align-items: center; gap: 6px; }
     button { min-height: 28px; border: 1px solid color-mix(in srgb, CanvasText 14%, Canvas); border-radius: 7px; background: Canvas; color: CanvasText; cursor: pointer; font: inherit; font-size: 12px; font-weight: 700; padding: 0 9px; }
+    button.primary { min-height: 32px; padding: 0 14px; background: CanvasText; color: Canvas; border-color: CanvasText; }
+    button.primary:hover:not(:disabled) { background: color-mix(in srgb, CanvasText 86%, Canvas); }
     button:disabled { opacity: .55; cursor: default; }
     .stage { position: relative; min-height: var(--agent-native-viewport-height); }
     iframe { display: block; width: 100%; height: var(--agent-native-viewport-height); border: 0; background: Canvas; }
     .message { display: grid; place-items: center; min-height: var(--agent-native-viewport-height); padding: 18px; color: color-mix(in srgb, CanvasText 62%, Canvas); font-size: 13px; line-height: 1.45; text-align: center; }
     .fallback { display: grid; align-content: center; justify-items: center; gap: 12px; min-height: var(--agent-native-viewport-height); padding: 24px; background: Canvas; color: CanvasText; text-align: center; }
+    .fallback-overlay { position: absolute; inset: 0; z-index: 2; display: grid; align-items: start; justify-items: end; padding: 12px; pointer-events: none; }
+    .fallback-overlay .fallback { width: min(100%, 560px); min-height: 0; border: 1px solid color-mix(in srgb, CanvasText 18%, Canvas); border-radius: 9px; background: color-mix(in srgb, Canvas 96%, transparent); box-shadow: 0 8px 24px color-mix(in srgb, CanvasText 16%, transparent); pointer-events: auto; }
     .fallback-title { max-width: 440px; font-size: 14px; font-weight: 700; }
     .fallback-copy { max-width: 520px; color: color-mix(in srgb, CanvasText 64%, Canvas); font-size: 13px; line-height: 1.45; }
     .fallback-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px; }
     .fallback-url { max-width: min(560px, 100%); overflow-wrap: anywhere; color: color-mix(in srgb, CanvasText 76%, Canvas); font-size: 12px; }
+    body[data-catalog-mode="directory"][data-widget-mode="inline"] .shell { display: flex; align-items: center; height: ${MCP_APP_INLINE_LAUNCHER_HEIGHT}px; min-height: ${MCP_APP_INLINE_LAUNCHER_HEIGHT}px; max-height: ${MCP_APP_INLINE_LAUNCHER_HEIGHT}px; overflow: hidden; }
+    body[data-catalog-mode="directory"][data-widget-mode="inline"] .bar { width: 100%; height: ${MCP_APP_INLINE_LAUNCHER_HEIGHT}px; min-height: ${MCP_APP_INLINE_LAUNCHER_HEIGHT}px; padding: 0 12px; border: 0; }
+    body[data-catalog-mode="directory"][data-widget-mode="inline"] [data-display] { display: none !important; }
+    body[data-catalog-mode="directory"][data-widget-mode="inline"] .stage { display: none; }
+    html[${MCP_APP_HOST_FILL_ATTRIBUTE}], html[${MCP_APP_HOST_FILL_ATTRIBUTE}] body { height: 100%; }
+    html[${MCP_APP_HOST_FILL_ATTRIBUTE}] .shell { display: flex; flex-direction: column; gap: 0; height: 100vh; height: 100dvh; min-height: 0; }
+    html[${MCP_APP_HOST_FILL_ATTRIBUTE}] .bar { display: none; }
+    html[${MCP_APP_HOST_FILL_ATTRIBUTE}] .stage { flex: 1 1 auto; min-height: 0; }
+    html[${MCP_APP_HOST_FILL_ATTRIBUTE}] iframe, html[${MCP_APP_HOST_FILL_ATTRIBUTE}] .message, html[${MCP_APP_HOST_FILL_ATTRIBUTE}] .fallback { height: 100% !important; min-height: 0; }
   </style>
 </head>
 <body
   data-app-title="${attr(title)}"
   data-iframe-title="${attr(iframeTitle)}"
   data-open-label="${attr(openLabel)}"
-  data-start-tool="${attr(startToolName)}"
+  data-start-tool="${attr(ctx.startToolName ?? startToolName)}"
+  data-catalog-mode="${attr(ctx.catalogMode)}"
+  data-widget-mode="${fillsPane ? "inline" : "content"}"
   data-embed-default="${embedByDefault ? "1" : "0"}"
 >
   <main class="shell">
@@ -109,9 +132,13 @@ export function embedApp(
     const chatBridgeParam = ${JSON.stringify(MCP_APP_CHAT_BRIDGE_QUERY_PARAM)};
     const defaultIntrinsicHeight = ${height};
     const chromeHeight = ${MCP_APP_WRAPPER_CHROME_HEIGHT};
+    const hostFillAttribute = ${JSON.stringify(MCP_APP_HOST_FILL_ATTRIBUTE)};
+    const fillsPane = ${fillsPane};
+    const paneFillMaxHeight = ${MCP_APP_PANE_FILL_MAX_HEIGHT};
     const frameReadyMessageDelays = [0, 200, 500, 1500, 3000, 7000, 15000, 30000];
     const frameReadyTimeoutMs = 45000;
     const frameLoadTimeoutMs = 45000;
+    const maxEmbedSessionRefreshAttempts = 2;
     const defaultOpenAiBridgeWaitMs = 200;
     const chatGptOpenAiBridgeWaitMs = 5000;
     const openAiBridgePollMs = 50;
@@ -119,19 +146,33 @@ export function embedApp(
     const nativeBridgeRequestTimeoutMs = 30000;
     const wrapperRequestTimeoutMs = 5000;
     let app = null;
+    let appConnectPromise = null;
     let openAiBridge = null;
+    let lastOpenAiSyncSignature = null;
     let wrapperRequestId = 0;
+    let hostChatQueue = Promise.resolve();
     const wrapperRequests = new Map();
+    const hostChatRequests = new Map();
     let toolInput = {};
     let toolResultData = {};
+    let toolResponseMetadata = {};
     let openUrl = "";
     let openStartUrl = "";
+    // Start URLs are single use. The host replays a saved one on every re-sync,
+    // so remember which one the server has already refused.
+    let spentStartUrl = "";
+    let activeEmbedSessionTicket = "";
     let startedFor = "";
     let appFrame = null;
     let appFrameReady = false;
     let appFrameReadyTimer = null;
     let appFrameLoadTimer = null;
     let lastFrameSrc = "";
+    const appFrameDocumentState = { loadGeneration: 0 };
+    let embedSessionRefreshAttempts = 0;
+    let reportedContentHeight = 0;
+    let directoryWidgetOpenRequested = false;
+    let lastHostDisplayMode = "";
 
     function esc(value) {
       return String(value ?? "")
@@ -165,13 +206,122 @@ export function embedApp(
         finiteNumber(context.containerDimensions && context.containerDimensions.maxHeight);
     }
 
+    // Keep in sync with mcpAppHostFillsContainer (shared/mcp-app-display.ts);
+    // embed-app.spec.ts runs both over the same table.
+    function hostFillsContainer(context) {
+      const record = objectValue(context);
+      const dimensions = objectValue(record.containerDimensions);
+      const fixedHeight = dimensions.height;
+      if (typeof fixedHeight === "number" && Number.isFinite(fixedHeight) && fixedHeight > 0) {
+        return true;
+      }
+      return record.displayMode === "fullscreen" || record.displayMode === "pip";
+    }
+
+    function isCompactDirectoryWidget() {
+      return fillsPane && body.dataset.widgetMode === "inline";
+    }
+
+    function updateDirectoryWidgetLayout() {
+      if (!fillsPane) return false;
+      const context = hostState().context || {};
+      const displayMode = context.displayMode;
+      if (displayMode === "inline" && lastHostDisplayMode === "fullscreen") {
+        directoryWidgetOpenRequested = false;
+      }
+      if (typeof displayMode === "string") {
+        lastHostDisplayMode = displayMode;
+      }
+      const inline =
+        !directoryWidgetOpenRequested &&
+        (displayMode === undefined || displayMode === "inline");
+      body.dataset.widgetMode = inline ? "inline" : "pane";
+      return inline;
+    }
+
+    // A fullscreen view or fixed-height container sizes the frame itself, so
+    // the shell fills it with CSS and never reports a height. An inline card is
+    // the opposite: the host follows the height reported here, so filling the
+    // frame would feed its own size back into it. Never derive the height from
+    // the frame's innerHeight. A directory widget fills with CSS in both cases;
+    // only the host-sized one still reports (see paneFillHeight).
+    function applyHostFillMode() {
+      const context = hostState().context || {};
+      const hostFill = hostFillsContainer(context);
+      const compactInline = isCompactDirectoryWidget();
+      const root = document.documentElement;
+      if (compactInline) {
+        root.removeAttribute(hostFillAttribute);
+        if (appFrame) appFrame.style.height = "";
+      } else if (hostFill || fillsPane) {
+        root.setAttribute(hostFillAttribute, "1");
+        if (appFrame) appFrame.style.height = "";
+      } else {
+        root.removeAttribute(hostFillAttribute);
+      }
+      body.dataset.hostFill = hostFill ? "1" : "0";
+      body.dataset.paneFill = fillsPane && !hostFill && !compactInline ? "1" : "0";
+      body.dataset.hostDisplayMode = typeof context.displayMode === "string" ? context.displayMode : "";
+      return hostFill;
+    }
+
+    // Codex and ChatGPT side panes size the widget frame only from the height
+    // reported here, and their containerDimensions are a { maxHeight } hint
+    // (about 360 inline on Codex), not the pane's height. A content-sized
+    // report leaves the pane's own background showing under the frame, so a
+    // directory widget reports the most height the viewer's screen can show and
+    // lets the host clamp it to the pane. It is a constant of the viewer, never
+    // of the frame or the content, so it cannot feed back into itself.
+    function paneFillHeight(context) {
+      const screenHeight = finiteNumber(window.screen && window.screen.availHeight) || 0;
+      const hostMaxHeight = contextMaxHeight(context) || 0;
+      // The configured height is only a fallback: as a floor it would push the
+      // frame past a pane shorter than it.
+      const height = screenHeight
+        ? Math.max(screenHeight, hostMaxHeight)
+        : Math.max(defaultIntrinsicHeight, hostMaxHeight);
+      return Math.floor(Math.min(paneFillMaxHeight, height));
+    }
+
+    // The app document lifts its inline-card height clamp when the host owns
+    // the frame's height; in a pane the shell owns it, so tell the app so.
+    function hostStateForApp() {
+      const state = hostState();
+      if (
+        !fillsPane ||
+        isCompactDirectoryWidget() ||
+        hostFillsContainer(state.context)
+      ) {
+        return state;
+      }
+      const context = objectValue(state.context);
+      return {
+        ...state,
+        context: {
+          ...context,
+          containerDimensions: {
+            ...objectValue(context.containerDimensions),
+            height: paneFillHeight(context)
+          }
+        }
+      };
+    }
+
     function visibleIntrinsicHeight() {
       const context = hostState().context || {};
       const hostMaxHeight = contextMaxHeight(context);
+      // Size to the app-reported content height (the shell can't measure the
+      // cross-origin frame). Don't clamp to the host maxHeight — on Codex it's a
+      // small inline hint (~360) that clips the plan; applyIntrinsicHeight still
+      // caps at defaultIntrinsicHeight.
+      if (reportedContentHeight > 0) {
+        return Math.floor(reportedContentHeight + chromeHeight);
+      }
       if (hostMaxHeight) return Math.floor(hostMaxHeight);
-      const viewportHeight = finiteNumber(window.visualViewport && window.visualViewport.height) ||
-        finiteNumber(window.innerHeight);
-      return Math.floor(viewportHeight || defaultIntrinsicHeight);
+      // No host maxHeight and no content height yet: use the CONFIGURED height,
+      // never window.innerHeight. Echoing the iframe's own size pins us to the
+      // current frame height (circular) and locks the embed at the cap forever.
+      return Math.floor(defaultIntrinsicHeight);
     }
 
     function applyIntrinsicHeight(nextHeight) {
@@ -219,7 +369,11 @@ export function embedApp(
     function toolResultMeta(params) {
       if (!params || typeof params !== "object") return {};
       const direct = metadataRecord(params);
-      if (direct) return direct;
+      if (direct) {
+        const mcpToolResult = direct.mcp_tool_result;
+        const mcpMeta = metadataRecord(mcpToolResult);
+        return mcpMeta || direct;
+      }
       if (params.result && typeof params.result === "object") {
         return toolResultMeta(params.result);
       }
@@ -263,13 +417,13 @@ export function embedApp(
       const record = data && typeof data === "object" ? data : {};
       const structuredOpenLinkUrl = openLinkWebUrlFrom(record.openLink);
       return firstNonEmbedStartUrl([
+        metaUrl,
         record.embedTargetPath,
         record.deepLinkUrl,
         record.deepLink,
-        record.openUrl,
-        record.url,
         structuredOpenLinkUrl,
-        metaUrl
+        record.openUrl,
+        record.url
       ]);
     }
 
@@ -317,9 +471,38 @@ export function embedApp(
       };
     }
 
+    function appFrameTargetOrigin() {
+      if (body.dataset.catalogMode !== "directory") return "*";
+      const candidates = [openStartUrl, openUrl];
+      for (const candidate of candidates) {
+        if (!candidate) continue;
+        try {
+          const origin = new URL(candidate, window.location.href).origin;
+          if (origin && origin !== "null") return origin;
+        // coercion-ok: skip a malformed optional URL so the next host URL can be tried.
+        } catch {}
+      }
+      return "";
+    }
+
+    function isTrustedAppFrameOrigin(origin) {
+      return (
+        body.dataset.catalogMode !== "directory" ||
+        origin === "null" ||
+        (!!origin && origin === appFrameTargetOrigin())
+      );
+    }
+
     function sendToAppFrame(message) {
       if (!appFrame || !appFrame.contentWindow) return;
+      // ChatGPT sandboxes nested app frames to opaque origins. Only non-secret bridge data is sent here.
       try { appFrame.contentWindow.postMessage(message, "*"); } catch {}
+    }
+
+    function notifyOuterMcpAppReady() {
+      try {
+        window.parent.postMessage({ type: "agentNative.embeddedAppReady" }, "*");
+      } catch {}
     }
 
     function nextWrapperRequestId() {
@@ -368,22 +551,26 @@ export function embedApp(
       wrapperRequests.delete(id);
       clearTimeout(pending.timer);
       if (message.error) {
-        pending.resolve({ ok: false, error: message.error });
+        pending.resolve({
+          ok: false,
+          error: message.error,
+          code: message.error.code
+        });
       } else {
-        pending.resolve({ ok: true, result: message.result });
+        pending.resolve(message.result);
       }
       return true;
     }
 
     function sendHostContext() {
-      sendToAppFrame({ type: "agentNative.mcpHostContext", data: hostState() });
+      sendToAppFrame({ type: "agentNative.mcpHostContext", data: hostStateForApp() });
     }
 
     function sendFrameReadyMessages(frame) {
       const originPayload = { type: "agentNative.frameOrigin", origin: window.location.origin };
       frameReadyMessageDelays.forEach((delay) => {
         setTimeout(() => {
-          try { frame.contentWindow && frame.contentWindow.postMessage(originPayload, "*"); } catch {}
+          if (frame.contentWindow) frame.contentWindow.postMessage(originPayload, "*");
           sendHostContext();
         }, delay);
       });
@@ -403,7 +590,51 @@ export function embedApp(
       }
     }
 
-    function embedSessionArgsFor(value) {
+    function embedTicketFromStartUrl(value) {
+      if (typeof value !== "string" || !value) return null;
+      const url = new URL(value, window.location.href);
+      return url.pathname.endsWith("/_agent-native/embed/start")
+        ? url.searchParams.get("ticket") || null
+        : null;
+    }
+
+    function rememberActiveEmbedSessionTicket(value) {
+      const ticket = embedTicketFromStartUrl(value);
+      if (ticket) activeEmbedSessionTicket = ticket;
+    }
+
+    function embedSessionArgsFor(
+      value,
+      renewInPlace = false,
+      renewalSourceTicket = "",
+    ) {
+      if (body.dataset.catalogMode === "directory") {
+        const widgetSource = objectValue(
+          toolResponseMetadata["agent-native/widgetSource"],
+        );
+        const originalSourceTicket =
+          typeof widgetSource.sourceTicket === "string" &&
+          widgetSource.sourceTicket.trim()
+            ? widgetSource.sourceTicket
+            : embedTicketFromStartUrl(openStartUrl || value);
+        const sourceTicket = renewInPlace
+          ? typeof renewalSourceTicket === "string" &&
+            renewalSourceTicket.trim()
+            ? renewalSourceTicket
+            : null
+          : originalSourceTicket;
+        if (typeof sourceTicket !== "string" || !sourceTicket.trim()) {
+          throw new Error(
+            renewInPlace
+              ? "The active widget session ticket is unavailable."
+              : "The original widget session ticket is unavailable.",
+          );
+        }
+        return {
+          sourceTicket,
+          ...(renewInPlace ? { renewInPlace: true } : {}),
+        };
+      }
       const chrome = typeof toolInput.chrome === "string" ? toolInput.chrome : "full";
       return typeof value === "string" && value.startsWith("/")
         ? { path: value, chrome }
@@ -453,6 +684,49 @@ export function embedApp(
         embedTokenParam: "__an_embed_token",
         embedTargetHeader: "x-agent-native-embed-target"
       };
+    }
+
+    function externalOpenUrlForAppUrl(appUrl) {
+      if (openUrl) return openUrl;
+      try {
+        const url = new URL(appUrl.href);
+        url.searchParams.delete("embedded");
+        url.searchParams.delete("__an_embed_token");
+        url.searchParams.delete(chatBridgeParam);
+        return url.toString();
+      } catch (_err) {
+        return "";
+      }
+    }
+
+    function installExternalOpenControl(appUrl) {
+      const href = externalOpenUrlForAppUrl(appUrl);
+      if (!href || !document.body || document.getElementById("agent-native-external-open-control")) {
+        return;
+      }
+      const host = document.createElement("div");
+      host.id = "agent-native-external-open-control";
+      host.style.position = "fixed";
+      host.style.top = "10px";
+      host.style.right = "10px";
+      host.style.zIndex = "2147483647";
+      host.style.pointerEvents = "auto";
+      const root = host.attachShadow ? host.attachShadow({ mode: "open" }) : host;
+      root.innerHTML =
+        '<style>' +
+          ':host{all:initial;}' +
+          'button{box-sizing:border-box;min-height:30px;border:1px solid color-mix(in srgb, CanvasText 18%, Canvas);border-radius:7px;background:Canvas;color:CanvasText;box-shadow:0 6px 22px color-mix(in srgb, CanvasText 14%, transparent);cursor:pointer;font:700 12px ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:0 10px;white-space:nowrap;}' +
+          'button:hover{background:color-mix(in srgb, CanvasText 6%, Canvas);}' +
+        '</style>' +
+        '<button type="button">Open in new tab</button>';
+      const button = root.querySelector("button");
+      if (button) {
+        button.addEventListener("click", (event) => {
+          event.preventDefault();
+          void openHostLink({ url: href });
+        });
+      }
+      document.body.appendChild(host);
     }
 
     function installReactRefreshPreambleFallback() {
@@ -595,6 +869,21 @@ export function embedApp(
       );
     }
 
+    function importHeadChildrenWithBase(source, baseHref) {
+      const base = document.createElement("base");
+      base.href = baseHref;
+      const nodes = Array.from(source.childNodes).filter((node) => {
+        return !(
+          node.nodeType === 1 &&
+          String(node.nodeName || "").toLowerCase() === "base"
+        );
+      });
+      document.head.replaceChildren(
+        base,
+        ...nodes.map((node) => document.importNode(node, true))
+      );
+    }
+
     function isModuleScript(script) {
       return (script.getAttribute("type") || "").trim().toLowerCase() === "module";
     }
@@ -681,7 +970,7 @@ export function embedApp(
 
     function stripDevOnlyModuleImports(code) {
       return String(code).replace(
-        /\\bimport\\s+(?:[^"']+\\s+from\\s+)?["'][^"']*(?:virtual:react-router\\/inject-hmr-runtime|__x00__virtual:react-router\\/inject-hmr-runtime)[^"']*["']\\s*;?/g,
+        /\\bimport\\s+(?:[^"']+\\s+from\\s+)?["'][^"']*(?:virtual:react-router\\/(?:inject-)?hmr-runtime|__x00__virtual:react-router\\/(?:inject-)?hmr-runtime)[^"']*["']\\s*;?/g,
         ""
       );
     }
@@ -790,11 +1079,9 @@ export function embedApp(
       );
       const scripts = Array.from(parsed.querySelectorAll("script"));
       copyDocumentElementAttributes(parsed.documentElement);
-      importChildren(parsed.head, document.head);
-      const base = document.createElement("base");
-      base.href = config.baseHref;
-      document.head.prepend(base);
+      importHeadChildrenWithBase(parsed.head, config.baseHref);
       importChildren(parsed.body, document.body);
+      installExternalOpenControl(appUrl);
       for (const script of scripts) {
         if (isRunnableClassicScript(script)) runClassicScript(script);
       }
@@ -838,6 +1125,7 @@ export function embedApp(
     }
 
     async function transplantAppDocument(src) {
+      rememberActiveEmbedSessionTicket(src);
       clearFrameReadyTimer();
       clearFrameLoadTimer();
       appFrame = null;
@@ -851,17 +1139,40 @@ export function embedApp(
       });
       if (!response.ok) {
         if (response.status === 401 && isEmbedStartUrl(src)) {
+          reportEmbedError(
+            "transplant-auth",
+            "Embedded app session expired (HTTP 401).",
+            "Opaque-origin sandbox could not authenticate the embed.",
+            401
+          );
           refreshExpiredEmbedSession();
           return;
         }
+        reportEmbedError(
+          "transplant-http",
+          "Embedded app returned HTTP " + response.status + ".",
+          undefined,
+          response.status
+        );
         throw new Error("Embedded app returned HTTP " + response.status + ".");
       }
       const html = await response.text();
-      const appUrl = source.url || new URL(response.url || src);
+      // Use the FINAL URL the fetch landed on after following redirects, NOT
+      // the pre-redirect embed-start location. The embed ticket's targetPath is
+      // /_agent-native/open?...&to=/plans/<id>, which 302-redirects to the real
+      // app route; we render that route's HTML. If we replaceState to the
+      // pre-redirect /_agent-native/open (a server-only framework route), the
+      // hydrated React Router has no matching client route and throws a 404
+      // ("No route matches URL /_agent-native/open"). response.url is the
+      // resolved app route (/plans/<id>) the router can actually match.
+      const appUrl = new URL(
+        response.url || (source.url ? source.url.href : src),
+      );
       try {
         window.history.replaceState(window.history.state, "", localPathFromUrl(appUrl, false));
       } catch {}
       await mountTransplantedHtml(html, appUrl);
+      embedSessionRefreshAttempts = 0;
       notifyHostHeightRepeatedly();
     }
 
@@ -920,16 +1231,45 @@ export function embedApp(
       const context = hostState().context || {};
       const nextMode = context.displayMode === "fullscreen" ? "inline" : "fullscreen";
       const supported = supportedDisplayMode(nextMode);
-      displayButton.hidden = !supported;
+      displayButton.hidden = !supported || (fillsPane && nextMode === "fullscreen");
       displayButton.disabled = !supported;
       displayButton.textContent = nextMode === "fullscreen" ? "Fullscreen" : "Inline";
       displayButton.onclick = () => {
         if (!supportedDisplayMode(nextMode)) return;
+        if (fillsPane && nextMode === "inline") {
+          directoryWidgetOpenRequested = false;
+          updateDirectoryWidgetLayout();
+          notifyHostHeight();
+        }
         void requestHostDisplayMode(nextMode).catch((err) => {
           console.warn("[agent-native] MCP host rejected display mode request", err);
         });
       };
     }
+
+    // A directory widget on a host that offers fullscreen asks for it once, on
+    // the first click into the app: never on load, which would take over the
+    // chat before the user touched the widget. The flag is not reset, so a host
+    // that refuses is not asked again.
+    let fullscreenRequested = false;
+    function requestFullscreenOnFirstInteraction() {
+      if (!fillsPane || fullscreenRequested) return;
+      const context = hostState().context || {};
+      if ((context.displayMode || "inline") !== "inline") return;
+      if (!supportedDisplayMode("fullscreen")) return;
+      fullscreenRequested = true;
+      void requestHostDisplayMode("fullscreen").catch((err) => {
+        console.warn("[agent-native] MCP host rejected display mode request", err);
+      });
+    }
+
+    // Focus moving into the cross-origin app frame is the only signal the
+    // shell gets that the user clicked in it.
+    window.addEventListener("blur", () => {
+      if (appFrame && document.activeElement === appFrame) {
+        requestFullscreenOnFirstInteraction();
+      }
+    });
 
     function setMessage(message) {
       stage.innerHTML = '<div class="message">' + esc(message) + '</div>';
@@ -954,19 +1294,116 @@ export function embedApp(
       }, frameReadyTimeoutMs);
     }
 
+    // Best-effort telemetry sink so inline-embed failures are visible in
+    // Sentry (handshake timeout, transplant fetch status/CORS, auth, CSP).
+    // The shell is a sandboxed opaque-origin iframe, so it POSTs to the app
+    // origin's CORS-open /_agent-native/mcp/embed-error route, derived from the
+    // known app URLs. Deduped per stage+message so a retry loop can't spam.
+    const reportedEmbedErrorKeys = new Set();
+    let embedErrorReportCount = 0;
+    function embedReportOrigin() {
+      for (const value of [openStartUrl, openUrl, lastFrameSrc]) {
+        if (typeof value === "string" && value) {
+          try { return new URL(value, window.location.href).origin; } catch {}
+        }
+      }
+      return "";
+    }
+    function reportEmbedError(stage, message, detail, status) {
+      try {
+        const key = String(stage) + "|" + String(message || "");
+        if (reportedEmbedErrorKeys.has(key) || embedErrorReportCount >= 8) return;
+        reportedEmbedErrorKeys.add(key);
+        embedErrorReportCount += 1;
+        const origin = embedReportOrigin();
+        if (!origin) return;
+        let renderMode = "";
+        try { renderMode = renderModeSource().mode || ""; } catch {}
+        const body = JSON.stringify({
+          stage: String(stage || ""),
+          message: String(message || "").slice(0, 500),
+          detail: detail ? String(detail).slice(0, 1200) : undefined,
+          url: openStartUrl || openUrl || lastFrameSrc || "",
+          status: typeof status === "number" ? status : undefined,
+          host: window.location.hostname || "",
+          renderMode: renderMode,
+          bridge: openAiBridge ? "openai" : app ? "native" : "none",
+          userAgent: navigator.userAgent || ""
+        });
+        fetch(origin + "/_agent-native/mcp/embed-error", {
+          method: "POST",
+          credentials: "omit",
+          keepalive: true,
+          headers: { "Content-Type": "application/json" },
+          body: body
+        }).catch(() => {});
+      } catch {}
+    }
+
+    function clearFallbackOverlay() {
+      stage.querySelector("[data-fallback-overlay]")?.remove();
+    }
+
+    function renderFallbackOverlay({ title, copyHtml, retryLabel, onRetry }) {
+      if (!appFrame || appFrame.parentElement !== stage) return false;
+      clearFallbackOverlay();
+      const overlay = document.createElement("div");
+      overlay.className = "fallback-overlay";
+      overlay.dataset.fallbackOverlay = "1";
+      overlay.innerHTML =
+        '<div class="fallback">' +
+          '<div class="fallback-title">' + esc(title) + '</div>' +
+          '<div class="fallback-copy">' + copyHtml + '</div>' +
+          '<div class="fallback-actions">' +
+            '<button type="button" class="primary" data-fallback-open>Open in new tab</button>' +
+            '<button type="button" data-fallback-retry>' + esc(retryLabel) + '</button>' +
+          '</div>' +
+          (openUrl ? '<a class="fallback-url" href="' + esc(openUrl) + '" target="_blank" rel="noreferrer">' + esc(openUrl) + '</a>' : '') +
+        '</div>';
+      stage.appendChild(overlay);
+
+      const fallbackOpen = overlay.querySelector("[data-fallback-open]");
+      const fallbackRetry = overlay.querySelector("[data-fallback-retry]");
+      if (fallbackOpen) {
+        fallbackOpen.disabled = !openUrl;
+        fallbackOpen.onclick = () => {
+          if (openUrl) void openFallbackExternal();
+        };
+      }
+      if (fallbackRetry) {
+        fallbackRetry.disabled = typeof onRetry !== "function";
+        fallbackRetry.onclick = () => {
+          if (typeof onRetry === "function") void onRetry();
+        };
+      }
+      return true;
+    }
+
     function renderFrameFallback() {
       clearFrameReadyTimer();
       clearFrameLoadTimer();
-      appFrame = null;
+      appFrameReady = false;
       const fallbackCopy = openUrl
         ? "This chat host did not allow the embedded app frame to load inline. You can still open the same app route through the host or use the URL below."
         : "This chat host did not allow the embedded app frame to load inline.";
+      reportEmbedError("frame-fallback", fallbackCopy);
+      if (renderFallbackOverlay({
+        title: "Open this app in its own tab",
+        copyHtml: esc(fallbackCopy),
+        retryLabel: "Try inline again",
+        onRetry: lastFrameSrc
+          ? () => renderFrame(lastFrameSrc)
+          : undefined
+      })) {
+        return;
+      }
+      appFrame = null;
       stage.innerHTML =
         '<div class="fallback">' +
           '<div class="fallback-title">Open this app in its own tab</div>' +
           '<div class="fallback-copy">' + esc(fallbackCopy) + '</div>' +
           '<div class="fallback-actions">' +
-            '<button type="button" data-fallback-open>Open app</button>' +
+            '<button type="button" class="primary" data-fallback-open>Open in new tab</button>' +
             '<button type="button" data-fallback-retry>Try inline again</button>' +
           '</div>' +
           (openUrl ? '<a class="fallback-url" href="' + esc(openUrl) + '" target="_blank" rel="noreferrer">' + esc(openUrl) + '</a>' : '') +
@@ -983,6 +1420,55 @@ export function embedApp(
         fallbackRetry.disabled = !lastFrameSrc;
         fallbackRetry.onclick = () => {
           if (lastFrameSrc) renderFrame(lastFrameSrc);
+        };
+      }
+    }
+
+    function renderAppLaunchError(message) {
+      clearFrameReadyTimer();
+      clearFrameLoadTimer();
+      appFrameReady = false;
+      const fallbackCopy = openUrl
+        ? "The inline MCP app could not load in this chat host. You can open the same app route in a new tab or retry the inline load."
+        : "The inline MCP app could not load in this chat host.";
+      reportEmbedError("app-launch-error", message || fallbackCopy, message);
+      const copyHtml = message
+        ? '<div>' + esc(message) + '</div><div>' + esc(fallbackCopy) + '</div>'
+        : esc(fallbackCopy);
+      if (renderFallbackOverlay({
+        title: "App did not load",
+        copyHtml,
+        retryLabel: "Retry",
+        onRetry: () => {
+          startedFor = "";
+          void launchEmbed();
+        }
+      })) {
+        return;
+      }
+      appFrame = null;
+      stage.innerHTML =
+        '<div class="fallback">' +
+          '<div class="fallback-title">App did not load</div>' +
+          '<div class="fallback-copy">' + copyHtml + '</div>' +
+          '<div class="fallback-actions">' +
+            '<button type="button" class="primary" data-fallback-open>Open in new tab</button>' +
+            '<button type="button" data-fallback-retry>Retry</button>' +
+          '</div>' +
+          (openUrl ? '<a class="fallback-url" href="' + esc(openUrl) + '" target="_blank" rel="noreferrer">' + esc(openUrl) + '</a>' : '') +
+        '</div>';
+      const fallbackOpen = stage.querySelector("[data-fallback-open]");
+      const fallbackRetry = stage.querySelector("[data-fallback-retry]");
+      if (fallbackOpen) {
+        fallbackOpen.disabled = !openUrl;
+        fallbackOpen.onclick = () => {
+          if (openUrl) void openHostLink({ url: openUrl });
+        };
+      }
+      if (fallbackRetry) {
+        fallbackRetry.onclick = () => {
+          startedFor = "";
+          void launchEmbed();
         };
       }
     }
@@ -1005,20 +1491,28 @@ export function embedApp(
     }
 
     function renderFrame(src) {
+      rememberActiveEmbedSessionTicket(src);
       clearFrameReadyTimer();
       clearFrameLoadTimer();
       const frame = document.createElement("iframe");
-      frame.title = body.dataset.iframeTitle || "Agent Native app";
+      frame.title = body.dataset.iframeTitle || "Agent-Native app";
       frame.src = src;
-      frame.allow = "clipboard-read; clipboard-write";
+      ${ctx.catalogMode === "directory" ? "" : 'frame.allow = "clipboard-read; clipboard-write";'}
       appFrame = frame;
       appFrameReady = false;
       lastFrameSrc = src;
+      appFrameDocumentState.loadGeneration += 1;
       frame.addEventListener("load", () => {
         if (appFrame !== frame) return;
+        appFrameDocumentState.loadGeneration += 1;
         clearFrameLoadTimer();
+        notifyOuterMcpAppReady();
         sendFrameReadyMessages(frame);
         startFrameReadyTimer(frame);
+      });
+      frame.addEventListener("error", () => {
+        if (appFrame !== frame) return;
+        renderFrameFallback();
       });
       stage.replaceChildren(frame);
       notifyHostHeight();
@@ -1035,11 +1529,95 @@ export function embedApp(
         renderFrameFallback();
         return;
       }
-      openStartUrl = "";
+      if (embedSessionRefreshAttempts >= maxEmbedSessionRefreshAttempts) {
+        renderAppLaunchError(
+          "Embedded app session expired. Reopen the app to mint a fresh session."
+        );
+        return;
+      }
+      embedSessionRefreshAttempts += 1;
+      spentStartUrl = openStartUrl;
       startedFor = "";
       lastFrameSrc = "";
       setMessage("Refreshing app session");
       void launchEmbed();
+    }
+
+    async function renewExpiredEmbedSession(
+      requestId,
+      frame,
+      frameLoadGeneration,
+    ) {
+      const directoryMode = body.dataset.catalogMode === "directory";
+      const canDeliverRenewal = () =>
+        frame === appFrame &&
+        (!directoryMode ||
+          appFrameDocumentState.loadGeneration === frameLoadGeneration);
+      const sendRenewalResult = (message) => {
+        if (!canDeliverRenewal()) return;
+        sendToAppFrame(message);
+      };
+      if (!requestId || !frame || !canDeliverRenewal()) return;
+      if (!openUrl) {
+        sendRenewalResult({
+          type: "agentNative.embedSessionRenewed",
+          data: { requestId, ok: false },
+        });
+        return;
+      }
+      if (embedSessionRefreshAttempts >= maxEmbedSessionRefreshAttempts) {
+        sendRenewalResult({
+          type: "agentNative.embedSessionRenewed",
+          data: { requestId, ok: false },
+        });
+        return;
+      }
+
+      embedSessionRefreshAttempts += 1;
+      try {
+        const result = await callEmbedSessionTool(
+          embedSessionArgsFor(
+            directoryMode ? openStartUrl || openUrl : openUrl,
+            directoryMode,
+            activeEmbedSessionTicket,
+          ),
+        );
+        const data = parseToolResult(result);
+        if (directoryMode) {
+          if (data.renewed !== true) {
+            sendRenewalResult({
+              type: "agentNative.embedSessionRenewed",
+              data: { requestId, ok: false },
+            });
+            return;
+          }
+          sendRenewalResult({
+            type: "agentNative.embedSessionRenewed",
+            data: { requestId, ok: true },
+          });
+          return;
+        }
+        if (typeof data.startUrl !== "string" || !data.startUrl) {
+          sendRenewalResult({
+            type: "agentNative.embedSessionRenewed",
+            data: { requestId, ok: false },
+          });
+          return;
+        }
+        sendRenewalResult({
+          type: "agentNative.embedSessionRenewed",
+          data: {
+            requestId,
+            ok: true,
+            startUrl: withChatBridgeParam(data.startUrl),
+          },
+        });
+      } catch {
+        sendRenewalResult({
+          type: "agentNative.embedSessionRenewed",
+          data: { requestId, ok: false },
+        });
+      }
     }
 
     function shouldSelfNavigateToApp() {
@@ -1054,9 +1632,14 @@ export function embedApp(
     function shouldTransplantAppDocument() {
       const render = renderModeSource();
       const mode = render.mode;
+      if (mode === "iframe" || mode === "nested" || render.frame === "iframe" || render.nested) {
+        return false;
+      }
+      // ChatGPT is excluded so it uses the controlled nested frame instead:
+      // transplant would cross-origin import() app chunks in its opaque-origin
+      // sandbox, which it blocks (blank embed). embedMode "transplant" still forces it.
       return (
         isClaudeMcpContentHost() ||
-        isChatGptSandboxHost() ||
         mode === "transplant" ||
         render.frame === "transplant"
       );
@@ -1074,17 +1657,37 @@ export function embedApp(
       try {
         const host = window.location.hostname || "";
         const appParam = new URL(window.location.href).searchParams.get("app");
-        return /^[^.]+\\.web-sandbox\\.oaiusercontent\\.com$/i.test(host) || appParam === "chatgpt";
+        return /^(?:[^.]+\\.)?web-sandbox\\.oaiusercontent\\.com$/i.test(host) || appParam === "chatgpt";
       } catch {
         return false;
       }
     }
 
     function shouldRenderControlledAppFrame() {
-      return !!openAiBridge || isChatGptSandboxHost();
+      return !!openAiBridge || !!app || isChatGptSandboxHost();
+    }
+
+    function shouldDirectRenderKnownAppRoute(src) {
+      return !!app && !openAiBridge && !isEmbedStartUrl(src) && !shouldTransplantAppDocument();
+    }
+
+    function isCurrentFrameUrl(src) {
+      try {
+        return new URL(src, window.location.href).href === window.location.href;
+      } catch {
+        return false;
+      }
     }
 
     function navigateToAppFrame(src) {
+      rememberActiveEmbedSessionTicket(src);
+      if (isCurrentFrameUrl(src)) {
+        clearFrameReadyTimer();
+        clearFrameLoadTimer();
+        setMessage("App opened");
+        notifyHostHeightRepeatedly();
+        return;
+      }
       clearFrameReadyTimer();
       clearFrameLoadTimer();
       appFrame = null;
@@ -1098,22 +1701,58 @@ export function embedApp(
       }
     }
 
+    async function ensureHostAppConnected() {
+      if (!app || typeof app.connect !== "function") return;
+      if (!appConnectPromise) {
+        appConnectPromise = Promise.resolve(app.connect())
+          .then(async (value) => {
+            // Let the host process ui/notifications/initialized before follow-up calls.
+            await new Promise((resolve) => window.setTimeout(resolve, 0));
+            await new Promise((resolve) => window.setTimeout(resolve, 0));
+            return value;
+          })
+          .catch((err) => {
+            appConnectPromise = null;
+            throw err;
+          });
+      }
+      await appConnectPromise;
+    }
+
     async function updateHostModelContext(data) {
       const params = {};
       if (Array.isArray(data && data.content)) params.content = data.content;
       if (data && data.structuredContent && typeof data.structuredContent === "object") {
         params.structuredContent = data.structuredContent;
       }
-      if (openAiBridge && typeof openAiBridge.setWidgetState === "function") {
-        openAiBridge.setWidgetState({
-          ...objectValue(openAiBridge.widgetState),
-          agentNativeModelContext: params
-        });
-        return { ok: true };
+      if (app && typeof app.updateModelContext === "function") {
+        await ensureHostAppConnected();
+        return await app.updateModelContext(params);
       }
-      if (!app || typeof app.updateModelContext !== "function") return { ok: false };
-      await app.updateModelContext(params);
-      return { ok: true };
+      return await wrapperRpcRequest("ui/update-model-context", params);
+    }
+
+    function openAiFollowUpPrompt(chat) {
+      const message = typeof chat.message === "string" ? chat.message.trim() : "";
+      const context = typeof chat.context === "string" ? chat.context.trim() : "";
+      if (context || chat.structuredContent !== undefined) return null;
+
+      const content = Array.isArray(chat.content) ? chat.content : [];
+      const extraText = [];
+      for (const part of content) {
+        if (!part || part.type !== "text" || typeof part.text !== "string") return null;
+        const audience = objectValue(part.annotations).audience;
+        if (
+          Array.isArray(audience) &&
+          (!audience.includes("assistant") || !audience.includes("user"))
+        ) return null;
+        const text = part.text.trim();
+        if (text && text !== message && !extraText.includes(text)) extraText.push(text);
+      }
+
+      const sections = [message];
+      if (extraText.length) sections.push("Additional text:\\n" + extraText.join("\\n\\n"));
+      return sections.filter(Boolean).join("\\n\\n");
     }
 
     async function openHostLink(data) {
@@ -1130,7 +1769,14 @@ export function embedApp(
     }
 
     function notifyHostHeight() {
-      const height = applyIntrinsicHeight(visibleIntrinsicHeight());
+      updateDirectoryWidgetLayout();
+      const compactInline = isCompactDirectoryWidget();
+      if (applyHostFillMode() && !compactInline) return;
+      const height = compactInline
+        ? ${MCP_APP_INLINE_LAUNCHER_HEIGHT}
+        : fillsPane
+        ? paneFillHeight(hostState().context || {})
+        : applyIntrinsicHeight(visibleIntrinsicHeight());
       if (!openAiBridge || typeof openAiBridge.notifyIntrinsicHeight !== "function") {
         if (app && typeof app.sendSizeChanged === "function") {
           try {
@@ -1154,7 +1800,7 @@ export function embedApp(
         .then((result) => {
           sendToAppFrame({
             type: "agentNative.mcpHost.response",
-            data: { requestId, ok: true, result }
+            data: { requestId, ok: !(result && (result.ok === false || result.isError === true)), result }
           });
         })
         .catch((err) => {
@@ -1169,7 +1815,45 @@ export function embedApp(
         });
     }
 
-    async function sendHostChat(chat) {
+    function acknowledgeHostChatNotSubmitted(requestId, request) {
+      if (!requestId || (request && request.acknowledgedNotSubmitted)) return;
+      if (request) request.acknowledgedNotSubmitted = true;
+      respondToWrapperRequest(requestId, { ok: false, notSubmitted: true });
+    }
+
+    function cancelHostChat(requestId) {
+      if (typeof requestId !== "string" || !requestId) return;
+      const request = hostChatRequests.get(requestId);
+      if (!request) return;
+      request.cancelled = true;
+      if (request.state === "queued") {
+        acknowledgeHostChatNotSubmitted(requestId, request);
+      }
+    }
+
+    function sendHostChat(chat) {
+      const requestId = typeof (chat && chat.requestId) === "string" ? chat.requestId : "";
+      const request = { state: "queued", cancelled: false };
+      if (requestId) hostChatRequests.set(requestId, request);
+      const result = hostChatQueue.then(() => {
+        if (request.cancelled) {
+          acknowledgeHostChatNotSubmitted(requestId, request);
+          return;
+        }
+        request.state = "context";
+        return sendHostChatNow(chat, request);
+      });
+      hostChatQueue = result.then(() => undefined, () => undefined);
+      const finish = () => {
+        if (requestId && hostChatRequests.get(requestId) === request) {
+          hostChatRequests.delete(requestId);
+        }
+      };
+      void result.then(finish, finish);
+      return result;
+    }
+
+    async function sendHostChatNow(chat, hostChatRequest) {
       const requestId = typeof (chat && chat.requestId) === "string" ? chat.requestId : "";
       if (!chat || chat.submit === false) return;
       const message = typeof chat.message === "string" ? chat.message : "";
@@ -1178,63 +1862,132 @@ export function embedApp(
       const content = Array.isArray(chat.content) && chat.content.length
         ? chat.content
         : [{ type: "text", text: message }];
+      const requestMode = chat.requestMode === "act" || chat.requestMode === "plan"
+        ? chat.requestMode
+        : chat.mode === "act" || chat.mode === "plan"
+          ? chat.mode
+          : null;
+      const requestModePayload =
+        requestMode
+          ? { mode: requestMode, requestMode }
+          : {};
       const structuredContent =
         chat && chat.structuredContent !== undefined
           ? chat.structuredContent
           : undefined;
+      let fallbackAttempted = false;
       try {
         const contextContent = context
-          ? [{ type: "text", text: context }, ...content.filter((part) => part && part.type !== "text")]
+          ? [{ type: "text", text: context, annotations: { audience: ["assistant"] } }, ...content.filter((part) => part && part.type !== "text")]
           : content.filter((part) => part && part.type !== "text");
         const modelContext = {
-          content: contextContent,
-          ...(structuredContent !== undefined ? { structuredContent } : {})
+          content: contextContent.map((part) => ({
+            ...part,
+            annotations: { ...(objectValue(part.annotations)), audience: ["assistant"] }
+          })),
+          ...(structuredContent !== undefined ? { structuredContent } : {}),
+          ...requestModePayload
         };
-        if (openAiBridge && typeof openAiBridge.setWidgetState === "function") {
-          openAiBridge.setWidgetState({
-            ...objectValue(openAiBridge.widgetState),
-            agentNativeChatContext: context || null,
-            agentNativeModelContext: modelContext
-          });
-        } else if (app && typeof app.updateModelContext === "function") {
-          await app.updateModelContext(modelContext);
+        const contextResult = await updateHostModelContext(modelContext);
+        if (contextResult && (contextResult.isError === true || contextResult.ok === false)) {
+          throw new Error("MCP host rejected model context update.");
         }
       } catch (err) {
-        console.warn("[agent-native] MCP host rejected model context update", err);
-      }
-      try {
-        if (openAiBridge && typeof openAiBridge.sendFollowUpMessage === "function") {
-          await openAiBridge.sendFollowUpMessage({
-            prompt: message,
-            scrollToBottom: true
-          });
-          respondToWrapperRequest(requestId, { ok: true });
+        if (hostChatRequest && hostChatRequest.cancelled) {
+          acknowledgeHostChatNotSubmitted(requestId, hostChatRequest);
           return;
         }
+        console.warn("[agent-native] MCP host rejected model context update", err);
+        respondToWrapperRequest(requestId, {
+          ok: false,
+          notSubmitted: true,
+          error: err && err.message ? err.message : String(err)
+        });
+        return;
+      }
+      if (hostChatRequest && hostChatRequest.cancelled) {
+        acknowledgeHostChatNotSubmitted(requestId, hostChatRequest);
+        return;
+      }
+      try {
         let result = null;
+        if (app && typeof app.sendMessage === "function") {
+          await ensureHostAppConnected();
+        }
+        if (hostChatRequest && hostChatRequest.cancelled) {
+          acknowledgeHostChatNotSubmitted(requestId, hostChatRequest);
+          return;
+        }
+        if (hostChatRequest) hostChatRequest.state = "sending";
         if (app && typeof app.sendMessage === "function") {
           result = await app.sendMessage({
             role: "user",
-            content
+            content,
+            ...requestModePayload
           });
         } else {
           result = await wrapperRpcRequest("ui/message", {
             role: "user",
-            content
+            content,
+            ...requestModePayload
           });
         }
-        if (result && result.isError) {
-          console.warn("[agent-native] MCP host rejected chat message", result);
-          respondToWrapperRequest(requestId, { ok: false, result });
-          return;
-        }
-        if (result && result.ok === false) {
-          console.warn("[agent-native] MCP host chat bridge failed", result);
-          respondToWrapperRequest(requestId, { ok: false, result });
-          return;
+        if ((result && result.isError) || (result && result.ok === false)) {
+          const error = new Error("MCP host rejected the chat message.");
+          if (result.code !== undefined) error.code = result.code;
+          throw error;
         }
         respondToWrapperRequest(requestId, { ok: true, result });
       } catch (err) {
+        const methodNotFound = err && Number(err.code) === -32601;
+        if (hostChatRequest && hostChatRequest.cancelled) {
+          if (methodNotFound || hostChatRequest.state !== "sending") {
+            acknowledgeHostChatNotSubmitted(requestId, hostChatRequest);
+          }
+          return;
+        }
+        if (methodNotFound) {
+          const fallbackPrompt = openAiFollowUpPrompt(chat);
+          if (
+            openAiBridge &&
+            typeof openAiBridge.sendFollowUpMessage === "function" &&
+            fallbackPrompt
+          ) {
+            fallbackAttempted = true;
+            try {
+              await openAiBridge.sendFollowUpMessage({
+                prompt: fallbackPrompt,
+                scrollToBottom: true,
+                ...requestModePayload
+              });
+              respondToWrapperRequest(requestId, { ok: true });
+              return;
+            } catch (fallbackError) {
+              err = fallbackError;
+            }
+          } else {
+            console.warn("[agent-native] MCP Apps host cannot relay chat", err);
+            respondToWrapperRequest(requestId, {
+              ok: false,
+              notSubmitted: true,
+              error: err && err.message ? err.message : String(err)
+            });
+            return;
+          }
+        }
+        if (
+          hostChatRequest &&
+          hostChatRequest.state !== "sending" &&
+          !fallbackAttempted
+        ) {
+          console.warn("[agent-native] MCP Apps host connection failed", err);
+          respondToWrapperRequest(requestId, {
+            ok: false,
+            notSubmitted: true,
+            error: err && err.message ? err.message : String(err)
+          });
+          return;
+        }
         console.warn("[agent-native] MCP host chat bridge failed", err);
         respondToWrapperRequest(requestId, { ok: false, error: err && err.message ? err.message : String(err) });
       }
@@ -1248,32 +2001,73 @@ export function embedApp(
     });
 
     window.addEventListener("message", (event) => {
-      if (!appFrame || event.source !== appFrame.contentWindow) return;
-      if (!event.data) return;
+      const message = event.data;
+      const expiredSessionMessage =
+        message?.type === "agentNative.embedSessionExpired" &&
+        typeof message.embedStartUrl === "string" &&
+        event.source === null &&
+        (message.embedStartUrl === appFrame?.src ||
+          message.embedStartUrl === lastFrameSrc);
+      if (!isTrustedAppFrameOrigin(event.origin)) return;
+      if (
+        !appFrame ||
+        (!expiredSessionMessage && event.source !== appFrame.contentWindow)
+      )
+        return;
+      if (!message) return;
       const data = event.data.data || {};
-      if (event.data.type === "agentNative.embeddedAppReady") {
+      if (message.type === "agentNative.embeddedAppReady") {
         appFrameReady = true;
+        clearFallbackOverlay();
+        embedSessionRefreshAttempts = 0;
         clearFrameLoadTimer();
         clearFrameReadyTimer();
+        notifyOuterMcpAppReady();
         return;
       }
-      if (event.data.type === "agentNative.embedSessionExpired") {
-        refreshExpiredEmbedSession();
+      if (message.type === "agentNative.contentHeight") {
+        const next = finiteNumber(data && data.height);
+        if (next && Math.abs(next - reportedContentHeight) >= 1) {
+          reportedContentHeight = next;
+          notifyHostHeightSoon();
+        }
         return;
       }
-      if (event.data.type === "agentNative.submitChat") {
+      if (message.type === "agentNative.embedSessionExpired") {
+        if (!expiredSessionMessage && typeof data.requestId === "string") {
+          void renewExpiredEmbedSession(
+            data.requestId,
+            appFrame,
+            appFrameDocumentState.loadGeneration,
+          );
+        } else {
+          // The server's expiry page names no request: it answered in place of
+          // the app, so there is no mounted session to renew in place.
+          refreshExpiredEmbedSession();
+        }
+        return;
+      }
+      if (message.type === "agentNative.embedSessionRenewalApplied") {
+        embedSessionRefreshAttempts = 0;
+        return;
+      }
+      if (message.type === "agentNative.submitChat") {
         void sendHostChat(data);
         return;
       }
-      if (event.data.type === "agentNative.mcpHost.updateModelContext") {
+      if (message.type === "agentNative.cancelChat") {
+        cancelHostChat(data.requestId);
+        return;
+      }
+      if (message.type === "agentNative.mcpHost.updateModelContext") {
         respondToAppFrame(data.requestId, updateHostModelContext(data));
         return;
       }
-      if (event.data.type === "agentNative.mcpHost.openLink") {
+      if (message.type === "agentNative.mcpHost.openLink") {
         respondToAppFrame(data.requestId, openHostLink(data));
         return;
       }
-      if (event.data.type === "agentNative.mcpHost.requestDisplayMode") {
+      if (message.type === "agentNative.mcpHost.requestDisplayMode") {
         respondToAppFrame(data.requestId, requestHostDisplayMode(data.mode));
       }
     });
@@ -1295,20 +2089,30 @@ export function embedApp(
     }
 
     async function launchEmbed() {
-      const launchUrl = openStartUrl || openUrl;
+      updateDirectoryWidgetLayout();
+      if (isCompactDirectoryWidget()) {
+        notifyHostHeight();
+        return;
+      }
+      let launchUrl = (openStartUrl !== spentStartUrl && openStartUrl) || openUrl;
       if (!launchUrl) {
-        setMessage("Open link was not available.");
+        renderAppLaunchError("Open link was not available.");
         return;
       }
       if (!wantsEmbed()) {
         setMessage("Ready to open.");
         return;
       }
-      if (startedFor === launchUrl) return;
-      startedFor = launchUrl;
-      setMessage("Loading app");
       try {
         const selfNavigate = shouldSelfNavigateToApp();
+        if (startedFor === launchUrl) return;
+        startedFor = launchUrl;
+        // Only show "Loading app" when no frame is mounted. set_globals
+        // re-launches constantly, so calling it every time would wipe the
+        // just-mounted iframe; renderFrame/transplant own the stage on (re)mount.
+        if (!appFrame) {
+          setMessage("Loading app");
+        }
         const embedUrl = withChatBridgeParam(launchUrl);
         if (selfNavigate && isEmbedStartUrl(embedUrl)) {
           if (shouldTransplantAppDocument()) {
@@ -1324,11 +2128,15 @@ export function embedApp(
           renderFrame(embedUrl);
           return;
         }
+        if (shouldDirectRenderKnownAppRoute(embedUrl)) {
+          renderFrame(embedUrl);
+          return;
+        }
         const result = await callEmbedSessionTool(embedSessionArgsFor(embedUrl));
         const data = parseToolResult(result);
         if (typeof data.startUrl !== "string" || !data.startUrl) {
           startedFor = "";
-          setMessage(data.error || "This app can be opened, but not embedded from this MCP server.");
+          renderAppLaunchError(data.error || "This app can be opened, but not embedded from this MCP server.");
           return;
         }
         const startUrl = withChatBridgeParam(data.startUrl);
@@ -1345,7 +2153,7 @@ export function embedApp(
         }
       } catch (err) {
         startedFor = "";
-        setMessage(err && err.message ? err.message : "Could not launch embedded app.");
+        renderAppLaunchError(err && err.message ? err.message : "Could not launch embedded app.");
       }
     }
 
@@ -1373,15 +2181,51 @@ export function embedApp(
     function updateOpenButton() {
       const buttonUrl = openUrl;
       openButton.disabled = !buttonUrl;
+      openButton.textContent = body.dataset.openLabel || "Open in app";
       openButton.onclick = () => {
-        if (buttonUrl) void openHostLink({ url: buttonUrl });
+        if (!buttonUrl) return;
+        if (fillsPane) {
+          void openDirectoryWidget();
+        } else {
+          void openHostLink({ url: buttonUrl });
+        }
       };
       updateHostOpenInAppUrl();
     }
 
+    async function openDirectoryWidget() {
+      directoryWidgetOpenRequested = true;
+      updateDirectoryWidgetLayout();
+      const displayMode = hostState().context?.displayMode;
+      if (displayMode !== "fullscreen") {
+        if (!supportedDisplayMode("fullscreen")) {
+          notifyHostHeight();
+          await launchEmbed();
+          return;
+        }
+        try {
+          const granted = await requestHostDisplayMode("fullscreen");
+          if (granted?.mode !== "fullscreen") {
+            notifyHostHeight();
+            await launchEmbed();
+            return;
+          }
+        } catch (err) {
+          console.warn("[agent-native] MCP host could not open the widget fullscreen", err);
+          notifyHostHeight();
+          await launchEmbed();
+          return;
+        }
+      }
+      updateDirectoryWidgetLayout();
+      notifyHostHeight();
+      await launchEmbed();
+    }
+
     function updateTitle(data) {
       const record = objectValue(data);
-      const label = record.label || record.app || record.view || body.dataset.appTitle || "App";
+      const openLink = objectValue(toolResponseMetadata["agent-native/openLink"]);
+      const label = record.label || openLink.label || record.app || record.view || body.dataset.appTitle || "App";
       titleEl.textContent = String(label);
     }
 
@@ -1394,6 +2238,9 @@ export function embedApp(
     function isChatGptHostHint() {
       try {
         if (new URLSearchParams(window.location.search).get("app") === "chatgpt") return true;
+      } catch (_err) {}
+      try {
+        if (/^(?:[^.]+\\.)?web-sandbox\\.oaiusercontent\\.com$/i.test(window.location.hostname || "")) return true;
       } catch (_err) {}
       try {
         return /chatgpt/i.test(String(navigator.userAgent || ""));
@@ -1422,11 +2269,40 @@ export function embedApp(
       openAiBridge = bridge;
       toolInput = objectValue(bridge.toolInput);
       const params = openAiToolResultParams(bridge);
+      toolResponseMetadata = toolResultMeta(params);
       const data = parseToolResult(params);
       toolResultData = objectValue(data);
       openUrl = openLinkFrom(params, data);
       openStartUrl = embedStartUrlFrom(params, data);
+      const openLinkLabel = objectValue(
+        toolResponseMetadata["agent-native/openLink"],
+      ).label;
+      // set_globals fires constantly, and this sync calls notifyHostHeight/
+      // sendHostContext which the host echoes back as another set_globals — an
+      // infinite storm. Only do the host round-trips + (re)launch when something
+      // we care about changed. Exclude maxHeight: the host mutates it every
+      // event, which would defeat the guard.
+      let signature;
+      try {
+        signature = JSON.stringify([
+          toolInput,
+          toolResponseMetadata["agent-native/widgetSource"],
+          openUrl,
+          openStartUrl,
+          openLinkLabel,
+          bridge.displayMode,
+          bridge.theme,
+          bridge.locale
+        ]);
+      } catch {
+        signature = null;
+      }
+      if (signature !== null && signature === lastOpenAiSyncSignature) {
+        return true;
+      }
+      lastOpenAiSyncSignature = signature;
       updateTitle(data);
+      updateDirectoryWidgetLayout();
       updateOpenButton();
       updateDisplayButton();
       notifyHostHeight();
@@ -1434,6 +2310,9 @@ export function embedApp(
       if (openUrl || openStartUrl) {
         void launchEmbed();
       } else if (!appFrame) {
+        // No open URL yet — a content-less result no longer reaches the host as
+        // a widget (build-server marks it isError), so this is the transient
+        // "waiting for the embed to resolve" state, not an empty box.
         setMessage("Waiting for app result");
       }
       return true;
@@ -1478,9 +2357,34 @@ export function embedApp(
 
     function createNativeMcpAppsBridge() {
       let rpcId = 0;
-      let connected = false;
+      let connectPromise = null;
       let hostContext = {};
+      let hostContextFields = {};
       const pendingRequests = new Map();
+
+      // ui/initialize answers { hostContext }; host-context-changed carries a
+      // partial context, so merge it instead of replacing what we know.
+      function setHostContext(payload, replace) {
+        const nextHostContext = objectValue(payload);
+        if (replace) hostContext = nextHostContext;
+        const fields = objectValue(nextHostContext.hostContext || nextHostContext.context || nextHostContext);
+        if (replace) {
+          hostContextFields = { ...fields };
+        } else {
+          const merged = { ...hostContextFields, ...fields };
+          if (
+            fields.containerDimensions &&
+            typeof fields.containerDimensions === "object" &&
+            !Array.isArray(fields.containerDimensions)
+          ) {
+            merged.containerDimensions = {
+              ...objectValue(hostContextFields.containerDimensions),
+              ...fields.containerDimensions,
+            };
+          }
+          hostContextFields = merged;
+        }
+      }
 
       function rpcNotify(method, params) {
         window.parent.postMessage({ jsonrpc: "2.0", method, params: params || {} }, "*");
@@ -1509,6 +2413,7 @@ export function embedApp(
         if (message.error) {
           const error = new Error(message.error.message || "MCP Apps bridge request failed.");
           error.data = message.error.data;
+          error.code = message.error.code;
           pending.reject(error);
           return true;
         }
@@ -1537,7 +2442,7 @@ export function embedApp(
         ontoolresult: null,
         onhostcontextchanged: null,
         getHostContext() {
-          return hostContext.context || hostContext;
+          return hostContextFields;
         },
         getHostCapabilities() {
           return hostContext.capabilities || { tools: true, messaging: true };
@@ -1546,26 +2451,32 @@ export function embedApp(
           return hostContext.protocolVersion || "mcp-apps-postmessage";
         },
         async connect() {
-          if (connected) return hostContext;
-          connected = true;
-          window.addEventListener("message", onMessage, { passive: true });
-          const result = await rpcRequest(
-            "ui/initialize",
-            {
-              appInfo: { name: "Agent Native Embed", version: "1.0.0" },
-              appCapabilities: {},
-              protocolVersion: "2026-01-26"
-            },
-            nativeBridgeInitializeTimeoutMs
-          );
-          hostContext = objectValue(result);
-          rpcNotify("ui/notifications/initialized", {});
-          if (typeof nativeApp.onhostcontextchanged === "function") {
-            nativeApp.onhostcontextchanged(hostContext);
-          }
-          return hostContext;
+          if (connectPromise) return await connectPromise;
+          connectPromise = (async () => {
+            window.addEventListener("message", onMessage, { passive: true });
+            const result = await rpcRequest(
+              "ui/initialize",
+              {
+                appInfo: { name: "Agent-Native Embed", version: "1.0.0" },
+                appCapabilities: {},
+                protocolVersion: "2026-01-26"
+              },
+              nativeBridgeInitializeTimeoutMs
+            );
+            setHostContext(result, true);
+            rpcNotify("ui/notifications/initialized", {});
+            if (typeof nativeApp.onhostcontextchanged === "function") {
+              nativeApp.onhostcontextchanged(hostContextFields);
+            }
+            return hostContext;
+          })().catch((err) => {
+            connectPromise = null;
+            throw err;
+          });
+          return await connectPromise;
         },
         async callServerTool(request) {
+          await nativeApp.connect();
           const record = objectValue(request);
           return await rpcRequest("tools/call", {
             name: record.name,
@@ -1573,21 +2484,29 @@ export function embedApp(
           });
         },
         async updateModelContext(params) {
+          await nativeApp.connect();
           return await rpcRequest("ui/update-model-context", objectValue(params));
         },
         async openLink(params) {
           const url = typeof (params && params.url) === "string" ? params.url : "";
           if (!url) return { isError: true };
-          window.open(url, "_blank", "noopener,noreferrer");
-          return { ok: true };
+          try {
+            return await rpcRequest("ui/open-link", { url }, wrapperRequestTimeoutMs);
+          } catch (err) {
+            console.warn("[agent-native] MCP host open-link request failed", err);
+          }
+          const opened = window.open(url, "_blank", "noopener,noreferrer");
+          return opened ? { ok: true } : { isError: true };
         },
         async requestDisplayMode(params) {
+          await nativeApp.connect();
           return await rpcRequest("ui/request-display-mode", objectValue(params));
         },
         sendSizeChanged(params) {
           rpcNotify("ui/notifications/size-changed", objectValue(params));
         },
         async sendMessage(params) {
+          await nativeApp.connect();
           return await rpcRequest("ui/message", objectValue(params));
         }
       };
@@ -1615,12 +2534,13 @@ export function embedApp(
           return;
         }
         if (
+          message.method === "ui/notifications/host-context-changed" ||
           message.method === "ui/notifications/host-context" ||
           message.method === "ui/notifications/context"
         ) {
-          hostContext = objectValue(params);
+          setHostContext(params, false);
           if (typeof nativeApp.onhostcontextchanged === "function") {
-            nativeApp.onhostcontextchanged(hostContext);
+            nativeApp.onhostcontextchanged(hostContextFields);
           }
         }
       }
@@ -1630,57 +2550,81 @@ export function embedApp(
 
     async function startNativeMcpAppsBridge() {
       app = createNativeMcpAppsBridge();
+      appConnectPromise = null;
       app.ontoolinput = (params) => {
         toolInput = params.arguments || {};
       };
       app.ontoolresult = (params) => {
         const data = parseToolResult(params);
+        toolResponseMetadata = objectValue(metadataRecord(params));
         toolResultData = objectValue(data);
         openUrl = openLinkFrom(params, data);
         openStartUrl = embedStartUrlFrom(params, data);
         updateTitle(data);
+        updateDirectoryWidgetLayout();
         updateOpenButton();
         void launchEmbed();
       };
       app.onhostcontextchanged = () => {
-        updateDisplayButton();
-        notifyHostHeight();
-        sendHostContext();
+        handleHostContextChanged();
       };
-      await app.connect();
+      await ensureHostAppConnected();
+      notifyOuterMcpAppReady();
+      updateDirectoryWidgetLayout();
       updateDisplayButton();
       notifyHostHeight();
       sendHostContext();
     }
 
-    async function startMcpAppsBridge() {
+    function handleHostContextChanged() {
+      updateDirectoryWidgetLayout();
+      updateDisplayButton();
+      notifyHostHeight();
+      sendHostContext();
+      if (
+        fillsPane &&
+        !isCompactDirectoryWidget() &&
+        (openStartUrl || openUrl)
+      ) {
+        void launchEmbed();
+      }
+    }
+
+    ${
+      remoteBridgeFallbackEnabled
+        ? `async function startMcpAppsBridge() {
       const { App } = await import("${MCP_APP_IMPORT}");
       app = new App(
-        { name: "Agent Native Embed", version: "1.0.0" },
+        { name: "Agent-Native Embed", version: "1.0.0" },
         {},
         { autoResize: false }
       );
+      appConnectPromise = null;
       app.ontoolinput = (params) => {
         toolInput = params.arguments || {};
       };
       app.ontoolresult = (params) => {
         const data = parseToolResult(params);
+        toolResponseMetadata = objectValue(metadataRecord(params));
         toolResultData = objectValue(data);
         openUrl = openLinkFrom(params, data);
         openStartUrl = embedStartUrlFrom(params, data);
         updateTitle(data);
+        updateDirectoryWidgetLayout();
         updateOpenButton();
         void launchEmbed();
       };
       app.onhostcontextchanged = () => {
-        updateDisplayButton();
-        notifyHostHeight();
-        sendHostContext();
+        handleHostContextChanged();
       };
-      await app.connect();
+      await ensureHostAppConnected();
+      notifyOuterMcpAppReady();
+      updateDirectoryWidgetLayout();
       updateDisplayButton();
       notifyHostHeight();
       sendHostContext();
+    }`
+        : ""
     }
 
     try {
@@ -1690,35 +2634,62 @@ export function embedApp(
           await startNativeMcpAppsBridge();
         } catch (nativeErr) {
           console.warn("[agent-native] native MCP Apps bridge failed", nativeErr);
-          await startMcpAppsBridge();
+          ${remoteBridgeFallbackEnabled ? "await startMcpAppsBridge();" : "throw nativeErr;"}
         }
       }
     } catch (err) {
       console.error("[agent-native] MCP app shell failed", err);
+      reportEmbedError(
+        "bridge-init",
+        err && err.message ? err.message : "Could not initialize app.",
+        err && err.stack ? String(err.stack) : undefined
+      );
       setMessage(err && err.message ? err.message : "Could not initialize app.");
     }
+
+    window.addEventListener("error", (event) => {
+      const err = event && event.error;
+      reportEmbedError(
+        "window-error",
+        (err && err.message) || (event && event.message) || "Uncaught error in MCP app embed.",
+        err && err.stack ? String(err.stack) : undefined
+      );
+    });
+    window.addEventListener("unhandledrejection", (event) => {
+      const reason = event && event.reason;
+      reportEmbedError(
+        "unhandled-rejection",
+        (reason && reason.message) || String(reason || "Unhandled promise rejection in MCP app embed."),
+        reason && reason.stack ? String(reason.stack) : undefined
+      );
+    });
     })();
   </script>
 </body>
-</html>`,
-    csp: {
-      connectDomains: [
-        "https://esm.sh",
-        MCP_APP_REQUEST_ORIGIN_CSP_SOURCE,
-        ...(options.connectDomains ?? []),
-        ...(options.frameDomains ?? []),
-      ],
-      resourceDomains: [
-        "https://esm.sh",
-        MCP_APP_REQUEST_ORIGIN_CSP_SOURCE,
-        ...(options.resourceDomains ?? []),
-        ...(options.frameDomains ?? []),
-      ],
-      baseUriDomains: [
-        MCP_APP_REQUEST_ORIGIN_CSP_SOURCE,
-        ...(options.baseUriDomains ?? []),
-      ],
-      frameDomains,
+</html>`;
+    },
+    csp: (ctx) => {
+      const bridgeFallbackDomains =
+        ctx.catalogMode === "directory" ? [] : ["https://esm.sh"];
+      return {
+        connectDomains: [
+          ...bridgeFallbackDomains,
+          MCP_APP_REQUEST_ORIGIN_CSP_SOURCE,
+          ...(options.connectDomains ?? []),
+          ...(options.frameDomains ?? []),
+        ],
+        resourceDomains: [
+          ...bridgeFallbackDomains,
+          MCP_APP_REQUEST_ORIGIN_CSP_SOURCE,
+          ...(options.resourceDomains ?? []),
+          ...(options.frameDomains ?? []),
+        ],
+        baseUriDomains: [
+          MCP_APP_REQUEST_ORIGIN_CSP_SOURCE,
+          ...(options.baseUriDomains ?? []),
+        ],
+        frameDomains,
+      };
     },
     prefersBorder: false,
   };

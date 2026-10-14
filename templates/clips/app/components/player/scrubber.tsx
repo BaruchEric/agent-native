@@ -1,15 +1,35 @@
-import { useMemo, useRef, useState } from "react";
+import { IconMessageFilled } from "@tabler/icons-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+
 import { cn } from "@/lib/utils";
+
+import {
+  COMMENT_PREVIEW_WIDTH_PX,
+  CommentPreview,
+  type CommentPreviewData,
+} from "./playback-comment-overlay";
+import {
+  scrubberFillPercent,
+  scrubberPositionFromClientX,
+  timelineMarkerAlignment,
+  timelineMarkerLanes,
+  timelineMarkerMs,
+} from "./scrubber-position";
 
 export interface ScrubberProps {
   currentMs: number;
   durationMs: number;
   onSeek: (ms: number) => void;
-  comments?: { id: string; videoTimestampMs: number; content: string }[];
+  comments?: (CommentPreviewData & {
+    videoTimestampMs: number;
+  })[];
   chapters?: { startMs: number; title: string }[];
   reactions?: { id: string; emoji: string; videoTimestampMs: number }[];
-  excludedRanges?: { startMs: number; endMs: number }[];
+  onMarkerLanesChange?: (lanes: Map<number, number>) => void;
 }
+
+const MARKER_CONTROL_SIZE_PX = 28;
+const MARKER_GAP_PX = 2;
 
 export function Scrubber(props: ScrubberProps) {
   const {
@@ -19,75 +39,201 @@ export function Scrubber(props: ScrubberProps) {
     comments,
     chapters,
     reactions,
-    excludedRanges,
+    onMarkerLanesChange,
   } = props;
   const barRef = useRef<HTMLDivElement | null>(null);
+  const activePointerIdRef = useRef<number | null>(null);
+  const [barWidth, setBarWidth] = useState(0);
   const [hoverMs, setHoverMs] = useState<number | null>(null);
   const [hoverX, setHoverX] = useState<number>(0);
   const [dragging, setDragging] = useState(false);
   const [tooltip, setTooltip] = useState<
-    | { kind: "comment"; content: string; ms: number }
-    | { kind: "chapter"; title: string; ms: number }
+    | { kind: "comment"; comment: CommentPreviewData; ms: number; lane: number }
+    | { kind: "chapter"; title: string; ms: number; lane: number }
+    | { kind: "reaction"; content: string; ms: number; lane: number }
     | null
   >(null);
 
-  const pct = durationMs > 0 ? (currentMs / durationMs) * 100 : 0;
+  const pct = scrubberFillPercent(currentMs, durationMs);
 
   const recentReactions = useMemo(
     () => (reactions ? reactions.slice(-50) : []),
     [reactions],
   );
 
-  function msFromEvent(e: { clientX: number }): number {
+  function positionFromClientX(clientX: number): { ms: number; x: number } {
     const el = barRef.current;
-    if (!el) return 0;
-    const rect = el.getBoundingClientRect();
-    const x = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
-    const ratio = rect.width > 0 ? x / rect.width : 0;
-    return Math.floor(ratio * durationMs);
+    if (!el) return { ms: 0, x: 0 };
+    return scrubberPositionFromClientX(
+      clientX,
+      el.getBoundingClientRect(),
+      durationMs,
+    );
   }
 
-  function onMouseDown(e: React.MouseEvent) {
+  function seekFromClientX(clientX: number): void {
+    const next = positionFromClientX(clientX);
+    setHoverX(next.x);
+    setHoverMs(next.ms);
+    onSeek(next.ms);
+  }
+
+  function onPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
     e.preventDefault();
+    e.stopPropagation();
+    activePointerIdRef.current = e.pointerId;
     setDragging(true);
-    const ms = msFromEvent(e);
-    onSeek(ms);
-
-    const onMove = (ev: MouseEvent) => {
-      onSeek(msFromEvent(ev));
-    };
-    const onUp = () => {
-      setDragging(false);
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // Older test/browser environments may not implement pointer capture.
+    }
+    seekFromClientX(e.clientX);
   }
 
-  function onHover(e: React.MouseEvent) {
-    const el = barRef.current;
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    const x = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
-    setHoverX(x);
-    setHoverMs(msFromEvent(e));
+  function onPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (activePointerIdRef.current === e.pointerId) {
+      e.preventDefault();
+      seekFromClientX(e.clientX);
+      return;
+    }
+
+    if (e.pointerType === "mouse") {
+      const next = positionFromClientX(e.clientX);
+      setHoverX(next.x);
+      setHoverMs(next.ms);
+    }
+  }
+
+  function endPointerDrag(e: React.PointerEvent<HTMLDivElement>) {
+    if (activePointerIdRef.current !== e.pointerId) return;
+    activePointerIdRef.current = null;
+    setDragging(false);
+    if (e.pointerType !== "mouse") setHoverMs(null);
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // Older test/browser environments may not implement pointer capture.
+    }
   }
 
   const commentsByMs = useMemo(() => {
-    const map = new Map<number, { id: string; content: string }[]>();
+    const map = new Map<number, CommentPreviewData[]>();
     (comments ?? []).forEach((c) => {
-      // Bucket by 500ms so overlapping comments cluster.
-      const key = Math.round(c.videoTimestampMs / 500) * 500;
+      const key = timelineMarkerMs(c.videoTimestampMs);
       const list = map.get(key) ?? [];
-      list.push({ id: c.id, content: c.content });
+      list.push({
+        id: c.id,
+        content: c.content,
+        authorEmail: c.authorEmail,
+        authorName: c.authorName,
+      });
       map.set(key, list);
     });
     return map;
   }, [comments]);
 
+  const reactionsByMs = useMemo(() => {
+    const map = new Map<number, { id: string; emoji: string }[]>();
+    recentReactions.forEach((reaction) => {
+      const key = timelineMarkerMs(reaction.videoTimestampMs);
+      const list = map.get(key) ?? [];
+      list.push({ id: reaction.id, emoji: reaction.emoji });
+      map.set(key, list);
+    });
+    return map;
+  }, [recentReactions]);
+
+  const markerTimes = useMemo(
+    () =>
+      Array.from(
+        new Set([...commentsByMs.keys(), ...reactionsByMs.keys()]),
+      ).sort((a, b) => a - b),
+    [commentsByMs, reactionsByMs],
+  );
+
+  const markerWidths = useMemo(
+    () =>
+      new Map(
+        markerTimes.map((ms) => [
+          ms,
+          MARKER_CONTROL_SIZE_PX *
+            (Number(commentsByMs.has(ms)) + Number(reactionsByMs.has(ms))) +
+            (commentsByMs.has(ms) && reactionsByMs.has(ms) ? MARKER_GAP_PX : 0),
+        ]),
+      ),
+    [commentsByMs, markerTimes, reactionsByMs],
+  );
+  const markerLanes = useMemo(
+    () => timelineMarkerLanes(markerTimes, markerWidths, durationMs, barWidth),
+    [barWidth, durationMs, markerTimes, markerWidths],
+  );
+  const previousMarkerLanesRef = useRef<Map<number, number> | null>(null);
+  useEffect(() => {
+    const bar = barRef.current;
+    if (!bar || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(([entry]) => {
+      const width = entry?.contentRect.width ?? bar.clientWidth;
+      setBarWidth(Math.max(1, width));
+    });
+    observer.observe(bar);
+    setBarWidth(
+      Math.max(1, bar.getBoundingClientRect().width || bar.clientWidth),
+    );
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    if (!onMarkerLanesChange) {
+      previousMarkerLanesRef.current = null;
+      return;
+    }
+    const previousMarkerLanes = previousMarkerLanesRef.current;
+    if (
+      previousMarkerLanes &&
+      previousMarkerLanes.size === markerLanes.size &&
+      [...markerLanes].every(
+        ([time, lane]) => previousMarkerLanes.get(time) === lane,
+      )
+    ) {
+      return;
+    }
+    previousMarkerLanesRef.current = markerLanes;
+    onMarkerLanesChange(markerLanes);
+  }, [markerLanes, onMarkerLanesChange]);
+  const tooltipPositionPercent = tooltip
+    ? Math.min(100, Math.max(0, (tooltip.ms / Math.max(1, durationMs)) * 100))
+    : 50;
+  const tooltipAlignment = tooltip
+    ? timelineMarkerAlignment(
+        tooltip.ms,
+        durationMs,
+        tooltip.kind === "comment"
+          ? Math.min(COMMENT_PREVIEW_WIDTH_PX, barWidth)
+          : (markerWidths.get(tooltip.ms) ?? MARKER_CONTROL_SIZE_PX),
+        barWidth,
+      )
+    : "center";
+
   return (
-    <div className="relative h-10 flex items-center" data-player-ui>
+    <div
+      className="relative h-10 flex items-center touch-none cursor-pointer"
+      data-player-ui
+      data-player-scrubber
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endPointerDrag}
+      onPointerCancel={endPointerDrag}
+      onLostPointerCapture={() => {
+        activePointerIdRef.current = null;
+        setDragging(false);
+      }}
+      onPointerLeave={() => {
+        if (activePointerIdRef.current === null) setHoverMs(null);
+      }}
+    >
       {/* Hover bubble */}
       {hoverMs !== null && !tooltip ? (
         <div
@@ -101,48 +247,43 @@ export function Scrubber(props: ScrubberProps) {
       {/* Tooltip (comment / chapter) */}
       {tooltip ? (
         <div
-          className="absolute -top-10 -translate-x-1/2 max-w-[240px] rounded bg-primary px-2 py-1 text-[11px] text-primary-foreground"
-          style={{ left: (tooltip.ms / Math.max(1, durationMs)) * 100 + "%" }}
+          data-player-comment-hover
+          className={cn(
+            "pointer-events-none absolute bottom-[calc(100%+1rem)] z-50 w-80 max-w-full",
+            tooltipAlignment === "center" && "-translate-x-1/2",
+          )}
+          style={{
+            ...(tooltipAlignment === "start"
+              ? { left: "0%" }
+              : tooltipAlignment === "end"
+                ? { right: "0%" }
+                : { left: tooltipPositionPercent + "%" }),
+            bottom: `calc(100% + ${1 + tooltip.lane * 1.75}rem)`,
+          }}
         >
-          {tooltip.kind === "comment" ? tooltip.content : tooltip.title}
+          {tooltip.kind === "comment" ? (
+            <CommentPreview
+              comment={tooltip.comment}
+              className="animate-in fade-in slide-in-from-bottom-2 duration-200"
+            />
+          ) : (
+            <div className="max-w-[min(36rem,100%)] rounded-xl bg-foreground/95 px-3 py-2.5 text-left text-[11px] text-background shadow-2xl ring-1 ring-background/15 backdrop-blur-md dark:bg-background/95 dark:text-foreground dark:ring-foreground/15">
+              {tooltip.kind === "reaction" ? tooltip.content : tooltip.title}
+            </div>
+          )}
         </div>
       ) : null}
 
       <div
         ref={barRef}
-        className="relative w-full h-1.5 bg-white/20 rounded-full cursor-pointer group/bar"
-        onMouseDown={onMouseDown}
-        onMouseMove={onHover}
-        onMouseLeave={() => setHoverMs(null)}
+        data-player-scrubber-bar
+        className="relative w-full h-1.5 bg-white/35 rounded-full cursor-pointer group/bar shadow-[0_0_0_1px_rgba(0,0,0,0.16)]"
       >
         {/* Filled portion */}
         <div
-          className="absolute inset-y-0 left-0 bg-primary rounded-full"
+          className="absolute inset-y-0 left-0 bg-white rounded-full shadow-[0_0_10px_rgba(255,255,255,0.45)]"
           style={{ width: pct + "%" }}
         />
-
-        {/* Cut ranges */}
-        {excludedRanges?.map((range, i) => {
-          const startPct =
-            (Math.max(0, range.startMs) / Math.max(1, durationMs)) * 100;
-          const endPct =
-            (Math.min(durationMs, range.endMs) / Math.max(1, durationMs)) * 100;
-          return (
-            <div
-              key={`${range.startMs}-${range.endMs}-${i}`}
-              className="absolute inset-y-0 rounded-sm bg-black/70"
-              style={{
-                left: `${startPct}%`,
-                width: `${Math.max(0.5, endPct - startPct)}%`,
-                backgroundImage:
-                  "repeating-linear-gradient(45deg, rgba(255,255,255,0.2) 0 3px, transparent 3px 7px)",
-              }}
-              title={`Cut: ${msToClock(range.startMs)}-${msToClock(
-                range.endMs,
-              )}`}
-            />
-          );
-        })}
 
         {/* Chapter notches */}
         {chapters?.map((ch, i) => (
@@ -150,14 +291,19 @@ export function Scrubber(props: ScrubberProps) {
             key={i}
             type="button"
             onMouseEnter={() =>
-              setTooltip({ kind: "chapter", title: ch.title, ms: ch.startMs })
+              setTooltip({
+                kind: "chapter",
+                title: ch.title,
+                ms: ch.startMs,
+                lane: 0,
+              })
             }
             onMouseLeave={() => setTooltip(null)}
             onClick={(e) => {
               e.stopPropagation();
               onSeek(ch.startMs);
             }}
-            className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 h-3 w-0.5 bg-white/80 hover:h-4 hover:w-1 transition-all"
+            className="absolute top-1/2 h-3 w-0.5 -translate-x-1/2 -translate-y-1/2 bg-white/80 transition-[transform,opacity] duration-150 ease-out hover:scale-x-[2] hover:scale-y-125 motion-reduce:transition-none motion-reduce:hover:scale-100"
             style={{
               left: (ch.startMs / Math.max(1, durationMs)) * 100 + "%",
             }}
@@ -165,47 +311,107 @@ export function Scrubber(props: ScrubberProps) {
           />
         ))}
 
-        {/* Comment dots */}
-        {Array.from(commentsByMs.entries()).map(([ms, list]) => (
-          <button
-            key={ms}
-            type="button"
-            onMouseEnter={() =>
-              setTooltip({
-                kind: "comment",
-                content: list[0].content.slice(0, 100),
-                ms,
-              })
-            }
-            onMouseLeave={() => setTooltip(null)}
-            onClick={(e) => {
-              e.stopPropagation();
-              onSeek(ms);
-            }}
-            className="absolute -top-1 -translate-x-1/2 h-3.5 w-3.5 rounded-full bg-yellow-400 border-2 border-black/50 hover:scale-125 transition-transform"
-            style={{ left: (ms / Math.max(1, durationMs)) * 100 + "%" }}
-            aria-label={`${list.length} comment${list.length > 1 ? "s" : ""}`}
-          />
-        ))}
+        {/* Timeline markers */}
+        {markerTimes.map((ms) => {
+          const commentList = commentsByMs.get(ms);
+          const reactionList = reactionsByMs.get(ms);
+          const markerLane = markerLanes.get(ms) ?? 0;
+          const markerAlignment = timelineMarkerAlignment(
+            ms,
+            durationMs,
+            markerWidths.get(ms) ?? MARKER_CONTROL_SIZE_PX,
+            barWidth,
+          );
 
-        {/* Reaction dots */}
-        {recentReactions.map((r) => (
-          <div
-            key={r.id}
-            className="absolute -bottom-4 -translate-x-1/2 text-[11px] pointer-events-none"
-            style={{
-              left: (r.videoTimestampMs / Math.max(1, durationMs)) * 100 + "%",
-            }}
-          >
-            {r.emoji}
-          </div>
-        ))}
+          return (
+            <div
+              key={`marker-${ms}`}
+              data-player-marker-group
+              className={cn(
+                "absolute flex h-7 items-center gap-0.5",
+                markerAlignment === "center" && "-translate-x-1/2",
+                markerLane ? "-top-14" : "-top-7",
+              )}
+              style={{
+                ...(markerAlignment === "start"
+                  ? { left: "0%" }
+                  : markerAlignment === "end"
+                    ? { right: "0%" }
+                    : { left: (ms / Math.max(1, durationMs)) * 100 + "%" }),
+                ...(markerLane > 1
+                  ? { top: `-${(markerLane + 1) * 1.75}rem` }
+                  : {}),
+              }}
+            >
+              {commentList ? (
+                <button
+                  type="button"
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onMouseEnter={() =>
+                    setTooltip({
+                      kind: "comment",
+                      comment: commentList[0],
+                      ms,
+                      lane: markerLane,
+                    })
+                  }
+                  onMouseLeave={() => setTooltip(null)}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onSeek(ms);
+                  }}
+                  className="relative flex h-7 w-7 shrink-0 items-center justify-center text-background drop-shadow-md transition-transform hover:scale-110 focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-background/80 dark:text-foreground dark:focus-visible:ring-foreground/80"
+                  aria-label={`${commentList.length} comment${commentList.length > 1 ? "s" : ""}`}
+                >
+                  <IconMessageFilled className="h-6 w-6" />
+                  {commentList.length > 1 && (
+                    <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-foreground/75 px-0.5 text-[8px] font-bold leading-none text-background shadow-sm dark:bg-background/75 dark:text-foreground">
+                      {commentList.length}
+                    </span>
+                  )}
+                </button>
+              ) : null}
+
+              {reactionList ? (
+                <button
+                  type="button"
+                  data-player-reaction-marker
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onMouseEnter={() =>
+                    setTooltip({
+                      kind: "reaction",
+                      content: `${reactionList.map((reaction) => reaction.emoji).join(" ")} · ${reactionList.length} reaction${reactionList.length === 1 ? "" : "s"}`,
+                      ms,
+                      lane: markerLane,
+                    })
+                  }
+                  onMouseLeave={() => setTooltip(null)}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onSeek(ms);
+                  }}
+                  className="relative flex h-7 min-w-7 shrink-0 items-center justify-center px-0.5 text-2xl leading-none text-background drop-shadow-sm transition-transform hover:scale-110 focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-background/80 dark:text-foreground dark:focus-visible:ring-foreground/80"
+                  aria-label={`${reactionList.length} reaction${reactionList.length === 1 ? "" : "s"} at ${msToClock(ms)}`}
+                >
+                  {reactionList[0].emoji}
+                  {reactionList.length > 1 ? (
+                    <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-foreground/75 px-0.5 text-[8px] font-bold leading-none text-background shadow-sm dark:bg-background/75 dark:text-foreground">
+                      {reactionList.length}
+                    </span>
+                  ) : null}
+                </button>
+              ) : null}
+            </div>
+          );
+        })}
 
         {/* Thumb */}
         <div
           className={cn(
-            "absolute top-1/2 -translate-y-1/2 -translate-x-1/2 h-3 w-3 rounded-full bg-white shadow transition-transform",
-            dragging ? "scale-125" : "scale-0 group-hover/bar:scale-100",
+            "absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white opacity-0 shadow transition-[transform,opacity] duration-150 ease-out motion-reduce:scale-100 motion-reduce:transition-none",
+            dragging
+              ? "scale-125 opacity-100"
+              : "scale-95 group-hover/bar:scale-100 group-hover/bar:opacity-100",
           )}
           style={{ left: pct + "%" }}
         />

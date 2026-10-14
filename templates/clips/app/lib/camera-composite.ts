@@ -128,14 +128,74 @@ function drawCover(
   ctx.restore();
 }
 
+const MAX_CANVAS_DIMENSION_PX = 1920;
+
+export function clampToMaxDimension(
+  width: number,
+  height: number,
+): { width: number; height: number } {
+  const longest = Math.max(width, height);
+  if (longest <= MAX_CANVAS_DIMENSION_PX) {
+    return { width, height };
+  }
+  const scale = MAX_CANVAS_DIMENSION_PX / longest;
+  return {
+    width: Math.round((width * scale) / 2) * 2,
+    height: Math.round((height * scale) / 2) * 2,
+  };
+}
+
+export function cameraBubbleStrokeRadius(
+  size: number,
+  lineWidth: number,
+): number {
+  return Math.max(0, size / 2 - lineWidth / 2);
+}
+
 function resizeCanvasToDisplay(
   canvas: HTMLCanvasElement,
   displayVideo: HTMLVideoElement,
   displayStream: MediaStream,
 ): void {
-  const { width, height } = videoDimensions(displayVideo, displayStream);
+  const source = videoDimensions(displayVideo, displayStream);
+  const { width, height } = clampToMaxDimension(source.width, source.height);
   if (canvas.width !== width) canvas.width = width;
   if (canvas.height !== height) canvas.height = height;
+}
+
+interface BubbleShadowSprite {
+  size: number;
+  canvas: HTMLCanvasElement;
+  pad: number;
+}
+
+let bubbleShadowSprite: BubbleShadowSprite | null = null;
+
+function getBubbleShadowSprite(size: number): BubbleShadowSprite {
+  if (bubbleShadowSprite && bubbleShadowSprite.size === size) {
+    return bubbleShadowSprite;
+  }
+  const blur = Math.max(16, size * 0.12);
+  const offsetY = Math.max(8, size * 0.05);
+  const pad = Math.ceil(blur * 2 + offsetY);
+  const spriteSize = size + pad * 2;
+  const sprite = document.createElement("canvas");
+  sprite.width = spriteSize;
+  sprite.height = spriteSize;
+  const sctx = sprite.getContext("2d");
+  if (sctx) {
+    const radius = size / 2;
+    const center = pad + radius;
+    sctx.shadowColor = "rgba(0, 0, 0, 0.35)";
+    sctx.shadowBlur = blur;
+    sctx.shadowOffsetY = offsetY;
+    sctx.fillStyle = "#000";
+    sctx.beginPath();
+    sctx.arc(center, center, radius, 0, Math.PI * 2);
+    sctx.fill();
+  }
+  bubbleShadowSprite = { size, canvas: sprite, pad };
+  return bubbleShadowSprite;
 }
 
 function drawCameraBubble(
@@ -162,6 +222,7 @@ function drawCameraBubble(
       maxSize,
     ),
   );
+  if (size <= 0) return;
   const margin = Math.round(
     clamp(minDimension * options.bubbleMarginRatio, 24, 80),
   );
@@ -172,15 +233,12 @@ function drawCameraBubble(
   const centerX = x + radius;
   const centerY = y + radius;
 
-  ctx.save();
-  ctx.shadowColor = "rgba(0, 0, 0, 0.35)";
-  ctx.shadowBlur = Math.max(16, size * 0.12);
-  ctx.shadowOffsetY = Math.max(8, size * 0.05);
-  ctx.fillStyle = "#000";
-  ctx.beginPath();
-  ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
+  const shadow = getBubbleShadowSprite(size);
+  ctx.drawImage(
+    shadow.canvas,
+    centerX - shadow.pad - radius,
+    centerY - shadow.pad - radius,
+  );
 
   ctx.save();
   ctx.beginPath();
@@ -195,7 +253,13 @@ function drawCameraBubble(
   ctx.strokeStyle = "rgba(255, 255, 255, 0.86)";
   ctx.lineWidth = Math.max(4, Math.round(size * 0.025));
   ctx.beginPath();
-  ctx.arc(centerX, centerY, radius - ctx.lineWidth / 2, 0, Math.PI * 2);
+  ctx.arc(
+    centerX,
+    centerY,
+    cameraBubbleStrokeRadius(size, ctx.lineWidth),
+    0,
+    Math.PI * 2,
+  );
   ctx.stroke();
   ctx.restore();
 }
@@ -244,13 +308,11 @@ export function createCameraCompositeStream(
     } catch {
       // The display video can be momentarily unavailable while metadata loads.
     }
-    drawCameraBubble(ctx, camera.video, canvas, drawOptions);
+    if (cameraTrack.readyState !== "ended") {
+      drawCameraBubble(ctx, camera.video, canvas, drawOptions);
+    }
   };
 
-  // Use a Worker-based timer so the draw loop keeps running at the target
-  // frame rate even when the user switches to a different tab. rAF is
-  // throttled to ~1fps in background tabs, which causes glitchy recordings.
-  // Falls back to rAF if Worker creation fails (e.g. strict CSP blocking blob: workers).
   let worker: Worker | null = null;
   let raf: number | null = null;
 

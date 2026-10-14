@@ -1,6 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { cn } from "@/lib/utils";
+import { useT } from "@agent-native/core/client/i18n";
 import type { PlanContent } from "@shared/plan-content";
+import { IconChevronRight } from "@tabler/icons-react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+
+import { cn } from "@/lib/utils";
+
 import {
   collectPlanTocItems,
   getActivePlanTocId,
@@ -27,41 +31,30 @@ function findScrollParent(el: HTMLElement | null): HTMLElement | Window {
 }
 
 function findDocumentFlow(nav: HTMLElement | null) {
-  return (
-    nav
-      ?.closest(".plan-document-shell")
-      ?.querySelector<HTMLElement>(".plan-document-flow") ?? null
-  );
+  return nav?.closest<HTMLElement>(".plan-document-shell") ?? null;
 }
 
 export function PlanTableOfContents({
   content,
   isRecap = false,
-  omitBlockId,
+  omitBlockIds,
 }: {
   content: PlanContent;
   isRecap?: boolean;
-  /**
-   * A block whose anchor should be dropped from the contents — e.g. the recap
-   * "Files touched" block, which on wide screens is relocated to a permanent
-   * left sidebar (outside `.plan-document-flow`), so a contents link to it would
-   * resolve to a hidden, unscrollable element.
-   */
-  omitBlockId?: string;
+  omitBlockIds?: string[];
 }) {
+  const t = useT();
   const navRef = useRef<HTMLElement>(null);
   const elementsRef = useRef<Map<string, HTMLElement>>(new Map());
   const [activeId, setActiveId] = useState("");
   const items = useMemo(
     () =>
       collectPlanTocItems(content.blocks).filter(
-        (item) => item.blockId !== omitBlockId,
+        (item) => !omitBlockIds?.includes(item.blockId),
       ),
-    [content.blocks, omitBlockId],
+    [content.blocks, omitBlockIds],
   );
 
-  // Keep the item -> element map and the active section in sync with the
-  // asynchronously-mounted document editor, reading the DOM only.
   useEffect(() => {
     const ids = items.map((item) => item.id);
     if (ids.length === 0) {
@@ -82,7 +75,10 @@ export function PlanTableOfContents({
     const getActiveId = () =>
       getActivePlanTocId(
         ids,
-        (id) => elementsRef.current.get(id) ?? null,
+        (id) => {
+          const el = elementsRef.current.get(id);
+          return el && el.isConnected ? el : null;
+        },
         OFFSET,
         scrollTarget instanceof HTMLElement ? scrollTarget : null,
       );
@@ -92,17 +88,20 @@ export function PlanTableOfContents({
       setActiveId((prev) => (prev === next ? prev : next));
     };
 
+    const refreshElements = () => {
+      const root = findDocumentFlow(navRef.current);
+      if (root) elementsRef.current = resolvePlanTocElements(root, items);
+    };
+
     const scheduleUpdateActiveId = () => {
       if (scrollRaf) return;
       scrollRaf = window.requestAnimationFrame(() => {
         scrollRaf = 0;
+        refreshElements();
         updateActiveId();
       });
     };
 
-    // Resolve element references, then bind the scroll listener once a target
-    // exists. The editor mounts asynchronously, so this re-resolves on every
-    // document mutation until the headings appear.
     const sync = (root: HTMLElement) => {
       elementsRef.current = resolvePlanTocElements(root, items);
       if (!scrollTarget) {
@@ -117,9 +116,6 @@ export function PlanTableOfContents({
       updateActiveId();
     };
 
-    // Debounce with setTimeout (not requestAnimationFrame, which is paused in
-    // background tabs) to coalesce the editor's mutation bursts. Because sync
-    // never writes to the editor DOM, this cannot feed back into the observer.
     const scheduleSync = (root: HTMLElement) => {
       if (syncTimer) return;
       syncTimer = window.setTimeout(() => {
@@ -131,8 +127,6 @@ export function PlanTableOfContents({
     const start = () => {
       const root = findDocumentFlow(navRef.current);
       if (!root) {
-        // The document flow shares this render, so it is normally present
-        // immediately; retry briefly in case of an SSR/hydration gap.
         if (rootAttempts < MAX_ROOT_ATTEMPTS) {
           rootAttempts += 1;
           rootTimer = window.setTimeout(start, 50);
@@ -157,56 +151,79 @@ export function PlanTableOfContents({
 
   if (items.length < 2) return null;
 
+  const heading = isRecap ? "On this recap" : "On this plan";
+
+  const handleNavClick = (
+    event: MouseEvent<HTMLAnchorElement>,
+    item: PlanTocItem,
+  ) => {
+    const target = elementsRef.current.get(item.id);
+    if (!target) return;
+    event.preventDefault();
+    if (!target.id) target.id = item.id;
+    target.scrollIntoView({
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+        ? "auto"
+        : "smooth",
+      block: "start",
+    });
+    setActiveId(item.id);
+    try {
+      history.pushState(null, "", `#${item.id}`);
+    } catch {
+      // Sandboxed or cross-origin — ignore.
+    }
+  };
+
+  const renderLink = (item: PlanTocItem) => (
+    <li key={item.id}>
+      <a
+        href={`#${item.id}`}
+        aria-current={activeId === item.id ? "true" : undefined}
+        className={cn(
+          "plan-document-toc__link",
+          activeId === item.id && "is-active",
+          item.level > 0 && "is-nested",
+        )}
+        onClick={(event) => handleNavClick(event, item)}
+      >
+        {item.label}
+      </a>
+    </li>
+  );
+
   return (
-    <aside className="plan-document-toc" aria-label="Plan sections">
-      <nav ref={navRef} className="plan-document-toc__nav">
-        <p className="plan-document-toc__heading">
-          {isRecap ? "On this recap" : "On this plan"}
-        </p>
-        <ol className="plan-document-toc__list">
-          {items.map((item) => (
-            <li key={item.id}>
-              <a
-                href={`#${item.id}`}
-                aria-current={activeId === item.id ? "true" : undefined}
-                className={cn(
-                  "plan-document-toc__link",
-                  activeId === item.id && "is-active",
-                  item.level > 0 && "is-nested",
-                )}
-                onClick={(event) => {
-                  const target = elementsRef.current.get(item.id);
-                  if (!target) return;
-                  event.preventDefault();
-                  // Set a stable `id` on the target element so the browser's
-                  // native hash-navigation (and back/forward) works. We write
-                  // it lazily here rather than during DOM setup to avoid
-                  // fighting the Tiptap editor's own reconcile passes.
-                  if (!target.id) target.id = item.id;
-                  target.scrollIntoView({
-                    behavior: window.matchMedia(
-                      "(prefers-reduced-motion: reduce)",
-                    ).matches
-                      ? "auto"
-                      : "smooth",
-                    block: "start",
-                  });
-                  setActiveId(item.id);
-                  // Update the URL hash so the deep link is shareable and the
-                  // browser back-button returns to this section.
-                  try {
-                    history.pushState(null, "", `#${item.id}`);
-                  } catch {
-                    // Sandboxed or cross-origin — ignore.
-                  }
-                }}
-              >
-                {item.label}
-              </a>
-            </li>
-          ))}
+    <>
+      {/* Wide layout: the contents live in the right-hand side rail. */}
+      <aside
+        className="plan-document-toc"
+        aria-label={t("raw.toc.planSections")}
+      >
+        <nav ref={navRef} className="plan-document-toc__nav">
+          <p className="plan-document-toc__heading">{heading}</p>
+          <ol className="plan-document-toc__list">{items.map(renderLink)}</ol>
+        </nav>
+      </aside>
+
+      {/* Narrow layout: same contents as an inline accordion. CSS shows exactly
+          one of rail/accordion (see global.css). */}
+      <details className="plan-document-toc-inline">
+        <summary className="plan-document-toc-inline__summary">
+          <IconChevronRight
+            className="plan-document-toc-inline__chevron"
+            size={16}
+            stroke={2}
+            aria-hidden
+          />
+          <span className="plan-document-toc-inline__label">{heading}</span>
+          <span className="plan-document-toc-inline__count">
+            {items.length}
+          </span>
+        </summary>
+        <ol className="plan-document-toc-inline__list">
+          {items.map(renderLink)}
         </ol>
-      </nav>
-    </aside>
+      </details>
+    </>
   );
 }

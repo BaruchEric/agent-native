@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+
 import type {
   MigrationContext,
   TargetAdapter,
@@ -60,6 +61,7 @@ export async function scaffoldAgentNativeTarget(
   await write("app/root.tsx", rootTsx());
   await write("app/global.css", globalCss());
   await write("app/routes/_index.tsx", indexRoute(context));
+  await write("app/routes/agent.tsx", agentRoute());
 
   for (const route of context.ir.site.routes.filter((r) => r.kind !== "api")) {
     const routeFile = route.path === "/" ? null : routeToFile(route.path);
@@ -168,26 +170,27 @@ function packageJson(): string {
       },
       dependencies: {
         "@agent-native/core": "latest",
+        "@agent-native/toolkit": "latest",
         "@tabler/icons-react": "^3.41.1",
         "@tanstack/react-query": "^5.99.2",
         "@vitejs/plugin-react": "^6.0.1",
         h3: "^2.0.1-rc.20",
         isbot: "^5",
         "next-themes": "^0.4.6",
-        react: "^19.2.5",
-        "react-dom": "^19.2.5",
-        "react-router": "^7.13.1",
+        react: "^19.2.7",
+        "react-dom": "^19.2.7",
+        "react-router": "^8.0.1",
         zod: "^4.3.6",
       },
       devDependencies: {
-        "@react-router/dev": "^7.13.1",
-        "@react-router/fs-routes": "^7.13.1",
+        "@react-router/dev": "^8.0.1",
+        "@react-router/fs-routes": "^8.0.1",
         "@tailwindcss/vite": "^4.2.4",
         "@types/node": "^25.8.0",
         "@types/react": "^19.2.14",
         "@types/react-dom": "^19.2.3",
         typescript: "^6.0.3",
-        vite: "8.0.3",
+        vite: "8.1.0",
       },
     },
     null,
@@ -208,8 +211,8 @@ function tsconfigJson(): string {
   "compilerOptions": {
     "ignoreDeprecations": "6.0",
     "rootDirs": [".", "./.react-router/types"],
-    "baseUrl": ".",
     "paths": {
+      "*": ["./*"],
       "@/*": ["./app/*"]
     }
   },
@@ -225,24 +228,28 @@ export default {
   appDirectory: "app",
   ssr: true,
   routeDiscovery: { mode: "initial" },
-  future: { v8_viteEnvironmentApi: true },
 } satisfies Config;
 `;
 }
 
 function viteConfig(): string {
   return `import { reactRouter } from "@react-router/dev/vite";
-import { defineConfig } from "@agent-native/core/vite";
+import { agentNative } from "@agent-native/core/vite";
+import { defineConfig } from "vite";
 
 export default defineConfig({
-  plugins: [reactRouter()],
-  ssrStubs: ["shiki"],
+  plugins: [
+    reactRouter(),
+    agentNative({
+      ssrStubs: ["shiki"],
+    }),
+  ],
 });
 `;
 }
 
 function viewScreenAction(): string {
-  return `import { defineAction } from "@agent-native/core";
+  return `import { defineAction } from "@agent-native/core/action";
 import { readAppState } from "@agent-native/core/application-state";
 import { z } from "zod";
 
@@ -259,7 +266,7 @@ export default defineAction({
 }
 
 function navigateAction(): string {
-  return `import { defineAction } from "@agent-native/core";
+  return `import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { z } from "zod";
 
@@ -330,12 +337,14 @@ function routesTs(): string {
   return `import { type RouteConfig } from "@react-router/dev/routes";
 import { flatRoutes } from "@react-router/fs-routes";
 
-export default flatRoutes() satisfies RouteConfig;
+export default flatRoutes({
+  ignoredRouteFiles: ["**/*.test.{ts,tsx}", "**/*.spec.{ts,tsx}"],
+}) satisfies RouteConfig;
 `;
 }
 
 function entryServerTsx(): string {
-  return `import type { AppLoadContext, EntryContext } from "react-router";
+  return `import type { EntryContext, RouterContextProvider } from "react-router";
 import { ServerRouter } from "react-router";
 import ReactDOMServer from "react-dom/server.browser";
 const { renderToReadableStream } = ReactDOMServer;
@@ -349,7 +358,7 @@ export default async function handleRequest(
   responseStatusCode: number,
   responseHeaders: Headers,
   routerContext: EntryContext,
-  _loadContext: AppLoadContext,
+  _loadContext: RouterContextProvider,
 ) {
   if (request.method.toUpperCase() === "HEAD") {
     return new Response(null, {
@@ -398,8 +407,9 @@ function rootTsx(): string {
   return `import { Links, Meta, Outlet, Scripts, ScrollRestoration } from "react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
-import { ClientOnly, DefaultSpinner } from "@agent-native/core/client";
-import { AgentSidebar } from "@agent-native/core/client";
+import { ClientOnly } from "@agent-native/core/client/ui";
+import { AppShellSkeleton } from "@agent-native/toolkit/app/shared";
+import { AgentSidebar } from "@agent-native/toolkit/app/chat";
 import stylesheet from "./global.css?url";
 import type { ReactNode } from "react";
 import type { LinksFunction } from "react-router";
@@ -427,9 +437,9 @@ export function Layout({ children }: { children: ReactNode }) {
 export default function Root() {
   const [queryClient] = useState(() => new QueryClient());
   return (
-    <ClientOnly fallback={<DefaultSpinner />}>
+    <ClientOnly fallback={<AppShellSkeleton layout="assistant" />}>
       <QueryClientProvider client={queryClient}>
-        <AgentSidebar position="right" defaultOpen>
+        <AgentSidebar position="right" defaultOpen agentPageHref="/agent">
           <Outlet />
         </AgentSidebar>
       </QueryClientProvider>
@@ -439,8 +449,17 @@ export default function Root() {
 `;
 }
 
+function agentRoute(): string {
+  return `import { AgentTabsPage } from "@agent-native/toolkit/app/agent-page";
+
+export default function AgentRoute() {
+  return <AgentTabsPage />;
+}
+`;
+}
+
 function globalCss(): string {
-  return `@import "@agent-native/core/styles/agent-native.css";
+  return `@import "@agent-native/toolkit/styles.css";
 `;
 }
 
@@ -462,12 +481,6 @@ function generatedRoute(
   sourceFile: string,
   isPublic: boolean,
 ): string {
-  // Emit dynamic strings as JSON-stringified JSX expressions so route paths
-  // containing JSX-significant characters (`{`, `}`, `<`, `>`, `&`) or
-  // template-literal terminators (backticks, `${`) can't break the outer
-  // generated file. Next.js routes legitimately contain `[slug]`, `(group)`,
-  // and `@parallel` segments; any of those slipping into JSX text un-escaped
-  // would produce invalid TS.
   const routePathExpr = JSON.stringify(routePath);
   const sourceFileExpr = JSON.stringify(sourceFile);
   return `export default function MigratedRoute() {

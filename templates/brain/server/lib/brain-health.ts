@@ -1,10 +1,23 @@
-import { and, desc, eq, inArray, ne } from "drizzle-orm";
+import {
+  getRequestOrgId,
+  getRequestUserEmail,
+} from "@agent-native/core/server/request-context";
 import { getSetting, putSetting } from "@agent-native/core/settings";
-import { accessFilter } from "@agent-native/core/sharing";
+import { accessFilter, assertAccess } from "@agent-native/core/sharing";
 import { listWorkspaceConnectionProviderCatalogForApp } from "@agent-native/core/workspace-connections";
+import { and, desc, eq, inArray, isNull, ne, or } from "drizzle-orm";
+
 import { getDb, schema } from "../db/index.js";
 import { nextBrainSourceSyncAt } from "../jobs/sync-sources.js";
-import { parseJson } from "./brain.js";
+import { listAccessibleAudienceIds } from "./audiences.js";
+import { parseJson, readBrainSettings } from "./brain.js";
+import { probeJevCredential } from "./jev-classifier.js";
+import { brainPrivacyReadiness } from "./privacy-readiness.js";
+import {
+  BRAIN_SEARCH_INDEX_VERSION,
+  BRAIN_SENSITIVITY_POLICY_VERSION,
+} from "./search-index-contracts.js";
+import { readEmbeddingReadiness } from "./search-index.js";
 import { redactSensitiveText } from "./search.js";
 
 const APP_ID = "brain";
@@ -15,6 +28,7 @@ const SOURCE_PROVIDERS = [
   "slack",
   "granola",
   "github",
+  "zoom",
   "clips",
   "generic",
   "manual",
@@ -32,7 +46,7 @@ export type BrainSourceHealthState =
   | "error";
 
 export interface BrainEvalSnapshot {
-  mode: "product-demo" | "retrieval" | string;
+  mode: "product-demo" | "retrieval" | (string & {});
   seedId?: string;
   dataset?: string;
   dataMode?: string;
@@ -138,6 +152,7 @@ function sourceConfig(source: SourceRow) {
 function sourceHasSlackChannels(source: SourceRow) {
   if (source.provider !== "slack") return false;
   const config = sourceConfig(source);
+  if (config.includePublicChannels === true) return true;
   const values = [
     config.channelIds,
     config.channels,
@@ -152,7 +167,8 @@ function sourceAutoSync(source: SourceRow) {
   return (
     source.provider === "slack" ||
     source.provider === "granola" ||
-    source.provider === "github"
+    source.provider === "github" ||
+    source.provider === "zoom"
   );
 }
 
@@ -181,9 +197,9 @@ function latestIso(values: Array<string | null | undefined>) {
   return latest;
 }
 
-function sourceHealthState(
+export function sourceHealthState(
   source: SourceRow,
-  latestRun: SyncRunRow | null,
+  latestRun: Pick<SyncRunRow, "status"> | null,
   nextSyncAt: string | null,
   nowMs: number,
 ): BrainSourceHealthState {
@@ -275,6 +291,8 @@ function providerLabel(providerId: string) {
       return "Slack";
     case "granola":
       return "Granola";
+    case "zoom":
+      return "Zoom";
     case "github":
       return "GitHub";
     case "clips":
@@ -313,6 +331,19 @@ export async function readBrainHealth() {
     )
     .orderBy(desc(schema.brainSources.updatedAt));
   const sourceIds = sourceRows.map((source) => source.id);
+  const audienceIds = await listAccessibleAudienceIds(sourceIds);
+  const adminSourceIds = (
+    await Promise.all(
+      sourceIds.map(async (sourceId) => {
+        try {
+          await assertAccess("brain-source", sourceId, "admin");
+          return sourceId;
+        } catch {
+          return null;
+        }
+      }),
+    )
+  ).filter((sourceId): sourceId is string => Boolean(sourceId));
   const syncRows = sourceIds.length
     ? await db
         .select()
@@ -328,46 +359,201 @@ export async function readBrainHealth() {
     }
   }
 
-  const captureRows = sourceIds.length
-    ? await db
-        .select({
-          sourceId: schema.brainRawCaptures.sourceId,
-          status: schema.brainRawCaptures.status,
-          createdAt: schema.brainRawCaptures.createdAt,
-          capturedAt: schema.brainRawCaptures.capturedAt,
-        })
-        .from(schema.brainRawCaptures)
-        .where(inArray(schema.brainRawCaptures.sourceId, sourceIds))
-    : [];
+  const captureRows =
+    sourceIds.length && audienceIds.length
+      ? await db
+          .select({
+            sourceId: schema.brainRawCaptures.sourceId,
+            status: schema.brainRawCaptures.status,
+            sensitivityDisposition:
+              schema.brainRawCaptures.sensitivityDisposition,
+            createdAt: schema.brainRawCaptures.createdAt,
+            capturedAt: schema.brainRawCaptures.capturedAt,
+          })
+          .from(schema.brainRawCaptures)
+          .innerJoin(
+            schema.brainCaptureAudiences,
+            eq(
+              schema.brainCaptureAudiences.captureId,
+              schema.brainRawCaptures.id,
+            ),
+          )
+          .where(
+            and(
+              inArray(schema.brainRawCaptures.sourceId, sourceIds),
+              eq(schema.brainRawCaptures.sensitivityDisposition, "allowed"),
+              inArray(schema.brainCaptureAudiences.audienceId, audienceIds),
+            ),
+          )
+      : [];
   const proposalRows = await db
     .select({ status: schema.brainProposals.status })
     .from(schema.brainProposals)
-    .where(accessFilter(schema.brainProposals, schema.brainProposalShares));
+    .where(
+      and(
+        accessFilter(schema.brainProposals, schema.brainProposalShares),
+        or(
+          isNull(schema.brainProposals.captureId),
+          audienceIds.length
+            ? inArray(schema.brainProposals.audienceId, audienceIds)
+            : undefined,
+        ),
+      ),
+    );
   const knowledgeRows = await db
     .select({ status: schema.brainKnowledge.status })
     .from(schema.brainKnowledge)
-    .where(accessFilter(schema.brainKnowledge, schema.brainKnowledgeShares));
-  const queueRows = await db
-    .select({
-      status: schema.brainIngestQueue.status,
-      updatedAt: schema.brainIngestQueue.updatedAt,
-      sourceId: schema.brainSources.id,
-    })
-    .from(schema.brainIngestQueue)
-    .innerJoin(
-      schema.brainRawCaptures,
-      eq(schema.brainIngestQueue.captureId, schema.brainRawCaptures.id),
-    )
-    .innerJoin(
-      schema.brainSources,
-      eq(schema.brainRawCaptures.sourceId, schema.brainSources.id),
-    )
     .where(
       and(
-        eq(schema.brainIngestQueue.operation, "distill"),
-        accessFilter(schema.brainSources, schema.brainSourceShares),
+        accessFilter(schema.brainKnowledge, schema.brainKnowledgeShares),
+        or(
+          isNull(schema.brainKnowledge.captureId),
+          audienceIds.length
+            ? inArray(schema.brainKnowledge.audienceId, audienceIds)
+            : undefined,
+        ),
       ),
     );
+  const queueRows = audienceIds.length
+    ? await db
+        .select({
+          operation: schema.brainIngestQueue.operation,
+          status: schema.brainIngestQueue.status,
+          updatedAt: schema.brainIngestQueue.updatedAt,
+          sourceId: schema.brainSources.id,
+        })
+        .from(schema.brainIngestQueue)
+        .innerJoin(
+          schema.brainRawCaptures,
+          eq(schema.brainIngestQueue.captureId, schema.brainRawCaptures.id),
+        )
+        .innerJoin(
+          schema.brainSources,
+          eq(schema.brainRawCaptures.sourceId, schema.brainSources.id),
+        )
+        .innerJoin(
+          schema.brainCaptureAudiences,
+          eq(
+            schema.brainCaptureAudiences.captureId,
+            schema.brainRawCaptures.id,
+          ),
+        )
+        .where(
+          and(
+            accessFilter(schema.brainSources, schema.brainSourceShares),
+            eq(schema.brainRawCaptures.sensitivityDisposition, "allowed"),
+            inArray(schema.brainCaptureAudiences.audienceId, audienceIds),
+          ),
+        )
+    : [];
+  const [sensitivityRows, artifactRows, embeddingRows, burstRows] =
+    await Promise.all([
+      adminSourceIds.length
+        ? db
+            .select({
+              disposition: schema.brainSensitivityEvents.disposition,
+              confidenceBand: schema.brainSensitivityEvents.confidenceBand,
+            })
+            .from(schema.brainSensitivityEvents)
+            .innerJoin(
+              schema.brainSources,
+              eq(
+                schema.brainSensitivityEvents.sourceId,
+                schema.brainSources.id,
+              ),
+            )
+            .where(
+              and(
+                accessFilter(schema.brainSources, schema.brainSourceShares),
+                inArray(schema.brainSensitivityEvents.sourceId, adminSourceIds),
+              ),
+            )
+        : Promise.resolve([]),
+      audienceIds.length
+        ? db
+            .select({
+              id: schema.brainSearchArtifacts.id,
+              captureId: schema.brainSearchArtifacts.captureId,
+              contentHash: schema.brainSearchArtifacts.contentHash,
+              sensitivityPolicyVersion:
+                schema.brainSearchArtifacts.sensitivityPolicyVersion,
+              aclHash: schema.brainSearchArtifacts.aclHash,
+              indexVersion: schema.brainSearchArtifacts.indexVersion,
+              status: schema.brainSearchArtifacts.status,
+              captureContentHash: schema.brainRawCaptures.contentHash,
+              captureSensitivityDisposition:
+                schema.brainRawCaptures.sensitivityDisposition,
+              captureSensitivityPolicyVersion:
+                schema.brainRawCaptures.sensitivityPolicyVersion,
+              captureAclHash: schema.brainRawCaptures.audienceAclHash,
+            })
+            .from(schema.brainSearchArtifacts)
+            .innerJoin(
+              schema.brainSources,
+              eq(schema.brainSearchArtifacts.sourceId, schema.brainSources.id),
+            )
+            .innerJoin(
+              schema.brainRawCaptures,
+              eq(
+                schema.brainSearchArtifacts.captureId,
+                schema.brainRawCaptures.id,
+              ),
+            )
+            .where(
+              and(
+                accessFilter(schema.brainSources, schema.brainSourceShares),
+                inArray(schema.brainSearchArtifacts.audienceId, audienceIds),
+              ),
+            )
+        : Promise.resolve([]),
+      audienceIds.length
+        ? db
+            .select({
+              targetType: schema.brainSearchEmbeddings.targetType,
+              targetId: schema.brainSearchEmbeddings.targetId,
+              embeddingSetId: schema.brainSearchEmbeddings.embeddingSetId,
+              contentHash: schema.brainSearchEmbeddings.contentHash,
+              sensitivityPolicyVersion:
+                schema.brainSearchEmbeddings.sensitivityPolicyVersion,
+              aclHash: schema.brainSearchEmbeddings.aclHash,
+              indexVersion: schema.brainSearchEmbeddings.indexVersion,
+              status: schema.brainSearchEmbeddings.status,
+            })
+            .from(schema.brainSearchEmbeddings)
+            .innerJoin(
+              schema.brainSources,
+              eq(schema.brainSearchEmbeddings.sourceId, schema.brainSources.id),
+            )
+            .where(
+              and(
+                accessFilter(schema.brainSources, schema.brainSourceShares),
+                inArray(schema.brainSearchEmbeddings.audienceId, audienceIds),
+              ),
+            )
+        : Promise.resolve([]),
+      audienceIds.length
+        ? db
+            .select({
+              id: schema.brainSearchBursts.id,
+              artifactId: schema.brainSearchBursts.artifactId,
+              aclHash: schema.brainSearchBursts.aclHash,
+              indexed: schema.brainSearchBursts.indexed,
+              contentHash: schema.brainSearchBursts.contentHash,
+              indexVersion: schema.brainSearchBursts.indexVersion,
+            })
+            .from(schema.brainSearchBursts)
+            .innerJoin(
+              schema.brainSources,
+              eq(schema.brainSearchBursts.sourceId, schema.brainSources.id),
+            )
+            .where(
+              and(
+                accessFilter(schema.brainSources, schema.brainSourceShares),
+                inArray(schema.brainSearchBursts.audienceId, audienceIds),
+              ),
+            )
+        : Promise.resolve([]),
+    ]);
 
   const configuredCounts = new Map<string, number>();
   for (const source of sourceRows) {
@@ -382,7 +568,6 @@ export async function readBrainHealth() {
     const latestRun = latestRunBySource.get(source.id) ?? null;
     const nextSyncAt = nextBrainSourceSyncAt(source);
     const health = sourceHealthState(source, latestRun, nextSyncAt, nowMs);
-    const config = sourceConfig(source);
     return {
       id: source.id,
       title: source.title,
@@ -391,7 +576,6 @@ export async function readBrainHealth() {
       health,
       demo: isDemoSource(source),
       autoSync: sourceAutoSync(source),
-      reviewRequired: config.reviewRequired !== false,
       hasChannelAllowList:
         source.provider === "slack" ? sourceHasSlackChannels(source) : null,
       lastSyncedAt: source.lastSyncedAt,
@@ -409,20 +593,126 @@ export async function readBrainHealth() {
     };
   });
 
-  const sourceHealthCounts = countStatuses<
-    BrainSourceHealthState | "active" | "paused" | "error"
-  >([
-    ...sourceSummaries.map((source) => ({ status: source.health })),
-    ...sourceRows.map((source) => ({ status: source.status })),
-  ]);
+  const sourceHealthCounts = countStatuses<BrainSourceHealthState>(
+    sourceSummaries.map((source) => ({ status: source.health })),
+  );
   const captureCounts = countStatuses(captureRows);
+  const captureDispositionCounts = countStatuses(
+    captureRows.map((capture) => ({
+      status: capture.sensitivityDisposition,
+    })),
+  );
   const proposalCounts = countStatuses(proposalRows);
   const knowledgeCounts = countStatuses(knowledgeRows);
-  const staleQueue = queueRows.filter(isStaleProcessing).length;
-  const failedQueue = queueRows.filter((row) => row.status === "failed").length;
-  const pendingQueue = queueRows.filter(
+  const distillationQueueRows = queueRows.filter(
+    (row) => row.operation === "distill",
+  );
+  const searchQueueRows = queueRows.filter(
+    (row) =>
+      row.operation === "search-index" || row.operation === "search-unindex",
+  );
+  const staleQueue = distillationQueueRows.filter(isStaleProcessing).length;
+  const failedQueue = distillationQueueRows.filter(
+    (row) => row.status === "failed",
+  ).length;
+  const pendingQueue = distillationQueueRows.filter(
     (row) => row.status === "queued" || row.status === "processing",
   ).length;
+  const staleSearchQueue = searchQueueRows.filter(isStaleProcessing).length;
+  const failedSearchQueue = searchQueueRows.filter(
+    (row) => row.status === "failed",
+  ).length;
+  const pendingSearchQueue = searchQueueRows.filter(
+    (row) => row.status === "queued" || row.status === "processing",
+  ).length;
+  const sensitivityCounts = countStatuses(
+    sensitivityRows.map((row) => ({ status: row.disposition })),
+  );
+  const sensitivityConfidenceCounts = countStatuses(
+    sensitivityRows.map((row) => ({ status: row.confidenceBand })),
+  );
+  const artifactCounts = countStatuses(artifactRows);
+  const embeddingCounts = countStatuses(embeddingRows);
+  const allowedCaptureCount = captureDispositionCounts.allowed ?? 0;
+  const currentArtifacts = artifactRows.filter(
+    (artifact) =>
+      artifact.status === "active" &&
+      artifact.captureSensitivityDisposition === "allowed" &&
+      artifact.contentHash === artifact.captureContentHash &&
+      artifact.sensitivityPolicyVersion ===
+        artifact.captureSensitivityPolicyVersion &&
+      artifact.aclHash === artifact.captureAclHash &&
+      artifact.indexVersion === BRAIN_SEARCH_INDEX_VERSION,
+  );
+  const activeArtifactCount = currentArtifacts.length;
+  const currentArtifactById = new Map(
+    currentArtifacts.map((artifact) => [artifact.id, artifact]),
+  );
+  const indexedCaptureCount = new Set(
+    currentArtifacts.map((artifact) => artifact.captureId),
+  ).size;
+  const embeddingReadiness = await readEmbeddingReadiness();
+  const currentBursts = burstRows.filter((burst) => {
+    const artifact = currentArtifactById.get(burst.artifactId);
+    return Boolean(
+      artifact &&
+      burst.indexed === 1 &&
+      burst.contentHash === artifact.contentHash &&
+      burst.aclHash === artifact.aclHash &&
+      burst.indexVersion === BRAIN_SEARCH_INDEX_VERSION,
+    );
+  });
+  const artifactIdByBurstId = new Map(
+    currentBursts.map((burst) => [burst.id, burst.artifactId]),
+  );
+  const expectedBurstIdsByArtifactId = new Map<string, string[]>();
+  for (const burst of currentBursts) {
+    const ids = expectedBurstIdsByArtifactId.get(burst.artifactId) ?? [];
+    ids.push(burst.id);
+    expectedBurstIdsByArtifactId.set(burst.artifactId, ids);
+  }
+  const embeddedTargetKeys = new Set(
+    embeddingRows.flatMap((embedding) => {
+      const artifactId =
+        embedding.targetType === "artifact"
+          ? embedding.targetId
+          : embedding.targetType === "burst"
+            ? artifactIdByBurstId.get(embedding.targetId)
+            : undefined;
+      const artifact = artifactId
+        ? currentArtifactById.get(artifactId)
+        : undefined;
+      return artifact &&
+        embedding.status === "active" &&
+        embedding.embeddingSetId === embeddingReadiness.embeddingSetId &&
+        embedding.contentHash === artifact.contentHash &&
+        embedding.sensitivityPolicyVersion ===
+          artifact.sensitivityPolicyVersion &&
+        embedding.aclHash === artifact.aclHash &&
+        embedding.indexVersion === BRAIN_SEARCH_INDEX_VERSION
+        ? [`${embedding.targetType}:${embedding.targetId}`]
+        : [];
+    }),
+  );
+  const embeddedArtifactCount = currentArtifacts.filter((artifact) => {
+    const burstIds = expectedBurstIdsByArtifactId.get(artifact.id) ?? [];
+    return (
+      embeddedTargetKeys.has(`artifact:${artifact.id}`) &&
+      burstIds.every((id) => embeddedTargetKeys.has(`burst:${id}`))
+    );
+  }).length;
+  const missingArtifactEmbeddings = Math.max(
+    0,
+    activeArtifactCount - embeddedArtifactCount,
+  );
+  const privacySettings = await readBrainSettings();
+  const privacyClassifier = brainPrivacyReadiness(
+    privacySettings,
+    await probeJevCredential({
+      ownerEmail: getRequestUserEmail() ?? "",
+      orgId: getRequestOrgId(),
+    }),
+  );
   const lastEval = await readBrainEvalSnapshot();
 
   const realSources = sourceSummaries.filter((source) => !source.demo);
@@ -437,7 +727,9 @@ export async function readBrainHealth() {
   );
   const hasMeetingSource =
     realSources.some((source) =>
-      ["granola", "clips", "generic", "manual"].includes(source.provider),
+      ["granola", "zoom", "clips", "generic", "manual"].includes(
+        source.provider,
+      ),
     ) || captureRows.length > 0;
   const hasDemo = sourceRows.some(isDemoSource);
   const hasSyncedOrImported =
@@ -474,7 +766,7 @@ export async function readBrainHealth() {
       detail: "Load the product-decision demo or run a bounded first sync.",
       done: hasDemo || hasSyncedOrImported,
       action: "seed-demo-data",
-      href: "/",
+      href: "/home",
     },
     {
       id: "ask-decision-question",
@@ -483,11 +775,14 @@ export async function readBrainHealth() {
         "Try the suggested product-decision question and inspect citations.",
       done: hasPublishedKnowledge && Boolean(lastEval),
       action: "ask-demo-question",
-      href: "/?demo=product-decisions",
+      href: "/home?demo=product-decisions",
     },
   ]);
 
   const nextSteps = [
+    !privacyClassifier.configured
+      ? "Configure Brain's approved privacy classifier. Until then, only deterministic-clean captures are stored; uncertain content is quarantined."
+      : null,
     ...setupSteps
       .filter((step) => step.status === "next")
       .map((step) => step.detail),
@@ -502,6 +797,13 @@ export async function readBrainHealth() {
       : null,
     (proposalCounts.pending ?? 0) > 0
       ? "Review pending proposals before expanding source scope."
+      : null,
+    !embeddingReadiness.ready
+      ? (embeddingReadiness.warning ??
+        "Configure one embedding provider to enable semantic retrieval.")
+      : null,
+    embeddingReadiness.ready && missingArtifactEmbeddings > 0
+      ? `Backfill embeddings for ${missingArtifactEmbeddings} active search artifact${missingArtifactEmbeddings === 1 ? "" : "s"}.`
       : null,
   ]
     .filter((step): step is string => Boolean(step))
@@ -562,6 +864,23 @@ export async function readBrainHealth() {
         captureRows.map((capture) => capture.capturedAt ?? capture.createdAt),
       ),
       counts: captureCounts,
+      sensitivityDispositionCounts: captureDispositionCounts,
+    },
+    privacy: {
+      classifier: {
+        ...privacyClassifier,
+      },
+      events: {
+        total: sensitivityRows.length,
+        suppressed: sensitivityCounts.suppressed ?? 0,
+        quarantined: sensitivityCounts.quarantined ?? 0,
+        released: sensitivityCounts.released ?? 0,
+        discarded: sensitivityCounts.discarded ?? 0,
+        expired: sensitivityCounts.expired ?? 0,
+        counts: sensitivityCounts,
+        confidenceCounts: sensitivityConfidenceCounts,
+      },
+      policyVersion: BRAIN_SENSITIVITY_POLICY_VERSION,
     },
     proposals: {
       pending: proposalCounts.pending ?? 0,
@@ -582,8 +901,55 @@ export async function readBrainHealth() {
       pending: pendingQueue,
       failed: failedQueue,
       stale: staleQueue,
-      total: queueRows.length,
-      counts: countStatuses(queueRows),
+      total: distillationQueueRows.length,
+      counts: countStatuses(distillationQueueRows),
+    },
+    searchIndex: {
+      indexVersion: BRAIN_SEARCH_INDEX_VERSION,
+      coverage: {
+        eligibleCaptures: allowedCaptureCount,
+        activeArtifacts: activeArtifactCount,
+        indexedCaptures: indexedCaptureCount,
+        missingCaptures: Math.max(0, allowedCaptureCount - indexedCaptureCount),
+        percent:
+          allowedCaptureCount === 0
+            ? 100
+            : Math.round((indexedCaptureCount / allowedCaptureCount) * 10_000) /
+              100,
+      },
+      artifacts: {
+        total: artifactRows.length,
+        active: artifactCounts.active ?? 0,
+        stale: artifactCounts.stale ?? 0,
+        deleted: artifactCounts.deleted ?? 0,
+        counts: artifactCounts,
+      },
+      embeddings: {
+        readiness: embeddingReadiness,
+        coverage: {
+          eligibleArtifacts: activeArtifactCount,
+          embeddedArtifacts: embeddedArtifactCount,
+          missingArtifacts: missingArtifactEmbeddings,
+          percent:
+            activeArtifactCount === 0
+              ? 100
+              : Math.round(
+                  (embeddedArtifactCount / activeArtifactCount) * 10_000,
+                ) / 100,
+        },
+        total: embeddingRows.length,
+        active: embeddingCounts.active ?? 0,
+        stale: embeddingCounts.stale ?? 0,
+        deleted: embeddingCounts.deleted ?? 0,
+        counts: embeddingCounts,
+      },
+      queue: {
+        pending: pendingSearchQueue,
+        failed: failedSearchQueue,
+        stale: staleSearchQueue,
+        total: searchQueueRows.length,
+        counts: countStatuses(searchQueueRows),
+      },
     },
     retrieval: {
       lastEval,

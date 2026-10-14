@@ -13,6 +13,7 @@ export const EDITABLE_DOCUMENT_PROPERTY_TYPES = [
   "email",
   "phone",
   "relation",
+  "blocks",
 ] as const;
 
 export const COMPUTED_DOCUMENT_PROPERTY_TYPES = [
@@ -30,6 +31,24 @@ export const DOCUMENT_PROPERTY_TYPES = [
   ...COMPUTED_DOCUMENT_PROPERTY_TYPES,
 ] as const;
 
+/** Most rows one relation value may link to. */
+export const MAX_RELATION_TARGETS = 100;
+
+/** Trim, drop empties and non-strings, and dedupe relation IDs, keeping order. */
+export function normalizeRelationIds(value: unknown): string[] {
+  const items = Array.isArray(value) ? value : value == null ? [] : [value];
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const item of items) {
+    if (typeof item !== "string") continue;
+    const id = item.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
 export const CREATABLE_DOCUMENT_PROPERTY_TYPES = [
   "text",
   "number",
@@ -44,6 +63,8 @@ export const CREATABLE_DOCUMENT_PROPERTY_TYPES = [
   "url",
   "email",
   "phone",
+  "relation",
+  "blocks",
   "id",
   "created_time",
   "created_by",
@@ -83,6 +104,7 @@ export interface DocumentPropertyOption {
   id: string;
   name: string;
   color: DocumentPropertyOptionColor;
+  description?: string;
 }
 
 export interface DocumentPropertyOptions {
@@ -90,6 +112,9 @@ export interface DocumentPropertyOptions {
   formula?: string;
   relation?: {
     databaseId?: string | null;
+  };
+  blocks?: {
+    primary?: boolean;
   };
   rollup?: {
     relationPropertyId?: string | null;
@@ -137,6 +162,7 @@ export const DOCUMENT_PROPERTY_TYPE_LABELS: Record<
   email: "Email",
   phone: "Phone",
   relation: "Relation",
+  blocks: "Blocks",
   formula: "Formula",
   rollup: "Rollup",
   id: "ID",
@@ -159,6 +185,65 @@ export function isComputedPropertyType(
   type: DocumentPropertyType,
 ): type is ComputedDocumentPropertyType {
   return (COMPUTED_DOCUMENT_PROPERTY_TYPES as readonly string[]).includes(type);
+}
+
+export const DEFAULT_BLOCKS_FIELD_NAME = "Content";
+
+export function isBlocksPropertyType(type: DocumentPropertyType): boolean {
+  return type === "blocks";
+}
+
+export function isPrimaryBlocksField(
+  options: DocumentPropertyOptions,
+): boolean {
+  return options.blocks?.primary === true;
+}
+
+export function countWords(content: string | null | undefined): number {
+  const text = (content ?? "")
+    // Drop fenced code blocks wholesale — they're not prose.
+    .replace(/```[\s\S]*?```/g, " ")
+    // Strip inline/other markdown punctuation that would split or pad tokens.
+    .replace(/[#>*_`~\-+=|[\]()!]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return 0;
+  return text.split(" ").filter(Boolean).length;
+}
+
+export function formatWordCount(content: string | null | undefined): string {
+  const count = countWords(content);
+  if (count === 0) return "Empty";
+  return `${count.toLocaleString()} ${count === 1 ? "word" : "words"}`;
+}
+
+export function blocksRenderMode(blocksFieldCount: number): "solo" | "multi" {
+  return blocksFieldCount >= 2 ? "multi" : "solo";
+}
+
+export function isOnlyBlocksFieldDeletion(args: {
+  type: DocumentPropertyType;
+  blocksFieldCount: number;
+}): boolean {
+  return isBlocksPropertyType(args.type) && args.blocksFieldCount <= 1;
+}
+
+export type BlocksStorageTarget = "document_body" | "block_field_store";
+
+export function blocksStorageTarget(
+  options: DocumentPropertyOptions,
+): BlocksStorageTarget {
+  return isPrimaryBlocksField(options) ? "document_body" : "block_field_store";
+}
+
+export function resolveBlocksFieldValue(args: {
+  options: DocumentPropertyOptions;
+  documentBody: string | null | undefined;
+  blockFieldContent: string | null | undefined;
+}): string {
+  return blocksStorageTarget(args.options) === "document_body"
+    ? (args.documentBody ?? "")
+    : (args.blockFieldContent ?? "");
 }
 
 export function defaultPropertyOptions(
@@ -198,6 +283,10 @@ export function defaultPropertyOptions(
     };
   }
 
+  if (type === "blocks") {
+    return { blocks: { primary: false } };
+  }
+
   return {};
 }
 
@@ -220,6 +309,10 @@ export function parsePropertyOptions(
                   ? parsed.relation.databaseId
                   : null,
             }
+          : undefined,
+      blocks:
+        parsed.blocks && typeof parsed.blocks === "object"
+          ? { primary: parsed.blocks.primary === true }
           : undefined,
       rollup:
         parsed.rollup && typeof parsed.rollup === "object"
@@ -346,8 +439,6 @@ export function normalizeDatePropertyValue(
 ): DocumentPropertyDateValue | null {
   if (value === undefined || value === null || value === "") return null;
 
-  // Accept epoch timestamps (e.g. Builder CMS date fields come back as
-  // milliseconds-since-epoch numbers) by coercing to an ISO string first.
   if (typeof value === "number" && Number.isFinite(value)) {
     const epoch = new Date(value);
     if (Number.isNaN(epoch.getTime())) return null;
@@ -404,7 +495,14 @@ export function normalizePropertyValue(
   switch (type) {
     case "number": {
       const numberValue =
-        typeof value === "number" ? value : Number(String(value).trim());
+        typeof value === "number"
+          ? value
+          : Number(
+              (typeof value === "string"
+                ? value
+                : (JSON.stringify(value) ?? "")
+              ).trim(),
+            );
       return Number.isFinite(numberValue) ? numberValue : null;
     }
     case "checkbox": {
@@ -425,7 +523,7 @@ export function normalizePropertyValue(
             .filter((item): item is string => typeof item === "string")
             .map((item) => item.trim())
             .filter(Boolean)
-        : String(value)
+        : (typeof value === "string" ? value : (JSON.stringify(value) ?? ""))
             .split(/\r?\n/)
             .map((item) => item.trim())
             .filter(Boolean);
@@ -436,10 +534,53 @@ export function normalizePropertyValue(
     case "url":
     case "email":
     case "phone":
-      return String(value);
+    case "blocks":
+      return typeof value === "string" ? value : (JSON.stringify(value) ?? "");
     case "date":
       return normalizeDatePropertyValue(value);
   }
+}
+
+function optionMatchKey(value: string) {
+  return value.trim().toLowerCase();
+}
+
+export function normalizePropertyValueWithOptions(
+  type: DocumentPropertyType,
+  value: unknown,
+  options?: DocumentPropertyOptions,
+): DocumentPropertyValue {
+  const normalized = normalizePropertyValue(type, value);
+  const optionList = options?.options ?? [];
+  if (
+    normalized === null ||
+    optionList.length === 0 ||
+    (type !== "select" && type !== "status" && type !== "multi_select")
+  ) {
+    return normalized;
+  }
+
+  const optionIdByName = new Map(
+    optionList.map((option) => [optionMatchKey(option.name), option.id]),
+  );
+  const optionIds = new Set(optionList.map((option) => option.id));
+  const resolveOptionId = (candidate: string) =>
+    optionIds.has(candidate)
+      ? candidate
+      : (optionIdByName.get(optionMatchKey(candidate)) ?? candidate);
+
+  if (type === "multi_select") {
+    const resolved = new Set<string>();
+    for (const item of Array.isArray(normalized) ? normalized : []) {
+      const optionId = resolveOptionId(item);
+      if (optionId.trim()) resolved.add(optionId);
+    }
+    return Array.from(resolved);
+  }
+
+  return typeof normalized === "string"
+    ? resolveOptionId(normalized)
+    : normalized;
 }
 
 export function formulaValueText(value: DocumentPropertyValue): string {
@@ -450,7 +591,10 @@ export function formulaValueText(value: DocumentPropertyValue): string {
     const end = value.end?.trim();
     return end ? `${start} - ${end}` : start;
   }
-  return String(value);
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean")
+    return String(value);
+  return JSON.stringify(value) ?? "";
 }
 
 export function evaluatePropertyFormula(
@@ -863,9 +1007,6 @@ function evaluateFormulaFunction(
   }
 }
 
-// URL-style slug (lowercase, non-alphanumeric runs → "-", trimmed). Distinct
-// from `slugifySourceField` in _database-source-utils, which slugs field *keys*
-// with "_" — different output space, kept separate on purpose.
 export function slugifyFormulaText(value: string): string {
   return value
     .trim()
@@ -874,8 +1015,6 @@ export function slugifyFormulaText(value: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-// Reduce a URL to its path so a host-qualified URL normalizes to the same key
-// as a relative one.
 function stripUrlHost(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return "";
@@ -969,8 +1108,6 @@ export function sanitizeNormalizationFormula(
   return trimmed;
 }
 
-// A bad pattern yields null (an un-joinable key) rather than throwing on the
-// read path — a broken formula fails visibly as "no match", never silently.
 function regexExtractFormula(
   value: string,
   pattern: string,

@@ -1,89 +1,39 @@
-/**
- * Server-side agent presence lifecycle for collaborative editing.
- *
- * Provides enter/leave semantics so the agent behaves like a real
- * collaborator — it "enters" a document, its edits are visible with
- * durable presence, and it "leaves" when done. Actions call these
- * instead of hand-rolling HTTP awareness calls.
- */
-
-import { getDocAwareness, type AwarenessEntry } from "./awareness.js";
 import { AGENT_CLIENT_ID, DEFAULT_AGENT_IDENTITY } from "./agent-identity.js";
+import { deleteAwarenessRow, upsertAwarenessRow } from "./awareness-store.js";
+import {
+  emitAwarenessChange,
+  forgetAwarenessClear,
+  getDocAwareness,
+  rememberAwarenessClear,
+  type AwarenessEntry,
+} from "./awareness.js";
+import { appendRecentEdit, type RecentEdit } from "./recent-edits.js";
 import { searchAndReplace } from "./ydoc-manager.js";
 
-const HEARTBEAT_INTERVAL = 10_000; // 10 seconds
+const HEARTBEAT_INTERVAL = 10_000;
 
-// docId → heartbeat interval handle
+export const AGENT_PRESENCE_LINGER_MS = 6_000;
+
 const _heartbeats = new Map<string, NodeJS.Timeout>();
-// docId → reference count (how many concurrent operations are using this doc)
 const _refCounts = new Map<string, number>();
+const _lingerTimers = new Map<string, NodeJS.Timeout>();
 
-/**
- * Mark the agent as present on a document.
- *
- * Sets an awareness entry for the agent and starts a heartbeat that
- * keeps it alive. If the agent is already present on this doc, just
- * refreshes `lastSeen` without creating a second interval.
- */
-export function agentEnterDocument(
-  docId: string,
-  metadata?: Record<string, unknown>,
-): void {
-  const map = getDocAwareness(docId);
-
-  const state = JSON.stringify({
-    user: {
-      name: DEFAULT_AGENT_IDENTITY.name,
-      email: DEFAULT_AGENT_IDENTITY.email,
-      color: DEFAULT_AGENT_IDENTITY.color,
-    },
-    ...metadata,
-  });
-
-  const entry: AwarenessEntry = {
-    clientId: AGENT_CLIENT_ID,
-    state,
-    lastSeen: Date.now(),
-  };
-  map.set(AGENT_CLIENT_ID, entry);
-
-  // Increment reference count
-  _refCounts.set(docId, (_refCounts.get(docId) ?? 0) + 1);
-
-  // Don't create another interval if one already exists
-  if (_heartbeats.has(docId)) return;
-
-  const interval = setInterval(() => {
-    const m = getDocAwareness(docId);
-    const existing = m.get(AGENT_CLIENT_ID);
-    if (existing) {
-      existing.lastSeen = Date.now();
-    }
-  }, HEARTBEAT_INTERVAL);
-
-  // Don't block Node from exiting if this is the only timer left
-  if (typeof interval === "object" && "unref" in interval) {
-    interval.unref();
+function cancelLinger(docId: string): void {
+  const timer = _lingerTimers.get(docId);
+  if (timer) {
+    clearTimeout(timer);
+    _lingerTimers.delete(docId);
   }
-
-  _heartbeats.set(docId, interval);
 }
 
-/**
- * Remove the agent's presence from a document.
- *
- * Clears the awareness entry and stops the heartbeat.
- */
-export function agentLeaveDocument(docId: string): void {
-  const count = (_refCounts.get(docId) ?? 1) - 1;
-  if (count > 0) {
-    _refCounts.set(docId, count);
-    return;
-  }
-  _refCounts.delete(docId);
-
+function removeAgentPresence(docId: string): void {
+  cancelLinger(docId);
+  const clearedAt = Date.now();
+  rememberAwarenessClear(docId, AGENT_CLIENT_ID, clearedAt);
   const map = getDocAwareness(docId);
   map.delete(AGENT_CLIENT_ID);
+  emitAwarenessChange(docId, currentAwarenessStates(map));
+  void deleteAwarenessRow(docId, AGENT_CLIENT_ID, clearedAt);
 
   const interval = _heartbeats.get(docId);
   if (interval) {
@@ -92,47 +42,156 @@ export function agentLeaveDocument(docId: string): void {
   }
 }
 
-/**
- * Update the agent's awareness state to include selection info
- * (e.g., which track, panel, or element the agent is working on).
- */
-export function agentUpdateSelection(
-  docId: string,
-  selection: Record<string, unknown>,
-): void {
-  const map = getDocAwareness(docId);
-  const existing = map.get(AGENT_CLIENT_ID);
+function scheduleLingerRemoval(docId: string, lingerMs: number): void {
+  cancelLinger(docId);
+  if (lingerMs <= 0) {
+    removeAgentPresence(docId);
+    return;
+  }
+  const timer = setTimeout(() => {
+    _lingerTimers.delete(docId);
+    if ((_refCounts.get(docId) ?? 0) > 0) return;
+    removeAgentPresence(docId);
+  }, lingerMs);
+  if (typeof timer === "object" && "unref" in timer) {
+    timer.unref();
+  }
+  _lingerTimers.set(docId, timer);
+}
 
-  let parsed: Record<string, unknown> = {
+function ensureHeartbeat(docId: string): void {
+  if (_heartbeats.has(docId)) return;
+
+  const interval = setInterval(() => {
+    const m = getDocAwareness(docId);
+    const existing = m.get(AGENT_CLIENT_ID);
+    if (existing) {
+      existing.lastSeen = Date.now();
+      void upsertAwarenessRow(
+        docId,
+        AGENT_CLIENT_ID,
+        existing.state,
+        existing.lastSeen,
+      );
+    }
+  }, HEARTBEAT_INTERVAL);
+
+  if (typeof interval === "object" && "unref" in interval) {
+    interval.unref();
+  }
+
+  _heartbeats.set(docId, interval);
+}
+
+function currentAwarenessStates(map: Map<number, AwarenessEntry>) {
+  return Array.from(map, ([clientId, entry]) => ({
+    clientId,
+    state: entry.state,
+  }));
+}
+
+function readAgentState(docId: string): Record<string, unknown> {
+  const existing = getDocAwareness(docId).get(AGENT_CLIENT_ID);
+  if (existing) {
+    try {
+      return JSON.parse(existing.state) as Record<string, unknown>;
+    } catch {
+      // Invalid state — fall through to defaults
+    }
+  }
+  return {
     user: {
       name: DEFAULT_AGENT_IDENTITY.name,
       email: DEFAULT_AGENT_IDENTITY.email,
       color: DEFAULT_AGENT_IDENTITY.color,
     },
   };
-
-  if (existing) {
-    try {
-      parsed = JSON.parse(existing.state) as Record<string, unknown>;
-    } catch {
-      // Invalid state — use defaults
-    }
-  }
-
-  const state = JSON.stringify({ ...parsed, ...selection });
-  map.set(AGENT_CLIENT_ID, {
-    clientId: AGENT_CLIENT_ID,
-    state,
-    lastSeen: Date.now(),
-  });
 }
 
-/**
- * Apply search-and-replace edits incrementally so each one appears
- * as a separate poll event to connected clients.
- *
- * Enters the document before editing and leaves in a finally block.
- */
+function writeAgentState(docId: string, state: Record<string, unknown>): void {
+  forgetAwarenessClear(docId, AGENT_CLIENT_ID);
+  const entry: AwarenessEntry = {
+    clientId: AGENT_CLIENT_ID,
+    state: JSON.stringify(state),
+    lastSeen: Date.now(),
+  };
+  const map = getDocAwareness(docId);
+  map.set(AGENT_CLIENT_ID, entry);
+  emitAwarenessChange(docId, currentAwarenessStates(map));
+  void upsertAwarenessRow(docId, AGENT_CLIENT_ID, entry.state, entry.lastSeen);
+}
+
+export function agentEnterDocument(
+  docId: string,
+  metadata?: Record<string, unknown>,
+): void {
+  cancelLinger(docId);
+
+  const state = { ...readAgentState(docId), ...metadata };
+  writeAgentState(docId, state);
+
+  _refCounts.set(docId, (_refCounts.get(docId) ?? 0) + 1);
+
+  ensureHeartbeat(docId);
+}
+
+export interface AgentLeaveOptions {
+  lingerMs?: number;
+}
+
+export function agentLeaveDocument(
+  docId: string,
+  options?: AgentLeaveOptions,
+): void {
+  const count = (_refCounts.get(docId) ?? 1) - 1;
+  if (count > 0) {
+    _refCounts.set(docId, count);
+    return;
+  }
+  _refCounts.delete(docId);
+
+  scheduleLingerRemoval(docId, options?.lingerMs ?? AGENT_PRESENCE_LINGER_MS);
+}
+
+export function agentUpdateSelection(
+  docId: string,
+  selection: Record<string, unknown>,
+): void {
+  const state = { ...readAgentState(docId), ...selection };
+  writeAgentState(docId, state);
+}
+
+export interface AgentTouchOptions {
+  edit?: Omit<RecentEdit, "at"> & { at?: number };
+  metadata?: Record<string, unknown>;
+  lingerMs?: number;
+}
+
+export function agentTouchDocument(
+  docId: string,
+  options?: AgentTouchOptions,
+): void {
+  cancelLinger(docId);
+
+  const state = { ...readAgentState(docId), ...(options?.metadata ?? {}) };
+  const now = Date.now();
+  if (options?.edit) {
+    const { at, ...rest } = options.edit;
+    state.recentEdits = appendRecentEdit(
+      state.recentEdits as RecentEdit[] | undefined,
+      { ...rest, at: at ?? now },
+    );
+  }
+  state.lastEditAt = now;
+  writeAgentState(docId, state);
+
+  ensureHeartbeat(docId);
+
+  if ((_refCounts.get(docId) ?? 0) === 0) {
+    scheduleLingerRemoval(docId, options?.lingerMs ?? AGENT_PRESENCE_LINGER_MS);
+  }
+}
+
 export async function agentApplyEditsIncrementally(
   docId: string,
   edits: Array<{ find: string; replace: string }>,
@@ -153,12 +212,6 @@ export async function agentApplyEditsIncrementally(
   }
 }
 
-/**
- * Apply structured data patches incrementally so each one appears
- * as a separate poll event to connected clients.
- *
- * Enters the document before patching and leaves in a finally block.
- */
 export async function agentApplyPatchesIncrementally(
   docId: string,
   fieldName: string,

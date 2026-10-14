@@ -1,10 +1,11 @@
+import { readBody } from "@agent-native/core/server";
 import { defineEventHandler, setResponseStatus } from "h3";
+
 import { credentialKeys } from "../../lib/credential-keys";
 import {
-  deleteCredential,
+  deleteResolvedCredential,
   getCredentialContextFromEvent,
 } from "../../lib/credentials";
-import { readBody } from "@agent-native/core/server";
 
 const ALLOWED_KEYS = new Set(credentialKeys.map((k) => k.key));
 
@@ -32,7 +33,7 @@ export default defineEventHandler(async (event) => {
   }
 
   for (const key of filtered) {
-    await deleteCredential(key, ctx);
+    await deleteResolvedCredential(key, ctx);
   }
 
   return { deleted: filtered };

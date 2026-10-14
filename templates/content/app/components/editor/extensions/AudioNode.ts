@@ -1,11 +1,13 @@
 import { Node } from "@tiptap/core";
 import { ReactNodeViewRenderer } from "@tiptap/react";
 import { defaultMarkdownSerializer } from "prosemirror-markdown";
+
 import { AudioBlock } from "./AudioBlock";
 
 export interface ContentAudioOptions {
   HTMLAttributes: Record<string, unknown>;
   documentId?: string;
+  canMutateMedia?: () => boolean;
   onAudioComment?: (quotedText: string, offsetTop: number) => void;
 }
 
@@ -57,6 +59,7 @@ export const AudioNode = Node.create<ContentAudioOptions>({
     return {
       HTMLAttributes: {},
       documentId: undefined,
+      canMutateMedia: undefined,
       onAudioComment: undefined,
     };
   },

@@ -1,22 +1,16 @@
+import { trackEvent } from "@agent-native/core/client/analytics";
+import { useT } from "@agent-native/core/client/i18n";
+import {
+  IconChevronDown,
+  IconDeviceFloppy,
+  IconFolderOpen,
+  IconFilePlus,
+  IconTrash,
+} from "@tabler/icons-react";
 import { useMemo, useState, useEffect } from "react";
 import { useSearchParams } from "react-router";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Card, CardContent } from "@/components/ui/card";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-} from "@/components/ui/dialog";
+
+import { ResourceLoadError } from "@/components/ResourceLoadError";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -27,29 +21,44 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
 import {
-  IconChevronDown,
-  IconDeviceFloppy,
-  IconFolderOpen,
-  IconFilePlus,
-  IconTrash,
-} from "@tabler/icons-react";
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
 import { useMetricsQuery } from "@/lib/query-metrics";
-import { EventPanel } from "./components/EventPanel";
+
+import { DateRangeInput } from "../_shared/components/DateRangeInput";
 import { ChartTypePicker } from "./components/ChartTypePicker";
-import { ExplorerChart } from "./components/ExplorerChart";
 import { DateRangePicker } from "./components/DateRangePicker";
+import { EventPanel } from "./components/EventPanel";
+import { ExplorerChart } from "./components/ExplorerChart";
 import { SqlPreview } from "./components/SqlPreview";
+import { buildSql, dateRangeToDays } from "./sql-builder";
+import type { DateRange } from "./types";
 import { useExplorerConfig } from "./use-explorer-config";
-import { buildSql } from "./sql-builder";
 
 export default function ExplorerPage() {
+  const t = useT();
   const [searchParams] = useSearchParams();
   const {
     config,
     setConfig,
     currentId,
     savedConfigs,
+    savedConfigsError,
+    retrySavedConfigs,
     loadConfig,
     saveConfig,
     deleteConfig,
@@ -57,7 +66,6 @@ export default function ExplorerPage() {
     isSaving,
   } = useExplorerConfig();
 
-  // Support ?config=<id> URL param to auto-load a saved config
   const configParam = searchParams.get("config");
   const [loadedParam, setLoadedParam] = useState<string | null>(null);
   useEffect(() => {
@@ -66,7 +74,7 @@ export default function ExplorerPage() {
       configParam !== loadedParam &&
       configParam !== currentId
     ) {
-      loadConfig(configParam);
+      void loadConfig(configParam);
       setLoadedParam(configParam);
     }
   }, [configParam, loadedParam, currentId, loadConfig]);
@@ -88,9 +96,20 @@ export default function ExplorerPage() {
     { enabled: hasValidEvents && sql.length > 0 },
   );
 
+  useEffect(() => {
+    if (!result || result.error || !hasValidEvents) return;
+    trackEvent("sql_run", {
+      app_name: "analytics",
+      template_name: "analytics",
+      surface: "explorer",
+      row_count: result.rows.length,
+      column_count: result.schema?.length ?? 0,
+    });
+  }, [hasValidEvents, result]);
+
   const handleSave = () => {
     if (currentId) {
-      saveConfig();
+      void saveConfig();
     } else {
       setSaveName(config.name || "");
       setSaveDialogOpen(true);
@@ -103,10 +122,27 @@ export default function ExplorerPage() {
   };
 
   const handleSaveConfirm = () => {
-    const name = saveName.trim() || "Untitled";
+    const name = saveName.trim() || t("explorer.untitled");
     setConfig({ ...config, name });
-    saveConfig(name);
+    void saveConfig(name);
     setSaveDialogOpen(false);
+  };
+
+  const handleDateRangeChange = (dateRange: DateRange) => {
+    if (dateRange !== "custom") {
+      setConfig({ ...config, dateRange });
+      return;
+    }
+    const start = new Date();
+    start.setDate(start.getDate() - dateRangeToDays(config.dateRange));
+    setConfig({
+      ...config,
+      dateRange,
+      customDateStart:
+        config.customDateStart || start.toISOString().slice(0, 10),
+      customDateEnd:
+        config.customDateEnd || new Date().toISOString().slice(0, 10),
+    });
   };
 
   return (
@@ -114,7 +150,9 @@ export default function ExplorerPage() {
       {/* Header bar */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div className="flex items-center gap-2 min-w-0">
-          <h2 className="text-lg font-semibold shrink-0">Explorer</h2>
+          <h2 className="text-lg font-semibold shrink-0">
+            {t("explorer.title")}
+          </h2>
           {currentId && (
             <span className="text-sm text-muted-foreground truncate">
               — {config.name}
@@ -130,62 +168,86 @@ export default function ExplorerPage() {
             disabled={isSaving}
           >
             <IconDeviceFloppy className="h-4 w-4 mr-1" />
-            {isSaving ? "Saving..." : "Save"}
+            {isSaving ? t("explorer.saving") : t("explorer.save")}
           </Button>
 
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button size="sm" variant="outline">
                 <IconFolderOpen className="h-4 w-4 mr-1" />
-                Load
+                {t("explorer.load")}
                 <IconChevronDown className="h-3 w-3 ml-1" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-56">
               <DropdownMenuItem onClick={newConfig}>
                 <IconFilePlus className="h-4 w-4 mr-2" />
-                New Explorer
+                {t("explorer.newExplorer")}
               </DropdownMenuItem>
               {currentId && (
                 <DropdownMenuItem onClick={handleSaveAs}>
                   <IconDeviceFloppy className="h-4 w-4 mr-2" />
-                  Save As...
+                  {t("explorer.saveAs")}
                 </DropdownMenuItem>
               )}
-              {savedConfigs.length > 0 && <DropdownMenuSeparator />}
-              {savedConfigs.map((sc) => (
-                <DropdownMenuItem
-                  key={sc.id}
-                  className="flex items-center justify-between"
-                  onClick={() => loadConfig(sc.id)}
-                >
-                  <span className="truncate">{sc.name}</span>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-5 w-5 shrink-0 ml-2"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setDeleteConfirm({ id: sc.id, name: sc.name });
-                    }}
+              {(savedConfigsError || savedConfigs.length > 0) && (
+                <DropdownMenuSeparator />
+              )}
+              {savedConfigsError ? (
+                <ResourceLoadError
+                  inline
+                  message={t("commandPalette.loadFailed")}
+                  retryLabel={t("sidebar.retry")}
+                  onRetry={() => void retrySavedConfigs()}
+                />
+              ) : (
+                savedConfigs.map((sc) => (
+                  <DropdownMenuItem
+                    key={sc.id}
+                    className="flex items-center justify-between"
+                    onClick={() => loadConfig(sc.id)}
                   >
-                    <IconTrash className="h-3 w-3 text-destructive" />
-                  </Button>
-                </DropdownMenuItem>
-              ))}
+                    <span className="truncate">{sc.name}</span>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-5 w-5 shrink-0 ml-2"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setDeleteConfirm({ id: sc.id, name: sc.name });
+                      }}
+                    >
+                      <IconTrash className="h-3 w-3 text-destructive" />
+                    </Button>
+                  </DropdownMenuItem>
+                ))
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
 
           {/* Date range */}
           <DateRangePicker
             value={config.dateRange}
-            onChange={(dateRange) => setConfig({ ...config, dateRange })}
+            onChange={handleDateRangeChange}
           />
+          {config.dateRange === "custom" && (
+            <DateRangeInput
+              label={t("sqlDashboard.customRange")}
+              startDate={config.customDateStart || ""}
+              endDate={config.customDateEnd || ""}
+              onStartChange={(customDateStart) =>
+                setConfig({ ...config, customDateStart })
+              }
+              onEndChange={(customDateEnd) =>
+                setConfig({ ...config, customDateEnd })
+              }
+            />
+          )}
         </div>
       </div>
 
       {/* Config panel */}
-      <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto] gap-4 items-start">
+      <div className="analytics-explorer-config-grid grid grid-cols-1 gap-4 items-start">
         <div className="space-y-4">
           <EventPanel
             events={config.events}
@@ -193,7 +255,9 @@ export default function ExplorerPage() {
           />
 
           <div className="flex items-center gap-3">
-            <span className="text-sm text-muted-foreground">Chart Type</span>
+            <span className="text-sm text-muted-foreground">
+              {t("explorer.chartType")}
+            </span>
             <ChartTypePicker
               value={config.chartType}
               onChange={(chartType) => setConfig({ ...config, chartType })}
@@ -217,10 +281,10 @@ export default function ExplorerPage() {
       <Dialog open={saveDialogOpen} onOpenChange={setSaveDialogOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Save Explorer</DialogTitle>
+            <DialogTitle>{t("explorer.saveExplorer")}</DialogTitle>
           </DialogHeader>
           <Input
-            placeholder="Dashboard name..."
+            placeholder={t("explorer.dashboardNamePlaceholder")}
             value={saveName}
             onChange={(e) => setSaveName(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleSaveConfirm()}
@@ -228,9 +292,9 @@ export default function ExplorerPage() {
           />
           <DialogFooter>
             <Button variant="outline" onClick={() => setSaveDialogOpen(false)}>
-              Cancel
+              {t("sidebar.cancel")}
             </Button>
-            <Button onClick={handleSaveConfirm}>Save</Button>
+            <Button onClick={handleSaveConfirm}>{t("explorer.save")}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -242,22 +306,26 @@ export default function ExplorerPage() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete saved explorer?</AlertDialogTitle>
+            <AlertDialogTitle>
+              {t("explorer.deleteSavedExplorerTitle")}
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              Delete &ldquo;{deleteConfirm?.name}&rdquo;? This cannot be undone.
+              {t("explorer.deleteSavedExplorerDescription", {
+                name: deleteConfirm?.name ?? "",
+              })}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogCancel>{t("sidebar.cancel")}</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {
                 if (deleteConfirm) {
-                  deleteConfig(deleteConfirm.id);
+                  void deleteConfig(deleteConfirm.id);
                   setDeleteConfirm(null);
                 }
               }}
             >
-              Delete
+              {t("sidebar.delete")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

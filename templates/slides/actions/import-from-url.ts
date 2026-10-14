@@ -1,18 +1,25 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
+import { extractRenderedDesignSystemFromUrl } from "@agent-native/creative-context/server";
 import { z } from "zod";
-import { extractDesignTokensFromUrl } from "@agent-native/core/server/design-token-utils";
 
 export default defineAction({
   description:
-    "Analyze a website URL to extract design tokens (colors, fonts, metadata) " +
-    "for use in creating or updating a design project. " +
-    "Returns extracted CSS variables, font faces, colors, and meta information.",
+    "Analyze a website URL in a real browser and return a bounded design.md-style " +
+    "visual system: computed colors, typography, spacing, radii, shadows, " +
+    "component styles, CSS variables, logo references, and reusable Brand Kit data. " +
+    "Uses a static SSRF-safe fallback only when a browser is unavailable.",
   schema: z.object({
-    url: z.string().describe("Website URL to analyze"),
+    url: z
+      .string()
+      .url()
+      .refine((value) => /^https?:\/\//i.test(value), {
+        message: "Website URL must use http or https.",
+      })
+      .describe("Website URL to analyze"),
   }),
   readOnly: true,
   http: { method: "GET" },
   run: async ({ url }) => {
-    return extractDesignTokensFromUrl(url);
+    return extractRenderedDesignSystemFromUrl(url);
   },
 });

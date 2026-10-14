@@ -1,6 +1,10 @@
-import { defineAction } from "@agent-native/core";
-import { getWorkspaceAppIdValidationError } from "@agent-native/core/shared";
+import { defineAction } from "@agent-native/core/action";
+import {
+  getWorkspaceAppIdValidationError,
+  normalizeWorkspaceAppId,
+} from "@agent-native/core/shared";
 import { z } from "zod";
+
 import { scaffoldWorkspaceAppFromTemplate } from "../server/lib/app-creation-store.js";
 
 function userFacingActionError(err: unknown): Error & { statusCode: number } {
@@ -21,17 +25,21 @@ export default defineAction({
       .string()
       .min(1)
       .describe(
-        "Template name (mail, calendar, slides, content, clips, analytics, forms, design, videos)",
+        "Template name (mail, calendar, slides, content, clips, analytics, forms, design, assets)",
       ),
     appId: z
       .string()
       .max(64)
+      .transform(normalizeWorkspaceAppId)
       .optional()
       .nullable()
-      .refine((appId) => !appId || !getWorkspaceAppIdValidationError(appId), {
-        message:
-          "Use a non-reserved app id with lowercase letters, numbers, and hyphens.",
-      })
+      .refine(
+        (appId) => appId == null || !getWorkspaceAppIdValidationError(appId),
+        {
+          message:
+            "Use a non-reserved app id with lowercase letters, numbers, and hyphens.",
+        },
+      )
       .describe(
         "Optional override for the apps/<id>/ directory name; defaults to the template name",
       ),

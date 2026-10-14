@@ -1,18 +1,26 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   addAgentNativeSkill,
   AGENT_NATIVE_SKILL_METADATA_FILE,
+  CONNECTION_REFERENCE_MD,
   parseSkillsArgs,
   runSkills,
+  VISUAL_RECAP_SKILL_MD,
 } from "./skills.js";
+import {
+  CHAT_STARTER_SKILLS,
+  BUILDER_CODE_STARTER_SKILLS,
+} from "./workspace-skill-policy.js";
+import { WORKSPACE_SKILLS } from "./workspace-skill-policy.js";
 
 const tmpRoots: string[] = [];
-const PLANS_SKILL_NAMES = ["visual-plan", "visual-recap"];
+const PLANS_SKILL_NAMES = ["visual-plan", "visual-recap", "visualize-repo"];
 
 afterEach(() => {
   for (const root of tmpRoots.splice(0)) {
@@ -24,6 +32,73 @@ afterEach(() => {
 function tmpDir(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "an-skills-"));
   tmpRoots.push(root);
+  return root;
+}
+
+function writeContentAppSkillFixture(root: string): string {
+  const skillRoot = path.join(root, ".agents", "skills", "content");
+  fs.mkdirSync(skillRoot, { recursive: true });
+  fs.writeFileSync(
+    path.join(skillRoot, "SKILL.md"),
+    [
+      "---",
+      "name: content",
+      "description: Use Content for local docs.",
+      "metadata:",
+      "  visibility: exported",
+      "---",
+      "",
+      "# Content",
+      "",
+      "Use Content for docs.",
+      "",
+    ].join("\n"),
+    "utf-8",
+  );
+  fs.writeFileSync(
+    path.join(root, "agent-native.app-skill.json"),
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        id: "content",
+        displayName: "Content",
+        description: "Edit docs, blogs, resources, and MDX content.",
+        hosted: {
+          url: "https://content.agent-native.com",
+          mcpUrl: "https://content.agent-native.com/mcp",
+        },
+        mcp: {
+          serverName: "agent-native-content",
+        },
+        local: {
+          sourcePath: ".",
+          defaultUrl: "http://127.0.0.1:8083",
+          commands: {
+            install: "pnpm install",
+            dev: "pnpm dev",
+          },
+        },
+        surfaces: [
+          {
+            id: "content-documents",
+            action: "list-documents",
+            path: "/",
+          },
+        ],
+        skills: [
+          {
+            path: ".agents/skills/content",
+            visibility: "both",
+            exportAs: "content",
+          },
+        ],
+        hostAdapters: ["plain-skill", "claude-skill", "generic-mcp"],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf-8",
+  );
   return root;
 }
 
@@ -45,9 +120,9 @@ describe("agent-native skills", () => {
       "utf-8",
     );
 
-    expect(source).toContain("Hosted plans, shareable links");
+    expect(source).toContain("Hosted plans, shareable links (recommended)");
     expect(source).toContain(
-      "Recommended. 100% free and open source. Stores plans at plan.agent-native.com with sharing, comments, and browser editor.",
+      "100% free and open source. Supports comments, browser editor, and sharing.",
     );
   });
 
@@ -60,6 +135,557 @@ describe("agent-native skills", () => {
       instructions: true,
       mcp: true,
     });
+  });
+
+  it("installs Rewind instructions and repairs the local Screen Memory MCP together", async () => {
+    const root = tmpDir();
+    const home = path.join(root, "home");
+    const codexHome = path.join(root, "codex-home");
+    const store = path.join(root, "screen-memory");
+    fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.mkdirSync(store, { recursive: true });
+    const previousHome = process.env.HOME;
+    const previousCodexHome = process.env.CODEX_HOME;
+    const previousStore = process.env.CLIPS_SCREEN_MEMORY_DIR;
+    process.env.HOME = home;
+    process.env.CODEX_HOME = codexHome;
+    process.env.CLIPS_SCREEN_MEMORY_DIR = store;
+
+    try {
+      const result = await addAgentNativeSkill(
+        parseSkillsArgs([
+          "add",
+          "rewind",
+          "--client",
+          "codex",
+          "--scope",
+          "user",
+          "--yes",
+        ]),
+        { baseDir: root },
+      );
+
+      expect(result).toMatchObject({
+        id: "rewind",
+        skillNames: ["rewind"],
+        mcpUrl: "",
+        mcpClients: ["codex"],
+      });
+      expect(
+        fs.readFileSync(
+          path.join(codexHome, "skills", "rewind", "SKILL.md"),
+          "utf-8",
+        ),
+      ).toContain("ask permission\n   before opening or downloading anything");
+      expect(
+        fs.readFileSync(
+          path.join(codexHome, "skills", "rewind", "SKILL.md"),
+          "utf-8",
+        ),
+      ).toContain("https://clips.agent-native.com/download");
+      const config = fs.readFileSync(
+        path.join(codexHome, "config.toml"),
+        "utf-8",
+      );
+      expect(config).toContain("clips-screen-memory");
+      // A TOML basic string escapes Windows backslashes the way JSON does.
+      expect(config).toContain(JSON.stringify(path.resolve(store)));
+      expect(result.commands).toContain(
+        "npx @agent-native/core@latest mcp install-screen-memory --client codex --scope user",
+      );
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      if (previousStore === undefined)
+        delete process.env.CLIPS_SCREEN_MEMORY_DIR;
+      else process.env.CLIPS_SCREEN_MEMORY_DIR = previousStore;
+    }
+  });
+
+  it("rejects Rewind installs that disable the local Screen Memory MCP", async () => {
+    const root = tmpDir();
+    const codexHome = path.join(root, "codex-home");
+    fs.mkdirSync(codexHome, { recursive: true });
+    const previousCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = codexHome;
+
+    try {
+      await expect(
+        addAgentNativeSkill(
+          parseSkillsArgs([
+            "add",
+            "rewind",
+            "--client",
+            "codex",
+            "--scope",
+            "user",
+            "--no-mcp",
+            "--yes",
+          ]),
+          { baseDir: root },
+        ),
+      ).rejects.toThrow("cannot be installed with --no-mcp");
+
+      expect(
+        fs.existsSync(path.join(codexHome, "skills", "rewind", "SKILL.md")),
+      ).toBe(false);
+      expect(fs.existsSync(path.join(codexHome, "config.toml"))).toBe(false);
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+    }
+  });
+
+  it.each([["--no-mcp"], ["--mcp-url", "https://example.com/mcp"]])(
+    "rejects incompatible multi-skill Rewind requests before any write (%s)",
+    async (...flags) => {
+      const root = tmpDir();
+      const home = path.join(root, "home");
+      const codexHome = path.join(root, "codex-home");
+      const telemetry = { track: vi.fn(), flush: vi.fn(async () => {}) };
+      fs.mkdirSync(home, { recursive: true });
+      fs.mkdirSync(codexHome, { recursive: true });
+      const previousHome = process.env.HOME;
+      const previousCodexHome = process.env.CODEX_HOME;
+      process.env.HOME = home;
+      process.env.CODEX_HOME = codexHome;
+
+      try {
+        await expect(
+          runSkills(
+            [
+              "add",
+              "--skill",
+              "assets",
+              "--skill",
+              "screen-memory",
+              "--client",
+              "codex",
+              "--scope",
+              "user",
+              "--yes",
+              ...flags,
+            ],
+            { baseDir: root, telemetry },
+          ),
+        ).rejects.toThrow(
+          /Rewind (requires|uses) the local Clips Screen Memory MCP/,
+        );
+
+        expect(fs.existsSync(path.join(codexHome, "skills"))).toBe(false);
+        expect(fs.existsSync(path.join(codexHome, "config.toml"))).toBe(false);
+        expect(telemetry.track).not.toHaveBeenCalled();
+      } finally {
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+        if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = previousCodexHome;
+      }
+    },
+  );
+
+  it.each([["--no-mcp"], ["--mcp-url", "https://example.com/mcp"]])(
+    "rejects prompted multi-skill Rewind selections before telemetry or writes (%s)",
+    async (...flags) => {
+      const root = tmpDir();
+      const home = path.join(root, "home");
+      const codexHome = path.join(root, "codex-home");
+      const telemetry = {
+        track: vi.fn(),
+        captureException: vi.fn(),
+        flush: vi.fn(async () => {}),
+      };
+      fs.mkdirSync(home, { recursive: true });
+      fs.mkdirSync(codexHome, { recursive: true });
+      const previousHome = process.env.HOME;
+      const previousCodexHome = process.env.CODEX_HOME;
+      process.env.HOME = home;
+      process.env.CODEX_HOME = codexHome;
+
+      try {
+        await expect(
+          runSkills(["add", ...flags], {
+            baseDir: root,
+            isInteractive: () => true,
+            promptSkills: async () => ["assets", "rewind"],
+            telemetry,
+          }),
+        ).rejects.toThrow(
+          /Rewind (requires|uses) the local Clips Screen Memory MCP/,
+        );
+
+        expect(fs.existsSync(path.join(codexHome, "skills"))).toBe(false);
+        expect(fs.existsSync(path.join(codexHome, "config.toml"))).toBe(false);
+        expect(telemetry.track).not.toHaveBeenCalled();
+        expect(telemetry.captureException).not.toHaveBeenCalled();
+        expect(telemetry.flush).not.toHaveBeenCalled();
+      } finally {
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+        if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = previousCodexHome;
+      }
+    },
+  );
+
+  it("directs missing-store installs to Clips without claiming native setup", async () => {
+    const root = tmpDir();
+    const home = path.join(root, "home");
+    const codexHome = path.join(root, "codex-home");
+    fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(codexHome, { recursive: true });
+    const previousHome = process.env.HOME;
+    const previousCodexHome = process.env.CODEX_HOME;
+    const previousStore = process.env.CLIPS_SCREEN_MEMORY_DIR;
+    const previousLegacyStore = process.env.AGENT_NATIVE_SCREEN_MEMORY_DIR;
+    process.env.HOME = home;
+    process.env.CODEX_HOME = codexHome;
+    delete process.env.CLIPS_SCREEN_MEMORY_DIR;
+    delete process.env.AGENT_NATIVE_SCREEN_MEMORY_DIR;
+
+    try {
+      await expect(
+        addAgentNativeSkill(
+          parseSkillsArgs([
+            "add",
+            "rewind",
+            "--client",
+            "codex",
+            "--scope",
+            "user",
+            "--yes",
+          ]),
+          { baseDir: root },
+        ),
+      ).rejects.toThrow(
+        /https:\/\/clips\.agent-native\.com\/download.*was not installed or enabled automatically/,
+      );
+
+      expect(
+        fs.existsSync(path.join(codexHome, "skills", "rewind", "SKILL.md")),
+      ).toBe(false);
+      expect(fs.existsSync(path.join(codexHome, "config.toml"))).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      if (previousStore === undefined)
+        delete process.env.CLIPS_SCREEN_MEMORY_DIR;
+      else process.env.CLIPS_SCREEN_MEMORY_DIR = previousStore;
+      if (previousLegacyStore === undefined)
+        delete process.env.AGENT_NATIVE_SCREEN_MEMORY_DIR;
+      else process.env.AGENT_NATIVE_SCREEN_MEMORY_DIR = previousLegacyStore;
+    }
+  });
+
+  it("rejects a missing Rewind store before telemetry or user config writes", async () => {
+    const root = tmpDir();
+    const home = path.join(root, "home");
+    const codexHome = path.join(root, "codex-home");
+    fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(codexHome, { recursive: true });
+    const previousHome = process.env.HOME;
+    const previousCodexHome = process.env.CODEX_HOME;
+    const previousStore = process.env.CLIPS_SCREEN_MEMORY_DIR;
+    const previousLegacyStore = process.env.AGENT_NATIVE_SCREEN_MEMORY_DIR;
+    process.env.HOME = home;
+    process.env.CODEX_HOME = codexHome;
+    delete process.env.CLIPS_SCREEN_MEMORY_DIR;
+    delete process.env.AGENT_NATIVE_SCREEN_MEMORY_DIR;
+    const telemetry = {
+      track: vi.fn(),
+      captureException: vi.fn(),
+      flush: vi.fn(async () => undefined),
+    };
+
+    try {
+      await expect(
+        runSkills(
+          ["add", "rewind", "--client", "codex", "--scope", "user", "--yes"],
+          { baseDir: root, telemetry },
+        ),
+      ).rejects.toThrow(
+        /https:\/\/clips\.agent-native\.com\/download.*was not installed or enabled automatically/,
+      );
+      await expect(
+        runSkills(
+          [
+            "add",
+            "--skill",
+            "rewind",
+            "--client",
+            "codex",
+            "--scope",
+            "user",
+            "--yes",
+          ],
+          { baseDir: root, telemetry },
+        ),
+      ).rejects.toThrow(
+        /https:\/\/clips\.agent-native\.com\/download.*was not installed or enabled automatically/,
+      );
+
+      expect(telemetry.track).not.toHaveBeenCalled();
+      expect(telemetry.captureException).not.toHaveBeenCalled();
+      expect(telemetry.flush).not.toHaveBeenCalled();
+      expect(fs.readdirSync(home)).toEqual([]);
+      expect(fs.readdirSync(codexHome)).toEqual([]);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      if (previousStore === undefined)
+        delete process.env.CLIPS_SCREEN_MEMORY_DIR;
+      else process.env.CLIPS_SCREEN_MEMORY_DIR = previousStore;
+      if (previousLegacyStore === undefined)
+        delete process.env.AGENT_NATIVE_SCREEN_MEMORY_DIR;
+      else process.env.AGENT_NATIVE_SCREEN_MEMORY_DIR = previousLegacyStore;
+    }
+  });
+
+  it("installs Rewind into the shared user skill directory for Cursor", async () => {
+    const root = tmpDir();
+    const home = path.join(root, "home");
+    const store = path.join(root, "screen-memory");
+    fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(store, { recursive: true });
+    const previousHome = process.env.HOME;
+    const previousStore = process.env.CLIPS_SCREEN_MEMORY_DIR;
+    process.env.HOME = home;
+    process.env.CLIPS_SCREEN_MEMORY_DIR = store;
+
+    try {
+      const result = await addAgentNativeSkill(
+        parseSkillsArgs([
+          "add",
+          "rewind",
+          "--client",
+          "cursor",
+          "--scope",
+          "user",
+          "--yes",
+        ]),
+        { baseDir: root },
+      );
+
+      expect(result.skillsAgents).toEqual(["cursor"]);
+      expect(
+        fs.existsSync(
+          path.join(home, ".agents", "skills", "rewind", "SKILL.md"),
+        ),
+      ).toBe(true);
+      expect(
+        fs.readFileSync(path.join(home, ".cursor", "mcp.json"), "utf-8"),
+      ).toContain("clips-screen-memory");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousStore === undefined)
+        delete process.env.CLIPS_SCREEN_MEMORY_DIR;
+      else process.env.CLIPS_SCREEN_MEMORY_DIR = previousStore;
+    }
+  });
+
+  it("configures Cowork without writing Rewind into Claude Code", async () => {
+    const root = tmpDir();
+    const home = path.join(root, "home");
+    const store = path.join(root, "screen-memory");
+    fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(store, { recursive: true });
+    const previousHome = process.env.HOME;
+    const previousStore = process.env.CLIPS_SCREEN_MEMORY_DIR;
+    process.env.HOME = home;
+    process.env.CLIPS_SCREEN_MEMORY_DIR = store;
+
+    try {
+      const result = await addAgentNativeSkill(
+        parseSkillsArgs([
+          "add",
+          "rewind",
+          "--client",
+          "cowork",
+          "--scope",
+          "user",
+          "--yes",
+        ]),
+        { baseDir: root },
+      );
+
+      expect(result.skillsAgents).toEqual([]);
+      expect(fs.existsSync(path.join(home, ".claude"))).toBe(false);
+      expect(
+        fs.readFileSync(path.join(home, ".cowork", "mcp.json"), "utf-8"),
+      ).toContain("clips-screen-memory");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousStore === undefined)
+        delete process.env.CLIPS_SCREEN_MEMORY_DIR;
+      else process.env.CLIPS_SCREEN_MEMORY_DIR = previousStore;
+    }
+  });
+
+  it("installs Rewind instructions and local MCP config for Claude Code", async () => {
+    const root = tmpDir();
+    const home = path.join(root, "home");
+    const store = path.join(root, "screen-memory");
+    fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(store, { recursive: true });
+    const previousHome = process.env.HOME;
+    const previousStore = process.env.CLIPS_SCREEN_MEMORY_DIR;
+    process.env.HOME = home;
+    process.env.CLIPS_SCREEN_MEMORY_DIR = store;
+
+    try {
+      const result = await addAgentNativeSkill(
+        parseSkillsArgs([
+          "add",
+          "rewind",
+          "--client",
+          "claude-code",
+          "--scope",
+          "user",
+          "--yes",
+        ]),
+        { baseDir: root },
+      );
+
+      expect(result.mcpClients).toEqual(["claude-code"]);
+      expect(
+        fs.existsSync(
+          path.join(home, ".claude", "skills", "rewind", "SKILL.md"),
+        ),
+      ).toBe(true);
+      expect(
+        fs.readFileSync(path.join(home, ".claude.json"), "utf-8"),
+      ).toContain("clips-screen-memory");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousStore === undefined)
+        delete process.env.CLIPS_SCREEN_MEMORY_DIR;
+      else process.env.CLIPS_SCREEN_MEMORY_DIR = previousStore;
+    }
+  });
+
+  it.each(["codex", "claude-code"] as const)(
+    "restores existing %s instructions and config when MCP setup fails",
+    async (client) => {
+      const root = tmpDir();
+      const home = path.join(root, "home");
+      const codexHome = path.join(root, "codex-home");
+      const store = path.join(root, "screen-memory");
+      const skillDir =
+        client === "codex"
+          ? path.join(codexHome, "skills", "rewind")
+          : path.join(home, ".claude", "skills", "rewind");
+      const configPath =
+        client === "codex"
+          ? path.join(codexHome, "config.toml")
+          : path.join(home, ".claude.json");
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.mkdirSync(path.dirname(configPath), { recursive: true });
+      fs.mkdirSync(store, { recursive: true });
+      fs.writeFileSync(path.join(skillDir, "SKILL.md"), "original skill\n");
+      fs.writeFileSync(configPath, "original config\n");
+      const previousHome = process.env.HOME;
+      const previousCodexHome = process.env.CODEX_HOME;
+      const previousStore = process.env.CLIPS_SCREEN_MEMORY_DIR;
+      process.env.HOME = home;
+      process.env.CODEX_HOME = codexHome;
+      process.env.CLIPS_SCREEN_MEMORY_DIR = store;
+      const telemetry = {
+        track: vi.fn(),
+        captureException: vi.fn(),
+        flush: vi.fn(async () => undefined),
+      };
+
+      try {
+        await expect(
+          addAgentNativeSkill(
+            parseSkillsArgs([
+              "add",
+              "rewind",
+              "--client",
+              client,
+              "--scope",
+              "user",
+              "--yes",
+            ]),
+            {
+              baseDir: root,
+              telemetry,
+              installScreenMemory: () => {
+                fs.writeFileSync(configPath, "partial config\n");
+                throw new Error("simulated MCP write failure");
+              },
+            },
+          ),
+        ).rejects.toThrow("simulated MCP write failure");
+
+        expect(fs.readFileSync(configPath, "utf-8")).toBe("original config\n");
+        expect(fs.readFileSync(path.join(skillDir, "SKILL.md"), "utf-8")).toBe(
+          "original skill\n",
+        );
+        expect(telemetry.track).not.toHaveBeenCalledWith(
+          "skills_cli install completed",
+          expect.anything(),
+        );
+      } finally {
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+        if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = previousCodexHome;
+        if (previousStore === undefined)
+          delete process.env.CLIPS_SCREEN_MEMORY_DIR;
+        else process.env.CLIPS_SCREEN_MEMORY_DIR = previousStore;
+      }
+    },
+  );
+
+  it("dry-runs Rewind setup without requiring an active local store", async () => {
+    const result = await addAgentNativeSkill(
+      parseSkillsArgs([
+        "add",
+        "rewind",
+        "--client",
+        "claude-code",
+        "--scope",
+        "user",
+        "--dry-run",
+        "--yes",
+      ]),
+      { baseDir: tmpDir() },
+    );
+
+    expect(result).toMatchObject({
+      id: "rewind",
+      dryRun: true,
+      mcpUrl: "",
+      mcpClients: ["claude-code"],
+    });
+  });
+
+  it("rejects hosted MCP overrides for local Rewind memory", async () => {
+    await expect(
+      addAgentNativeSkill(
+        parseSkillsArgs([
+          "add",
+          "rewind",
+          "--client",
+          "codex",
+          "--mcp-url",
+          "https://example.com/mcp",
+          "--yes",
+        ]),
+        { baseDir: tmpDir() },
+      ),
+    ).rejects.toThrow("uses the local Clips Screen Memory MCP");
   });
 
   it("tracks when --client is explicit", () => {
@@ -297,11 +923,209 @@ describe("agent-native skills", () => {
 
     expect(result.id).toBe("assets");
     expect(result.skillNames).toEqual(["assets"]);
-    // Built-in skill instructions are written straight into the client's skills
-    // directory (no npx @agent-native/skills@latest shell-out).
     const skillDir = path.join(root, ".agents", "skills", "assets");
     expect(result.written).toContain(skillDir);
     expect(fs.existsSync(path.join(skillDir, "SKILL.md"))).toBe(true);
+  });
+
+  it("installs Content local-files instructions and repo manifest", async () => {
+    const root = tmpDir();
+
+    const result = await addAgentNativeSkill(
+      parseSkillsArgs([
+        "add",
+        "content",
+        "--mode",
+        "local-files",
+        "--client",
+        "codex",
+        "--scope",
+        "project",
+      ]),
+      { baseDir: root, runCommand: async () => 0 },
+    );
+
+    const skillDir = path.join(root, ".agents", "skills", "content");
+    const manifestPath = path.join(root, "agent-native.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+
+    expect(result.id).toBe("content");
+    expect(result.skillNames).toEqual(["content"]);
+    expect(result.planMode).toBe("local-files");
+    expect(result.mcpUrl).toBe("");
+    expect(result.mcpClients).toEqual([]);
+    expect(result.localManifestPath).toBe(manifestPath);
+    expect(result.commands).toContain(`write ${manifestPath}`);
+    expect(fs.readFileSync(path.join(skillDir, "SKILL.md"), "utf-8")).toContain(
+      "Default storage for this installation is Content's SQL database.",
+    );
+    expect(manifest).toMatchObject({
+      version: 1,
+      apps: {
+        content: {
+          components: "components",
+          extensions: "extensions",
+        },
+      },
+    });
+    expect(manifest.apps.content.roots.map((root: any) => root.path)).toEqual([
+      "docs",
+      "blog",
+      "content",
+      "resources",
+    ]);
+    for (const root of manifest.apps.content.roots) {
+      expect(root.source).toMatchObject({
+        type: "local-folder",
+        truthPolicy: "source_primary",
+      });
+      expect(root.source.connectionId).toMatch(/^local-folder:/);
+    }
+    expect(manifest.apps.content.mode).toBeUndefined();
+    expect(manifest.mode).toBeUndefined();
+  });
+
+  it("preserves existing Content local-files manifest customizations", async () => {
+    const root = tmpDir();
+    fs.writeFileSync(
+      path.join(root, "agent-native.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          mode: "workspace",
+          apps: {
+            plan: {
+              mode: "hosted",
+            },
+            content: {
+              roots: [
+                {
+                  name: "Knowledge",
+                  path: "knowledge",
+                  kind: "docs",
+                  extensions: [".mdx"],
+                },
+              ],
+              components: ["blocks"],
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf-8",
+    );
+
+    await addAgentNativeSkill(
+      parseSkillsArgs([
+        "add",
+        "content",
+        "--mode",
+        "local-files",
+        "--client",
+        "codex",
+        "--scope",
+        "project",
+      ]),
+      { baseDir: root, runCommand: async () => 0 },
+    );
+
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(root, "agent-native.json"), "utf-8"),
+    );
+    expect(manifest.apps.content.roots).toEqual([
+      expect.objectContaining({
+        name: "Knowledge",
+        path: "knowledge",
+        kind: "docs",
+        extensions: [".mdx"],
+        source: expect.objectContaining({
+          type: "local-folder",
+          truthPolicy: "source_primary",
+        }),
+      }),
+    ]);
+    expect(manifest.apps.content.roots[0].source.connectionId).toMatch(
+      /^local-folder:/,
+    );
+    expect(manifest.apps.content.components).toEqual(["blocks"]);
+    expect(manifest.apps.content.extensions).toBe("extensions");
+    expect(manifest.mode).toBe("workspace");
+    expect(manifest.apps.plan).toEqual({ mode: "hosted" });
+  });
+
+  it("accepts Content app-skill directories with local-files mode", async () => {
+    const root = tmpDir();
+    const appDir = writeContentAppSkillFixture(tmpDir());
+    const commands: { cmd: string; args: string[] }[] = [];
+
+    const result = await addAgentNativeSkill(
+      parseSkillsArgs([
+        "add",
+        appDir,
+        "--mode",
+        "local-files",
+        "--client",
+        "codex",
+        "--scope",
+        "project",
+      ]),
+      {
+        baseDir: root,
+        runCommand: async (cmd, args) => {
+          commands.push({ cmd, args });
+          return 0;
+        },
+      },
+    );
+
+    const manifestPath = path.join(root, "agent-native.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+
+    expect(result.id).toBe("content");
+    expect(result.planMode).toBe("local-files");
+    expect(result.mcpUrl).toBe("");
+    expect(result.mcpClients).toEqual([]);
+    expect(result.localManifestPath).toBe(manifestPath);
+    expect(commands).toHaveLength(1);
+    expect(commands[0].args).toEqual(
+      expect.arrayContaining(["--mode", "local-files"]),
+    );
+    expect(manifest.mode).toBeUndefined();
+    expect(manifest.apps.content.mode).toBeUndefined();
+    expect(manifest.apps.content.roots[0].source.type).toBe("local-folder");
+  });
+
+  it("accepts Content app-skill manifests with local-files mode", async () => {
+    const root = tmpDir();
+    const appDir = writeContentAppSkillFixture(tmpDir());
+    const appManifest = path.join(appDir, "agent-native.app-skill.json");
+
+    const result = await addAgentNativeSkill(
+      parseSkillsArgs([
+        "add",
+        appManifest,
+        "--mode",
+        "local-files",
+        "--client",
+        "codex",
+        "--scope",
+        "project",
+      ]),
+      { baseDir: root, runCommand: async () => 0 },
+    );
+
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(root, "agent-native.json"), "utf-8"),
+    );
+
+    expect(result.id).toBe("content");
+    expect(result.planMode).toBe("local-files");
+    expect(result.mcpUrl).toBe("");
+    expect(result.mcpClients).toEqual([]);
+    expect(manifest.mode).toBeUndefined();
+    expect(manifest.apps.content.mode).toBeUndefined();
+    expect(manifest.apps.content.roots[0].source.type).toBe("local-folder");
   });
 
   it("accepts design-exploration aliases for the built-in Design skill", async () => {
@@ -324,8 +1148,67 @@ describe("agent-native skills", () => {
     const skillDir = path.join(root, ".agents", "skills", "design-exploration");
     expect(result.written).toContain(skillDir);
     expect(fs.existsSync(path.join(skillDir, "SKILL.md"))).toBe(true);
-    expect(result.mcpUrl).toBe(
-      "https://design.agent-native.com/_agent-native/mcp",
+    expect(result.mcpUrl).toBe("https://design.agent-native.com/mcp");
+  });
+
+  it("accepts visual-edit as a Design skill alias", async () => {
+    const root = tmpDir();
+
+    const result = await addAgentNativeSkill(
+      parseSkillsArgs([
+        "add",
+        "visual-edit",
+        "--client",
+        "codex",
+        "--scope",
+        "project",
+      ]),
+      { baseDir: root, runCommand: async () => 0 },
+    );
+
+    expect(result.id).toBe("design");
+    expect(result.skillNames).toEqual(["visual-edit"]);
+    const skillDir = path.join(root, ".agents", "skills", "visual-edit");
+    expect(result.written).toContain(skillDir);
+    expect(fs.existsSync(path.join(skillDir, "SKILL.md"))).toBe(true);
+    expect(fs.readFileSync(path.join(skillDir, "SKILL.md"), "utf8")).toContain(
+      "npx @agent-native/core@latest design connect",
+    );
+    expect(result.mcpUrl).toBe("https://design.agent-native.com/mcp");
+  });
+
+  it("does not replace a symlinked project skill folder", async () => {
+    const root = tmpDir();
+    const sourceDir = path.join(root, "skills", "visual-edit");
+    const skillDir = path.join(root, ".agents", "skills", "visual-edit");
+    fs.mkdirSync(sourceDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sourceDir, "SKILL.md"),
+      "local visual-edit source\n",
+      "utf8",
+    );
+    fs.mkdirSync(path.dirname(skillDir), { recursive: true });
+    fs.symlinkSync(path.relative(path.dirname(skillDir), sourceDir), skillDir);
+
+    await expect(
+      addAgentNativeSkill(
+        parseSkillsArgs([
+          "add",
+          "visual-edit",
+          "--client",
+          "codex",
+          "--scope",
+          "project",
+        ]),
+        { baseDir: root, runCommand: async () => 0 },
+      ),
+    ).rejects.toThrow(
+      "Refusing to replace symlinked Agent-Native skill folder",
+    );
+
+    expect(fs.lstatSync(skillDir).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(path.join(skillDir, "SKILL.md"), "utf8")).toBe(
+      "local visual-edit source\n",
     );
   });
 
@@ -349,8 +1232,6 @@ describe("agent-native skills", () => {
         { baseDir: root, runCommand: async () => 0 },
       );
 
-      // The `plannotate` alias targets the whole plan bundle, so both skills
-      // install. Project-scope codex instructions land in .agents/skills.
       const planSkillDir = path.join(root, ".agents", "skills", "visual-plan");
       const materializedVisualPlan = fs.readFileSync(
         path.join(planSkillDir, "SKILL.md"),
@@ -369,9 +1250,7 @@ describe("agent-native skills", () => {
           path.join(root, ".agents", "skills", "visual-recap"),
         ]),
       );
-      expect(result.mcpUrl).toBe(
-        "https://plan.agent-native.com/_agent-native/mcp",
-      );
+      expect(result.mcpUrl).toBe("https://plan.agent-native.com/mcp");
       expect(fs.existsSync(path.join(codexHome, "config.toml"))).toBe(false);
       expect(result.commands).toContain(
         "npx @agent-native/core@latest connect https://plan.agent-native.com --client codex --scope project",
@@ -432,6 +1311,15 @@ describe("agent-native skills", () => {
     expect(fs.readFileSync(path.join(skillDir, "SKILL.md"), "utf-8")).toContain(
       "create-visual-recap",
     );
+    expect(fs.readFileSync(path.join(skillDir, "SKILL.md"), "utf-8")).toBe(
+      VISUAL_RECAP_SKILL_MD,
+    );
+    expect(
+      fs.readFileSync(
+        path.join(skillDir, "references", "connection.md"),
+        "utf-8",
+      ),
+    ).toBe(CONNECTION_REFERENCE_MD);
     expect(
       fs.readFileSync(
         path.join(skillDir, "references", "wireframe.md"),
@@ -470,6 +1358,7 @@ describe("agent-native skills", () => {
     const pairs = [
       ["visual-plan", "visual-plans"],
       ["visual-recap", "visual-recap"],
+      ["visualize-repo", "visualize-repo"],
     ];
 
     for (const [templateName, exportedName] of pairs) {
@@ -764,8 +1653,6 @@ describe("agent-native skills", () => {
     );
 
     expect(result.skillNames).toEqual(["assets"]);
-    // Built-in instructions are written in-process, so nothing shells out to
-    // the standalone @agent-native/skills installer.
     expect(commands).toHaveLength(0);
     const skillDir = path.join(root, ".claude", "skills", "assets");
     expect(result.written).toContain(skillDir);
@@ -773,7 +1660,131 @@ describe("agent-native skills", () => {
     expect(
       JSON.parse(fs.readFileSync(path.join(root, ".mcp.json"), "utf-8"))
         .mcpServers["agent-native-assets"].url,
-    ).toBe("https://assets.agent-native.com/_agent-native/mcp");
+    ).toBe("https://assets.agent-native.com/mcp");
+  });
+
+  it("installs /an with the Dispatch MCP connector and slash command", async () => {
+    const root = tmpDir();
+
+    const result = await addAgentNativeSkill(
+      parseSkillsArgs([
+        "add",
+        "an",
+        "--client",
+        "claude-code",
+        "--scope",
+        "project",
+        "--no-connect",
+      ]),
+      { baseDir: root },
+    );
+
+    expect(result).toMatchObject({
+      id: "agent-native",
+      displayName: "Agent-Native",
+      skillNames: ["an"],
+      mcpUrl: "https://dispatch.agent-native.com/mcp",
+      mcpClients: ["claude-code"],
+    });
+    expect(
+      fs.readFileSync(
+        path.join(root, ".claude", "skills", "an", "SKILL.md"),
+        "utf8",
+      ),
+    ).toContain("`/an slides`");
+    expect(
+      fs.readFileSync(path.join(root, ".claude", "commands", "an.md"), "utf8"),
+    ).toContain("call `open_app` with app `slides`");
+    expect(
+      JSON.parse(fs.readFileSync(path.join(root, ".mcp.json"), "utf8"))
+        .mcpServers["agent-native-dispatch"].url,
+    ).toBe("https://dispatch.agent-native.com/mcp");
+  });
+
+  it("installs visual-plan into Claude Code user skills idempotently", async () => {
+    const root = tmpDir();
+    const home = path.join(root, "home");
+    const skillDir = path.join(home, ".claude", "skills", "visual-plan");
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, "old.txt"), "stale copy\n");
+    fs.writeFileSync(path.join(skillDir, "SKILL.md"), "old visual plan\n");
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+
+    try {
+      const result = await addAgentNativeSkill(
+        parseSkillsArgs([
+          "add",
+          "visual-plan",
+          "--client",
+          "claude-code",
+          "--scope",
+          "user",
+          "--no-connect",
+        ]),
+        { baseDir: root, runCommand: async () => 0 },
+      );
+
+      expect(result.skillNames).toEqual(["visual-plan"]);
+      expect(result.planMode).toBe("hosted");
+      expect(result.mcpUrl).toBe("https://plan.agent-native.com/mcp");
+      expect(result.written).toContain(skillDir);
+      expect(fs.existsSync(path.join(skillDir, "old.txt"))).toBe(false);
+      expect(
+        fs.readFileSync(path.join(skillDir, "SKILL.md"), "utf-8"),
+      ).toContain("# Agent-Native Plans");
+      const metadata = JSON.parse(
+        fs.readFileSync(
+          path.join(skillDir, AGENT_NATIVE_SKILL_METADATA_FILE),
+          "utf-8",
+        ),
+      );
+      expect(metadata).toMatchObject({
+        source: "agent-native",
+        appSkillId: "visual-plans",
+        skillName: "visual-plan",
+        mcpUrl: "https://plan.agent-native.com/mcp",
+        planMode: "hosted",
+        installCommand: "npx @agent-native/core@latest skills add visual-plan",
+        updateCommand:
+          "npx @agent-native/core@latest skills update visual-plan",
+      });
+      expect(
+        fs.existsSync(path.join(home, ".claude", "commands", "visual-plan.md")),
+      ).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
+  it("fails loudly when the target skill folder cannot be written", async () => {
+    const root = tmpDir();
+    const home = path.join(root, "home");
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, ".claude"), "not a directory\n");
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+
+    try {
+      await expect(
+        addAgentNativeSkill(
+          parseSkillsArgs([
+            "add",
+            "visual-plan",
+            "--client",
+            "claude-code",
+            "--scope",
+            "user",
+            "--no-mcp",
+          ]),
+          { baseDir: root, runCommand: async () => 0 },
+        ),
+      ).rejects.toThrow(/Cannot write Agent-Native skill folder .*visual-plan/);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
   });
 
   it("delegates plain GitHub skill repos to @agent-native/skills", async () => {
@@ -886,7 +1897,6 @@ describe("agent-native skills", () => {
         "github-copilot",
       ]);
       expect(promptClients.mock.calls[0]?.[0].installsMcp).toBe(true);
-      // Built-in instructions are written in-process for each selected client.
       expect(
         fs.existsSync(path.join(codexHome, "skills", "assets", "SKILL.md")),
       ).toBe(true);
@@ -899,8 +1909,7 @@ describe("agent-native skills", () => {
       expect(
         JSON.parse(fs.readFileSync(path.join(home, ".claude.json"), "utf-8"))
           .mcpServers["agent-native-assets"].url,
-      ).toBe("https://assets.agent-native.com/_agent-native/mcp");
-      // Install also authenticates the hosted connector in one step.
+      ).toBe("https://assets.agent-native.com/mcp");
       expect(runConnect).toHaveBeenCalledTimes(1);
       expect(runConnect.mock.calls[0][0]).toEqual(
         expect.arrayContaining([
@@ -914,7 +1923,6 @@ describe("agent-native skills", () => {
       expect(stdout.join("")).toContain("Authentication");
       expect(stdout.join("")).toContain("completed");
       expect(stdout.join("")).toContain("Add another client later");
-      // Final "all done" outro + slash-command guidance.
       expect(stdout.join("")).toContain("All set!");
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
@@ -1082,8 +2090,6 @@ describe("agent-native skills", () => {
       });
 
       expect(promptSkills).toHaveBeenCalledTimes(1);
-      // Each selected built-in skill is written in-process into the user-scope
-      // codex skills directory.
       expect(
         fs.existsSync(path.join(codexHome, "skills", "assets", "SKILL.md")),
       ).toBe(true);
@@ -1100,7 +2106,7 @@ describe("agent-native skills", () => {
     }
   });
 
-  it("offers all Agent Native skills while defaulting the two plan skills", async () => {
+  it("offers all Agent-Native skills while defaulting the Plan skills", async () => {
     const root = tmpDir();
     let context:
       | { initialTargets: string[]; options: { value: string }[] }
@@ -1123,14 +2129,19 @@ describe("agent-native skills", () => {
 
     expect(promptSkills).toHaveBeenCalledTimes(1);
     expect(context?.options.map((o) => o.value)).toEqual([
+      "an",
       "visual-plan",
       "visual-recap",
+      "visualize-repo",
       "assets",
+      "content",
+      "rewind",
       "design-exploration",
+      "visual-edit",
       "context-xray",
+      "turn-into-app",
     ]);
-    expect(context?.initialTargets).toEqual(["visual-plan", "visual-recap"]);
-    // Both selected installs the whole plan bundle (one shared MCP connector).
+    expect(context?.initialTargets).toEqual(PLANS_SKILL_NAMES);
     expect(
       fs.existsSync(
         path.join(root, ".agents", "skills", "visual-plan", "SKILL.md"),
@@ -1146,6 +2157,16 @@ describe("agent-native skills", () => {
     ).toBe(true);
     expect(
       fs.existsSync(path.join(root, ".agents", "commands", "visual-recap.md")),
+    ).toBe(true);
+    expect(
+      fs.existsSync(
+        path.join(root, ".agents", "skills", "visualize-repo", "SKILL.md"),
+      ),
+    ).toBe(true);
+    expect(
+      fs.existsSync(
+        path.join(root, ".agents", "commands", "visualize-repo.md"),
+      ),
     ).toBe(true);
   });
 
@@ -1196,14 +2217,115 @@ describe("agent-native skills", () => {
     });
 
     expect(allContext?.options.map((option) => option.value)).toEqual([
+      "an",
       "visual-plan",
       "visual-recap",
+      "visualize-repo",
       "assets",
+      "content",
+      "rewind",
       "design-exploration",
+      "visual-edit",
       "context-xray",
+      "turn-into-app",
       "quick-recap",
     ]);
-    expect(allContext?.initialTargets).toEqual(["visual-plan", "visual-recap"]);
+    expect(allContext?.initialTargets).toEqual(PLANS_SKILL_NAMES);
+  });
+
+  it("preselects installer groups and installs only the selected subset", async () => {
+    const root = tmpDir();
+    const calls: string[] = [];
+    const commands: { cmd: string; args: string[] }[] = [];
+    const contexts: Array<{
+      message?: string;
+      initialTargets: string[];
+      required?: boolean;
+      options: { value: string }[];
+    }> = [];
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await runSkills(["add"], {
+      baseDir: root,
+      catalogMode: "all",
+      publicSkillSource: "BuilderIO/skills",
+      publicSkillEntries: [
+        {
+          name: "factory",
+          description: "Factory root skill.",
+          installerGroup: "factory",
+        },
+        {
+          name: "factory-review-prs",
+          description: "Review Factory PRs.",
+          installerGroup: "factory",
+        },
+        {
+          name: "factory-ship",
+          description: "Ship Factory work.",
+          installerGroup: "factory",
+        },
+        {
+          name: "quick-recap",
+          description: "Use final response status blocks.",
+        },
+      ],
+      isInteractive: () => true,
+      promptSkills: async (promptContext) => {
+        contexts.push(promptContext);
+        calls.push("skills");
+        return contexts.length === 1
+          ? ["factory", "factory-ship", "quick-recap"]
+          : ["factory-review-prs"];
+      },
+      promptClients: async () => {
+        calls.push("clients");
+        return ["codex"];
+      },
+      promptScope: async () => {
+        calls.push("scope");
+        return "project";
+      },
+      promptUpdateInstructions: async () => {
+        calls.push("instructions");
+        return false;
+      },
+      runCommand: async (cmd, args) => {
+        calls.push("install");
+        commands.push({ cmd, args });
+        return 0;
+      },
+    });
+
+    expect(contexts).toHaveLength(2);
+    expect(contexts[0]?.initialTargets).toEqual(PLANS_SKILL_NAMES);
+    expect(contexts[1]).toMatchObject({
+      message:
+        "Which Factory skills do you want to install?\n" +
+        "  (all selected; deselect any you want to skip)",
+      initialTargets: ["factory-review-prs", "factory-ship"],
+      required: false,
+      options: [{ value: "factory-review-prs" }, { value: "factory-ship" }],
+    });
+    expect(calls).toEqual([
+      "skills",
+      "skills",
+      "clients",
+      "scope",
+      "instructions",
+      "install",
+    ]);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]?.args).toContain("@agent-native/skills@latest");
+    const installedSkillNames = commands[0]!.args.flatMap((arg, index, args) =>
+      arg === "--skill" ? [args[index + 1]] : [],
+    );
+    expect(installedSkillNames).toEqual([
+      "factory",
+      "quick-recap",
+      "factory-review-prs",
+    ]);
+    expect(installedSkillNames).not.toContain("factory-ship");
   });
 
   it("asks for plan mode before clients and skips MCP for local-files", async () => {
@@ -1226,7 +2348,7 @@ describe("agent-native skills", () => {
       isInteractive: () => true,
       promptSkills: async () => {
         calls.push("skills");
-        return ["visual-plan", "visual-recap"];
+        return PLANS_SKILL_NAMES;
       },
       promptPlanMode: async () => {
         calls.push("plan-mode");
@@ -1463,6 +2585,9 @@ describe("agent-native skills", () => {
       fs.existsSync(path.join(root, ".agents", "skills", "visual-plan")),
     ).toBe(false);
     expect(
+      fs.existsSync(path.join(root, ".agents", "skills", "visualize-repo")),
+    ).toBe(false);
+    expect(
       fs.existsSync(path.join(root, ".agents", "commands", "visual-plan.md")),
     ).toBe(false);
   });
@@ -1558,7 +2683,6 @@ describe("agent-native skills", () => {
     expect(promptScope.mock.calls[0][0]).toMatchObject({
       initialScope: "project",
     });
-    // The chosen project scope routes instructions into .agents/skills.
     expect(
       fs.existsSync(
         path.join(root, ".agents", "skills", "visual-recap", "SKILL.md"),
@@ -1641,7 +2765,7 @@ describe("agent-native skills", () => {
           displayName: "Agent-Native Plans",
           skillName: "visual-plan",
           contentHash: "old",
-          mcpUrl: "https://plan.agent-native.com/_agent-native/mcp",
+          mcpUrl: "https://plan.agent-native.com/mcp",
           installedAt: "2026-01-01T00:00:00.000Z",
           updateCommand:
             "npx @agent-native/core@latest skills update visual-plan",
@@ -1680,6 +2804,37 @@ describe("agent-native skills", () => {
     });
   });
 
+  it("explains that update is not the first-time visual-plan installer", async () => {
+    const root = tmpDir();
+    const home = path.join(root, "home");
+    fs.mkdirSync(home, { recursive: true });
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    const stdout: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+
+    try {
+      await runSkills(
+        ["update", "visual-plan", "--client", "claude-code", "--scope", "user"],
+        { baseDir: root, runCommand: async () => 0 },
+      );
+
+      expect(stdout.join("")).toContain(
+        "The update command only refreshes skill folders that already exist",
+      );
+      expect(stdout.join("")).toContain(
+        "npx @agent-native/core@latest skills add visual-plan",
+      );
+      expect(stdout.join("")).toContain("MCP registration");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
   it("updates managed copied skill folders in place", async () => {
     const root = tmpDir();
     const skillDir = path.join(root, ".agents", "skills", "visual-plan");
@@ -1695,7 +2850,7 @@ describe("agent-native skills", () => {
           displayName: "Agent-Native Plans",
           skillName: "visual-plan",
           contentHash: "old",
-          mcpUrl: "https://plan.agent-native.com/_agent-native/mcp",
+          mcpUrl: "https://plan.agent-native.com/mcp",
           installedAt: "2026-01-01T00:00:00.000Z",
           updateCommand:
             "npx @agent-native/core@latest skills update visual-plan",
@@ -1733,6 +2888,773 @@ describe("agent-native skills", () => {
     expect(metadata.contentHash).not.toBe("old");
   });
 
+  it("updates generated workspace scaffold skills and repairs agent symlinks", async () => {
+    const root = tmpDir();
+    const shared = path.join(root, "packages", "shared");
+    fs.mkdirSync(path.join(shared, ".agents", "skills", "actions"), {
+      recursive: true,
+    });
+    fs.mkdirSync(path.join(root, "apps"), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify(
+        {
+          name: "my-workspace",
+          "agent-native": { workspaceCore: "@my/shared" },
+        },
+        null,
+        2,
+      ),
+    );
+    fs.writeFileSync(path.join(root, "AGENTS.md"), "# Workspace\n");
+    fs.writeFileSync(
+      path.join(shared, "package.json"),
+      JSON.stringify({ name: "@my/shared" }, null, 2),
+    );
+    fs.writeFileSync(path.join(shared, "AGENTS.md"), "# Shared\n");
+    fs.writeFileSync(
+      path.join(shared, ".agents", "skills", "actions", "SKILL.md"),
+      "old actions skill\n",
+    );
+    const stdout: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+
+    await runSkills(["update", "scaffold", "--scope", "project", "--json"], {
+      baseDir: root,
+      runCommand: async () => 0,
+    });
+
+    const json = JSON.parse(stdout.join(""));
+    expect(json).toMatchObject({ command: "update", found: 1, updated: 1 });
+    expect(json.scaffold[0]).toMatchObject({
+      kind: "workspace-core",
+      status: "current",
+    });
+    expect(
+      fs.readFileSync(
+        path.join(shared, ".agents", "skills", "actions", "SKILL.md"),
+        "utf-8",
+      ),
+    ).toContain("# Agent Actions");
+    expect(
+      fs.existsSync(
+        path.join(root, ".agents", "skills", "actions", "SKILL.md"),
+      ),
+    ).toBe(true);
+    const claudePath = path.join(root, "CLAUDE.md");
+    expect(fs.existsSync(claudePath)).toBe(true);
+    if (fs.lstatSync(claudePath).isSymbolicLink()) {
+      expect(fs.readlinkSync(claudePath)).toBe("AGENTS.md");
+    }
+    expect(fs.existsSync(path.join(root, ".claude", "skills"))).toBe(true);
+  });
+
+  it("preserves app-owned framework-named skills in existing workspace apps", async () => {
+    const root = tmpDir();
+    const shared = path.join(root, "packages", "shared");
+    const app = path.join(root, "apps", "mail");
+    fs.mkdirSync(path.join(shared, ".agents", "skills", "actions"), {
+      recursive: true,
+    });
+    fs.mkdirSync(path.join(app, ".agents", "skills", "actions"), {
+      recursive: true,
+    });
+    fs.mkdirSync(path.join(app, ".agents", "skills", "call-coach"), {
+      recursive: true,
+    });
+    fs.mkdirSync(path.join(app, ".agents", "skills", "feature-flags"), {
+      recursive: true,
+    });
+    fs.mkdirSync(path.join(root, "apps"), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify(
+        {
+          name: "my-workspace",
+          "agent-native": { workspaceCore: "@my/shared" },
+        },
+        null,
+        2,
+      ),
+    );
+    fs.writeFileSync(
+      path.join(shared, "package.json"),
+      JSON.stringify({ name: "@my/shared" }, null, 2),
+    );
+    fs.writeFileSync(
+      path.join(shared, ".agents", "skills", "actions", "SKILL.md"),
+      "old actions skill\n",
+    );
+    fs.writeFileSync(
+      path.join(app, "package.json"),
+      JSON.stringify({ name: "mail" }, null, 2),
+    );
+    fs.writeFileSync(
+      path.join(app, ".agents", "skills", "actions", "SKILL.md"),
+      "old actions skill\n",
+    );
+    fs.writeFileSync(
+      path.join(app, ".agents", "skills", "call-coach", "SKILL.md"),
+      "app-owned skill\n",
+    );
+    fs.writeFileSync(
+      path.join(app, ".agents", "skills", "feature-flags", "SKILL.md"),
+      "copied optional framework skill\n",
+    );
+
+    const stdout: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+
+    await runSkills(["update", "scaffold", "--scope", "project", "--json"], {
+      baseDir: root,
+      runCommand: async () => 0,
+    });
+
+    expect(
+      fs.readFileSync(
+        path.join(app, ".agents", "skills", "actions", "SKILL.md"),
+        "utf8",
+      ),
+    ).toBe("old actions skill\n");
+    expect(
+      fs.readFileSync(
+        path.join(app, ".agents", "skills", "call-coach", "SKILL.md"),
+        "utf8",
+      ),
+    ).toBe("app-owned skill\n");
+    expect(
+      fs.existsSync(path.join(app, ".agents", "skills", "feature-flags")),
+    ).toBe(true);
+  });
+
+  it("repairs copied skills even when workspace-core is already current", async () => {
+    const root = tmpDir();
+    const shared = path.join(root, "packages", "shared");
+    const app = path.join(root, "apps", "mail");
+    fs.mkdirSync(path.join(root, "apps"), { recursive: true });
+    fs.cpSync(
+      path.join(
+        workspaceRoot(),
+        "packages",
+        "core",
+        "src",
+        "templates",
+        "workspace-core",
+        ".agents",
+        "skills",
+      ),
+      path.join(shared, ".agents", "skills"),
+      { recursive: true },
+    );
+    fs.mkdirSync(path.join(app, ".agents", "skills", "actions"), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify(
+        {
+          name: "my-workspace",
+          "agent-native": { workspaceCore: "@my/shared" },
+        },
+        null,
+        2,
+      ),
+    );
+    fs.writeFileSync(
+      path.join(shared, "package.json"),
+      JSON.stringify({ name: "@my/shared" }, null, 2),
+    );
+    fs.writeFileSync(
+      path.join(app, "package.json"),
+      JSON.stringify({ name: "mail" }, null, 2),
+    );
+    fs.cpSync(
+      path.join(shared, ".agents", "skills", "actions"),
+      path.join(app, ".agents", "skills", "actions"),
+      { recursive: true },
+    );
+
+    const stdout: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+
+    await runSkills(["update", "scaffold", "--scope", "project", "--json"], {
+      baseDir: root,
+      runCommand: async () => 0,
+    });
+
+    expect(JSON.parse(stdout.join(""))).toMatchObject({
+      scaffold: [{ status: "current" }],
+      updated: 0,
+    });
+    expect(
+      fs
+        .lstatSync(path.join(app, ".agents", "skills", "actions"))
+        .isSymbolicLink(),
+    ).toBe(true);
+  });
+
+  it("refreshes Chat workspace skills without restoring omitted defaults", async () => {
+    const root = tmpDir();
+    const shared = path.join(root, "packages", "shared");
+    const app = path.join(root, "apps", "chat");
+    const sharedSkills = path.join(shared, ".agents", "skills");
+    const appSkills = path.join(app, ".agents", "skills");
+    fs.mkdirSync(path.join(root, "apps"), { recursive: true });
+    fs.cpSync(
+      path.join(
+        workspaceRoot(),
+        "packages",
+        "core",
+        "src",
+        "templates",
+        "workspace-core",
+        ".agents",
+        "skills",
+      ),
+      sharedSkills,
+      { recursive: true },
+    );
+    fs.writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify(
+        {
+          name: "my-workspace",
+          "agent-native": { workspaceCore: "@my/shared" },
+        },
+        null,
+        2,
+      ),
+    );
+    fs.writeFileSync(
+      path.join(shared, "package.json"),
+      JSON.stringify({ name: "@my/shared" }, null, 2),
+    );
+    fs.mkdirSync(app, { recursive: true });
+    fs.writeFileSync(
+      path.join(app, "package.json"),
+      JSON.stringify(
+        {
+          name: "roomwise",
+          "agent-native": {
+            scaffold: { template: "chat", frameworkSkills: "default" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    fs.cpSync(
+      path.join(workspaceRoot(), "templates", "chat", ".agents", "skills"),
+      appSkills,
+      { recursive: true },
+    );
+    for (const skill of ["portability", "workspace-conventions"]) {
+      fs.cpSync(
+        path.join(
+          workspaceRoot(),
+          "packages",
+          "core",
+          "src",
+          "templates",
+          "workspace-core",
+          ".agents",
+          "skills",
+          skill,
+        ),
+        path.join(appSkills, skill),
+        { recursive: true },
+      );
+    }
+    fs.writeFileSync(
+      path.join(sharedSkills, "actions", "SKILL.md"),
+      "old actions skill\n",
+    );
+    fs.rmSync(path.join(appSkills, "actions"), {
+      recursive: true,
+      force: true,
+    });
+    fs.symlinkSync(
+      path.relative(appSkills, path.join(sharedSkills, "actions")),
+      path.join(appSkills, "actions"),
+      "dir",
+    );
+
+    const stdout: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+
+    await runSkills(["update", "scaffold", "--scope", "project", "--json"], {
+      baseDir: root,
+      runCommand: async () => 0,
+    });
+
+    expect(JSON.parse(stdout.join(""))).toMatchObject({
+      scaffold: [{ status: "current" }],
+      updated: 1,
+    });
+    expect(fs.lstatSync(path.join(appSkills, "actions")).isSymbolicLink()).toBe(
+      true,
+    );
+    for (const skill of ["portability", "workspace-conventions"]) {
+      expect(fs.lstatSync(path.join(appSkills, skill)).isSymbolicLink()).toBe(
+        true,
+      );
+    }
+    expect(
+      fs.readFileSync(path.join(appSkills, "actions", "SKILL.md"), "utf-8"),
+    ).toContain("# Agent Actions");
+    expect(fs.existsSync(path.join(appSkills, "turn-into-app"))).toBe(false);
+  });
+
+  it("updates generated standalone headless scaffold skills", async () => {
+    const root = tmpDir();
+    fs.mkdirSync(path.join(root, "actions"), { recursive: true });
+    fs.mkdirSync(path.join(root, ".agents", "skills", "agent-native-docs"), {
+      recursive: true,
+    });
+    fs.mkdirSync(path.join(root, ".agents", "skills", "actions"), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify(
+        {
+          name: "headless-app",
+          dependencies: { "@agent-native/core": "latest" },
+        },
+        null,
+        2,
+      ),
+    );
+    fs.writeFileSync(path.join(root, "AGENTS.md"), "# Headless\n");
+    fs.writeFileSync(path.join(root, "actions", "hello.ts"), "export {}\n");
+    fs.writeFileSync(
+      path.join(root, ".agents", "skills", "agent-native-docs", "SKILL.md"),
+      "old docs skill\n",
+    );
+    fs.writeFileSync(
+      path.join(root, ".agents", "skills", "actions", "SKILL.md"),
+      "old actions skill\n",
+    );
+
+    await runSkills(["update", "scaffold", "--scope", "project"], {
+      baseDir: root,
+      runCommand: async () => 0,
+    });
+
+    expect(
+      fs.readFileSync(
+        path.join(root, ".agents", "skills", "agent-native-docs", "SKILL.md"),
+        "utf-8",
+      ),
+    ).toContain("# Agent-Native Docs");
+    expect(
+      fs.readFileSync(
+        path.join(root, ".agents", "skills", "actions", "SKILL.md"),
+        "utf-8",
+      ),
+    ).toContain("# Agent Actions");
+    expect(
+      fs.existsSync(path.join(root, ".agents", "skills", "performance")),
+    ).toBe(false);
+    expect(fs.existsSync(path.join(root, "CLAUDE.md"))).toBe(true);
+    expect(fs.existsSync(path.join(root, ".claude", "skills"))).toBe(true);
+  });
+
+  it.each([
+    {
+      template: "chat",
+      frameworkSkills: "default",
+      sourceTemplates: ["chat"],
+      refreshedSkill: "build-an-app",
+      omittedSkill: "agent-engines",
+    },
+    {
+      template: "default",
+      frameworkSkills: "default",
+      sourceTemplates: ["default"],
+      refreshedSkill: "build-an-app",
+      omittedSkill: "turn-into-skill",
+    },
+    {
+      template: "headless",
+      frameworkSkills: "headless",
+      sourceTemplates: ["headless"],
+      refreshedSkill: "self-modifying-code",
+      omittedSkill: "build-an-app",
+    },
+    ...[
+      "analytics",
+      "assets",
+      "brain",
+      "calendar",
+      "content",
+      "crm",
+      "design",
+      "forms",
+      "mail",
+      "plan",
+      "slides",
+      "tasks",
+    ].map((template) => ({
+      template,
+      frameworkSkills: "default",
+      sourceTemplates: ["workspace-core"],
+      refreshedSkill: "turn-into-skill",
+      omittedSkill: "build-an-app",
+    })),
+    {
+      template: "clips",
+      frameworkSkills: "default",
+      sourceTemplates: ["workspace-core"],
+      refreshedSkill: "a2a-protocol",
+      omittedSkill: "build-an-app",
+    },
+    {
+      template: "dispatch",
+      frameworkSkills: "default",
+      sourceTemplates: ["workspace-core"],
+      refreshedSkill: "adding-workspace-apps",
+      omittedSkill: "review-prs",
+    },
+    {
+      template: "factory",
+      frameworkSkills: "default",
+      sourceTemplates: ["workspace-core", "factory"],
+      refreshedSkill: "review-prs",
+      omittedSkill: "build-an-app",
+    },
+    {
+      template: "builder-code-starter",
+      frameworkSkills: "default",
+      sourceTemplates: ["builder-code-starter", "chat"],
+      refreshedSkill: "authentication",
+      omittedSkill: "turn-into-app",
+    },
+  ])(
+    "refreshes only installed skills in the $template scaffold",
+    async ({
+      template,
+      frameworkSkills,
+      sourceTemplates,
+      refreshedSkill,
+      omittedSkill,
+    }) => {
+      const root = tmpDir();
+      const targetSkills = path.join(root, ".agents", "skills");
+      const repoRoot = workspaceRoot();
+      for (const skill of ["actions", refreshedSkill]) {
+        fs.mkdirSync(path.join(targetSkills, skill), { recursive: true });
+        fs.writeFileSync(
+          path.join(targetSkills, skill, "SKILL.md"),
+          `old ${skill}\n`,
+        );
+      }
+      fs.mkdirSync(path.join(targetSkills, "app-local-guide"), {
+        recursive: true,
+      });
+      fs.writeFileSync(
+        path.join(targetSkills, "app-local-guide", "SKILL.md"),
+        "app-owned guide\n",
+      );
+      fs.mkdirSync(path.join(root, "app", "routes"), { recursive: true });
+      fs.mkdirSync(path.join(root, "actions"), { recursive: true });
+      fs.writeFileSync(
+        path.join(root, "package.json"),
+        JSON.stringify(
+          {
+            name: `${template}-app`,
+            dependencies: { "@agent-native/core": "latest" },
+            "agent-native": {
+              scaffold: { template, frameworkSkills },
+            },
+          },
+          null,
+          2,
+        ),
+      );
+      for (const sourceTemplate of sourceTemplates) {
+        if (sourceTemplate === "headless") {
+          fs.writeFileSync(
+            path.join(root, "actions", "hello.ts"),
+            "export {};\n",
+          );
+        }
+      }
+
+      const stdout: string[] = [];
+      vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+        stdout.push(String(chunk));
+        return true;
+      });
+      await runSkills(["update", "scaffold", "--scope", "project", "--json"], {
+        baseDir: root,
+        runCommand: async () => 0,
+      });
+
+      expect(
+        fs.readFileSync(path.join(targetSkills, "actions", "SKILL.md"), "utf8"),
+      ).toContain("# Agent Actions");
+      expect(
+        fs.readFileSync(
+          path.join(targetSkills, refreshedSkill, "SKILL.md"),
+          "utf8",
+        ),
+      ).toBe(
+        fs.readFileSync(
+          path.join(
+            repoRoot,
+            "packages/core/src/templates",
+            sourceTemplates.find((sourceTemplate) =>
+              fs.existsSync(
+                path.join(
+                  repoRoot,
+                  "packages/core/src/templates",
+                  sourceTemplate,
+                  ".agents/skills",
+                  refreshedSkill,
+                  "SKILL.md",
+                ),
+              ),
+            )!,
+            ".agents/skills",
+            refreshedSkill,
+            "SKILL.md",
+          ),
+          "utf8",
+        ),
+      );
+      expect(fs.existsSync(path.join(targetSkills, omittedSkill))).toBe(false);
+      expect(
+        fs.readFileSync(
+          path.join(targetSkills, "app-local-guide", "SKILL.md"),
+          "utf8",
+        ),
+      ).toBe("app-owned guide\n");
+      expect(JSON.parse(stdout.join(""))).toMatchObject({
+        found: 1,
+        updated: 1,
+      });
+    },
+  );
+
+  it("prefers builder-code-starter skill overrides and inherits the rest from Chat", async () => {
+    const root = tmpDir();
+    const targetSkills = path.join(root, ".agents", "skills");
+    const bundled = path.join(workspaceRoot(), "packages/core/src/templates");
+    fs.writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify(
+        {
+          name: "app",
+          dependencies: { "@agent-native/core": "latest" },
+          "agent-native": {
+            scaffold: {
+              template: "builder-code-starter",
+              frameworkSkills: "default",
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    for (const skill of [
+      "storing-data",
+      "security",
+      "multi-app-workspace",
+      "turn-into-app",
+      "self-modifying-code",
+    ]) {
+      fs.mkdirSync(path.join(targetSkills, skill), { recursive: true });
+      fs.writeFileSync(
+        path.join(targetSkills, skill, "SKILL.md"),
+        `old ${skill}\n`,
+      );
+    }
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await runSkills(["update", "scaffold", "--scope", "project", "--json"], {
+      baseDir: root,
+      runCommand: async () => 0,
+    });
+
+    const read = (dir: string, skill: string) =>
+      fs.readFileSync(path.join(dir, skill, "SKILL.md"), "utf8");
+    const builderCodeSkills = path.join(
+      bundled,
+      "builder-code-starter/.agents/skills",
+    );
+    const chatSkills = path.join(bundled, "chat/.agents/skills");
+    // The layer stores storing-data as a patch over Chat's copy.
+    expect(read(targetSkills, "storing-data")).toContain(
+      "managed Drizzle scaffold is the only app migration path",
+    );
+    expect(read(chatSkills, "storing-data")).not.toContain(
+      "managed Drizzle scaffold is the only app migration path",
+    );
+    expect(read(targetSkills, "security")).toBe(read(chatSkills, "security"));
+    expect(read(targetSkills, "multi-app-workspace")).toBe(
+      read(builderCodeSkills, "multi-app-workspace"),
+    );
+    // Skills outside the policy stay app-owned and untouched.
+    expect(read(targetSkills, "turn-into-app")).toBe("old turn-into-app\n");
+    expect(read(targetSkills, "self-modifying-code")).toBe(
+      "old self-modifying-code\n",
+    );
+    expect(fs.existsSync(path.join(targetSkills, "performance"))).toBe(false);
+    for (const excluded of [
+      "turn-into-app",
+      "turn-into-skill",
+      "workspace-conventions",
+      "self-modifying-code",
+    ]) {
+      expect(BUILDER_CODE_STARTER_SKILLS).not.toContain(excluded);
+    }
+  });
+
+  it("refreshes existing Chat scaffold skills without adding omitted skills", async () => {
+    const root = tmpDir();
+    fs.mkdirSync(path.join(root, "app", "routes"), { recursive: true });
+    fs.mkdirSync(path.join(root, "actions"), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify(
+        {
+          name: "roomwise-app",
+          dependencies: { "@agent-native/core": "latest" },
+          "agent-native": {
+            scaffold: { template: "chat", frameworkSkills: "default" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    fs.writeFileSync(path.join(root, "app", "routes", "database.tsx"), "\n");
+    fs.writeFileSync(path.join(root, "app", "routes", "_index.tsx"), "\n");
+    fs.writeFileSync(
+      path.join(root, "actions", "view-screen.ts"),
+      "export {};\n",
+    );
+    fs.cpSync(
+      path.join(workspaceRoot(), "templates", "chat", ".agents", "skills"),
+      path.join(root, ".agents", "skills"),
+      { recursive: true },
+    );
+    fs.rmSync(path.join(root, ".agents", "skills", "performance"), {
+      recursive: true,
+      force: true,
+    });
+    fs.writeFileSync(
+      path.join(root, ".agents", "skills", "actions", "SKILL.md"),
+      "old actions skill\n",
+    );
+    fs.writeFileSync(
+      path.join(root, ".agents", "skills", "build-an-app", "SKILL.md"),
+      "old build guide\n",
+    );
+    const stdout: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      stdout.push(String(chunk));
+      return true;
+    });
+
+    await runSkills(["update", "scaffold", "--scope", "project", "--json"], {
+      baseDir: root,
+      runCommand: async () => 0,
+    });
+
+    expect(JSON.parse(stdout.join(""))).toMatchObject({
+      scaffold: [
+        { status: "current", skillCount: CHAT_STARTER_SKILLS.length - 1 },
+      ],
+      updated: 1,
+    });
+    expect(
+      fs.readFileSync(
+        path.join(root, ".agents", "skills", "actions", "SKILL.md"),
+        "utf-8",
+      ),
+    ).toContain("# Agent Actions");
+    expect(
+      fs.readFileSync(
+        path.join(root, ".agents", "skills", "build-an-app", "SKILL.md"),
+        "utf-8",
+      ),
+    ).toBe(
+      fs.readFileSync(
+        path.join(
+          workspaceRoot(),
+          "packages",
+          "core",
+          "src",
+          "templates",
+          "chat",
+          ".agents",
+          "skills",
+          "build-an-app",
+          "SKILL.md",
+        ),
+        "utf-8",
+      ),
+    );
+    expect(
+      fs.existsSync(path.join(root, ".agents", "skills", "performance")),
+    ).toBe(false);
+    expect(
+      fs.existsSync(path.join(root, ".agents", "skills", "notifications")),
+    ).toBe(false);
+    expect(
+      fs.existsSync(path.join(root, ".agents", "skills", "turn-into-app")),
+    ).toBe(false);
+  });
+
+  it("does not overwrite same-named skills in an unmarked UI template", async () => {
+    const root = tmpDir();
+    const skillPath = path.join(
+      root,
+      ".agents",
+      "skills",
+      "agent-native-toolkit",
+      "SKILL.md",
+    );
+    fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+    fs.mkdirSync(path.join(root, "app", "routes"), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify(
+        {
+          name: "custom-ui-app",
+          dependencies: { "@agent-native/core": "latest" },
+        },
+        null,
+        2,
+      ),
+    );
+    fs.writeFileSync(skillPath, "app-owned Toolkit guidance\n");
+
+    await runSkills(["update", "scaffold", "--scope", "project"], {
+      baseDir: root,
+      runCommand: async () => 0,
+    });
+
+    expect(fs.readFileSync(skillPath, "utf-8")).toBe(
+      "app-owned Toolkit guidance\n",
+    );
+  });
+
   it("registers the skill against a --mcp-url override (bare origin gets the mcp path)", async () => {
     const root = tmpDir();
 
@@ -1750,13 +3672,11 @@ describe("agent-native skills", () => {
       { baseDir: root, runCommand: async () => 0 },
     );
 
-    expect(result.mcpUrl).toBe(
-      "https://archer.ngrok-free.dev/_agent-native/mcp",
-    );
+    expect(result.mcpUrl).toBe("https://archer.ngrok-free.dev/mcp");
     expect(
       JSON.parse(fs.readFileSync(path.join(root, ".mcp.json"), "utf-8"))
         .mcpServers["agent-native-assets"].url,
-    ).toBe("https://archer.ngrok-free.dev/_agent-native/mcp");
+    ).toBe("https://archer.ngrok-free.dev/mcp");
   });
 
   it("accepts a full --mcp-url and surfaces it in dry-run", async () => {
@@ -1775,7 +3695,7 @@ describe("agent-native skills", () => {
       { baseDir: root },
     );
 
-    expect(result.mcpUrl).toBe("http://localhost:8092/_agent-native/mcp");
+    expect(result.mcpUrl).toBe("http://localhost:8092/mcp");
     expect(result.commands[0]).toContain(
       "--mcp-url http://localhost:8092/_agent-native/mcp",
     );
@@ -1848,13 +3768,11 @@ describe("agent-native skills", () => {
       { baseDir: root, runCommand: async () => 0 },
     );
 
-    expect(result.mcpUrl).toBe(
-      "https://self-hosted.example.com/mail/_agent-native/mcp",
-    );
+    expect(result.mcpUrl).toBe("https://self-hosted.example.com/mail/mcp");
     expect(
       JSON.parse(fs.readFileSync(path.join(root, ".mcp.json"), "utf-8"))
         .mcpServers["agent-native-assets"].url,
-    ).toBe("https://self-hosted.example.com/mail/_agent-native/mcp");
+    ).toBe("https://self-hosted.example.com/mail/mcp");
   });
 
   it("keeps --json output machine-readable for MCP-only installs", async () => {
@@ -1896,9 +3814,7 @@ describe("agent-native skills", () => {
 
       const result = JSON.parse(stdout.join(""));
       expect(result.id).toBe("assets");
-      expect(result.mcpUrl).toBe(
-        "https://assets.agent-native.com/_agent-native/mcp",
-      );
+      expect(result.mcpUrl).toBe("https://assets.agent-native.com/mcp");
       expect(stderr.join("")).toBe("");
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
@@ -1953,8 +3869,6 @@ describe("agent-native skills", () => {
 
       const result = JSON.parse(stdout.join(""));
       expect(result.id).toBe("assets");
-      // User scope writes the built-in instructions into the codex home skills
-      // dir in-process (no npx -g shell-out).
       expect(
         fs.existsSync(path.join(codexHome, "skills", "assets", "SKILL.md")),
       ).toBe(true);

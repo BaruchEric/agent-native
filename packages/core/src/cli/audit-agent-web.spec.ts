@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 import { runAuditAgentWeb } from "./audit-agent-web.js";
 
 describe("runAuditAgentWeb", () => {
@@ -46,6 +47,36 @@ describe("runAuditAgentWeb", () => {
     expect(output).toContain("PASS llms.txt");
     expect(output).toContain("PASS Markdown mirror");
     expect(output).toContain("PASS Accept: text/markdown");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("audits page URLs from the first child of a sitemap index", async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const parsed = new URL(url);
+      const accept = String(
+        (init?.headers as Record<string, string> | undefined)?.accept ?? "",
+      );
+      const body =
+        parsed.pathname === "/sitemap.xml"
+          ? `<?xml version="1.0" encoding="UTF-8"?><sitemapindex><sitemap><loc>https://www.example.com/sitemap-en-us.xml</loc></sitemap><sitemap><loc>https://www.example.com/sitemap-es-es.xml</loc></sitemap></sitemapindex>`
+          : parsed.pathname === "/sitemap-en-us.xml"
+            ? `<?xml version="1.0" encoding="UTF-8"?><urlset><url><loc>https://www.example.com/docs</loc></url></urlset>`
+            : responseBody(parsed.pathname, accept);
+      return new Response(body, { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await runAuditAgentWeb(["--url", "https://example.com"]);
+
+    const output = logSpy.mock.calls.flat().join("\n");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://example.com/sitemap-en-us.xml",
+      expect.anything(),
+    );
+    expect(output).toContain("PASS sitemap.xml");
+    expect(output).toContain("1 of 2 indexed sitemaps");
+    expect(output).toContain("PASS Accept: text/markdown");
+    expect(output).toContain("https://example.com/docs returned 200");
     expect(process.exitCode).toBeUndefined();
   });
 

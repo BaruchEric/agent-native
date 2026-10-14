@@ -1,36 +1,65 @@
-/**
- * GET /api/public-recording?id=<recordingId>[&password=<pw>]
- *
- * Public read endpoint for share/:id and embed/:id pages — lets unauthenticated
- * viewers fetch a recording's player data without going through the
- * authenticated `/_agent-native/actions/get-recording-player-data` route.
- *
- * Only returns data when:
- *   - recording.visibility === 'public' (or the signed-in viewer is owner), AND
- *   - either no password is set, the viewer is owner, or the provided password matches
- *
- * For `org` or `private` visibility, returns 401 (viewer must sign in and use
- * the authenticated player route).
- */
-
+import {
+  getSession,
+  getForwardedRequestOrigin,
+  getForwardedRequestURL,
+  signScopedAgentAccessToken,
+  signShortLivedToken,
+  verifyScopedAgentAccessToken,
+} from "@agent-native/core/server";
+import { resolveAccess } from "@agent-native/core/sharing";
+import { asc, eq } from "drizzle-orm";
 import {
   defineEventHandler,
+  getHeader,
   getQuery,
-  getRequestURL,
   setResponseHeader,
   setResponseStatus,
+  setCookie,
+  type H3Event,
 } from "h3";
-import { asc, eq } from "drizzle-orm";
-import { getSession, signShortLivedToken } from "@agent-native/core/server";
-import { getDb, schema } from "../../db/index.js";
-import { parseSpaceIds } from "../../lib/recordings.js";
-import { resolvePlayerVideoUrl } from "../../lib/player-video-url.js";
-import { verifySharePassword } from "../../lib/share-password.js";
-import { buildAgentApiUrls } from "../../../shared/agent-context.js";
+
+import {
+  buildAgentApiUrls,
+  CLIP_AGENT_ACCESS_TOKEN_PREFIX,
+} from "../../../shared/agent-context.js";
+import { displayCommentMentions } from "../../../shared/comment-mentions.js";
+import {
+  isImageRecording,
+  resolveRecordingKind,
+} from "../../../shared/recording-kind.js";
 import {
   normalizeTranscriptSegments,
   parseTranscriptSegments,
 } from "../../../shared/transcript-segments.js";
+import { resolveTranscriptPresentation } from "../../../shared/transcript-status.js";
+import { getDb, schema } from "../../db/index.js";
+import { countRecordingAgentViews } from "../../lib/agent-views.js";
+import { isMediaVerificationPending } from "../../lib/media-verification-state.js";
+import {
+  isHeldForRedaction,
+  REDACTION_HOLD_MESSAGE,
+} from "../../lib/pending-redactions.js";
+import { resolvePlayerThumbnailUrl } from "../../lib/player-thumbnail-url.js";
+import { resolvePlayerVideoUrl } from "../../lib/player-video-url.js";
+import {
+  canOpenDirectRecordingPage,
+  isRecordingExpiredForViewer,
+  type RecordingPageAccessRole,
+} from "../../lib/recording-page-access.js";
+import { hasExplicitRecordingShare } from "../../lib/recording-share-grant.js";
+import {
+  countRecordingViews,
+  getOrganizationRoleForEmail,
+  parseSpaceIds,
+  type RecordingVisibility,
+} from "../../lib/recordings.js";
+import { viewerScreenshotEditsJson } from "../../lib/screenshot-edits.js";
+import { isSeekableRepairPending } from "../../lib/seekable-media-state.js";
+import {
+  getRecordingAccessTokenResourceId,
+  verifySharePassword,
+} from "../../lib/share-password.js";
+import { hydrateCommentAuthorNames } from "../../lib/user-identities.js";
 
 function appPath(path: string): string {
   if (!path.startsWith("/")) return path;
@@ -45,10 +74,138 @@ function appBasePath(): string {
   return base ? `/${base}` : "";
 }
 
+const PROTECTED_MEDIA_ACCESS_TTL_SECONDS = 6 * 60 * 60;
+const PROTECTED_MEDIA_COOKIE_PREFIX = "clips_media_";
+
+function protectedMediaCookieName(recordingId: string): string {
+  return `${PROTECTED_MEDIA_COOKIE_PREFIX}${recordingId.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+}
+
+function protectedMediaCookiePath(recordingId: string): string {
+  return appPath(`/api/video/${encodeURIComponent(recordingId)}`);
+}
+
+function isHttpsRequest(event: H3Event): boolean {
+  try {
+    const xfProto = getHeader(event, "x-forwarded-proto");
+    if (xfProto && String(xfProto).split(",")[0].trim() === "https") {
+      return true;
+    }
+    const requestUrl = getForwardedRequestURL(event);
+    if (requestUrl.protocol === "https:") return true;
+    const appUrl = process.env.APP_URL || process.env.BETTER_AUTH_URL || "";
+    if (appUrl.startsWith("https://")) return true;
+  } catch {
+    // keep plain-http dev behavior if request metadata is unavailable
+  }
+  return false;
+}
+
+function setProtectedMediaAccessCookie(
+  event: H3Event,
+  recordingId: string,
+  password: string | null | undefined,
+  sharePasswordVersion: string | null | undefined,
+): string {
+  const token = signShortLivedToken({
+    resourceId: getRecordingAccessTokenResourceId(
+      recordingId,
+      password,
+      sharePasswordVersion,
+    ),
+    ttlSeconds: PROTECTED_MEDIA_ACCESS_TTL_SECONDS,
+  });
+  const secure = isHttpsRequest(event);
+  setCookie(event, protectedMediaCookieName(recordingId), token, {
+    httpOnly: true,
+    sameSite: secure ? "none" : "lax",
+    secure,
+    ...(secure ? { partitioned: true } : {}),
+    path: protectedMediaCookiePath(recordingId),
+    maxAge: PROTECTED_MEDIA_ACCESS_TTL_SECONDS,
+  });
+  return token;
+}
+
+// Best-effort, per-instance (not distributed) throttle on wrong-password
+// attempts against a password-protected share. Keyed by IP + recordingId so
+// one abusive client/recording pair can't brute-force unlimited guesses
+// against a single server instance. Mirrors the limiter in view-event.post.ts.
+const PASSWORD_ATTEMPT_WINDOW_MS = 60_000;
+const PASSWORD_ATTEMPT_MAX = 10;
+const PASSWORD_ATTEMPT_MAX_BUCKETS = 5000;
+const passwordAttemptBuckets = new Map<
+  string,
+  { count: number; reset: number }
+>();
+
+function pruneExpiredPasswordAttemptBuckets(now: number): void {
+  for (const [key, bucket] of passwordAttemptBuckets) {
+    if (bucket.reset < now) passwordAttemptBuckets.delete(key);
+  }
+}
+
+function passwordAttemptAllowed(key: string): boolean {
+  const now = Date.now();
+  const existing = passwordAttemptBuckets.get(key);
+  if (!existing || existing.reset < now) {
+    if (passwordAttemptBuckets.size >= PASSWORD_ATTEMPT_MAX_BUCKETS) {
+      pruneExpiredPasswordAttemptBuckets(now);
+    }
+    passwordAttemptBuckets.set(key, {
+      count: 1,
+      reset: now + PASSWORD_ATTEMPT_WINDOW_MS,
+    });
+    return true;
+  }
+  if (existing.count >= PASSWORD_ATTEMPT_MAX) return false;
+  existing.count += 1;
+  return true;
+}
+
+function requestIp(event: H3Event): string {
+  const xff = getHeader(event, "x-forwarded-for");
+  if (xff) return String(xff).split(",")[0].trim();
+  return event.node?.req?.socket?.remoteAddress || "unknown";
+}
+
+function appendQueryParam(url: string, key: string, value: string): string {
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+}
+
+function isLocalVideoRoute(value: string): boolean {
+  try {
+    const parsed = new URL(value, "http://local.test");
+    return /(?:^|\/)api\/video\/[^/]+$/.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function addProtectedMediaTokenFallback(
+  videoUrl: string | null,
+  token: string | null,
+): string | null {
+  if (!videoUrl || !token || !isLocalVideoRoute(videoUrl)) return videoUrl;
+  return appendQueryParam(videoUrl, "t", token);
+}
+
 export default defineEventHandler(async (event) => {
-  const q = getQuery(event) as { id?: string; password?: string };
+  const q = getQuery(event) as {
+    id?: string;
+    password?: string;
+    agent_access?: string;
+    t?: string;
+  };
   const recordingId = q.id;
   const password = typeof q.password === "string" ? q.password : "";
+  const suppliedAgentAccessToken =
+    typeof q.agent_access === "string"
+      ? q.agent_access
+      : typeof q.t === "string"
+        ? q.t
+        : "";
 
   if (!recordingId) {
     setResponseStatus(event, 400);
@@ -68,30 +225,107 @@ export default defineEventHandler(async (event) => {
   }
 
   const session = await getSession(event).catch(() => null);
-  const viewerIsOwner = Boolean(
-    session?.email && session.email === rec.ownerEmail,
-  );
+  const tokenAllowsAgentAccess = suppliedAgentAccessToken
+    ? verifyScopedAgentAccessToken(suppliedAgentAccessToken, {
+        resourceKind: CLIP_AGENT_ACCESS_TOKEN_PREFIX,
+        resourceId: getRecordingAccessTokenResourceId(
+          rec.id,
+          rec.password,
+          rec.sharePasswordVersion,
+        ),
+      }).ok
+    : false;
 
-  if (rec.visibility !== "public" && !viewerIsOwner) {
+  const viewerAccess = session?.email
+    ? await resolveAccess("recording", rec.id, {
+        userEmail: session.email,
+        orgId: session.orgId,
+      })
+    : null;
+  const viewerIsOwner = viewerAccess?.role === "owner";
+
+  let viewerIsOrgMember = false;
+  if (session?.email && rec.visibility === "org" && rec.organizationId) {
+    try {
+      const role = await getOrganizationRoleForEmail(
+        rec.organizationId,
+        session.email,
+      );
+      viewerIsOrgMember = Boolean(role);
+    } catch {
+      viewerIsOrgMember = false;
+    }
+  }
+
+  if (
+    rec.visibility !== "public" &&
+    !viewerAccess &&
+    !viewerIsOrgMember &&
+    !tokenAllowsAgentAccess
+  ) {
+    setResponseHeader(event, "Cache-Control", "private, max-age=0, no-store");
     setResponseStatus(event, 404);
     return { error: "Not found" };
   }
 
-  // Expiry check
-  if (rec.expiresAt) {
-    const expires = new Date(rec.expiresAt).getTime();
-    if (isFinite(expires) && expires < Date.now()) {
-      setResponseStatus(event, 410);
-      return { error: "Recording has expired", expired: true };
-    }
+  const viewerCanComment = Boolean(
+    session?.email &&
+    (rec.visibility === "public" || viewerAccess || viewerIsOrgMember),
+  );
+
+  const recordingExpired = isRecordingExpiredForViewer({
+    expiresAt: rec.expiresAt,
+    viewerIsOwner,
+  });
+  if (recordingExpired) {
+    setResponseStatus(event, 410);
+    return { error: "Recording has expired", expired: true };
   }
 
-  // Password check
+  if (isHeldForRedaction(rec.editsJson, viewerAccess?.role ?? null)) {
+    setResponseStatus(event, 409);
+    return {
+      error: REDACTION_HOLD_MESSAGE,
+      redactionPending: true,
+    };
+  }
+
+  let protectedMediaToken: string | null = null;
   if (rec.password && !viewerIsOwner) {
-    if (!password || !verifySharePassword(password, rec.password)) {
-      setResponseStatus(event, 401);
-      return { error: "Password required", passwordRequired: true };
+    if (!tokenAllowsAgentAccess) {
+      if (!password) {
+        // No password supplied at all — this is the initial load or a
+        // background poll sitting on the password prompt, not a guess. Don't
+        // touch the throttle, or a viewer who never submits anything would
+        // eventually get 429'd just for polling.
+        setResponseStatus(event, 401);
+        return { error: "Password required", passwordRequired: true };
+      }
+      if (!verifySharePassword(password, rec.password)) {
+        // Only a supplied-and-wrong password counts against the throttle, so
+        // a viewer who supplies the correct password is never rate-limited.
+        const attemptKey = `${requestIp(event)}:${recordingId}`;
+        if (!passwordAttemptAllowed(attemptKey)) {
+          setResponseStatus(event, 429);
+          return { error: "Too many attempts, try again later" };
+        }
+        setResponseStatus(event, 401);
+        return { error: "Password required", passwordRequired: true };
+      }
     }
+    protectedMediaToken = setProtectedMediaAccessCookie(
+      event,
+      recordingId,
+      rec.password,
+      rec.sharePasswordVersion,
+    );
+  } else if (tokenAllowsAgentAccess && !viewerIsOwner) {
+    protectedMediaToken = setProtectedMediaAccessCookie(
+      event,
+      recordingId,
+      rec.password,
+      rec.sharePasswordVersion,
+    );
   }
 
   const [transcript] = await db
@@ -110,6 +344,16 @@ export default defineEventHandler(async (event) => {
           asc(schema.recordingComments.createdAt),
         )
     : [];
+  const hydratedComments = await hydrateCommentAuthorNames(comments);
+  const commentMentions = new Map(
+    hydratedComments.map((comment) => [
+      comment.id,
+      displayCommentMentions(comment.mentionsJson),
+    ]),
+  );
+  for (const comment of hydratedComments) {
+    Reflect.deleteProperty(comment, "mentionsJson");
+  }
 
   const reactions = rec.enableReactions
     ? await db
@@ -145,60 +389,136 @@ export default defineEventHandler(async (event) => {
   // Normalize the player videoUrl:
   //   1. Rewrite the legacy `/api/uploads/:id/blob` shape to the current
   //      `/api/video/:id` endpoint so old rows keep playing after the move.
-  //   2. Keep Loom imports behind the same-origin `/api/video/:id` access
-  //      gate instead of returning the underlying public Loom embed URL.
-  //   3. For password-protected recordings, mint a short-lived HMAC token
-  //      bound to this recording id and pass it via `?t=<token>` instead of
-  //      the plaintext password. Sticking the password in the URL leaks it
-  //      into browser history, CDN logs, and the Referer header on outbound
-  //      requests. The downstream `/api/video/:id` route accepts either
-  //      `?t=<token>` (preferred) or `?password=<pw>` (legacy fallback) so
-  //      old share pages keep working during rollout. (audit 11 F-07)
-  //      Real provider URLs (R2/S3/Builder) are left untouched; those are
-  //      already signed.
+  //   2. Keep all Loom imports behind the same-origin `/api/video/:id` access
+  //      gate. Legacy Loom rows render an iframe inside that route; reuploaded
+  //      Loom rows proxy their stored provider URL from the server.
+  //   3. For password-protected public recordings, the password check above
+  //      mints a signed media grant cookie scoped to `/api/video/:id`. We also
+  //      append the same 6-hour token as a fallback for browsers/embeds that
+  //      cannot use the cookie immediately. Sticking the plaintext password in
+  //      the URL leaks it into browser history, CDN logs, and Referer headers.
+  //      The downstream `/api/video/:id` route accepts `?t=<token>`, the media
+  //      cookie, or `?password=<pw>` as a legacy fallback. (audit 11 F-07)
+  //      Remote provider URLs (R2/S3/Builder) are kept behind the same-origin
+  //      proxy on public pages so CORS, Range support, and fragile signed URLs
+  //      fail in one server-controlled place instead of as opaque <video>
+  //      errors in the browser.
   const resolvedVideoUrl = resolvePlayerVideoUrl(rec, {
-    addPasswordToken: true,
+    addPasswordToken: false,
+    appPath,
+    proxyRemoteMedia: true,
+  });
+  const playbackVideoUrl = addProtectedMediaTokenFallback(
+    resolvedVideoUrl,
+    protectedMediaToken,
+  );
+  const playbackThumbnailUrl = resolvePlayerThumbnailUrl(rec, {
+    accessToken: protectedMediaToken,
     appPath,
   });
+  const playbackAnimatedThumbnailUrl = rec.animatedThumbnailUrl
+    ? resolvePlayerThumbnailUrl(rec, {
+        accessToken: protectedMediaToken,
+        animated: true,
+        appPath,
+      })
+    : null;
 
   const canExposeAgentContext =
-    rec.visibility === "public" && !rec.archivedAt && !rec.trashedAt;
+    (rec.visibility === "public" || tokenAllowsAgentAccess || viewerIsOwner) &&
+    !rec.archivedAt &&
+    !rec.trashedAt;
   const agentToken =
-    canExposeAgentContext && rec.password
-      ? signShortLivedToken({ resourceId: recordingId })
-      : undefined;
+    canExposeAgentContext && tokenAllowsAgentAccess
+      ? suppliedAgentAccessToken
+      : canExposeAgentContext && rec.password
+        ? signScopedAgentAccessToken({
+            resourceKind: CLIP_AGENT_ACCESS_TOKEN_PREFIX,
+            resourceId: getRecordingAccessTokenResourceId(
+              recordingId,
+              rec.password,
+              rec.sharePasswordVersion,
+            ),
+          })
+        : undefined;
   const agentContextUrl = canExposeAgentContext
     ? buildAgentApiUrls(recordingId, {
-        origin: getRequestURL(event).origin,
+        origin: getForwardedRequestOrigin(event),
         basePath: appBasePath(),
         token: agentToken,
       }).contextUrl
     : null;
 
-  // Don't leak the URL (which now carries a short-lived token) into the
-  // Referer of any outbound link the share page renders.
   setResponseHeader(event, "Referrer-Policy", "no-referrer");
+  const transcriptPresentation = resolveTranscriptPresentation(transcript);
+  const [verificationPending, seekableRepairPending] = await Promise.all([
+    isMediaVerificationPending({
+      ownerEmail: rec.ownerEmail,
+      recordingId,
+      recordingStatus: rec.status,
+    }),
+    isSeekableRepairPending({
+      ownerEmail: rec.ownerEmail,
+      recordingId,
+      recordingStatus: rec.status,
+      videoUrl: rec.videoUrl,
+    }),
+  ]);
+
+  const [viewCount, agentViewCount] = await Promise.all([
+    countRecordingViews(recordingId),
+    countRecordingAgentViews(recordingId),
+  ]);
+
+  const viewerRole =
+    viewerAccess?.role ?? (viewerIsOrgMember ? "viewer" : null);
+  const canOpenDashboard =
+    Boolean(session?.email) && viewerAccess
+      ? canOpenDirectRecordingPage({
+          role: viewerAccess.role as RecordingPageAccessRole,
+          visibility: rec.visibility as RecordingVisibility,
+          hasPassword: Boolean(rec.password),
+          hasExplicitShare: await hasExplicitRecordingShare({
+            recordingId,
+            role: viewerAccess.role as RecordingPageAccessRole,
+            visibility: rec.visibility as RecordingVisibility,
+            hasPassword: Boolean(rec.password),
+            userEmail: session?.email ?? null,
+            orgId: session?.orgId ?? null,
+          }),
+        })
+      : false;
 
   return {
     recording: {
       id: rec.id,
       title: rec.title,
       description: rec.description,
-      thumbnailUrl: rec.thumbnailUrl,
-      animatedThumbnailUrl: rec.animatedThumbnailUrl,
+      kind: resolveRecordingKind(rec.kind),
+      // A screenshot's picture is served by the thumbnail route, which is the
+      // full stored image and carries the same short-lived token as the video
+      // URL — so the share password gates the image bytes too.
+      imageUrl: isImageRecording(rec) ? playbackThumbnailUrl : null,
+      thumbnailUrl: playbackThumbnailUrl,
+      animatedThumbnailUrl: playbackAnimatedThumbnailUrl,
       sourceAppName: rec.sourceAppName,
       durationMs: rec.durationMs,
-      editsJson: rec.editsJson,
-      videoUrl: resolvedVideoUrl,
+      editsJson: isImageRecording(rec)
+        ? viewerScreenshotEditsJson(rec.editsJson)
+        : rec.editsJson,
+      videoUrl: playbackVideoUrl,
       videoFormat: rec.videoFormat,
+      videoSizeBytes: rec.videoSizeBytes ?? null,
+      mediaUpdatedAt: rec.mediaUpdatedAt,
       width: rec.width,
       height: rec.height,
       hasAudio: Boolean(rec.hasAudio),
       hasCamera: Boolean(rec.hasCamera),
       status: rec.status,
+      verificationPending,
+      seekableRepairPending,
       uploadProgress: rec.uploadProgress,
       failureReason: rec.failureReason,
-      // Don't leak the password to clients; just indicate whether one was set.
       hasPassword: !!rec.password,
       expiresAt: rec.expiresAt,
       enableComments: Boolean(rec.enableComments),
@@ -212,16 +532,18 @@ export default defineEventHandler(async (event) => {
       updatedAt: rec.updatedAt,
     },
     agentContextUrl,
+    viewCount,
+    agentViewCount,
     transcript: transcript
       ? {
-          status: transcript.status,
+          status: transcriptPresentation.status,
           language: transcript.language,
           fullText: transcript.fullText,
-          failureReason: transcript.failureReason,
+          failureReason: transcriptPresentation.failureReason,
           segments: transcriptSegments,
         }
       : null,
-    comments: comments.map((c) => ({
+    comments: hydratedComments.map((c) => ({
       id: c.id,
       recordingId: c.recordingId,
       threadId: c.threadId,
@@ -229,6 +551,7 @@ export default defineEventHandler(async (event) => {
       authorEmail: c.authorEmail,
       authorName: c.authorName,
       content: c.content,
+      mentions: commentMentions.get(c.id) ?? [],
       videoTimestampMs: c.videoTimestampMs,
       emojiReactionsJson: c.emojiReactionsJson,
       resolved: Boolean(c.resolved),
@@ -253,9 +576,14 @@ export default defineEventHandler(async (event) => {
     })),
     viewer: session?.email
       ? {
-          canEdit: viewerIsOwner,
-          isOwner: viewerIsOwner,
-          role: viewerIsOwner ? "owner" : "viewer",
+          canEdit:
+            viewerRole === "owner" ||
+            viewerRole === "admin" ||
+            viewerRole === "editor",
+          canComment: viewerCanComment,
+          isOwner: viewerRole === "owner",
+          role: viewerRole ?? "viewer",
+          canOpenDashboard,
         }
       : null,
   };

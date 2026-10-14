@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+
 import type { Message } from "./types.js";
 
-// In-memory SQL mock
 let tables: Record<string, any[]> = {};
+let onIdempotentInsert: ((args: any[]) => void) | null = null;
 
 function createMockDb() {
   return {
@@ -10,14 +11,22 @@ function createMockDb() {
       const rawSql = typeof sql === "string" ? sql : sql.sql;
       const args = typeof sql === "string" ? [] : sql.args || [];
 
-      // CREATE TABLE
       if (rawSql.includes("CREATE TABLE")) {
         tables["a2a_tasks"] = tables["a2a_tasks"] || [];
         return { rows: [], rowsAffected: 0 };
       }
 
-      // INSERT
       if (rawSql.includes("INSERT INTO a2a_tasks")) {
+        if (rawSql.includes("ON CONFLICT")) {
+          onIdempotentInsert?.(args);
+          const existing = (tables["a2a_tasks"] || []).find(
+            (row) =>
+              row.owner_email === args[7] &&
+              row.owner_scope === args[8] &&
+              row.idempotency_key === args[9],
+          );
+          if (existing) return { rows: [], rowsAffected: 0 };
+        }
         const row = {
           id: args[0],
           context_id: args[1],
@@ -26,15 +35,36 @@ function createMockDb() {
           status_timestamp: args[3],
           history: args[4],
           artifacts: args[5],
-          metadata: null,
-          created_at: args[6],
-          updated_at: args[7],
+          metadata: args[6],
+          owner_email: args[7],
+          owner_scope: args[8],
+          idempotency_key: args[9],
+          created_at: args[10],
+          updated_at: args[11],
         };
         tables["a2a_tasks"].push(row);
         return { rows: [], rowsAffected: 1 };
       }
 
-      // SELECT * ... WHERE id = ?
+      if (
+        rawSql.includes(
+          "WHERE owner_email IS NOT DISTINCT FROM ? AND owner_scope = ? AND idempotency_key = ?",
+        )
+      ) {
+        const rows = (tables["a2a_tasks"] || []).filter(
+          (row) =>
+            row.owner_email === args[0] &&
+            row.owner_scope === args[1] &&
+            row.idempotency_key === args[2],
+        );
+        return { rows, rowsAffected: 0 };
+      }
+
+      if (rawSql.includes("SELECT owner_email, owner_scope")) {
+        const row = (tables["a2a_tasks"] || []).find((r) => r.id === args[0]);
+        return { rows: row ? [row] : [], rowsAffected: 0 };
+      }
+
       if (rawSql.includes("SELECT * FROM a2a_tasks WHERE id")) {
         const rows = (tables["a2a_tasks"] || []).filter(
           (r) => r.id === args[0],
@@ -42,22 +72,47 @@ function createMockDb() {
         return { rows, rowsAffected: 0 };
       }
 
-      // SELECT * ... WHERE context_id = ?
-      if (rawSql.includes("WHERE context_id")) {
-        const rows = (tables["a2a_tasks"] || []).filter(
-          (r) => r.context_id === args[0],
+      if (rawSql.includes("FROM a2a_tasks") && rawSql.includes("LIMIT ?")) {
+        let rows = [...(tables["a2a_tasks"] || [])];
+        let argIndex = 0;
+        if (rawSql.includes("context_id = ?")) {
+          rows = rows.filter((row) => row.context_id === args[argIndex]);
+          argIndex += 1;
+        }
+        if (rawSql.includes("created_at < ?")) {
+          const createdAt = Number(args[argIndex]);
+          const id = String(args[argIndex + 2]);
+          rows = rows.filter(
+            (row) =>
+              row.created_at < createdAt ||
+              (row.created_at === createdAt && row.id < id),
+          );
+        }
+        rows.sort(
+          (a, b) =>
+            b.created_at - a.created_at ||
+            String(b.id).localeCompare(String(a.id)),
         );
-        return { rows, rowsAffected: 0 };
+        return {
+          rows: rows.slice(0, Number(args.at(-1))),
+          rowsAffected: 0,
+        };
       }
 
-      // SELECT * ... ORDER BY (list all)
-      if (rawSql.includes("SELECT * FROM a2a_tasks ORDER BY")) {
-        return { rows: tables["a2a_tasks"] || [], rowsAffected: 0 };
-      }
-
-      // UPDATE
       if (rawSql.includes("UPDATE a2a_tasks SET")) {
-        const id = args[6]; // last arg
+        if (rawSql.includes("SET idempotency_key = NULL")) {
+          const row = (tables["a2a_tasks"] || []).find(
+            (candidate) =>
+              candidate.id === args[1] &&
+              candidate.idempotency_key === args[2] &&
+              ["failed", "canceled"].includes(candidate.status_state),
+          );
+          if (!row) return { rows: [], rowsAffected: 0 };
+          row.idempotency_key = null;
+          row.updated_at = args[0];
+          return { rows: [], rowsAffected: 1 };
+        }
+        const id = args[6];
         const row = (tables["a2a_tasks"] || []).find((r) => r.id === id);
         if (row) {
           row.status_state = args[0];
@@ -77,12 +132,20 @@ function createMockDb() {
 }
 
 const mockDb = createMockDb();
+const executeDdlMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../db/client.js", () => ({
   getDbExec: () => mockDb,
-  isPostgres: () => false,
-  intType: () => "INTEGER",
 }));
+
+vi.mock("../db/ddl-guard.js", () => ({
+  ensureColumnExists: (_table: string, _column: string, sql: string) =>
+    executeDdlMock(sql),
+  ensureIndexExists: (_index: string, sql: string) => executeDdlMock(sql),
+  ensureTableExists: (_table: string, sql: string) => executeDdlMock(sql),
+}));
+
+executeDdlMock.mockImplementation((sql: string) => mockDb.execute(sql));
 
 function makeMessage(text: string, role: "user" | "agent" = "user"): Message {
   return {
@@ -94,6 +157,7 @@ function makeMessage(text: string, role: "user" | "agent" = "user"): Message {
 describe("task-store (SQL)", () => {
   beforeEach(() => {
     tables = {};
+    onIdempotentInsert = null;
     vi.clearAllMocks();
     vi.resetModules();
   });
@@ -101,6 +165,17 @@ describe("task-store (SQL)", () => {
   async function loadStore() {
     return import("./task-store.js");
   }
+
+  it("indexes only active task states for stale-task recovery scans", async () => {
+    const { ensureTable } = await loadStore();
+    await ensureTable();
+
+    expect(executeDdlMock).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "ON a2a_tasks(created_at) WHERE status_state IN ('submitted', 'working', 'processing')",
+      ),
+    );
+  });
 
   describe("createTask", () => {
     it("creates a task with submitted state", async () => {
@@ -130,7 +205,6 @@ describe("task-store (SQL)", () => {
     it("generates a UUID for the task ID", async () => {
       const { createTask } = await loadStore();
       const task = await createTask(makeMessage("Test"));
-      // UUID v4 format
       expect(task.id).toMatch(
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
       );
@@ -140,6 +214,254 @@ describe("task-store (SQL)", () => {
       const { createTask } = await loadStore();
       const task = await createTask(makeMessage("Test"));
       expect(task.status.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    });
+  });
+
+  describe("createOrReuseTask", () => {
+    it("atomically reuses one owner-scoped task for the same key", async () => {
+      const { createOrReuseTask } = await loadStore();
+      const first = await createOrReuseTask(
+        makeMessage("Hello"),
+        "thread-1",
+        { callerApp: "mail" },
+        "Alice@Example.test",
+        "acme.test",
+        "v1:stable",
+      );
+      const duplicate = await createOrReuseTask(
+        makeMessage("Hello"),
+        "thread-1",
+        { callerApp: "mail" },
+        "alice@example.test",
+        "acme.test",
+        "v1:stable",
+      );
+
+      expect(first.reused).toBe(false);
+      expect(duplicate).toMatchObject({
+        reused: true,
+        task: { id: first.task.id },
+      });
+      expect(tables.a2a_tasks).toHaveLength(1);
+    });
+
+    it("reuses organization-scoped tasks without assigning a user owner", async () => {
+      const { createOrReuseTask } = await loadStore();
+      const first = await createOrReuseTask(
+        makeMessage("Hello"),
+        undefined,
+        undefined,
+        null,
+        "__a2a_org_id__:org-acme",
+        "v1:stable-org-message",
+      );
+      const duplicate = await createOrReuseTask(
+        makeMessage("Retry"),
+        undefined,
+        undefined,
+        null,
+        "__a2a_org_id__:org-acme",
+        "v1:stable-org-message",
+      );
+      const otherOrganization = await createOrReuseTask(
+        makeMessage("Other organization"),
+        undefined,
+        undefined,
+        null,
+        "__a2a_org_id__:org-other",
+        "v1:stable-org-message",
+      );
+
+      expect(first.reused).toBe(false);
+      expect(duplicate).toMatchObject({
+        reused: true,
+        task: { id: first.task.id, ownerEmail: null },
+      });
+      expect(otherOrganization.reused).toBe(false);
+      expect(otherOrganization.task.id).not.toBe(first.task.id);
+    });
+
+    it("does not reuse tasks for an unauthenticated caller", async () => {
+      const { createOrReuseTask } = await loadStore();
+      const first = await createOrReuseTask(
+        makeMessage("Hello"),
+        undefined,
+        undefined,
+        null,
+        null,
+        "v1:anonymous-message",
+      );
+      const second = await createOrReuseTask(
+        makeMessage("Retry"),
+        undefined,
+        undefined,
+        null,
+        null,
+        "v1:anonymous-message",
+      );
+
+      expect(first.reused).toBe(false);
+      expect(second.reused).toBe(false);
+      expect(second.task.id).not.toBe(first.task.id);
+    });
+
+    it("keeps the same key independent across authenticated owners", async () => {
+      const { createOrReuseTask } = await loadStore();
+      const first = await createOrReuseTask(
+        makeMessage("Hello"),
+        undefined,
+        undefined,
+        "alice@example.test",
+        "acme.test",
+        "v1:stable",
+      );
+      const second = await createOrReuseTask(
+        makeMessage("Hello"),
+        undefined,
+        undefined,
+        "bob@example.test",
+        "acme.test",
+        "v1:stable",
+      );
+
+      expect(first.task.id).not.toBe(second.task.id);
+      expect(second.reused).toBe(false);
+      expect(tables.a2a_tasks).toHaveLength(2);
+    });
+
+    it("preserves non-idempotent behavior without an authenticated owner", async () => {
+      const { createOrReuseTask } = await loadStore();
+      const first = await createOrReuseTask(
+        makeMessage("Hello"),
+        undefined,
+        undefined,
+        null,
+        null,
+        "v1:stable",
+      );
+      const second = await createOrReuseTask(
+        makeMessage("Hello"),
+        undefined,
+        undefined,
+        null,
+        null,
+        "v1:stable",
+      );
+
+      expect(first.task.id).not.toBe(second.task.id);
+      expect(tables.a2a_tasks).toHaveLength(2);
+    });
+
+    it("rejects oversized keys before storage", async () => {
+      const { createOrReuseTask, MAX_A2A_IDEMPOTENCY_KEY_CHARS } =
+        await loadStore();
+      await expect(
+        createOrReuseTask(
+          makeMessage("Hello"),
+          undefined,
+          undefined,
+          "alice@example.test",
+          "acme.test",
+          "x".repeat(MAX_A2A_IDEMPOTENCY_KEY_CHARS + 1),
+        ),
+      ).rejects.toThrow("too long");
+      expect(tables.a2a_tasks ?? []).toHaveLength(0);
+    });
+
+    it("keeps the same owner and key independent across org scopes", async () => {
+      const { createOrReuseTask } = await loadStore();
+      const first = await createOrReuseTask(
+        makeMessage("Hello"),
+        undefined,
+        undefined,
+        "alice@example.test",
+        "acme.test",
+        "v1:stable",
+      );
+      const second = await createOrReuseTask(
+        makeMessage("Hello"),
+        undefined,
+        undefined,
+        "alice@example.test",
+        "other.test",
+        "v1:stable",
+      );
+
+      expect(first.task.id).not.toBe(second.task.id);
+      expect(second.reused).toBe(false);
+    });
+
+    it("releases failed tasks so an intentional retry can start fresh", async () => {
+      const { createOrReuseTask } = await loadStore();
+      const first = await createOrReuseTask(
+        makeMessage("Hello"),
+        undefined,
+        undefined,
+        "alice@example.test",
+        "acme.test",
+        "v1:stable",
+      );
+      tables.a2a_tasks[0].status_state = "failed";
+      const retry = await createOrReuseTask(
+        makeMessage("Hello"),
+        undefined,
+        undefined,
+        "alice@example.test",
+        "acme.test",
+        "v1:stable",
+      );
+
+      expect(retry.reused).toBe(false);
+      expect(retry.task.id).not.toBe(first.task.id);
+    });
+
+    it("marks a concurrent retry winner as reused after releasing a failed key", async () => {
+      const { createOrReuseTask } = await loadStore();
+      const first = await createOrReuseTask(
+        makeMessage("Hello"),
+        undefined,
+        undefined,
+        "alice@example.test",
+        "acme.test",
+        "v1:stable",
+      );
+      tables.a2a_tasks[0].status_state = "failed";
+
+      let retryInsertAttempts = 0;
+      onIdempotentInsert = (args) => {
+        retryInsertAttempts++;
+        if (retryInsertAttempts !== 2) return;
+        tables.a2a_tasks.push({
+          id: "concurrent-winner",
+          context_id: args[1],
+          status_state: "submitted",
+          status_message: null,
+          status_timestamp: args[3],
+          history: args[4],
+          artifacts: args[5],
+          metadata: args[6],
+          owner_email: args[7],
+          owner_scope: args[8],
+          idempotency_key: args[9],
+          created_at: args[10],
+          updated_at: args[11],
+        });
+      };
+
+      const retry = await createOrReuseTask(
+        makeMessage("Hello"),
+        undefined,
+        undefined,
+        "alice@example.test",
+        "acme.test",
+        "v1:stable",
+      );
+
+      expect(retry).toMatchObject({
+        reused: true,
+        task: { id: "concurrent-winner" },
+      });
+      expect(retry.task.id).not.toBe(first.task.id);
     });
   });
 
@@ -239,6 +561,74 @@ describe("task-store (SQL)", () => {
       const filtered = await listTasks("ctx-1");
       expect(filtered).toHaveLength(2);
       expect(filtered.every((t) => t.contextId === "ctx-1")).toBe(true);
+    });
+
+    it("paginates newest-first with a stable cursor", async () => {
+      const { createTask, listTasksPage } = await loadStore();
+      vi.useFakeTimers();
+      vi.setSystemTime(1_000);
+      try {
+        const oldest = await createTask(makeMessage("A"));
+        vi.setSystemTime(2_000);
+        const middle = await createTask(makeMessage("B"));
+        vi.setSystemTime(3_000);
+        const newest = await createTask(makeMessage("C"));
+
+        const first = await listTasksPage(undefined, { limit: 2 });
+        expect(first.tasks.map((task) => task.id)).toEqual([
+          newest.id,
+          middle.id,
+        ]);
+        expect(first.nextCursor).toEqual({ createdAt: 2_000, id: middle.id });
+
+        const second = await listTasksPage(undefined, {
+          limit: 2,
+          before: first.nextCursor!,
+        });
+        expect(second.tasks.map((task) => task.id)).toEqual([oldest.id]);
+        expect(second.nextCursor).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("returns the full legacy list through bounded pages", async () => {
+      const { listTasks } = await loadStore();
+      tables["a2a_tasks"] = Array.from({ length: 205 }, (_, index) => ({
+        id: `task-${String(index).padStart(3, "0")}`,
+        context_id: null,
+        status_state: "submitted",
+        status_message: null,
+        status_timestamp: new Date(index).toISOString(),
+        history: "[]",
+        artifacts: "[]",
+        metadata: null,
+        owner_email: null,
+        owner_scope: "",
+        created_at: index,
+        updated_at: index,
+      }));
+
+      const tasks = await listTasks();
+      const listCalls = mockDb.execute.mock.calls.filter((call) => {
+        const sql = typeof call[0] === "string" ? call[0] : call[0].sql;
+        return sql.includes("FROM a2a_tasks") && sql.includes("LIMIT ?");
+      });
+
+      expect(tasks).toHaveLength(205);
+      expect(tasks[0]?.id).toBe("task-204");
+      expect(listCalls).toHaveLength(3);
+      expect(
+        listCalls.every(
+          (call) => typeof call[0] !== "string" && call[0].args.at(-1) === 101,
+        ),
+      ).toBe(true);
+      expect(listCalls[0]![0]).toMatchObject({
+        sql: expect.stringContaining("SELECT id, context_id"),
+      });
+      expect(listCalls[0]![0]).not.toMatchObject({
+        sql: expect.stringContaining("SELECT *"),
+      });
     });
 
     it("returns empty for non-matching contextId", async () => {

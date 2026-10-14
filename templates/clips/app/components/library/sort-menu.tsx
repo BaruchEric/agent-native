@@ -1,11 +1,17 @@
 import { IconArrowsSort, IconCheck } from "@tabler/icons-react";
+
+import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 export type SortKey = "recent" | "views" | "oldest";
 
@@ -23,12 +29,21 @@ interface SortMenuProps {
 export function SortMenu({ value, onChange }: SortMenuProps) {
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="outline" size="sm" className="gap-1.5 h-8">
-          <IconArrowsSort className="h-3.5 w-3.5" />
-          <span className="text-xs">{LABELS[value]}</span>
-        </Button>
-      </DropdownMenuTrigger>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost-inset"
+              size="icon-sm"
+              className="shrink-0"
+              aria-label={LABELS[value]}
+            >
+              <IconArrowsSort className="h-3.5 w-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+        </TooltipTrigger>
+        <TooltipContent>{LABELS[value]}</TooltipContent>
+      </Tooltip>
       <DropdownMenuContent align="end" className="w-44">
         {(Object.keys(LABELS) as SortKey[]).map((key) => (
           <DropdownMenuItem

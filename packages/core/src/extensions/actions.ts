@@ -1,10 +1,54 @@
+import { randomUUID } from "node:crypto";
+
+import { and, eq, inArray, or, sql } from "drizzle-orm";
+
+import { ACTION_CHAT_UI_INLINE_EXTENSION_RENDERER } from "../action-ui.js";
+import {
+  AgentActionStopError,
+  fail,
+  type ActionRunContext,
+} from "../action.js";
 import type { ActionEntry } from "../agent/production-agent.js";
-import type { ActionRunContext } from "../action.js";
 import type { AgentChatAttachment } from "../agent/types.js";
 import { writeAppState } from "../application-state/script-helpers.js";
+import { getDbExec } from "../db/client.js";
+import { createGetDb } from "../db/create-get-db.js";
+import { readResource } from "../resources/script-helpers.js";
+import {
+  getRequestOrgId,
+  getRequestRunContext,
+  getRequestUserEmail,
+} from "../server/request-context.js";
+import { resolveAccess } from "../sharing/access.js";
+import { ROLE_RANK, roleSatisfies, type ShareRole } from "../sharing/schema.js";
+import {
+  readWorkspaceFile,
+  type WorkspaceFilesScope,
+} from "../workspace-files/store.js";
+import { ExtensionContentEditError } from "./content-patch.js";
+import type {
+  ExtensionContentEdit,
+  ExtensionLegacyPatch,
+} from "./content-patch.js";
+import {
+  getLocalExtension,
+  isLocalExtensionRow,
+  listLocalExtensions,
+  type LocalExtensionRow,
+} from "./local.js";
+import { extensionPath } from "./path.js";
+import { extensions, extensionShares } from "./schema.js";
+import {
+  addExtensionSlotTarget,
+  installExtensionSlot,
+  uninstallExtensionSlot,
+  listExtensionsForSlot,
+  listSlotsForExtension,
+} from "./slots/store.js";
 import {
   createExtension,
   deleteExtension,
+  ensureExtensionsTables,
   findRecentDuplicateExtension,
   getHiddenExtensionIdsForCurrentUser,
   getExtension,
@@ -14,31 +58,115 @@ import {
   hideExtension,
   listExtensionHistory,
   listExtensions,
+  notifyExtensionChangeForResource,
   restoreExtensionHistoryVersion,
   unhideExtension,
   updateExtension,
   updateExtensionContent,
+  type ExtensionHistoryDetail,
+  type ExtensionHistoryEntry,
   type ExtensionRow,
 } from "./store.js";
-import { resolveAccess } from "../sharing/access.js";
-import {
-  addExtensionSlotTarget,
-  installExtensionSlot,
-  uninstallExtensionSlot,
-  listExtensionsForSlot,
-  listSlotsForExtension,
-} from "./slots/store.js";
-import {
-  getLocalExtension,
-  isLocalExtensionRow,
-  listLocalExtensions,
-  type LocalExtensionRow,
-} from "./local.js";
-import { extensionPath } from "./path.js";
-import type {
-  ExtensionContentEdit,
-  ExtensionLegacyPatch,
-} from "./content-patch.js";
+
+const getExtensionsAccessDb = createGetDb({
+  extensions,
+  extensionShares,
+});
+
+async function resolveExtensionAccessRoles(
+  rows: Array<Pick<ExtensionRow, "id" | "ownerEmail" | "visibility" | "orgId">>,
+): Promise<Map<string, ShareRole | "owner">> {
+  const roles = new Map<string, ShareRole | "owner">();
+  if (rows.length === 0) return roles;
+
+  const userEmail = getRequestUserEmail()?.trim().toLowerCase() || null;
+  const orgId = getRequestOrgId();
+  const pending: typeof rows = [];
+
+  for (const row of rows) {
+    if (userEmail && row.ownerEmail.trim().toLowerCase() === userEmail) {
+      roles.set(row.id, "owner");
+    } else {
+      pending.push(row);
+    }
+  }
+
+  if (pending.length === 0) return roles;
+
+  const pendingIds = pending.map((row) => row.id);
+  const principalClauses = [];
+  if (userEmail) {
+    principalClauses.push(
+      and(
+        eq(extensionShares.principalType, "user"),
+        sql`lower(${extensionShares.principalId}) = ${userEmail}`,
+      ),
+    );
+  }
+  if (orgId) {
+    principalClauses.push(
+      and(
+        eq(extensionShares.principalType, "org"),
+        eq(extensionShares.principalId, orgId),
+      ),
+    );
+  }
+
+  let batched = false;
+  if (principalClauses.length > 0) {
+    try {
+      await ensureExtensionsTables();
+      const db = getExtensionsAccessDb();
+      const shareRows = (await db
+        .select({
+          resourceId: extensionShares.resourceId,
+          role: extensionShares.role,
+        })
+        .from(extensionShares)
+        .where(
+          and(
+            inArray(extensionShares.resourceId, pendingIds),
+            or(...principalClauses),
+          ),
+        )) as Array<{ resourceId: string; role: ShareRole }>;
+
+      for (const share of shareRows) {
+        const prev = roles.get(share.resourceId);
+        if (!prev || ROLE_RANK[share.role] > ROLE_RANK[prev]) {
+          roles.set(share.resourceId, share.role);
+        }
+      }
+      batched = true;
+    } catch {
+      batched = false;
+    }
+  }
+
+  if (!batched) {
+    await Promise.all(
+      pending.map(async (row) => {
+        const access = await resolveAccess("extension", row.id).catch(
+          () => null,
+        );
+        roles.set(row.id, access?.role ?? "viewer");
+      }),
+    );
+    return roles;
+  }
+
+  for (const row of pending) {
+    if (!roles.has(row.id)) roles.set(row.id, "viewer");
+  }
+
+  return roles;
+}
+
+const GET_EXTENSION_MAX_RESULT_CHARS = 500_000;
+const GET_EXTENSION_HISTORY_MAX_RESULT_CHARS = 2_000_000;
+const LARGE_EXTENSION_INLINE_CONTENT_MAX_CHARS = 60_000;
+const EXTENSION_CONTENT_MATCH_LIMIT = 8;
+const DEFAULT_EXTENSION_CONTENT_CONTEXT_CHARS = 1_500;
+const MAX_EXTENSION_CONTENT_CONTEXT_CHARS = 4_000;
 
 export function createExtensionActionEntries(): Record<string, ActionEntry> {
   return {
@@ -92,6 +220,7 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
           await listExtensions({
             includeHidden,
             includeGloballyHidden,
+            ...(includeContent ? { includeContent: true } : {}),
           });
         const localRows = await listLocalExtensions();
         const allRows: Array<ExtensionRow | LocalExtensionRow> = [
@@ -110,8 +239,13 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
         }
 
         rows = rows.slice(0, limit);
+        const roleById = await resolveExtensionAccessRoles(
+          rows.filter((row): row is ExtensionRow => !isLocalExtensionRow(row)),
+        );
         const extensions = await Promise.all(
-          rows.map((row) => summarizeExtension(row, hiddenIds, includeContent)),
+          rows.map((row) =>
+            summarizeExtension(row, hiddenIds, includeContent, roleById),
+          ),
         );
         return {
           ok: true,
@@ -125,7 +259,7 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
     "get-extension": {
       tool: {
         description:
-          "Get one existing extension by id. Use this when <current-screen> or <current-url> contains extensionId for the current extension; do not call list-extensions just to rediscover that id. Defaults to including the full Alpine.js content so you can make a targeted update-extension edit.",
+          "Get one existing extension by id. Use this when <current-screen> or <current-url> contains extensionId for the current extension; do not call list-extensions just to rediscover that id. Small extensions include their full Alpine.js content once per run. Large extensions return compact metadata first; pass contentQuery with a function, variable, section marker, or literal text to retrieve bounded source excerpts for a targeted update-extension edit. Repeated unchanged full reads return compact metadata unless forceContent=true.",
         parameters: {
           type: "object",
           properties: {
@@ -139,6 +273,21 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
               description:
                 "Include full Alpine.js content. Defaults to true for targeted edits.",
             },
+            forceContent: {
+              type: "boolean",
+              description:
+                "Return full content even when the extension is large or this run already read the same unchanged body. Use only for a broad rewrite; prefer contentQuery plus focused update-extension edits.",
+            },
+            contentQuery: {
+              type: "string",
+              description:
+                "Literal, case-insensitive source text to find. Returns bounded excerpts around up to 8 matches without loading the full extension.",
+            },
+            contentContextChars: {
+              type: "number",
+              description:
+                "Characters of context before and after each contentQuery match. Defaults to 1500 and is capped at 4000.",
+            },
           },
           required: ["id"],
         },
@@ -150,14 +299,22 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
           args?.includeContent === undefined
             ? true
             : coerceBoolean(args.includeContent);
+        const forceContent = coerceBoolean(args?.forceContent);
+        const contentQuery = String(args?.contentQuery ?? "").trim();
+        const contentContextChars = normalizeExtensionContentContextChars(
+          args?.contentContextChars,
+        );
         const localExtension = await getLocalExtension(id);
         if (localExtension) {
           return {
             ok: true,
-            extension: await summarizeExtension(
+            extension: await summarizeExtensionForAgentRead(
               localExtension,
               new Set(),
               includeContent,
+              forceContent,
+              contentQuery,
+              contentContextChars,
             ),
           };
         }
@@ -166,13 +323,17 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
         const hiddenIds = await getHiddenExtensionIdsForCurrentUser();
         return {
           ok: true,
-          extension: await summarizeExtension(
+          extension: await summarizeExtensionForAgentRead(
             extension,
             hiddenIds,
             includeContent,
+            forceContent,
+            contentQuery,
+            contentContextChars,
           ),
         };
       },
+      maxResultChars: GET_EXTENSION_MAX_RESULT_CHARS,
       readOnly: true,
     },
 
@@ -222,7 +383,7 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
     "get-extension-history-version": {
       tool: {
         description:
-          "Get one extension history version with its previous-version diff. Use after list-extension-history when the user wants to inspect exactly what changed.",
+          "Get one extension history version with its previous-version diff. Use after list-extension-history when the user wants to inspect exactly what changed. Full HTML bodies are omitted by default; set includeContent=true only when restoring or manually comparing full source.",
         parameters: {
           type: "object",
           properties: {
@@ -233,6 +394,11 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
             version: {
               type: "number",
               description: "History version number to inspect.",
+            },
+            includeContent: {
+              type: "boolean",
+              description:
+                "Include full HTML for the current and previous versions. Defaults to false to keep agent context compact.",
             },
           },
           required: ["id", "version"],
@@ -251,15 +417,215 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
         if (!detail) {
           return `Error: extension history version not found: ${id}#${version}`;
         }
-        return { ok: true, ...detail };
+        return {
+          ok: true,
+          ...compactExtensionHistoryDetail(
+            detail,
+            coerceBoolean(args?.includeContent),
+          ),
+        };
+      },
+      maxResultChars: GET_EXTENSION_HISTORY_MAX_RESULT_CHARS,
+      readOnly: true,
+    },
+
+    "render-inline-extension": {
+      tool: {
+        description:
+          "Render a one-time, transient sandboxed Alpine.js mini-app directly inside the chat. Use this for generated UI that should answer the current turn inline without saving anything to the Extensions view: calculators, adjustable controls, knobs, pickers, visualizers, temporary dashboards, and interactive results. The content must be a self-contained Alpine.js HTML body snippet that can use appAction(), appFetch(), dbQuery(), extensionFetch(), extensionData, agentNative.ui.output(value, opts?), and agentNative.chat.send()/sendToAgentChat(). Use appAction() or extensionData for writes; dbQuery() is for read-only inspection of known app SQL tables. Use agentNative.ui.output for passive current values from knobs, sliders, and selections; it writes application state at inline-ui:<inline extension id>:output, which the agent can read later with readAppState when the user says to use that value. Use agentNative.chat.send(message, { submit: true }) only for visible user-triggered submit/apply actions; omit submit or set it to false for a draft, and never call chat.send from polling, refresh, or error handlers. For transient UIs, extensionData is browser-local throwaway state; use application_state/appFetch, appAction, ui.output, or chat.send for anything the agent or app must observe. Use semantic Tailwind colors (bg-background, text-foreground, bg-primary, etc.) so it inherits the parent app theme. Use create-extension instead when the user wants the UI saved or reusable.",
+        parameters: {
+          type: "object",
+          properties: {
+            name: {
+              type: "string",
+              description: "Short display name for the inline UI.",
+            },
+            description: {
+              type: "string",
+              description: "One-sentence summary of what the inline UI does.",
+            },
+            content: {
+              type: "string",
+              description:
+                "Self-contained Alpine.js HTML body snippet. Do not include a full app build, React code, or source files. Required unless contentFromAttachment is set.",
+            },
+            contentFromAttachment: {
+              type: "string",
+              description:
+                'Render a pasted/attached HTML file verbatim without re-typing it. Set to an attachment name or "latest".',
+            },
+            context: {
+              type: "string",
+              description:
+                "Optional JSON object passed to the iframe as slotContext for initial inputs from chat.",
+            },
+            initialHeight: {
+              type: "number",
+              description:
+                "Optional initial iframe height in pixels before auto-resize reports. Defaults to 260.",
+            },
+          },
+          required: ["name"],
+        },
+      },
+      chatUI: {
+        renderer: ACTION_CHAT_UI_INLINE_EXTENSION_RENDERER,
+        title: "Inline extension",
+      },
+      maxResultChars: 220_000,
+      readOnly: true,
+      run: async (args, ctx) => {
+        const name = String(args?.name ?? "").trim();
+        if (!name) return "Error: name is required.";
+        const resolved = resolveExtensionContent(args, ctx);
+        if ("error" in resolved) return resolved.error;
+        const content = resolved.content.trim();
+        if (!content) return "Error: content is required.";
+        const description = String(args?.description ?? "").trim();
+        const id = `inline-${Date.now().toString(36)}-${Math.random()
+          .toString(36)
+          .slice(2, 8)}`;
+        return {
+          ok: true,
+          inlineExtension: {
+            mode: "transient",
+            id,
+            name,
+            description,
+            content,
+            context: parseInlineContext(args?.context),
+            initialHeight: coerceInlineHeight(args?.initialHeight),
+          },
+          next: "Rendered inline in chat only. It is not saved in the Extensions view.",
+        };
+      },
+    },
+
+    "show-extension-inline": {
+      tool: {
+        description:
+          "Render an existing saved extension inline in the chat. Use this when the user asks to load, reopen, reuse, or show a saved extension/widget/dashboard/calculator/mini-app in the conversation. Inline extensions can expose passive current values through agentNative.ui.output(value, opts?), which writes application state at inline-ui:<extension id>:output for the agent to read later with readAppState. Pass id when known; otherwise pass a search string and the action will use the best visible extension match.",
+        parameters: {
+          type: "object",
+          properties: {
+            id: {
+              type: "string",
+              description: "Extension id to render inline.",
+            },
+            search: {
+              type: "string",
+              description:
+                "Fallback search matched against id, name, description, and owner email when id is unknown.",
+            },
+            context: {
+              type: "string",
+              description:
+                "Optional JSON object passed to the iframe as slotContext for chat-provided inputs.",
+            },
+            initialHeight: {
+              type: "number",
+              description:
+                "Optional initial iframe height in pixels before auto-resize reports. Defaults to 260.",
+            },
+          },
+        },
+      },
+      chatUI: {
+        renderer: ACTION_CHAT_UI_INLINE_EXTENSION_RENDERER,
+        title: "Inline extension",
       },
       readOnly: true,
+      run: async (args) => {
+        let id = String(args?.id ?? "").trim();
+        const search = String(args?.search ?? "")
+          .trim()
+          .toLowerCase();
+
+        if (!id && search) {
+          const hiddenIds = await getHiddenExtensionIdsForCurrentUser();
+          const rows: Array<ExtensionRow | LocalExtensionRow> = [
+            ...(await listExtensions({
+              includeHidden: false,
+              includeGloballyHidden: false,
+            })),
+            ...(await listLocalExtensions()),
+          ];
+          const match = rows.find((row) =>
+            [row.id, row.name, row.description, row.ownerEmail]
+              .join("\n")
+              .toLowerCase()
+              .includes(search),
+          );
+          if (match) {
+            id = match.id;
+          } else {
+            const roleById = await resolveExtensionAccessRoles(
+              rows.filter(
+                (row): row is ExtensionRow => !isLocalExtensionRow(row),
+              ),
+            );
+            return {
+              ok: false,
+              error: `No extension matched "${args?.search}".`,
+              available: await Promise.all(
+                rows
+                  .slice(0, 10)
+                  .map((row) =>
+                    summarizeExtension(row, hiddenIds, false, roleById),
+                  ),
+              ),
+            };
+          }
+        }
+
+        if (!id) return "Error: provide id or search.";
+
+        const localExtension = await getLocalExtension(id);
+        const hiddenIds = await getHiddenExtensionIdsForCurrentUser();
+        if (localExtension) {
+          const summary = await summarizeExtension(
+            localExtension,
+            hiddenIds,
+            false,
+          );
+          return {
+            ok: true,
+            inlineExtension: {
+              mode: "persisted",
+              id: summary.id,
+              name: summary.name,
+              description: summary.description,
+              path: summary.path,
+              updatedAt: summary.updatedAt,
+              context: parseInlineContext(args?.context),
+              initialHeight: coerceInlineHeight(args?.initialHeight),
+            },
+          };
+        }
+
+        const extension = await getExtension(id);
+        if (!extension) return `Error: extension not found: ${id}`;
+        const summary = await summarizeExtension(extension, hiddenIds, false);
+        return {
+          ok: true,
+          inlineExtension: {
+            mode: "persisted",
+            id: summary.id,
+            name: summary.name,
+            description: summary.description,
+            path: summary.path,
+            updatedAt: summary.updatedAt,
+            context: parseInlineContext(args?.context),
+            initialHeight: coerceInlineHeight(args?.initialHeight),
+          },
+        };
+      },
     },
 
     "create-extension": {
       tool: {
         description:
-          'Create a sandboxed Alpine.js mini-app extension. Use this when the user asks to create, build, or make an extension/widget/dashboard/calculator. Call this action exactly once per requested extension. The content must be a self-contained Alpine.js HTML body snippet that can use appAction(), appFetch(), dbQuery(), dbExec(), extensionFetch(), and extensionData. IMPORTANT — hosting a pasted file: if the user pasted a large HTML/Alpine file (it appears in your context as an <attachment name="pasted-text-…"> block) and asked you to host it as-is, do NOT copy that file into `content`. Instead leave `content` empty and pass `contentFromAttachment` set to that attachment\'s name (or the literal "latest" for the most recent pasted block) — the server reads the file verbatim. Re-emitting a large pasted file as `content` regularly gets cut off mid-stream and stalls the turn. Prefer appAction(name, params) for app data and actions, including read actions mounted as GET; do not call template /api/* routes from appFetch because the extension bridge only allows framework /_agent-native/* paths. Parse JSON string action results before aggregating; use dbQuery()/dbExec() only for known existing SQL tables. Keep the initial create-extension payload compact and working; for complex extensions, create a useful v1 first, then use focused update-extension edits for refinements rather than assembling one enormous tool input. For any non-trivial component (more than a couple of state fields, any methods, any string formatting, any branching) put the component in a <script> block via Alpine.data(\'name\', () => ({...})) and reference it with x-data="name" — do NOT cram methods, template literals, or branching logic into an inline x-data="{...}" attribute (HTML parser pitfalls cause ReferenceError failures). Define every variable referenced from x-text/x-show/x-if/x-for on the data object\'s initial state. If the extension\'s value depends on an LLM call, require a real key via \\${keys.OPENAI_API_KEY}/\\${keys.ANTHROPIC_API_KEY} (and tell the user to add it in the Dispatch Vault, or in app Settings → API Keys & Connections for standalone apps, if missing) or route the AI work to the agent chat — never ship a stubbed analysis step that renders a placeholder/boolean as the result.',
+          'Create a persisted sandboxed Alpine.js mini-app extension and render it inline in the chat. Use this when the user wants generated UI that should be saved, reusable, or visible in the Extensions view: extensions, widgets, dashboards, calculators, mini-apps, and reusable interactive utilities. For one-time chat-only UI, use render-inline-extension instead. The content must be a self-contained Alpine.js HTML body snippet that can use appAction(), appFetch(), dbQuery(), extensionFetch(), extensionData, agentNative.ui.output(value, opts?), and agentNative.chat.send()/sendToAgentChat(). Use appAction() for app data writes and extensionData for extension-owned persisted UI state; dbQuery() is for read-only inspection of known app SQL tables. Use agentNative.ui.output for passive current values from knobs, sliders, and selections; it writes application state at inline-ui:<extension id>:output, which the agent can read later with readAppState when the user says to use that value. Use agentNative.chat.send(message, { submit: true }) only for visible user-triggered submit/apply actions; omit submit or set it to false for a draft, and never call chat.send from polling, refresh, or error handlers. Persist reusable user-edited state with extensionData: if the extension has checkboxes, todos, notes, filters, preferences, or any control whose value should survive reload/reopen, load that state on init and save changes with extensionData, usually at user scope, instead of keeping it only in Alpine state. IMPORTANT — hosting a pasted file: if the user pasted a large HTML/Alpine file (it appears in your context as an <attachment name="pasted-text-…"> block) and asked you to host it as-is, do NOT copy that file into `content`. Instead leave `content` empty and pass `contentFromAttachment` set to that attachment\'s name (or the literal "latest" for the most recent pasted block) — the server reads the file verbatim. Re-emitting a large pasted file as `content` regularly gets cut off mid-stream and stalls the turn. IMPORTANT — cloning a large extension that lives as a workspace resource (not a chat attachment): leave `content` empty and pass `contentFromWorkspaceFile` set to the resource path (e.g. "intuit-analytics-extension.html"); the server reads the full file. Do NOT try to reconstruct the body with run-code or route create-extension through run-code (mutating actions are not callable there). Prefer appAction(name, params) for app data and actions, including read actions mounted as GET; do not call template /api/* routes from appFetch because the extension bridge only allows framework /_agent-native/* paths. Parse JSON string action results before aggregating; use dbQuery() only for known existing SQL tables and never for writes. Keep the initial create-extension payload compact and working; for complex extensions, create a useful v1 first, then use focused update-extension edits for refinements rather than assembling one enormous initial tool input. For any non-trivial component (more than a couple of state fields, any methods, any string formatting, any branching) put the component in a <script> block via Alpine.data(\'name\', () => ({...})) and reference it with x-data="name" — do NOT cram methods, template literals, or branching logic into an inline x-data="{...}" attribute (HTML parser pitfalls cause ReferenceError failures). Define every variable referenced from x-text/x-show/x-if/x-for on the data object\'s initial state. If the extension\'s value depends on an LLM call, require a real key via \\${keys.OPENAI_API_KEY}/\\${keys.ANTHROPIC_API_KEY} (and tell the user to add it in the Dispatch Vault, or in app Settings → API Keys & Connections for standalone apps, if missing) or route the AI work to the agent chat — never ship a stubbed analysis step that renders a placeholder/boolean as the result.',
         parameters: {
           type: "object",
           properties: {
@@ -282,6 +648,11 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
               description:
                 'Host a pasted/attached file verbatim WITHOUT re-typing it. Set this to the name of an attachment on the current turn (e.g. "pasted-text-1718000000000-ab12cd.txt") or the literal "latest" for the most recent pasted block; the server resolves it into the extension content. Use this instead of `content` whenever the user pasted a large file to host — it avoids re-emitting thousands of tokens. When set, leave `content` empty.',
             },
+            contentFromWorkspaceFile: {
+              type: "string",
+              description:
+                'Host a workspace/shared resource file verbatim WITHOUT re-typing it. Set this to the resource path (e.g. "intuit-analytics-extension.html"); the server reads the full file and uses it as the extension content. Use this — NOT run-code or contentFromAttachment — when cloning a large extension body that already exists as a workspace resource. When set, leave `content` empty.',
+            },
             icon: {
               type: "string",
               description: "Optional icon name or short label.",
@@ -290,23 +661,20 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
           required: ["name"],
         },
       },
+      chatUI: {
+        renderer: ACTION_CHAT_UI_INLINE_EXTENSION_RENDERER,
+        title: "Extension",
+      },
       run: async (args, ctx) => {
         const name = String(args?.name ?? "").trim();
         if (!name) return "Error: name is required.";
-        const resolved = resolveExtensionContent(args, ctx);
+        const resolved = await resolveExtensionContentAsync(args, ctx);
         if ("error" in resolved) return resolved.error;
         const content = resolved.content.trim();
         if (!content) return "Error: content is required.";
         const description = String(args?.description ?? "").trim();
         const icon = args?.icon ? String(args.icon) : undefined;
 
-        // Idempotency: if an identical extension was created in the last 5
-        // minutes (e.g. a connection drop caused the agent to retry this tool
-        // call), return the existing one instead of creating a duplicate.
-        // Keyed on the FULL create inputs (name + content + description + icon),
-        // so two creates that differ in ANY of them are treated as distinct
-        // rather than silently collapsed — only a byte-identical re-create (the
-        // retry case) recovers the existing row.
         const existing = await findRecentDuplicateExtension({
           name,
           content,
@@ -325,9 +693,10 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
           } catch {
             // Non-fatal — agent can still mention the path in its reply.
           }
+          const hiddenIds = await getHiddenExtensionIdsForCurrentUser();
           return {
             ok: true,
-            extension: { ...existing, path: existingPath },
+            extension: await summarizeExtension(existing, hiddenIds, false),
             path: existingPath,
             next: `Extension was already created in this session (recovered from a connection retry). The user is being navigated to it — no further navigation tool calls needed.`,
           };
@@ -341,25 +710,21 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
         });
         const path = extensionPath(extension.id, extension.name);
 
-        // Auto-navigate so the user lands on the new extension instead of
-        // having to read the JSON response and click a link. Writes a
-        // one-shot `navigate` app-state command the UI consumes and clears.
         try {
           await writeAppState("navigate", {
             view: "extensions",
             extensionId: extension.id,
             path,
-            // Unique-per-write token so the UI's `use-navigation-state` hook
-            // can dedup race-driven re-reads of the same command.
             _writeId: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           });
         } catch {
           // Non-fatal — agent can still mention the path in its reply.
         }
 
+        const hiddenIds = await getHiddenExtensionIdsForCurrentUser();
         return {
           ok: true,
-          extension: { ...extension, path },
+          extension: await summarizeExtension(extension, hiddenIds, false),
           path,
           next: `Created. The user is being navigated to the new extension automatically — no further navigation tool calls needed.`,
         };
@@ -369,7 +734,7 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
     "update-extension": {
       tool: {
         description:
-          'Update an existing sandboxed Alpine.js mini-app extension. If the user is viewing the extension, use the extensionId from <current-screen> or <current-url> directly; do not list extensions first just to find the current id. Prefer granular edits for surgical changes; use full content replacement only for broad rewrites. Supported edits include literal replace, insert-before/after marker, replace-between markers, replace-section/wrap-section/remove-section for <!-- agent-native:section name --> blocks, and regex-replace. Pass format=true to run Prettier on the final HTML. To replace the whole body with a large pasted file, pass contentFromAttachment (the attachment name, or "latest") instead of copying the file into `content` — that avoids re-emitting thousands of tokens.',
+          'Update an existing sandboxed Alpine.js mini-app extension. Pass exactly three fields: `id`, `operation`, and `payloadJson`. `payloadJson` is a JSON object encoded as a string so model gateways cannot fill its optional members with invalid empty placeholders. For operation="edit", pass {"edits":[...]} or {"patches":[...]} and optional format=true — prefer several small, targeted edits over one large one; a single edit/replace body over roughly 8KB risks the model truncating its own payloadJson mid-generation, which arrives here as an empty or malformed call that must be retried from scratch. For operation="replace", pass exactly one of content, contentFromAttachment, or contentFromWorkspaceFile; use this operation only for a user-requested broad visual rewrite or complete replacement body. Do not inline large static datasets (full metric histories, big arrays) into the HTML/JS body — store them with extension-data-set and fetch them at runtime via extensionData.list()/get() instead, so edits stay small regardless of dataset size. For operation="metadata", pass name, description, or icon. Change sharing through set-resource-visibility instead. If the user is viewing the extension, use the extensionId from <current-screen> or <current-url> directly.',
         parameters: {
           type: "object",
           properties: {
@@ -378,98 +743,124 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
               description:
                 "Extension id to update. Prefer the extensionId from <current-screen> or <current-url> for the current extension.",
             },
-            name: {
+            operation: {
               type: "string",
-              description: "Optional new display name.",
-            },
-            description: {
-              type: "string",
-              description: "Optional new description.",
-            },
-            content: {
-              type: "string",
+              enum: ["edit", "replace", "metadata"],
               description:
-                "Optional full replacement Alpine.js HTML body snippet.",
+                'The single update mode: "edit" for focused patches/edits, "replace" for an explicitly authorized complete body replacement, or "metadata" for name/description/icon.',
             },
-            contentFromAttachment: {
+            payloadJson: {
               type: "string",
+              minLength: 2,
               description:
-                'Optional full replacement sourced from a pasted/attached file on the current turn, by attachment name (or the literal "latest" for the most recent pasted block). Use instead of `content` when replacing the whole body with a large pasted file so you do not have to re-type it. Ignored when `content` is provided.',
-            },
-            patches: {
-              type: "string",
-              description:
-                'Legacy optional JSON array of { "find": "...", "replace": "...", "all"?: true, "expectedMatches"?: 1, "required"?: true } patches. Missing required targets fail instead of silently no-oping.',
-            },
-            edits: {
-              type: "string",
-              description:
-                'Preferred optional JSON array of granular edit operations. Examples: { "op": "insert-after", "marker": "<!-- section:metrics -->", "content": "..." }, { "op": "replace-section", "section": "npm-chart", "content": "..." }, { "op": "wrap-section", "section": "charts", "before": "<div>", "after": "</div>" }, { "op": "regex-replace", "pattern": "...", "replace": "...", "expectedMatches": 1 }.',
-            },
-            format: {
-              type: "boolean",
-              description:
-                "When true, format the final extension HTML with Prettier after applying content, patches, and edits.",
-            },
-            icon: {
-              type: "string",
-              description: "Optional icon name or short label.",
-            },
-            visibility: {
-              type: "string",
-              description: "Optional sharing visibility.",
-              enum: ["private", "org", "public"],
+                'A non-empty JSON object encoded as a string. edit example: {"edits":[{"op":"replace","find":"old","replace":"new"}],"format":true}. replace example: {"contentFromAttachment":"latest"}. metadata example: {"name":"New name"}.',
             },
           },
-          required: ["id"],
+          required: ["id", "operation", "payloadJson"],
+          additionalProperties: false,
         },
       },
       run: async (args, ctx) => {
+        const normalizedUpdate = normalizeUpdateExtensionArgs(args);
+        if ("error" in normalizedUpdate) return normalizedUpdate.error;
+        args = normalizedUpdate.args;
         const id = String(args?.id ?? "").trim();
         if (!id) return "Error: id is required.";
+        if (
+          args?.name !== undefined &&
+          (typeof args.name !== "string" || args.name.trim().length === 0)
+        ) {
+          return "Error: extension name must be a non-empty string. No changes were applied.";
+        }
         const localMessage = await localExtensionEditMessage(id);
         if (localMessage) return localMessage;
 
-        // Full-replacement content can come inline (`content`) or by reference
-        // (`contentFromAttachment`) so the model never has to re-type a large
-        // pasted file. Inline wins only when NON-EMPTY — the docstring tells
-        // callers to leave `content` empty when using `contentFromAttachment`,
-        // so an empty/blank `content` must fall through to the attachment
-        // instead of blanking the extension (mirrors resolveExtensionContent).
+        if (
+          typeof args?.visibility === "string" &&
+          args.visibility.trim().toLowerCase() === "public"
+        ) {
+          const message =
+            "Public extension sharing is not supported. Use visibility=private or visibility=org. No content changes were applied; do not retry visibility=public.";
+          throw new AgentActionStopError(message, {
+            errorCode: "extension_public_visibility_unsupported",
+            toolResult: JSON.stringify(
+              {
+                error: "extension_public_visibility_unsupported",
+                message,
+                recoverable: false,
+                next: "Retry only with visibility=private or visibility=org.",
+              },
+              null,
+              2,
+            ),
+          });
+        }
+
+        const attachmentRef =
+          typeof args?.contentFromAttachment === "string"
+            ? args.contentFromAttachment.trim()
+            : "";
+        const workspaceFileRef =
+          typeof args?.contentFromWorkspaceFile === "string"
+            ? args.contentFromWorkspaceFile.trim()
+            : "";
+        const fullReplacementRequested =
+          (typeof args?.content === "string" &&
+            args.content.trim().length > 0) ||
+          attachmentRef.length > 0 ||
+          workspaceFileRef.length > 0;
+        if (
+          fullReplacementRequested &&
+          !coerceBoolean(args?.allowFullReplacement)
+        ) {
+          const message =
+            "Full extension-body replacement requires allowFullReplacement=true. No changes were applied. If the user's request includes a broad visual rewrite such as changing layout, compactness, visible sections, naming, or padding, retry once with allowFullReplacement=true; otherwise read the current extension and use focused patches/edits for a data-only repair. Do not retry unchanged arguments.";
+          throw new ExtensionContentEditError(message);
+        }
+
         let replacementContent =
           typeof args?.content === "string" && args.content.trim().length > 0
             ? args.content
             : undefined;
         if (
           replacementContent === undefined &&
-          args?.contentFromAttachment !== undefined
+          (attachmentRef.length > 0 || workspaceFileRef.length > 0)
         ) {
-          const resolved = resolveExtensionContent(args, ctx);
+          const resolved = await resolveExtensionContentAsync(args, ctx);
           if ("error" in resolved) return resolved.error;
           replacementContent = resolved.content;
         }
 
         let result = null;
+        const patches = parsePatches((args as any).patches);
+        if (args?.patches !== undefined && !patches) {
+          return "Error: patches must be a JSON array of { find, replace } objects.";
+        }
+        const edits = parseEdits((args as any).edits);
+        if (args?.edits !== undefined && !edits) {
+          return "Error: edits must be a JSON array of supported extension edit operations.";
+        }
         const hasContentUpdate =
           replacementContent !== undefined ||
-          args?.patches !== undefined ||
-          args?.edits !== undefined ||
-          args?.format !== undefined;
+          (patches?.length ?? 0) > 0 ||
+          (edits?.length ?? 0) > 0 ||
+          coerceBoolean(args?.format);
         if (hasContentUpdate) {
-          const patches = parsePatches((args as any).patches);
-          if (args?.patches !== undefined && !patches) {
-            return "Error: patches must be a JSON array of { find, replace } objects.";
+          try {
+            result = await updateExtensionContent(id, {
+              content: replacementContent,
+              allowFullReplacement: coerceBoolean(args?.allowFullReplacement),
+              patches,
+              edits,
+              format: coerceBoolean(args?.format),
+            });
+          } catch (error) {
+            if (!(error instanceof ExtensionContentEditError)) throw error;
+            const message =
+              `The extension edit was not applied: ${error.message} ` +
+              "Do not retry the same arguments. Read the current extension and submit one focused patch or edit with an exact target.";
+            fail(message, { errorCode: "extension_content_edit_failed" });
           }
-          const edits = parseEdits((args as any).edits);
-          if (args?.edits !== undefined && !edits) {
-            return "Error: edits must be a JSON array of supported extension edit operations.";
-          }
-          result = await updateExtensionContent(id, {
-            content: replacementContent,
-            patches,
-            edits,
-            format: coerceBoolean(args?.format),
-          });
         }
 
         const meta: Record<string, string> = {};
@@ -478,13 +869,15 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
           meta.description = String(args.description).trim();
         }
         if (args?.icon !== undefined) meta.icon = String(args.icon);
-        if (args?.visibility !== undefined) {
+        if (args?.visibility !== undefined)
           meta.visibility = String(args.visibility);
-        }
         if (Object.keys(meta).length > 0) {
           result = await updateExtension(id, meta as any);
         }
 
+        if (!result && !hasContentUpdate && Object.keys(meta).length === 0) {
+          return "Error: update-extension received no actual changes. Choose one operation and provide a non-empty payloadJson object; empty placeholder fields are not an update.";
+        }
         if (!result) result = await getExtension(id);
         if (!result) return `Error: extension not found: ${id}`;
         const hiddenIds = await getHiddenExtensionIdsForCurrentUser();
@@ -495,17 +888,239 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
       },
     },
 
+    "extension-data-set": {
+      tool: {
+        description:
+          "Write a value to an extension's extensionData store (the tool_data table) from the agent side. Use this when the agent needs to update or seed data that an extension reads via extensionData.get() at render time. Requires editor access to the extension.",
+        parameters: {
+          type: "object",
+          properties: {
+            extensionId: {
+              type: "string",
+              description: "Extension id whose data store to write to.",
+            },
+            collection: {
+              type: "string",
+              description: "Collection name within the extension's data store.",
+            },
+            itemId: {
+              type: "string",
+              description:
+                "Item id within the collection. Upserts if it already exists.",
+            },
+            data: {
+              description:
+                "The data value to store. Objects are JSON-serialized automatically.",
+            },
+            scope: {
+              type: "string",
+              enum: ["user", "org"],
+              description:
+                "Storage scope. 'user' (default) is private to the current user; 'org' is shared across the organization.",
+            },
+          },
+          required: ["extensionId", "collection", "itemId", "data"],
+        },
+      },
+      run: async (args) => {
+        const extensionId = String(args?.extensionId ?? "").trim();
+        const collection = String(args?.collection ?? "").trim();
+        const itemId = String(args?.itemId ?? "").trim();
+        if (!extensionId || !collection || !itemId)
+          return "Error: extensionId, collection, and itemId are required.";
+        if (args?.data === undefined) return "Error: data is required.";
+
+        await ensureExtensionsTables();
+        const access = await resolveAccess("extension", extensionId);
+        if (
+          !access ||
+          (access.resource as ExtensionRow | undefined)?.archivedAt ||
+          !roleSatisfies(access.role, "editor")
+        )
+          return `Error: editor access required for extension ${extensionId}.`;
+
+        const userEmail = getRequestUserEmail()?.toLowerCase() ?? "";
+        const scope = args?.scope === "org" ? "org" : "user";
+        const orgId = getRequestOrgId();
+        if (scope === "org" && !orgId)
+          return "Error: org context required for scope=org.";
+
+        const data =
+          typeof args.data === "string" ? args.data : JSON.stringify(args.data);
+        const MAX_BYTES = 1024 * 1024;
+        if (Buffer.byteLength(data, "utf8") > MAX_BYTES)
+          return `Error: data exceeds ${MAX_BYTES} byte limit. Store large payloads in file storage instead.`;
+
+        const now = new Date().toISOString();
+        const scopeKey = scope === "org" ? `org:${orgId}` : userEmail;
+        const client = getDbExec();
+        const pg = true;
+        const conflictClause = pg
+          ? `ON CONFLICT (tool_id, collection, scope_key, item_id)
+             DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at`
+          : `ON CONFLICT (tool_id, collection, scope_key, item_id)
+             DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`;
+
+        await client.execute({
+          sql: `UPDATE tools SET updated_at = ? WHERE id = ?`,
+          args: [now, extensionId],
+        });
+        await client.execute({
+          sql: `INSERT INTO tool_data (id, tool_id, collection, item_id, data, owner_email, scope, org_id, scope_key, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ${conflictClause}`,
+          args: [
+            randomUUID(),
+            extensionId,
+            collection,
+            itemId,
+            data,
+            userEmail,
+            scope,
+            scope === "org" ? orgId! : null,
+            scopeKey,
+            now,
+            now,
+          ],
+        });
+        await notifyExtensionChangeForResource(extensionId);
+
+        return {
+          ok: true,
+          id: itemId,
+          extensionId,
+          collection,
+          scope,
+          updatedAt: now,
+        };
+      },
+    },
+
+    "extension-data-get": {
+      tool: {
+        description:
+          "Read items from an extension's extensionData store (the tool_data table) from the agent side. Use this to inspect what data an extension currently has stored, or to verify a write succeeded. Requires viewer access to the extension.",
+        parameters: {
+          type: "object",
+          properties: {
+            extensionId: {
+              type: "string",
+              description: "Extension id whose data store to read from.",
+            },
+            collection: {
+              type: "string",
+              description: "Collection name within the extension's data store.",
+            },
+            itemId: {
+              type: "string",
+              description:
+                "Optional specific item id. If omitted, lists all items in the collection.",
+            },
+            scope: {
+              type: "string",
+              enum: ["user", "org", "all"],
+              description:
+                "Storage scope to read. 'user' (default) reads the current user's items; 'org' reads organization-shared items; 'all' reads both.",
+            },
+            limit: {
+              type: "number",
+              description:
+                "Maximum items to return when listing (default 100, max 1000).",
+            },
+          },
+          required: ["extensionId", "collection"],
+        },
+      },
+      run: async (args) => {
+        const extensionId = String(args?.extensionId ?? "").trim();
+        const collection = String(args?.collection ?? "").trim();
+        if (!extensionId || !collection)
+          return "Error: extensionId and collection are required.";
+
+        await ensureExtensionsTables();
+        const access = await resolveAccess("extension", extensionId);
+        if (
+          !access ||
+          (access.resource as ExtensionRow | undefined)?.archivedAt
+        )
+          return `Error: no access to extension ${extensionId}.`;
+
+        const userEmail = getRequestUserEmail()?.toLowerCase() ?? "";
+        const scope = args?.scope ?? "user";
+        const orgId = getRequestOrgId();
+        if ((scope === "org" || scope === "all") && !orgId)
+          return "Error: org context required for scope=org or scope=all.";
+        const itemId = args?.itemId ? String(args.itemId).trim() : null;
+        const limit = Math.min(Math.max(1, Number(args?.limit) || 100), 1000);
+        const client = getDbExec();
+
+        if (itemId) {
+          const scopeClause =
+            scope === "org"
+              ? `AND scope = 'org' AND org_id = ?`
+              : scope === "all"
+                ? `AND ((scope = 'user' AND lower(owner_email) = ?) OR (scope = 'org' AND org_id = ?))`
+                : `AND scope = 'user' AND lower(owner_email) = ?`;
+          const scopeArgs =
+            scope === "org"
+              ? [orgId ?? ""]
+              : scope === "all"
+                ? [userEmail, orgId ?? ""]
+                : [userEmail];
+
+          const result = await client.execute({
+            sql: `SELECT COALESCE(item_id, id) AS id, data, scope, owner_email, updated_at
+              FROM tool_data
+              WHERE tool_id = ? AND collection = ? AND COALESCE(item_id, id) = ? ${scopeClause}`,
+            args: [extensionId, collection, itemId, ...scopeArgs],
+          });
+          const row = result.rows?.[0];
+          if (!row) return { found: false, extensionId, collection, itemId };
+          return { found: true, ...row };
+        }
+
+        const scopeClause =
+          scope === "org"
+            ? `AND scope = 'org' AND org_id = ?`
+            : scope === "all"
+              ? `AND ((scope = 'user' AND lower(owner_email) = ?) OR (scope = 'org' AND org_id = ?))`
+              : `AND scope = 'user' AND lower(owner_email) = ?`;
+        const scopeArgs =
+          scope === "org"
+            ? [orgId ?? ""]
+            : scope === "all"
+              ? [userEmail, orgId ?? ""]
+              : [userEmail];
+
+        const result = await client.execute({
+          sql: `SELECT COALESCE(item_id, id) AS id, data, scope, owner_email, updated_at
+            FROM tool_data
+            WHERE tool_id = ? AND collection = ? ${scopeClause}
+            ORDER BY updated_at DESC
+            LIMIT ?`,
+          args: [extensionId, collection, ...scopeArgs, limit],
+        });
+        return {
+          extensionId,
+          collection,
+          scope,
+          count: result.rows?.length ?? 0,
+          items: result.rows ?? [],
+        };
+      },
+    },
+
     "delete-extension": {
       tool: {
         description:
-          "Permanently delete an extension everywhere it is shared. Requires owner/admin access. If the user only wants a shared extension removed from their own sidebar/list, use hide-extension instead.",
+          "Archive an extension everywhere it is shared. Archiving is a soft delete: the extension and its history, data, sharing, and slot configuration are retained, but it disappears from normal lists. Requires owner/admin access. If the user only wants a shared extension removed from their own sidebar/list, use hide-extension instead.",
         parameters: {
           type: "object",
           properties: {
             id: {
               type: "string",
               description:
-                "Extension id to permanently delete. Use list-extensions first if you only know the display name.",
+                "Extension id to archive. Use list-extensions first if you only know the display name.",
             },
           },
           required: ["id"],
@@ -522,7 +1137,7 @@ export function createExtensionActionEntries(): Record<string, ActionEntry> {
         try {
           const ok = await deleteExtension(id);
           if (!ok) return `Error: extension not found: ${id}`;
-          return { ok: true, deleted: summarizeDeletedExtension(extension) };
+          return { ok: true, archived: summarizeDeletedExtension(extension) };
         } catch (err: any) {
           return {
             ok: false,
@@ -844,11 +1459,24 @@ async function summarizeExtension(
   row: ExtensionRow | LocalExtensionRow,
   hiddenIds: Set<string>,
   includeContent: boolean,
+  roleById?: Map<string, ShareRole | "owner">,
 ) {
   const local = isLocalExtensionRow(row);
-  const access = local
-    ? ({ role: "viewer" } as const)
-    : await resolveAccess("extension", row.id).catch(() => null);
+  let role: ShareRole | "owner" | null;
+  if (local) {
+    role = "viewer";
+  } else if (roleById) {
+    role = roleById.get(row.id) ?? null;
+  } else {
+    // coercion-ok: unit mocks and offline runs may lack database tables, falling back to null access role
+    const access = await resolveAccess("extension", row.id).catch(() => null);
+    role = access?.role ?? null;
+  }
+  const contentLength =
+    typeof row.contentLength === "number"
+      ? row.contentLength
+      : row.content.length;
+  const contentLoaded = row.content.length > 0 || contentLength === 0;
   return {
     id: row.id,
     name: row.name,
@@ -857,20 +1485,211 @@ async function summarizeExtension(
     icon: row.icon,
     ownerEmail: row.ownerEmail,
     visibility: row.visibility,
-    role: access?.role ?? null,
-    canEdit: access
-      ? ["owner", "admin", "editor"].includes(access.role)
-      : false,
-    canDelete: access ? ["owner", "admin"].includes(access.role) : false,
+    role,
+    canEdit: role ? ["owner", "admin", "editor"].includes(role) : false,
+    canDelete: role ? ["owner", "admin"].includes(role) : false,
     hidden: hiddenIds.has(row.id),
     globallyHidden: row.hiddenAt != null,
     hiddenAt: row.hiddenAt,
     hiddenBy: row.hiddenBy,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+    contentLength,
+    ...(contentLoaded ? { contentHash: contentFingerprint(row.content) } : {}),
     ...(local ? { source: row.source } : {}),
-    ...(includeContent ? { content: row.content } : {}),
+    ...(includeContent && contentLoaded ? { content: row.content } : {}),
   };
+}
+
+async function summarizeExtensionForAgentRead(
+  row: ExtensionRow | LocalExtensionRow,
+  hiddenIds: Set<string>,
+  includeContent: boolean,
+  forceContent: boolean,
+  contentQuery: string,
+  contentContextChars: number,
+) {
+  const fingerprint = contentFingerprint(row.content);
+
+  if (contentQuery) {
+    const summary = await summarizeExtension(row, hiddenIds, false);
+    const excerptCtx = getRequestRunContext();
+    const excerpts = excerptCtx
+      ? (excerptCtx.extensionExcerptReads ??= {})
+      : undefined;
+    const excerptKey = `${row.id}:${fingerprint}:${contentContextChars}:${contentQuery}`;
+    if (excerpts?.[excerptKey]) {
+      return {
+        ...summary,
+        contentOmitted: {
+          reason: "identical-excerpt-already-returned-this-run",
+          contentHash: fingerprint,
+          contentLength: row.content.length,
+          next: 'These exact excerpts were already returned earlier in this run and the body has not changed. Use them to call update-extension with operation="edit"; use a different contentQuery only for a source area you have not read yet.',
+        },
+      };
+    }
+    if (excerpts) excerpts[excerptKey] = true;
+    return {
+      ...summary,
+      contentMatches: findExtensionContentMatches(
+        row.content,
+        contentQuery,
+        contentContextChars,
+      ),
+      contentOmitted: {
+        reason: "targeted-content-read",
+        contentHash: fingerprint,
+        contentLength: row.content.length,
+        next: 'Use the returned excerpts to call update-extension with operation="edit" and focused edits. Call get-extension again with a different contentQuery when another source area is needed.',
+      },
+    };
+  }
+
+  if (!includeContent) {
+    return summarizeExtension(row, hiddenIds, false);
+  }
+
+  if (
+    !forceContent &&
+    row.content.length > LARGE_EXTENSION_INLINE_CONTENT_MAX_CHARS
+  ) {
+    const summary = await summarizeExtension(row, hiddenIds, false);
+    return {
+      ...summary,
+      contentOmitted: {
+        reason: "large-content-requires-targeted-read",
+        contentHash: fingerprint,
+        contentLength: row.content.length,
+        inlineContentLimit: LARGE_EXTENSION_INLINE_CONTENT_MAX_CHARS,
+        next: `Call get-extension again with contentQuery set to the relevant function, variable, section marker, or literal text. If you expect to read more than about three separate areas of this ${row.content.length}-char body, call get-extension once with forceContent=true instead — repeated excerpt reads of the same file cost more context than one whole read.`,
+      },
+    };
+  }
+
+  const runCtx = getRequestRunContext();
+  const reads = runCtx ? (runCtx.extensionContentReads ??= {}) : undefined;
+  const alreadySent = !forceContent && reads?.[row.id] === fingerprint;
+  if (!alreadySent && reads) {
+    reads[row.id] = fingerprint;
+  }
+
+  const summary = await summarizeExtension(row, hiddenIds, !alreadySent);
+  if (!alreadySent) return summary;
+
+  return {
+    ...summary,
+    contentOmitted: {
+      reason: "unchanged-content-already-returned-this-run",
+      contentHash: fingerprint,
+      contentLength: row.content.length,
+      next: 'Use the content already returned earlier in this run and call update-extension with operation="edit" plus focused edits/patches inside payloadJson. Set forceContent=true only if you truly need the full body again.',
+    },
+  };
+}
+
+function normalizeExtensionContentContextChars(value: unknown): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return DEFAULT_EXTENSION_CONTENT_CONTEXT_CHARS;
+  }
+  return Math.min(
+    MAX_EXTENSION_CONTENT_CONTEXT_CHARS,
+    Math.max(250, Math.floor(numeric)),
+  );
+}
+
+function findExtensionContentMatches(
+  content: string,
+  query: string,
+  contextChars: number,
+) {
+  const lowerContent = content.toLowerCase();
+  const lowerQuery = query.toLowerCase();
+  const matches: Array<{
+    matchStart: number;
+    matchEnd: number;
+    excerptStart: number;
+    excerptEnd: number;
+    excerpt: string;
+  }> = [];
+  let searchFrom = 0;
+
+  while (matches.length < EXTENSION_CONTENT_MATCH_LIMIT) {
+    const matchStart = lowerContent.indexOf(lowerQuery, searchFrom);
+    if (matchStart < 0) break;
+    const matchEnd = matchStart + query.length;
+    const excerptStart = Math.max(0, matchStart - contextChars);
+    const excerptEnd = Math.min(content.length, matchEnd + contextChars);
+    matches.push({
+      matchStart,
+      matchEnd,
+      excerptStart,
+      excerptEnd,
+      excerpt: content.slice(excerptStart, excerptEnd),
+    });
+    searchFrom = matchEnd;
+  }
+
+  return {
+    query,
+    matches,
+    hasMore:
+      matches.length === EXTENSION_CONTENT_MATCH_LIMIT &&
+      lowerContent.indexOf(lowerQuery, searchFrom) >= 0,
+  };
+}
+
+function compactExtensionHistoryDetail(
+  detail: ExtensionHistoryDetail,
+  includeContent: boolean,
+): ExtensionHistoryDetail & {
+  diffOmitted?: { omittedLines: number; maxLines: number };
+} {
+  const diffMaxLines = 400;
+  const fullDiff = detail.diff ?? [];
+  const diff =
+    fullDiff.length > diffMaxLines
+      ? [...fullDiff.slice(0, 200), ...fullDiff.slice(fullDiff.length - 200)]
+      : fullDiff;
+  return {
+    ...detail,
+    entry: compactHistoryEntry(detail.entry, includeContent),
+    previous: detail.previous
+      ? compactHistoryEntry(detail.previous, includeContent)
+      : null,
+    diff,
+    ...(fullDiff.length > diff.length
+      ? {
+          diffOmitted: {
+            omittedLines: fullDiff.length - diff.length,
+            maxLines: diffMaxLines,
+          },
+        }
+      : {}),
+  };
+}
+
+function compactHistoryEntry(
+  entry: ExtensionHistoryEntry,
+  includeContent: boolean,
+): ExtensionHistoryEntry & { contentHash?: string } {
+  const content = entry.content ?? "";
+  const withHash = {
+    ...entry,
+    ...(content ? { contentHash: contentFingerprint(content) } : {}),
+  };
+  if (includeContent) return withHash;
+  const { content: _content, ...withoutContent } = withHash;
+  return withoutContent;
+}
+
+function contentFingerprint(content: string): string {
+  let hash = 5381;
+  for (let i = 0; i < content.length; i++) {
+    hash = (hash * 33) ^ content.charCodeAt(i);
+  }
+  return `${content.length.toString(36)}-${(hash >>> 0).toString(36)}`;
 }
 
 async function localExtensionEditMessage(id: string): Promise<string | null> {
@@ -896,15 +1715,8 @@ function summarizeDeletedExtension(row: ExtensionRow) {
   };
 }
 
-/**
- * Filename prefix the composer stamps on a "Pasted text" attachment chip
- * (`createPastedTextFile` in `client/composer/pasted-text.ts`). The agent sees
- * these as `<attachment name="pasted-text-…">` blocks, so a model hosting a
- * pasted file can reference it by that name via `contentFromAttachment`.
- */
 const PASTED_TEXT_ATTACHMENT_PREFIX = "pasted-text-";
 
-/** Keyword refs that mean "use the most recent pasted block above". */
 const LATEST_ATTACHMENT_KEYWORDS = new Set([
   "latest",
   "last",
@@ -915,23 +1727,11 @@ const LATEST_ATTACHMENT_KEYWORDS = new Set([
   "above",
 ]);
 
-/** Strip the `<attachment …>\n…\n</attachment>` wrapper if one is present. */
 function unwrapAttachmentEnvelope(text: string): string {
   const match = text.match(/^<attachment\b[^>]*>\n([\s\S]*)\n<\/attachment>$/);
   return match ? match[1] : text;
 }
 
-/**
- * Resolve the HTML body for create/update-extension from either the inline
- * `content` argument or a `contentFromAttachment` handle pointing at a pasted /
- * uploaded text attachment on the current turn. The by-reference path lets the
- * model host a large pasted file without re-emitting it as a tool argument —
- * which frequently gets cut off mid-stream and triggers a continuation loop.
- *
- * Resolution is forgiving: an exact attachment-name match wins, then a keyword
- * ("latest"/"pasted"/…) or a near-miss name falls back to the most recent
- * pasted-text attachment (or the only text attachment).
- */
 function resolveExtensionContent(
   args: Record<string, string> | undefined,
   ctx: ActionRunContext | undefined,
@@ -991,12 +1791,6 @@ function resolveExtensionContent(
   }
 
   const resolved = unwrapAttachmentEnvelope(match.text);
-  // Fail fast instead of hosting corrupted content. The client caps an
-  // outbound attachment at MAX_OUTBOUND_ATTACHMENT_CHARS (200k) and appends a
-  // trailing notice ending "...omitted from the submitted attachment.]" (see
-  // truncateOutboundAttachment in agent-chat-adapter.ts). Hosting that verbatim
-  // would bake a half file + the notice into the extension body; reject it with
-  // an actionable message so the user shrinks/splits the file instead.
   if (/omitted from the submitted attachment\.\]\s*$/.test(resolved)) {
     return {
       error:
@@ -1006,8 +1800,276 @@ function resolveExtensionContent(
   return { content: resolved };
 }
 
+function workspaceFilesBridgeScope(): WorkspaceFilesScope | null {
+  const orgId = getRequestOrgId();
+  if (orgId) return { scope: "org", scopeId: orgId };
+  const email = getRequestUserEmail();
+  if (email) return { scope: "user", scopeId: email };
+  return null;
+}
+
+/**
+ * Read a workspace/shared/personal resource file's FULL content by path.
+ *
+ * Precedence (single, documented rule so this never silently resolves a
+ * different file than the agent inspected):
+ *   1. The run-code `workspace-files` bridge scope (org → shared owner, else the
+ *      user's email). This is the SAME owner/scope `workspaceRead` /
+ *      `workspaceWrite` use, so a body the agent staged via `workspaceWrite` is
+ *      resolved here verbatim — the two paths cannot diverge.
+ *   2. User-managed Resources (personal override → org/shared → workspace
+ *      default) as a fallback, for pre-built resources that were created in the
+ *      Resources panel rather than staged through the bridge.
+ *
+ * Unlike attachments, resource content is not capped/truncated on the way in, so
+ * this is the correct path for cloning a large extension body that already
+ * exists as a workspace resource (e.g. a per-customer dashboard).
+ */
+async function readWorkspaceFileContent(path: string): Promise<string | null> {
+  const trimmed = path.trim();
+  if (!trimmed) return null;
+  const bridgeScope = workspaceFilesBridgeScope();
+  if (bridgeScope) {
+    let bridgeFile: Awaited<ReturnType<typeof readWorkspaceFile>>;
+    try {
+      bridgeFile = await readWorkspaceFile(bridgeScope, trimmed);
+    } catch {
+      // A THROW here is a transient store error or invalid path — NOT a
+      // definitive "not found". Fail closed rather than silently hosting a
+      // possibly-different same-path Resources body than workspaceRead
+      // inspected. A retry re-runs this read cleanly.
+      return null;
+    }
+    if (bridgeFile && typeof bridgeFile.content === "string") {
+      return bridgeFile.content;
+    }
+  }
+  for (const scope of ["personal", "shared", "workspace"] as const) {
+    try {
+      const content = await readResource(trimmed, { scope });
+      if (typeof content === "string") return content;
+    } catch {
+      // A given scope can throw (e.g. `personal` when no user identity is
+      // resolvable in this context). Don't let one scope abort the lookup —
+      // fall through and try the next one.
+    }
+  }
+  return null;
+}
+
+async function resolveExtensionContentAsync(
+  args: Record<string, string> | undefined,
+  ctx: ActionRunContext | undefined,
+): Promise<{ content: string } | { error: string }> {
+  const inline = args?.content !== undefined ? String(args.content) : undefined;
+  if (inline !== undefined && inline.trim().length > 0) {
+    return { content: inline };
+  }
+
+  const wsRef =
+    args?.contentFromWorkspaceFile !== undefined
+      ? String(args.contentFromWorkspaceFile).trim()
+      : "";
+  if (wsRef) {
+    const content = await readWorkspaceFileContent(wsRef);
+    if (content === null) {
+      return {
+        error: `Error: contentFromWorkspaceFile="${wsRef}" did not match any readable workspace/shared/personal resource file. Check the exact path (e.g. "intuit-analytics-extension.html"), or pass the HTML inline via content.`,
+      };
+    }
+    if (content.trim().length === 0) {
+      return {
+        error: `Error: workspace file "${wsRef}" is empty. Pass non-empty HTML inline via content, or point contentFromWorkspaceFile at a file with content.`,
+      };
+    }
+    return { content };
+  }
+
+  return resolveExtensionContent(args, ctx);
+}
+
 function coerceBoolean(value: unknown): boolean {
   return value === true || value === "true";
+}
+
+function normalizeUpdateExtensionArgs(
+  args: any,
+): { args: Record<string, unknown> } | { error: string } {
+  const hasCompactContract =
+    args?.operation !== undefined || args?.payloadJson !== undefined;
+  if (!hasCompactContract) {
+    const legacyArgs = { ...((args ?? {}) as Record<string, unknown>) };
+    const hasInvalidPlaceholderSignal =
+      (typeof legacyArgs.visibility === "string" &&
+        legacyArgs.visibility.trim().length === 0) ||
+      [legacyArgs.patches, legacyArgs.edits].some(
+        (value) =>
+          value !== null &&
+          typeof value === "object" &&
+          (Array.isArray(value)
+            ? value.length > 0 &&
+              value.every(
+                (item) =>
+                  item !== null &&
+                  typeof item === "object" &&
+                  !Array.isArray(item) &&
+                  Object.keys(item).length === 0,
+              )
+            : Object.keys(value).length === 0),
+      );
+    if (hasInvalidPlaceholderSignal) {
+      for (const [key, value] of Object.entries(legacyArgs)) {
+        if (key === "id") continue;
+        const empty =
+          value === false ||
+          value === null ||
+          (typeof value === "string" && value.trim().length === 0) ||
+          (Array.isArray(value) &&
+            (value.length === 0 ||
+              value.every(
+                (item) =>
+                  item !== null &&
+                  typeof item === "object" &&
+                  !Array.isArray(item) &&
+                  Object.keys(item).length === 0,
+              ))) ||
+          (typeof value === "object" &&
+            value !== null &&
+            !Array.isArray(value) &&
+            Object.keys(value).length === 0);
+        if (empty) delete legacyArgs[key];
+      }
+      delete legacyArgs.visibility;
+    }
+    return { args: legacyArgs };
+  }
+
+  const operation = String(args?.operation ?? "").trim();
+  if (!(["edit", "replace", "metadata"] as const).includes(operation as any)) {
+    return {
+      error:
+        'Error: operation must be "edit", "replace", or "metadata". No changes were applied.',
+    };
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(String(args?.payloadJson ?? ""));
+  } catch {
+    return {
+      error:
+        "Error: payloadJson must be a valid JSON object encoded as a string. No changes were applied.",
+    };
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return {
+      error:
+        "Error: payloadJson must decode to a non-empty JSON object. No changes were applied.",
+    };
+  }
+
+  const payloadRecord = payload as Record<string, unknown>;
+  const allowedByOperation: Record<string, Set<string>> = {
+    edit: new Set(["patches", "edits", "format"]),
+    replace: new Set([
+      "content",
+      "contentFromAttachment",
+      "contentFromWorkspaceFile",
+      "format",
+    ]),
+    metadata: new Set(["name", "description", "icon"]),
+  };
+  const unexpected = Object.keys(payloadRecord).filter(
+    (key) => !allowedByOperation[operation].has(key),
+  );
+  if (unexpected.length > 0) {
+    return {
+      error: `Error: operation=${operation} does not accept ${unexpected.join(", ")}. No changes were applied.`,
+    };
+  }
+
+  if (operation === "edit") {
+    const patches = parsePatches(payloadRecord.patches);
+    const edits = parseEdits(payloadRecord.edits);
+    const hasEdit =
+      (patches?.length ?? 0) > 0 ||
+      (edits?.length ?? 0) > 0 ||
+      coerceBoolean(payloadRecord.format);
+    if (!hasEdit) {
+      return {
+        error:
+          "Error: operation=edit requires at least one valid patch/edit or format=true. No changes were applied.",
+      };
+    }
+  }
+
+  if (operation === "replace") {
+    const replacementSources = [
+      payloadRecord.content,
+      payloadRecord.contentFromAttachment,
+      payloadRecord.contentFromWorkspaceFile,
+    ].filter((value) => typeof value === "string" && value.trim().length > 0);
+    if (replacementSources.length !== 1) {
+      return {
+        error:
+          "Error: operation=replace requires exactly one non-empty content, contentFromAttachment, or contentFromWorkspaceFile value. No changes were applied.",
+      };
+    }
+  }
+
+  if (operation === "metadata") {
+    const keys = Object.keys(payloadRecord);
+    if (keys.length === 0) {
+      return {
+        error:
+          "Error: operation=metadata requires name, description, or icon. No changes were applied.",
+      };
+    }
+    if (
+      payloadRecord.name !== undefined &&
+      (typeof payloadRecord.name !== "string" ||
+        payloadRecord.name.trim().length === 0)
+    ) {
+      return {
+        error:
+          "Error: extension name must be a non-empty string. No changes were applied.",
+      };
+    }
+  }
+
+  return {
+    args: {
+      id: String(args?.id ?? "").trim(),
+      ...payloadRecord,
+      ...(operation === "replace" ? { allowFullReplacement: true } : {}),
+    },
+  };
+}
+
+function parseInlineContext(
+  value: unknown,
+): Record<string, unknown> | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const parsed =
+    typeof value === "string"
+      ? (() => {
+          try {
+            return JSON.parse(value);
+          } catch {
+            return undefined;
+          }
+        })()
+      : value;
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : undefined;
+}
+
+function coerceInlineHeight(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const height = Number(value);
+  if (!Number.isFinite(height) || height <= 0) return undefined;
+  return Math.min(Math.max(Math.round(height), 120), 1000);
 }
 
 function coerceLimit(value: unknown): number {
@@ -1018,7 +2080,7 @@ function coerceLimit(value: unknown): number {
 
 function parsePatches(value: unknown): ExtensionLegacyPatch[] | undefined {
   if (value === undefined) return undefined;
-  const parsed = typeof value === "string" ? JSON.parse(value) : value;
+  const parsed = parseJsonArray(value);
   if (!Array.isArray(parsed)) return undefined;
   if (
     parsed.some(
@@ -1035,11 +2097,20 @@ function parsePatches(value: unknown): ExtensionLegacyPatch[] | undefined {
 
 function parseEdits(value: unknown): ExtensionContentEdit[] | undefined {
   if (value === undefined) return undefined;
-  const parsed = typeof value === "string" ? JSON.parse(value) : value;
+  const parsed = parseJsonArray(value);
   if (!Array.isArray(parsed)) return undefined;
   return parsed.every(isValidContentEdit)
     ? (parsed as ExtensionContentEdit[])
     : undefined;
+}
+
+function parseJsonArray(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
 }
 
 function isValidContentEdit(value: unknown): boolean {

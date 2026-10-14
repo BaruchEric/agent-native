@@ -1,48 +1,160 @@
-import { defineEventHandler, setResponseStatus, getMethod, getQuery } from "h3";
-import { createRemoteJWKSet, jwtVerify } from "jose";
+import {
+  defineEventHandler,
+  setResponseStatus,
+  setResponseHeader,
+  getMethod,
+  getQuery,
+  sendRedirect,
+} from "h3";
+import { getRequestHeader } from "h3";
+import type { EventHandler } from "h3";
+
+import {
+  AGENT_BACKGROUND_PROCESSOR_FIELD,
+  AGENT_BACKGROUND_PROCESSOR_INTEGRATION,
+  isInBackgroundFunctionRuntime,
+} from "../agent/durable-background.js";
+import { abortRun } from "../agent/run-manager.js";
+import { AppConfigurationError, getAppConfig } from "../app-config/index.js";
+import { isServerlessRuntime } from "../db/client.js";
+import { getOrgContext, resolveOrgIdForEmail } from "../org/context.js";
+import { loadResourcesForPrompt } from "../server/agent-chat-plugin.js";
+import { withConfiguredAppBasePath } from "../server/app-base-path.js";
+import { getSession } from "../server/auth.js";
 import { FRAMEWORK_ROUTE_PREFIX } from "../server/core-routes-plugin.js";
+import { resolveSecret } from "../server/credential-provider.js";
 import {
   getH3App,
   markDefaultPluginProvided,
 } from "../server/framework-request-handler.js";
-import type {
-  PlatformAdapter,
-  IntegrationsPluginOptions,
-  IntegrationStatus,
-} from "./types.js";
-import { handleWebhook, processIntegrationTask } from "./webhook-handler.js";
 import {
-  claimPendingTask,
-  markTaskCompleted,
-  markTaskFailed,
-} from "./pending-tasks-store.js";
-import { extractBearerToken, verifyInternalToken } from "./internal-token.js";
+  decodeOAuthState,
+  encodeOAuthState,
+  logOAuthStateDecodeFailure,
+  oauthCallbackResponse,
+  oauthErrorPage,
+  resolveOAuthRedirectUri,
+} from "../server/google-oauth.js";
 import { readBody } from "../server/h3-helpers.js";
-import { getRequestHeader } from "h3";
-import { getIntegrationConfig, saveIntegrationConfig } from "./config-store.js";
-import { slackAdapter } from "./adapters/slack.js";
-import { telegramAdapter } from "./adapters/telegram.js";
-import { whatsappAdapter } from "./adapters/whatsapp.js";
-import { googleDocsAdapter } from "./adapters/google-docs.js";
-import { emailAdapter } from "./adapters/email.js";
 import {
-  startGoogleDocsPoller,
-  handlePushNotification,
-} from "./google-docs-poller.js";
-import { startPendingTasksRetryJob } from "./pending-tasks-retry-job.js";
+  startIntervalJob,
+  type IntervalJobHandle,
+} from "../server/interval-job.js";
+import { runWithRequestContext } from "../server/request-context.js";
+import { resolveSelfDispatchBaseUrl } from "../server/self-dispatch.js";
+import { dispatchAutomationWebhookTask } from "../triggers/dispatcher.js";
+import {
+  AUTOMATION_WEBHOOK_PLATFORM,
+  type AutomationWebhookTaskPayload,
+} from "../triggers/webhook.js";
 import {
   processA2AContinuationById,
   processDueA2AContinuations,
+  reconcileTerminalA2AParentIfDisabled,
+  recoverA2AContinuationAfterProcessorFailure,
+  recoverDueA2AContinuations,
 } from "./a2a-continuation-processor.js";
-import { failA2AContinuation } from "./a2a-continuations-store.js";
-import { loadResourcesForPrompt } from "../server/agent-chat-plugin.js";
-import { getTaskQueueStats } from "./task-queue-stats.js";
-import { getSession } from "../server/auth.js";
-import { getOrgContext } from "../org/context.js";
-import { withConfiguredAppBasePath } from "../server/app-base-path.js";
+import { getA2AContinuationTaskOutcome } from "./a2a-continuations-store.js";
+import { mergeIntegrationAdapters } from "./adapter-overrides.js";
+import { discordAdapter } from "./adapters/discord.js";
+import { emailAdapter } from "./adapters/email.js";
+import { googleDocsAdapter } from "./adapters/google-docs.js";
+import { microsoftTeamsAdapter } from "./adapters/microsoft-teams.js";
+import { slackAdapter } from "./adapters/slack.js";
+import { telegramAdapter } from "./adapters/telegram.js";
+import { whatsappAdapter } from "./adapters/whatsapp.js";
+import {
+  createComputerApprovalRequest,
+  decideComputerApproval,
+  listComputerApprovalsForOwner,
+} from "./computer-supervision-store.js";
+import { ComputerSupervisionError } from "./computer-supervision.js";
+import { getIntegrationConfig, saveIntegrationConfig } from "./config-store.js";
+import { claimIntegrationControl } from "./controls-store.js";
+import {
+  startGoogleDocsPoller,
+  stopGoogleDocsPoller,
+  handlePushNotification,
+  verifyGoogleDocsPushNotification,
+} from "./google-docs-poller.js";
+import {
+  IntegrationIdentityDeclinedError,
+  resolveDefaultIntegrationExecutionContext,
+} from "./identity.js";
+import {
+  disconnectIntegrationInstallation,
+  listIntegrationInstallations,
+  resolveIntegrationTokenBundle,
+  updateIntegrationInstallation,
+  upsertIntegrationInstallation,
+} from "./installations-store.js";
+import { recoverDueIntegrationCampaigns } from "./integration-campaign-recovery.js";
+import {
+  claimIntegrationCampaignDeliveryForTask,
+  completeIntegrationCampaignTaskAfterA2A,
+  completeIntegrationCampaignTask,
+  failIntegrationCampaignTaskDeliveryContainment,
+  failDisabledIntegrationCampaignTask,
+  failIntegrationCampaign,
+  refreshIntegrationCampaignTaskA2AReceiptRetry,
+  terminalizeIntegrationCampaignForTask,
+  transitionIntegrationCampaignTaskToA2AReceiptRetry,
+  transitionIntegrationCampaignTaskToDeliveryRetry,
+  waitForA2AIntegrationCampaign,
+} from "./integration-campaigns-store.js";
+import {
+  dispatchPendingIntegrationTask,
+  INTEGRATION_CAMPAIGN_PROCESSOR_FIELD,
+  INTEGRATION_RETRY_SWEEP_TOKEN_SUBJECT,
+  integrationDispatchScopeValue,
+  isInIntegrationRecoveryRuntime,
+  isIntegrationDurableDispatchEnabledForTask,
+  isIntegrationDurableDispatchExplicitlyDisabledForTask,
+} from "./integration-durable-dispatch.js";
+import {
+  forgetIntegrationMemory,
+  integrationMemoryActions,
+  listIntegrationMemory,
+  rememberForIntegrationScope,
+} from "./integration-memory.js";
+import { extractBearerToken, verifyInternalToken } from "./internal-token.js";
+import {
+  setMountedChannels,
+  type MountedChannels,
+} from "./mounted-channels.js";
+import {
+  retryStuckPendingTasks,
+  startPendingTasksRetryJob,
+} from "./pending-tasks-retry-job.js";
+import {
+  claimPendingTask,
+  getNextPendingTaskForThread,
+  getPendingTask,
+  insertPendingTask,
+  isDuplicateEventError,
+  MAX_PENDING_TASK_ATTEMPTS,
+  MAX_RECOVERABLE_PENDING_TASK_AGE_MS,
+  markTaskCompleted,
+  markTaskDeliveryRetryable,
+  markTaskFailed,
+  markTaskRetryable,
+  stageTaskDeliveryPayload,
+  type PendingTask,
+} from "./pending-tasks-store.js";
+import {
+  claimNextComputerCommand,
+  claimNextRemoteCommand,
+  enqueueComputerCommand,
+  enqueueRemoteCommand as enqueueRemoteCommandRow,
+  isRemoteCommandKind,
+  listRemoteCommandsForOwner,
+  updateRemoteCommandResult,
+} from "./remote-commands-store.js";
 import {
   authenticateRemoteDeviceToken,
   createRemoteDevice,
+  getRemoteComputerCapabilities,
+  getRemoteExecutionCapabilities,
   getRemoteDeviceForOwner,
   listRemoteDevicesForOwner,
   revokeRemoteDeviceForOwner,
@@ -50,17 +162,7 @@ import {
   unregisterRemoteDevice,
   updateRemoteDeviceDetails,
 } from "./remote-devices-store.js";
-import {
-  claimNextRemoteCommand,
-  enqueueRemoteCommand as enqueueRemoteCommandRow,
-  isRemoteCommandKind,
-  listRemoteCommandsForOwner,
-  updateRemoteCommandResult,
-} from "./remote-commands-store.js";
-import {
-  insertRemoteRunEvents,
-  listRemoteRunEvents,
-} from "./remote-run-events-store.js";
+import { startRemotePushDeliveryJob } from "./remote-push-delivery-job.js";
 import {
   listRemotePushNotificationsForOwner,
   listRemotePushRegistrationsForOwner,
@@ -70,95 +172,245 @@ import {
   upsertRemotePushRegistration,
 } from "./remote-push-store.js";
 import { startRemoteCommandsRetryJob } from "./remote-retry-job.js";
+import {
+  insertRemoteRunEvents,
+  listRemoteRunEvents,
+} from "./remote-run-events-store.js";
 import type {
+  ComputerCommandEnvelope,
+  ComputerOperationClass,
   RemoteCommand,
   RemoteCommandKind,
   RemoteDevice,
+  RemoteExecutionCapabilities,
 } from "./remote-types.js";
+import { listIntegrationScopes, saveIntegrationScope } from "./scope-store.js";
+import { buildSlackAgentManifest } from "./slack-manifest.js";
+import {
+  assertSlackInstallAccess,
+  buildSlackAuthorizeUrl,
+  exchangeSlackOAuthCode,
+  slackOAuthResponseToInstallation,
+  testSlackAuth,
+} from "./slack-oauth.js";
+import { getTaskQueueStats } from "./task-queue-stats.js";
+import type {
+  PlatformAdapter,
+  IntegrationsPluginOptions,
+  IntegrationStatus,
+  IntegrationExecutionContext,
+  IncomingMessage,
+  PlatformDeliveryReceipt,
+} from "./types.js";
+import {
+  listIntegrationUsageBudgets,
+  saveIntegrationUsageBudget,
+} from "./usage-budget-store.js";
+import {
+  handleWebhook,
+  integrationResponseIdempotencyKey,
+  processIntegrationTask,
+  recordIntegrationResponseDelivery,
+  type IntegrationResponseDeliveryTaskPayload,
+} from "./webhook-handler.js";
 
 type NitroPluginDef = (nitroApp: any) => void | Promise<void>;
 
-let a2aContinuationRetryInterval: ReturnType<typeof setInterval> | null = null;
+let a2aContinuationJob: IntervalJobHandle | null = null;
+let a2aContinuationStartupTimer: ReturnType<typeof setTimeout> | null = null;
+const A2A_CONTINUATION_SWEEP_INTERVAL_MS = 60_000;
+const INTEGRATION_DELIVERY_LEASE_MS = 2 * 60_000;
+
+async function checkpointIntegrationDeliveryRetry(
+  task: PendingTask,
+  payload: string,
+  errorMessage: string,
+  event: unknown,
+  campaignLease?: {
+    campaignId: string;
+    runId: string;
+    leaseToken: string;
+    campaignStatus: "completed" | "failed" | "waiting-a2a";
+  },
+): Promise<"requeued" | "superseded"> {
+  let terminalStatus: "completed" | "failed" | undefined;
+  let confirmedReceipt = false;
+  let awaitingA2ACompletion = false;
+  try {
+    const parsed = JSON.parse(
+      payload,
+    ) as Partial<IntegrationResponseDeliveryTaskPayload>;
+    terminalStatus = parsed.campaignTerminalStatus;
+    confirmedReceipt = parsed.deliveryReceipt?.status === "delivered";
+    awaitingA2ACompletion = parsed.awaitingA2ACompletion === true;
+  } catch {}
+  if (awaitingA2ACompletion) {
+    if (campaignLease && campaignLease.campaignStatus !== "waiting-a2a") {
+      throw new Error("A2A receipt retry lease has the wrong custody mode");
+    }
+    const transitioned = campaignLease
+      ? await transitionIntegrationCampaignTaskToA2AReceiptRetry(task.id, {
+          payload,
+          errorMessage,
+          campaignId: campaignLease.campaignId,
+          runId: campaignLease.runId,
+          leaseToken: campaignLease.leaseToken,
+          nextRunAt: Date.now() + 15_000,
+        })
+      : await refreshIntegrationCampaignTaskA2AReceiptRetry(task.id, {
+          payload,
+          errorMessage,
+        });
+    if (!transitioned) return "superseded";
+    await dispatchPendingIntegrationTask({
+      taskId: task.id,
+      task: {
+        platform: task.platform,
+        externalThreadId: task.externalThreadId,
+        platformContext: task.dispatchScope
+          ? { channelId: task.dispatchScope }
+          : undefined,
+      },
+      event,
+      baseUrl: getBaseUrl(event),
+      campaignContinuation: true,
+      allowPortableConfirmedReceiptReconciliation: confirmedReceipt,
+    });
+    return "requeued";
+  }
+  if (terminalStatus && !campaignLease && !confirmedReceipt) {
+    throw new Error("Campaign delivery retry is missing its lease");
+  }
+  if (terminalStatus && campaignLease) {
+    if (terminalStatus !== campaignLease.campaignStatus) {
+      throw new Error(
+        "Campaign delivery retry status does not match its lease",
+      );
+    }
+    const transitioned = await transitionIntegrationCampaignTaskToDeliveryRetry(
+      task.id,
+      {
+        payload,
+        errorMessage,
+        campaignStatus: campaignLease.campaignStatus,
+        campaignId: campaignLease.campaignId,
+        runId: campaignLease.runId,
+        leaseToken: campaignLease.leaseToken,
+      },
+    );
+    if (!transitioned) {
+      return "superseded";
+    }
+  } else {
+    await markTaskDeliveryRetryable(task.id, payload, errorMessage);
+  }
+  await dispatchPendingIntegrationTask({
+    taskId: task.id,
+    task: {
+      platform: task.platform,
+      externalThreadId: task.externalThreadId,
+      platformContext: task.dispatchScope
+        ? { channelId: task.dispatchScope }
+        : undefined,
+    },
+    event,
+    baseUrl: getBaseUrl(event),
+  });
+  return "requeued";
+}
+
+async function containFailedDeliveryTransition(
+  task: PendingTask,
+  errorMessage: string,
+  event: unknown,
+): Promise<void> {
+  const contained = await failIntegrationCampaignTaskDeliveryContainment(
+    task.id,
+    errorMessage,
+  );
+  if (!contained) {
+    throw new Error("Delivery containment lost pending-task custody");
+  }
+  const nextTask = await getNextPendingTaskForThread(
+    task.platform,
+    task.externalThreadId,
+  );
+  if (!nextTask) return;
+  await dispatchPendingIntegrationTask({
+    taskId: nextTask.id,
+    task: {
+      platform: task.platform,
+      externalThreadId: task.externalThreadId,
+      platformContext: nextTask.dispatchScope
+        ? { channelId: nextTask.dispatchScope }
+        : undefined,
+    },
+    event,
+    baseUrl: getBaseUrl(event),
+  });
+}
 
 function startA2AContinuationRetryJob(
   adapters: Map<string, PlatformAdapter>,
 ): void {
-  if (a2aContinuationRetryInterval) return;
-  const initialTimer = setTimeout(() => {
-    processDueA2AContinuations({ adapters }).catch((err) => {
-      console.error("[integrations] A2A continuation retry job failed:", err);
-    });
+  if (a2aContinuationJob || a2aContinuationStartupTimer) return;
+  a2aContinuationStartupTimer = setTimeout(() => {
+    a2aContinuationStartupTimer = null;
+    a2aContinuationJob = startIntervalJob(
+      () => processDueA2AContinuations({ adapters }),
+      {
+        intervalMs: A2A_CONTINUATION_SWEEP_INTERVAL_MS,
+        onError: (err) => {
+          console.error(
+            "[integrations] A2A continuation retry job failed:",
+            err,
+          );
+        },
+      },
+    );
   }, 10_000);
-  unrefTimer(initialTimer);
-  a2aContinuationRetryInterval = setInterval(() => {
-    processDueA2AContinuations({ adapters }).catch((err) => {
-      console.error("[integrations] A2A continuation retry job failed:", err);
-    });
-  }, 60_000);
-  unrefTimer(a2aContinuationRetryInterval);
+  a2aContinuationStartupTimer.unref?.();
 }
 
-function unrefTimer(timer: ReturnType<typeof setInterval>): void {
-  (timer as unknown as { unref?: () => void }).unref?.();
-}
+export const BUILT_IN_INTEGRATION_ADAPTER_FACTORIES = Object.freeze([
+  { platform: "slack", create: slackAdapter },
+  { platform: "telegram", create: telegramAdapter },
+  { platform: "whatsapp", create: whatsappAdapter },
+  { platform: "microsoft-teams", create: microsoftTeamsAdapter },
+  { platform: "discord", create: discordAdapter },
+  { platform: "google-docs", create: googleDocsAdapter },
+  { platform: "email", create: emailAdapter },
+] as const satisfies ReadonlyArray<{
+  platform: string;
+  create: () => PlatformAdapter;
+}>);
 
-// ─── Google Pub/Sub OIDC verifier (for Drive changes.watch push) ────────────
-// Cache Google's public keys for OIDC verification. jose handles TTL +
-// refresh internally — same pattern as templates/mail/.../gmail/push.post.ts.
-// Used to verify Google Pub/Sub push notifications carry a valid bearer token
-// signed by a configured service account. Without this, the webhook is wide
-// open to anonymous callers who can force a Drive sync (H7 in the audit).
-const GOOGLE_JWKS = createRemoteJWKSet(
-  new URL("https://www.googleapis.com/oauth2/v3/certs"),
+export const BUILT_IN_INTEGRATION_ADAPTER_IDS = Object.freeze(
+  BUILT_IN_INTEGRATION_ADAPTER_FACTORIES.map(({ platform }) => platform),
 );
-const GOOGLE_ISSUERS = ["https://accounts.google.com", "accounts.google.com"];
 
-/**
- * Verify a Pub/Sub OIDC bearer token. Throws on any verification failure.
- * Requires GOOGLE_DOCS_PUSH_AUDIENCE and GOOGLE_DOCS_PUSH_SIGNER_EMAIL to be
- * set; if either is missing in production, the webhook handler refuses the
- * request entirely (so a misconfigured deployment fails closed, surfacing in
- * Pub/Sub's delivery metrics).
- */
-async function verifyGoogleDocsPushToken(authHeader: string): Promise<void> {
-  if (!authHeader.startsWith("Bearer ")) {
-    throw new Error("missing bearer token");
-  }
-  const token = authHeader.slice(7);
-  const audience = process.env.GOOGLE_DOCS_PUSH_AUDIENCE;
-  if (!audience) {
-    throw new Error("GOOGLE_DOCS_PUSH_AUDIENCE not configured");
-  }
-  const { payload } = await jwtVerify(token, GOOGLE_JWKS, {
-    issuer: GOOGLE_ISSUERS,
-    audience,
-  });
-  if (payload.email_verified !== true) {
-    throw new Error("email_verified claim is not true");
-  }
-  // Pin to a specific service account — without this, any Google-issued
-  // token with the right audience could trigger a Drive sync.
-  const expectedSigner = process.env.GOOGLE_DOCS_PUSH_SIGNER_EMAIL;
-  if (!expectedSigner) {
-    throw new Error("GOOGLE_DOCS_PUSH_SIGNER_EMAIL not configured");
-  }
-  if (payload.email !== expectedSigner) {
-    throw new Error(`unexpected signer: ${String(payload.email)}`);
-  }
+export function createBuiltInIntegrationAdapters(): PlatformAdapter[] {
+  return BUILT_IN_INTEGRATION_ADAPTER_FACTORIES.map(({ create }) => create());
 }
 
-/** Built-in adapters, instantiated lazily */
-function getDefaultAdapters(): PlatformAdapter[] {
-  return [
-    slackAdapter(),
-    telegramAdapter(),
-    whatsappAdapter(),
-    googleDocsAdapter(),
-    emailAdapter(),
-  ];
+export function applyConfiguredPlatformAllowList(
+  adapters: PlatformAdapter[],
+): PlatformAdapter[] {
+  const allowed = getAppConfig().integrations.platforms;
+  if (!allowed) return adapters;
+  const available = new Set(adapters.map((adapter) => adapter.platform));
+  const unknown = allowed.filter((platform) => !available.has(platform));
+  if (unknown.length > 0) {
+    throw new AppConfigurationError(
+      `[agent-native] integrations.platforms names ${unknown.join(", ")}, which no mounted adapter provides. ` +
+        `Available: ${[...available].join(", ") || "(none)"}.`,
+    );
+  }
+  const allowedSet = new Set(allowed);
+  return adapters.filter((adapter) => allowedSet.has(adapter.platform));
 }
 
-const INTEGRATION_SYSTEM_PROMPT = `You are an AI agent responding via a messaging platform integration (Slack, Telegram, WhatsApp, etc.).
+const INTEGRATION_SYSTEM_PROMPT = `You are an AI agent responding via a messaging platform integration (Slack, Microsoft Teams, Discord interactions, Telegram, WhatsApp, etc.).
 
 You have the same capabilities as the web chat agent. Use your tools to help the user.
 
@@ -174,7 +426,32 @@ type RemoteCodeCommandEnvelope = {
   source?: unknown;
 };
 
+type IntegrationCredentialContext = {
+  userEmail: string;
+  orgId?: string;
+  isIntegrationCaller?: boolean;
+};
+
 const REMOTE_DEVICE_ONLINE_MS = 90_000;
+
+const DECLINE_NOTICE_DEDUPE_TTL_MS = 5 * 60 * 1_000;
+const SYSTEM_NOTICE_DEDUPE_TTL_MS = 24 * 60 * 60 * 1_000;
+
+type IntegrationSystemNoticeTaskPayload = {
+  kind: "system-notice";
+  incoming: IncomingMessage;
+  text: string;
+  dedupeKey?: string;
+  dedupeTtlMs?: number;
+};
+
+function systemNoticeEventKey(
+  dedupeKey: string,
+  ttlMs: number,
+  now = Date.now(),
+): string {
+  return `system-notice:${dedupeKey}:${Math.floor(now / ttlMs)}`;
+}
 
 export async function enqueueRemoteCommand(
   envelope: RemoteCodeCommandEnvelope,
@@ -225,10 +502,17 @@ export async function enqueueRemoteCommand(
   });
   const requestedDeviceId =
     readString(command.hostId) ?? readString(command.deviceId);
-  const device =
-    (requestedDeviceId
-      ? devices.find((candidate) => candidate.id === requestedDeviceId)
-      : undefined) ?? devices[0];
+  const device = requestedDeviceId
+    ? devices.find((candidate) => candidate.id === requestedDeviceId)
+    : devices[0];
+  if (requestedDeviceId && !device) {
+    return {
+      ok: false,
+      hostOnline: false,
+      hostStatus: "offline",
+      error: "The requested execution host is not paired with this account.",
+    };
+  }
   if (!device) {
     return {
       ok: false,
@@ -296,6 +580,13 @@ function remoteCodeCommandParams(
       cwd: readString(command.cwd),
       goalId: readString(command.goalId) ?? "task",
       permissionMode: readString(command.permissionMode),
+      engine: readString(command.engine),
+      model: readString(command.model),
+      effort: readString(command.effort),
+      reasoningEffort: readString(command.reasoningEffort),
+      runId: readString(command.runId),
+      workload: readString(command.workload) ?? "code-agent",
+      metadata: readObject(command.metadata) ?? undefined,
     };
   }
   if (type === "continue") {
@@ -335,6 +626,13 @@ function enqueueBodyToRemoteCodeCommand(
       cwd: payload.cwd,
       goalId: payload.goalId,
       permissionMode: payload.permissionMode,
+      engine: payload.engine,
+      model: payload.model,
+      effort: payload.effort,
+      reasoningEffort: payload.reasoningEffort,
+      runId: payload.runId,
+      workload: payload.workload,
+      metadata: payload.metadata,
     };
   }
   if (operation === "code-agent.run.follow-up") {
@@ -430,6 +728,18 @@ async function hasOnlineRemoteDevice(
 
 function remoteDeviceToHost(device: RemoteDevice): Record<string, unknown> {
   const online = device.status === "active" && isRemoteDeviceOnline(device);
+  const executionCapabilities = getRemoteExecutionCapabilities(device);
+  const capabilities = [
+    ...(executionCapabilities?.workloads ?? []).map(
+      (workload) => `workload:${workload}`,
+    ),
+    ...(executionCapabilities?.engines ?? []).map(
+      (engine) => `engine:${engine}`,
+    ),
+    ...(executionCapabilities?.acceptsScheduledWork ? ["scheduled-task"] : []),
+    ...(executionCapabilities?.acceptsPortalHandoffs ? ["portal"] : []),
+    ...(device.metadata?.computerCapabilities ? ["computer"] : []),
+  ];
   return {
     id: device.id,
     name: device.label,
@@ -442,6 +752,8 @@ function remoteDeviceToHost(device: RemoteDevice): Record<string, unknown> {
     platform: device.platform ?? "desktop",
     appVersion: device.appVersion ?? undefined,
     hostName: device.hostName ?? undefined,
+    capabilities,
+    executionCapabilities: executionCapabilities ?? undefined,
     metadata: device.metadata ?? undefined,
     device: toPublicRemoteDevice(device),
   };
@@ -467,7 +779,6 @@ function mountedPathParts(event: any, mountSuffix: string): string[] {
 function remoteCommandPushPayload(
   command: RemoteCommand,
 ): Record<string, unknown> {
-  const result = readObject(command.result);
   const status = command.status;
   const title =
     status === "completed"
@@ -475,82 +786,249 @@ function remoteCommandPushPayload(
       : status === "failed"
         ? "Remote run failed"
         : "Remote run updated";
+  const body =
+    status === "completed"
+      ? "Open Agent-Native to review the result."
+      : status === "failed"
+        ? "Open Agent-Native to review the failure."
+        : "Open Agent-Native to review the latest status.";
   return {
     title,
-    body: command.errorMessage ?? readString(result?.message),
+    body,
     commandId: command.id,
     hostId: command.deviceId,
     kind: command.kind,
     status,
-    result: command.result,
     updatedAt: command.updatedAt,
   };
 }
 
-/**
- * Creates a Nitro plugin that mounts messaging platform integration webhook routes.
- *
- * Routes:
- *   POST   /_agent-native/integrations/:platform/webhook  — receive platform webhooks
- *   GET    /_agent-native/integrations/status              — all integrations status
- *   GET    /_agent-native/integrations/:platform/status    — single platform status
- *   POST   /_agent-native/integrations/:platform/enable    — enable integration
- *   POST   /_agent-native/integrations/:platform/disable   — disable integration
- *   POST   /_agent-native/integrations/:platform/setup     — platform-specific setup
- */
 export function createIntegrationsPlugin(
   options?: IntegrationsPluginOptions,
 ): NitroPluginDef {
+  if (
+    options?.adapters !== undefined &&
+    options.adapterOverrides !== undefined
+  ) {
+    throw new Error(
+      "Choose either adapters for full replacement or adapterOverrides for per-platform customization.",
+    );
+  }
   return async (nitroApp: any) => {
     markDefaultPluginProvided(nitroApp, "integrations");
-    const adapters = options?.adapters ?? getDefaultAdapters();
+    const adapters = applyConfiguredPlatformAllowList(
+      options?.adapters ??
+        mergeIntegrationAdapters(
+          createBuiltInIntegrationAdapters(),
+          options?.adapterOverrides,
+        ),
+    );
     const adapterMap = new Map<string, PlatformAdapter>();
     for (const adapter of adapters) {
       adapterMap.set(adapter.platform, adapter);
     }
 
     const model = options?.model;
-    // Read the API key at REQUEST time, not plugin-init time. On Netlify
-    // Lambda the plugin module loads in a context where env vars from the
-    // site's runtime config may not yet be populated, so capturing at
-    // init can leave us with an empty string forever. The getter
-    // re-resolves on every webhook so freshly-set secrets work without
-    // a redeploy.
-    const getApiKey = () =>
-      options?.apiKey ?? process.env.ANTHROPIC_API_KEY ?? "";
+    const getApiKey = () => options?.apiKey ?? "";
 
-    // Build the system prompt
     const baseSystemPrompt = options?.systemPrompt ?? INTEGRATION_SYSTEM_PROMPT;
 
-    // Resolve actions — auto-include call-agent so the integration agent can
-    // delegate to other A2A apps, matching the behavior of the agent-chat plugin.
     const localActions = options?.actions ?? {};
     let callAgentEntry: Record<string, unknown> = {};
     try {
-      const mod = await import("../scripts/call-agent.js");
-      callAgentEntry = {
-        "call-agent": {
-          tool: mod.tool,
-          run: (args: Record<string, string>, context: unknown) =>
-            mod.run(args, context as any, options?.appId),
-        },
-      };
+      if (options?.callAgent !== false) {
+        const mod = await import("../scripts/call-agent.js");
+        callAgentEntry = {
+          "call-agent": {
+            tool: mod.tool,
+            run: (args: Record<string, string>, context: unknown) =>
+              mod.run(args, context as any, options?.appId),
+          },
+        };
+      }
     } catch {
       // call-agent script not available — skip
     }
     const actions = {
+      ...integrationMemoryActions(),
       ...localActions,
       ...callAgentEntry,
     } as typeof localActions;
+    const initialToolNames = options?.initialToolNames
+      ? [...options.initialToolNames]
+      : Object.keys(localActions);
 
     const h3 = getH3App(nitroApp);
     const P = `${FRAMEWORK_ROUTE_PREFIX}/integrations`;
+    let googleDocsPollerTransition: Promise<void> = Promise.resolve();
+    const runGoogleDocsPollerTransition = (
+      operation: () => Promise<void>,
+    ): Promise<void> => {
+      const previous = googleDocsPollerTransition;
+      let release!: () => void;
+      googleDocsPollerTransition = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return previous
+        .catch(() => undefined)
+        .then(operation)
+        .finally(release);
+    };
+    const createGoogleDocsPollerOptions = (requestBaseUrl?: string) => {
+      const configuredBaseUrl = getAppConfig().integrations.webhookBaseUrl;
+      const baseUrl = configuredBaseUrl || requestBaseUrl;
+      const webhookUrl = baseUrl
+        ? `${withConfiguredAppBasePath(baseUrl)}${P}/google-docs/webhook`
+        : undefined;
 
-    async function requireSession(event: any): Promise<boolean> {
-      const session = await getSession(event).catch(() => null);
-      if (session?.email) return true;
-      setResponseStatus(event, 401);
-      return false;
+      return {
+        systemPrompt: baseSystemPrompt,
+        actions,
+        initialToolNames,
+        model: model ?? "",
+        apiKey: getApiKey(),
+        ownerEmail: "integration@google-docs",
+        webhookUrl,
+      };
+    };
+
+    const channels: MountedChannels = {
+      adapters,
+      webhookUrl: (baseUrl, platform) => `${baseUrl}${P}/${platform}/webhook`,
+      async setEnabled(platform, enabled, { actorEmail, baseUrl }) {
+        await saveIntegrationConfig(
+          platform,
+          { enabled },
+          "default",
+          actorEmail,
+        );
+        if (platform !== "google-docs") return;
+        await runGoogleDocsPollerTransition(
+          enabled
+            ? () =>
+                startGoogleDocsPoller(createGoogleDocsPollerOptions(baseUrl))
+            : stopGoogleDocsPoller,
+        );
+      },
+      async registerWebhook(platform, baseUrl) {
+        if (platform !== "telegram") {
+          return { ok: true, message: "No setup required" };
+        }
+        const webhookUrl = channels.webhookUrl(baseUrl, "telegram");
+        const token = await resolveSecret("TELEGRAM_BOT_TOKEN");
+        const webhookSecret = await resolveSecret("TELEGRAM_WEBHOOK_SECRET");
+        if (!token || !webhookSecret) {
+          return {
+            ok: false,
+            statusCode: 400,
+            error:
+              "TELEGRAM_BOT_TOKEN and TELEGRAM_WEBHOOK_SECRET must be configured before webhook setup.",
+          };
+        }
+        try {
+          const res = await fetch(
+            `https://api.telegram.org/bot${token}/setWebhook`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                url: webhookUrl,
+                secret_token: webhookSecret,
+              }),
+            },
+          );
+          const body = await res.text();
+          type TelegramSetWebhookResponse = {
+            ok?: boolean;
+            description?: string;
+            [key: string]: unknown;
+          };
+          let data: TelegramSetWebhookResponse | null = null;
+          try {
+            const parsed = JSON.parse(body);
+            if (parsed && typeof parsed === "object") {
+              data = parsed as TelegramSetWebhookResponse;
+            }
+          } catch {
+            // Keep provider and proxy failures distinguishable from a successful setup.
+            data = null;
+          }
+          if (!res.ok || data?.ok !== true) {
+            return {
+              ok: false,
+              statusCode: 502,
+              error: `Telegram setWebhook failed: ${data?.description ?? `HTTP ${res.status}`}`,
+            };
+          }
+          return { ok: true, webhookUrl, result: data };
+        } catch (err: any) {
+          return { ok: false, statusCode: 500, error: err.message };
+        }
+      },
+    };
+    setMountedChannels(channels);
+
+    const allowedPlatforms = getAppConfig().integrations.platforms;
+    const mountForPlatform = (
+      platform: string,
+      path: string,
+      handler: EventHandler,
+    ) => {
+      if (allowedPlatforms && !allowedPlatforms.includes(platform)) return;
+      h3.use(path, handler);
+    };
+
+    async function enqueueSystemNotice(
+      event: any,
+      incoming: IncomingMessage,
+      text: string,
+      opts?: { dedupeKey?: string; dedupeTtlMs?: number },
+    ): Promise<void> {
+      if (!text.trim()) return;
+      const taskId = `notice-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const dedupeTtlMs = Math.max(
+        1,
+        opts?.dedupeTtlMs ?? SYSTEM_NOTICE_DEDUPE_TTL_MS,
+      );
+      const noticeThreadId = `system-notice:${taskId}`;
+      const payload: IntegrationSystemNoticeTaskPayload = {
+        kind: "system-notice",
+        incoming,
+        text,
+        ...(opts?.dedupeKey ? { dedupeKey: opts.dedupeKey } : {}),
+        ...(opts?.dedupeTtlMs ? { dedupeTtlMs: opts.dedupeTtlMs } : {}),
+      };
+      try {
+        await insertPendingTask({
+          id: taskId,
+          platform: incoming.platform,
+          externalThreadId: noticeThreadId,
+          payload: JSON.stringify(payload),
+          ownerEmail: `integration@${incoming.platform}`,
+          externalEventKey: opts?.dedupeKey
+            ? systemNoticeEventKey(opts.dedupeKey, dedupeTtlMs)
+            : undefined,
+          dispatchScope: integrationDispatchScopeValue({
+            platform: incoming.platform,
+            externalThreadId: noticeThreadId,
+            platformContext: incoming.platformContext,
+          }),
+        });
+      } catch (err) {
+        if (isDuplicateEventError(err)) return;
+        throw err;
+      }
+
+      await dispatchPendingIntegrationTask({
+        taskId,
+        task: {
+          platform: incoming.platform,
+          externalThreadId: noticeThreadId,
+          platformContext: incoming.platformContext,
+        },
+        event,
+        baseUrl: getBaseUrl(event),
+      });
     }
 
     async function requireSessionContext(
@@ -568,36 +1046,59 @@ export function createIntegrationsPlugin(
       };
     }
 
+    function toCredentialContext(
+      ctx: { ownerEmail: string; orgId: string | null },
+      opts?: { isIntegrationCaller?: boolean },
+    ): IntegrationCredentialContext {
+      return {
+        userEmail: ctx.ownerEmail,
+        ...(ctx.orgId ? { orgId: ctx.orgId } : {}),
+        ...(opts?.isIntegrationCaller ? { isIntegrationCaller: true } : {}),
+      };
+    }
+
+    async function credentialContextForIntegrationConfig(
+      config: Awaited<ReturnType<typeof getIntegrationConfig>>,
+    ): Promise<IntegrationCredentialContext | null> {
+      const ownerEmail =
+        typeof config?.owner === "string" ? config.owner.trim() : "";
+      if (!ownerEmail) return null;
+      const orgId = await resolveOrgIdForEmail(ownerEmail).catch(() => null);
+      return {
+        userEmail: ownerEmail,
+        ...(orgId ? { orgId } : {}),
+        isIntegrationCaller: true,
+      };
+    }
+
+    async function withCredentialContext<T>(
+      context: IntegrationCredentialContext | null,
+      fn: () => Promise<T>,
+    ): Promise<T> {
+      if (!context) return fn();
+      return runWithRequestContext(context, fn);
+    }
+
     async function requireRemoteDevice(event: any) {
-      const token = extractBearerToken(
-        getRequestHeader(event, "authorization"),
+      // Some managed proxies omit Authorization before a serverless function
+      // sees the request. Keep the device secret in a dedicated TLS-only
+      // header as a transport fallback; the value is still hashed and looked
+      // up by authenticateRemoteDeviceToken, never persisted raw.
+      const candidates = [
+        getRequestHeader(event, "x-agent-native-device-token")?.trim() || null,
+        extractBearerToken(getRequestHeader(event, "authorization")),
+      ].filter(
+        (token, index, all): token is string =>
+          Boolean(token) && all.indexOf(token) === index,
       );
-      const device = await authenticateRemoteDeviceToken(token);
-      if (device) return device;
+      for (const token of candidates) {
+        const device = await authenticateRemoteDeviceToken(token);
+        if (device) return device;
+      }
       setResponseStatus(event, 401);
       return null;
     }
 
-    /**
-     * Gate destructive integration writes (enable/disable, setup,
-     * setIntegrationConfig…) behind an org-owner/admin check.
-     *
-     * `integration_configs` is keyed `(platform, config_key)` with no
-     * owner column in the PRIMARY KEY — so this row is effectively
-     * deployment-wide. Any signed-in user toggling /enable or /disable
-     * would otherwise affect every other user (a regular org member could
-     * disable Slack/email org-wide, write a malicious allowlist for
-     * inbound email, etc.). This check enforces that only owners and
-     * admins of the user's active org may mutate integration config.
-     *
-     * Solo / no-org sessions (i.e. ctx.orgId == null) are allowed — that's
-     * the local-dev / single-user case where there's no privilege gradient
-     * to enforce. The deployment is single-tenant by definition there.
-     *
-     * Returns an `{ ok: true }` on pass, or `{ ok: false, error }` with the
-     * status already set on the event. The error string lines up with the
-     * status code (401 → "unauthorized"; 403 → admin-required message).
-     */
     async function checkOrgAdmin(
       event: any,
     ): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -607,7 +1108,6 @@ export function createIntegrationsPlugin(
         return { ok: false, error: "unauthorized" };
       }
       const ctx = await getOrgContext(event).catch(() => null);
-      // Solo (no org membership) — single-tenant flow, allow.
       if (!ctx?.orgId) return { ok: true };
       if (ctx.role === "owner" || ctx.role === "admin") return { ok: true };
       setResponseStatus(event, 403);
@@ -618,7 +1118,6 @@ export function createIntegrationsPlugin(
       };
     }
 
-    // ─── Status endpoint (all integrations) ───────────────────────
     h3.use(
       `${P}/status`,
       defineEventHandler(async (event) => {
@@ -626,11 +1125,15 @@ export function createIntegrationsPlugin(
           setResponseStatus(event, 405);
           return { error: "Method not allowed" };
         }
-        if (!(await requireSession(event))) return { error: "unauthorized" };
         const baseUrl = getBaseUrl(event);
+        const ctx = await requireSessionContext(event);
+        if (!ctx) return { error: "unauthorized" };
+        const credentialContext = toCredentialContext(ctx);
         const statuses: IntegrationStatus[] = [];
         for (const adapter of adapters) {
-          const status = await adapter.getStatus(baseUrl);
+          const status = await withCredentialContext(credentialContext, () =>
+            adapter.getStatus(baseUrl),
+          );
           const config = await getIntegrationConfig(adapter.platform);
           status.enabled = !!config?.configData?.enabled;
           status.webhookUrl = `${baseUrl}${P}/${adapter.platform}/webhook`;
@@ -647,12 +1150,6 @@ export function createIntegrationsPlugin(
       }),
     );
 
-    // ─── Task queue status (observability) ───────────────────────
-    // GET /_agent-native/integrations/task-queue/status
-    // Returns counts + recent failures for the integration_pending_tasks
-    // queue. Requires a normal session — this exposes operational data, not
-    // platform secrets. If the queue table doesn't exist yet (no inbound
-    // webhook has been processed), returns zeroed stats rather than 500.
     h3.use(
       `${P}/task-queue/status`,
       defineEventHandler(async (event) => {
@@ -660,9 +1157,10 @@ export function createIntegrationsPlugin(
           setResponseStatus(event, 405);
           return { error: "Method not allowed" };
         }
-        if (!(await requireSession(event))) return { error: "unauthorized" };
+        const scope = await requireSessionContext(event);
+        if (!scope) return { error: "unauthorized" };
         try {
-          return await getTaskQueueStats();
+          return await getTaskQueueStats(scope);
         } catch (err: any) {
           setResponseStatus(event, 500);
           return { error: err?.message ?? String(err) };
@@ -670,11 +1168,6 @@ export function createIntegrationsPlugin(
       }),
     );
 
-    // ─── Remote relay endpoints ──────────────────────────────────
-    // These routes allow a signed-in browser session to enqueue work for a
-    // registered remote device, and the device to claim/complete that work
-    // using its one-time-issued bearer token. State lives entirely in SQL so
-    // long polling can safely degrade to short polling on serverless hosts.
     h3.use(
       `${P}/remote/register`,
       defineEventHandler(async (event) => {
@@ -692,11 +1185,17 @@ export function createIntegrationsPlugin(
           hostName?: unknown;
           hostname?: unknown;
           metadata?: unknown;
+          executionCapabilities?: unknown;
         };
         const label =
           typeof body.label === "string" && body.label.trim()
             ? body.label.trim().slice(0, 200)
             : "Remote device";
+        const metadata = readObject(body.metadata);
+        const hasExecutionCapabilities = Object.prototype.hasOwnProperty.call(
+          body,
+          "executionCapabilities",
+        );
         const { device, token } = await createRemoteDevice({
           ownerEmail: ctx.ownerEmail,
           orgId: ctx.orgId,
@@ -704,7 +1203,19 @@ export function createIntegrationsPlugin(
           platform: readString(body.platform),
           appVersion: readString(body.appVersion) ?? readString(body.version),
           hostName: readString(body.hostName) ?? readString(body.hostname),
-          metadata: readObject(body.metadata),
+          metadata:
+            metadata || hasExecutionCapabilities
+              ? {
+                  ...(metadata ?? {}),
+                  ...(hasExecutionCapabilities
+                    ? {
+                        executionCapabilities: readRemoteExecutionCapabilities(
+                          body.executionCapabilities,
+                        ),
+                      }
+                    : {}),
+                }
+              : null,
         });
         return { device: toPublicRemoteDevice(device), token };
       }),
@@ -998,6 +1509,115 @@ export function createIntegrationsPlugin(
     );
 
     h3.use(
+      `${P}/remote/computer/approvals`,
+      defineEventHandler(async (event) => {
+        const method = getMethod(event);
+        if (method !== "GET" && method !== "POST") {
+          setResponseStatus(event, 405);
+          return { error: "Method not allowed" };
+        }
+        const ctx = await requireSessionContext(event);
+        if (!ctx) return { error: "unauthorized" };
+        const parts = mountedPathParts(event, "remote/computer/approvals");
+        if (method === "GET") {
+          if (parts.length > 0) {
+            setResponseStatus(event, 404);
+            return { error: "not found" };
+          }
+          const query = getQuery(event);
+          const status = readComputerApprovalStatus(query.status);
+          return {
+            approvals: await listComputerApprovalsForOwner({
+              ownerEmail: ctx.ownerEmail,
+              orgId: ctx.orgId,
+              deviceId: readString(query.deviceId),
+              taskId: readString(query.taskId),
+              runId: readString(query.runId),
+              status,
+              limit: Number(query.limit ?? 100) || 100,
+            }),
+          };
+        }
+        const body = (await readBody(event)) as Record<string, unknown>;
+        if (parts[0] && parts[1] === "decision" && parts.length === 2) {
+          const decision =
+            body.decision === "approved" || body.decision === "denied"
+              ? body.decision
+              : null;
+          const actionHash = readString(body.actionHash);
+          if (!decision || !actionHash) {
+            setResponseStatus(event, 400);
+            return { error: "decision and actionHash required" };
+          }
+          const approval = await decideComputerApproval({
+            id: decodeURIComponent(parts[0]),
+            ownerEmail: ctx.ownerEmail,
+            orgId: ctx.orgId,
+            actionHash,
+            decision,
+            decidedBy: ctx.ownerEmail,
+            result: readObject(body.result),
+          });
+          if (!approval) {
+            setResponseStatus(event, 404);
+            return { error: "approval not found or no longer pending" };
+          }
+          return { approval };
+        }
+        if (parts.length > 0) {
+          setResponseStatus(event, 404);
+          return { error: "not found" };
+        }
+        const deviceId = readString(body.deviceId);
+        if (!deviceId || !body.envelope) {
+          setResponseStatus(event, 400);
+          return { error: "deviceId and envelope required" };
+        }
+        try {
+          const approval = await createComputerApprovalRequest({
+            ownerEmail: ctx.ownerEmail,
+            orgId: ctx.orgId,
+            deviceId,
+            envelope: body.envelope as ComputerCommandEnvelope,
+          });
+          return { approval };
+        } catch (error) {
+          return computerSupervisionRouteError(event, error);
+        }
+      }),
+    );
+
+    h3.use(
+      `${P}/remote/computer/commands`,
+      defineEventHandler(async (event) => {
+        if (getMethod(event) !== "POST") {
+          setResponseStatus(event, 405);
+          return { error: "Method not allowed" };
+        }
+        const ctx = await requireSessionContext(event);
+        if (!ctx) return { error: "unauthorized" };
+        const body = (await readBody(event)) as Record<string, unknown>;
+        const deviceId = readString(body.deviceId);
+        if (!deviceId || !body.envelope) {
+          setResponseStatus(event, 400);
+          return { error: "deviceId and envelope required" };
+        }
+        try {
+          const command = await enqueueComputerCommand({
+            deviceId,
+            ownerEmail: ctx.ownerEmail,
+            orgId: ctx.orgId,
+            envelope: body.envelope as ComputerCommandEnvelope,
+            platform: readString(body.platform),
+          });
+          return { command };
+        } catch (error) {
+          return computerSupervisionRouteError(event, error);
+        }
+      }),
+    );
+
+    h3.use(
       `${P}/remote/enqueue`,
       defineEventHandler(async (event) => {
         if (getMethod(event) !== "POST") {
@@ -1084,15 +1704,70 @@ export function createIntegrationsPlugin(
         const query = getQuery(event);
         const body =
           method === "POST"
-            ? ((await readBody(event)) as { waitMs?: unknown })
+            ? ((await readBody(event)) as {
+                waitMs?: unknown;
+                computerCapabilities?: unknown;
+                browserSession?: unknown;
+                executionCapabilities?: unknown;
+              })
             : {};
+        let pollingDevice = device;
+        if (
+          method === "POST" &&
+          (Object.prototype.hasOwnProperty.call(body, "computerCapabilities") ||
+            Object.prototype.hasOwnProperty.call(body, "browserSession") ||
+            Object.prototype.hasOwnProperty.call(body, "executionCapabilities"))
+        ) {
+          const updated = await updateRemoteDeviceDetails({
+            id: device.id,
+            metadata: {
+              ...(device.metadata ?? {}),
+              ...(Object.prototype.hasOwnProperty.call(
+                body,
+                "computerCapabilities",
+              )
+                ? {
+                    computerCapabilities: readComputerCapabilities(
+                      body.computerCapabilities,
+                    ),
+                  }
+                : {}),
+              ...(Object.prototype.hasOwnProperty.call(
+                body,
+                "executionCapabilities",
+              )
+                ? {
+                    executionCapabilities: readRemoteExecutionCapabilities(
+                      body.executionCapabilities,
+                    ),
+                  }
+                : {}),
+              ...(Object.prototype.hasOwnProperty.call(body, "browserSession")
+                ? { browserSession: readBrowserSession(body.browserSession) }
+                : {}),
+            },
+          });
+          if (updated) pollingDevice = updated;
+        }
         const requestedWait =
           Number(body.waitMs ?? query.waitMs ?? query.wait_ms ?? 25_000) || 0;
         const waitMs = Math.max(0, Math.min(25_000, requestedWait));
         const deadline = Date.now() + waitMs;
 
         while (true) {
-          const command = await claimNextRemoteCommand(device.id);
+          const operationClasses =
+            advertisedComputerOperationClasses(pollingDevice);
+          const computerCommand =
+            operationClasses.length > 0
+              ? await claimNextComputerCommand({
+                  deviceId: pollingDevice.id,
+                  ownerEmail: pollingDevice.ownerEmail,
+                  orgId: pollingDevice.orgId,
+                  operationClasses,
+                })
+              : null;
+          const command =
+            computerCommand ?? (await claimNextRemoteCommand(pollingDevice.id));
           if (command) return { command };
           const remaining = deadline - Date.now();
           if (remaining <= 0) return { command: null };
@@ -1211,11 +1886,76 @@ export function createIntegrationsPlugin(
       }),
     );
 
-    // ─── Process pending task (cross-platform task queue) ────────
-    // POST /_agent-native/integrations/process-task
-    // Internal endpoint invoked via fire-and-forget self-webhook from the
-    // public webhook handler. Auth: HMAC bearer signed with A2A_SECRET.
-    // Each invocation runs the agent loop in a fresh function execution.
+    h3.use(
+      `${P}/retry-stuck-tasks`,
+      defineEventHandler(async (event) => {
+        if (getMethod(event) !== "POST") {
+          setResponseStatus(event, 405);
+          return { error: "Method not allowed" };
+        }
+        const body = (await readBody(event)) as {
+          taskId?: string;
+          [AGENT_BACKGROUND_PROCESSOR_FIELD]?: string;
+        };
+        if (body?.taskId !== INTEGRATION_RETRY_SWEEP_TOKEN_SUBJECT) {
+          setResponseStatus(event, 400);
+          return { error: "invalid sweep subject" };
+        }
+        if (!process.env.A2A_SECRET) {
+          setResponseStatus(event, 503);
+          return { error: "durable integration recovery is not configured" };
+        }
+        const token = extractBearerToken(
+          getRequestHeader(event, "authorization"),
+        );
+        if (
+          !token ||
+          !verifyInternalToken(INTEGRATION_RETRY_SWEEP_TOKEN_SUBJECT, token)
+        ) {
+          setResponseStatus(event, 401);
+          return { error: "Invalid or expired internal token" };
+        }
+        // Scheduled recovery functions call this route with a rebuilt request
+        // that carries no Host header, so the request cannot say where this
+        // deployment answers and its host fell back to localhost. Resolve the
+        // deployment's own URL the way webhook ingress does.
+        const webhookBaseUrl = resolveSelfDispatchBaseUrl(event);
+        const [pendingTasks, campaigns, a2aContinuations] = await Promise.all([
+          retryStuckPendingTasks({
+            webhookBaseUrl,
+            limit: 20,
+          }).catch((error) => {
+            console.error(
+              "[integrations] Pending-task recovery failed:",
+              error,
+            );
+            return { error: "pending-task-recovery-failed" };
+          }),
+          recoverDueIntegrationCampaigns({
+            event,
+            webhookBaseUrl,
+            limit: 20,
+          }).catch((error) => {
+            console.error("[integrations] Campaign recovery failed:", error);
+            return { error: "campaign-recovery-failed" };
+          }),
+          recoverDueA2AContinuations({
+            webhookBaseUrl,
+            limit: 10,
+          }).catch((error) => {
+            console.error("[integrations] A2A recovery failed:", error);
+            return { error: "a2a-recovery-failed" };
+          }),
+        ]);
+        return {
+          ok: true,
+          pendingTasks,
+          campaigns,
+          a2aContinuations,
+        };
+      }),
+    );
+
     h3.use(
       `${P}/process-task`,
       defineEventHandler(async (event) => {
@@ -1224,7 +1964,11 @@ export function createIntegrationsPlugin(
           return { error: "Method not allowed" };
         }
 
-        const body = (await readBody(event)) as { taskId?: string };
+        const body = (await readBody(event)) as {
+          taskId?: string;
+          [AGENT_BACKGROUND_PROCESSOR_FIELD]?: string;
+          [INTEGRATION_CAMPAIGN_PROCESSOR_FIELD]?: boolean;
+        };
         const taskId = body?.taskId;
         if (!taskId) {
           setResponseStatus(event, 400);
@@ -1260,35 +2004,462 @@ export function createIntegrationsPlugin(
           }
         }
 
-        // Atomic claim: only one invocation gets to process this task
-        const task = await claimPendingTask(taskId);
+        const dispatchOutcome =
+          body[AGENT_BACKGROUND_PROCESSOR_FIELD] ===
+          AGENT_BACKGROUND_PROCESSOR_INTEGRATION
+            ? "background-acknowledged"
+            : "portable-unconfirmed";
+        const campaignContinuation =
+          body[INTEGRATION_CAMPAIGN_PROCESSOR_FIELD] === true;
+        const task = campaignContinuation
+          ? await getPendingTask(taskId)
+          : await claimPendingTask(taskId, { dispatchOutcome });
         if (!task) {
           setResponseStatus(event, 200);
           return { ok: true, skipped: "already-claimed-or-missing" };
         }
-
+        if (campaignContinuation && task.status !== "processing") {
+          setResponseStatus(event, 200);
+          return { ok: true, skipped: "campaign-task-not-processing" };
+        }
+        // Continuations read the task directly instead of claiming it, so the
+        // claim's age bound does not reach them.
+        if (
+          campaignContinuation &&
+          task.createdAt < Date.now() - MAX_RECOVERABLE_PENDING_TASK_AGE_MS
+        ) {
+          setResponseStatus(event, 200);
+          return { ok: true, skipped: "campaign-task-expired" };
+        }
+        let taskPayload:
+          | IntegrationSystemNoticeTaskPayload
+          | IntegrationResponseDeliveryTaskPayload
+          | AutomationWebhookTaskPayload
+          | { kind?: undefined };
         try {
+          taskPayload = JSON.parse(task.payload) as typeof taskPayload;
+        } catch {
+          await markTaskFailed(task.id, "Invalid integration task payload");
+          setResponseStatus(event, 400);
+          return { error: "Invalid integration task payload" };
+        }
+        const durableCampaignEnabled =
+          isIntegrationDurableDispatchEnabledForTask({
+            platform: task.platform,
+            externalThreadId: task.externalThreadId,
+            platformContext: task.dispatchScope
+              ? { channelId: task.dispatchScope }
+              : undefined,
+          });
+        const a2aOutcome = campaignContinuation
+          ? await getA2AContinuationTaskOutcome(task.id)
+          : null;
+        const confirmedDeliveryReceipt =
+          taskPayload.kind === "response-delivery" &&
+          taskPayload.deliveryReceipt?.status === "delivered";
+        const confirmedDeliveryProof =
+          confirmedDeliveryReceipt || a2aOutcome === "terminal-delivered";
+        if (
+          campaignContinuation &&
+          !durableCampaignEnabled &&
+          !confirmedDeliveryProof
+        ) {
+          if (
+            !isIntegrationDurableDispatchExplicitlyDisabledForTask({
+              platform: task.platform,
+              externalThreadId: task.externalThreadId,
+              platformContext: task.dispatchScope
+                ? { channelId: task.dispatchScope }
+                : undefined,
+            })
+          ) {
+            setResponseStatus(event, 202);
+            return { ok: true, paused: "durable-runtime-unavailable" };
+          }
+          await failDisabledIntegrationCampaignTask(task.id);
+          const nextTask = await getNextPendingTaskForThread(
+            task.platform,
+            task.externalThreadId,
+          );
+          if (nextTask) {
+            await dispatchPendingIntegrationTask({
+              taskId: nextTask.id,
+              task: {
+                platform: task.platform,
+                externalThreadId: task.externalThreadId,
+                platformContext: nextTask.dispatchScope
+                  ? { channelId: nextTask.dispatchScope }
+                  : undefined,
+              },
+              event,
+              baseUrl: getBaseUrl(event),
+            });
+          }
+          setResponseStatus(event, 200);
+          return { ok: true, failed: "campaign-disabled" };
+        }
+
+        let deliveryRetryTransitionStarted = false;
+        let deliveryRetryRecovery:
+          | { payload: string; errorMessage: string }
+          | undefined;
+        let confirmedDeliveryRetryPayload: string | undefined;
+        let campaignDeliveryLease:
+          | {
+              campaignId: string;
+              runId: string;
+              leaseToken: string;
+              campaignStatus: "completed" | "failed" | "waiting-a2a";
+            }
+          | undefined;
+        try {
+          if (task.platform === AUTOMATION_WEBHOOK_PLATFORM) {
+            if (
+              taskPayload.kind !== "automation-webhook" ||
+              campaignContinuation
+            ) {
+              await markTaskFailed(taskId, "Invalid automation webhook task");
+              setResponseStatus(event, 400);
+              return { error: "Invalid automation webhook task" };
+            }
+            const webhookResult = await runWithRequestContext(
+              {
+                userEmail: task.ownerEmail,
+                ...(task.orgId ? { orgId: task.orgId } : {}),
+                isIntegrationCaller: true,
+              },
+              () =>
+                dispatchAutomationWebhookTask(
+                  taskPayload as AutomationWebhookTaskPayload,
+                ),
+            );
+            if (webhookResult === "retry") {
+              await markTaskRetryable(
+                taskId,
+                "Automation is already running.",
+                { resetAttempts: true },
+              );
+              setResponseStatus(event, 202);
+              return { ok: true, taskId, retrying: "automation-active" };
+            }
+            await markTaskCompleted(taskId);
+            const nextTask = await getNextPendingTaskForThread(
+              task.platform,
+              task.externalThreadId,
+            );
+            if (nextTask) {
+              await dispatchPendingIntegrationTask({
+                taskId: nextTask.id,
+                task: {
+                  platform: task.platform,
+                  externalThreadId: task.externalThreadId,
+                },
+                event,
+                baseUrl: getBaseUrl(event),
+              });
+            }
+            setResponseStatus(event, 200);
+            return { ok: true, taskId };
+          }
           const adapter = adapterMap.get(task.platform);
           if (!adapter) {
             await markTaskFailed(taskId, `Unknown platform: ${task.platform}`);
             setResponseStatus(event, 404);
             return { error: "Unknown platform" };
           }
-          const resources = await loadResourcesForPrompt(
-            task.ownerEmail,
-            true,
-            options?.appId,
+          const processingResult = await runWithRequestContext(
+            {
+              userEmail: task.ownerEmail,
+              ...(task.orgId ? { orgId: task.orgId } : {}),
+              isIntegrationCaller: true,
+            },
+            async () => {
+              if (
+                !campaignContinuation &&
+                taskPayload.kind === "system-notice"
+              ) {
+                if (!adapter.sendSystemNotice) {
+                  throw new Error(
+                    `Platform ${task.platform} cannot deliver system notices`,
+                  );
+                }
+                const config = await getIntegrationConfig(task.platform);
+                const credentialContext =
+                  await credentialContextForIntegrationConfig(config);
+                await withCredentialContext(credentialContext, () =>
+                  adapter.sendSystemNotice!(
+                    taskPayload.incoming,
+                    taskPayload.text,
+                    {
+                      ...(taskPayload.dedupeKey
+                        ? { dedupeKey: taskPayload.dedupeKey }
+                        : {}),
+                      ...(taskPayload.dedupeTtlMs
+                        ? { dedupeTtlMs: taskPayload.dedupeTtlMs }
+                        : {}),
+                    },
+                  ),
+                );
+                return;
+              }
+              if (taskPayload.kind === "response-delivery") {
+                if (
+                  campaignContinuation &&
+                  taskPayload.awaitingA2ACompletion &&
+                  a2aOutcome === "terminal-delivered"
+                ) {
+                  const completed =
+                    await completeIntegrationCampaignTaskAfterA2A(task.id);
+                  return completed
+                    ? ("completed" as const)
+                    : ("campaign-active" as const);
+                }
+                let receipt: void | PlatformDeliveryReceipt =
+                  taskPayload.deliveryReceipt;
+                let deliveryLease:
+                  | { campaignId: string; runId: string; leaseToken: string }
+                  | undefined;
+                if (campaignContinuation && !receipt) {
+                  const runId = `integration-delivery-${crypto.randomUUID()}`;
+                  const leaseToken = crypto.randomUUID();
+                  const deliveryClaim =
+                    await claimIntegrationCampaignDeliveryForTask(task.id, {
+                      runId,
+                      leaseToken,
+                      leaseDurationMs: INTEGRATION_DELIVERY_LEASE_MS,
+                    });
+                  if (!deliveryClaim) return "campaign-active" as const;
+                  deliveryLease = {
+                    campaignId: deliveryClaim.id,
+                    runId,
+                    leaseToken,
+                  };
+                  campaignDeliveryLease = {
+                    ...deliveryLease,
+                    campaignStatus:
+                      taskPayload.campaignTerminalStatus ??
+                      (taskPayload.awaitingA2ACompletion
+                        ? "waiting-a2a"
+                        : "completed"),
+                  };
+                }
+                if (!receipt) {
+                  receipt = await adapter.sendResponse(
+                    taskPayload.message,
+                    taskPayload.incoming,
+                    {
+                      ...(taskPayload.placeholderRef
+                        ? { placeholderRef: taskPayload.placeholderRef }
+                        : {}),
+                      ...(taskPayload.strictTargetRef
+                        ? { strictTargetRef: true }
+                        : {}),
+                      idempotencyKey: integrationResponseIdempotencyKey(
+                        task.id,
+                      ),
+                      reconcileAfter: task.createdAt,
+                    },
+                  );
+                }
+                if (receipt?.status !== "delivered") {
+                  throw new Error(
+                    `${task.platform} response completed without delivery proof`,
+                  );
+                }
+                const deliveredPayload = taskPayload.deliveryReceipt
+                  ? taskPayload
+                  : {
+                      ...taskPayload,
+                      deliveryReceipt: receipt,
+                      deliveredAt: new Date().toISOString(),
+                    };
+                confirmedDeliveryRetryPayload =
+                  JSON.stringify(deliveredPayload);
+                if (!taskPayload.deliveryReceipt) {
+                  deliveryRetryRecovery = {
+                    payload: confirmedDeliveryRetryPayload,
+                    errorMessage:
+                      "Provider delivery was confirmed but its receipt checkpoint failed",
+                  };
+                  await stageTaskDeliveryPayload(
+                    task.id,
+                    deliveryRetryRecovery.payload,
+                  );
+                  deliveryRetryRecovery = undefined;
+                }
+                await recordIntegrationResponseDelivery(
+                  deliveredPayload,
+                  receipt,
+                );
+                const campaignTerminalStatus =
+                  taskPayload.campaignTerminalStatus;
+                if (campaignTerminalStatus) {
+                  const errorMessage =
+                    "Integration campaign exhausted its continuation limit";
+                  const terminalized = deliveryLease
+                    ? campaignTerminalStatus === "failed"
+                      ? await failIntegrationCampaign(
+                          deliveryLease.campaignId,
+                          {
+                            runId: deliveryLease.runId,
+                            leaseToken: deliveryLease.leaseToken,
+                            errorMessage,
+                          },
+                        )
+                      : await completeIntegrationCampaignTask(
+                          deliveryLease.campaignId,
+                          {
+                            integrationTaskId: task.id,
+                            runId: deliveryLease.runId,
+                            leaseToken: deliveryLease.leaseToken,
+                          },
+                        )
+                    : await terminalizeIntegrationCampaignForTask(task.id, {
+                        status: campaignTerminalStatus,
+                        ...(campaignTerminalStatus === "failed"
+                          ? { errorMessage }
+                          : {}),
+                      });
+                  if (deliveryLease && !terminalized) {
+                    return "campaign-active" as const;
+                  }
+                  return campaignTerminalStatus === "failed"
+                    ? ("campaign-failed" as const)
+                    : ("completed" as const);
+                }
+                if (taskPayload.awaitingA2ACompletion) {
+                  if (deliveryLease) {
+                    const waiting = await waitForA2AIntegrationCampaign(
+                      deliveryLease.campaignId,
+                      {
+                        runId: deliveryLease.runId,
+                        leaseToken: deliveryLease.leaseToken,
+                        nextRunAt: Date.now() + 15_000,
+                      },
+                    );
+                    if (!waiting) return "campaign-active" as const;
+                  }
+                  if (
+                    a2aOutcome === "terminal-without-delivery" &&
+                    (await reconcileTerminalA2AParentIfDisabled(task.id))
+                  ) {
+                    return "campaign-failed" as const;
+                  }
+                  if (a2aOutcome !== "active") {
+                    console.warn(
+                      `[integrations] Waiting campaign ${task.id} has A2A outcome ${a2aOutcome} without terminal delivery proof`,
+                    );
+                  }
+                  return "campaign-active" as const;
+                }
+                if (campaignContinuation) {
+                  return "campaign-active" as const;
+                }
+                return;
+              }
+              const resources = await loadResourcesForPrompt(
+                task.ownerEmail,
+                true,
+                options?.appId,
+                task.orgId,
+              );
+              const result = await processIntegrationTask(
+                task,
+                {
+                  adapter,
+                  systemPrompt: baseSystemPrompt + resources,
+                  actions,
+                  initialToolNames,
+                  model,
+                  apiKey: getApiKey(),
+                  engine: options?.engine,
+                  ownerEmail: task.ownerEmail,
+                  appId: options?.appId,
+                },
+                {
+                  enabled: durableCampaignEnabled,
+                  continuationInvocation: campaignContinuation,
+                },
+              );
+              if (result?.status === "delivery-pending") {
+                deliveryRetryTransitionStarted = true;
+                const checkpoint = await checkpointIntegrationDeliveryRetry(
+                  task,
+                  JSON.stringify(result.payload),
+                  result.errorMessage,
+                  event,
+                  result.campaignLease,
+                );
+                if (checkpoint === "superseded") {
+                  return "campaign-active" as const;
+                }
+                return "delivery-retry" as const;
+              }
+              if (
+                result?.status === "campaign-pending" ||
+                result?.status === "campaign-active"
+              ) {
+                return "campaign-active" as const;
+              }
+              if (result?.status === "campaign-failed") {
+                return "campaign-failed" as const;
+              }
+              return "completed" as const;
+            },
           );
-          await processIntegrationTask(task, {
-            adapter,
-            systemPrompt: baseSystemPrompt + resources,
-            actions,
-            model,
-            apiKey: getApiKey(),
-            engine: options?.engine,
-            ownerEmail: task.ownerEmail,
-          });
+          if (processingResult === "delivery-retry") {
+            setResponseStatus(event, 202);
+            return { ok: true, taskId, retrying: "response-delivery" };
+          }
+          if (processingResult === "campaign-active") {
+            setResponseStatus(event, 202);
+            return { ok: true, taskId, continuing: true };
+          }
+          if (processingResult === "campaign-failed") {
+            await markTaskFailed(
+              taskId,
+              "Integration campaign exhausted its continuation limit",
+            );
+            const nextTask = await getNextPendingTaskForThread(
+              task.platform,
+              task.externalThreadId,
+            );
+            if (nextTask) {
+              await dispatchPendingIntegrationTask({
+                taskId: nextTask.id,
+                task: {
+                  platform: task.platform,
+                  externalThreadId: task.externalThreadId,
+                  platformContext: nextTask.dispatchScope
+                    ? { channelId: nextTask.dispatchScope }
+                    : undefined,
+                },
+                event,
+                baseUrl: getBaseUrl(event),
+              });
+            }
+            setResponseStatus(event, 200);
+            return { ok: true, taskId, failed: "campaign-exhausted" };
+          }
           await markTaskCompleted(taskId);
+          const nextTask = await getNextPendingTaskForThread(
+            task.platform,
+            task.externalThreadId,
+          );
+          if (nextTask) {
+            await dispatchPendingIntegrationTask({
+              taskId: nextTask.id,
+              task: {
+                platform: task.platform,
+                externalThreadId: task.externalThreadId,
+                platformContext: nextTask.dispatchScope
+                  ? { channelId: nextTask.dispatchScope }
+                  : undefined,
+              },
+              event,
+              baseUrl: getBaseUrl(event),
+            });
+          }
           await processDueA2AContinuations({
             adapters: adapterMap,
             limit: 2,
@@ -1300,12 +2471,95 @@ export function createIntegrationsPlugin(
           });
           return { ok: true, taskId };
         } catch (err: any) {
-          await markTaskFailed(
-            taskId,
-            err?.message
-              ? String(err.message).slice(0, 1000)
-              : "processor failed",
-          );
+          const errorMessage = err?.message
+            ? String(err.message).slice(0, 1000)
+            : "processor failed";
+          if (deliveryRetryRecovery) {
+            try {
+              const checkpoint = await checkpointIntegrationDeliveryRetry(
+                task,
+                deliveryRetryRecovery.payload,
+                `${deliveryRetryRecovery.errorMessage}: ${errorMessage}`,
+                event,
+                campaignDeliveryLease,
+              );
+              if (checkpoint === "superseded") {
+                setResponseStatus(event, 202);
+                return { ok: true, taskId, continuing: true };
+              }
+              setResponseStatus(event, 202);
+              return { ok: true, taskId, retrying: "response-delivery" };
+            } catch (transitionError) {
+              const transitionMessage =
+                transitionError instanceof Error
+                  ? transitionError.message
+                  : String(transitionError);
+              await containFailedDeliveryTransition(
+                task,
+                `Could not safely checkpoint the delivery receipt: ${transitionMessage}`,
+                event,
+              ).catch((failureTransitionError) => {
+                console.error(
+                  "[integrations] Failed to contain delivery receipt transition failure:",
+                  failureTransitionError,
+                );
+              });
+            }
+          } else if (confirmedDeliveryRetryPayload) {
+            try {
+              const checkpoint = await checkpointIntegrationDeliveryRetry(
+                task,
+                confirmedDeliveryRetryPayload,
+                `Provider delivery was confirmed but history persistence failed: ${errorMessage}`,
+                event,
+                campaignDeliveryLease,
+              );
+              if (checkpoint === "superseded") {
+                setResponseStatus(event, 202);
+                return { ok: true, taskId, continuing: true };
+              }
+              console.error("[integrations] process-task failure:", err);
+              setResponseStatus(event, 202);
+              return { ok: true, taskId, retrying: "response-delivery" };
+            } catch (transitionError) {
+              const transitionMessage =
+                transitionError instanceof Error
+                  ? transitionError.message
+                  : String(transitionError);
+              console.error(
+                "[integrations] Failed to requeue confirmed delivery history:",
+                transitionError,
+              );
+              await containFailedDeliveryTransition(
+                task,
+                `Could not safely checkpoint confirmed delivery history: ${transitionMessage}`,
+                event,
+              ).catch((failureTransitionError) => {
+                console.error(
+                  "[integrations] Failed to contain confirmed delivery history transition failure:",
+                  failureTransitionError,
+                );
+              });
+              console.error("[integrations] process-task failure:", err);
+              setResponseStatus(event, 500);
+              return { error: "Internal task failed" };
+            }
+          } else if (deliveryRetryTransitionStarted) {
+            await containFailedDeliveryTransition(
+              task,
+              `Could not safely checkpoint the delivery retry: ${errorMessage}`,
+              event,
+            ).catch((transitionError) => {
+              console.error(
+                "[integrations] Failed to contain delivery retry transition failure:",
+                transitionError,
+              );
+            });
+          } else if (task.attempts >= MAX_PENDING_TASK_ATTEMPTS) {
+            await markTaskFailed(taskId, errorMessage);
+          } else {
+            await markTaskRetryable(taskId, errorMessage);
+          }
           // Log the detail server-side; never return the raw error message
           // to the caller. Raw messages have leaked DB error codes, schema
           // names, and stack hints in the past (L3 in the webhook security
@@ -1317,10 +2571,6 @@ export function createIntegrationsPlugin(
       }),
     );
 
-    // ─── Process deferred A2A continuation ──────────────────────────
-    // POST /_agent-native/integrations/process-a2a-continuation
-    // Internal endpoint invoked when call-agent timed out inside an
-    // integration processor but the remote A2A task kept running.
     h3.use(
       `${P}/process-a2a-continuation`,
       defineEventHandler(async (event) => {
@@ -1359,15 +2609,18 @@ export function createIntegrationsPlugin(
             adapters: adapterMap,
           });
         } catch (err: any) {
-          // Mark the continuation failed so it isn't left dangling, and surface
-          // a 500 to the caller instead of leaking an unhandled rejection.
-          await failA2AContinuation(
-            continuationId,
-            err?.message?.slice(0, 500) || "continuation processing failed",
-          ).catch(() => {});
+          const reason =
+            err?.message?.slice(0, 500) || "continuation processing failed";
+          await recoverA2AContinuationAfterProcessorFailure(continuationId, {
+            adapters: adapterMap,
+            reason,
+          }).catch(() => {
+            console.error(
+              `[integrations] A2A continuation ${continuationId} recovery scheduling failed`,
+            );
+          });
           console.error(
-            "[integrations] process-a2a-continuation failure:",
-            err,
+            `[integrations] process-a2a-continuation failure for ${continuationId}; durable recovery requested`,
           );
           setResponseStatus(event, 500);
           return { error: "Failed to process A2A continuation" };
@@ -1376,29 +2629,562 @@ export function createIntegrationsPlugin(
       }),
     );
 
-    // ─── Per-platform catch-all ───────────────────────────────────
-    // Handles: webhook, status, enable, disable, setup for each platform
+    mountForPlatform(
+      "slack",
+      `${P}/slack/interactions`,
+      defineEventHandler(async (event) => {
+        if (getMethod(event) !== "POST") {
+          setResponseStatus(event, 405);
+          return { error: "Method not allowed" };
+        }
+        const adapter = adapterMap.get("slack");
+        if (!adapter) {
+          setResponseStatus(event, 404);
+          return "ok";
+        }
+        await adapter.handleVerification(event);
+        if (!(await adapter.verifyWebhook(event))) {
+          setResponseStatus(event, 401);
+          return { error: "Invalid webhook signature" };
+        }
+        try {
+          const raw = stringifyValue(event.context?.__rawBody ?? "");
+          const encoded = new URLSearchParams(raw).get("payload");
+          const payload = encoded ? JSON.parse(encoded) : null;
+          const action = payload?.actions?.[0];
+          const actionKind =
+            action?.action_id === "agent_native_approve"
+              ? "approve"
+              : action?.action_id === "agent_native_deny"
+                ? "deny"
+                : action?.action_id === "agent_native_cancel"
+                  ? "cancel"
+                  : null;
+          if (!actionKind || typeof action?.value !== "string") return "ok";
+          const requesterId = payload?.user?.id;
+          const teamId = payload?.team?.id ?? payload?.user?.team_id;
+          const channelId =
+            payload?.channel?.id ?? payload?.container?.channel_id;
+          const messageTs = payload?.container?.message_ts;
+          if (!requesterId || !teamId || !channelId || !messageTs) {
+            return "ok";
+          }
+          const control = await claimIntegrationControl({
+            id: action.value,
+            action: actionKind,
+            requesterId,
+            teamId,
+            apiAppId:
+              typeof payload?.api_app_id === "string" ? payload.api_app_id : "",
+            channelId,
+            messageTs,
+          });
+          if (!control) return "ok";
+          if (actionKind === "cancel") {
+            if (control.runId) abortRun(control.runId, "slack_cancel");
+            return "ok";
+          }
+          if (actionKind === "deny") return "ok";
+          if (!control.approvalKey) return "ok";
+
+          const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const incoming = {
+            ...control.incoming,
+            text: "The requester approved the pending action. Continue the task.",
+            approvedToolCalls: [control.approvalKey],
+            timestamp: Date.now(),
+            platformContext: {
+              ...control.incoming.platformContext,
+              eventId: `control:${control.id}`,
+            },
+          };
+          await insertPendingTask({
+            id: taskId,
+            platform: incoming.platform,
+            externalThreadId: incoming.externalThreadId,
+            payload: JSON.stringify({ incoming }),
+            ownerEmail: control.ownerEmail,
+            orgId: control.orgId,
+            externalEventKey: `control:${control.id}`,
+            dispatchScope: integrationDispatchScopeValue({
+              platform: incoming.platform,
+              externalThreadId: incoming.externalThreadId,
+              platformContext: incoming.platformContext,
+            }),
+          });
+          await dispatchPendingIntegrationTask({
+            taskId,
+            task: {
+              platform: incoming.platform,
+              externalThreadId: incoming.externalThreadId,
+              platformContext: incoming.platformContext,
+            },
+            event,
+            baseUrl: getBaseUrl(event),
+          });
+        } catch (err) {
+          console.error("[slack] Interaction handling failed:", err);
+        }
+        return "ok";
+      }),
+    );
+
+    h3.use(
+      `${P}/installations`,
+      defineEventHandler(async (event) => {
+        const method = getMethod(event);
+        if (method !== "GET" && method !== "POST") {
+          setResponseStatus(event, 405);
+          return { error: "Method not allowed" };
+        }
+        const session = await getSession(event).catch(() => null);
+        if (!session?.email) {
+          setResponseStatus(event, 401);
+          return { error: "unauthorized" };
+        }
+        const org = await getOrgContext(event).catch(() => null);
+        const actor = {
+          userEmail: session.email,
+          orgId: org?.orgId ?? session.orgId ?? null,
+          isOrgAdmin: org?.role === "owner" || org?.role === "admin",
+        };
+        if (method === "GET") {
+          const query = getQuery(event);
+          return {
+            installations: await listIntegrationInstallations(
+              actor,
+              typeof query.platform === "string" ? query.platform : undefined,
+            ),
+          };
+        }
+        const body = (await readBody(event)) as {
+          id?: unknown;
+          action?: unknown;
+        };
+        const id = typeof body.id === "string" ? body.id : "";
+        if (!id) {
+          setResponseStatus(event, 400);
+          return { error: "installation id required" };
+        }
+        if (body.action === "disconnect") {
+          return {
+            installation: await disconnectIntegrationInstallation(id, actor),
+          };
+        }
+        if (body.action === "test") {
+          const installation = (
+            await listIntegrationInstallations(actor, "slack")
+          ).find((item) => item.id === id);
+          if (!installation) {
+            setResponseStatus(event, 404);
+            return { error: "installation not found" };
+          }
+          const bundle = await resolveIntegrationTokenBundle(
+            installation.platform,
+            installation.installationKey,
+          );
+          if (!bundle) {
+            const updated = await updateIntegrationInstallation(id, actor, {
+              health: "revoked",
+              status: "revoked",
+              lastError: "token_unavailable",
+              healthCheckedAt: Date.now(),
+            });
+            return { installation: updated };
+          }
+          const health = await testSlackAuth(bundle.accessToken);
+          const updated = await updateIntegrationInstallation(id, actor, {
+            health: health.health,
+            status: health.health === "revoked" ? "revoked" : "connected",
+            lastError: health.error,
+            healthCheckedAt: health.checkedAt,
+            ...(health.ok ? { lastHealthyAt: health.checkedAt } : {}),
+          });
+          return { installation: updated };
+        }
+        setResponseStatus(event, 400);
+        return { error: "unsupported installation action" };
+      }),
+    );
+
+    h3.use(
+      `${P}/scopes`,
+      defineEventHandler(async (event) => {
+        const method = getMethod(event);
+        if (method !== "GET" && method !== "POST") {
+          setResponseStatus(event, 405);
+          return { error: "Method not allowed" };
+        }
+        const ctx = await requireSessionContext(event);
+        if (!ctx) return { error: "unauthorized" };
+        const access = { ownerEmail: ctx.ownerEmail, orgId: ctx.orgId };
+        if (method === "GET") {
+          const query = getQuery(event);
+          return {
+            scopes: await listIntegrationScopes(access, {
+              platform:
+                typeof query.platform === "string" ? query.platform : undefined,
+              tenantId:
+                typeof query.tenantId === "string" ? query.tenantId : undefined,
+            }),
+          };
+        }
+        const admin = await checkOrgAdmin(event);
+        if (!admin.ok) return { error: admin.error };
+        try {
+          const body = (await readBody(event)) as Parameters<
+            typeof saveIntegrationScope
+          >[0];
+          return { scope: await saveIntegrationScope(body, access) };
+        } catch (err) {
+          setResponseStatus(event, 400);
+          return {
+            error: err instanceof Error ? err.message : "invalid scope",
+          };
+        }
+      }),
+    );
+
+    h3.use(
+      `${P}/budgets`,
+      defineEventHandler(async (event) => {
+        const method = getMethod(event);
+        if (method !== "GET" && method !== "POST") {
+          setResponseStatus(event, 405);
+          return { error: "Method not allowed" };
+        }
+        const ctx = await requireSessionContext(event);
+        if (!ctx) return { error: "unauthorized" };
+        const access = { ownerEmail: ctx.ownerEmail, orgId: ctx.orgId };
+        if (method === "GET") {
+          return { budgets: await listIntegrationUsageBudgets(access) };
+        }
+        const admin = await checkOrgAdmin(event);
+        if (!admin.ok) return { error: admin.error };
+        try {
+          const body = (await readBody(event)) as Parameters<
+            typeof saveIntegrationUsageBudget
+          >[0];
+          return {
+            budget: await saveIntegrationUsageBudget(body, access),
+          };
+        } catch (err) {
+          setResponseStatus(event, 400);
+          return {
+            error: err instanceof Error ? err.message : "invalid budget",
+          };
+        }
+      }),
+    );
+
+    h3.use(
+      `${P}/memory`,
+      defineEventHandler(async (event) => {
+        const method = getMethod(event);
+        if (method !== "GET" && method !== "POST") {
+          setResponseStatus(event, 405);
+          return { error: "Method not allowed" };
+        }
+        const ctx = await requireSessionContext(event);
+        if (!ctx) return { error: "unauthorized" };
+        const access = { ownerEmail: ctx.ownerEmail, orgId: ctx.orgId };
+        const query = getQuery(event);
+        const body =
+          method === "POST"
+            ? ((await readBody(event)) as Record<string, unknown>)
+            : null;
+        const scopeId =
+          typeof query.scopeId === "string"
+            ? query.scopeId
+            : typeof body?.scopeId === "string"
+              ? body.scopeId
+              : "";
+        const scope = (await listIntegrationScopes(access)).find(
+          (item) => item.id === scopeId,
+        );
+        if (!scope) {
+          setResponseStatus(event, 404);
+          return { error: "integration scope not found" };
+        }
+        if (method === "GET") {
+          return { memories: await listIntegrationMemory(scope.id) };
+        }
+        const admin = await checkOrgAdmin(event);
+        if (!admin.ok) return { error: admin.error };
+        if (body?.action === "remember") {
+          return {
+            memory: await rememberForIntegrationScope(
+              {
+                name: stringifyValue(body.name ?? ""),
+                description: stringifyValue(body.description ?? ""),
+                content: stringifyValue(body.content ?? ""),
+              },
+              scope.id,
+            ),
+          };
+        }
+        if (body?.action === "forget") {
+          return {
+            memory: await forgetIntegrationMemory(
+              { name: stringifyValue(body.name ?? "") },
+              scope.id,
+            ),
+          };
+        }
+        setResponseStatus(event, 400);
+        return { error: "unsupported memory action" };
+      }),
+    );
+
+    mountForPlatform(
+      "slack",
+      `${P}/slack/manifest`,
+      defineEventHandler(async (event) => {
+        if (getMethod(event) !== "GET") {
+          setResponseStatus(event, 405);
+          return { error: "Method not allowed" };
+        }
+        const oauthRedirectUrl = resolveOAuthRedirectUri(
+          event,
+          `${P}/slack/oauth/callback`,
+        );
+        const eventsRequestUrl = resolveOAuthRedirectUri(
+          event,
+          `${P}/slack/webhook`,
+        );
+        const interactivityRequestUrl = resolveOAuthRedirectUri(
+          event,
+          `${P}/slack/interactions`,
+        );
+        if (
+          !oauthRedirectUrl ||
+          !eventsRequestUrl ||
+          !interactivityRequestUrl
+        ) {
+          setResponseStatus(event, 400);
+          return { error: "Slack manifest URLs are not allowed." };
+        }
+        setResponseHeader(
+          event,
+          "content-disposition",
+          'attachment; filename="agent-native-slack-manifest.json"',
+        );
+        return buildSlackAgentManifest({
+          oauthRedirectUrl,
+          eventsRequestUrl,
+          interactivityRequestUrl,
+        });
+      }),
+    );
+
+    mountForPlatform(
+      "slack",
+      `${P}/slack/oauth/install`,
+      defineEventHandler(async (event) => {
+        if (getMethod(event) !== "GET") {
+          setResponseStatus(event, 405);
+          return { error: "Method not allowed" };
+        }
+        const session = await getSession(event).catch(() => null);
+        if (!session?.email) {
+          setResponseStatus(event, 401);
+          return { error: "Sign in before connecting Slack." };
+        }
+        const org = await getOrgContext(event).catch(() => null);
+        try {
+          assertSlackInstallAccess({
+            email: session.email,
+            orgId: org?.orgId ?? session.orgId ?? null,
+            orgRole: org?.role ?? null,
+          });
+        } catch (err) {
+          setResponseStatus(event, 403);
+          return {
+            error: err instanceof Error ? err.message : "Slack access denied",
+          };
+        }
+        return await runWithRequestContext(
+          {
+            userEmail: session.email,
+            orgId: org?.orgId ?? session.orgId ?? undefined,
+          },
+          async () => {
+            const clientId = await resolveSecret("SLACK_CLIENT_ID");
+            const clientSecret = await resolveSecret("SLACK_CLIENT_SECRET");
+            const signingSecret = await resolveSecret("SLACK_SIGNING_SECRET");
+            if (!clientId || !clientSecret || !signingSecret) {
+              setResponseStatus(event, 503);
+              return {
+                error:
+                  "Slack OAuth is not configured. Add the Slack client id, client secret, and signing secret first.",
+              };
+            }
+            const redirectUri = resolveOAuthRedirectUri(
+              event,
+              `${P}/slack/oauth/callback`,
+            );
+            if (!redirectUri) {
+              setResponseStatus(event, 400);
+              return { error: "Slack OAuth redirect URL is not allowed." };
+            }
+            const query = getQuery(event);
+            const state = encodeOAuthState({
+              redirectUri,
+              owner: session.email,
+              orgId: org?.orgId ?? session.orgId ?? undefined,
+              app: "agent-native:slack",
+              addAccount: true,
+              returnUrl:
+                typeof query.return === "string" ? query.return : "/messaging",
+            });
+            return sendRedirect(
+              event,
+              buildSlackAuthorizeUrl({ clientId, redirectUri, state }),
+              302,
+            );
+          },
+        );
+      }),
+    );
+
+    mountForPlatform(
+      "slack",
+      `${P}/slack/oauth/callback`,
+      defineEventHandler(async (event) => {
+        if (getMethod(event) !== "GET") {
+          setResponseStatus(event, 405);
+          return { error: "Method not allowed" };
+        }
+        const query = getQuery(event);
+        if (typeof query.error === "string") {
+          return oauthErrorPage("Slack authorization was canceled or denied.");
+        }
+        const fallbackRedirect = resolveOAuthRedirectUri(
+          event,
+          `${P}/slack/oauth/callback`,
+        );
+        if (!fallbackRedirect) {
+          return oauthErrorPage("Slack OAuth redirect URL is not allowed.");
+        }
+        const state = decodeOAuthState(
+          typeof query.state === "string" ? query.state : undefined,
+          fallbackRedirect,
+        );
+        if (!state.ok) {
+          logOAuthStateDecodeFailure(event, state.reason, "slack");
+          return oauthErrorPage(
+            "Your Slack install session expired or changed. Sign in and start again.",
+          );
+        }
+        const session = await getSession(event).catch(() => null);
+        const org = await getOrgContext(event).catch(() => null);
+        if (
+          state.app !== "agent-native:slack" ||
+          !session?.email ||
+          !state.owner ||
+          session.email.toLowerCase() !== state.owner.toLowerCase() ||
+          (state.orgId ?? null) !== (org?.orgId ?? session.orgId ?? null)
+        ) {
+          return oauthErrorPage(
+            "Your Slack install session expired or changed. Sign in and start again.",
+          );
+        }
+        const code = typeof query.code === "string" ? query.code : null;
+        if (!code) return oauthErrorPage("Slack did not return an OAuth code.");
+        try {
+          const access = assertSlackInstallAccess({
+            email: session.email,
+            orgId: org?.orgId ?? session.orgId ?? null,
+            orgRole: org?.role ?? null,
+          });
+          return await runWithRequestContext(
+            {
+              userEmail: access.ownerEmail,
+              orgId: access.orgId ?? undefined,
+            },
+            async () => {
+              const clientId = await resolveSecret("SLACK_CLIENT_ID");
+              const clientSecret = await resolveSecret("SLACK_CLIENT_SECRET");
+              if (!clientId || !clientSecret) {
+                return oauthErrorPage("Slack OAuth is not configured.");
+              }
+              const oauth = await exchangeSlackOAuthCode({
+                code,
+                clientId,
+                clientSecret,
+                redirectUri: state.redirectUri,
+              });
+              const health = await testSlackAuth(oauth.access_token || "");
+              if (!health.ok) {
+                return oauthErrorPage(
+                  "Slack connected, but the bot token could not be verified. Please retry.",
+                );
+              }
+              if (
+                oauth.team?.id &&
+                health.teamId &&
+                oauth.team.id !== health.teamId
+              ) {
+                return oauthErrorPage(
+                  "Slack returned inconsistent workspace details. Please retry.",
+                );
+              }
+              const input = slackOAuthResponseToInstallation(oauth, access);
+              const installation = await upsertIntegrationInstallation({
+                ...input,
+                health: health.health,
+                healthCheckedAt: health.checkedAt,
+                lastHealthyAt: health.checkedAt,
+              });
+              await saveIntegrationConfig(
+                "slack",
+                { enabled: true, managedOAuth: true },
+                "default",
+                access.ownerEmail,
+              );
+              return oauthCallbackResponse(
+                event,
+                installation.teamName || installation.enterpriseName || "Slack",
+                {
+                  addAccount: true,
+                  appName: "Agent-Native",
+                  returnUrl: state.returnUrl || "/messaging",
+                },
+              );
+            },
+          );
+        } catch (err) {
+          console.error("[slack] OAuth callback failed:", err);
+          return oauthErrorPage("Slack connection failed. Please try again.");
+        }
+      }),
+    );
+
     h3.use(
       `${P}`,
       defineEventHandler(async (event) => {
         const method = getMethod(event);
-        // event.path is stripped to the remainder after the mount prefix
         const raw = (event.path || "/").split("?")[0].replace(/^\//, "");
         const parts = raw.split("/").filter(Boolean);
 
-        // Already handled by the dedicated /status route above
         if (parts[0] === "status" && parts.length === 1) return;
-        // Already handled by the dedicated /task-queue/status route above
         if (parts[0] === "task-queue") return;
-        // Already handled by the dedicated /remote/* routes above
         if (parts[0] === "remote") return;
-        // Already handled by the dedicated /process-task route above
         if (parts[0] === "process-task") return;
-        // Already handled by the dedicated /process-a2a-continuation route above
+        if (parts[0] === "retry-stuck-tasks") return;
         if (parts[0] === "process-a2a-continuation") return;
+        if (
+          parts[0] === "installations" ||
+          parts[0] === "scopes" ||
+          parts[0] === "budgets" ||
+          parts[0] === "memory"
+        ) {
+          setResponseStatus(event, 404);
+          return { error: "Not found" };
+        }
 
         const platform = parts[0];
-        const action = parts[1]; // webhook, status, enable, disable, setup
+        const action = parts[1];
 
         if (!platform) {
           setResponseStatus(event, 404);
@@ -1411,7 +3197,6 @@ export function createIntegrationsPlugin(
           return { error: `Unknown platform: ${platform}` };
         }
 
-        // Set params for handlers that read them
         if (event.context) {
           event.context.params = {
             ...event.context.params,
@@ -1419,11 +3204,14 @@ export function createIntegrationsPlugin(
           };
         }
 
-        // ─── GET /:platform/status ─────────────────────────────
         if (action === "status" && method === "GET") {
-          if (!(await requireSession(event))) return { error: "unauthorized" };
+          const ctx = await requireSessionContext(event);
+          if (!ctx) return { error: "unauthorized" };
           const baseUrl = getBaseUrl(event);
-          const status = await adapter.getStatus(baseUrl);
+          const status = await withCredentialContext(
+            toCredentialContext(ctx),
+            () => adapter.getStatus(baseUrl),
+          );
           const config = await getIntegrationConfig(platform);
           status.enabled = !!config?.configData?.enabled;
           status.webhookUrl = `${baseUrl}${P}/${platform}/webhook`;
@@ -1437,43 +3225,24 @@ export function createIntegrationsPlugin(
           return status;
         }
 
-        // ─── POST /:platform/webhook ───────────────────────────
-        if (action === "webhook" && method === "POST") {
-          // Google Docs push notifications bypass the normal webhook flow —
-          // they're opaque "something changed" pings, not message payloads.
-          // We MUST verify the Pub/Sub OIDC token here. Without it, anyone
-          // could POST any body to this URL and force a Drive changes pull
-          // (H7 in the webhook security audit).
-          if (platform === "google-docs") {
-            const audience = process.env.GOOGLE_DOCS_PUSH_AUDIENCE;
-            if (!audience) {
-              if (process.env.NODE_ENV === "production") {
-                // Fail closed in prod so a misconfigured deployment surfaces
-                // in Pub/Sub's delivery metrics rather than silently
-                // accepting anonymous requests.
-                setResponseStatus(event, 503);
-                return {
-                  ok: false,
-                  error:
-                    "google-docs push endpoint disabled (audience not configured)",
-                };
-              }
-              // Dev: keep the loose posture so contributors can play with the
-              // integration locally without configuring Pub/Sub.
-              handlePushNotification().catch((err) => {
-                console.error("[google-docs] Push handler error:", err);
-              });
-              return "ok";
-            }
-            const authHeader = getRequestHeader(event, "authorization") || "";
-            try {
-              await verifyGoogleDocsPushToken(authHeader);
-            } catch (err: any) {
-              console.warn(
-                `[google-docs] OIDC verify failed: ${err?.message ?? String(err)}`,
-              );
+        if (action === "webhook" && (method === "GET" || method === "POST")) {
+          if (platform === "google-docs" && method === "POST") {
+            const verified = await verifyGoogleDocsPushNotification({
+              channelId: getRequestHeader(event, "x-goog-channel-id"),
+              channelToken: getRequestHeader(event, "x-goog-channel-token"),
+              resourceId: getRequestHeader(event, "x-goog-resource-id"),
+            });
+            if (!verified) {
               setResponseStatus(event, 401);
               return { ok: false, error: "unauthorized" };
+            }
+            const config = await getIntegrationConfig(platform);
+            if (!config?.configData?.enabled) {
+              setResponseStatus(event, 404);
+              return {
+                ok: false,
+                error: `Integration ${platform} is not enabled`,
+              };
             }
             handlePushNotification().catch((err) => {
               console.error("[google-docs] Push handler error:", err);
@@ -1481,61 +3250,230 @@ export function createIntegrationsPlugin(
             return "ok";
           }
 
-          // Handle platform verification challenges (e.g. Slack url_verification)
-          // before checking enable state or parsing the message.
-          const verification = await adapter.handleVerification(event);
+          const config = await getIntegrationConfig(platform);
+          const credentialContext =
+            await credentialContextForIntegrationConfig(config);
+
+          const verification = await withCredentialContext(
+            credentialContext,
+            () => adapter.handleVerification(event),
+          );
+
+          if (method === "GET") {
+            if (verification.handled) {
+              setResponseStatus(event, 200);
+              return verification.response ?? "ok";
+            }
+            setResponseStatus(event, 403);
+            return { error: "Invalid webhook verification challenge" };
+          }
+
+          const isValid = await withCredentialContext(credentialContext, () =>
+            adapter.verifyWebhook(event),
+          );
+          if (!isValid) {
+            setResponseStatus(event, 401);
+            return { error: "Invalid webhook signature" };
+          }
           if (verification.handled) {
+            setResponseStatus(event, 200);
             return verification.response ?? "ok";
           }
 
-          const config = await getIntegrationConfig(platform);
           if (!config?.configData?.enabled) {
             setResponseStatus(event, 404);
             return { error: `Integration ${platform} is not enabled` };
           }
 
-          // Verify the webhook signature BEFORE parsing. We pre-parse the
-          // body here (so handleWebhook can skip its second readBody, which
-          // hangs on streaming providers), and that means handleWebhook's
-          // own verifyWebhook step is bypassed. Without this call anyone
-          // could POST a forged Slack/Telegram/email payload.
-          const isValid = await adapter.verifyWebhook(event);
-          if (!isValid) {
-            setResponseStatus(event, 401);
-            return { error: "Invalid webhook signature" };
-          }
-
-          const incoming = await adapter.parseIncomingMessage(event);
+          let incoming = await withCredentialContext(credentialContext, () =>
+            adapter.parseIncomingMessage(event),
+          );
           if (!incoming) {
             setResponseStatus(event, 200);
             return "ok";
           }
-          let owner = `integration@${platform}`;
-          if (options?.resolveOwner) {
+          if (adapter.hydrateIncomingIdentity) {
             try {
-              owner = await options.resolveOwner(incoming);
+              incoming = await withCredentialContext(credentialContext, () =>
+                adapter.hydrateIncomingIdentity!(incoming!),
+              );
+            } catch (err) {
+              console.warn(
+                `[integrations] Could not hydrate ${platform} sender identity:`,
+                err instanceof Error ? err.message : err,
+              );
+            }
+          }
+          let defaultExecutionContext: IntegrationExecutionContext | null =
+            null;
+          if (
+            incoming.platform === "slack" &&
+            incoming.conversationType === "dm" &&
+            !options?.resolveExecutionContext
+          ) {
+            try {
+              defaultExecutionContext = await withCredentialContext(
+                credentialContext,
+                () => resolveDefaultIntegrationExecutionContext(incoming!),
+              );
+            } catch (err) {
+              const declined =
+                err instanceof IntegrationIdentityDeclinedError ? err : null;
+              if (declined) {
+                console.warn(
+                  `[integrations] default Slack DM identity declined message:`,
+                  declined.message,
+                );
+                if (adapter.sendSystemNotice) {
+                  try {
+                    await enqueueSystemNotice(
+                      event,
+                      incoming!,
+                      declined.userFacingMessage,
+                      {
+                        dedupeKey: `decline:${incoming!.tenantId ?? "unknown"}:${incoming!.senderId ?? "unknown"}:${declined.reason}`,
+                        dedupeTtlMs: DECLINE_NOTICE_DEDUPE_TTL_MS,
+                      },
+                    );
+                  } catch (noticeErr) {
+                    console.warn(
+                      `[integrations] could not persist decline notice:`,
+                      noticeErr instanceof Error
+                        ? noticeErr.message
+                        : noticeErr,
+                    );
+                    setResponseStatus(event, 500);
+                    return { error: "notice enqueue failed" };
+                  }
+                }
+              } else {
+                console.error(
+                  `[integrations] default Slack DM identity denied message:`,
+                  err,
+                );
+              }
+              setResponseStatus(event, 200);
+              return "ok";
+            }
+          }
+          let executionContext: IntegrationExecutionContext = {
+            ownerEmail: `integration@${platform}`,
+            orgId: null as string | null,
+            principalType: "service" as const,
+          };
+          if (options?.resolveExecutionContext) {
+            try {
+              executionContext = await withCredentialContext(
+                credentialContext,
+                () =>
+                  Promise.resolve(options.resolveExecutionContext!(incoming)),
+              );
+            } catch (err) {
+              console.error(
+                `[integrations] resolveExecutionContext denied message:`,
+                err,
+              );
+              setResponseStatus(event, 200);
+              return "ok";
+            }
+          } else if (defaultExecutionContext) {
+            executionContext = defaultExecutionContext;
+            if (defaultExecutionContext.anonymousMember) {
+              if (!options?.allowAnonymousOrgScopedSlackDm) {
+                const senderEmail =
+                  typeof incoming.senderEmail === "string" &&
+                  incoming.senderEmail.trim()
+                    ? incoming.senderEmail.trim()
+                    : null;
+                const noticeText = senderEmail
+                  ? `I couldn't match your Slack account to an organization member, so I can't run this request. Ask an organization admin to add ${senderEmail}, then try again.`
+                  : "I couldn't verify your Slack account email, so I can't run this request. Ask an organization admin to reconnect Slack with the users:read.email scope, then try again.";
+                if (adapter.sendSystemNotice) {
+                  try {
+                    await enqueueSystemNotice(event, incoming, noticeText, {
+                      dedupeKey: `anonymous-tier-disabled:${incoming.tenantId ?? "unknown"}:${incoming.senderId ?? "unknown"}`,
+                    });
+                  } catch (noticeErr) {
+                    console.warn(
+                      `[integrations] could not persist unlinked-member notice:`,
+                      noticeErr instanceof Error
+                        ? noticeErr.message
+                        : noticeErr,
+                    );
+                    setResponseStatus(event, 500);
+                    return { error: "notice enqueue failed" };
+                  }
+                }
+                setResponseStatus(event, 200);
+                return "ok";
+              }
+              incoming.identityNote =
+                "Caller is an unlinked Slack workspace member running with organization-wide visibility only; personal or privately-shared data is not accessible. They can get personal access by having an admin add their Slack email to the organization (or by reconnecting Slack with the users:read.email scope).";
+              if (adapter.sendSystemNotice) {
+                const senderEmail =
+                  typeof incoming.senderEmail === "string" &&
+                  incoming.senderEmail.trim()
+                    ? incoming.senderEmail.trim()
+                    : null;
+                const noticeText = senderEmail
+                  ? `Heads up: I couldn't match your Slack account to an organization member, so I can only use org-wide data. Ask an admin to add ${senderEmail} to the organization for personal access.`
+                  : "Heads up: I couldn't verify your Slack account's email, so I can only use org-wide data. Ask an admin to update the Slack connection with the users:read.email scope for personal access.";
+                try {
+                  await enqueueSystemNotice(event, incoming, noticeText, {
+                    dedupeKey: `anonymous-tier:${incoming.tenantId ?? "unknown"}:${incoming.senderId ?? "unknown"}`,
+                  });
+                } catch (noticeErr) {
+                  console.warn(
+                    `[integrations] could not persist anonymous-tier notice:`,
+                    noticeErr instanceof Error ? noticeErr.message : noticeErr,
+                  );
+                  setResponseStatus(event, 500);
+                  return { error: "notice enqueue failed" };
+                }
+              }
+            }
+          } else if (options?.resolveOwner) {
+            try {
+              executionContext.ownerEmail = await withCredentialContext(
+                credentialContext,
+                () => Promise.resolve(options.resolveOwner!(incoming)),
+              );
             } catch (err) {
               console.error(
                 `[integrations] resolveOwner failed, using default:`,
                 err,
               );
             }
+          } else {
+            try {
+              executionContext = await withCredentialContext(
+                credentialContext,
+                () => resolveDefaultIntegrationExecutionContext(incoming!),
+              );
+            } catch (err) {
+              console.error(
+                `[integrations] default execution identity denied message:`,
+                err,
+              );
+              setResponseStatus(event, 200);
+              return "ok";
+            }
           }
-          const resources = await loadResourcesForPrompt(
-            owner,
-            true,
-            options?.appId,
-          );
-          const systemPrompt = baseSystemPrompt + resources;
+          if (executionContext.scopeId) {
+            incoming.integrationScopeId = executionContext.scopeId;
+          }
           const result = await handleWebhook(event, {
             adapter,
-            systemPrompt,
+            systemPrompt: baseSystemPrompt,
             actions,
+            initialToolNames,
             model,
             apiKey: getApiKey(),
             engine: options?.engine,
             appId: options?.appId,
-            ownerEmail: owner,
+            ownerEmail: executionContext.ownerEmail,
+            orgId: executionContext.orgId,
+            principalType: executionContext.principalType,
             beforeProcess: options?.beforeProcess,
             incoming,
           });
@@ -1543,66 +3481,36 @@ export function createIntegrationsPlugin(
           return result.body;
         }
 
-        // ─── POST /:platform/enable ────────────────────────────
-        if (action === "enable" && method === "POST") {
-          const adminCheck = await checkOrgAdmin(event);
-          if (adminCheck.ok === false) return { error: adminCheck.error };
-          // Stamp the org-admin who toggled this so downstream code can
-          // tell who is responsible — useful for audit logs even though
-          // the row itself remains deployment-wide.
-          const session = await getSession(event).catch(() => null);
-          await saveIntegrationConfig(
-            platform,
-            { enabled: true },
-            "default",
-            session?.email,
-          );
-          return { ok: true, platform, enabled: true };
-        }
-
-        // ─── POST /:platform/disable ───────────────────────────
-        if (action === "disable" && method === "POST") {
+        // ─── POST /:platform/enable|disable ────────────────────
+        if (
+          (action === "enable" || action === "disable") &&
+          method === "POST"
+        ) {
           const adminCheck = await checkOrgAdmin(event);
           if (adminCheck.ok === false) return { error: adminCheck.error };
           const session = await getSession(event).catch(() => null);
-          await saveIntegrationConfig(
-            platform,
-            { enabled: false },
-            "default",
-            session?.email,
-          );
-          return { ok: true, platform, enabled: false };
+          const enabled = action === "enable";
+          await channels.setEnabled(platform, enabled, {
+            actorEmail: session?.email,
+            baseUrl: getBaseUrl(event),
+          });
+          return { ok: true, platform, enabled };
         }
 
-        // ─── POST /:platform/setup ─────────────────────────────
         if (action === "setup" && method === "POST") {
           const adminCheck = await checkOrgAdmin(event);
           if (adminCheck.ok === false) return { error: adminCheck.error };
-          if (platform === "telegram") {
-            const baseUrl = getBaseUrl(event);
-            const webhookUrl = `${baseUrl}${P}/telegram/webhook`;
-            const token = process.env.TELEGRAM_BOT_TOKEN;
-            if (!token) {
-              setResponseStatus(event, 400);
-              return { error: "TELEGRAM_BOT_TOKEN not configured" };
-            }
-            try {
-              const res = await fetch(
-                `https://api.telegram.org/bot${token}/setWebhook`,
-                {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ url: webhookUrl }),
-                },
-              );
-              const data = await res.json();
-              return { ok: true, platform, webhookUrl, result: data };
-            } catch (err: any) {
-              setResponseStatus(event, 500);
-              return { error: err.message };
-            }
+          const ctx = await requireSessionContext(event);
+          if (!ctx) return { error: "unauthorized" };
+          const registration = await withCredentialContext(
+            toCredentialContext(ctx),
+            () => channels.registerWebhook(platform, getBaseUrl(event)),
+          );
+          if (registration.ok === false) {
+            setResponseStatus(event, registration.statusCode);
+            return { error: registration.error };
           }
-          return { ok: true, platform, message: "No setup required" };
+          return { platform, ...registration };
         }
 
         setResponseStatus(event, 404);
@@ -1610,40 +3518,25 @@ export function createIntegrationsPlugin(
       }),
     );
 
-    // ─── Start pending-tasks retry sweeper ────────────────────────
-    // Sweeps the integration_pending_tasks queue every 60s and re-fires the
-    // processor for any tasks that got stuck (initial dispatch lost or
-    // processor killed mid-flight). No-ops gracefully if the queue table
-    // hasn't been created yet on this deployment.
-    startPendingTasksRetryJob({
-      webhookBaseUrl: process.env.WEBHOOK_BASE_URL,
-    });
-    startA2AContinuationRetryJob(adapterMap);
-    startRemoteCommandsRetryJob();
+    if (
+      !isInBackgroundFunctionRuntime() &&
+      !isInIntegrationRecoveryRuntime() &&
+      !isServerlessRuntime()
+    ) {
+      startPendingTasksRetryJob({
+        webhookBaseUrl: getAppConfig().integrations.webhookBaseUrl,
+      });
+      startA2AContinuationRetryJob(adapterMap);
+      startRemoteCommandsRetryJob();
+      startRemotePushDeliveryJob();
 
-    // ─── Start Google Docs poller/push ────────────────────────────
-    if (adapterMap.has("google-docs")) {
-      // Defer startup slightly so the server is fully ready
-      setTimeout(() => {
-        // We don't know the base URL at plugin init time — it depends on
-        // the incoming request. For push mode, the webhook URL needs to be
-        // resolved. We pass it as a special option; the poller will attempt
-        // to register a watch when the first request reveals the base URL,
-        // or use the WEBHOOK_BASE_URL env var if set.
-        const baseUrl = process.env.WEBHOOK_BASE_URL;
-        const webhookUrl = baseUrl
-          ? `${withConfiguredAppBasePath(baseUrl)}${P}/google-docs/webhook`
-          : undefined;
-
-        startGoogleDocsPoller({
-          systemPrompt: baseSystemPrompt,
-          actions,
-          model: model ?? "",
-          apiKey: getApiKey(),
-          ownerEmail: "integration@google-docs",
-          webhookUrl,
-        });
-      }, 2000);
+      if (adapterMap.has("google-docs")) {
+        setTimeout(() => {
+          void runGoogleDocsPollerTransition(() =>
+            startGoogleDocsPoller(createGoogleDocsPollerOptions()),
+          );
+        }, 2000);
+      }
     }
 
     if (process.env.DEBUG)
@@ -1653,12 +3546,8 @@ export function createIntegrationsPlugin(
   };
 }
 
-/**
- * Default integrations plugin — auto-mounts all adapters.
- */
 export const defaultIntegrationsPlugin = createIntegrationsPlugin();
 
-/** Extract base URL from the request */
 function getBaseUrl(event: any): string {
   try {
     const headers = event.node?.req?.headers || event.headers || {};
@@ -1676,4 +3565,152 @@ function getBaseUrl(event: any): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function readComputerCapabilities(value: unknown) {
+  const input = readObject(value);
+  const readSurface = (surface: unknown, desktop = false) => {
+    const record = readObject(surface);
+    if (!record) return undefined;
+    return {
+      observe: record.observe === true,
+      control: record.control === true,
+      ...(desktop
+        ? {
+            accessibility: record.accessibility === true,
+            screenCapture: record.screenCapture === true,
+          }
+        : {}),
+      provider: readString(record.provider) ?? null,
+      version: readString(record.version) ?? null,
+    };
+  };
+  return {
+    browser: readSurface(input?.browser),
+    desktop: readSurface(input?.desktop, true),
+  };
+}
+
+function readRemoteExecutionCapabilities(
+  value: unknown,
+): RemoteExecutionCapabilities {
+  const input = readObject(value);
+  if (!input) return {};
+  const backend = readString(input.backend);
+  const persistence = readString(input.persistence);
+  const list = (candidate: unknown, max: number) =>
+    [
+      ...new Set(
+        Array.isArray(candidate)
+          ? candidate
+              .filter((entry): entry is string => typeof entry === "string")
+              .map((entry) => entry.trim().slice(0, 120))
+              .filter(Boolean)
+          : [],
+      ),
+    ].slice(0, max);
+  return {
+    ...(backend === "desktop" ||
+    backend === "container" ||
+    backend === "kubernetes" ||
+    backend === "external"
+      ? { backend }
+      : {}),
+    workloads: list(
+      input.workloads,
+      16,
+    ) as RemoteExecutionCapabilities["workloads"],
+    engines: list(input.engines, 32),
+    ...(typeof input.acceptsScheduledWork === "boolean"
+      ? { acceptsScheduledWork: input.acceptsScheduledWork }
+      : {}),
+    ...(persistence === "local-files" ||
+    persistence === "persistent-volume" ||
+    persistence === "ephemeral"
+      ? { persistence }
+      : {}),
+    adapters: list(input.adapters, 32),
+  };
+}
+
+function readBrowserSession(value: unknown) {
+  if (value === null) return null;
+  const input = readObject(value);
+  if (!input) return null;
+  const handle = readString(input.handle);
+  const origin = readString(input.origin);
+  const title = readString(input.title);
+  if (
+    input.version !== 1 ||
+    !handle ||
+    handle.length > 128 ||
+    !/^bsn_[0-9a-f-]+$/i.test(handle) ||
+    !origin ||
+    origin.length > 2_048 ||
+    !title ||
+    title.length > 512
+  ) {
+    return null;
+  }
+  try {
+    const url = new URL(origin);
+    if (
+      url.origin !== origin ||
+      (url.protocol !== "http:" && url.protocol !== "https:")
+    ) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  return { version: 1, handle, origin, title };
+}
+
+function advertisedComputerOperationClasses(
+  device: Pick<RemoteDevice, "metadata">,
+): ComputerOperationClass[] {
+  const capabilities = getRemoteComputerCapabilities(device);
+  const classes: ComputerOperationClass[] = [];
+  if (capabilities?.browser?.observe) classes.push("browser.observe");
+  if (capabilities?.browser?.control) classes.push("browser.control");
+  if (capabilities?.desktop?.observe) classes.push("desktop.observe");
+  if (capabilities?.desktop?.control) classes.push("desktop.control");
+  return classes;
+}
+
+function readComputerApprovalStatus(value: unknown) {
+  return value === "pending" ||
+    value === "approved" ||
+    value === "denied" ||
+    value === "consumed" ||
+    value === "expired"
+    ? value
+    : undefined;
+}
+
+function computerSupervisionRouteError(event: any, error: unknown) {
+  if (error instanceof ComputerSupervisionError) {
+    const status =
+      error.code === "expired-lease"
+        ? 410
+        : error.code === "replay"
+          ? 409
+          : error.code === "approval-required" ||
+              error.code === "approval-denied"
+            ? 403
+            : 400;
+    setResponseStatus(event, status);
+    return { error: error.message, code: error.code };
+  }
+  throw error;
+}
+
+function stringifyValue(value: unknown): string {
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  )
+    return String(value);
+  return value == null ? "" : (JSON.stringify(value) ?? "");
 }

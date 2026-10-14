@@ -1,8 +1,15 @@
 import { createCoreRoutesPlugin } from "@agent-native/core/server";
+
 import { envKeys } from "../lib/env-config.js";
 
 export default createCoreRoutesPlugin({
+  googleOAuthManagedConnection: "not_applicable",
   envKeys,
+  googleOAuthCallbackPaths: [
+    "/_agent-native/google/callback",
+    "/_agent-native/google-docs/callback",
+  ],
+  googleOAuthCredentialMode: "user",
   resolveOpenPath: ({ view, params }) => {
     if (params.deckId) {
       const slideNumber =
@@ -16,8 +23,8 @@ export default createCoreRoutesPlugin({
         : "";
       return `/deck/${params.deckId}${suffix}${query}`;
     }
-    if (view === "settings") return "/settings";
-    if (view === "editor" || view === "present" || view === "list") return "/";
+    if (view === "editor" || view === "list") return "/home";
+    if (view === "present") return "/";
     return null;
   },
 });

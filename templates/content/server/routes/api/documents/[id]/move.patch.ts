@@ -1,17 +1,23 @@
-import { defineEventHandler, createError } from "h3";
-import { and, eq, sql } from "drizzle-orm";
-import { getDb } from "../../../../db/index.js";
-import { schema } from "../../../../db/index.js";
-import {
-  parseDocumentFavorite,
-  parseDocumentHideFromSearch,
-} from "../../../../lib/documents.js";
 import {
   getSession,
   readBody,
   runWithRequestContext,
 } from "@agent-native/core/server";
 import { assertAccess } from "@agent-native/core/sharing";
+import { and, eq, sql } from "drizzle-orm";
+import { defineEventHandler, createError } from "h3";
+
+import {
+  documentsPositionScope,
+  nextAppendPosition,
+  withPositionLock,
+} from "../../../../../actions/_position-utils.js";
+import { getDb } from "../../../../db/index.js";
+import { schema } from "../../../../db/index.js";
+import {
+  parseDocumentFavorite,
+  parseDocumentHideFromSearch,
+} from "../../../../lib/documents.js";
 
 async function assertParentIsNotDescendant({
   db,
@@ -106,37 +112,46 @@ export default defineEventHandler(async (event) => {
         updates.parentId = body.parentId;
       }
 
+      const applyUpdate = () =>
+        db
+          .update(schema.documents)
+          .set(updates)
+          .where(
+            and(
+              eq(schema.documents.id, id),
+              eq(schema.documents.ownerEmail, ownerEmail),
+            ),
+          );
+
       if (body.position !== undefined) {
         updates.position = body.position;
+        await applyUpdate();
       } else if (body.parentId !== undefined) {
-        // Auto-assign position at end of new parent's children
         const parentId = body.parentId;
-        const maxPos = await db
-          .select({ max: sql<number>`COALESCE(MAX(position), -1)` })
-          .from(schema.documents)
-          .where(
-            parentId
-              ? and(
-                  eq(schema.documents.ownerEmail, ownerEmail),
-                  eq(schema.documents.parentId, parentId),
-                )
-              : and(
-                  eq(schema.documents.ownerEmail, ownerEmail),
-                  sql`parent_id IS NULL`,
-                ),
-          );
-        updates.position = (maxPos[0]?.max ?? -1) + 1;
-      }
-
-      await db
-        .update(schema.documents)
-        .set(updates)
-        .where(
-          and(
-            eq(schema.documents.id, id),
-            eq(schema.documents.ownerEmail, ownerEmail),
-          ),
+        await withPositionLock(
+          documentsPositionScope(ownerEmail, parentId),
+          async () => {
+            const maxPos = await db
+              .select({ max: sql<unknown>`COALESCE(MAX(position), -1)` })
+              .from(schema.documents)
+              .where(
+                parentId
+                  ? and(
+                      eq(schema.documents.ownerEmail, ownerEmail),
+                      eq(schema.documents.parentId, parentId),
+                    )
+                  : and(
+                      eq(schema.documents.ownerEmail, ownerEmail),
+                      sql`parent_id IS NULL`,
+                    ),
+              );
+            updates.position = nextAppendPosition(maxPos[0]?.max);
+            await applyUpdate();
+          },
         );
+      } else {
+        await applyUpdate();
+      }
 
       const [doc] = await db
         .select()

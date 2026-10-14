@@ -1,13 +1,15 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { nanoid } from "nanoid";
-import { marked, type Tokens, Renderer } from "marked";
-import type { ComposeAttachment } from "@shared/types.js";
+
 import {
   decodeCommonHtmlEntities,
   escapeHtml,
   normalizeMarkdownHardBreaks,
 } from "@shared/markdown.js";
+import type { ComposeAttachment } from "@shared/types.js";
+import { marked, type Tokens, Renderer } from "marked";
+import { nanoid } from "nanoid";
+
 import {
   injectTrackingIntoHtml,
   type TrackingContext,
@@ -15,6 +17,7 @@ import {
 import { getStoredUpload } from "./upload-store.js";
 
 const UPLOADS_DIR = path.resolve("data/uploads");
+const MAX_ATTACHMENT_FETCH_BYTES = 15 * 1024 * 1024;
 
 export type ResolvedComposeAttachment = ComposeAttachment & {
   data: Buffer;
@@ -30,21 +33,31 @@ function stripCrlf(value: string): string {
   return value.replace(/[\r\n]+/g, " ").trim();
 }
 
+async function fetchStoredUpload(url: string): Promise<Buffer> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Stored upload fetch failed: ${response.status}`);
+  }
+  const contentLength = Number(response.headers.get("content-length") || "0");
+  if (contentLength > MAX_ATTACHMENT_FETCH_BYTES) {
+    throw new Error("Stored upload is too large to attach");
+  }
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.byteLength > MAX_ATTACHMENT_FETCH_BYTES) {
+    throw new Error("Stored upload is too large to attach");
+  }
+  return bytes;
+}
+
 function safeHeaderParam(value: string): string {
   return stripCrlf(value).replace(/["\\]/g, "_") || "attachment";
 }
 
-// RFC 2047 base64-encode a header value when it contains non-ASCII. Without
-// this, characters like the em-dash "—" arrive as mojibake (e.g. "Ã¢Â€Â\"")
-// because intermediate MTAs interpret raw UTF-8 bytes in headers as Latin-1.
 export function encodeMimeHeaderValue(value: string): string {
   if (/^[\x20-\x7e]*$/.test(value)) return value;
   return `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`;
 }
 
-// RFC 2047 encode the display-name part of an address-list header
-// (To/From/Cc/Bcc). The bare email itself is always ASCII-safe, so we leave it
-// alone and only encode the name when needed.
 export function encodeAddressHeader(value: string): string {
   return value
     .split(",")
@@ -65,15 +78,11 @@ function encodeSingleAddress(addr: string): string {
   return encodeMimeHeaderValue(addr);
 }
 
-// Build a marked Renderer that keeps links safe for email clients (absolute
-// hrefs only, target=_blank + rel=noopener, no javascript:).
 function buildEmailRenderer(): Renderer {
   const renderer = new Renderer();
 
   renderer.link = ({ href, title, tokens }: Tokens.Link) => {
     const safeHref = href && /^https?:\/\//i.test(href) ? href : (href ?? "#");
-    // Use the parser to render the inline tokens when available; fall back to
-    // extracting raw text so the label is never empty.
     const label = (renderer as any).parser
       ? (renderer as any).parser.parseInline(tokens)
       : tokens.map((t: any) => t.text ?? "").join("") || safeHref;
@@ -174,13 +183,20 @@ export async function resolveComposeAttachments(
   ownerEmail?: string,
   options?: ResolveComposeAttachmentOptions,
 ): Promise<ResolvedComposeAttachment[]> {
-  if (!Array.isArray(attachments)) return [];
+  if (attachments == null) return [];
+  if (!Array.isArray(attachments)) {
+    throw new Error("Attachments must be an array");
+  }
 
   const resolved: ResolvedComposeAttachment[] = [];
   for (const raw of attachments) {
     const att = raw as Partial<ComposeAttachment>;
-    if (!att.filename || typeof att.filename !== "string") continue;
-    if (att.filename.includes("/") || att.filename.includes("..")) continue;
+    if (!att.filename || typeof att.filename !== "string") {
+      throw new Error("Attachment is missing a filename and could not be read");
+    }
+    if (att.filename.includes("/") || att.filename.includes("..")) {
+      throw new Error(`Attachment filename is invalid: ${att.filename}`);
+    }
 
     if (att.source === "gmail" || att.gmailMessageId || att.gmailAttachmentId) {
       if (
@@ -216,7 +232,13 @@ export async function resolveComposeAttachments(
       if (!ownerEmail) throw error;
       const stored = await getStoredUpload(ownerEmail, att.filename);
       if (!stored) throw error;
-      data = Buffer.from(stored.dataBase64, "base64");
+      if (stored.url) {
+        data = await fetchStoredUpload(stored.url);
+      } else if (stored.dataBase64) {
+        data = Buffer.from(stored.dataBase64, "base64");
+      } else {
+        throw error;
+      }
       att.originalName = att.originalName || stored.originalName;
       att.mimeType = att.mimeType || stored.mimeType;
       att.size = att.size || stored.size;

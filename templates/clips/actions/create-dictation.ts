@@ -1,39 +1,62 @@
-/**
- * Create a dictation row from browser or desktop voice capture.
- */
-
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
+import { writeAppState } from "@agent-native/core/application-state";
+import { track } from "@agent-native/core/tracking";
+import { and, eq } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import {
   getActiveOrganizationId,
   getCurrentOwnerEmail,
   nanoid,
+  ownerEmailMatches,
 } from "../server/lib/recordings.js";
-import { writeAppState } from "@agent-native/core/application-state";
 
 export default defineAction({
   description:
-    "Create a dictation history row from captured voice text. Used by browser Dictate and desktop voice capture.",
+    "Create a dictation history row from captured voice text. Used by browser, desktop, and mobile voice capture.",
   schema: z.object({
+    id: z.string().min(1).optional().describe("Stable client-generated id"),
     fullText: z.string().min(1).describe("Raw dictation text"),
     cleanedText: z.string().nullable().optional(),
     durationMs: z.coerce.number().int().min(0).optional(),
     audioUrl: z.string().url().nullable().optional(),
     source: z
-      .enum(["fn-hold", "cmd-shift-space", "manual", "other", "fn", "custom"])
+      .enum([
+        "fn-hold",
+        "cmd-shift-space",
+        "manual",
+        "mobile",
+        "other",
+        "fn",
+        "custom",
+      ])
       .default("manual"),
     targetApp: z.string().nullable().optional(),
     startedAt: z.string().datetime().optional(),
   }),
-  run: async (args) => {
+  run: async (args, context) => {
     const db = getDb();
     const ownerEmail = getCurrentOwnerEmail();
     const orgId = await getActiveOrganizationId().catch(() => null);
     const now = new Date().toISOString();
-    const id = nanoid();
+    const id = args.id ?? nanoid();
     const fullText = args.fullText.trim();
     if (!fullText) throw new Error("Dictation text is required");
+
+    if (args.id) {
+      const [existing] = await db
+        .select()
+        .from(schema.dictations)
+        .where(
+          and(
+            eq(schema.dictations.id, id),
+            ownerEmailMatches(schema.dictations.ownerEmail, ownerEmail),
+          ),
+        )
+        .limit(1);
+      if (existing) return existing;
+    }
 
     await db.insert(schema.dictations).values({
       id,
@@ -52,6 +75,18 @@ export default defineAction({
     });
 
     await writeAppState("refresh-signal", { ts: Date.now() });
+    track(
+      "dictation_used",
+      {
+        app_name: "clips",
+        template_name: "clips",
+        output_id: id,
+        output_type: "dictation",
+        duration_s: Math.round((args.durationMs ?? 0) / 1000),
+        source: args.source,
+      },
+      context,
+    );
 
     return {
       id,

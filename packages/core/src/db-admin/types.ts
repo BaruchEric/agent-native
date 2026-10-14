@@ -1,13 +1,3 @@
-/**
- * Shared contract types for the dev-mode database admin (Supabase-Studio-like).
- *
- * The backend (operations / routes / agent tools) and the frontend both import
- * these so request/response shapes stay in lockstep. Keep this file free of any
- * runtime imports — it is a pure type module.
- */
-
-export type DbAdminDialect = "sqlite" | "postgres" | "d1";
-
 export interface DbAdminColumn {
   name: string;
   type: string;
@@ -15,6 +5,7 @@ export interface DbAdminColumn {
   pk: boolean;
   defaultValue: string | null;
   autoIncrement?: boolean;
+  largeValuePreview?: boolean;
 }
 
 export interface DbAdminForeignKey {
@@ -74,6 +65,7 @@ export interface DbAdminRowsRequest {
   pageSize: number;
   sort?: DbAdminSort[];
   filters?: DbAdminFilter[];
+  includeLargeCells?: boolean;
 }
 
 export interface DbAdminRowsResult {
@@ -82,6 +74,7 @@ export interface DbAdminRowsResult {
   total: number;
   page: number;
   pageSize: number;
+  truncatedCells?: number;
 }
 
 export interface DbAdminMutation {
@@ -103,4 +96,5 @@ export interface DbAdminQueryResult {
   rows: Record<string, unknown>[];
   rowsAffected: number;
   durationMs: number;
+  truncatedCells?: number;
 }

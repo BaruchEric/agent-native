@@ -1,33 +1,19 @@
-/**
- * Application state helpers for use in scripts and actions.
- *
- * The session ID determines which user's application state is read/written.
- * Resolution order:
- *   1. Per-request context (AsyncLocalStorage) — set by the HTTP handler
- *   2. AGENT_USER_EMAIL env var — CLI scripts only
- *
- * The per-request context is critical in multi-user deployments: the env var
- * is process-global and gets overwritten by concurrent requests, so it cannot
- * reliably identify the caller. Only CLI scripts (single-user, no HTTP
- * context) should fall through to the env var.
- */
-
+import {
+  getAmbientUserEmail,
+  getRequestAuthCapability,
+  getRequestRunContext,
+} from "../server/request-context.js";
 import {
   appStateGet,
   appStatePut,
   appStateDelete,
+  appStateCompareAndSet,
+  appStateCompareAndSetMany,
   appStateList,
   appStateDeleteByPrefix,
+  type AppStateCompareAndSetOperation,
 } from "./store.js";
 
-/**
- * Resolve session ID for the current caller.
- *
- * In an HTTP/action context, uses the per-request user email from
- * AsyncLocalStorage so concurrent users don't collide. In a CLI context
- * (no request), falls back to AGENT_USER_EMAIL. Throws when neither is
- * present — application state must be scoped to a real identity.
- */
 async function resolveSessionId(): Promise<string> {
   try {
     const { getRequestUserEmail } =
@@ -38,7 +24,10 @@ async function resolveSessionId(): Promise<string> {
     // request-context not available — fall through to env var
   }
 
-  const email = process.env.AGENT_USER_EMAIL;
+  const capability = getRequestAuthCapability();
+  if (capability) return `capability:${capability}`;
+
+  const email = getAmbientUserEmail();
   if (email) return email;
 
   throw new Error(
@@ -49,8 +38,7 @@ async function resolveSessionId(): Promise<string> {
 export async function readAppState(
   key: string,
 ): Promise<Record<string, unknown> | null> {
-  const sessionId = await resolveSessionId();
-  return appStateGet(sessionId, key);
+  return readUnscopedAppState(requestScopedAppStateKey(key));
 }
 
 export async function writeAppState(
@@ -58,16 +46,45 @@ export async function writeAppState(
   value: Record<string, unknown>,
 ): Promise<void> {
   const sessionId = await resolveSessionId();
-  return appStatePut(sessionId, key, value, {
+  return appStatePut(sessionId, requestScopedAppStateKey(key), value, {
     requestSource: "agent",
   });
 }
 
 export async function deleteAppState(key: string): Promise<boolean> {
   const sessionId = await resolveSessionId();
-  return appStateDelete(sessionId, key, {
+  return appStateDelete(sessionId, requestScopedAppStateKey(key), {
     requestSource: "agent",
   });
+}
+
+export async function compareAndSetAppState(
+  key: string,
+  expectedValue: Record<string, unknown> | null,
+  nextValue: Record<string, unknown> | null,
+): Promise<boolean> {
+  const sessionId = await resolveSessionId();
+  return appStateCompareAndSet(
+    sessionId,
+    requestScopedAppStateKey(key),
+    expectedValue,
+    nextValue,
+    { requestSource: "agent" },
+  );
+}
+
+export async function compareAndSetManyAppState(
+  operations: readonly AppStateCompareAndSetOperation[],
+): Promise<boolean> {
+  const sessionId = await resolveSessionId();
+  return appStateCompareAndSetMany(
+    sessionId,
+    operations.map((operation) => ({
+      ...operation,
+      key: requestScopedAppStateKey(operation.key),
+    })),
+    { requestSource: "agent" },
+  );
 }
 
 export async function listAppState(
@@ -82,4 +99,70 @@ export async function deleteAppStateByPrefix(prefix: string): Promise<number> {
   return appStateDeleteByPrefix(sessionId, prefix, {
     requestSource: "agent",
   });
+}
+
+const SAFE_TAB_ID_RE = /^[A-Za-z0-9_-]{1,96}$/;
+const TAB_SCOPED_AMBIENT_KEYS = new Set([
+  "navigation",
+  "navigate",
+  "__url__",
+  "__set_url__",
+  "settings-view",
+  "pending-selection-context",
+]);
+
+export function normalizeBrowserTabId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return SAFE_TAB_ID_RE.test(trimmed) ? trimmed : null;
+}
+
+export function getCurrentRequestBrowserTabId(): string | null {
+  try {
+    return normalizeBrowserTabId(getRequestRunContext()?.browserTabId);
+  } catch {
+    return null;
+  }
+}
+
+export function appStateKeyForBrowserTab(
+  key: string,
+  browserTabId: unknown,
+): string {
+  const normalized = normalizeBrowserTabId(browserTabId);
+  return normalized ? `${key}:${normalized}` : key;
+}
+
+function requestScopedAppStateKey(key: string): string {
+  if (!TAB_SCOPED_AMBIENT_KEYS.has(key)) return key;
+  return appStateKeyForBrowserTab(key, getCurrentRequestBrowserTabId());
+}
+
+async function readUnscopedAppState(
+  key: string,
+): Promise<Record<string, unknown> | null> {
+  const sessionId = await resolveSessionId();
+  return appStateGet(sessionId, key);
+}
+
+export async function readAppStateForCurrentTab(
+  key: string,
+  options?: { fallbackToGlobal?: boolean },
+): Promise<Record<string, unknown> | null> {
+  const browserTabId = getCurrentRequestBrowserTabId();
+  const tabKey = appStateKeyForBrowserTab(key, browserTabId);
+  if (tabKey !== key) {
+    const scoped = await readAppState(tabKey);
+    if (scoped) return scoped;
+    if (options?.fallbackToGlobal !== true) return null;
+  }
+  return readUnscopedAppState(key);
+}
+
+export async function writeAppStateForCurrentTab(
+  key: string,
+  value: Record<string, unknown>,
+): Promise<void> {
+  const tabKey = appStateKeyForBrowserTab(key, getCurrentRequestBrowserTabId());
+  return writeAppState(tabKey, value);
 }

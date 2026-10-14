@@ -7,6 +7,21 @@ description: >-
 
 # Form Responses
 
+## Team Roles
+
+Forms enforces the Team page roles through shared permission guards. Reviewer can review submissions and export or analyze responses, but cannot create, edit, publish, archive, delete, or restore forms. Editor can edit and review. Submission review still requires an editor-level resource share; the app role does not grant access to private forms. Form owners and organization owners/admins bypass the app-role restriction while resource sharing checks remain in force. Members without an assigned role retain Editor permissions for compatibility; assigning Reviewer removes those edit permissions. Authenticated personal deployments without an organization retain their existing resource access. Forms opts into `defineAppRoles(descriptor, { unassignedRole: "editor", allowOrgAdmins: true })`; `defaultRole` remains display-only, and other apps retain strict guards unless they opt in.
+
+Organization-owned forms always use that organization's role policy, even when personal scope or a different organization is selected. Changing a form's visibility also requires edit permission.
+
+For organization-owned forms, editing and submission review require active membership in the form's organization unless the sharing system recognizes the caller as its owner. A direct share alone does not satisfy this app-permission check.
+
+If `view-screen` reports `responseAccess.status: "denied"`, use its navigation and available form metadata as context; submission counts and previews are omitted. Other permission-lookup failures still fail the action.
+
+- For tables or charts in chat, use typed action results. `response-insights`
+  is the first-party path for native response tables and submission charts, but
+  do not include both unless the user asked for both; iframe/MCP App rendering
+  is only a fallback for external hosts.
+
 ## Viewing Responses
 
 Use `list-responses` to see submissions for a specific form:
@@ -48,14 +63,16 @@ status, visibility, and an "Open editor" action.
 
 ## Exporting Responses
 
-Use `export-responses` to export to CSV or JSON:
+Use `export-responses` to export to CSV or JSON. The export is uploaded to
+configured file storage (never written to local disk — serverless hosts have
+a read-only filesystem) and the action returns the resulting file URL:
 
 ```bash
 # CSV export (default)
-pnpm action export-responses --form <form-id> --output data/export.csv
+pnpm action export-responses --form <form-id>
 
 # JSON export
-pnpm action export-responses --form <form-id> --output data/export.json --format json
+pnpm action export-responses --form <form-id> --format json
 ```
 
 The CSV includes headers derived from field labels. Array values (multiselect) are joined with semicolons.
@@ -64,12 +81,28 @@ The CSV includes headers derived from field labels. Array values (multiselect) a
 
 Each response is stored in the `responses` SQL table:
 
-| Column        | Type | Description                          |
-| ------------- | ---- | ------------------------------------ |
-| `id`          | text | Unique response ID                   |
-| `formId`      | text | Foreign key to the form              |
-| `data`        | text | JSON string of field ID -> value map |
-| `submittedAt` | text | ISO timestamp                        |
+| Column           | Type | Description                          |
+| ---------------- | ---- | ------------------------------------ |
+| `id`             | text | Unique response ID                   |
+| `formId`         | text | Foreign key to the form              |
+| `data`           | text | JSON string of field ID -> value map |
+| `submittedAt`    | text | ISO timestamp                        |
+| `ip`             | text | Submitter IP when available          |
+| `submitterEmail` | text | Submitter email hint when known      |
+| `pageUrl`        | text | Page the respondent was on, if sent  |
+| `clientSurface`  | text | App surface: web, electron, or tauri |
+
+`submitterEmail` may come from the logged-in Forms session or from trusted
+feedback clients that pass the logged-in user email as submission metadata.
+
+`pageUrl` and `clientSurface` are hidden pass-through fields. Direct public
+fills record the current form URL, while trusted embeds (e.g. the framework
+FeedbackButton) forward the respondent's source page and runtime shell (`web`,
+`electron`, or `tauri`) so owners can see which screen and app feedback came
+from. Sensitive URL query keys are scrubbed before persistence, `clientSurface`
+is allowlisted server-side (unknown values are dropped), and anonymous forms
+suppress both fields. The responses table surfaces them as "Page" and "Source"
+columns when any response carries them.
 
 The `data` JSON maps field IDs to values:
 
@@ -92,13 +125,18 @@ To analyze responses, the workflow is:
 4. Use `list-responses --formId <id>` only when exact row-level inspection is needed
 5. Report whether the answer is exact or sampled, including row counts and truncation
 
+For an actionable theme, ground one concise title and evidence line in the
+`response-insights` result, then call `show-response-insight` with a specific
+follow-up prompt. Its button only prefills the Forms chat; it does not submit or
+change the form.
+
 ## Common Tasks
 
 | User request           | What to do                                                                   |
 | ---------------------- | ---------------------------------------------------------------------------- |
 | "@Form setup?"         | `preview-form --formId <id>` and answer from the returned fields/settings    |
 | "How many responses?"  | `response-insights --formId <id>` and report `summary.responses`             |
-| "Export to CSV"        | `export-responses --form <id> --output data/export.csv`                      |
+| "Export to CSV"        | `export-responses --form <id>`                                               |
 | "Submissions by day"   | `response-insights --formId <id> --days 30`                                  |
 | "Summarize feedback"   | `response-insights`, then `list-responses` if more detail is needed          |
 | "Average rating"       | `list-responses`, compute from rating fields and state the sampled row count |

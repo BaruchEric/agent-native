@@ -1,12 +1,22 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
 import {
   runWithRequestContext,
   getRequestUserEmail,
   getRequestOrgId,
+  getRequestBuilderStorageCredentialOrgId,
   getRequestTimezone,
   getRequestContext,
+  getCredentialContext,
   hasRequestContext,
   hasAuthContextAccess,
+  getAmbientUserEmail,
+  getAmbientOrgId,
+  hasRequestBoundary,
+  markRequestBoundaryInstalled,
+  getRequestIdentityAuthenticatedAtMs,
+  getRequestIdentitySessionToken,
+  markRequestIdentityAuthenticatedAtMs,
 } from "./request-context.js";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -33,11 +43,6 @@ describe("server/request-context", () => {
     });
 
     it("does NOT leak AGENT_USER_EMAIL into a request context that explicitly has no userEmail", () => {
-      // Reproduces the A2A unsigned/api-key path: the request context is set
-      // (so we're inside an HTTP request), but the caller is not user-
-      // authenticated. Returning the env var here would let a previous
-      // request's identity leak into the unauthenticated call on a warm
-      // serverless instance.
       vi.stubEnv("AGENT_USER_EMAIL", "leaked@previous-request.com");
       runWithRequestContext({}, () => {
         expect(getRequestUserEmail()).toBeUndefined();
@@ -69,6 +74,98 @@ describe("server/request-context", () => {
       runWithRequestContext({ userEmail: "alice@example.com" }, () => {
         expect(getRequestOrgId()).toBeUndefined();
       });
+    });
+  });
+
+  it("keeps the Builder storage grant org separate from data org scope", () => {
+    runWithRequestContext(
+      {
+        userEmail: "alice@example.com",
+        orgScope: "personal",
+        builderStorageCredentialOrgId: "storage-org",
+      },
+      () => {
+        expect(getRequestOrgId()).toBeUndefined();
+        expect(getRequestBuilderStorageCredentialOrgId()).toBe("storage-org");
+      },
+    );
+  });
+
+  it("keeps org-only credential scope separate from the authenticated user", () => {
+    runWithRequestContext(
+      {
+        userEmail: "admin@example.test",
+        orgId: "customer-org",
+        credentialScope: "org",
+      },
+      () => {
+        expect(getRequestUserEmail()).toBe("admin@example.test");
+        expect(getCredentialContext()).toEqual({
+          userEmail: "admin@example.test",
+          orgId: "customer-org",
+          credentialScope: "org",
+        });
+      },
+    );
+  });
+
+  describe("request identity validation time", () => {
+    it("keeps the earliest time for a matching identity and never shares it", () => {
+      const event = { context: {} };
+      markRequestIdentityAuthenticatedAtMs(
+        event,
+        "Alice@Example.com",
+        1_000,
+        "alice-session",
+      );
+      markRequestIdentityAuthenticatedAtMs(event, "alice@example.com", 2_000);
+
+      expect(
+        getRequestIdentityAuthenticatedAtMs(event, "ALICE@example.com"),
+      ).toBe(1_000);
+      expect(
+        getRequestIdentityAuthenticatedAtMs(event, "bob@example.com"),
+      ).toBe(undefined);
+      expect(getRequestIdentitySessionToken(event, "alice@example.com")).toBe(
+        "alice-session",
+      );
+
+      markRequestIdentityAuthenticatedAtMs(event, "bob@example.com", 3_000);
+      expect(
+        getRequestIdentityAuthenticatedAtMs(event, "alice@example.com"),
+      ).toBe(undefined);
+      expect(getRequestIdentitySessionToken(event, "alice@example.com")).toBe(
+        undefined,
+      );
+      expect(
+        getRequestIdentityAuthenticatedAtMs(event, "bob@example.com"),
+      ).toBe(3_000);
+    });
+
+    it("inherits a source session token only for the same request identity", () => {
+      runWithRequestContext(
+        {
+          userEmail: "alice@example.com",
+          identitySessionToken: "alice-session",
+        },
+        () =>
+          runWithRequestContext({ userEmail: "ALICE@example.com" }, () => {
+            expect(getRequestContext()?.identitySessionToken).toBe(
+              "alice-session",
+            );
+          }),
+      );
+
+      runWithRequestContext(
+        {
+          userEmail: "alice@example.com",
+          identitySessionToken: "alice-session",
+        },
+        () =>
+          runWithRequestContext({ userEmail: "bob@example.com" }, () => {
+            expect(getRequestContext()?.identitySessionToken).toBeUndefined();
+          }),
+      );
     });
   });
 
@@ -152,6 +249,14 @@ describe("server/request-context", () => {
       });
     });
 
+    it("inherits synthetic traffic through nested request contexts", () => {
+      runWithRequestContext({ isSyntheticTraffic: true }, () => {
+        runWithRequestContext({ userEmail: "alice@example.com" }, () => {
+          expect(getRequestContext()?.isSyntheticTraffic).toBe(true);
+        });
+      });
+    });
+
     it("marks contexts when authenticated request identity is read", () => {
       runWithRequestContext({ userEmail: "alice@example.com" }, () => {
         const ctx = getRequestContext();
@@ -181,6 +286,42 @@ describe("server/request-context", () => {
           expect(duplicate.getRequestTimezone()).toBe("America/New_York");
         },
       );
+    });
+  });
+
+  describe("ambient process identity", () => {
+    it("answers the process identity even inside a request context", () => {
+      vi.stubEnv("AGENT_USER_EMAIL", "deploy@example.com");
+      vi.stubEnv("AGENT_ORG_ID", "deploy-org");
+      runWithRequestContext({ userEmail: "alice@example.com" }, () => {
+        expect(getRequestUserEmail()).toBe("alice@example.com");
+        expect(getAmbientUserEmail()).toBe("deploy@example.com");
+        expect(getAmbientOrgId()).toBe("deploy-org");
+      });
+    });
+
+    it("stays quiet when the process has no request boundary (CLI)", () => {
+      vi.stubEnv("AGENT_USER_EMAIL", "cli-quiet@example.com");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      expect(hasRequestBoundary()).toBe(false);
+      expect(getRequestUserEmail()).toBe("cli-quiet@example.com");
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it("warns and names the identity when an HTTP process falls back", () => {
+      vi.stubEnv("AGENT_USER_EMAIL", "ambient-warned@example.com");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      markRequestBoundaryInstalled();
+      expect(hasRequestBoundary()).toBe(true);
+
+      expect(getRequestUserEmail()).toBe("ambient-warned@example.com");
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.[0]).toContain("ambient-warned@example.com");
+
+      getRequestUserEmail();
+      expect(warn).toHaveBeenCalledTimes(1);
+      warn.mockRestore();
     });
   });
 });

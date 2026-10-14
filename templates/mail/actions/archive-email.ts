@@ -1,8 +1,26 @@
-import { defineAction } from "@agent-native/core";
-import { getRequestUserEmail } from "@agent-native/core/server";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
-import { archiveEmail } from "../server/lib/email-state.js";
+import { getRequestUserEmail } from "@agent-native/core/server";
+import { track } from "@agent-native/core/tracking";
+import { summarizeArchiveFailures } from "@shared/archive-errors.js";
 import { z } from "zod";
+
+import {
+  archiveEmail,
+  resolveMutationAccounts,
+} from "../server/lib/email-state.js";
+import {
+  gmailBatchArchiveByAccount,
+  isConnected,
+} from "../server/lib/google-auth.js";
+import { syncInboxLabelDeltaForTargets } from "../server/lib/inbox-store-sync.js";
+import { invalidateThreadCache } from "../server/lib/thread-cache.js";
+
+function userFacingActionError(message: string, statusCode: number): Error {
+  const error = new Error(message) as Error & { statusCode: number };
+  error.statusCode = statusCode;
+  return error;
+}
 
 export default defineAction({
   description:
@@ -13,6 +31,12 @@ export default defineAction({
       .string()
       .optional()
       .describe("Specific connected account to use"),
+    accountEmails: z
+      .string()
+      .optional()
+      .describe(
+        "Per-id account emails, comma-separated and positionally matched to --id (bulk UI calls only)",
+      ),
     removeLabel: z
       .string()
       .optional()
@@ -23,8 +47,14 @@ export default defineAction({
       .string()
       .optional()
       .describe("Thread ID hint to skip an extra Gmail API round-trip"),
+    threadIds: z
+      .string()
+      .optional()
+      .describe(
+        "Per-id thread ID hints, comma-separated and positionally matched to --id (bulk UI calls only)",
+      ),
   }),
-  run: async (args) => {
+  run: async (args, ctx) => {
     const ids = args.id
       .split(",")
       .map((s) => s.trim())
@@ -37,33 +67,124 @@ export default defineAction({
     const ownerEmail = getRequestUserEmail();
     if (!ownerEmail) throw new Error("no authenticated user");
 
-    const results: { id: string; success: boolean; error?: string }[] = [];
+    const threadIdList = args.threadIds?.split(",").map((s) => s.trim());
+    const accountEmailList = args.accountEmails
+      ?.split(",")
+      .map((s) => s.trim());
+    const threadIdFor = (i: number) => threadIdList?.[i] || args.threadId;
+    const accountEmailFor = (i: number) =>
+      accountEmailList?.[i] || args.accountEmail;
 
-    for (const id of ids) {
-      try {
-        await archiveEmail({
-          id,
-          ownerEmail,
-          accountEmail: args.accountEmail,
-          removeLabel: args.removeLabel,
-          threadId: args.threadId,
-        });
+    const results: { id: string; success: boolean; error?: string }[] = [];
+    let remainingIds: string[] = [];
+    let retryAfterSeconds: number | undefined;
+
+    if (await isConnected(ownerEmail)) {
+      const targets = ids.map((id, i) => ({
+        id,
+        threadId: threadIdFor(i),
+        accountEmail: accountEmailFor(i),
+      }));
+      const { resolved, unresolved } = await resolveMutationAccounts(
+        ownerEmail,
+        targets,
+      );
+      const {
+        succeeded,
+        failed,
+        threadIdsByTarget,
+        removeLabelIdsByAccount,
+        remaining,
+        retryAfterSeconds: retryDelay,
+      } = await gmailBatchArchiveByAccount(
+        ownerEmail,
+        resolved,
+        args.removeLabel,
+      );
+      remainingIds = remaining;
+      retryAfterSeconds = retryDelay;
+      for (const id of succeeded) {
+        const tid = threadIdsByTarget[id];
+        if (tid) invalidateThreadCache(ownerEmail, tid);
         results.push({ id, success: true });
-      } catch (err: any) {
-        results.push({ id, success: false, error: err?.message ?? "failed" });
+      }
+      for (const f of failed)
+        results.push({ id: f.id, success: false, error: f.error });
+      for (const u of unresolved)
+        results.push({ id: u.id, success: false, error: u.error });
+      const succeededIds = new Set(succeeded);
+      const succeededTargets = resolved
+        .filter((target) => succeededIds.has(target.id))
+        .map((target) => ({
+          ...target,
+          threadId: threadIdsByTarget[target.id] || target.threadId,
+        }));
+      const targetsByAccount = new Map<string, typeof succeededTargets>();
+      for (const target of succeededTargets) {
+        const accountEmail = target.accountEmail.toLowerCase();
+        const group = targetsByAccount.get(accountEmail) ?? [];
+        group.push(target);
+        targetsByAccount.set(accountEmail, group);
+      }
+      for (const [accountEmail, accountTargets] of targetsByAccount) {
+        await syncInboxLabelDeltaForTargets(ownerEmail, accountTargets, {
+          remove: removeLabelIdsByAccount[accountEmail] ?? ["INBOX"],
+        });
+      }
+    } else {
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        try {
+          await archiveEmail({
+            id,
+            ownerEmail,
+            accountEmail: accountEmailFor(i),
+            removeLabel: args.removeLabel,
+            threadId: threadIdFor(i),
+          });
+          results.push({ id, success: true });
+        } catch (err: any) {
+          results.push({ id, success: false, error: err?.message ?? "failed" });
+        }
       }
     }
 
     await writeAppState("refresh-signal", { ts: Date.now() });
 
+    if (remainingIds.length > 0) {
+      return {
+        requested: ids,
+        succeeded: results.filter((result) => result.success).map((r) => r.id),
+        failed: results
+          .filter((result) => !result.success)
+          .map(({ id, error }) => ({ id, error: error ?? "Archive failed" })),
+        remaining: [...new Set(remainingIds)],
+        ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
+      };
+    }
+
     const succeeded = results.filter((r) => r.success).length;
     const failed = results.filter((r) => !r.success);
 
     if (failed.length > 0) {
-      throw new Error(
-        `Archived ${succeeded}/${ids.length} email(s). Failures: ${failed.map((r) => `${r.id}: ${r.error}`).join("; ")}`,
-      );
+      const summary = summarizeArchiveFailures({
+        succeeded,
+        total: ids.length,
+        failures: failed.map((r) => r.error ?? "failed"),
+      });
+      throw userFacingActionError(summary.message, summary.statusCode);
     }
+    track(
+      "inbox_triaged",
+      {
+        app_name: "mail",
+        template_name: "mail",
+        action: "archive",
+        items_triaged: succeeded,
+        succeeded: true,
+      },
+      ctx,
+    );
     return `Archived ${succeeded} email(s) successfully`;
   },
 });

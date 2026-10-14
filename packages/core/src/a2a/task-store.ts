@@ -1,14 +1,33 @@
 import crypto from "crypto";
-import { getDbExec, intType } from "../db/client.js";
+
+import { getDbExec } from "../db/client.js";
+import {
+  ensureTableExists,
+  ensureColumnExists,
+  ensureIndexExists,
+} from "../db/ddl-guard.js";
+import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import { assertA2APersistablePayload } from "./persistence-safety.js";
 import type { Task, Message, TaskState, Artifact } from "./types.js";
 
 let _initPromise: Promise<void> | undefined;
+export const MAX_A2A_IDEMPOTENCY_KEY_CHARS = 128;
+const A2A_IDEMPOTENCY_INDEX = "idx_a2a_tasks_owner_scope_idempotency";
+const A2A_ORG_IDEMPOTENCY_INDEX = "idx_a2a_tasks_org_scope_idempotency";
+const A2A_RECOVERY_INDEX = "idx_a2a_tasks_recovery_created";
+export const A2A_PERSONAL_OWNER_SCOPE = "__personal__";
+export const A2A_ORG_ID_OWNER_SCOPE_PREFIX = "__a2a_org_id__:";
+const MAX_TASK_LIST_PAGE_SIZE = 100;
 
-async function ensureTable(): Promise<void> {
+export interface A2ATaskListCursor {
+  createdAt: number;
+  id: string;
+}
+
+export async function ensureTable(): Promise<void> {
   if (!_initPromise) {
-    _initPromise = (async () => {
-      const client = getDbExec();
-      await client.execute(`
+    const _initPromiseWithRequestDbPoolScope = (async () => {
+      const createSql = `
         CREATE TABLE IF NOT EXISTS a2a_tasks (
           id TEXT PRIMARY KEY,
           context_id TEXT,
@@ -18,33 +37,325 @@ async function ensureTable(): Promise<void> {
           history TEXT NOT NULL DEFAULT '[]',
           artifacts TEXT NOT NULL DEFAULT '[]',
           metadata TEXT,
-          created_at ${intType()} NOT NULL,
-          updated_at ${intType()} NOT NULL
+          owner_email TEXT,
+          owner_scope TEXT NOT NULL DEFAULT '',
+          idempotency_key TEXT,
+          created_at BIGINT NOT NULL,
+          updated_at BIGINT NOT NULL
         )
-      `);
-      // Additive migration: owner_email column. Bound to the JWT-verified
-      // caller at task-creation time so handleGet / handleCancel can reject
-      // mismatched callers (the IDOR class fixed in PR #369). Existing rows
-      // have NULL owner_email and remain accessible to legacy callers via
-      // the legacy-token apiKeyEnv path; new rows are scoped from this point
-      // forward.
-      try {
-        await client.execute(
-          `ALTER TABLE a2a_tasks ADD COLUMN owner_email TEXT`,
-        );
-      } catch {
-        // Column already exists — expected on every restart after first run.
-      }
+      `;
+      const createIdempotencyIndexSql =
+        `CREATE UNIQUE INDEX IF NOT EXISTS ${A2A_IDEMPOTENCY_INDEX} ` +
+        `ON a2a_tasks(owner_email, owner_scope, idempotency_key)`;
+      const createOrgIdempotencyIndexSql =
+        `CREATE UNIQUE INDEX IF NOT EXISTS ${A2A_ORG_IDEMPOTENCY_INDEX} ` +
+        "ON a2a_tasks(owner_scope, idempotency_key) " +
+        "WHERE owner_email IS NULL AND idempotency_key IS NOT NULL";
+      const createRecoveryIndexSql =
+        `CREATE INDEX IF NOT EXISTS ${A2A_RECOVERY_INDEX} ` +
+        "ON a2a_tasks(created_at) " +
+        "WHERE status_state IN ('submitted', 'working', 'processing')";
+      const createApprovalsSql = `
+        CREATE TABLE IF NOT EXISTS a2a_approvals (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL UNIQUE,
+          owner_email TEXT NOT NULL,
+          org_id TEXT,
+          tool_name TEXT NOT NULL,
+          tool_input TEXT NOT NULL,
+          approval_key TEXT NOT NULL,
+          call_id TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          result TEXT,
+          expires_at BIGINT NOT NULL,
+          created_at BIGINT NOT NULL,
+          updated_at BIGINT NOT NULL
+        )
+      `;
+
+      await ensureTableExists("a2a_tasks", createSql);
+      await ensureColumnExists(
+        "a2a_tasks",
+        "owner_email",
+        `ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS owner_email TEXT`,
+      );
+      await ensureColumnExists(
+        "a2a_tasks",
+        "owner_scope",
+        `ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS owner_scope TEXT NOT NULL DEFAULT ''`,
+      );
+      await ensureColumnExists(
+        "a2a_tasks",
+        "idempotency_key",
+        `ALTER TABLE a2a_tasks ADD COLUMN IF NOT EXISTS idempotency_key TEXT`,
+      );
+      await ensureIndexExists(A2A_IDEMPOTENCY_INDEX, createIdempotencyIndexSql);
+      await ensureIndexExists(
+        A2A_ORG_IDEMPOTENCY_INDEX,
+        createOrgIdempotencyIndexSql,
+      );
+      await ensureIndexExists(A2A_RECOVERY_INDEX, createRecoveryIndexSql);
+      await ensureTableExists("a2a_approvals", createApprovalsSql);
     })().catch((err) => {
-      // Retry init on the next call after a failed startup.
       _initPromise = undefined;
       throw err;
     });
+    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
   }
   return _initPromise;
 }
 
-function taskFromRow(row: any): Task & { ownerEmail?: string | null } {
+export interface A2AApprovalRecord {
+  id: string;
+  taskId: string;
+  ownerEmail: string;
+  orgId: string | null;
+  tool: string;
+  input: unknown;
+  approvalKey: string;
+  callId: string;
+  status: "pending" | "processing" | "completed" | "failed";
+  result: string | null;
+  expiresAt: number;
+}
+
+async function withDbTransaction<T>(
+  client: ReturnType<typeof getDbExec>,
+  fn: (tx: ReturnType<typeof getDbExec>) => Promise<T>,
+): Promise<T> {
+  if (client.transaction) return client.transaction(fn);
+  await client.execute("BEGIN");
+  try {
+    const result = await fn(client);
+    await client.execute("COMMIT");
+    return result;
+  } catch (error) {
+    await client.execute("ROLLBACK").catch(() => {});
+    throw error;
+  }
+}
+
+function approvalFromRow(row: any): A2AApprovalRecord {
+  return {
+    id: String(row.id),
+    taskId: String(row.task_id),
+    ownerEmail: String(row.owner_email),
+    orgId: row.org_id ? String(row.org_id) : null,
+    tool: String(row.tool_name),
+    input: JSON.parse(String(row.tool_input)),
+    approvalKey: String(row.approval_key),
+    callId: String(row.call_id),
+    status: row.status,
+    result: row.result ? String(row.result) : null,
+    expiresAt: Number(row.expires_at),
+  };
+}
+
+export async function createA2AApproval(input: {
+  taskId: string;
+  ownerEmail: string;
+  orgId?: string | null;
+  tool: string;
+  toolInput: unknown;
+  approvalKey: string;
+  callId: string;
+  ttlMs?: number;
+}): Promise<A2AApprovalRecord> {
+  assertA2APersistablePayload(input.toolInput, "A2A approval input");
+  await ensureTable();
+  const client = getDbExec();
+  const id = crypto.randomUUID();
+  const now = Date.now();
+  const expiresAt = now + (input.ttlMs ?? 15 * 60_000);
+  await client.execute({
+    sql: `INSERT INTO a2a_approvals (id, task_id, owner_email, org_id, tool_name, tool_input, approval_key, call_id, status, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+    args: [
+      id,
+      input.taskId,
+      input.ownerEmail,
+      input.orgId ?? null,
+      input.tool,
+      JSON.stringify(input.toolInput ?? {}),
+      input.approvalKey,
+      input.callId,
+      expiresAt,
+      now,
+      now,
+    ],
+  });
+  return {
+    id,
+    taskId: input.taskId,
+    ownerEmail: input.ownerEmail,
+    orgId: input.orgId ?? null,
+    tool: input.tool,
+    input: input.toolInput ?? {},
+    approvalKey: input.approvalKey,
+    callId: input.callId,
+    status: "pending",
+    result: null,
+    expiresAt,
+  };
+}
+
+export async function getA2AApprovalForOwner(
+  id: string,
+  ownerEmail: string,
+  orgId?: string | null,
+): Promise<A2AApprovalRecord | null> {
+  await ensureTable();
+  const { rows } = await getDbExec().execute({
+    sql: `SELECT * FROM a2a_approvals WHERE id = ? AND owner_email = ? AND (org_id IS NULL OR org_id = ?)`,
+    args: [id, ownerEmail, orgId ?? null],
+  });
+  return rows[0] ? approvalFromRow(rows[0]) : null;
+}
+
+export async function claimA2AApproval(
+  id: string,
+  ownerEmail: string,
+  orgId?: string | null,
+): Promise<A2AApprovalRecord | null> {
+  await ensureTable();
+  const client = getDbExec();
+  const now = Date.now();
+  class ClaimRejected extends Error {}
+  try {
+    return await withDbTransaction(client, async (tx) => {
+      const approvalUpdate = await tx.execute({
+        sql: `UPDATE a2a_approvals SET status = 'processing', updated_at = ? WHERE id = ? AND owner_email = ? AND status = 'pending' AND expires_at > ? AND (org_id IS NULL OR org_id = ?)`,
+        args: [now, id, ownerEmail, now, orgId ?? null],
+      });
+      if (getAffectedRowCount(approvalUpdate) === 0) throw new ClaimRejected();
+      const { rows } = await tx.execute({
+        sql: `SELECT * FROM a2a_approvals WHERE id = ? AND owner_email = ? AND status = 'processing'`,
+        args: [id, ownerEmail],
+      });
+      if (!rows[0]) throw new ClaimRejected();
+      const approval = approvalFromRow(rows[0]);
+      const timestamp = new Date(now).toISOString();
+      const runningMessage: Message = {
+        role: "agent",
+        parts: [{ type: "text", text: "Approved action is running." }],
+      };
+      const taskUpdate = await tx.execute({
+        sql: `UPDATE a2a_tasks SET status_state = 'working', status_message = ?, status_timestamp = ?, updated_at = ? WHERE id = ? AND owner_email = ? AND status_state = 'input-required'`,
+        args: [
+          JSON.stringify(runningMessage),
+          timestamp,
+          now,
+          approval.taskId,
+          ownerEmail,
+        ],
+      });
+      if (getAffectedRowCount(taskUpdate) === 0) throw new ClaimRejected();
+      return approval;
+    });
+  } catch (error) {
+    if (error instanceof ClaimRejected) return null;
+    throw error;
+  }
+}
+
+export async function settleA2AApproval(
+  id: string,
+  status: "completed" | "failed",
+  resultText: string,
+): Promise<void> {
+  let settledStatus = status;
+  let settledText = resultText;
+  try {
+    assertA2APersistablePayload(resultText, "A2A approval result");
+  } catch {
+    settledStatus = "failed";
+    settledText =
+      "The approved action result could not be safely stored. Verify its outcome before retrying.";
+  }
+  await ensureTable();
+  const client = getDbExec();
+  const now = Date.now();
+  const message: Message = {
+    role: "agent",
+    parts: [{ type: "text", text: settledText }],
+  };
+  await withDbTransaction(client, async (tx) => {
+    const { rows } = await tx.execute({
+      sql: `SELECT task_id FROM a2a_approvals WHERE id = ? AND status = 'processing'`,
+      args: [id],
+    });
+    if (!rows[0]) throw new Error("Approval is not processing");
+    const taskId = String((rows[0] as any).task_id);
+    const { rows: taskRows } = await tx.execute({
+      sql: `SELECT history FROM a2a_tasks WHERE id = ? AND status_state = 'working'`,
+      args: [taskId],
+    });
+    if (!taskRows[0]) {
+      throw new Error("Approval task is no longer awaiting settlement");
+    }
+    const history = JSON.parse(String((taskRows[0] as any).history));
+    history.push(message);
+    assertA2APersistablePayload(history, "A2A task history");
+    const timestamp = new Date(now).toISOString();
+    const taskUpdate = await tx.execute({
+      sql: `UPDATE a2a_tasks SET status_state = ?, status_message = ?, status_timestamp = ?, history = ?, updated_at = ? WHERE id = ? AND status_state = 'working'`,
+      args: [
+        settledStatus,
+        JSON.stringify(message),
+        timestamp,
+        JSON.stringify(history),
+        now,
+        taskId,
+      ],
+    });
+    if (getAffectedRowCount(taskUpdate) === 0) {
+      throw new Error("Approval task settlement lost its state claim");
+    }
+    const approvalUpdate = await tx.execute({
+      sql: `UPDATE a2a_approvals SET status = ?, result = ?, updated_at = ? WHERE id = ? AND status = 'processing'`,
+      args: [settledStatus, settledText, now, id],
+    });
+    if (getAffectedRowCount(approvalUpdate) === 0) {
+      throw new Error("Approval settlement lost its state claim");
+    }
+  });
+}
+
+export async function pauseProcessingA2ATask(
+  id: string,
+  message: Message,
+): Promise<Task | null> {
+  assertA2APersistablePayload(message, "A2A task status message");
+  await ensureTable();
+  const client = getDbExec();
+  const { rows } = await client.execute({
+    sql: `SELECT * FROM a2a_tasks WHERE id = ? AND status_state = 'processing'`,
+    args: [id],
+  });
+  if (!rows[0]) return null;
+  const task = taskFromRow(rows[0]);
+  task.history?.push(message);
+  assertA2APersistablePayload(task.history, "A2A task history");
+  const now = Date.now();
+  const timestamp = new Date(now).toISOString();
+  const result = await client.execute({
+    sql: `UPDATE a2a_tasks SET status_state = 'input-required', status_message = ?, status_timestamp = ?, history = ?, updated_at = ? WHERE id = ? AND status_state = 'processing'`,
+    args: [
+      JSON.stringify(message),
+      timestamp,
+      JSON.stringify(task.history ?? []),
+      now,
+      id,
+    ],
+  });
+  if (getAffectedRowCount(result) === 0) return null;
+  task.status = { state: "input-required", message, timestamp };
+  return task;
+}
+
+function taskFromRow(row: any): Task & {
+  ownerEmail?: string | null;
+  ownerScope?: string | null;
+} {
   return {
     id: row.id as string,
     contextId: (row.context_id as string) || undefined,
@@ -59,6 +370,7 @@ function taskFromRow(row: any): Task & { ownerEmail?: string | null } {
     artifacts: JSON.parse(row.artifacts as string),
     metadata: row.metadata ? JSON.parse(row.metadata as string) : undefined,
     ownerEmail: (row.owner_email as string | null) ?? null,
+    ownerScope: (row.owner_scope as string | null) ?? null,
   };
 }
 
@@ -80,7 +392,10 @@ export async function createTask(
   contextId?: string,
   metadata?: Record<string, unknown>,
   ownerEmail?: string | null,
+  ownerScope?: string | null,
 ): Promise<Task> {
+  assertA2APersistablePayload(message, "A2A task message");
+  assertA2APersistablePayload(metadata, "A2A task metadata");
   await ensureTable();
   const client = getDbExec();
   const id = crypto.randomUUID();
@@ -97,7 +412,7 @@ export async function createTask(
   };
 
   await client.execute({
-    sql: `INSERT INTO a2a_tasks (id, context_id, status_state, status_timestamp, history, artifacts, metadata, owner_email, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    sql: `INSERT INTO a2a_tasks (id, context_id, status_state, status_timestamp, history, artifacts, metadata, owner_email, owner_scope, idempotency_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       id,
       contextId ?? null,
@@ -107,6 +422,8 @@ export async function createTask(
       "[]",
       metadata ? JSON.stringify(metadata) : null,
       ownerEmail ?? null,
+      ownerScope ?? "",
+      null,
       now,
       now,
     ],
@@ -115,35 +432,128 @@ export async function createTask(
   return task;
 }
 
-/**
- * Fetch the verified owner email recorded against a task at creation time.
- * Returns null when the task has no owner (legacy rows or unauthenticated
- * deployments) or when the task is missing.
- *
- * Used by `handleGet` / `handleCancel` to reject IDOR access — the JWT-
- * verified caller's email must match `owner_email` to read or cancel.
- */
+export async function createOrReuseTask(
+  message: Message,
+  contextId: string | undefined,
+  metadata: Record<string, unknown> | undefined,
+  ownerEmail: string | null,
+  ownerScope: string | null,
+  idempotencyKey: string | undefined,
+): Promise<{ task: Task; reused: boolean }> {
+  assertA2APersistablePayload(message, "A2A task message");
+  assertA2APersistablePayload(metadata, "A2A task metadata");
+  const normalizedOwner = ownerEmail?.trim().toLowerCase() || null;
+  const normalizedScope =
+    ownerScope?.trim().toLowerCase() ||
+    (normalizedOwner ? A2A_PERSONAL_OWNER_SCOPE : null);
+  if (!idempotencyKey || !normalizedScope) {
+    return {
+      task: await createTask(
+        message,
+        contextId,
+        metadata,
+        ownerEmail,
+        ownerScope,
+      ),
+      reused: false,
+    };
+  }
+  if (idempotencyKey.length > MAX_A2A_IDEMPOTENCY_KEY_CHARS) {
+    throw new Error("A2A idempotency key is too long");
+  }
+
+  await ensureTable();
+  const client = getDbExec();
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const id = crypto.randomUUID();
+    const now = Date.now();
+    const timestamp = new Date().toISOString();
+    await client.execute({
+      sql: `INSERT INTO a2a_tasks (id, context_id, status_state, status_timestamp, history, artifacts, metadata, owner_email, owner_scope, idempotency_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+      args: [
+        id,
+        contextId ?? null,
+        "submitted",
+        timestamp,
+        JSON.stringify([message]),
+        "[]",
+        metadata ? JSON.stringify(metadata) : null,
+        normalizedOwner,
+        normalizedScope,
+        idempotencyKey,
+        now,
+        now,
+      ],
+    });
+
+    const { rows } = await client.execute({
+      sql: `SELECT * FROM a2a_tasks WHERE owner_email IS NOT DISTINCT FROM ? AND owner_scope = ? AND idempotency_key = ?`,
+      args: [normalizedOwner, normalizedScope, idempotencyKey],
+    });
+    if (rows.length === 0) {
+      throw new Error("A2A idempotent task insert could not be verified");
+    }
+    const task = taskFromRow(rows[0]);
+    const reused = task.id !== id;
+    if (
+      reused &&
+      (task.status.state === "failed" || task.status.state === "canceled")
+    ) {
+      await client.execute({
+        sql: `UPDATE a2a_tasks SET idempotency_key = NULL, updated_at = ? WHERE id = ? AND idempotency_key = ? AND status_state IN ('failed', 'canceled')`,
+        args: [Date.now(), task.id, idempotencyKey],
+      });
+      continue;
+    }
+    return { task, reused };
+  }
+  throw new Error("A2A terminal task idempotency key could not be released");
+}
+
+export interface A2ATaskOwnership {
+  ownerEmail: string | null;
+  ownerScope: string | null;
+}
+
+export interface A2ATaskAccessScope {
+  ownerEmail: string;
+  ownerScope: string | null;
+}
+
+function taskAccessPredicate(scope: A2ATaskAccessScope | undefined): {
+  sql: string;
+  args: unknown[];
+} {
+  if (!scope) return { sql: "", args: [] };
+  return {
+    sql: " AND LOWER(COALESCE(owner_email, '')) = LOWER(?) AND LOWER(COALESCE(owner_scope, '')) = LOWER(?)",
+    args: [scope.ownerEmail, scope.ownerScope ?? ""],
+  };
+}
+
 export async function getTaskOwner(id: string): Promise<string | null> {
+  return (await getTaskOwnership(id)).ownerEmail;
+}
+
+export async function getTaskOwnership(id: string): Promise<A2ATaskOwnership> {
   await ensureTable();
   const client = getDbExec();
   const { rows } = await client.execute({
-    sql: `SELECT owner_email FROM a2a_tasks WHERE id = ?`,
+    sql: `SELECT owner_email, owner_scope FROM a2a_tasks WHERE id = ?`,
     args: [id],
   });
-  if (rows.length === 0) return null;
+  if (rows.length === 0) return { ownerEmail: null, ownerScope: null };
   const ownerEmail = (rows[0] as any).owner_email;
-  return typeof ownerEmail === "string" && ownerEmail ? ownerEmail : null;
+  const ownerScope = (rows[0] as any).owner_scope;
+  return {
+    ownerEmail:
+      typeof ownerEmail === "string" && ownerEmail ? ownerEmail : null,
+    ownerScope:
+      typeof ownerScope === "string" && ownerScope ? ownerScope : null,
+  };
 }
 
-/**
- * Atomically claim a task for processing. Only succeeds when the task is in
- * state 'submitted' or 'working' — flipping it to 'processing' so concurrent
- * processors can't pick it up twice. Returns the task if claimed, null if it
- * was already claimed/completed/missing.
- *
- * Used by the cross-platform async processor (`_process-task` route) to avoid
- * duplicate handler runs when retries fire.
- */
 export async function claimA2ATaskForProcessing(
   id: string,
 ): Promise<Task | null> {
@@ -177,11 +587,12 @@ export async function getA2ATaskDispatchState(id: string): Promise<{
   statusState: string;
   metadata: Record<string, unknown> | undefined;
   updatedAt: number;
+  createdAt: number;
 } | null> {
   await ensureTable();
   const client = getDbExec();
   const { rows } = await client.execute({
-    sql: `SELECT id, status_state, metadata, updated_at FROM a2a_tasks WHERE id = ?`,
+    sql: `SELECT id, status_state, metadata, created_at, updated_at FROM a2a_tasks WHERE id = ?`,
     args: [id],
   });
   const row = rows[0] as any;
@@ -191,6 +602,7 @@ export async function getA2ATaskDispatchState(id: string): Promise<{
     statusState: row.status_state as string,
     metadata: row.metadata ? JSON.parse(row.metadata as string) : undefined,
     updatedAt: Number(row.updated_at ?? 0),
+    createdAt: Number(row.created_at ?? 0),
   };
 }
 
@@ -250,7 +662,52 @@ export async function failStuckA2ATask(
   id: string,
   processingCutoff: number,
   reason: string,
+  createdAtCutoff?: number,
 ): Promise<boolean> {
+  assertA2APersistablePayload(reason, "A2A task failure status");
+  await ensureTable();
+  const client = getDbExec();
+  const now = Date.now();
+  const timestamp = new Date().toISOString();
+  const message: Message = {
+    role: "agent",
+    parts: [{ type: "text", text: reason }],
+  };
+  const ageCondition =
+    createdAtCutoff !== undefined
+      ? `AND (updated_at <= ? OR created_at <= ?)`
+      : `AND updated_at <= ?`;
+  const result = await client.execute({
+    sql: `UPDATE a2a_tasks
+            SET status_state = 'failed',
+                status_message = ?,
+                status_timestamp = ?,
+                updated_at = ?
+          WHERE id = ?
+            AND status_state = 'processing'
+            ${ageCondition}`,
+    args:
+      createdAtCutoff !== undefined
+        ? [
+            JSON.stringify(message),
+            timestamp,
+            now,
+            id,
+            processingCutoff,
+            createdAtCutoff,
+          ]
+        : [JSON.stringify(message), timestamp, now, id, processingCutoff],
+  });
+  const affected = getAffectedRowCount(result);
+  return affected !== 0;
+}
+
+export async function failStuckQueuedA2ATask(
+  id: string,
+  createdAtCutoff: number,
+  reason: string,
+): Promise<boolean> {
+  assertA2APersistablePayload(reason, "A2A task failure status");
   await ensureTable();
   const client = getDbExec();
   const now = Date.now();
@@ -266,20 +723,24 @@ export async function failStuckA2ATask(
                 status_timestamp = ?,
                 updated_at = ?
           WHERE id = ?
-            AND status_state = 'processing'
-            AND updated_at <= ?`,
-    args: [JSON.stringify(message), timestamp, now, id, processingCutoff],
+            AND status_state IN ('submitted', 'working')
+            AND created_at <= ?`,
+    args: [JSON.stringify(message), timestamp, now, id, createdAtCutoff],
   });
   const affected = getAffectedRowCount(result);
   return affected !== 0;
 }
 
-export async function getTask(id: string): Promise<Task | null> {
+export async function getTask(
+  id: string,
+  accessScope?: A2ATaskAccessScope,
+): Promise<Task | null> {
   await ensureTable();
   const client = getDbExec();
+  const predicate = taskAccessPredicate(accessScope);
   const { rows } = await client.execute({
-    sql: `SELECT * FROM a2a_tasks WHERE id = ?`,
-    args: [id],
+    sql: `SELECT * FROM a2a_tasks WHERE id = ?${predicate.sql}`,
+    args: [id, ...predicate.args],
   });
   if (rows.length === 0) return null;
   return taskFromRow(rows[0]);
@@ -292,14 +753,17 @@ export async function updateTask(
     message?: Message;
     artifacts?: Artifact[];
   },
+  accessScope?: A2ATaskAccessScope,
 ): Promise<Task | null> {
+  assertA2APersistablePayload(update.message, "A2A task message");
+  assertA2APersistablePayload(update.artifacts, "A2A task artifacts");
   await ensureTable();
   const client = getDbExec();
+  const predicate = taskAccessPredicate(accessScope);
 
-  // Read current task
   const { rows } = await client.execute({
-    sql: `SELECT * FROM a2a_tasks WHERE id = ?`,
-    args: [id],
+    sql: `SELECT * FROM a2a_tasks WHERE id = ?${predicate.sql}`,
+    args: [id, ...predicate.args],
   });
   if (rows.length === 0) return null;
 
@@ -321,9 +785,84 @@ export async function updateTask(
   if (update.artifacts) {
     task.artifacts = [...(task.artifacts ?? []), ...update.artifacts];
   }
+  assertA2APersistablePayload(task.status.message, "A2A task status message");
+  assertA2APersistablePayload(task.history, "A2A task history");
+  assertA2APersistablePayload(task.artifacts, "A2A task artifacts");
 
-  await client.execute({
-    sql: `UPDATE a2a_tasks SET status_state = ?, status_message = ?, status_timestamp = ?, history = ?, artifacts = ?, updated_at = ? WHERE id = ?`,
+  const result = await client.execute({
+    sql: `UPDATE a2a_tasks SET status_state = ?, status_message = ?, status_timestamp = ?, history = ?, artifacts = ?, updated_at = ? WHERE id = ?${predicate.sql}`,
+    args: [
+      task.status.state,
+      task.status.message ? JSON.stringify(task.status.message) : null,
+      task.status.timestamp,
+      JSON.stringify(task.history),
+      JSON.stringify(task.artifacts),
+      now,
+      id,
+      ...predicate.args,
+    ],
+  });
+
+  if (accessScope && getAffectedRowCount(result) !== 1) {
+    return null;
+  }
+
+  return task;
+}
+
+/**
+ * Persist the terminal result produced by the async processor, but only while
+ * that processor still owns a task in `processing`. A tasks/get request may
+ * fail an over-lifetime processor while its handler is still running; the
+ * handler cannot be canceled reliably, so this compare-and-set is what keeps
+ * its eventual completion (or error) from overwriting the timeout result.
+ */
+export async function settleProcessingA2ATask(
+  id: string,
+  update: {
+    state: "completed" | "failed";
+    message?: Message;
+    artifacts?: Artifact[];
+  },
+): Promise<Task | null> {
+  assertA2APersistablePayload(update.message, "A2A task result message");
+  assertA2APersistablePayload(update.artifacts, "A2A task result artifacts");
+  await ensureTable();
+  const client = getDbExec();
+
+  const { rows } = await client.execute({
+    sql: `SELECT * FROM a2a_tasks WHERE id = ?`,
+    args: [id],
+  });
+  if (rows.length === 0) return null;
+
+  const task = taskFromRow(rows[0]);
+  const now = Date.now();
+  task.status = {
+    state: update.state,
+    message: update.message ?? task.status.message,
+    timestamp: new Date().toISOString(),
+  };
+  if (update.message && task.history) {
+    task.history.push(update.message);
+  }
+  if (update.artifacts) {
+    task.artifacts = [...(task.artifacts ?? []), ...update.artifacts];
+  }
+  assertA2APersistablePayload(task.status.message, "A2A task status message");
+  assertA2APersistablePayload(task.history, "A2A task history");
+  assertA2APersistablePayload(task.artifacts, "A2A task artifacts");
+
+  const result = await client.execute({
+    sql: `UPDATE a2a_tasks
+            SET status_state = ?,
+                status_message = ?,
+                status_timestamp = ?,
+                history = ?,
+                artifacts = ?,
+                updated_at = ?
+          WHERE id = ?
+            AND status_state = 'processing'`,
     args: [
       task.status.state,
       task.status.message ? JSON.stringify(task.status.message) : null,
@@ -334,7 +873,8 @@ export async function updateTask(
       id,
     ],
   });
-
+  const affected = getAffectedRowCount(result);
+  if (affected === 0) return null;
   return task;
 }
 
@@ -342,6 +882,7 @@ export async function updateTaskStatusMessage(
   id: string,
   message: Message,
 ): Promise<void> {
+  assertA2APersistablePayload(message, "A2A task status message");
   await ensureTable();
   const client = getDbExec();
   const now = Date.now();
@@ -357,20 +898,58 @@ export async function updateTaskStatusMessage(
   });
 }
 
-export async function listTasks(contextId?: string): Promise<Task[]> {
+export async function listTasksPage(
+  contextId?: string,
+  options: { limit?: number; before?: A2ATaskListCursor } = {},
+): Promise<{ tasks: Task[]; nextCursor: A2ATaskListCursor | null }> {
   await ensureTable();
   const client = getDbExec();
-
+  const requestedLimit = options.limit ?? MAX_TASK_LIST_PAGE_SIZE;
+  const limit = Number.isFinite(requestedLimit)
+    ? Math.min(MAX_TASK_LIST_PAGE_SIZE, Math.max(1, Math.floor(requestedLimit)))
+    : MAX_TASK_LIST_PAGE_SIZE;
+  const conditions: string[] = [];
+  const args: unknown[] = [];
   if (contextId) {
-    const { rows } = await client.execute({
-      sql: `SELECT * FROM a2a_tasks WHERE context_id = ? ORDER BY created_at DESC`,
-      args: [contextId],
-    });
-    return rows.map(taskFromRow);
+    conditions.push("context_id = ?");
+    args.push(contextId);
   }
+  if (options.before) {
+    conditions.push("(created_at < ? OR (created_at = ? AND id < ?))");
+    args.push(
+      options.before.createdAt,
+      options.before.createdAt,
+      options.before.id,
+    );
+  }
+  const where =
+    conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const { rows } = await client.execute({
+    sql: `SELECT id, context_id, status_state, status_message, status_timestamp, history, artifacts, metadata, owner_email, owner_scope, created_at
+      FROM a2a_tasks ${where}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?`,
+    args: [...args, limit + 1],
+  });
+  const hasMore = rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  const lastRow = pageRows.at(-1) as Record<string, unknown> | undefined;
+  return {
+    tasks: pageRows.map(taskFromRow),
+    nextCursor:
+      hasMore && lastRow
+        ? { createdAt: Number(lastRow.created_at), id: String(lastRow.id) }
+        : null,
+  };
+}
 
-  const { rows } = await client.execute(
-    `SELECT * FROM a2a_tasks ORDER BY created_at DESC`,
-  );
-  return rows.map(taskFromRow);
+export async function listTasks(contextId?: string): Promise<Task[]> {
+  const tasks: Task[] = [];
+  let before: A2ATaskListCursor | undefined;
+  while (true) {
+    const page = await listTasksPage(contextId, { before });
+    tasks.push(...page.tasks);
+    if (!page.nextCursor) return tasks;
+    before = page.nextCursor;
+  }
 }

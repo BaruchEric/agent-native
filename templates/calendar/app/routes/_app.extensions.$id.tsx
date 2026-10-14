@@ -1,6 +1,8 @@
+import { ExtensionViewerPage } from "@agent-native/toolkit/app/extensions";
 import { useMemo } from "react";
-import { ExtensionViewerPage } from "@agent-native/core/client/extensions";
+
 import { useAppHeaderControls } from "@/components/layout/AppLayout";
+import { HeaderActions } from "@/components/layout/HeaderActions";
 
 export default function ExtensionViewerRoute() {
   const controls = useMemo(
@@ -14,5 +16,5 @@ export default function ExtensionViewerRoute() {
     [],
   );
   useAppHeaderControls(controls);
-  return <ExtensionViewerPage />;
+  return <ExtensionViewerPage headerActions={<HeaderActions />} />;
 }

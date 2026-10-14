@@ -1,61 +1,40 @@
-/**
- * MCP client configuration loading.
- *
- * Resolves `mcp.config.json` in the following precedence order:
- *   1. Workspace root (detected via `agent-native.workspaceCore` in package.json)
- *   2. App root (`process.cwd()`)
- *   3. `MCP_SERVERS` env var (JSON string) — for CI / production deploys
- *
- * Returns `null` when nothing is configured.
- *
- * This module is Node-only — it reads the filesystem. `loadMcpConfig()` guards
- * every fs operation with `isNode()` so a non-Node bundle simply gets `null`.
- */
-
 import fs from "node:fs";
-import path from "node:path";
 import os from "node:os";
-import { findWorkspaceRoot } from "../scripts/utils.js";
+import path from "node:path";
 
-/**
- * Stdio transport — spawns a local binary and speaks MCP over its stdio.
- * This is the default when no `type` field is set (backward compat).
- */
+import { findWorkspaceRoot } from "../scripts/workspace-root.js";
+
 export interface McpStdioServerConfig {
   type?: "stdio";
-  /** Executable or path to spawn over stdio */
   command: string;
-  /** Arguments passed to the command */
   args?: string[];
-  /** Extra env vars merged into process.env for the spawned server */
   env?: Record<string, string>;
-  /** Optional working directory for the spawned process */
   cwd?: string;
-  /** Human-readable description (optional, shown in /mcp/status) */
   description?: string;
 }
 
-/**
- * HTTP transport — connects to a remote MCP server over Streamable HTTP
- * (the transport hosted providers like Zapier / Cloudflare / Composio use).
- */
 export interface McpHttpServerConfig {
   type: "http";
-  /** Full URL of the remote MCP server's Streamable HTTP endpoint. */
   url: string;
-  /** Extra headers to send with every request (e.g. Authorization). */
   headers?: Record<string, string>;
-  /** Human-readable description (optional, shown in /mcp/status) */
+  firstParty?: boolean;
+  firstPartyAppId?: string;
+  firstPartyOrgId?: string;
   description?: string;
 }
 
 export type McpServerConfig = McpStdioServerConfig | McpHttpServerConfig;
 
 export interface McpConfig {
-  /** Map of server id → config */
   servers: Record<string, McpServerConfig>;
-  /** Where the config was loaded from (workspace root path, app path, or "env") */
   source?: string;
+}
+
+const DESKTOP_COMPUTER_SERVER_ID = "agent-native-desktop-computer";
+
+export interface DesktopChildComputerMcpServer {
+  id: string;
+  config: McpHttpServerConfig;
 }
 
 function isNode(): boolean {
@@ -118,11 +97,6 @@ function parseConfig(raw: string, source: string): McpConfig | null {
   }
 }
 
-/**
- * Load MCP configuration.
- *
- * @param startDir - Directory to start the upward search from (defaults to cwd)
- */
 export function loadMcpConfig(startDir?: string): McpConfig | null {
   const envConfig = readEnvConfig();
 
@@ -135,8 +109,58 @@ export function loadMcpConfig(startDir?: string): McpConfig | null {
     }
   }
 
-  if (fileConfig) return fileConfig;
-  return envConfig;
+  return mergeDesktopChildComputerConfig(fileConfig ?? envConfig);
+}
+
+export function resolveDesktopChildComputerMcpServer(
+  existingServers: Record<string, McpServerConfig>,
+  environment: NodeJS.ProcessEnv = process.env,
+): DesktopChildComputerMcpServer | null {
+  if (environment.AGENT_NATIVE_DESKTOP_CHILD !== "1") return null;
+  const url = environment.AGENT_NATIVE_DESKTOP_COMPUTER_MCP_URL?.trim();
+  const token = environment.AGENT_NATIVE_DESKTOP_COMPUTER_MCP_TOKEN?.trim();
+  if (!url || !token || !/^[A-Za-z0-9_-]{32,}$/.test(token)) return null;
+  if (!URL.canParse(url)) return null;
+  const parsed = new URL(url);
+  if (
+    parsed.protocol !== "http:" ||
+    parsed.hostname !== "127.0.0.1" ||
+    parsed.pathname !== "/mcp" ||
+    parsed.username ||
+    parsed.password
+  ) {
+    return null;
+  }
+  let serverId = DESKTOP_COMPUTER_SERVER_ID;
+  for (let suffix = 2; existingServers[serverId]; suffix += 1) {
+    serverId = `${DESKTOP_COMPUTER_SERVER_ID}-${suffix}`;
+  }
+  return {
+    id: serverId,
+    config: {
+      type: "http",
+      url,
+      headers: { Authorization: `Bearer ${token}` },
+      description:
+        "Authenticated computer control for this Agent-Native desktop task",
+    },
+  };
+}
+
+function mergeDesktopChildComputerConfig(
+  base: McpConfig | null,
+): McpConfig | null {
+  const desktopServer = resolveDesktopChildComputerMcpServer(
+    base?.servers ?? {},
+  );
+  if (!desktopServer) return base;
+  return {
+    servers: {
+      ...(base?.servers ?? {}),
+      [desktopServer.id]: desktopServer.config,
+    },
+    source: base?.source ? `${base.source}+desktop-child` : "desktop-child",
+  };
 }
 
 function readEnvConfig(): McpConfig | null {
@@ -144,10 +168,8 @@ function readEnvConfig(): McpConfig | null {
   const raw = process.env?.MCP_SERVERS;
   if (!raw || !raw.trim()) return null;
   const trimmed = raw.trim();
-  // Try full shape first ({ servers: {...} })
   const full = parseConfig(trimmed, "env:MCP_SERVERS");
   if (full) return full;
-  // Then try inner-map shape ({ <id>: {...} })
   return parseConfig(`{"servers":${trimmed}}`, "env:MCP_SERVERS");
 }
 
@@ -170,13 +192,6 @@ function readFileConfig(startDir?: string): McpConfig | null {
   return null;
 }
 
-/**
- * Auto-detect the claude-in-chrome MCP server if it's installed but no
- * config file exists. Gated by `AGENT_NATIVE_DISABLE_MCP_AUTODETECT`.
- *
- * Returns a synthesized config pointing at the detected binary, or `null`
- * when nothing is found or auto-detect is disabled.
- */
 export function autoDetectMcpConfig(): McpConfig | null {
   if (!isNode()) return null;
   if (process.env.AGENT_NATIVE_DISABLE_MCP_AUTODETECT) return null;

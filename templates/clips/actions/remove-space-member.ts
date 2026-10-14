@@ -1,14 +1,8 @@
-/**
- * Remove a member from a space.
- *
- * Usage:
- *   pnpm action remove-space-member --spaceId=<id> --email=alice@example.com
- */
-
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import { requireOrganizationAccess } from "../server/lib/recordings.js";
 

@@ -1,32 +1,18 @@
-/**
- * Machine-readable manifest of what this package ships.
- *
- * Consumed by `agent-native add scheduling` (or the template scaffolder) to:
- *   - generate stub action files in the consumer's `actions/` folder
- *   - symlink/copy skill files into the consumer's `.agents/skills/`
- *   - append required secret declarations
- *   - print the list in `agent-native info @agent-native/scheduling`
- */
-
 export interface SchedulingManifest {
+  manifestVersion: 1;
   name: string;
-  version: string;
   actions: string[];
   schemaEntryPoint: string;
-  docs: {
-    llms: string;
-    llmsFull: string;
-    skills: string[];
-  };
+  docs: { llms: string; llmsFull: string; skills: string[] };
   requiredSecrets: { key: string; label: string; optional?: boolean }[];
   peerProviders: string[];
+  eject?: { sourceRoot: string; targetDirectory: string };
 }
 
 export const MANIFEST: SchedulingManifest = {
+  manifestVersion: 1,
   name: "@agent-native/scheduling",
-  version: "0.1.0",
   actions: [
-    // Event types
     "list-event-types",
     "get-event-type",
     "create-event-type",
@@ -38,7 +24,6 @@ export const MANIFEST: SchedulingManifest = {
     "set-event-type-location",
     "add-private-link",
     "revoke-private-link",
-    // Availability / schedules
     "list-schedules",
     "create-schedule",
     "update-schedule",
@@ -49,7 +34,6 @@ export const MANIFEST: SchedulingManifest = {
     "get-availability",
     "check-availability",
     "find-available-slot",
-    // Bookings
     "list-bookings",
     "get-booking",
     "create-booking",
@@ -62,7 +46,6 @@ export const MANIFEST: SchedulingManifest = {
     "send-reschedule-link",
     "add-booking-note",
     "export-bookings-csv",
-    // Integrations
     "list-calendar-integrations",
     "connect-calendar",
     "connect-video",
@@ -72,29 +55,24 @@ export const MANIFEST: SchedulingManifest = {
     "set-destination-calendar",
     "refresh-busy-times",
     "install-conferencing-app",
-    // Team
     "create-team",
     "invite-team-member",
     "accept-team-invite",
     "remove-team-member",
     "update-member-role",
     "set-team-branding",
-    // Round-robin / hosts
     "assign-round-robin-host",
     "set-event-type-hosts",
     "set-host-availability-override",
     "create-host-group",
-    // Settings / profile
     "update-profile",
     "set-appearance",
     "set-default-conferencing-app",
-    // Workflows
     "list-workflows",
     "create-workflow",
     "update-workflow",
     "delete-workflow",
     "toggle-workflow",
-    // Routing forms
     "list-routing-forms",
     "create-routing-form",
     "update-routing-form",
@@ -168,7 +146,12 @@ export const MANIFEST: SchedulingManifest = {
     "google-calendar",
     "office365",
     "zoom",
+    "teams",
     "google-meet",
     "builtin-video",
   ],
+  eject: {
+    sourceRoot: "src",
+    targetDirectory: "packages/scheduling",
+  },
 };

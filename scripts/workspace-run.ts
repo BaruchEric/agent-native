@@ -55,13 +55,18 @@ const concurrency = resolveConcurrency(
 );
 const pnpmArgs = [
   "-r",
+  ...(process.env.GITHUB_ACTIONS === "true"
+    ? ["--filter", "!agentnative", "--filter", "!./community-templates/**"]
+    : []),
+  "--no-bail",
   `--workspace-concurrency=${formatConcurrency(concurrency)}`,
   ...profile.pnpmArgs,
+  "run",
   profile.script,
 ];
 
 if (parsedArgs.forwarded.length > 0) {
-  pnpmArgs.push("--", ...parsedArgs.forwarded);
+  pnpmArgs.push(...parsedArgs.forwarded);
 }
 
 const command = pnpmCommand();
@@ -78,7 +83,10 @@ if (parsedArgs.dryRun) {
 
 const child = spawn(command, pnpmArgs, {
   cwd: process.cwd(),
-  env: process.env,
+  env:
+    profileName === "test" && !process.env.DATABASE_URL
+      ? { ...process.env, DATABASE_URL: "pglite:memory" }
+      : process.env,
   stdio: "inherit",
 });
 

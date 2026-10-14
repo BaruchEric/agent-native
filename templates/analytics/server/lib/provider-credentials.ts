@@ -1,13 +1,31 @@
-import { resolveCredential, type CredentialContext } from "./credentials";
-import type { WorkspaceConnectionCredentialResolution } from "@agent-native/core/workspace-connections";
-import { resolveWorkspaceConnectionCredentialForApp } from "@agent-native/core/workspace-connections";
+import { isAgentConnectionRequiredError } from "@agent-native/core/action";
+import {
+  isProviderApiId,
+  resolveProviderApiOAuthAccessToken,
+} from "@agent-native/core/provider-api";
 import type { SecretRef } from "@agent-native/core/secrets";
+import type { WorkspaceConnectionCredentialResolution } from "@agent-native/core/workspace-connections";
+import {
+  resolveWorkspaceConnectionCredentialForApp,
+  resolveWorkspaceConnectionForApp,
+} from "@agent-native/core/workspace-connections";
+
+import {
+  resolveCredentialDetailed,
+  type CredentialContext,
+} from "./credentials";
 
 export const ANALYTICS_APP_ID = "analytics";
 
 export const HUBSPOT_ANALYTICS_CREDENTIAL_KEYS = [
   "HUBSPOT_PRIVATE_APP_TOKEN",
   "HUBSPOT_ACCESS_TOKEN",
+] as const;
+
+export const CLAY_ANALYTICS_CREDENTIAL_KEYS = ["CLAY_PUBLIC_API_KEY"] as const;
+
+export const BUILDER_ANALYTICS_CREDENTIAL_KEYS = [
+  "BUILDER_PUBLIC_KEY",
 ] as const;
 
 export const GONG_ANALYTICS_CREDENTIAL_KEYS = [
@@ -29,6 +47,7 @@ export interface AnalyticsProviderCredential {
   connectionId?: string;
   connectionLabel?: string;
   scope?: SecretRef["scope"];
+  scopeId?: string;
 }
 
 export interface ResolveProviderCredentialOptions {
@@ -64,7 +83,7 @@ function uniqueKeys(keys: string | readonly string[]): string[] {
 
 function normalizeCoreCredentialResult(
   result: WorkspaceConnectionCredentialResolution,
-  fallback: { provider: string; key: string },
+  fallback: { provider: string; key: string; ctx: CredentialContext },
 ): AnalyticsProviderCredential | null {
   if (!result.available || !result.value) return null;
   const scope =
@@ -81,6 +100,11 @@ function normalizeCoreCredentialResult(
     connectionId: result.provenance?.connectionId,
     connectionLabel: result.provenance?.connectionLabel,
     scope,
+    ...(scope === "user"
+      ? { scopeId: fallback.ctx.userEmail }
+      : scope === "org" || scope === "workspace"
+        ? { scopeId: fallback.ctx.orgId ?? undefined }
+        : {}),
   };
 }
 
@@ -139,15 +163,68 @@ async function resolveViaCoreHelper({
       connectionId: normalizedConnectionId,
       userEmail: ctx.userEmail,
       orgId: ctx.orgId,
+      ...(ctx.credentialScope === "org"
+        ? { credentialScope: "org" as const }
+        : {}),
     });
     const credential = normalizeCoreCredentialResult(result, {
       provider,
       key,
+      ctx,
     });
     if (credential) return credential;
   }
 
   return null;
+}
+
+async function resolveWorkspaceOAuthProviderCredential(
+  options: ResolveProviderCredentialOptions,
+): Promise<AnalyticsProviderCredential | null> {
+  if (options.workspaceConnection === false) return null;
+  const provider = options.provider.trim().toLowerCase();
+  if (!isProviderApiId(provider)) return null;
+  if (provider === "bigquery" && options.ctx.credentialScope === "org") {
+    return null;
+  }
+
+  const requestedConnectionId = options.connectionId?.trim() || undefined;
+  const resolvedConnection = await resolveWorkspaceConnectionForApp({
+    appId: ANALYTICS_APP_ID,
+    provider,
+    connectionId: requestedConnectionId,
+    ...(provider === "bigquery"
+      ? { connectionOwnerEmail: options.ctx.userEmail }
+      : {}),
+    requireConnected: true,
+  });
+  if (
+    !resolvedConnection.available ||
+    resolvedConnection.connection?.config.credentialMode !== "oauth"
+  ) {
+    return null;
+  }
+
+  const oauth = await resolveProviderApiOAuthAccessToken(
+    {
+      provider,
+      connectionId: resolvedConnection.connection.id,
+    },
+    {
+      appId: ANALYTICS_APP_ID,
+      providerIds: [provider],
+      getCredentialContext: () => options.ctx,
+    },
+  );
+  return {
+    value: oauth.accessToken,
+    key: `${normalizeKey(provider)}_OAUTH_TOKEN`,
+    provider,
+    source: "workspace_connection",
+    connectionId: oauth.connectionId ?? resolvedConnection.connection.id,
+    connectionLabel:
+      oauth.connectionLabel ?? resolvedConnection.connection.label,
+  };
 }
 
 export async function resolveWorkspaceConnectionProviderCredential(
@@ -170,13 +247,15 @@ export async function resolveLocalAnalyticsProviderCredential(
 ): Promise<AnalyticsProviderCredential | null> {
   const keys = uniqueKeys(options.keys);
   for (const key of keys) {
-    const value = await resolveCredential(key, options.ctx);
-    if (value) {
+    const credential = await resolveCredentialDetailed(key, options.ctx);
+    if (credential) {
       return {
-        value,
+        value: credential.value,
         key,
         provider: options.provider,
         source: "analytics_local",
+        scope: credential.scope,
+        scopeId: credential.scopeId,
       };
     }
   }
@@ -217,6 +296,10 @@ export async function resolveAnalyticsProviderCredential(
   options: ResolveProviderCredentialOptions,
 ): Promise<AnalyticsProviderCredential | null> {
   const keys = uniqueKeys(options.keys);
+  const oauthCredential =
+    await resolveWorkspaceOAuthProviderCredential(options);
+  if (oauthCredential) return oauthCredential;
+
   const workspaceCredential =
     await resolveWorkspaceConnectionProviderCredential({ ...options, keys });
   if (workspaceCredential) return workspaceCredential;
@@ -238,6 +321,27 @@ export async function resolveAnalyticsProviderCredential(
   }
 
   return null;
+}
+
+export async function resolveBigQueryOAuthCredential(
+  ctx: CredentialContext,
+): Promise<AnalyticsProviderCredential | null> {
+  try {
+    return await resolveAnalyticsProviderCredential({
+      provider: "bigquery",
+      keys: [],
+      ctx,
+    });
+  } catch (error) {
+    if (
+      isAgentConnectionRequiredError(error) &&
+      error.provider === "bigquery" &&
+      error.reason === "reauthorize"
+    ) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 export async function resolveAnalyticsGongCredentials(

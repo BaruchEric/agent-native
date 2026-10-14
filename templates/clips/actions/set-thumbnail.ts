@@ -1,43 +1,21 @@
-/**
- * Set a recording's thumbnail.
- *
- * Three modes:
- *   1. `upload` — caller passes a base64 data URL (usually from the UI file
- *      picker). We decode and push it through the framework `uploadFile`.
- *   2. `frame` — caller passes a `timeMs`. This stores the time in editsJson
- *      (so the player can show a freeze-frame overlay). The UI is responsible
- *      for also capturing the frame bitmap client-side and calling this action
- *      again in `upload` mode to replace the stored image.
- *   3. `gif` — caller passes a pre-encoded animated GIF data URL (generated
- *      client-side via ffmpeg.wasm). Stored as `animatedThumbnailUrl`.
- *
- * The source-of-truth spec also lives in `editsJson.thumbnail` so the editor
- * UI can round-trip the chosen mode.
- *
- * Usage:
- *   pnpm action set-thumbnail --recordingId=<id> --kind=frame --timeMs=12000
- */
-
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { and, eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
-import { getCurrentOwnerEmail } from "../server/lib/recordings.js";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { uploadFile } from "@agent-native/core/file-upload";
+import { assertAccess } from "@agent-native/core/sharing";
+import { isImageRecording } from "@shared/recording-kind";
+import { and, eq, isNull } from "drizzle-orm";
+import { z } from "zod";
+
 import { parseEdits, serializeEdits } from "../app/lib/timestamp-mapping.js";
+import { getDb, schema } from "../server/db/index.js";
+import { getCurrentOwnerEmail } from "../server/lib/recordings.js";
+import { requiresConfiguredVideoStorage } from "../server/lib/video-storage.js";
+import { decodeDataUrl } from "./lib/data-url.js";
 import { assertNativeRecordingMedia } from "./lib/native-media.js";
 
-function decodeDataUrl(dataUrl: string): { bytes: Uint8Array; mime: string } {
-  const match = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
-  if (!match) throw new Error("dataUrl must be base64-encoded data: URL");
-  const mime = match[1];
-  const base64 = match[2];
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return { bytes, mime };
-}
+const MAX_CAS_ATTEMPTS = 5;
+const THUMBNAIL_STORAGE_REQUIRED_REASON =
+  "No object storage is connected. Use Builder.io (free) or configure your own S3-compatible storage keys in Settings → File uploads.";
 
 export default defineAction({
   description:
@@ -78,29 +56,33 @@ export default defineAction({
     filename: z.string().optional(),
   }),
   run: async (args) => {
+    await assertAccess("recording", args.recordingId, "editor");
+
     const db = getDb();
     const ownerEmail = getCurrentOwnerEmail();
 
     const [existing] = await db
       .select()
       .from(schema.recordings)
-      .where(
-        and(
-          eq(schema.recordings.id, args.recordingId),
-          eq(schema.recordings.ownerEmail, ownerEmail),
-        ),
-      );
+      .where(eq(schema.recordings.id, args.recordingId));
     if (!existing) {
       throw new Error(`Recording not found: ${args.recordingId}`);
+    }
+    // A screenshot's thumbnail is the picture itself: the viewer and share
+    // page serve `thumbnailUrl`, so a custom one would replace the screenshot.
+    if (isImageRecording(existing)) {
+      throw new Error(
+        "A screenshot uses its own picture as its thumbnail. Edit the screenshot instead.",
+      );
     }
     if (args.kind !== "upload") {
       assertNativeRecordingMedia(existing);
     }
 
-    const edits = parseEdits(existing.editsJson);
-    const patch: Record<string, unknown> = {
-      updatedAt: new Date().toISOString(),
-    };
+    const basePatch: Record<string, unknown> = {};
+    let thumbnailPatch: { kind: "url"; value: string } | undefined;
+    let gifPatch: { kind: "gif"; value: string; url: string } | undefined;
+    let framePatch: { kind: "frame"; value: string } | undefined;
 
     if (args.kind === "upload") {
       if (!args.dataUrl) throw new Error("dataUrl is required for kind=upload");
@@ -112,15 +94,19 @@ export default defineAction({
           args.filename ??
           `thumb-${args.recordingId}.${mime.split("/")[1] ?? "png"}`,
         ownerEmail,
+        recordAsset: false,
       });
-      const url = uploaded?.url ?? args.dataUrl; // fall back to inline storage
-      patch.thumbnailUrl = url;
-      edits.thumbnail = { kind: "url", value: url };
+      if (!uploaded?.url && requiresConfiguredVideoStorage()) {
+        throw new Error(THUMBNAIL_STORAGE_REQUIRED_REASON);
+      }
+      const url = uploaded?.url ?? args.dataUrl;
+      basePatch.thumbnailUrl = url;
+      thumbnailPatch = { kind: "url", value: url };
     } else if (args.kind === "frame") {
       if (typeof args.timeMs !== "number") {
         throw new Error("timeMs is required for kind=frame");
       }
-      edits.thumbnail = { kind: "frame", value: String(args.timeMs) };
+      framePatch = { kind: "frame", value: String(args.timeMs) };
       // thumbnailUrl stays whatever the last captured-frame upload was.
     } else if (args.kind === "gif") {
       if (!args.dataUrl) throw new Error("dataUrl is required for kind=gif");
@@ -130,12 +116,17 @@ export default defineAction({
         mimeType: mime || "image/gif",
         filename: args.filename ?? `thumb-${args.recordingId}.gif`,
         ownerEmail,
+        recordAsset: false,
       });
+      if (!uploaded?.url && requiresConfiguredVideoStorage()) {
+        throw new Error(THUMBNAIL_STORAGE_REQUIRED_REASON);
+      }
       const url = uploaded?.url ?? args.dataUrl;
-      patch.animatedThumbnailUrl = url;
-      patch.animatedThumbnailEnabled = true;
-      edits.thumbnail = {
+      basePatch.animatedThumbnailUrl = url;
+      basePatch.animatedThumbnailEnabled = true;
+      gifPatch = {
         kind: "gif",
+        url,
         value: JSON.stringify({
           url,
           startMs: args.startMs ?? 0,
@@ -144,24 +135,64 @@ export default defineAction({
       };
     }
 
-    patch.editsJson = serializeEdits(edits);
+    for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
+      const [current] =
+        attempt === 0
+          ? [existing]
+          : await db
+              .select()
+              .from(schema.recordings)
+              .where(eq(schema.recordings.id, args.recordingId));
+      if (!current) {
+        throw new Error(`Recording not found: ${args.recordingId}`);
+      }
 
-    await db
-      .update(schema.recordings)
-      .set(patch)
-      .where(eq(schema.recordings.id, args.recordingId));
+      const previousEditsJson = current.editsJson;
+      const edits = parseEdits(previousEditsJson);
 
-    await writeAppState("refresh-signal", { ts: Date.now() });
+      if (thumbnailPatch) edits.thumbnail = thumbnailPatch;
+      else if (framePatch) edits.thumbnail = framePatch;
+      else if (gifPatch)
+        edits.thumbnail = { kind: gifPatch.kind, value: gifPatch.value };
 
-    console.log(`Set ${args.kind} thumbnail for ${args.recordingId}`);
+      const patch: Record<string, unknown> = {
+        ...basePatch,
+        editsJson: serializeEdits(edits),
+        updatedAt: new Date().toISOString(),
+      };
 
-    return {
-      id: args.recordingId,
-      kind: args.kind,
-      thumbnailUrl: patch.thumbnailUrl ?? existing.thumbnailUrl,
-      animatedThumbnailUrl:
-        patch.animatedThumbnailUrl ?? existing.animatedThumbnailUrl,
-      editsJson: edits,
-    };
+      const result = await db
+        .update(schema.recordings)
+        .set(patch)
+        .where(
+          and(
+            eq(schema.recordings.id, args.recordingId),
+            previousEditsJson == null
+              ? isNull(schema.recordings.editsJson)
+              : eq(schema.recordings.editsJson, previousEditsJson),
+          ),
+        )
+        .returning({ id: schema.recordings.id });
+
+      if (result.length > 0) {
+        await writeAppState("refresh-signal", { ts: Date.now() });
+        console.log(`Set ${args.kind} thumbnail for ${args.recordingId}`);
+        return {
+          id: args.recordingId,
+          kind: args.kind,
+          thumbnailUrl: patch.thumbnailUrl ?? current.thumbnailUrl,
+          animatedThumbnailUrl:
+            patch.animatedThumbnailUrl ?? current.animatedThumbnailUrl,
+          editsJson: edits,
+        };
+      }
+      // Someone else changed editsJson between our read and write — retry
+      // against the now-current value. The already-uploaded file stays
+      // valid; only the editsJson merge is recomputed.
+    }
+
+    throw new Error(
+      `Could not set thumbnail on recording ${args.recordingId} after ${MAX_CAS_ATTEMPTS} concurrent attempts.`,
+    );
   },
 });

@@ -1,16 +1,17 @@
 // @vitest-environment happy-dom
 
+import {
+  docToNfm,
+  nfmToDoc,
+  serializeInlineNode,
+  serializeInlineTextNodeWithOffsets,
+  type PMNode,
+} from "@shared/nfm";
 import { Editor } from "@tiptap/core";
 import { describe, expect, it } from "vitest";
-import { createVisualEditorExtensions } from "./VisualEditor";
-import { docToNfm, nfmToDoc } from "@shared/nfm";
 
-/**
- * End-to-end fidelity: load canonical NFM into a REAL TipTap editor (full
- * extension set, the same schema the app runs) and serialize it back. If the
- * result differs from the input, opening a synced document and saving it with
- * no edits would mutate it — exactly the drift this rewrite eliminates.
- */
+import { createVisualEditorExtensions } from "./VisualEditor";
+
 function editorRoundTrip(nfm: string): string {
   const editor = new Editor({
     extensions: createVisualEditorExtensions(),
@@ -23,13 +24,43 @@ function editorRoundTrip(nfm: string): string {
 
 const L = (...lines: string[]) => lines.join("\n");
 
+describe("inline text source offsets", () => {
+  it.each([
+    {
+      text: "a``b",
+      source: "```a``b```",
+      offsets: [3, 4, 5, 6, 7],
+    },
+    {
+      text: "`edge`",
+      source: "`` `edge` ``",
+      offsets: [3, 4, 5, 6, 7, 8, 9],
+    },
+    {
+      text: " edge ",
+      source: "`  edge  `",
+      offsets: [2, 3, 4, 5, 6, 7, 8],
+    },
+  ])(
+    "keeps code serialization and every visible boundary aligned for $source",
+    ({ text, source, offsets }) => {
+      const node: PMNode = { type: "text", text, marks: [{ type: "code" }] };
+      expect(serializeInlineTextNodeWithOffsets(node)).toEqual({
+        source,
+        textOffsets: offsets,
+      });
+      expect(serializeInlineNode(node)).toBe(source);
+    },
+  );
+});
+
 const CASES: Array<{ name: string; nfm: string }> = [
   { name: "plain paragraph", nfm: "Just a paragraph." },
   {
     name: "inline marks",
     nfm: 'Intro with **bold**, *italic*, ~~strike~~, `code`, <span underline="true">underline</span>, <span color="red">red text</span>, a [link](https://example.com).',
   },
-  { name: "inline math", nfm: "before $`a^2 + b^2`$ after" },
+  { name: "inline math", nfm: "before $a^2 + b^2$ after" },
   { name: "block color paragraph", nfm: 'Colored paragraph {color="red"}' },
   {
     name: "headings",
@@ -206,16 +237,18 @@ const HARD_CASES: Array<{ name: string; nfm: string }> = [
       "</synced_block_reference>",
     ),
   },
+  {
+    name: "raw container (meeting-notes) preserves body through the editor",
+    nfm: L(
+      "<meeting-notes>",
+      "Attendees: Steve, Alex",
+      "Notes: discussed the roadmap",
+      "Decisions: ship it",
+      "</meeting-notes>",
+    ),
+  },
 ];
 
-/**
- * Registry-block cases (T6): a registered structured block lives inline in the
- * NFM string as an MDX element. The live editor schema must include core's
- * `registryBlock` atom node so it parses to a `registryBlock`, preserves the
- * verbatim source in `__raw`, and serializes back byte-exact with no edit —
- * exactly like every other block above. An untouched block never needs the
- * side-map: `docToNfm` emits `__raw` verbatim.
- */
 const REGISTRY_CASES: Array<{ name: string; nfm: string }> = [
   {
     name: "self-closing endpoint",
@@ -252,11 +285,6 @@ const REGISTRY_CASES: Array<{ name: string; nfm: string }> = [
       "Below the block.",
     ),
   },
-  // The remaining dev-doc blocks from the unification, seeded byte-exact from
-  // each spec's `empty()` via `seedRegistryBlockRaw` (the slash-insert path).
-  // These exercise multi-line JSON-expression `__raw` attributes (embedded
-  // newlines in mermaid `source`, pretty-printed `entities`/`spec`) through the
-  // FULL live TipTap schema — the strongest round-trip guarantee.
   {
     name: "mermaid block (multi-line source expr)",
     nfm: '<Mermaid id="mermaid-seed" source={"flowchart TD\\n  A[Start] --> B{Decision}\\n  B -->|Yes| C[Do it]\\n  B -->|No| D[Skip]"} />',
@@ -331,4 +359,96 @@ describe("NFM ⇄ real TipTap editor round-trip", () => {
       expect(editorRoundTrip(nfm)).toBe(nfm);
     });
   }
+
+  it("promotes mixed MDX pipe tables through the live editor schema", () => {
+    const source = L(
+      '<Aside type="note">',
+      "Keep this source.",
+      "</Aside>",
+      "| Component | Responsibility |",
+      "| --- | --- |",
+      "| Content | Preserve structure |",
+      "```mermaid",
+      "flowchart TD",
+      "  Import --> Repair",
+      "```",
+      "Trailing content.",
+    );
+
+    const result = editorRoundTrip(source);
+    expect(result).toContain(
+      '<Aside type="note">\nKeep this source.\n</Aside>',
+    );
+    expect(result).toContain('<table header-row="true">');
+    expect(result).toContain("<td>Component</td>");
+    expect(result).toContain("```mermaid\nflowchart TD");
+    expect(result.endsWith("Trailing content.")).toBe(true);
+  });
+
+  it("keeps aligned table cells editable through the live editor", () => {
+    const source = "| Left | Right |\n| :--- | ---: |\n| A | B |";
+    const result = editorRoundTrip(source);
+    expect(result).toContain('<td align="left">Left</td>');
+    expect(result).toContain('<td align="right">Right</td>');
+    expect(result).toContain('<td align="right">B</td>');
+  });
+});
+
+describe("NFM ⇄ real TipTap editor round-trip: editor-typed toggle summaries", () => {
+  const docRoundTrip = (docJson: any): any => {
+    const editor = new Editor({
+      extensions: createVisualEditorExtensions(),
+      content: docJson,
+    });
+    const nfm = docToNfm(editor.getJSON() as any);
+    editor.destroy();
+    const editor2 = new Editor({
+      extensions: createVisualEditorExtensions(),
+      content: nfmToDoc(nfm),
+    });
+    const result = editor2.getJSON();
+    editor2.destroy();
+    return { nfm, result };
+  };
+
+  const headingToggleDoc = (summary: string) => ({
+    type: "doc",
+    content: [
+      {
+        type: "notionToggle",
+        attrs: { summary, headingLevel: 2, open: true },
+        content: [{ type: "paragraph" }],
+      },
+    ],
+  });
+
+  it("preserves a toggle-heading summary ending in a single backslash", () => {
+    const { result } = docRoundTrip(headingToggleDoc("b\\"));
+    expect(result.content?.[0]?.type).toBe("notionToggle");
+    expect(result.content?.[0]?.attrs?.summary).toBe("b\\");
+    expect(result.content?.[0]?.attrs?.headingLevel).toBe(2);
+  });
+
+  it("preserves an editor-typed Windows-path toggle-heading summary", () => {
+    const { result } = docRoundTrip(headingToggleDoc("C:\\path\\"));
+    expect(result.content?.[0]?.type).toBe("notionToggle");
+    expect(result.content?.[0]?.attrs?.summary).toBe("C:\\path\\");
+  });
+
+  it("preserves a toggle-heading summary containing an attr-lookalike sequence", () => {
+    const { result } = docRoundTrip(headingToggleDoc('hi {color="red"}'));
+    expect(result.content?.[0]?.type).toBe("notionToggle");
+    expect(result.content?.[0]?.attrs?.summary).toBe('hi {color="red"}');
+  });
+
+  it("is a stable fixpoint on the second save", () => {
+    const { nfm } = docRoundTrip(headingToggleDoc("b\\"));
+    const editor2 = new Editor({
+      extensions: createVisualEditorExtensions(),
+      content: nfmToDoc(nfm),
+    });
+    const nfm2 = docToNfm(editor2.getJSON() as any);
+    editor2.destroy();
+    expect(nfm2).toBe(nfm);
+  });
 });

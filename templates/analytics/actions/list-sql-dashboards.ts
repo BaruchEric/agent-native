@@ -5,8 +5,9 @@ import {
   buildDeepLink,
 } from "@agent-native/core/server";
 import { z } from "zod";
+
 import {
-  listDashboards,
+  listDashboardSummaries,
   type DashboardArchiveFilter,
   type DashboardHiddenFilter,
 } from "../server/lib/dashboards-store";
@@ -41,6 +42,7 @@ export default defineAction({
   }),
   http: { method: "GET" },
   readOnly: true,
+  mcpTool: true,
   publicAgent: { expose: true, readOnly: true, requiresAuth: true },
   mcpApp: {
     compactCatalog: true,
@@ -64,10 +66,18 @@ export default defineAction({
     const ctx = { email, orgId };
     const archived = parseArchivedFilter(args.archived);
     const hidden = parseHiddenFilter(args.hidden);
-    const rows = await listDashboards(ctx, { kind: "sql", archived, hidden });
+    const rows = await listDashboardSummaries(ctx, {
+      kind: "sql",
+      archived,
+      hidden,
+      includeCatalogMetadata: true,
+    });
     return rows.map((d) => ({
       id: d.id,
-      ...(d.config as Record<string, unknown>),
+      name: d.name,
+      ...(d.parentId ? { parentId: d.parentId } : {}),
+      ...(d.folderId ? { folderId: d.folderId } : {}),
+      ...(d.demoId ? { demo: true } : {}),
       ownerEmail: d.ownerEmail,
       orgId: d.orgId,
       visibility: d.visibility,

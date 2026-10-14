@@ -1,17 +1,10 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
-import createVisualPlan from "./create-visual-plan.js";
+
 import { getDb, schema } from "../server/db/index.js";
 import type { PlanContent } from "../shared/plan-content.js";
-
-/**
- * DEV-ONLY one-off seed: creates a real, persisted plan that exercises every
- * diff-aware block (change-aware data-model + api-endpoint, annotated unified +
- * split diffs, file-tree badges, annotated-code) and makes it public so it can
- * be opened at /plans/<id> without a session. Run against a throwaway local
- * SQLite DB; safe to delete.
- */
+import createVisualPlan from "./create-visual-plan.js";
 
 const DM_FIELD_BEFORE = `export interface DataModelField {
   name: string;
@@ -287,7 +280,6 @@ export default defineAction({
     } as never)) as { planId: string };
 
     const planId = result.planId;
-    // Make it public so it opens at /plans/<id> without a session.
     await getDb()
       .update(schema.plans)
       .set({ visibility: "public" })

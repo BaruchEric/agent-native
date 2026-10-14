@@ -1,6 +1,7 @@
-import { useEffect } from "react";
+import { agentNativePath } from "@agent-native/core/client/api-path";
+import { oauthRedirectUri } from "@agent-native/core/client/host";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { agentNativePath, oauthRedirectUri } from "@agent-native/core/client";
+import { useEffect } from "react";
 
 export interface ZoomAuthStatus {
   connected: boolean;
@@ -8,8 +9,20 @@ export interface ZoomAuthStatus {
   accounts: Array<{ id: string; email?: string; displayName?: string }>;
 }
 
+const FETCH_ABORT_MS = 10_000;
+
 async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(input, init);
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), FETCH_ABORT_MS);
+  let res: Response;
+  try {
+    res = await fetch(input, {
+      ...init,
+      signal: init?.signal ?? controller.signal,
+    });
+  } finally {
+    clearTimeout(abortTimer);
+  }
   if (!res.ok) {
     let message = `${input} -> ${res.status}`;
     try {
@@ -23,31 +36,57 @@ async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+const zoomAuthSubscribers = new Set<() => void>();
+let zoomAuthChannel: BroadcastChannel | null = null;
+let zoomAuthWindowListenerAttached = false;
+
+function notifyZoomAuthSubscribers(): void {
+  for (const subscriber of zoomAuthSubscribers) subscriber();
+}
+
+function onZoomAuthWindowMessage(event: MessageEvent): void {
+  if (event.origin !== window.location.origin) return;
+  if (event.data?.type === "agent-native:zoom-connected") {
+    notifyZoomAuthSubscribers();
+  }
+}
+
+function onZoomAuthChannelMessage(event: MessageEvent): void {
+  if (event.data?.type === "agent-native:zoom-connected") {
+    notifyZoomAuthSubscribers();
+  }
+}
+
+function subscribeZoomAuthConnected(subscriber: () => void): () => void {
+  if (zoomAuthSubscribers.size === 0) {
+    window.addEventListener("message", onZoomAuthWindowMessage);
+    zoomAuthWindowListenerAttached = true;
+    if ("BroadcastChannel" in window) {
+      zoomAuthChannel = new BroadcastChannel("agent-native-zoom-oauth");
+      zoomAuthChannel.onmessage = onZoomAuthChannelMessage;
+    }
+  }
+  zoomAuthSubscribers.add(subscriber);
+
+  return () => {
+    zoomAuthSubscribers.delete(subscriber);
+    if (zoomAuthSubscribers.size === 0) {
+      if (zoomAuthWindowListenerAttached) {
+        window.removeEventListener("message", onZoomAuthWindowMessage);
+        zoomAuthWindowListenerAttached = false;
+      }
+      zoomAuthChannel?.close();
+      zoomAuthChannel = null;
+    }
+  };
+}
+
 export function useZoomStatus() {
   const queryClient = useQueryClient();
   useEffect(() => {
     const refresh = () =>
       queryClient.invalidateQueries({ queryKey: ["zoom-status"] });
-
-    const onMessage = (event: MessageEvent) => {
-      if (event.origin !== window.location.origin) return;
-      if (event.data?.type === "agent-native:zoom-connected") refresh();
-    };
-
-    window.addEventListener("message", onMessage);
-
-    let channel: BroadcastChannel | null = null;
-    if ("BroadcastChannel" in window) {
-      channel = new BroadcastChannel("agent-native-zoom-oauth");
-      channel.onmessage = (event) => {
-        if (event.data?.type === "agent-native:zoom-connected") refresh();
-      };
-    }
-
-    return () => {
-      window.removeEventListener("message", onMessage);
-      channel?.close();
-    };
+    return subscribeZoomAuthConnected(refresh);
   }, [queryClient]);
 
   return useQuery<ZoomAuthStatus>({
@@ -58,11 +97,6 @@ export function useZoomStatus() {
   });
 }
 
-/**
- * Kick off the Zoom OAuth flow by navigating to the auth URL. Uses a
- * mutation (not a query) so the flow only starts when the user clicks
- * Connect, not on mount.
- */
 export function useConnectZoom() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -83,11 +117,18 @@ export function useConnectZoom() {
       return { opened: "popup" as const };
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["zoom-status"] });
+      void queryClient.invalidateQueries({ queryKey: ["zoom-status"] });
 
       const startedAt = Date.now();
-      const pollId = window.setInterval(() => {
-        queryClient.invalidateQueries({ queryKey: ["zoom-status"] });
+      let inFlight = false;
+      const pollId = window.setInterval(async () => {
+        if (document.hidden || inFlight) return;
+        inFlight = true;
+        try {
+          await queryClient.invalidateQueries({ queryKey: ["zoom-status"] });
+        } finally {
+          inFlight = false;
+        }
         if (Date.now() - startedAt > 120_000) {
           window.clearInterval(pollId);
         }

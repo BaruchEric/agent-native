@@ -1,8 +1,10 @@
+// i18n-raw-literal-disable-file
 // Navigation context state helpers exposed to the agent.
 // Pure logic — no React, no icons.
 import type {
   ContentDatabaseItem,
   ContentDatabaseResponse,
+  ContentDatabaseSource,
   ContentDatabaseView,
   Document,
   DocumentProperty,
@@ -10,14 +12,15 @@ import type {
   DocumentPropertyValue,
 } from "@shared/api";
 import { isComputedPropertyType } from "@shared/properties";
+
+import { databaseCalculationSummaries } from "./calculations";
+import { propertyValueText } from "./filter-sort";
+import { databaseCalendarDateProperty } from "./grouping";
 import type {
   DatabaseSort,
   DatabaseFilter,
   DatabaseDateViewRange,
 } from "./types";
-import { databaseCalendarDateProperty } from "./grouping";
-import { databaseCalculationSummaries } from "./calculations";
-import { propertyValueText } from "./filter-sort";
 
 export function databaseItemPreviewTitle(
   item: Pick<ContentDatabaseItem, "document"> | null | undefined,
@@ -36,6 +39,12 @@ export function databaseViewSummaries(
 }
 
 export const DATABASE_NAVIGATION_VISIBLE_ITEM_LIMIT = 50;
+export const DATABASE_NAVIGATION_CELL_TEXT_LIMIT = 200;
+/**
+ * Navigation state is rewritten on every table change and read into the
+ * agent's context on every turn.
+ */
+export const DATABASE_NAVIGATION_STATE_MAX_BYTES = 48 * 1024;
 
 export function databaseVisibleItemSummaries(
   items: ContentDatabaseItem[],
@@ -52,20 +61,76 @@ export function databaseVisibleItemSummaries(
         item.properties.find(
           (candidate) => candidate.definition.id === property.definition.id,
         ) ?? property;
+      const text = propertyValueText(itemProperty);
+      const truncated = text.length > DATABASE_NAVIGATION_CELL_TEXT_LIMIT;
+      const value = itemProperty.value;
+      const valueRepeatsText =
+        (value === null || typeof value !== "object") &&
+        String(value ?? "") === text;
       return {
         propertyId: property.definition.id,
         name: property.definition.name,
         type: property.definition.type,
-        value: itemProperty.value,
-        text: propertyValueText(itemProperty),
+        ...(valueRepeatsText ? {} : { value }),
+        text: truncated
+          ? `${text.slice(0, DATABASE_NAVIGATION_CELL_TEXT_LIMIT)}…`
+          : text,
+        ...(truncated ? { textTruncated: true } : {}),
       };
     }),
   }));
 }
 
+function jsonByteLength(value: unknown) {
+  return new TextEncoder().encode(JSON.stringify(value)).length;
+}
+
+export function databaseNavigationStateFitsKeepaliveBudget(value: unknown) {
+  return jsonByteLength(value) <= DATABASE_NAVIGATION_STATE_MAX_BYTES;
+}
+
+/**
+ * Keep the largest row prefix whose state fits the byte budget, and report
+ * the applied cap in `databaseVisibleItemLimit` so a trimmed summary is never
+ * mistaken for the whole visible slice. Rows are the only part that grows
+ * with the collection. The view's own settings stay whole even when they
+ * alone pass the budget: dropping a sort or filter would describe a
+ * different view to the agent.
+ */
+export function fitDatabaseNavigationState<
+  State extends {
+    databaseVisibleItems?: unknown[];
+    databaseSelectedItems?: unknown[];
+    databaseVisibleItemLimit?: number;
+  },
+>(state: State, maxBytes = DATABASE_NAVIGATION_STATE_MAX_BYTES): State {
+  if (jsonByteLength(state) <= maxBytes) return state;
+  const withRowCap = (cap: number): State => ({
+    ...state,
+    databaseVisibleItems: state.databaseVisibleItems?.slice(0, cap),
+    databaseSelectedItems: state.databaseSelectedItems?.slice(0, cap),
+    databaseVisibleItemLimit: cap,
+  });
+  let fits = 0;
+  let tooBig = Math.max(
+    state.databaseVisibleItems?.length ?? 0,
+    state.databaseSelectedItems?.length ?? 0,
+  );
+  while (tooBig - fits > 1) {
+    const cap = Math.floor((fits + tooBig) / 2);
+    if (jsonByteLength(withRowCap(cap)) <= maxBytes) fits = cap;
+    else tooBig = cap;
+  }
+  return withRowCap(fits);
+}
+
 export function databaseNavigationState({
   document,
   databaseId,
+  databaseDocumentId,
+  hostDocumentId,
+  renderMode,
+  source = null,
   views = [],
   activeView,
   searchQuery = "",
@@ -80,9 +145,14 @@ export function databaseNavigationState({
   totalItemCount,
   selectedItems = [],
   previewItem,
+  effectiveFrozenColumnIds,
 }: {
   document: Pick<Document, "id" | "title">;
   databaseId: string;
+  databaseDocumentId?: string;
+  hostDocumentId?: string;
+  renderMode?: "page" | "inline";
+  source?: ContentDatabaseSource | null;
   views?: Array<Pick<ContentDatabaseView, "id" | "name" | "type">>;
   activeView: Pick<
     ContentDatabaseView,
@@ -97,8 +167,11 @@ export function databaseNavigationState({
     | "endDatePropertyId"
     | "calculations"
     | "wrapCells"
+    | "columnWrapOverrides"
+    | "frozenThroughColumnId"
     | "rowDensity"
     | "openPagesIn"
+    | "formQuestions"
   >;
   searchQuery?: string;
   sorts?: DatabaseSort[];
@@ -112,6 +185,7 @@ export function databaseNavigationState({
   totalItemCount?: number;
   selectedItems?: ContentDatabaseItem[];
   previewItem: ContentDatabaseItem | null;
+  effectiveFrozenColumnIds?: string[];
 }) {
   const trimmedSearchQuery = searchQuery.trim();
   const calculations = activeView.calculations ?? {};
@@ -138,12 +212,33 @@ export function databaseNavigationState({
         (property) => property.definition.id === activeView.endDatePropertyId,
       )
     : null;
+  const outboundSourceChangeCount =
+    source?.changeSets.filter((changeSet) => changeSet.direction === "outbound")
+      .length ?? 0;
+  const navigationInstanceHostId =
+    hostDocumentId ?? databaseDocumentId ?? document.id;
 
   return {
     view: "editor",
     documentId: document.id,
     title: document.title,
     databaseId,
+    databaseDocumentId,
+    databaseHostDocumentId: hostDocumentId,
+    databaseRenderMode: renderMode,
+    databaseNavigationInstanceId:
+      databaseDocumentId || hostDocumentId || renderMode
+        ? `${navigationInstanceHostId}:${databaseId}`
+        : undefined,
+    databaseSourceType: source?.sourceType,
+    databaseSourceName: source?.sourceName,
+    databaseSourceTable: source?.sourceTable,
+    databaseSourceSyncState: source?.syncState,
+    databaseSourceFreshness: source?.freshness,
+    databaseSourcePendingChangeCount: source?.changeSets.length,
+    databaseSourceLocalChangeCount: source
+      ? outboundSourceChangeCount
+      : undefined,
     databaseViews: databaseViewSummaries(
       views.length > 0 ? views : [activeView],
     ),
@@ -178,6 +273,9 @@ export function databaseNavigationState({
     databaseCalculationResults:
       calculationResults.length > 0 ? calculationResults : undefined,
     databaseWrapCells: activeView.wrapCells === true || undefined,
+    databaseColumnWrapOverrides: activeView.columnWrapOverrides,
+    databaseFrozenThroughColumnId: activeView.frozenThroughColumnId,
+    databaseEffectiveFrozenColumnIds: effectiveFrozenColumnIds,
     databaseRowDensity:
       activeView.rowDensity && activeView.rowDensity !== "default"
         ? activeView.rowDensity
@@ -186,6 +284,8 @@ export function databaseNavigationState({
       activeView.openPagesIn === "full_page"
         ? activeView.openPagesIn
         : undefined,
+    databaseFormQuestions:
+      activeView.type === "form" ? activeView.formQuestions : undefined,
     databaseVisibleItemCount: visibleItemCount,
     databaseTotalItemCount: totalItemCount,
     databaseVisibleItems: databaseVisibleItemSummaries(
@@ -221,7 +321,10 @@ export function databaseSelectedItems(
 export function databaseBulkEditableProperties(properties: DocumentProperty[]) {
   return properties.filter(
     (property) =>
-      property.editable && !isComputedPropertyType(property.definition.type),
+      property.editable &&
+      !isComputedPropertyType(property.definition.type) &&
+      // Row mutations do not accept relation values yet.
+      property.definition.type !== "relation",
   );
 }
 
@@ -248,11 +351,17 @@ export function databaseBulkScalarInputState(
 
 export function databaseDuplicatedItemFromResponse(
   response: Pick<ContentDatabaseResponse, "items"> &
-    Pick<Partial<ContentDatabaseResponse>, "duplicatedItemId">,
+    Pick<
+      Partial<ContentDatabaseResponse>,
+      "duplicatedItemId" | "duplicatedItemIds"
+    >,
 ) {
-  return (
-    response.items.find((item) => item.id === response.duplicatedItemId) ?? null
-  );
+  const duplicatedItemIds = response.duplicatedItemIds ?? [];
+  const duplicatedItemId =
+    duplicatedItemIds.length > 0
+      ? duplicatedItemIds[duplicatedItemIds.length - 1]
+      : response.duplicatedItemId;
+  return response.items.find((item) => item.id === duplicatedItemId) ?? null;
 }
 
 export function toggleDatabaseRowSelection(
@@ -269,7 +378,12 @@ export function pruneDatabaseRowSelection(
   visibleItems: ContentDatabaseItem[],
 ) {
   const visibleIds = new Set(visibleItems.map((item) => item.id));
-  return selectedItemIds.filter((id) => visibleIds.has(id));
+  const nextSelectedItemIds = selectedItemIds.filter((id) =>
+    visibleIds.has(id),
+  );
+  return nextSelectedItemIds.length === selectedItemIds.length
+    ? selectedItemIds
+    : nextSelectedItemIds;
 }
 
 export function toggleAllDatabaseRowSelection(

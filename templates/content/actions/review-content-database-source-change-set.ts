@@ -1,15 +1,16 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { getRequestUserEmail } from "@agent-native/core/server/request-context";
 import { assertAccess } from "@agent-native/core/sharing";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
 import type {
   ContentDatabaseResponse,
   ReviewContentDatabaseSourceChangeSetRequest,
 } from "../shared/api.js";
-import { getDb, schema } from "../server/db/index.js";
 import {
-  getExistingSource,
+  getExistingSourceForWrite,
   resolveDatabaseForSourceMutation,
 } from "./_database-source-utils.js";
 import { getContentDatabaseResponse } from "./_database-utils.js";
@@ -25,8 +26,12 @@ export default defineAction({
   description:
     "Approve or reject a local source change-set review record. This only records review state and never calls external providers.",
   schema: z.object({
-    databaseId: z.string().optional().describe("Database ID"),
-    documentId: z.string().optional().describe("Database document/page ID"),
+    databaseId: z.string().optional().describe("Collection ID"),
+    documentId: z.string().optional().describe("Collection document/page ID"),
+    sourceId: z
+      .string()
+      .optional()
+      .describe("Target source ID (defaults to the primary source)"),
     changeSetId: z.string().describe("Source change-set ID"),
     decision: z
       .enum(["approve", "reject"])
@@ -40,7 +45,7 @@ export default defineAction({
     if (!database) throw new Error("Database not found.");
     await assertAccess("document", database.documentId, "editor");
 
-    const source = await getExistingSource(database.id);
+    const source = await getExistingSourceForWrite(database.id, args.sourceId);
     if (!source) throw new Error("Attach a source before reviewing changes.");
 
     const [changeSet] = await getDb()
@@ -111,6 +116,6 @@ export default defineAction({
       .set({ updatedAt: now })
       .where(eq(schema.contentDatabaseSources.id, source.id));
 
-    return getContentDatabaseResponse(database.id);
+    return getContentDatabaseResponse(database.id, { limit: 100, offset: 0 });
   },
 });

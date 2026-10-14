@@ -1,11 +1,10 @@
+import { useAgentChatGenerating } from "@agent-native/core/client/agent-chat";
+import { useT } from "@agent-native/core/client/i18n";
 import {
-  useState,
-  useRef,
-  useMemo,
-  useEffect,
-  forwardRef,
-  useImperativeHandle,
-} from "react";
+  appendSignatureToBody,
+  splitAppendedSignature,
+} from "@shared/signature";
+import type { ComposeState, EmailMessage } from "@shared/types";
 import {
   IconSend,
   IconBold,
@@ -18,46 +17,53 @@ import {
   IconExternalLink,
   IconChevronDown,
 } from "@tabler/icons-react";
-import { Button } from "@/components/ui/button";
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
+  useState,
+  useRef,
+  useMemo,
+  useEffect,
+  forwardRef,
+  useImperativeHandle,
+} from "react";
+import { toast } from "sonner";
+
+import { Button } from "@/components/ui/button";
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useAliases } from "@/hooks/use-aliases";
+import {
   useSendEmail,
   useAddOptimisticReply,
+  useArchiveEmail,
   useSettings,
 } from "@/hooks/use-emails";
-import { useAliases } from "@/hooks/use-aliases";
+import { canUseAgentGenerate } from "@/lib/agent-generate";
 import { expandAliasTokens } from "@/lib/alias-utils";
-import { useAgentChatGenerating } from "@agent-native/core/client";
-import { toast } from "sonner";
-import type { ComposeState, EmailMessage } from "@shared/types";
-import {
-  appendSignatureToBody,
-  splitAppendedSignature,
-} from "@shared/signature";
+import { openFilePicker, uploadFile, uploadFiles } from "@/lib/upload";
+import { cn } from "@/lib/utils";
+
+import { AttachmentStrip } from "./AttachmentStrip";
 import {
   getCurrentDraftBodyFromEditor,
   splitQuotedContent,
 } from "./compose-draft-context";
+import { ComposeEditor, type ComposeEditorHandle } from "./ComposeEditor";
+import { shouldMarkReplyDoneAfterSend } from "./mail-send-policy";
 import {
   RecipientInput,
   computeRecipientMove,
   type RecipientField,
 } from "./RecipientInput";
-import { ComposeEditor, type ComposeEditorHandle } from "./ComposeEditor";
-import { openFilePicker, uploadFiles } from "@/lib/upload";
-import { canUseAgentGenerate } from "@/lib/agent-generate";
-import { AttachmentStrip } from "./AttachmentStrip";
-import { cn } from "@/lib/utils";
 
+const SEND_UNDO_WINDOW_MS = 10_000;
 export interface InlineReplyHandle {
   focusEditor: () => void;
 }
@@ -89,6 +95,7 @@ export const InlineReplyComposer = forwardRef<
   },
   ref,
 ) {
+  const t = useT();
   const [showQuoted, setShowQuoted] = useState(false);
   const [generateOpen, setGenerateOpen] = useState(false);
   const [generatePrompt, setGeneratePrompt] = useState("");
@@ -98,6 +105,7 @@ export const InlineReplyComposer = forwardRef<
   const [isGenerating, sendToAgent] = useAgentChatGenerating();
   const sendEmail = useSendEmail();
   const addOptimisticReply = useAddOptimisticReply();
+  const archiveEmail = useArchiveEmail();
   const { data: settings } = useSettings();
   const { data: aliases = [] } = useAliases();
   const editorRef = useRef<ComposeEditorHandle>(null);
@@ -110,7 +118,6 @@ export const InlineReplyComposer = forwardRef<
     },
   }));
 
-  // Auto-focus editor and scroll into view on mount
   useEffect(() => {
     setTimeout(() => {
       editorRef.current?.getEditor()?.commands.focus();
@@ -125,7 +132,6 @@ export const InlineReplyComposer = forwardRef<
     if (draft.cc?.trim() || draft.bcc?.trim()) setShowCcBcc(true);
   }, [draft.cc, draft.bcc]);
 
-  // Resolve recipient display names from thread messages
   const recipientDisplay = useMemo(() => {
     const emails = draft.to
       .split(",")
@@ -134,7 +140,6 @@ export const InlineReplyComposer = forwardRef<
     return emails
       .map((email) => {
         const lower = email.toLowerCase();
-        // Check senders
         const senderMsg = messages.find(
           (m) => m.from.email.toLowerCase() === lower,
         );
@@ -143,7 +148,6 @@ export const InlineReplyComposer = forwardRef<
           senderMsg.from.name !== senderMsg.from.email
         )
           return senderMsg.from.name;
-        // Check recipients
         for (const m of messages) {
           const r = [...m.to, ...(m.cc || [])].find(
             (r) => r.email.toLowerCase() === lower,
@@ -155,7 +159,6 @@ export const InlineReplyComposer = forwardRef<
       .join(", ");
   }, [draft.to, messages]);
 
-  // Split quoted content
   const [editableContent, quotedContent] = useMemo(
     () => splitQuotedContent(draft.body),
     [draft.body],
@@ -178,19 +181,23 @@ export const InlineReplyComposer = forwardRef<
       ? editableContent
       : draft.body;
 
-  const handleSend = async () => {
+  const handleSend = async (explicitlyMarkDone = false) => {
     if (sendingRef.current) return;
     if (!draft.to.trim()) {
-      toast.error("Please add at least one recipient");
+      toast.error(t("mail.toasts.pleaseAddRecipient"));
       return;
     }
     sendingRef.current = true;
 
     const draftSnapshot = { ...draft };
+    const markDoneAfterSend = shouldMarkReplyDoneAfterSend(
+      draftSnapshot,
+      settings?.sendAndArchive === true,
+      explicitlyMarkDone,
+    );
 
     onDiscard(draft.id);
 
-    // Show optimistic reply in the thread immediately
     const undoOptimistic = addOptimisticReply({
       to: expandAliasTokens(draftSnapshot.to, aliases),
       cc: expandAliasTokens(draftSnapshot.cc ?? "", aliases) || undefined,
@@ -203,38 +210,33 @@ export const InlineReplyComposer = forwardRef<
     });
 
     let cancelled = false;
+    let dispatchStarted = false;
 
     const handleUndo = () => {
-      if (cancelled) return;
+      if (cancelled || dispatchStarted) return;
       cancelled = true;
       sendingRef.current = false;
       clearTimeout(sendTimer);
-      clearTimeout(transitionTimer);
       toast.dismiss(toastId);
       undoOptimistic?.();
       const { id: _id, ...reopenData } = draftSnapshot;
       onReopen(reopenData);
     };
 
-    const toastId = toast("Sending...", {
-      action: { label: "UNDO", onClick: handleUndo },
+    const toastId = toast(t("mail.compose.sending"), {
+      action: { label: t("mail.actions.undo"), onClick: handleUndo },
       duration: Infinity,
     });
 
-    const transitionTimer = setTimeout(() => {
-      if (cancelled) return;
-      toast("Message sent.", {
-        id: toastId,
-        action: { label: "UNDO", onClick: handleUndo },
-        duration: Infinity,
-      });
-    }, 1500);
-
     const sendTimer = setTimeout(() => {
       if (cancelled) return;
+      dispatchStarted = true;
       toast.dismiss(toastId);
-      sendEmail.mutate(
-        {
+      const sendingToastId = toast(t("mail.compose.sending"), {
+        duration: Infinity,
+      });
+      void sendEmail
+        .mutateAsync({
           to: expandAliasTokens(draftSnapshot.to, aliases),
           cc: expandAliasTokens(draftSnapshot.cc ?? "", aliases) || undefined,
           bcc: expandAliasTokens(draftSnapshot.bcc ?? "", aliases) || undefined,
@@ -244,19 +246,30 @@ export const InlineReplyComposer = forwardRef<
           replyToThreadId: draftSnapshot.replyToThreadId,
           accountEmail: draftSnapshot.accountEmail,
           attachments: draftSnapshot.attachments,
-        },
-        {
-          onError: () => {
-            toast.error("Failed to send email");
-            const { id: _id, ...reopenData } = draftSnapshot;
-            onReopen(reopenData);
-          },
-          onSettled: () => {
-            sendingRef.current = false;
-          },
-        },
-      );
-    }, 5000);
+        })
+        .then(() => {
+          toast(t("mail.toasts.messageSent"), {
+            id: sendingToastId,
+            duration: 3_000,
+          });
+          if (markDoneAfterSend && draftSnapshot.replyToId) {
+            archiveEmail.mutate({
+              id: draftSnapshot.replyToId,
+              accountEmail: draftSnapshot.accountEmail,
+              threadId: draftSnapshot.replyToThreadId,
+            });
+          }
+        })
+        .catch(() => {
+          toast.dismiss(sendingToastId);
+          toast.error(t("mail.toasts.failedToSendEmail"));
+          const { id: _id, ...reopenData } = draftSnapshot;
+          onReopen(reopenData);
+        })
+        .finally(() => {
+          sendingRef.current = false;
+        });
+    }, SEND_UNDO_WINDOW_MS);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -264,7 +277,7 @@ export const InlineReplyComposer = forwardRef<
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
       e.stopPropagation();
-      handleSend();
+      void handleSend(e.shiftKey);
     }
     if (e.key === "Escape") {
       e.preventDefault();
@@ -276,9 +289,7 @@ export const InlineReplyComposer = forwardRef<
   const handleGenerate = async () => {
     if (!generatePrompt.trim()) return;
     if (!(await canUseAgentGenerate())) {
-      toast.error(
-        "Connect Builder or another AI engine before using Generate.",
-      );
+      toast.error(t("mail.toasts.aiEngineRequired"));
       window.dispatchEvent(new CustomEvent("agent-panel:open"));
       return;
     }
@@ -346,18 +357,21 @@ export const InlineReplyComposer = forwardRef<
     <>
       <div className="flex items-center border-b border-border/30 px-4 pb-2">
         <span className="w-8 shrink-0 text-xs font-medium text-muted-foreground">
-          To
+          {t("mail.compose.to")}
         </span>
         <RecipientInput
           value={draft.to}
           onChange={(val) => onUpdate(draft.id, { to: val })}
+          ariaLabel={t("mail.compose.toRecipients")}
           autoFocus={draft.mode === "forward"}
           field="to"
           onMoveRecipient={moveRecipient}
         />
         <button
           type="button"
-          aria-label={showCcBcc ? "Hide Cc and Bcc" : "Show Cc and Bcc"}
+          aria-label={t(
+            showCcBcc ? "mail.compose.hideCcBcc" : "mail.compose.showCcBcc",
+          )}
           aria-expanded={showCcBcc}
           onClick={toggleCcBcc}
           className="p-1 text-muted-foreground transition-colors hover:text-foreground"
@@ -375,22 +389,24 @@ export const InlineReplyComposer = forwardRef<
         <>
           <div className="flex items-center border-b border-border/30 px-4">
             <span className="w-8 shrink-0 text-xs font-medium text-muted-foreground">
-              Cc
+              {t("mail.compose.cc")}
             </span>
             <RecipientInput
               value={draft.cc ?? ""}
               onChange={(val) => onUpdate(draft.id, { cc: val })}
+              ariaLabel={t("mail.compose.ccRecipients")}
               field="cc"
               onMoveRecipient={moveRecipient}
             />
           </div>
           <div className="flex items-center border-b border-border/30 px-4">
             <span className="w-8 shrink-0 text-xs font-medium text-muted-foreground">
-              Bcc
+              {t("mail.compose.bcc")}
             </span>
             <RecipientInput
               value={draft.bcc ?? ""}
               onChange={(val) => onUpdate(draft.id, { bcc: val })}
+              ariaLabel={t("mail.compose.bccRecipients")}
               field="bcc"
               onMoveRecipient={moveRecipient}
             />
@@ -406,8 +422,22 @@ export const InlineReplyComposer = forwardRef<
       const attachments = await uploadFiles(files);
       const existing = draft.attachments ?? [];
       onUpdate(draft.id, { attachments: [...existing, ...attachments] });
-    } catch {
-      toast.error("Failed to attach file");
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t("mail.toasts.failedToAttachFile"),
+      );
+    }
+  };
+
+  const handleUploadImage = async (file: File) => {
+    try {
+      const result = await uploadFile(file);
+      return result.url;
+    } catch (err) {
+      toast.error(t("mail.toasts.failedToUploadImage"));
+      throw err;
     }
   };
 
@@ -427,6 +457,14 @@ export const InlineReplyComposer = forwardRef<
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
     const files = Array.from(e.dataTransfer.files ?? []);
     if (files.length === 0) return;
+    const target = e.target as HTMLElement;
+    const droppedOnEditor = target.closest(".compose-editor") != null;
+    if (
+      droppedOnEditor &&
+      files.every((file) => file.type.startsWith("image/"))
+    ) {
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     void handleAttachFiles(files);
@@ -442,7 +480,7 @@ export const InlineReplyComposer = forwardRef<
   return (
     <div
       ref={composerRef}
-      className="rounded-lg bg-card dark:bg-[hsl(220,5%,10%)] overflow-hidden"
+      className="rounded-lg bg-card dark:bg-[var(--mail-message-surface)] overflow-hidden"
       onKeyDown={handleKeyDown}
       onDragOverCapture={handleDragOver}
       onDropCapture={handleDrop}
@@ -452,18 +490,20 @@ export const InlineReplyComposer = forwardRef<
         <>
           <div className="flex items-center justify-between px-4 pt-3 pb-1">
             <span className="text-[13px] font-semibold text-green-400">
-              Forward
+              {t("mail.compose.forward")}
             </span>
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
+                  type="button"
+                  aria-label={t("mail.compose.popOut")}
                   onClick={() => onPopOut(draft.id)}
                   className="flex h-9 w-9 sm:h-6 sm:w-6 items-center justify-center rounded text-muted-foreground/40 hover:text-foreground transition-colors"
                 >
                   <IconExternalLink className="h-3.5 w-3.5" />
                 </button>
               </TooltipTrigger>
-              <TooltipContent>Pop out to compose window</TooltipContent>
+              <TooltipContent>{t("mail.compose.popOut")}</TooltipContent>
             </Tooltip>
           </div>
           {recipientFields}
@@ -473,22 +513,27 @@ export const InlineReplyComposer = forwardRef<
           <div className="flex items-center justify-between px-4 pt-3 pb-1">
             <div className="flex items-center gap-1.5 min-w-0">
               <span className="text-[13px] font-semibold text-green-400">
-                Reply
+                {t("mail.compose.reply")}
               </span>
-              <span className="text-[13px] text-muted-foreground/70 truncate">
-                to {recipientDisplay}
+              <span
+                data-an-mask
+                className="text-[13px] text-muted-foreground/70 truncate"
+              >
+                {t("mail.compose.replyTo", { recipient: recipientDisplay })}
               </span>
             </div>
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
+                  type="button"
+                  aria-label={t("mail.compose.popOut")}
                   onClick={() => onPopOut(draft.id)}
                   className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground/40 hover:text-foreground transition-colors shrink-0"
                 >
                   <IconExternalLink className="h-3.5 w-3.5" />
                 </button>
               </TooltipTrigger>
-              <TooltipContent>Pop out to compose window</TooltipContent>
+              <TooltipContent>{t("mail.compose.popOut")}</TooltipContent>
             </Tooltip>
           </div>
           {recipientFields}
@@ -526,6 +571,7 @@ export const InlineReplyComposer = forwardRef<
           onClose={() => onClose(draft.id)}
           onFlush={() => onFlush(draft.id)}
           isGenerating={isGenerating}
+          autocompleteEnabled={settings?.autocompleteEnabled ?? false}
           draftId={draft.id}
           getCurrentDraftBody={(editor) =>
             getCurrentDraftBodyFromEditor({
@@ -535,19 +581,27 @@ export const InlineReplyComposer = forwardRef<
             })
           }
           sendToAgent={sendToAgent}
+          onUploadImage={handleUploadImage}
         />
         {hasQuote && (
           <>
             <button
               type="button"
-              aria-label={showQuoted ? "Hide quoted text" : "Show quoted text"}
+              aria-label={
+                showQuoted
+                  ? t("mail.thread.hideQuotedText")
+                  : t("mail.thread.showQuotedText")
+              }
               onClick={() => setShowQuoted(!showQuoted)}
               className="mt-1 inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground/50 transition-colors hover:bg-accent hover:text-muted-foreground"
             >
               <IconDots className="h-4 w-4" />
             </button>
             {showQuoted && (
-              <pre className="mt-2 whitespace-pre-wrap text-[13px] text-muted-foreground/60 font-sans leading-relaxed">
+              <pre
+                data-an-block
+                className="mt-2 whitespace-pre-wrap text-[13px] text-muted-foreground/60 font-sans leading-relaxed"
+              >
                 {quotedContent.trim()}
               </pre>
             )}
@@ -571,52 +625,60 @@ export const InlineReplyComposer = forwardRef<
               <Button
                 variant="ghost"
                 size="icon"
+                type="button"
+                aria-label={t("mail.compose.bold")}
                 className="h-7 w-7"
                 onClick={() => editorRef.current?.toggleBold()}
               >
                 <IconBold className="h-3.5 w-3.5" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Bold</TooltipContent>
+            <TooltipContent>{t("mail.compose.bold")}</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
                 variant="ghost"
                 size="icon"
+                type="button"
+                aria-label={t("mail.compose.italic")}
                 className="h-7 w-7"
                 onClick={() => editorRef.current?.toggleItalic()}
               >
                 <IconItalic className="h-3.5 w-3.5" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Italic</TooltipContent>
+            <TooltipContent>{t("mail.compose.italic")}</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
                 variant="ghost"
                 size="icon"
+                type="button"
+                aria-label={t("mail.compose.insertLink")}
                 className="h-7 w-7"
                 onClick={() => editorRef.current?.setLink()}
               >
                 <IconLink className="h-3.5 w-3.5" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Insert link</TooltipContent>
+            <TooltipContent>{t("mail.compose.insertLink")}</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
                 variant="ghost"
                 size="icon"
+                type="button"
+                aria-label={t("mail.compose.attachFile")}
                 className="h-7 w-7"
                 onClick={() => void handleAttach()}
               >
                 <IconPaperclip className="h-3.5 w-3.5" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Attach file</TooltipContent>
+            <TooltipContent>{t("mail.compose.attachFile")}</TooltipContent>
           </Tooltip>
 
           <div className="mx-1 h-4 w-px bg-border" />
@@ -624,7 +686,7 @@ export const InlineReplyComposer = forwardRef<
           {isGenerating ? (
             <div className="flex items-center gap-1.5 px-2 text-xs text-muted-foreground">
               <IconLoader2 className="h-3.5 w-3.5 animate-spin" />
-              <span>Generating…</span>
+              <span>{t("mail.compose.generating")}</span>
             </div>
           ) : (
             <Popover open={generateOpen} onOpenChange={setGenerateOpen}>
@@ -634,13 +696,13 @@ export const InlineReplyComposer = forwardRef<
                   size="sm"
                   className="h-7 gap-1.5 px-2 text-xs"
                 >
-                  Generate
+                  {t("mail.compose.generate")}
                 </Button>
               </PopoverTrigger>
               <PopoverContent side="top" align="start" className="w-80 p-3">
                 <div className="flex flex-col gap-2">
                   <label className="text-xs font-medium text-muted-foreground">
-                    What should the agent write?
+                    {t("mail.compose.agentPromptLabel")}
                   </label>
                   <textarea
                     value={generatePrompt}
@@ -648,20 +710,21 @@ export const InlineReplyComposer = forwardRef<
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && !e.shiftKey) {
                         e.preventDefault();
-                        handleGenerate();
+                        void handleGenerate();
                       }
                       if (e.key === "Escape") {
                         e.stopPropagation();
                         setGenerateOpen(false);
                       }
                     }}
-                    placeholder="e.g. Write a polite follow-up..."
+                    placeholder={t("mail.compose.agentPromptPlaceholder")}
                     className="min-h-[60px] w-full resize-none rounded-md border bg-transparent px-3 py-2 text-sm outline-none placeholder:text-muted-foreground focus:ring-1 focus:ring-ring"
                     autoFocus
                   />
                   <div className="flex items-center justify-between">
                     <span className="text-[10px] text-muted-foreground">
-                      <kbd className="kbd-hint">↵</kbd> to submit
+                      <kbd className="kbd-hint">↵</kbd>{" "}
+                      {t("mail.compose.toSubmit")}
                     </span>
                     <Button
                       size="sm"
@@ -669,7 +732,7 @@ export const InlineReplyComposer = forwardRef<
                       disabled={!generatePrompt.trim()}
                       className="h-7 gap-1.5 px-3 text-xs"
                     >
-                      Generate
+                      {t("mail.compose.generate")}
                     </Button>
                   </div>
                 </div>
@@ -684,22 +747,24 @@ export const InlineReplyComposer = forwardRef<
               <Button
                 variant="ghost"
                 size="icon"
+                type="button"
+                aria-label={t("mail.compose.discardDraft")}
                 className="h-7 w-7 text-muted-foreground hover:text-destructive"
                 onClick={() => onDiscard(draft.id)}
               >
                 <IconTrash className="h-3.5 w-3.5" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>Discard draft</TooltipContent>
+            <TooltipContent>{t("mail.compose.discardDraft")}</TooltipContent>
           </Tooltip>
           <Button
             size="sm"
-            onClick={handleSend}
+            onClick={() => void handleSend()}
             disabled={sendEmail.isPending || !draft.to.trim()}
             className="gap-1.5"
           >
             <IconSend className="h-3.5 w-3.5" />
-            Send
+            {t("mail.compose.send")}
           </Button>
         </div>
       </div>

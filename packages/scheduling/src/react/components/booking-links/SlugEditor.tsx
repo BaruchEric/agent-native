@@ -1,28 +1,16 @@
-/**
- * SlugEditor — inline-editable URL preview for a booking link.
- *
- * Renders the public booking URL as a single interactive line. Clicking
- * the username segment (if editable) or the slug segment swaps it for an
- * input; pressing Enter / blurring commits. All changes are fired through
- * the `onUsernameChange` / `onSlugChange` callbacks synchronously — the
- * caller owns persistence and should update UI optimistically.
- *
- * Shadcn primitives expected in the consumer: label.
- */
+import { Label } from "@agent-native/toolkit/ui";
 import { useState } from "react";
-import { Label } from "@/components/ui/label";
+
+import { useSchedulingT } from "../../i18n.js";
 
 export interface SlugEditorProps {
   host: string;
-  /** Path prefix before the username, e.g. "/meet" (calendar) or "" (scheduling). */
   pathPrefix?: string;
   username: string;
   slug: string;
   onUsernameChange?: (next: string) => void;
   onSlugChange: (next: string) => void;
-  /** Hide the top label (e.g. inside a compact inline row). */
   hideLabel?: boolean;
-  /** Label text. Defaults to "URL". */
   label?: string;
 }
 
@@ -39,6 +27,7 @@ function cls(...parts: (string | false | null | undefined)[]) {
 }
 
 export function SlugEditor(props: SlugEditorProps) {
+  const t = useSchedulingT();
   const {
     host,
     pathPrefix = "",
@@ -47,7 +36,7 @@ export function SlugEditor(props: SlugEditorProps) {
     onUsernameChange,
     onSlugChange,
     hideLabel,
-    label = "URL",
+    label = t("url"),
   } = props;
 
   const [editing, setEditing] = useState<"username" | "slug" | null>(null);
@@ -108,9 +97,9 @@ export function SlugEditor(props: SlugEditorProps) {
                 ? "text-foreground hover:bg-primary/10 hover:text-primary"
                 : "text-primary/60 bg-primary/5 border border-dashed border-primary/30 hover:bg-primary/10",
             )}
-            title="Click to edit username"
+            title={t("clickToEditUsername")}
           >
-            {username || "your-name"}
+            {username || t("yourName")}
           </button>
         ) : (
           <span className="font-mono text-foreground">{username}</span>
@@ -138,9 +127,9 @@ export function SlugEditor(props: SlugEditorProps) {
             type="button"
             onClick={() => startEdit("slug")}
             className="inline rounded px-0.5 -mx-0.5 font-mono text-foreground hover:bg-primary/10 hover:text-primary"
-            title="Click to edit slug"
+            title={t("clickToEditSlug")}
           >
-            {slug || "meeting"}
+            {slug || t("meeting")}
           </button>
         )}
       </div>

@@ -1,5 +1,475 @@
 # @agent-native/pinpoint
 
+## 0.1.84
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.83
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.82
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.81
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.80
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.79
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.78
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.77
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.76
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.75
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.74
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.73
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.72
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.71
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.70
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.69
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.68
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.67
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.66
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.65
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.64
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.63
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.62
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.61
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.60
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.59
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.58
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- ed3801e: Remove nonessential source comments.
+
+## 0.1.57
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.56
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.55
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.54
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.53
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.52
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.51
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.50
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.49
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.48
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.47
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.46
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.45
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.44
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.43
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.42
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.41
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.40
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.39
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.38
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.37
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.36
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.35
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.34
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.33
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.32
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.31
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- 4776e61: Reduce CI lint warnings with safer type narrowing, callback binding, and explicit async intent.
+
+## 0.1.30
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.29
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.28
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.27
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.26
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.25
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.24
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.23
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.22
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.21
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.20
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.19
+
+### Patch Changes
+
+- f499dff: Add `@agent-native/core/vitest-config`, a base vitest config that caps a suite's
+  worker pool so concurrent test runs no longer oversubscribe the CPU. Defaults to
+  25% of cores; override with `VITEST_CONCURRENCY`. Every template and package
+  config merges it in.
+
+## 0.1.18
+
+### Patch Changes
+
+- 0aada94: Serve the stateless MCP 2026-07-28 protocol natively while preserving stateless
+  legacy clients, automatically negotiate the newest supported protocol from
+  outbound clients and stdio bridges, and harden MCP OAuth issuer, client type,
+  scope, credential binding, and Client ID Metadata Document behavior. Require
+  durable, single-use MCP 2026 approval elicitation before running actions marked
+  `needsApproval`.
+
+  Update the Pinpoint MCP server example to use the stable split MCP v2 packages.
+
+## 0.1.17
+
+### Patch Changes
+
+- 22e9951: Test-only: the `FileStore.update()` spec now drives the clock with fake timers instead of assuming wall-clock advances between two back-to-back writes, which made it flake when both landed in the same millisecond. No runtime behavior change.
+
+## 0.1.16
+
+### Patch Changes
+
+- 52cce19: Shrink the dispatch and pinpoint install footprint by removing code and
+  dependencies nothing could reach. Dispatch drops the unused pre-auth routing
+  helper — `rootDispatchRedirect` had no callers and was not re-exported from
+  `./server` or any other published subpath — along with the database client and
+  `h3` dependencies, which had no imports in the package but were still installed
+  for every consumer. Pinpoint drops the `HistoryDropdown` and `SettingsPanel`
+  overlay components, which were never rendered by the overlay and were not
+  reachable from any of its `.`, `./react`, `./primitives`, `./server`, or
+  `./types` entry points. No exported API changes.
+
+## 0.1.15
+
+### Patch Changes
+
+- 8df32f6: Publish the latest Builder link tracking updates.
+
+## 0.1.14
+
+### Patch Changes
+
+- b6d7f87: Move portable rich-editor, context presentation, and visual design controls into Toolkit while preserving Core compatibility re-exports, and add accurate side-effect metadata to capability packages.
+
+## 0.1.13
+
+### Patch Changes
+
+- 38ca6fa: Make annotation badges appear from a natural scale and respect reduced-motion preferences.
+
+## 0.1.12
+
+### Patch Changes
+
+- f43d34c: Stage atomic writes inside the data directory so saves work when /tmp is a different filesystem.
+
+## 0.1.11
+
+### Patch Changes
+
+- 823d635: Upgrade the workspace toolchain to TypeScript 7 (`tsc`) with a side-by-side TypeScript 6 API package for tools that still need programmatic access. Replace `@typescript/native-preview` / `tsgo` with the stable `typescript` 7 release.
+
+## 0.1.10
+
+### Patch Changes
+
+- 2a03c35: Adopt the native TypeScript and oxfmt package build baselines.
+
 ## 0.1.9
 
 ### Patch Changes

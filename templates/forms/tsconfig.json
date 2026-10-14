@@ -3,8 +3,8 @@
   "compilerOptions": {
     "ignoreDeprecations": "6.0",
     "rootDirs": [".", "./.react-router/types"],
-    "baseUrl": ".",
     "paths": {
+      "*": ["./*"],
       "@/*": ["./app/*"],
       "@shared/*": ["./shared/*"]
     }
@@ -13,6 +13,7 @@
     "app/**/*",
     "server/**/*",
     "shared/**/*",
+    "scripts/**/*",
     "react-router.config.ts",
     ".react-router/types/**/*",
     ".generated/**/*"

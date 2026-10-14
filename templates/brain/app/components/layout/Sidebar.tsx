@@ -1,40 +1,47 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { Link, NavLink, useLocation, useNavigate } from "react-router";
 import {
-  IconArchive,
-  IconDots,
-  IconEdit,
-  IconPin,
-  IconPlus,
-} from "@tabler/icons-react";
-import { toast } from "sonner";
-import {
-  appPath,
-  DevDatabaseLink,
-  FeedbackButton,
   navigateWithAgentChatViewTransition,
   useChatThreads,
   type ChatThreadSummary,
-} from "@agent-native/core/client";
-import { ExtensionsSidebarSection } from "@agent-native/core/client/extensions";
-import { OrgSwitcher } from "@agent-native/core/client/org";
-import { navItems } from "@/lib/brain";
-import { cn } from "@/lib/utils";
+} from "@agent-native/core/client/agent-chat";
+import { useT } from "@agent-native/core/client/i18n";
+import { DevDatabaseLink } from "@agent-native/toolkit/app/db-admin";
+import { FeedbackButton } from "@agent-native/toolkit/app/feedback";
+import { OrgSwitcher } from "@agent-native/toolkit/app/org";
+import { openCommandMenu } from "@agent-native/toolkit/app/shared";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { Input } from "@/components/ui/input";
+  AppSidebar,
+  AppSidebarNavItem,
+} from "@agent-native/toolkit/app/shared";
+import {
+  ChatHistoryRail,
+  type ChatHistoryItem,
+} from "@agent-native/toolkit/chat-history";
+import { IconSearch } from "@tabler/icons-react";
+import { useEffect, useMemo } from "react";
+import { useLocation, useNavigate } from "react-router";
+import { toast } from "sonner";
+
+import { Button } from "@/components/ui/button";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import {
+  brainAskThreadIdFromPath,
+  brainAskThreadPath,
+  isBrainAskPath,
+  navItems,
+} from "@/lib/brain";
 
 const BRAIN_CHAT_STORAGE_KEY = "brain";
 const BRAIN_ACTIVE_THREAD_KEY = `agent-chat-active-thread:${BRAIN_CHAT_STORAGE_KEY}`;
+
+interface SidebarProps {
+  collapsed?: boolean;
+  collapsible?: boolean;
+  onCollapsedChange?: (collapsed: boolean) => void;
+}
 
 function formatThreadAge(updatedAt: number) {
   const diffMs = Math.max(0, Date.now() - updatedAt);
@@ -78,12 +85,11 @@ function persistedActiveThreadId() {
   }
 }
 
-function BrainChatsSection() {
+function BrainChatsSection({ open }: { open: boolean }) {
   const navigate = useNavigate();
+  const t = useT();
   const {
     threads,
-    activeThreadId,
-    createThread,
     switchThread,
     pinThread,
     archiveThread,
@@ -93,18 +99,31 @@ function BrainChatsSection() {
     autoCreate: false,
     restoreActiveThread: false,
   });
-  const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
-  const [renameDraft, setRenameDraft] = useState("");
-  const renameInputRef = useRef<HTMLInputElement | null>(null);
-  const committingRenameRef = useRef(false);
+  // The URL is the source of truth for the highlighted thread: this instance is
+  // not route-controlled, so its own active id is not cleared by New chat.
+  const location = useLocation();
+  const activeThreadId = brainAskThreadIdFromPath(location.pathname);
 
   const visibleThreads = useMemo(
     () =>
       threads
         .filter((thread) => thread.messageCount > 0 && !thread.archivedAt)
-        .sort(compareThreads)
-        .slice(0, 8),
+        .sort(compareThreads),
     [threads],
+  );
+  const chatItems = useMemo<ChatHistoryItem[]>(
+    () =>
+      visibleThreads.map((thread) => ({
+        id: thread.id,
+        title: threadTitle(thread),
+        titleText: threadTitle(thread),
+        timestamp:
+          thread.id === activeThreadId
+            ? undefined
+            : formatThreadAge(threadUpdatedAt(thread)),
+        pinned: Boolean(thread.pinnedAt),
+      })),
+    [activeThreadId, visibleThreads],
   );
 
   useEffect(() => {
@@ -126,29 +145,21 @@ function BrainChatsSection() {
     };
   }, [refreshThreads]);
 
-  useEffect(() => {
-    if (!renamingThreadId) return;
-    requestAnimationFrame(() => {
-      renameInputRef.current?.focus();
-      renameInputRef.current?.select();
-    });
-  }, [renamingThreadId]);
-
-  function openThread(threadId: string, options?: { isNew?: boolean }) {
+  function openThread(threadId: string) {
     switchThread(threadId);
-    navigateWithAgentChatViewTransition(navigate, "/");
+    navigateWithAgentChatViewTransition(navigate, brainAskThreadPath(threadId));
     window.requestAnimationFrame(() => {
       window.dispatchEvent(
         new CustomEvent("agent-chat:open-thread", {
-          detail: { threadId, newThread: options?.isNew === true },
+          detail: { threadId, newThread: false },
         }),
       );
     });
   }
 
-  async function handleNewChat() {
-    const threadId = await createThread();
-    if (threadId) openThread(threadId, { isNew: true });
+  // No thread is created here: the id joins the URL on the first saved message.
+  function handleNewChat() {
+    navigateWithAgentChatViewTransition(navigate, brainAskThreadPath(null));
   }
 
   async function handleArchiveThread(threadId: string) {
@@ -156,254 +167,147 @@ function BrainChatsSection() {
       threadId === activeThreadId || threadId === persistedActiveThreadId();
     const archived = await archiveThread(threadId);
     if (!archived) {
-      toast.error("Could not archive chat.");
+      toast.error(t("chat.archiveFailed"));
       return;
     }
     if (wasActive) {
-      await handleNewChat();
+      handleNewChat();
     }
   }
 
-  function startRenameThread(thread: ChatThreadSummary) {
-    committingRenameRef.current = false;
-    setRenameDraft(threadTitle(thread));
-    setRenamingThreadId(thread.id);
-  }
-
-  function cancelRenameThread() {
-    committingRenameRef.current = true;
-    setRenamingThreadId(null);
-    setRenameDraft("");
-  }
-
-  async function commitRenameThread() {
-    if (committingRenameRef.current) return;
-    const threadId = renamingThreadId;
-    const title = renameDraft.trim();
-    if (!threadId) return;
-    committingRenameRef.current = true;
-    setRenamingThreadId(null);
-    setRenameDraft("");
-    if (title) {
-      const renamed = await renameThread(threadId, title);
-      if (!renamed) toast.error("Could not rename chat.");
-    }
-    committingRenameRef.current = false;
-  }
-
-  function handleRenameSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    void commitRenameThread();
+  function handleRenameThread(threadId: string, title: string) {
+    void renameThread(threadId, title).then((renamed) => {
+      if (!renamed) toast.error(t("chat.renameFailed"));
+    });
   }
 
   return (
-    <div className="mt-2 border-l border-sidebar-border/70 pl-3">
-      <div className="mb-1 flex h-7 items-center gap-2 pr-1">
-        <div className="min-w-0 flex-1 text-xs font-medium text-sidebar-foreground/70">
-          Chats
-        </div>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              onClick={handleNewChat}
-              className="flex size-6 shrink-0 items-center justify-center rounded-md text-sidebar-foreground/65 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-              aria-label="New Brain chat"
-            >
-              <IconPlus className="size-3.5" />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent>New chat</TooltipContent>
-        </Tooltip>
-      </div>
-      <div className="grid gap-0.5">
-        {visibleThreads.map((thread) => {
-          const isActive = thread.id === activeThreadId;
-          const isRenaming = thread.id === renamingThreadId;
-          return (
-            <div
-              key={thread.id}
-              className={cn(
-                "group flex h-8 min-w-0 items-center rounded-md text-sm transition-colors",
-                isActive
-                  ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                  : "text-sidebar-foreground/80 hover:bg-sidebar-accent/65 hover:text-sidebar-accent-foreground",
-              )}
-            >
-              {isRenaming ? (
-                <form
-                  onSubmit={handleRenameSubmit}
-                  className="flex h-full min-w-0 flex-1 items-center px-1.5"
-                >
-                  <Input
-                    ref={renameInputRef}
-                    value={renameDraft}
-                    onChange={(event) => setRenameDraft(event.target.value)}
-                    onBlur={() => void commitRenameThread()}
-                    onKeyDown={(event) => {
-                      if (event.key === "Escape") {
-                        event.preventDefault();
-                        cancelRenameThread();
-                      }
-                    }}
-                    maxLength={160}
-                    aria-label={`Rename ${threadTitle(thread)}`}
-                    className="h-6 min-w-0 rounded-sm border-sidebar-border bg-background px-1.5 text-xs"
-                  />
-                </form>
-              ) : (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => openThread(thread.id)}
-                    className="flex h-full min-w-0 flex-1 items-center px-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    <span className="min-w-0 flex-1 truncate">
-                      {threadTitle(thread)}
-                    </span>
-                  </button>
-                  <div className="relative flex size-7 shrink-0 items-center justify-end pr-1">
-                    <span className="text-[11px] text-sidebar-foreground/50 transition-opacity group-hover:opacity-0 group-focus-within:opacity-0">
-                      {isActive ? "" : formatThreadAge(threadUpdatedAt(thread))}
-                    </span>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <button
-                          type="button"
-                          aria-label={`Chat options for ${threadTitle(thread)}`}
-                          className="absolute right-1 flex size-6 items-center justify-center rounded-md text-sidebar-foreground/65 opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100"
-                        >
-                          <IconDots className="size-4" />
-                        </button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent
-                        align="end"
-                        side="right"
-                        sideOffset={6}
-                      >
-                        <DropdownMenuItem
-                          onSelect={() => startRenameThread(thread)}
-                        >
-                          <IconEdit className="size-4" />
-                          Rename chat
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onSelect={() =>
-                            void pinThread(thread.id, !thread.pinnedAt)
-                          }
-                        >
-                          <IconPin className="size-4" />
-                          {thread.pinnedAt ? "Unpin chat" : "Pin chat"}
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          variant="destructive"
-                          onSelect={() => void handleArchiveThread(thread.id)}
-                        >
-                          <IconArchive className="size-4" />
-                          Archive chat
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                </>
-              )}
-            </div>
-          );
-        })}
+    <div
+      className="an-chat-history-rail__collapse"
+      data-state={open ? "open" : "closed"}
+      aria-hidden={!open}
+    >
+      <div className="ms-4">
+        <ChatHistoryRail
+          items={chatItems}
+          activeId={activeThreadId}
+          onSelect={openThread}
+          onNewChat={handleNewChat}
+          railLabels={{
+            newChat: t("chat.newChat"),
+            showMore: t("chat.chats"),
+            showLess: t("chat.chats"),
+          }}
+          previewCount={5}
+          expandedCount={15}
+          onTogglePin={(threadId) => {
+            const thread = visibleThreads.find((item) => item.id === threadId);
+            if (thread) void pinThread(threadId, !thread.pinnedAt);
+          }}
+          onRename={handleRenameThread}
+          renameMaxLength={160}
+          onDelete={(threadId) => void handleArchiveThread(threadId)}
+          labels={{
+            options: (item) =>
+              t("chat.optionsFor", { title: item.titleText ?? "" }),
+            renameInput: (item) =>
+              t("chat.renameThread", { title: item.titleText ?? "" }),
+            rename: t("chat.renameChat"),
+            pin: t("chat.pinChat"),
+            unpin: t("chat.unpinChat"),
+            delete: t("chat.archiveChat"),
+          }}
+          className="min-w-0"
+        />
       </div>
     </div>
   );
 }
 
-export function Sidebar() {
+export function Sidebar({
+  collapsed = false,
+  collapsible = true,
+  onCollapsedChange,
+}: SidebarProps) {
   const location = useLocation();
   const navigate = useNavigate();
-  const isAskRoute = location.pathname === "/";
-  const navClass = ({ isActive }: { isActive: boolean }) =>
-    cn(
-      "flex h-9 items-center gap-3 rounded-md px-3 text-sm transition-colors",
-      isActive
-        ? "bg-sidebar-accent text-sidebar-accent-foreground"
-        : "text-sidebar-foreground hover:bg-sidebar-accent/65 hover:text-sidebar-accent-foreground",
-    );
+  const t = useT();
+  const isAskRoute = isBrainAskPath(location.pathname);
+
+  const feedbackButton = (
+    <FeedbackButton variant={collapsed ? "icon" : "sidebar"} side="right" />
+  );
+
+  const orgSwitcher = <OrgSwitcher compact={collapsed} />;
+
+  const searchButton = (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="shrink-0 text-primary hover:bg-accent/60 hover:text-primary"
+          onClick={openCommandMenu}
+          aria-label={t("navigation.search")}
+        >
+          <IconSearch className="size-4" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="right">{t("navigation.search")}</TooltipContent>
+    </Tooltip>
+  );
 
   return (
-    <aside className="flex h-full w-60 min-w-0 shrink-0 flex-col overflow-hidden border-r border-sidebar-border bg-sidebar text-sidebar-foreground">
-      <div className="flex h-14 shrink-0 items-center gap-3 border-b border-sidebar-border px-4">
-        <Link
-          to="/"
-          className="flex min-w-0 items-center gap-3 rounded outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <img
-            src={appPath("/agent-native-icon-light.svg")}
-            alt=""
-            aria-hidden="true"
-            className="block h-4 w-auto shrink-0 dark:hidden"
-          />
-          <img
-            src={appPath("/agent-native-icon-dark.svg")}
-            alt=""
-            aria-hidden="true"
-            className="hidden h-4 w-auto shrink-0 dark:block"
-          />
-          <div className="min-w-0">
-            <p className="truncate text-sm font-semibold text-sidebar-accent-foreground">
-              Brain
-            </p>
-          </div>
-        </Link>
-      </div>
-
-      <nav className="flex-1 overflow-y-auto px-2 py-3">
-        <div className="grid gap-1">
-          {navItems.map((item) => {
-            const Icon = item.icon;
-            return (
-              <div key={item.href}>
-                <NavLink
-                  to={item.href}
-                  end={item.href === "/"}
-                  onClick={(event) => {
-                    if (
-                      item.view === "ask" &&
-                      !isAskRoute &&
-                      !event.metaKey &&
-                      !event.ctrlKey &&
-                      !event.shiftKey &&
-                      !event.altKey
-                    ) {
-                      event.preventDefault();
-                      navigateWithAgentChatViewTransition(navigate, "/");
-                    }
-                  }}
-                  className={navClass}
-                >
-                  <Icon className="size-4 shrink-0" />
-                  <span className="truncate">{item.label}</span>
-                </NavLink>
-                {item.view === "ask" && isAskRoute ? (
-                  <BrainChatsSection />
-                ) : null}
-              </div>
-            );
-          })}
-        </div>
-      </nav>
-
-      <div className="mt-auto shrink-0">
-        <div className="border-t border-sidebar-border px-2 py-1">
-          <ExtensionsSidebarSection />
-        </div>
-
-        <div className="border-t border-sidebar-border px-3 py-2">
-          <OrgSwitcher reserveSpace />
-        </div>
-
-        <div className="border-t border-sidebar-border px-3 py-2">
+    <AppSidebar
+      collapsed={collapsed}
+      collapsible={collapsible}
+      onCollapsedChange={onCollapsedChange}
+      brandName={t("navigation.brand")}
+      appId="brain"
+      brandHref="/home"
+      feedback={feedbackButton}
+      orgSwitcher={orgSwitcher}
+      footerExtras={
+        <>
+          {searchButton}
           <DevDatabaseLink />
-          <FeedbackButton />
-        </div>
-      </div>
-    </aside>
+        </>
+      }
+    >
+      {navItems.map((item) => {
+        const label = t(`navigation.${item.view}`);
+        const isActive =
+          item.href === "/home"
+            ? isAskRoute
+            : location.pathname.startsWith(item.href);
+        return (
+          <div key={item.href}>
+            <AppSidebarNavItem
+              to={item.href}
+              label={label}
+              icon={item.icon}
+              active={isActive}
+              onClick={(event) => {
+                if (
+                  item.view === "ask" &&
+                  !isAskRoute &&
+                  !event.metaKey &&
+                  !event.ctrlKey &&
+                  !event.shiftKey &&
+                  !event.altKey
+                ) {
+                  event.preventDefault();
+                  navigateWithAgentChatViewTransition(navigate, "/home");
+                }
+              }}
+            />
+            {!collapsed && item.view === "ask" ? (
+              <BrainChatsSection open={isAskRoute} />
+            ) : null}
+          </div>
+        );
+      })}
+    </AppSidebar>
   );
 }

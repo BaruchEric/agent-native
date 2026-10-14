@@ -1,4 +1,5 @@
 import path from "path";
+
 import type {
   MigrationInputKind,
   ProjectIR,
@@ -9,7 +10,7 @@ import type {
 
 export interface MigrationInputDescriptor {
   sourceRoot: string;
-  inputKind?: MigrationInputKind | string;
+  inputKind?: MigrationInputKind | (string & {});
   inputDescription?: string;
 }
 
@@ -27,7 +28,9 @@ export function inferMigrationInputKind(input: string): MigrationInputKind {
 
 export function normalizeMigrationSourceRoot(
   input: string,
-  inputKind: MigrationInputKind | string = inferMigrationInputKind(input),
+  inputKind: MigrationInputKind | (string & {}) = inferMigrationInputKind(
+    input,
+  ),
 ): string {
   const trimmed = input.trim();
   return inputKind === "path" ? path.resolve(trimmed) : trimmed;
@@ -35,7 +38,9 @@ export function normalizeMigrationSourceRoot(
 
 export function describeMigrationInput(
   input: string,
-  inputKind: MigrationInputKind | string = inferMigrationInputKind(input),
+  inputKind: MigrationInputKind | (string & {}) = inferMigrationInputKind(
+    input,
+  ),
 ): string {
   const trimmed = input.trim();
   if (inputKind === "path")
@@ -118,7 +123,7 @@ export const agentIntrospectionSourceAdapter =
 
 function createFallbackRoute(
   sourceRoot: string,
-  inputKind: MigrationInputKind | string,
+  inputKind: MigrationInputKind | (string & {}),
   inputDescription: string,
 ): SiteRoute {
   const routePath = inputKind === "url" ? pathFromUrl(sourceRoot) : "/";

@@ -1,26 +1,36 @@
-import { getDbExec, intType } from "../db/client.js";
+import { getDbExec } from "../db/client.js";
+import { ensureIndexExists, ensureTableExists } from "../db/ddl-guard.js";
+import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
 
 let _initPromise: Promise<void> | undefined;
 
-async function ensureCheckpointTable(): Promise<void> {
+export async function ensureCheckpointTable(): Promise<void> {
   if (!_initPromise) {
-    _initPromise = (async () => {
-      const client = getDbExec();
-      await client.execute(`
+    const _initPromiseWithRequestDbPoolScope = (async () => {
+      const createSql = `
         CREATE TABLE IF NOT EXISTS agent_checkpoints (
           id TEXT PRIMARY KEY,
           thread_id TEXT NOT NULL,
           run_id TEXT,
           commit_sha TEXT NOT NULL,
           message TEXT NOT NULL DEFAULT '',
-          created_at ${intType()} NOT NULL
+          created_at BIGINT NOT NULL
         )
-      `);
+      `;
+      const threadIdxSql = `CREATE INDEX IF NOT EXISTS agent_checkpoints_thread_created_idx ON agent_checkpoints (thread_id, created_at)`;
+      const runIdxSql = `CREATE INDEX IF NOT EXISTS agent_checkpoints_run_idx ON agent_checkpoints (run_id)`;
+
+      await ensureTableExists("agent_checkpoints", createSql);
+      await ensureIndexExists(
+        "agent_checkpoints_thread_created_idx",
+        threadIdxSql,
+      );
+      await ensureIndexExists("agent_checkpoints_run_idx", runIdxSql);
     })().catch((err) => {
-      // Retry init on the next call after a failed startup.
       _initPromise = undefined;
       throw err;
     });
+    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
   }
   return _initPromise;
 }
@@ -53,7 +63,7 @@ export async function getCheckpointsByThread(threadId: string): Promise<
   await ensureCheckpointTable();
   const client = getDbExec();
   const { rows } = await client.execute({
-    sql: `SELECT id, thread_id, run_id, commit_sha, message, created_at FROM agent_checkpoints WHERE thread_id = ? ORDER BY created_at DESC`,
+    sql: `SELECT id, thread_id, run_id, commit_sha, message, created_at FROM agent_checkpoints WHERE thread_id = ? ORDER BY created_at DESC LIMIT 200`,
     args: [threadId],
   });
   return (rows as any[]).map((r) => ({

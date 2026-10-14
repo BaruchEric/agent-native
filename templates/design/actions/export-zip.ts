@@ -1,13 +1,36 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
+import { defineAction } from "@agent-native/core/action";
 import { resolveAccess } from "@agent-native/core/sharing";
+import { eq } from "drizzle-orm";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
+import { designDataForAccessRole } from "../server/lib/design-data-access.js";
+import {
+  trackDesignExported,
+  withDesignExportFailureTracking,
+} from "../server/lib/design-export-tracking.js";
 import {
   exportFilename,
+  injectHiddenLayerExportStyle,
   trySaveExportFile,
 } from "../server/lib/design-export.js";
-import "../server/db/index.js"; // ensure registerShareableResource runs
+import { isBoardFile } from "../shared/board-file.js";
+import "../server/db/index.js";
+
+const METADATA_ARCHIVE_DIR = "agent-native-metadata";
+
+function safeArchivePath(filename: string, fallback: string): string {
+  const normalized = filename
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((part) => part && part !== "." && part !== "..")
+    .join("/");
+  return normalized || fallback;
+}
+
+const trackZipExportFailures = withDesignExportFailureTracking<{ id: string }>(
+  "zip",
+);
 
 export default defineAction({
   description:
@@ -16,24 +39,24 @@ export default defineAction({
   schema: z.object({
     id: z.string().describe("Design ID to export"),
   }),
-  run: async ({ id }) => {
+  run: trackZipExportFailures(async ({ id }, ctx, facts) => {
     const access = await resolveAccess("design", id);
     if (!access) throw new Error(`Design not found: ${id}`);
+    facts.designId = id;
 
     const row = access.resource;
     const db = getDb();
 
-    // Fetch all design files
     const files = await db
       .select()
       .from(schema.designFiles)
       .where(eq(schema.designFiles.designId, id));
+    const exportFiles = files.filter((file) => !isBoardFile(file.filename));
+    facts.fileCount = exportFiles.length;
 
-    // Dynamic import JSZip
     const JSZip = (await import("jszip")).default;
     const zip = new JSZip();
 
-    // Add README
     const readme = [
       `# ${row.title}`,
       "",
@@ -44,30 +67,49 @@ export default defineAction({
       "",
       "## Files",
       "",
-      ...files.map((f) => `- ${f.filename} (${f.fileType})`),
+      ...exportFiles.map((f) => `- ${f.filename} (${f.fileType})`),
     ].join("\n");
 
-    zip.file("README.md", readme);
+    zip.file(`${METADATA_ARCHIVE_DIR}/README.md`, readme);
 
-    // Add all design files organized by type
-    for (const file of files) {
-      const folder =
-        file.fileType === "asset" ? "assets" : (file.fileType ?? "html");
-      zip.file(`${folder}/${file.filename}`, file.content ?? "");
+    for (const [index, file] of exportFiles.entries()) {
+      const filename = safeArchivePath(
+        file.filename,
+        `design-file-${index + 1}.txt`,
+      );
+      const content =
+        file.fileType === "html"
+          ? injectHiddenLayerExportStyle(file.content ?? "")
+          : (file.content ?? "");
+      zip.file(filename, content);
     }
 
-    // Add design data if present
-    if (row.data) {
-      zip.file("design-data.json", row.data);
+    // Add design data if present. Public/viewer exports keep render metadata
+    // but must never serialize a localhost bridge token into the archive.
+    const exportDesignData = designDataForAccessRole(
+      row.data ?? null,
+      access.role,
+    );
+    if (typeof exportDesignData === "string") {
+      zip.file(`${METADATA_ARCHIVE_DIR}/design-data.json`, exportDesignData);
     }
 
-    // Generate ZIP
     const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
     const zipBase64 = zipBuffer.toString("base64");
 
     const filename = exportFilename(row.title, "zip");
     const saveResult = await trySaveExportFile(filename, zipBuffer);
 
-    return { zipBase64, filename, ...saveResult, fileCount: files.length };
-  },
+    trackDesignExported(
+      { ...facts, exportFormat: "zip", status: "completed" },
+      ctx,
+    );
+
+    return {
+      zipBase64,
+      filename,
+      ...saveResult,
+      fileCount: exportFiles.length,
+    };
+  }),
 });

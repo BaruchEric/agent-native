@@ -1,4 +1,7 @@
-import type { CalendarEvent } from "@shared/api";
+import type { CalendarEvent, UpdateEventScope } from "@shared/api";
+import { dateTimeInTimezoneToIso } from "@shared/timezone";
+
+export { dateTimeInTimezoneToIso };
 
 export type ReminderMethod = "popup" | "email";
 export type ReminderMode = "default" | "none" | "custom";
@@ -7,9 +10,22 @@ export type RecurrencePreset =
   | "daily"
   | "weekdays"
   | "weekly"
+  | "biweekly"
   | "monthly"
   | "yearly"
   | "custom";
+
+export type RecurrenceUnit = "day" | "week" | "month" | "year";
+export type RecurrenceEndMode = "never" | "date" | "count";
+
+export interface CustomRecurrenceDraft {
+  interval: number;
+  unit: RecurrenceUnit;
+  days: string[];
+  endMode: RecurrenceEndMode;
+  endDate: string;
+  count: number;
+}
 
 export interface ReminderDraft {
   id: string;
@@ -33,6 +49,19 @@ export const REMINDER_PRESETS = [
 ] as const;
 
 export const MAX_EVENT_ATTACHMENTS = 25;
+export const UNNAMED_EVENT_TITLE = "(No title)";
+
+export function getEditableEventTitle(
+  event: Pick<CalendarEvent, "title" | "titleIsGenerated">,
+): string {
+  return event.titleIsGenerated ? "" : event.title;
+}
+
+export function buildEventTitleUpdate(
+  title: string,
+): Pick<CalendarEvent, "title" | "titleIsGenerated"> {
+  return { title: title.trim(), titleIsGenerated: false };
+}
 
 const DAY_CODES = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"] as const;
 const DAY_CODE_BY_LABEL: Record<string, (typeof DAY_CODES)[number]> = {
@@ -195,48 +224,29 @@ export function getEventEndValidationMessage({
   return "End date and time must be after start date and time.";
 }
 
+export function normalizeAllDayEditEndDate(
+  singleDay: boolean,
+  startDate: string,
+  endDate: string,
+): string {
+  return singleDay ? startDate : endDate;
+}
+
+export function resolveTimeEditScope(
+  isRecurring: boolean,
+  isSingleDayWorkingLocation: boolean,
+  requestedScope: UpdateEventScope,
+): UpdateEventScope {
+  if (!isRecurring || isSingleDayWorkingLocation) return "single";
+  return requestedScope;
+}
+
 export function getLocalTimezone() {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 }
 
-function getTimezoneOffsetMs(date: Date, timezone: string) {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    hourCycle: "h23",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).formatToParts(date);
-  const values = new Map(parts.map((part) => [part.type, part.value]));
-  const asUtc = Date.UTC(
-    Number(values.get("year")),
-    Number(values.get("month")) - 1,
-    Number(values.get("day")),
-    Number(values.get("hour")),
-    Number(values.get("minute")),
-    Number(values.get("second")),
-  );
-  return asUtc - date.getTime();
-}
-
-export function dateTimeInTimezoneToIso(
-  date: string,
-  time: string,
-  timezone: string,
-) {
-  const [year, month, day] = date.split("-").map(Number);
-  const [hour, minute] = time.split(":").map(Number);
-  const wallTimeAsUtc = new Date(
-    Date.UTC(year, month - 1, day, hour, minute, 0),
-  );
-  let offset = getTimezoneOffsetMs(wallTimeAsUtc, timezone);
-  let result = new Date(wallTimeAsUtc.getTime() - offset);
-  offset = getTimezoneOffsetMs(result, timezone);
-  result = new Date(wallTimeAsUtc.getTime() - offset);
-  return result.toISOString();
+export function resolveEventTimezone(timezone?: string | null) {
+  return timezone?.trim() || getLocalTimezone();
 }
 
 export function formatTimezoneLabel(timezone: string) {
@@ -317,6 +327,7 @@ export function getRecurrencePreset(recurrence?: string[]): RecurrencePreset {
   const interval = recurrenceField(rule, "INTERVAL") || "1";
   const byDay = recurrenceField(rule, "BYDAY");
 
+  if (freq === "WEEKLY" && interval === "2") return "biweekly";
   if (interval !== "1") return "custom";
   if (freq === "DAILY" && !byDay) return "daily";
   if ((freq === "DAILY" || freq === "WEEKLY") && byDay === "MO,TU,WE,TH,FR") {
@@ -326,6 +337,107 @@ export function getRecurrencePreset(recurrence?: string[]): RecurrencePreset {
   if (freq === "MONTHLY") return "monthly";
   if (freq === "YEARLY") return "yearly";
   return "custom";
+}
+
+function recurrenceFieldValue(rule: string, key: string): string | undefined {
+  return rule.match(new RegExp(`${key}=([^;]+)`, "i"))?.[1];
+}
+
+function recurrenceWeekday(startIso: string, timeZone?: string) {
+  return eventWeekdayCode(startIso, timeZone);
+}
+
+export function createCustomRecurrenceDraft(
+  startIso: string,
+  timeZone?: string,
+): CustomRecurrenceDraft {
+  return {
+    interval: 1,
+    unit: "week",
+    days: [recurrenceWeekday(startIso, timeZone)],
+    endMode: "never",
+    endDate: "",
+    count: 13,
+  };
+}
+
+export function parseCustomRecurrence(
+  recurrence: string[] | undefined,
+  startIso: string,
+  timeZone?: string,
+): CustomRecurrenceDraft {
+  const draft = createCustomRecurrenceDraft(startIso, timeZone);
+  const rule = recurrenceRule(recurrence);
+  if (!rule) return draft;
+
+  const freq = recurrenceFieldValue(rule, "FREQ")?.toLowerCase();
+  const unit: RecurrenceUnit =
+    freq === "daily"
+      ? "day"
+      : freq === "weekly"
+        ? "week"
+        : freq === "monthly"
+          ? "month"
+          : freq === "yearly"
+            ? "year"
+            : draft.unit;
+  const interval = Number.parseInt(
+    recurrenceFieldValue(rule, "INTERVAL") || "1",
+    10,
+  );
+  const count = Number.parseInt(
+    recurrenceFieldValue(rule, "COUNT") || String(draft.count),
+    10,
+  );
+  const until = recurrenceFieldValue(rule, "UNTIL");
+  const byDay = recurrenceFieldValue(rule, "BYDAY")
+    ?.split(",")
+    .map((day) => day.replace(/^[+-]?\d+/, "").toUpperCase())
+    .filter(Boolean);
+
+  return {
+    interval: Number.isFinite(interval) ? Math.max(1, interval) : 1,
+    unit,
+    days: byDay && byDay.length > 0 ? byDay : unit === "week" ? draft.days : [],
+    endMode: until
+      ? "date"
+      : recurrenceFieldValue(rule, "COUNT")
+        ? "count"
+        : "never",
+    endDate:
+      until && /^\d{8}/.test(until)
+        ? `${until.slice(0, 4)}-${until.slice(4, 6)}-${until.slice(6, 8)}`
+        : "",
+    count: Number.isFinite(count) ? Math.max(1, count) : draft.count,
+  };
+}
+
+export function buildCustomRecurrenceRules(
+  draft: CustomRecurrenceDraft,
+): string[] {
+  const interval = Math.max(1, Math.round(draft.interval));
+  const frequency = {
+    day: "DAILY",
+    week: "WEEKLY",
+    month: "MONTHLY",
+    year: "YEARLY",
+  }[draft.unit];
+  const parts = [
+    `FREQ=${frequency}`,
+    ...(interval > 1 ? [`INTERVAL=${interval}`] : []),
+  ];
+  if (draft.unit === "week" && draft.days.length > 0) {
+    parts.push(`BYDAY=${draft.days.join(",")}`);
+  }
+  if (draft.unit === "month" && draft.days.length > 0) {
+    parts.push(`BYDAY=${draft.days.join(",")}`);
+  }
+  if (draft.endMode === "date" && /^\d{4}-\d{2}-\d{2}$/.test(draft.endDate)) {
+    parts.push(`UNTIL=${draft.endDate.replace(/-/g, "")}T235959Z`);
+  } else if (draft.endMode === "count") {
+    parts.push(`COUNT=${Math.max(1, Math.round(draft.count))}`);
+  }
+  return [`RRULE:${parts.join(";")}`];
 }
 
 export function buildRecurrenceRules(
@@ -343,6 +455,10 @@ export function buildRecurrenceRules(
     case "weekly": {
       const day = eventWeekdayCode(startIso, timeZone);
       return [`RRULE:FREQ=WEEKLY;BYDAY=${day}`];
+    }
+    case "biweekly": {
+      const day = eventWeekdayCode(startIso, timeZone);
+      return [`RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=${day}`];
     }
     case "monthly":
       return ["RRULE:FREQ=MONTHLY"];

@@ -1,30 +1,29 @@
+import { readBody } from "@agent-native/core/server";
 import {
   defineEventHandler,
   getQuery,
   setResponseStatus,
   type H3Event,
 } from "h3";
-import { readBody } from "@agent-native/core/server";
+
 import {
   getIntegrationKey,
   saveIntegrationKey,
   deleteIntegrationKey,
 } from "../lib/integration-credentials.js";
 
-// GET /api/hubspot/status — never returns the key, only connection state.
 export const hubspotStatus = defineEventHandler(async (event: H3Event) => {
   return { connected: !!(await getIntegrationKey(event, "hubspot")) };
 });
 
-// PUT /api/hubspot/key — store the key in the encrypted per-user vault.
 export const hubspotSaveKey = defineEventHandler(async (event: H3Event) => {
   const body = await readBody(event);
-  const { apiKey } = body;
+  const { apiKey, scope } = body;
   if (!apiKey || typeof apiKey !== "string") {
     setResponseStatus(event, 400);
     return { error: "apiKey is required" };
   }
-  const ok = await saveIntegrationKey(event, "hubspot", apiKey);
+  const ok = await saveIntegrationKey(event, "hubspot", apiKey, scope);
   if (!ok) {
     setResponseStatus(event, 401);
     return { error: "Sign in to connect HubSpot" };
@@ -32,7 +31,6 @@ export const hubspotSaveKey = defineEventHandler(async (event: H3Event) => {
   return { connected: true };
 });
 
-// DELETE /api/hubspot/key
 export const hubspotDeleteKey = defineEventHandler(async (event: H3Event) => {
   const ok = await deleteIntegrationKey(event, "hubspot");
   if (!ok) {
@@ -42,7 +40,6 @@ export const hubspotDeleteKey = defineEventHandler(async (event: H3Event) => {
   return { connected: false };
 });
 
-// GET /api/hubspot/contact?email=...
 export const hubspotContactLookup = defineEventHandler(
   async (event: H3Event) => {
     const { email } = getQuery(event);
@@ -58,7 +55,6 @@ export const hubspotContactLookup = defineEventHandler(
     }
 
     try {
-      // Search for contact by email
       const searchRes = await fetch(
         "https://api.hubapi.com/crm/v3/objects/contacts/search",
         {
@@ -103,7 +99,6 @@ export const hubspotContactLookup = defineEventHandler(
         return null;
       }
 
-      // Fetch associated deals
       let deals: any[] = [];
       try {
         const dealsRes = await fetch(
@@ -152,7 +147,6 @@ export const hubspotContactLookup = defineEventHandler(
         }
       } catch {}
 
-      // Fetch associated tickets
       let tickets: any[] = [];
       try {
         const ticketsRes = await fetch(

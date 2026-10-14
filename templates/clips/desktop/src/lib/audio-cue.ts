@@ -1,107 +1,117 @@
-/**
- * Recording-start audio cue.
- *
- * A short descending "boop" played the instant capture begins so the user
- * gets audible confirmation. Two design constraints shape this module:
- *
- *   1. Browser audio needs a user gesture to start. We therefore build the
- *      cue (and `resume()` its AudioContext) inside the start click, then
- *      `play()` it later once streams have settled — the gesture activation
- *      is preserved across that gap.
- *   2. The cue must not bleed into the recording. `cue.playBeforeCapture()`
- *      plays it and waits a short settle before the caller starts the
- *      recorder, so the beep lands just ahead of capture.
- */
-
 export interface AudioCue {
-  /**
-   * Play the cue (bounded by a timeout) and wait a short settle so the tone
-   * sits just before capture rather than inside the recording. Safe to await
-   * directly before starting the recorder.
-   */
-  playBeforeCapture(): Promise<void>;
+  playBeforeCapture(signal?: AbortSignal): Promise<void>;
   cleanup(): void;
 }
 
-/** Hard cap on waiting for the cue to finish before we start capturing. */
-const CUE_PLAY_TIMEOUT_MS = 450;
-/** Quiet gap after the cue so it isn't captured in the recording. */
+type CueOutcome = "played" | "timed_out" | "failed" | "cancelled";
+
+const CUE_PLAY_TIMEOUT_MS = 1000;
 const CUE_SETTLE_MS = 80;
-/** Abandon an unplayed cue (recording never started) after this long. */
 const CUE_IDLE_CLEANUP_MS = 5 * 60_000;
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-/** A cue that does nothing — used when Web Audio is unavailable. */
 const noopAudioCue: AudioCue = {
-  async playBeforeCapture() {},
+  async playBeforeCapture(signal) {
+    console.warn(
+      `[clips-recorder] start cue outcome=${signal?.aborted ? "cancelled" : "unavailable"}`,
+    );
+  },
   cleanup() {},
 };
 
-/**
- * Play `play` bounded by a timeout, then wait a short settle so the tone sits
- * just before capture rather than inside the recording.
- */
 async function playBeforeCapture(
   play: () => Promise<void>,
   cleanup: () => void,
+  signal?: AbortSignal,
 ): Promise<void> {
-  let timedOut = false;
-  await Promise.race([
-    play(),
-    wait(CUE_PLAY_TIMEOUT_MS).then(() => {
-      timedOut = true;
-    }),
-  ]).catch((err) => {
-    console.warn("[clips-recorder] start cue unavailable:", err);
-  });
-  if (timedOut) {
+  if (signal?.aborted) {
+    console.warn("[clips-recorder] start cue outcome=cancelled");
     cleanup();
     return;
   }
+  let timer: ReturnType<typeof window.setTimeout> | null = null;
+  let abortHandler: (() => void) | null = null;
+  const deadline = performance.now() + CUE_PLAY_TIMEOUT_MS;
+  const playback = play().then<CueOutcome, CueOutcome>(
+    () => (performance.now() < deadline ? "played" : "timed_out"),
+    (err) => {
+      console.warn("[clips-recorder] start cue outcome=failed:", err);
+      return "failed";
+    },
+  );
+  const timeout = new Promise<CueOutcome>((resolve) => {
+    timer = window.setTimeout(() => resolve("timed_out"), CUE_PLAY_TIMEOUT_MS);
+  });
+  const cancellation = signal
+    ? new Promise<CueOutcome>((resolve) => {
+        abortHandler = () => resolve("cancelled");
+        if (signal.aborted) abortHandler();
+        else signal.addEventListener("abort", abortHandler, { once: true });
+      })
+    : new Promise<CueOutcome>(() => {});
+  const outcome = await Promise.race([playback, timeout, cancellation]);
+  if (timer !== null && outcome !== "timed_out") {
+    window.clearTimeout(timer);
+  }
+  if (abortHandler) signal?.removeEventListener("abort", abortHandler);
+  if (outcome !== "played") {
+    if (outcome !== "failed") {
+      console.warn(`[clips-recorder] start cue outcome=${outcome}`);
+    }
+    cleanup();
+    return;
+  }
+  console.info("[clips-recorder] start cue outcome=played");
   await wait(CUE_SETTLE_MS);
 }
 
-/** Schedule the descending-chirp tone on an already-running context. */
 function scheduleTone(ctx: AudioContext): Promise<void> {
   return new Promise<void>((resolve) => {
-    const startedAt = ctx.currentTime + 0.005;
-    const oscillator = ctx.createOscillator();
-    const gain = ctx.createGain();
+    const t0 = ctx.currentTime + 0.005;
+    const voices = [
+      { freq: 783.99, at: 0.0, dur: 0.26, peak: 0.07, type: "triangle" }, // G5
+      { freq: 1046.5, at: 0.11, dur: 0.34, peak: 0.085, type: "triangle" }, // C6
+      { freq: 2093.0, at: 0.115, dur: 0.18, peak: 0.022, type: "sine" }, // C7
+    ] as const;
 
-    oscillator.type = "sine";
-    oscillator.frequency.setValueAtTime(880, startedAt);
-    oscillator.frequency.exponentialRampToValueAtTime(660, startedAt + 0.14);
+    let lastStop = t0;
+    for (const voice of voices) {
+      const startAt = t0 + voice.at;
+      const stopAt = startAt + voice.dur;
+      lastStop = Math.max(lastStop, stopAt);
 
-    gain.gain.setValueAtTime(0.0001, startedAt);
-    gain.gain.exponentialRampToValueAtTime(0.07, startedAt + 0.018);
-    gain.gain.exponentialRampToValueAtTime(0.0001, startedAt + 0.18);
+      const oscillator = ctx.createOscillator();
+      oscillator.type = voice.type;
+      oscillator.frequency.setValueAtTime(voice.freq, startAt);
 
-    oscillator.connect(gain);
-    gain.connect(ctx.destination);
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, startAt);
+      gain.gain.exponentialRampToValueAtTime(voice.peak, startAt + 0.018);
+      gain.gain.exponentialRampToValueAtTime(0.0001, stopAt);
 
-    // Resolve on `ended`, with a timeout fallback in case it never fires.
+      oscillator.connect(gain);
+      gain.connect(ctx.destination);
+
+      oscillator.start(startAt);
+      oscillator.stop(stopAt + 0.02);
+    }
+
     let resolved = false;
     const finish = () => {
       if (resolved) return;
       resolved = true;
-      window.clearTimeout(timer);
       resolve();
     };
-    const timer = window.setTimeout(finish, 500);
-    oscillator.addEventListener("ended", finish, { once: true });
-
-    oscillator.start(startedAt);
-    oscillator.stop(startedAt + 0.2);
+    window.setTimeout(
+      finish,
+      Math.ceil((lastStop - ctx.currentTime) * 1000) + 60,
+    );
   });
 }
 
-/**
- * Create a recording-start cue. Call this inside the user gesture that starts
- * recording so the AudioContext can unlock; then `play()` it once you're ready.
- */
 export function createAudioCue(): AudioCue {
   try {
     const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
@@ -109,6 +119,7 @@ export function createAudioCue(): AudioCue {
 
     const ctx: AudioContext = new AudioCtx();
     let played = false;
+    let playPromise: Promise<void> | null = null;
     let closed = false;
     let idleTimer: ReturnType<typeof window.setTimeout> | null = null;
 
@@ -123,25 +134,23 @@ export function createAudioCue(): AudioCue {
     };
 
     const play = async () => {
-      if (played || closed) return;
+      if (closed) throw new Error("Audio cue context is closed");
+      if (played) return playPromise ?? Promise.resolve();
       played = true;
-      try {
+      playPromise = (async () => {
         if (ctx.state !== "running") await ctx.resume();
         await scheduleTone(ctx);
-      } catch (err) {
-        console.warn("[clips-recorder] start cue unavailable:", err);
-        cleanup();
-      }
+      })();
+      await playPromise;
     };
 
-    // Unlock eagerly inside the gesture; drop the context if never played.
     ctx.resume().catch((err) => {
       console.warn("[clips-recorder] AudioContext resume failed:", err);
     });
     idleTimer = window.setTimeout(cleanup, CUE_IDLE_CLEANUP_MS);
 
     return {
-      playBeforeCapture: () => playBeforeCapture(play, cleanup),
+      playBeforeCapture: (signal) => playBeforeCapture(play, cleanup, signal),
       cleanup,
     };
   } catch (err) {

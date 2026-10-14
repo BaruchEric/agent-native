@@ -1,9 +1,10 @@
-import { defineAction } from "@agent-native/core";
-import { and, eq } from "drizzle-orm";
-import { z } from "zod";
-import { getDb, schema } from "../server/db/index.js";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { assertAccess } from "@agent-native/core/sharing";
+import { and, eq } from "drizzle-orm";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
 import { nanoid } from "../server/lib/recordings.js";
 
 export default defineAction({
@@ -28,7 +29,6 @@ export default defineAction({
     }
 
     if (args.op === "add") {
-      // De-dup — only insert if not already present
       const [existing] = await db
         .select()
         .from(schema.recordingTags)
@@ -59,7 +59,6 @@ export default defineAction({
 
     await writeAppState("refresh-signal", { ts: Date.now() });
 
-    // Return current tag set
     const tags = await db
       .select({ tag: schema.recordingTags.tag })
       .from(schema.recordingTags)

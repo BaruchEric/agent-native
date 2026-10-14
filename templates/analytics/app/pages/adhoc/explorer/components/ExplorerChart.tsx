@@ -1,3 +1,5 @@
+import { useT } from "@agent-native/core/client/i18n";
+import { IconChevronLeft, IconChevronRight } from "@tabler/icons-react";
 import { useMemo, useState } from "react";
 import {
   ResponsiveContainer,
@@ -11,14 +13,24 @@ import {
   Tooltip,
   Legend,
 } from "recharts";
+
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Button } from "@/components/ui/button";
-import { IconChevronLeft, IconChevronRight } from "@tabler/icons-react";
-import type { ExplorerConfig } from "../types";
 import type { QueryMetricsResult } from "@/lib/query-metrics";
 
+import type { ExplorerConfig } from "../types";
+
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
+
+function stringifyValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  if (typeof value === "object") return JSON.stringify(value);
+  return typeof value === "number" || typeof value === "boolean"
+    ? String(value)
+    : JSON.stringify(value);
+}
 
 const COLORS = [
   "var(--brand-blue)",
@@ -46,6 +58,7 @@ export function ExplorerChart({
   isLoading,
   sql,
 }: ExplorerChartProps) {
+  const t = useT();
   const rows = result?.rows ?? [];
   const error = result?.error;
 
@@ -53,7 +66,7 @@ export function ExplorerChart({
     return (
       <Card>
         <CardContent className="flex items-center justify-center h-64 text-muted-foreground text-sm">
-          Add an event and select it to see results
+          {t("explorer.addEventToSeeResults")}
         </CardContent>
       </Card>
     );
@@ -74,7 +87,9 @@ export function ExplorerChart({
     return (
       <Card>
         <CardContent className="p-6">
-          <div className="text-destructive text-sm">Query error: {error}</div>
+          <div className="text-destructive text-sm">
+            {t("explorer.queryError", { message: error })}
+          </div>
         </CardContent>
       </Card>
     );
@@ -84,7 +99,7 @@ export function ExplorerChart({
     return (
       <Card>
         <CardContent className="flex items-center justify-center h-64 text-muted-foreground text-sm">
-          No data returned
+          {t("explorer.noDataReturned")}
         </CardContent>
       </Card>
     );
@@ -111,7 +126,7 @@ function MetricView({
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
       {rows.map((row, i) => {
-        const label = String(
+        const label = stringifyValue(
           row.event_label ?? config.events[0]?.event ?? "Count",
         );
         const value = Number(row.count ?? 0);
@@ -133,6 +148,7 @@ function MetricView({
 }
 
 function TableView({ rows }: { rows: Record<string, unknown>[] }) {
+  const t = useT();
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(10);
 
@@ -175,7 +191,7 @@ function TableView({ rows }: { rows: Record<string, unknown>[] }) {
         {rows.length > PAGE_SIZE_OPTIONS[0] && (
           <div className="flex items-center justify-between px-3 py-2 border-t border-border text-xs text-muted-foreground">
             <div className="flex items-center gap-2">
-              <span>Rows per page:</span>
+              <span>{t("common.rowsPerPage")}</span>
               <select
                 className="bg-background border border-border rounded px-1 py-0.5 text-xs"
                 value={pageSize}
@@ -194,7 +210,11 @@ function TableView({ rows }: { rows: Record<string, unknown>[] }) {
             <div className="flex items-center gap-1">
               <span>
                 {page * pageSize + 1}–
-                {Math.min((page + 1) * pageSize, rows.length)} of {rows.length}
+                {t("explorer.rowsRange", {
+                  start: page * pageSize + 1,
+                  end: Math.min((page + 1) * pageSize, rows.length),
+                  total: rows.length,
+                })}
               </span>
               <Button
                 variant="ghost"
@@ -239,7 +259,6 @@ function TimeSeriesView({
 
   const { chartData, seriesNames } = useMemo(() => {
     if (!seriesKey) {
-      // Simple: date + count
       return {
         chartData: rows.map((r) => ({
           date: formatDate(r.date),
@@ -249,13 +268,12 @@ function TimeSeriesView({
       };
     }
 
-    // Pivot: date x series → wide format
     const dateMap = new Map<string, Record<string, number>>();
     const allSeries = new Set<string>();
 
     for (const row of rows) {
       const d = formatDate(row.date);
-      const s = String(row[seriesKey] ?? "unknown");
+      const s = stringifyValue(row[seriesKey] ?? "unknown");
       const v = Number(row.count ?? 0);
       allSeries.add(s);
       if (!dateMap.has(d)) dateMap.set(d, {});
@@ -263,7 +281,6 @@ function TimeSeriesView({
       entry[s] = (entry[s] ?? 0) + v;
     }
 
-    // Rank series by total, keep top 10
     const totals = new Map<string, number>();
     for (const entry of dateMap.values()) {
       for (const [s, v] of Object.entries(entry)) {
@@ -348,10 +365,9 @@ function TimeSeriesView({
 
 function formatDate(val: unknown): string {
   if (!val) return "";
-  const s = String(val);
-  // BigQuery DATE format: { value: "2024-01-15" } or plain string
+  const s = stringifyValue(val);
   if (typeof val === "object" && val !== null && "value" in val) {
-    return String((val as any).value);
+    return stringifyValue((val as { value: unknown }).value);
   }
   return s.slice(0, 10);
 }
@@ -360,6 +376,6 @@ function formatCell(val: unknown): string {
   if (val == null) return "";
   if (typeof val === "number") return val.toLocaleString();
   if (typeof val === "object" && val !== null && "value" in val)
-    return String((val as any).value);
-  return String(val);
+    return stringifyValue((val as { value: unknown }).value);
+  return stringifyValue(val);
 }

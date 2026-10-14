@@ -1,6 +1,29 @@
-import { useState, useCallback, useRef, useEffect } from "react";
-import { useParams, useNavigate, useSearchParams } from "react-router";
-import { nanoid } from "nanoid";
+import { trackEvent } from "@agent-native/core/client/analytics";
+import { appPath } from "@agent-native/core/client/api-path";
+import {
+  setClientAppState,
+  useReconciledState,
+} from "@agent-native/core/client/hooks";
+import { useFormatters, useT } from "@agent-native/core/client/i18n";
+import { normalizeDocumentTitle } from "@agent-native/core/shared";
+import { AgentToggleButton } from "@agent-native/toolkit/app/chat";
+import { useSendToAgentChat } from "@agent-native/toolkit/app/chat/composer";
+import { ShareButton } from "@agent-native/toolkit/app/sharing";
+import { appStateKeyForBrowserTab } from "@shared/app-state-tabs";
+import type {
+  FormCompletionMode,
+  FormField,
+  FormFieldType,
+  FormIntegration,
+  FormSettings,
+  IntegrationType,
+} from "@shared/types";
+import {
+  DEFAULT_FORM_COMPLETION_REFRESH_SECONDS,
+  getFormCompletionMode,
+  MAX_FORM_COMPLETION_REFRESH_SECONDS,
+  MIN_FORM_COMPLETION_REFRESH_SECONDS,
+} from "@shared/types";
 import {
   IconExternalLink,
   IconCheck,
@@ -8,6 +31,7 @@ import {
   IconPlus,
   IconChevronDown,
   IconCopy,
+  IconArrowLeft,
   IconArrowUp,
   IconArrowDown,
   IconArrowsSort,
@@ -20,25 +44,51 @@ import {
   IconDownload,
   IconRefresh,
   IconLoader2,
-  IconDots,
+  IconDotsVertical,
   IconLock,
   IconArchive,
 } from "@tabler/icons-react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
-import { Label } from "@/components/ui/label";
+import { format } from "date-fns";
+import { nanoid } from "nanoid";
+import { useState, useCallback, useRef, useEffect } from "react";
+import { Link, useParams, useNavigate, useSearchParams } from "react-router";
+import { toast } from "sonner";
+
+import { FieldPropertiesPanel } from "@/components/builder/FieldPropertiesPanel";
+import { FieldRenderer } from "@/components/builder/FieldRenderer";
+import { CommunityPromotionCell } from "@/components/CommunityPromotionCell";
+import { ResponseValue } from "@/components/ResponseValue";
 import { Badge } from "@/components/ui/badge";
-import { Switch } from "@/components/ui/switch";
-import { Skeleton } from "@/components/ui/skeleton";
+import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { FieldRenderer } from "@/components/builder/FieldRenderer";
-import { FieldPropertiesPanel } from "@/components/builder/FieldPropertiesPanel";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Tooltip,
+  TooltipTrigger,
+  TooltipContent,
+} from "@/components/ui/tooltip";
 import { useAgentPromptRun } from "@/hooks/use-agent-prompt-run";
 import {
   useForm,
@@ -47,84 +97,96 @@ import {
   useDeleteForm,
 } from "@/hooks/use-forms";
 import { useFormResponses } from "@/hooks/use-responses";
-import { useDbStatus } from "@/hooks/use-db-status";
-import { CloudUpgrade } from "@/components/CloudUpgrade";
-import {
-  AgentToggleButton,
-  NotificationsBell,
-  ShareButton,
-  appPath,
-  useReconciledState,
-  useSendToAgentChat,
-} from "@agent-native/core/client";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
-import {
-  Tooltip,
-  TooltipTrigger,
-  TooltipContent,
-} from "@/components/ui/tooltip";
-import { toast } from "sonner";
-import { cn } from "@/lib/utils";
-import { normalizeFields } from "@/lib/normalize-fields";
 import {
   formBuilderTabSearchParam,
   normalizeFormBuilderTab,
   type FormBuilderTab,
 } from "@/lib/form-builder-tabs";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { format } from "date-fns";
-import type {
-  FormField,
-  FormFieldType,
-  FormIntegration,
-  FormSettings,
-  IntegrationType,
-} from "@shared/types";
+import type { AppFormFieldType } from "@/lib/form-field-types";
+import { normalizeFields } from "@/lib/normalize-fields";
+import { getPublishedFormUrl } from "@/lib/public-form-link";
+import { TAB_ID } from "@/lib/tab-id";
+import { cn } from "@/lib/utils";
 
-const fieldTypeDefaults: Record<FormFieldType, Partial<FormField>> = {
-  text: { label: "Text Field", placeholder: "Enter text..." },
-  email: { label: "Email", placeholder: "you@example.com" },
-  number: { label: "Number", placeholder: "0" },
-  textarea: { label: "Long Answer", placeholder: "Type your answer..." },
-  select: { label: "Dropdown", options: ["Option 1", "Option 2", "Option 3"] },
-  multiselect: {
-    label: "Multi-select",
-    options: ["Option 1", "Option 2", "Option 3"],
-  },
-  checkbox: { label: "Checkbox" },
-  radio: {
-    label: "Multiple Choice",
-    options: ["Option 1", "Option 2", "Option 3"],
-  },
-  date: { label: "Date" },
-  rating: { label: "Rating" },
-  scale: { label: "Scale", validation: { min: 1, max: 10 } },
-};
+type Translator = ReturnType<typeof useT>;
 
-const fieldTypeLabels: Record<FormFieldType, string> = {
-  text: "Short Text",
-  email: "Email",
-  number: "Number",
-  textarea: "Long Text",
-  select: "Dropdown",
-  multiselect: "Multi-select",
-  checkbox: "Checkbox",
-  radio: "Multiple Choice",
-  date: "Date",
-  rating: "Rating",
-  scale: "Scale",
-};
+interface FormsSelectionState {
+  formId: string;
+  selectedFieldId: string;
+  selectedFieldLabel: string;
+  selectedFieldType: FormFieldType;
+}
+
+function publishFormsSelection(state: FormsSelectionState | null) {
+  const keys = [
+    appStateKeyForBrowserTab("forms-selection", TAB_ID),
+    "forms-selection",
+  ];
+  for (const key of keys) {
+    setClientAppState(key, state, {
+      requestSource: TAB_ID,
+      keepalive: true,
+    }).catch(() => {});
+  }
+}
+
+function getFieldTypeDefaults(
+  t: Translator,
+): Record<AppFormFieldType, Partial<FormField>> {
+  const defaultOptions = [
+    t("builder.fieldDefaults.option1"),
+    t("builder.fieldDefaults.option2"),
+    t("builder.fieldDefaults.option3"),
+  ];
+  return {
+    text: {
+      label: t("builder.fieldDefaults.textLabel"),
+      placeholder: t("builder.fieldDefaults.textPlaceholder"),
+    },
+    email: {
+      label: t("builder.fieldDefaults.emailLabel"),
+      placeholder: t("builder.fieldDefaults.emailPlaceholder"),
+    },
+    number: {
+      label: t("builder.fieldDefaults.numberLabel"),
+      placeholder: "0",
+    },
+    textarea: {
+      label: t("builder.fieldDefaults.textareaLabel"),
+      placeholder: t("builder.fieldDefaults.textareaPlaceholder"),
+    },
+    select: {
+      label: t("builder.fieldDefaults.selectLabel"),
+      options: defaultOptions,
+    },
+    multiselect: {
+      label: t("builder.fieldDefaults.multiselectLabel"),
+      options: defaultOptions,
+    },
+    checkbox: { label: t("builder.fieldDefaults.checkboxLabel") },
+    radio: {
+      label: t("builder.fieldDefaults.radioLabel"),
+      options: defaultOptions,
+    },
+    date: { label: t("builder.fieldDefaults.dateLabel") },
+    rating: { label: t("builder.fieldDefaults.ratingLabel") },
+    scale: {
+      label: t("builder.fieldDefaults.scaleLabel"),
+      validation: { min: 1, max: 10 },
+    },
+    file: {
+      label: t("builder.fieldDefaults.fileLabel"),
+    },
+  };
+}
 
 type FieldOp =
-  | { op: "upsert"; field: Record<string, any> }
+  | { op: "upsert"; field: FormField }
   | { op: "remove"; id: string }
   | { op: "reorder"; ids: string[] };
 
 export function FormBuilderPage() {
+  const t = useT();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -149,30 +211,30 @@ export function FormBuilderPage() {
   );
   const activeBuilderTab: FormBuilderTab = canEdit ? activeTab : "edit";
   const [copied, setCopied] = useState(false);
-  // Target status while a publish/unpublish is in flight (and until the cache
-  // refetch catches up). `null` once the displayed form.status matches it.
   const [pendingStatus, setPendingStatus] = useState<
     "published" | "draft" | null
   >(null);
-  const { isLocal } = useDbStatus();
-  const [showCloudUpgrade, setShowCloudUpgrade] = useState(false);
   const publishedFormUrl =
-    form?.status === "published" && typeof window !== "undefined"
-      ? `${window.location.origin}${appPath(`/f/${form.slug}`)}`
+    form && typeof window !== "undefined"
+      ? getPublishedFormUrl(form, window.location.origin)
       : undefined;
   const [agentPopoverOpen, setAgentPopoverOpen] = useState(false);
   const [agentPrompt, setAgentPrompt] = useState("");
   const agentPromptRef = useRef<HTMLTextAreaElement>(null);
   const { send, codeRequiredDialog } = useSendToAgentChat();
   const promptRun = useAgentPromptRun({
-    staleMessage:
-      "Form edit is taking longer than expected. You can try again.",
+    staleMessage: t("builder.agentEditStale"),
   });
   const descriptionRef = useRef<HTMLTextAreaElement>(null);
 
   const setBuilderTab = useCallback(
     (value: string) => {
       const nextTab = normalizeFormBuilderTab(value);
+      trackEvent("form_builder_tab_changed", {
+        app_name: "forms",
+        template_name: "forms",
+        tab: nextTab,
+      });
       setActiveTab(nextTab);
       const nextParams = new URLSearchParams(searchParams);
       nextParams.set("tab", formBuilderTabSearchParam(nextTab));
@@ -196,17 +258,25 @@ export function FormBuilderPage() {
     setSearchParams(nextParams, { replace: true });
   }, [activeBuilderTab, form, searchParams, setSearchParams, tabParam]);
 
-  // Local state for text inputs and fields — prevents polling-driven refetches
-  // from resetting input values while the user is typing or losing optimistic
-  // updates (e.g. newly added fields). `useReconciledState` re-adopts the
-  // server/agent value whenever the field isn't focused, so an agent edit to
-  // the title/description shows up live without yanking in-progress typing.
   const titleFocused = useRef(false);
   const descriptionFocused = useRef(false);
   const fieldsDirty = useRef(false);
   const [localTitle, setLocalTitle] = useReconciledState(form?.title ?? "", {
     active: titleFocused.current,
   });
+
+  useEffect(() => {
+    const nextTitle = `${normalizeDocumentTitle(
+      localTitle,
+      t("forms.untitled"),
+    )} — Forms`;
+    const previousTitle = document.title;
+    document.title = nextTitle;
+    return () => {
+      if (document.title === nextTitle) document.title = previousTitle;
+    };
+  }, [localTitle, t]);
+
   const [localDescription, setLocalDescription] = useReconciledState(
     form?.description ?? "",
     { active: descriptionFocused.current },
@@ -217,7 +287,6 @@ export function FormBuilderPage() {
   const titleMeasureRef = useRef<HTMLSpanElement>(null);
   const [titleInputWidth, setTitleInputWidth] = useState<number | undefined>();
 
-  // Esc to deselect field
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       if (e.key === "Escape" && selectedFieldId) {
@@ -228,30 +297,50 @@ export function FormBuilderPage() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [selectedFieldId]);
 
-  // Measure title text width for auto-sizing input
+  const selectedFieldForSync = localFields.find(
+    (f) => f.id === selectedFieldId,
+  );
+  useEffect(() => {
+    if (!form) return;
+    publishFormsSelection(
+      selectedFieldForSync
+        ? {
+            formId: form.id,
+            selectedFieldId: selectedFieldForSync.id,
+            selectedFieldLabel: selectedFieldForSync.label,
+            selectedFieldType: selectedFieldForSync.type,
+          }
+        : null,
+    );
+  }, [
+    form?.id,
+    selectedFieldId,
+    selectedFieldForSync?.label,
+    selectedFieldForSync?.type,
+  ]);
+
+  useEffect(() => {
+    return () => publishFormsSelection(null);
+  }, []);
+
   useEffect(() => {
     if (titleMeasureRef.current) {
       setTitleInputWidth(Math.max(titleMeasureRef.current.offsetWidth + 4, 60));
     }
   }, [localTitle]);
 
-  // Sync fields from server when not dirty (e.g. agent updates the fields).
-  // Title/description re-sync is handled by `useReconciledState` above.
   useEffect(() => {
     if (form && !fieldsDirty.current)
       setLocalFields(normalizeFields(form.fields));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [form?.fields]);
 
-  // Clear pending publish state once the refetched form reflects the new
-  // status — otherwise the spinner stops before the badge/label updates.
   useEffect(() => {
     if (pendingStatus && form?.status === pendingStatus) {
       setPendingStatus(null);
     }
   }, [form?.status, pendingStatus]);
 
-  // Auto-grow description textarea
   useEffect(() => {
     const el = descriptionRef.current;
     if (el) {
@@ -260,8 +349,6 @@ export function FormBuilderPage() {
     }
   }, [localDescription]);
 
-  // Debounced save for non-field form properties (title, description, status,
-  // settings). Full-array field saves are handled by saveFieldOps below.
   const saveTimeout = useRef<ReturnType<typeof setTimeout>>(undefined);
   const save = useCallback(
     (data: Parameters<typeof updateForm.mutate>[0]) => {
@@ -277,8 +364,18 @@ export function FormBuilderPage() {
     [updateForm],
   );
 
-  // Debounced field-op save — uses patch-form-fields (server-side merge) so
-  // concurrent edits to different fields both survive.
+  const saveImmediately = useCallback(
+    async (data: Parameters<typeof updateForm.mutate>[0]) => {
+      clearTimeout(saveTimeout.current);
+      try {
+        await updateForm.mutateAsync(data);
+      } finally {
+        fieldsDirty.current = false;
+      }
+    },
+    [updateForm],
+  );
+
   const fieldOpTimeout = useRef<ReturnType<typeof setTimeout>>(undefined);
   const pendingOps = useRef<FieldOp[]>([]);
   const saveFieldOps = useCallback(
@@ -315,8 +412,24 @@ export function FormBuilderPage() {
     return (
       <div className="flex flex-col h-full">
         {/* Top bar */}
-        <div className="flex items-center justify-between border-b border-border pl-12 pr-2 sm:px-4 md:pl-4 h-14 shrink-0 min-w-0">
-          <div className="flex items-center gap-3 min-w-0 flex-1">
+        <div className="flex items-center justify-between border-b border-border ps-14 pe-2 sm:px-4 md:ps-4 h-14 shrink-0 min-w-0">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  asChild
+                  variant="ghost"
+                  size="icon-lg"
+                  className="shrink-0 active:scale-[0.96]"
+                  aria-label={t("builder.backToForms")}
+                >
+                  <Link to="/forms">
+                    <IconArrowLeft className="h-4 w-4" />
+                  </Link>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t("builder.backToForms")}</TooltipContent>
+            </Tooltip>
             <Skeleton className="h-5 w-48" />
             <Skeleton className="h-4 w-14 rounded-full" />
           </div>
@@ -325,10 +438,19 @@ export function FormBuilderPage() {
             <Skeleton className="h-8 w-20 rounded-md" />
           </div>
         </div>
-        {/* Body: builder + properties */}
-        <div className="flex flex-1 overflow-hidden">
-          <div className="flex-1 overflow-auto p-4 sm:p-6">
-            <div className="max-w-2xl mx-auto space-y-4">
+        {/* Tabs */}
+        <div className="border-b border-border px-2 sm:px-4 py-2 shrink-0 overflow-hidden">
+          <div className="flex w-max items-center gap-1 rounded-lg bg-muted/40 p-1">
+            <Skeleton className="h-8 w-12 rounded-md" />
+            <Skeleton className="h-8 w-16 rounded-md" />
+            <Skeleton className="h-8 w-16 rounded-md" />
+            <Skeleton className="h-8 w-24 rounded-md" />
+          </div>
+        </div>
+        {/* Body: builder */}
+        <div className="flex flex-1 overflow-hidden relative">
+          <div className="flex-1 overflow-auto bg-muted/30">
+            <div className="max-w-2xl mx-auto py-4 sm:py-8 px-3 sm:px-4 space-y-4">
               <Skeleton className="h-8 w-2/3" />
               <Skeleton className="h-4 w-1/2" />
               <div className="space-y-3 pt-4">
@@ -344,41 +466,26 @@ export function FormBuilderPage() {
               </div>
             </div>
           </div>
-          <div className="hidden lg:block w-72 border-l border-border p-4 space-y-4">
-            <Skeleton className="h-4 w-32" />
-            <Skeleton className="h-9 w-full" />
-            <Skeleton className="h-9 w-full" />
-            <Skeleton className="h-9 w-full" />
-          </div>
         </div>
       </div>
     );
   }
 
   if (error && !form) {
-    // `get-form` throws the same "not found" for both missing forms and forms
-    // the current user has no access to. Phrase the message so it works for
-    // both without leaking which case applies.
     const errorMessage = error instanceof Error ? error.message : "";
     const isAccessIssue = /not found|forbidden|no access/i.test(errorMessage);
     return (
       <div className="flex flex-col items-center justify-center h-full gap-3">
         <p className="text-sm text-muted-foreground">
-          {isAccessIssue
-            ? "You don't have access to this form. Ask the owner to share it with you."
-            : "Failed to load form"}
+          {isAccessIssue ? t("builder.accessDenied") : t("builder.loadFailed")}
         </p>
         <div className="flex gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => navigate("/forms")}
-          >
-            Back to Forms
+          <Button asChild variant="outline" size="sm">
+            <Link to="/forms">{t("builder.backToForms")}</Link>
           </Button>
           {!isAccessIssue && (
             <Button variant="outline" size="sm" onClick={() => refetch()}>
-              Retry
+              {t("common.retry")}
             </Button>
           )}
         </div>
@@ -391,21 +498,26 @@ export function FormBuilderPage() {
 
   const fields = localFields;
   const selectedField = fields.find((f) => f.id === selectedFieldId);
-  // Viewers can see the form but not edit it or peek at responses / settings /
-  // integrations. The role is set by `get-form` based on ownership + shares.
 
-  function addField(type: FormFieldType) {
+  function addField(type: AppFormFieldType) {
+    trackEvent("form_field_type_selected", {
+      app_name: "forms",
+      template_name: "forms",
+      field_type: type,
+    });
+    const fieldTypeDefaults = getFieldTypeDefaults(t);
     const defaults = fieldTypeDefaults[type] || {};
-    const newField: FormField = {
+    const newField = {
       id: nanoid(8),
-      type,
-      label: defaults.label || "New Field",
+      type: type as FormFieldType,
+      label: defaults.label || t("builder.fieldDefaults.newField"),
       placeholder: defaults.placeholder,
       required: false,
       options: defaults.options,
       validation: defaults.validation,
       width: "full",
-    };
+      ...(type === "file" ? { multiple: true } : {}),
+    } as FormField;
     setLocalFields((prev) => [...prev, newField]);
     fieldsDirty.current = true;
     saveFieldOps([{ op: "upsert", field: newField }]);
@@ -432,7 +544,6 @@ export function FormBuilderPage() {
       const next = [...prev];
       const [moved] = next.splice(from, 1);
       next.splice(to, 0, moved);
-      // Emit a reorder op with the new order.
       saveFieldOps([{ op: "reorder", ids: next.map((f) => f.id) }]);
       return next;
     });
@@ -468,20 +579,16 @@ export function FormBuilderPage() {
 
   function handleTogglePublish() {
     const newStatus = loadedForm.status === "published" ? "draft" : "published";
-    if (newStatus === "published" && isLocal) {
-      setShowCloudUpgrade(true);
-      return;
-    }
     setPendingStatus(newStatus);
     updateForm.mutate(
       { id: loadedForm.id, status: newStatus },
       {
         onSuccess: () =>
           toast.success(
-            newStatus === "published" ? "Form published!" : "Form unpublished",
+            newStatus === "published"
+              ? t("builder.publishedToast")
+              : t("builder.unpublishedToast"),
           ),
-        // Errors (including publish-validation failures) are surfaced by
-        // useUpdateForm's onError, which echoes the server's actual message.
         onError: () => setPendingStatus(null),
       },
     );
@@ -492,35 +599,54 @@ export function FormBuilderPage() {
       { id: loadedForm.id },
       {
         onSuccess: () => {
-          toast.success("Form moved to Archive");
-          navigate("/forms");
+          toast.success(t("forms.movedToArchive"));
+          void navigate("/forms");
         },
       },
     );
   }
 
   function copyShareLink() {
-    if (loadedForm.status !== "published") {
-      toast.info("Publish this form before copying its public link");
+    if (!publishedFormUrl) {
+      toast.info(t("builder.publishBeforeCopyToast"));
       return;
     }
-    if (isLocal) {
-      setShowCloudUpgrade(true);
-      return;
-    }
-    const url = `${window.location.origin}${appPath(`/f/${loadedForm.slug}`)}`;
-    navigator.clipboard.writeText(url);
+    void navigator.clipboard.writeText(publishedFormUrl).then(
+      () =>
+        trackEvent("share_link_copied", {
+          resource_type: "form",
+          resource_id: loadedForm.id,
+          link_type: "share",
+        }),
+      () => undefined,
+    );
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
-    toast.success("Link copied to clipboard");
+    toast.success(t("builder.linkCopiedToast"));
   }
 
   return (
     <div className="flex flex-col h-full">
       {codeRequiredDialog}
       {/* Top bar */}
-      <div className="flex items-center justify-between border-b border-border pl-12 pr-2 sm:px-4 md:pl-4 h-14 shrink-0 min-w-0">
-        <div className="flex items-center gap-2 sm:gap-3 relative min-w-0 flex-1 mr-2">
+      <div className="flex items-center justify-between border-b border-border ps-14 pe-2 sm:px-4 md:ps-4 h-14 shrink-0 min-w-0">
+        <div className="flex items-center gap-1 sm:gap-2 relative min-w-0 flex-1 me-2">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                asChild
+                variant="ghost"
+                size="icon-lg"
+                className="shrink-0 active:scale-[0.96]"
+                aria-label={t("builder.backToForms")}
+              >
+                <Link to="/forms">
+                  <IconArrowLeft className="h-4 w-4" />
+                </Link>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t("builder.backToForms")}</TooltipContent>
+          </Tooltip>
           <span
             ref={titleMeasureRef}
             aria-hidden
@@ -529,6 +655,7 @@ export function FormBuilderPage() {
             {localTitle || " "}
           </span>
           <Input
+            size="sm"
             value={localTitle}
             onChange={(e) => {
               setLocalTitle(e.target.value);
@@ -537,7 +664,7 @@ export function FormBuilderPage() {
             onFocus={() => (titleFocused.current = true)}
             onBlur={() => (titleFocused.current = false)}
             style={{ width: titleInputWidth }}
-            className="h-8 text-sm font-medium border-none bg-transparent px-0 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0 max-w-[50vw] sm:max-w-80"
+            className="text-sm font-medium border-none bg-transparent px-0 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0 max-w-[50vw] sm:max-w-80"
           />
           <Badge
             variant="outline"
@@ -556,51 +683,70 @@ export function FormBuilderPage() {
           {form.status === "published" && (
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button variant="ghost" size="icon" className="h-8 w-8" asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-lg"
+                  className="active:scale-[0.96] motion-reduce:active:scale-100"
+                  asChild
+                >
                   <a
-                    href={appPath(`/f/${form.slug}`)}
+                    href={publishedFormUrl}
                     target="_blank"
                     rel="noopener"
+                    onClick={() =>
+                      trackEvent("form_preview_opened", {
+                        app_name: "forms",
+                        template_name: "forms",
+                      })
+                    }
                   >
                     <IconExternalLink className="h-4 w-4" />
                   </a>
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>Preview published form</TooltipContent>
+              <TooltipContent>
+                {t("builder.previewPublishedForm")}
+              </TooltipContent>
             </Tooltip>
           )}
 
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span className="inline-flex">
+          {form.status === "published" && (
+            <Tooltip>
+              <TooltipTrigger asChild>
                 <Button
                   variant="ghost"
-                  size="icon"
-                  className="h-8 w-8"
+                  size="icon-lg"
+                  className="active:scale-[0.96] motion-reduce:active:scale-100"
                   onClick={copyShareLink}
-                  disabled={form.status !== "published"}
-                  aria-label={
-                    form.status === "published"
-                      ? "Copy public form link"
-                      : "Publish before copying the public form link"
-                  }
+                  aria-label={t("builder.copyPublicFormLink")}
                 >
-                  {copied ? (
-                    <IconCheck className="h-4 w-4" />
-                  ) : (
-                    <IconCopy className="h-4 w-4" />
-                  )}
+                  <span className="relative inline-flex h-4 w-4 items-center justify-center">
+                    <IconCopy
+                      className={cn(
+                        "absolute h-4 w-4 transition-[opacity,scale] duration-200 ease-out",
+                        copied
+                          ? "scale-[0.25] opacity-0"
+                          : "scale-100 opacity-100",
+                      )}
+                    />
+                    <IconCheck
+                      className={cn(
+                        "absolute h-4 w-4 transition-[opacity,scale] duration-200 ease-out",
+                        copied
+                          ? "scale-100 opacity-100"
+                          : "scale-[0.25] opacity-0",
+                      )}
+                    />
+                  </span>
                 </Button>
-              </span>
-            </TooltipTrigger>
-            <TooltipContent>
-              {form.status === "published"
-                ? copied
-                  ? "Public link copied"
-                  : "Copy published public link"
-                : "Publish before copying the public link"}
-            </TooltipContent>
-          </Tooltip>
+              </TooltipTrigger>
+              <TooltipContent>
+                {copied
+                  ? t("builder.publicLinkCopied")
+                  : t("builder.copyPublishedPublicLink")}
+              </TooltipContent>
+            </Tooltip>
+          )}
 
           <Tooltip>
             <TooltipTrigger asChild>
@@ -608,51 +754,53 @@ export function FormBuilderPage() {
                 <ShareButton
                   resourceType="form"
                   resourceId={form.id}
+                  allowedRoles={["viewer", "editor", "admin"]}
                   resourceTitle={form.title}
-                  triggerClassName="h-9 border-input bg-transparent px-3 text-xs hover:bg-accent hover:text-accent-foreground"
+                  triggerClassName="h-10 border-input bg-transparent px-3 text-xs active:scale-[0.96] hover:bg-accent hover:text-accent-foreground"
                   shareUrl={publishedFormUrl}
-                  shareUrlLabel="Public response link"
-                  shareUrlDescription="Respondents use this link to submit the published form."
+                  shareUrlLabel={t("builder.publicResponseLink")}
+                  shareUrlDescription={t(
+                    "builder.publicResponseLinkDescription",
+                  )}
                   shareUrlPlacement="top"
-                  shareUrlPlaceholder="Publish this form to get a public response link."
-                  peopleAccessLabel="People with editing access"
-                  generalAccessLabel="General editing access"
+                  shareUrlPlaceholder={t(
+                    "builder.publicResponseLinkPlaceholder",
+                  )}
+                  peopleAccessLabel={t("builder.peopleAccessLabel")}
+                  generalAccessLabel={t("builder.generalAccessLabel")}
                   visibilityCopy={{
                     private: {
-                      description:
-                        "Only invited people can open this form in the builder",
+                      description: t("builder.privateAccessDescription"),
                     },
                     org: {
-                      description:
-                        "Anyone in your organization can open this form in the builder",
+                      description: t("builder.orgAccessDescription"),
                     },
                     public: {
-                      label: "Public builder access",
-                      description:
-                        "Anyone with the builder link can view this form's setup",
+                      label: t("builder.publicBuilderAccess"),
+                      description: t("builder.publicAccessDescription"),
                     },
                   }}
                 />
               </span>
             </TooltipTrigger>
-            <TooltipContent>Manage builder access</TooltipContent>
+            <TooltipContent>{t("builder.manageBuilderAccess")}</TooltipContent>
           </Tooltip>
 
           {canEdit && form.status !== "published" && (
             <Button
               size="sm"
-              className="text-xs"
+              className="relative text-xs before:absolute before:-inset-y-0.5 before:content-[''] active:scale-[0.96] motion-reduce:active:scale-100"
               onClick={handleTogglePublish}
               disabled={pendingStatus !== null}
             >
               {pendingStatus !== null && (
-                <IconLoader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+                <IconLoader2 className="h-3.5 w-3.5 me-1.5 animate-spin" />
               )}
               {pendingStatus === "published"
-                ? "Publishing…"
+                ? t("builder.publishing")
                 : pendingStatus === "draft"
-                  ? "Unpublishing…"
-                  : "Publish"}
+                  ? t("builder.unpublishing")
+                  : t("forms.publish")}
             </Button>
           )}
           {canEdit && form.status === "published" && (
@@ -661,16 +809,16 @@ export function FormBuilderPage() {
                 <TooltipTrigger asChild>
                   <DropdownMenuTrigger asChild>
                     <Button
-                      variant="outline"
-                      size="icon"
-                      className="h-9 w-9 bg-transparent"
-                      aria-label="More form actions"
+                      variant="ghost"
+                      size="icon-lg"
+                      className="bg-transparent active:scale-[0.96] motion-reduce:active:scale-100"
+                      aria-label={t("forms.formActions")}
                     >
-                      <IconDots className="h-4 w-4" />
+                      <IconDotsVertical className="h-4 w-4" />
                     </Button>
                   </DropdownMenuTrigger>
                 </TooltipTrigger>
-                <TooltipContent>More actions</TooltipContent>
+                <TooltipContent>{t("builder.moreActions")}</TooltipContent>
               </Tooltip>
               <DropdownMenuContent align="end">
                 <DropdownMenuItem
@@ -678,22 +826,23 @@ export function FormBuilderPage() {
                   onClick={handleTogglePublish}
                 >
                   {pendingStatus === "draft" ? (
-                    <IconLoader2 className="h-4 w-4 mr-2 animate-spin" />
+                    <IconLoader2 className="h-4 w-4 me-2 animate-spin" />
                   ) : (
-                    <IconLock className="h-4 w-4 mr-2" />
+                    <IconLock className="h-4 w-4 me-2" />
                   )}
-                  {pendingStatus === "draft" ? "Unpublishing…" : "Unpublish"}
+                  {pendingStatus === "draft"
+                    ? t("builder.unpublishing")
+                    : t("forms.unpublish")}
                 </DropdownMenuItem>
                 {canArchive && (
                   <DropdownMenuItem onClick={handleArchiveForm}>
-                    <IconArchive className="h-4 w-4 mr-2" />
-                    Move to Archive
+                    <IconArchive className="h-4 w-4 me-2" />
+                    {t("forms.moveToArchive")}
                   </DropdownMenuItem>
                 )}
               </DropdownMenuContent>
             </DropdownMenu>
           )}
-          <NotificationsBell />
           <AgentToggleButton />
         </div>
       </div>
@@ -706,28 +855,40 @@ export function FormBuilderPage() {
           value={activeBuilderTab}
           onValueChange={canEdit ? setBuilderTab : undefined}
         >
-          <TabsList className="w-max sm:w-auto">
-            <TabsTrigger value="edit" className="text-xs">
-              {canEdit ? "Edit" : "Preview"}
+          <TabsList className="w-max rounded-lg shadow-[inset_0_1px_0_hsl(var(--foreground)/0.04)] sm:w-auto">
+            <TabsTrigger
+              value="edit"
+              className="rounded-md text-xs transition-[color,background-color,box-shadow,transform] active:scale-[0.96]"
+            >
+              {canEdit ? t("builder.editTab") : t("builder.previewTab")}
             </TabsTrigger>
             {canEdit && (
               <>
-                <TabsTrigger value="responses" className="text-xs">
-                  Results
+                <TabsTrigger
+                  value="responses"
+                  className="rounded-md text-xs transition-[color,background-color,box-shadow,transform] active:scale-[0.96]"
+                >
+                  {t("builder.resultsTab")}
                   {(form.responseCount ?? 0) > 0 && (
                     <Badge
                       variant="secondary"
-                      className="ml-1.5 text-[9px] px-1 py-0 h-4 min-w-4"
+                      className="ms-1.5 text-[9px] px-1 py-0 h-4 min-w-4"
                     >
                       {form.responseCount}
                     </Badge>
                   )}
                 </TabsTrigger>
-                <TabsTrigger value="settings" className="text-xs">
-                  Settings
+                <TabsTrigger
+                  value="settings"
+                  className="rounded-md text-xs transition-[color,background-color,box-shadow,transform] active:scale-[0.96]"
+                >
+                  {t("header.settings")}
                 </TabsTrigger>
-                <TabsTrigger value="integrations" className="text-xs">
-                  Integrations
+                <TabsTrigger
+                  value="integrations"
+                  className="rounded-md text-xs transition-[color,background-color,box-shadow,transform] active:scale-[0.96]"
+                >
+                  {t("builder.integrationsTab")}
                 </TabsTrigger>
               </>
             )}
@@ -785,8 +946,17 @@ export function FormBuilderPage() {
               key={JSON.stringify(form.settings)}
               form={form}
               onSave={(settings) => {
-                save({ id: form.id, settings });
-                toast.success("Settings saved");
+                void saveImmediately({ id: form.id, settings })
+                  .then(() => toast.success(t("builder.settingsSaved")))
+                  .catch((error: unknown) => {
+                    toast.error(
+                      error instanceof Error && error.message
+                        ? error.message
+                        : t("builder.saveFailed", {
+                            defaultValue: "Failed to save changes",
+                          }),
+                    );
+                  });
               }}
             />
           </div>
@@ -800,28 +970,25 @@ export function FormBuilderPage() {
               key={JSON.stringify(form.settings?.integrations)}
               form={form}
               onSave={(settings) => {
-                save({ id: form.id, settings });
-                toast.success("Integrations saved");
+                void saveImmediately({ id: form.id, settings })
+                  .then(() => toast.success(t("builder.integrationsSaved")))
+                  .catch((error: unknown) => {
+                    toast.error(
+                      error instanceof Error && error.message
+                        ? error.message
+                        : t("builder.saveFailed", {
+                            defaultValue: "Failed to save changes",
+                          }),
+                    );
+                  });
               }}
             />
           </div>
         </div>
       )}
-
-      {showCloudUpgrade && (
-        <CloudUpgrade
-          title="Publish Form"
-          description="To publish forms publicly, connect a cloud database so submissions can be received from anywhere."
-          onClose={() => setShowCloudUpgrade(false)}
-        />
-      )}
     </div>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Builder content (form editor + properties panel)
-// ---------------------------------------------------------------------------
 
 function BuilderContent({
   form,
@@ -875,11 +1042,27 @@ function BuilderContent({
   onDragStart: (idx: number) => void;
   onDragOver: (e: React.DragEvent, idx: number) => void;
   onDragEnd: () => void;
-  onAddField: (type: FormFieldType) => void;
+  onAddField: (type: AppFormFieldType) => void;
   onAgentPopoverChange: (open: boolean) => void;
   onAgentPromptChange: (v: string) => void;
   onSubmitAgent: () => void;
 }) {
+  const t = useT();
+  const fieldTypeLabels: Record<AppFormFieldType, string> = {
+    text: t("fieldProperties.fieldTypes.text"),
+    email: t("fieldProperties.fieldTypes.email"),
+    number: t("fieldProperties.fieldTypes.number"),
+    textarea: t("fieldProperties.fieldTypes.textarea"),
+    select: t("fieldProperties.fieldTypes.select"),
+    multiselect: t("fieldProperties.fieldTypes.multiselect"),
+    checkbox: t("fieldProperties.fieldTypes.checkbox"),
+    radio: t("builder.fieldTypeLabels.radio"),
+    date: t("fieldProperties.fieldTypes.date"),
+    rating: t("fieldProperties.fieldTypes.rating"),
+    scale: t("fieldProperties.fieldTypes.scale"),
+    file: t("fieldProperties.fieldTypes.file"),
+  };
+
   return (
     <div className="flex flex-1 overflow-hidden relative">
       {/* Live preview */}
@@ -894,7 +1077,7 @@ function BuilderContent({
               onBlur={() => (titleFocused.current = false)}
               readOnly={!canEdit}
               className="text-2xl font-semibold border-none bg-transparent px-0 focus-visible:ring-0 h-auto"
-              placeholder="Form Title"
+              placeholder={t("builder.formTitlePlaceholder")}
             />
             <textarea
               ref={descriptionRef}
@@ -904,7 +1087,9 @@ function BuilderContent({
               onBlur={() => (descriptionFocused.current = false)}
               readOnly={!canEdit}
               className="mt-1 w-full text-sm text-muted-foreground bg-transparent px-0 focus-visible:outline-none resize-none overflow-hidden"
-              placeholder={canEdit ? "Add a description..." : ""}
+              placeholder={
+                canEdit ? t("builder.addDescriptionPlaceholder") : ""
+              }
               rows={1}
               style={{ minHeight: "24px", maxHeight: "120px" }}
             />
@@ -933,18 +1118,21 @@ function BuilderContent({
                         )
                       }
                       className={cn(
-                        "group relative rounded-lg border p-4 cursor-pointer",
+                        "group relative -mx-3 cursor-pointer rounded-lg border px-3 py-4 transition-[background-color,border-color,box-shadow,opacity] duration-150 ease-out sm:-mx-4 sm:px-4",
                         selectedFieldId === field.id
-                          ? "border-primary ring-1 ring-primary/20 bg-card"
-                          : "border-border bg-card hover:border-primary/30",
+                          ? "border-primary bg-card shadow-[0_1px_3px_-2px_hsl(var(--foreground)/0.16)] ring-1 ring-primary/20"
+                          : "border-transparent bg-transparent shadow-none hover:border-border/80 hover:bg-card/70 hover:shadow-[0_1px_3px_-2px_hsl(var(--foreground)/0.12)]",
                         dragIdx === idx && "opacity-50",
                       )}
                     >
+                      {/* Sits in the row's negative-margin gutter (sm:-mx-4 / sm:px-4
+                          = 16px). Offset must clear the handle's own width (size-10 =
+                          40px) or the grip icon bleeds across the input's left border. */}
                       <div
-                        className="absolute -left-3 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 cursor-grab hidden sm:block"
-                        aria-label="Drag to reorder"
+                        className="absolute -start-8 top-1/2 hidden size-10 -translate-y-1/2 items-center justify-center cursor-grab text-muted-foreground opacity-0 transition-[color,opacity,transform] duration-150 ease-out group-hover:opacity-100 group-focus-within:opacity-100 hover:text-foreground sm:flex"
+                        aria-label={t("builder.dragToReorder")}
                       >
-                        <IconGripVertical className="h-4 w-4 text-muted-foreground" />
+                        <IconGripVertical className="h-4 w-4 translate-x-px" />
                       </div>
                       <FieldRenderer field={field} preview />
                     </div>
@@ -953,10 +1141,9 @@ function BuilderContent({
                     side="right"
                     align="start"
                     sideOffset={12}
-                    className="w-[calc(100vw-2rem)] sm:w-72 max-h-[70vh] sm:max-h-[520px] overflow-auto p-0"
+                    className="w-[calc(100vw-2rem)] max-h-[70vh] overflow-auto rounded-lg p-0 shadow-md sm:w-72 sm:max-h-[520px]"
                     onOpenAutoFocus={(e) => e.preventDefault()}
                     onInteractOutside={(e) => {
-                      // Don't close when interacting with dropdowns portaled to body
                       const target = e.target as HTMLElement;
                       if (
                         target.closest("[data-radix-popper-content-wrapper]") ||
@@ -969,6 +1156,7 @@ function BuilderContent({
                   >
                     <FieldPropertiesPanel
                       field={field}
+                      fields={fields}
                       onChange={onUpdateField}
                       onDelete={() => onDeleteField(field.id)}
                     />
@@ -977,7 +1165,7 @@ function BuilderContent({
               ) : (
                 <div
                   key={field.id}
-                  className="relative rounded-lg border border-border bg-card p-4"
+                  className="relative -mx-3 rounded-lg border border-transparent bg-transparent px-3 py-4 transition-[background-color,border-color] duration-150 hover:border-border/70 hover:bg-card/70 sm:-mx-4 sm:px-4"
                 >
                   <FieldRenderer field={field} preview />
                 </div>
@@ -991,17 +1179,20 @@ function BuilderContent({
             <div className="mt-4 flex items-center gap-2">
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button variant="outline" className="gap-2">
-                    <IconPlus className="h-4 w-4" />
-                    Add Field
-                    <IconChevronDown className="h-3 w-3" />
+                  <Button
+                    variant="outline"
+                    className="gap-2 active:scale-[0.96]"
+                  >
+                    <IconPlus className="h-4 w-4 shrink-0" />
+                    {t("builder.addField")}
+                    <IconChevronDown className="h-3.5 w-3.5 translate-y-px" />
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="w-48">
                   {Object.entries(fieldTypeLabels).map(([type, label]) => (
                     <DropdownMenuItem
                       key={type}
-                      onClick={() => onAddField(type as FormFieldType)}
+                      onClick={() => onAddField(type as AppFormFieldType)}
                     >
                       {label}
                     </DropdownMenuItem>
@@ -1017,7 +1208,8 @@ function BuilderContent({
                   <Button
                     variant="outline"
                     size="icon"
-                    aria-label="Edit form with AI"
+                    className="active:scale-[0.96]"
+                    aria-label={t("builder.editFormWithAi")}
                   >
                     <IconMessage className="h-4 w-4" />
                   </Button>
@@ -1026,14 +1218,16 @@ function BuilderContent({
                   side="top"
                   align="end"
                   sideOffset={8}
-                  className="w-[calc(100vw-2rem)] sm:w-80 p-0 rounded-xl"
+                  className="w-[calc(100vw-2rem)] rounded-lg p-0 shadow-md sm:w-80"
                   onOpenAutoFocus={(e) => {
                     e.preventDefault();
                     agentPromptRef.current?.focus();
                   }}
                 >
                   <div className="p-4 pb-3">
-                    <p className="text-sm font-semibold">Edit form</p>
+                    <p className="text-sm font-semibold">
+                      {t("builder.editForm")}
+                    </p>
                     <textarea
                       ref={agentPromptRef}
                       value={agentPrompt}
@@ -1044,7 +1238,7 @@ function BuilderContent({
                           onSubmitAgent();
                         }
                       }}
-                      placeholder="Add missing fields, change the layout..."
+                      placeholder={t("builder.agentPromptPlaceholder")}
                       rows={4}
                       className="mt-2 w-full resize-none bg-transparent text-sm placeholder:text-muted-foreground/50 focus:outline-none"
                     />
@@ -1054,18 +1248,18 @@ function BuilderContent({
                       {/Mac|iPhone|iPad/.test(navigator.userAgent)
                         ? "⌘"
                         : "Ctrl"}
-                      +Enter to submit
+                      {t("sidebar.submitShortcutSuffix")}
                     </span>
                     <Button
                       variant="secondary"
-                      size="icon"
-                      className="h-7 w-7"
+                      size="icon-lg"
+                      className="active:scale-[0.96] motion-reduce:active:scale-100"
                       onClick={onSubmitAgent}
                       disabled={
                         !agentPrompt.trim() ||
                         promptRun.isActivePrompt(agentPrompt)
                       }
-                      aria-label="Send prompt"
+                      aria-label={t("sidebar.sendPrompt")}
                     >
                       <IconArrowUp className="h-3.5 w-3.5" />
                     </Button>
@@ -1080,14 +1274,42 @@ function BuilderContent({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Results content (responses table)
-// ---------------------------------------------------------------------------
+function responseValueAsString(val: unknown): string {
+  if (val === undefined || val === null) return "";
+  if (Array.isArray(val)) return val.join(", ");
+  return typeof val === "string" ||
+    typeof val === "number" ||
+    typeof val === "boolean" ||
+    typeof val === "bigint"
+    ? String(val)
+    : JSON.stringify(val);
+}
+
+function compareResponseValues(a: unknown, b: unknown): number {
+  const aText = responseValueAsString(a);
+  const bText = responseValueAsString(b);
+  const aEmpty = !aText;
+  const bEmpty = !bText;
+  if (aEmpty && bEmpty) return 0;
+  if (aEmpty) return 1;
+  if (bEmpty) return -1;
+
+  const aNum = Number(aText);
+  const bNum = Number(bText);
+  if (!Number.isNaN(aNum) && !Number.isNaN(bNum)) return aNum - bNum;
+
+  return aText.localeCompare(bText, undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
 
 function ResultsContent({ formId, form }: { formId: string; form: any }) {
+  const t = useT();
+  const formatters = useFormatters();
+  const formatNumber = formatters.formatNumber.bind(formatters);
   const { data, isLoading, error, refetch } = useFormResponses(formId);
   const [search, setSearch] = useState("");
-  // `_submitted` is the synthetic Submitted column. Field columns sort by id.
   const [sortKey, setSortKey] = useState<string>("_submitted");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
@@ -1096,63 +1318,63 @@ function ResultsContent({ formId, form }: { formId: string; form: any }) {
       setSortDir((d) => (d === "asc" ? "desc" : "asc"));
     } else {
       setSortKey(key);
-      setSortDir("asc");
+      setSortDir(key === "_submitted" ? "desc" : "asc");
     }
   }
 
   const allResponses = data?.responses || [];
   const fields: FormField[] = data?.fields || form?.fields || [];
-  const total = data?.total ?? 0;
+  const isCommunitySubmissionForm = form?.slug === "community-app-submission";
+  const hasSubmitterEmail = allResponses.some((r: any) =>
+    responseValueAsString(r.submitterEmail).trim(),
+  );
+  const responseTableMinWidth =
+    64 +
+    160 +
+    (hasSubmitterEmail ? 224 : 0) +
+    (isCommunitySubmissionForm ? 168 : 0) +
+    Math.max(fields.length, 1) * 320;
 
   const filtered = search.trim()
     ? allResponses.filter((r: any) => {
-        const needle = search.toLowerCase();
+        const needle = search.trim().toLowerCase();
+        if (
+          responseValueAsString(r.submitterEmail).toLowerCase().includes(needle)
+        ) {
+          return true;
+        }
         return fields.some((f) => {
-          const val = r.data[f.id];
-          if (val == null) return false;
-          const str = Array.isArray(val) ? val.join(" ") : String(val);
-          return str.toLowerCase().includes(needle);
+          return responseValueAsString(r.data[f.id])
+            .toLowerCase()
+            .includes(needle);
         });
       })
     : allResponses;
 
   const responses = [...filtered].sort((a, b) => {
-    let av: string | number;
-    let bv: string | number;
+    let cmp: number;
     if (sortKey === "_submitted") {
-      av = new Date(a.submittedAt).getTime();
-      bv = new Date(b.submittedAt).getTime();
+      cmp =
+        new Date(a.submittedAt).getTime() - new Date(b.submittedAt).getTime();
+    } else if (sortKey === "_email") {
+      cmp = compareResponseValues(a.submitterEmail, b.submitterEmail);
     } else {
-      const aVal = a.data[sortKey];
-      const bVal = b.data[sortKey];
-      av =
-        aVal == null
-          ? ""
-          : Array.isArray(aVal)
-            ? aVal.join(", ")
-            : String(aVal);
-      bv =
-        bVal == null
-          ? ""
-          : Array.isArray(bVal)
-            ? bVal.join(", ")
-            : String(bVal);
+      cmp = compareResponseValues(a.data[sortKey], b.data[sortKey]);
     }
-    if (av < bv) return sortDir === "asc" ? -1 : 1;
-    if (av > bv) return sortDir === "asc" ? 1 : -1;
-    return 0;
+    return sortDir === "asc" ? cmp : -cmp;
   });
 
   function exportCsv() {
     if (!fields.length || !responses.length) return;
-    const headers = ["Submitted At", ...fields.map((f) => f.label)];
+    const headers = [
+      t("builder.results.submittedAt"),
+      ...(hasSubmitterEmail ? [t("builder.results.submitterEmail")] : []),
+      ...fields.map((f) => f.label),
+    ];
     const rows = responses.map((r) => [
       r.submittedAt,
-      ...fields.map((f) => {
-        const val = r.data[f.id];
-        if (Array.isArray(val)) return val.join(", ");
-        return String(val ?? "");
-      }),
+      ...(hasSubmitterEmail ? [responseValueAsString(r.submitterEmail)] : []),
+      ...fields.map((f) => responseValueAsString(r.data[f.id])),
     ]);
 
     const csv = [headers, ...rows]
@@ -1165,7 +1387,7 @@ function ResultsContent({ formId, form }: { formId: string; form: any }) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${form?.title || "responses"}-${format(new Date(), "yyyy-MM-dd")}.csv`;
+    a.download = `${form?.title || t("builder.results.responsesFilename")}-${format(new Date(), "yyyy-MM-dd")}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -1202,27 +1424,27 @@ function ResultsContent({ formId, form }: { formId: string; form: any }) {
     return (
       <div className="flex flex-col items-center justify-center flex-1 gap-3">
         <p className="text-sm text-muted-foreground">
-          Failed to load responses
+          {t("responses.failedLoad")}
         </p>
         <Button
           variant="outline"
           size="sm"
           onClick={() => refetch()}
-          className="gap-2"
+          className="gap-2 active:scale-[0.96]"
         >
           <IconRefresh className="h-3.5 w-3.5" />
-          Retry
+          {t("common.retry")}
         </Button>
       </div>
     );
   }
 
-  if (responses.length === 0) {
+  if (allResponses.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center flex-1 py-20">
-        <h3 className="font-medium mb-1">No responses yet</h3>
+        <h3 className="font-medium mb-1">{t("responses.emptyTitle")}</h3>
         <p className="text-sm text-muted-foreground">
-          Share your form to start collecting responses
+          {t("responses.emptyDescription")}
         </p>
       </div>
     );
@@ -1231,25 +1453,24 @@ function ResultsContent({ formId, form }: { formId: string; form: any }) {
   return (
     <div className="flex flex-col flex-1 overflow-hidden">
       <div className="flex flex-wrap items-center justify-between gap-2 px-3 sm:px-4 py-2 border-b border-border">
-        <div className="flex items-center gap-2">
-          <Badge variant="secondary" className="text-xs">
-            {total} response{total !== 1 ? "s" : ""}
-          </Badge>
+        <div className="ms-auto flex items-center gap-2">
           {search.trim() && filtered.length !== allResponses.length && (
             <span className="text-xs text-muted-foreground">
-              {filtered.length} match{filtered.length !== 1 ? "es" : ""}
+              {t("builder.results.matchCount", {
+                count: filtered.length,
+                formattedCount: formatNumber(filtered.length),
+              })}
             </span>
           )}
-        </div>
-        <div className="flex items-center gap-2">
           <div className="relative">
-            <IconSearch className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground pointer-events-none" />
+            <IconSearch className="absolute start-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground pointer-events-none" />
             <Input
+              size="sm"
               type="search"
-              placeholder="Search responses…"
+              placeholder={t("builder.results.searchPlaceholder")}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="h-8 pl-7 text-xs w-44 sm:w-56"
+              className="ps-7 text-xs w-44 sm:w-56"
             />
           </div>
           <Button
@@ -1259,37 +1480,73 @@ function ResultsContent({ formId, form }: { formId: string; form: any }) {
             onClick={exportCsv}
           >
             <IconDownload className="h-3.5 w-3.5" />
-            Export CSV
+            {t("responses.exportCsv")}
           </Button>
         </div>
       </div>
       <div className="flex-1 min-w-0 overflow-auto overscroll-x-contain">
-        <div className="w-max min-w-full">
-          <table className="min-w-full text-sm whitespace-nowrap">
+        <div className="w-full min-w-full">
+          <table
+            className="w-full min-w-full table-fixed text-sm"
+            style={{ width: "100%", minWidth: responseTableMinWidth }}
+          >
+            <colgroup>
+              <col className="w-16" />
+              <col className="w-40" />
+              {hasSubmitterEmail ? <col className="w-56" /> : null}
+              {isCommunitySubmissionForm ? <col className="w-40" /> : null}
+              {fields.map((f, index) => (
+                <col
+                  key={f.id}
+                  className={index === fields.length - 1 ? "w-auto" : "w-80"}
+                />
+              ))}
+            </colgroup>
             <thead>
               <tr className="border-b border-border bg-muted/30">
                 <th
                   scope="col"
-                  className="min-w-16 px-4 py-2.5 text-left text-xs font-medium text-muted-foreground whitespace-nowrap"
+                  className="min-w-16 px-4 py-2.5 text-start text-xs font-medium text-muted-foreground whitespace-nowrap"
                 >
                   #
                 </th>
                 <th
                   scope="col"
-                  className="min-w-36 px-4 py-2.5 text-left text-xs font-medium text-muted-foreground whitespace-nowrap"
+                  className="min-w-36 px-4 py-2.5 text-start text-xs font-medium text-muted-foreground whitespace-nowrap"
                 >
                   <ResultsSortableHeader
-                    label="Submitted"
+                    label={t("responses.submitted")}
                     active={sortKey === "_submitted"}
                     dir={sortDir}
                     onClick={() => toggleSort("_submitted")}
                   />
                 </th>
+                {hasSubmitterEmail && (
+                  <th
+                    scope="col"
+                    className="px-4 py-2.5 text-start text-xs font-medium text-muted-foreground whitespace-nowrap"
+                  >
+                    <ResultsSortableHeader
+                      label={t("responses.email")}
+                      active={sortKey === "_email"}
+                      dir={sortDir}
+                      onClick={() => toggleSort("_email")}
+                    />
+                  </th>
+                )}
+                {isCommunitySubmissionForm && (
+                  <th
+                    scope="col"
+                    className="px-4 py-2.5 text-start text-xs font-medium text-muted-foreground whitespace-nowrap"
+                  >
+                    {t("responses.communityReview")}
+                  </th>
+                )}
                 {fields.map((f) => (
                   <th
                     key={f.id}
                     scope="col"
-                    className="min-w-40 px-4 py-2.5 text-left text-xs font-medium text-muted-foreground whitespace-nowrap"
+                    className="px-4 py-2.5 text-start text-xs font-medium text-muted-foreground whitespace-nowrap"
                   >
                     <ResultsSortableHeader
                       label={f.label}
@@ -1305,10 +1562,15 @@ function ResultsContent({ formId, form }: { formId: string; form: any }) {
               {responses.length === 0 && (
                 <tr>
                   <td
-                    colSpan={2 + fields.length}
+                    colSpan={
+                      2 +
+                      (hasSubmitterEmail ? 1 : 0) +
+                      (isCommunitySubmissionForm ? 1 : 0) +
+                      fields.length
+                    }
                     className="px-4 py-8 text-center text-xs text-muted-foreground"
                   >
-                    No responses match your search.
+                    {t("builder.results.noSearchMatches")}
                   </td>
                 </tr>
               )}
@@ -1317,29 +1579,32 @@ function ResultsContent({ formId, form }: { formId: string; form: any }) {
                   key={response.id}
                   className="border-b border-border hover:bg-muted/20"
                 >
-                  <td className="px-4 py-2.5 text-xs text-muted-foreground">
+                  <td className="px-4 py-2.5 align-top text-xs text-muted-foreground">
                     {responses.length - idx}
                   </td>
-                  <td className="min-w-36 px-4 py-2.5 text-xs text-muted-foreground whitespace-nowrap">
+                  <td className="min-w-36 px-4 py-2.5 align-top text-xs text-muted-foreground whitespace-nowrap">
                     {format(new Date(response.submittedAt), "MMM d, h:mm a")}
                   </td>
+                  {hasSubmitterEmail && (
+                    <td className="px-4 py-3 align-top text-xs text-muted-foreground whitespace-normal break-words">
+                      {responseValueAsString(response.submitterEmail) || "-"}
+                    </td>
+                  )}
+                  {isCommunitySubmissionForm && (
+                    <td className="px-4 py-3 align-top">
+                      <CommunityPromotionCell response={response} />
+                    </td>
+                  )}
                   {fields.map((f) => {
                     const val = response.data[f.id];
-                    let display: string;
-                    if (val === undefined || val === null) {
-                      display = "-";
-                    } else if (Array.isArray(val)) {
-                      display = val.join(", ");
-                    } else {
-                      display = String(val);
-                    }
+                    const display = responseValueAsString(val) || "-";
                     return (
                       <td
                         key={f.id}
-                        className="min-w-40 max-w-[220px] truncate px-4 py-2.5 text-xs"
+                        className="min-w-48 px-4 py-3 align-top text-xs leading-5 whitespace-pre-wrap break-words"
                         title={display}
                       >
-                        {display}
+                        <ResponseValue value={val} />
                       </td>
                     );
                   })}
@@ -1368,25 +1633,36 @@ function ResultsSortableHeader({
     <button
       type="button"
       onClick={onClick}
-      className="inline-flex items-center gap-1 hover:text-foreground transition-colors cursor-pointer"
+      className="relative inline-flex cursor-pointer items-center gap-1 transition-[color,transform] duration-150 ease-out hover:text-foreground active:scale-[0.96] motion-reduce:active:scale-100 before:absolute before:-inset-3 before:content-['']"
     >
       <span>{label}</span>
-      {active ? (
-        dir === "asc" ? (
-          <IconArrowUp className="h-3 w-3" />
-        ) : (
-          <IconArrowDown className="h-3 w-3" />
-        )
-      ) : (
-        <IconArrowsSort className="h-3 w-3 opacity-40" />
-      )}
+      <span className="relative inline-flex h-3 w-3 items-center justify-center">
+        <IconArrowUp
+          className={cn(
+            "absolute h-3 w-3 transition-[opacity,scale] duration-200 ease-out",
+            active && dir === "asc"
+              ? "scale-100 opacity-100"
+              : "scale-[0.25] opacity-0",
+          )}
+        />
+        <IconArrowDown
+          className={cn(
+            "absolute h-3 w-3 transition-[opacity,scale] duration-200 ease-out",
+            active && dir === "desc"
+              ? "scale-100 opacity-100"
+              : "scale-[0.25] opacity-0",
+          )}
+        />
+        <IconArrowsSort
+          className={cn(
+            "absolute h-3 w-3 transition-[opacity,scale] duration-200 ease-out",
+            active ? "scale-[0.25] opacity-0" : "scale-100 opacity-40",
+          )}
+        />
+      </span>
     </button>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Settings editor (general settings)
-// ---------------------------------------------------------------------------
 
 function SettingsEditor({
   form,
@@ -1395,7 +1671,9 @@ function SettingsEditor({
   form: { settings: FormSettings };
   onSave: (settings: FormSettings) => void;
 }) {
+  const t = useT();
   const [settings, setSettings] = useState<FormSettings>({ ...form.settings });
+  const completionMode = getFormCompletionMode(settings);
 
   function update(partial: Partial<FormSettings>) {
     setSettings((prev) => ({ ...prev, ...partial }));
@@ -1404,20 +1682,25 @@ function SettingsEditor({
   return (
     <div className="space-y-4">
       <div className="space-y-2">
-        <Label className="text-xs">Submit button text</Label>
+        <Label className="text-xs">
+          {t("builder.settings.submitButtonText")}
+        </Label>
         <Input
-          value={settings.submitText || "Submit"}
+          size="sm"
+          value={settings.submitText || t("builder.settings.defaultSubmitText")}
           onChange={(e) => update({ submitText: e.target.value })}
-          className="h-8 text-sm"
+          className="text-sm"
         />
       </div>
 
       <div className="space-y-2">
-        <Label className="text-xs">Success message</Label>
+        <Label className="text-xs">
+          {t("builder.settings.successMessage")}
+        </Label>
         <Textarea
           value={
             settings.successMessage ||
-            "Thank you! Your response has been recorded."
+            t("builder.settings.defaultSuccessMessage")
           }
           onChange={(e) => update({ successMessage: e.target.value })}
           rows={2}
@@ -1426,67 +1709,163 @@ function SettingsEditor({
       </div>
 
       <div className="space-y-2">
-        <Label className="text-xs">Redirect URL (optional)</Label>
-        <Input
-          value={settings.redirectUrl || ""}
-          onChange={(e) => update({ redirectUrl: e.target.value })}
-          placeholder="https://..."
-          className="h-8 text-sm"
+        <Label className="text-xs">
+          {t("builder.settings.completionMode")}
+        </Label>
+        <Select
+          value={completionMode}
+          onValueChange={(value) =>
+            update({ completionMode: value as FormCompletionMode })
+          }
+        >
+          <SelectTrigger size="sm" className="text-sm">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="message" className="text-sm">
+              {t("builder.settings.completionMessage")}
+            </SelectItem>
+            <SelectItem value="redirect" className="text-sm">
+              {t("builder.settings.completionRedirect")}
+            </SelectItem>
+            <SelectItem value="message_then_refresh" className="text-sm">
+              {t("builder.settings.completionMessageThenRefresh")}
+            </SelectItem>
+            <SelectItem value="refresh" className="text-sm">
+              {t("builder.settings.completionRefresh")}
+            </SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      {completionMode === "redirect" && (
+        <div className="space-y-2">
+          <Label className="text-xs">{t("builder.settings.redirectUrl")}</Label>
+          <Input
+            size="sm"
+            value={settings.redirectUrl || ""}
+            onChange={(e) => update({ redirectUrl: e.target.value })}
+            placeholder="https://..."
+            className="text-sm"
+          />
+        </div>
+      )}
+
+      {completionMode === "message_then_refresh" && (
+        <div className="space-y-2">
+          <Label className="text-xs">
+            {t("builder.settings.completionRefreshSeconds")}
+          </Label>
+          <Input
+            size="sm"
+            type="number"
+            min={MIN_FORM_COMPLETION_REFRESH_SECONDS}
+            max={MAX_FORM_COMPLETION_REFRESH_SECONDS}
+            step={1}
+            value={
+              settings.completionRefreshSeconds ??
+              DEFAULT_FORM_COMPLETION_REFRESH_SECONDS
+            }
+            onChange={(e) => {
+              const value = e.target.value;
+              update({
+                completionRefreshSeconds:
+                  value === "" ? undefined : Number(value),
+              });
+            }}
+            className="text-sm"
+          />
+        </div>
+      )}
+
+      <div className="flex items-start justify-between gap-4 rounded-lg border border-border/60 bg-card p-3">
+        <div className="space-y-1">
+          <Label htmlFor="anonymous-responses" className="text-xs">
+            {t("builder.settings.anonymousResponses")}
+          </Label>
+          <p className="text-xs leading-5 text-muted-foreground">
+            {t("builder.settings.anonymousResponsesDescription")}
+          </p>
+        </div>
+        <Switch
+          id="anonymous-responses"
+          checked={settings.anonymous === true}
+          onCheckedChange={(anonymous) => update({ anonymous })}
+          aria-label={t("builder.settings.anonymousResponses")}
         />
       </div>
 
-      <Button onClick={() => onSave(settings)} className="w-full" size="sm">
-        Save Settings
+      <div className="flex items-start justify-between gap-4 rounded-lg border border-border/60 bg-card p-3">
+        <div className="space-y-1">
+          <Label htmlFor="email-new-responses" className="text-xs">
+            {t("builder.settings.emailNewResponses")}
+          </Label>
+          <p className="text-xs leading-5 text-muted-foreground">
+            {t("builder.settings.emailNewResponsesDescription")}
+          </p>
+        </div>
+        <Switch
+          id="email-new-responses"
+          checked={settings.emailOnNewResponses === true}
+          onCheckedChange={(emailOnNewResponses) =>
+            update({ emailOnNewResponses })
+          }
+          aria-label={t("builder.settings.emailNewResponses")}
+        />
+      </div>
+
+      <Button
+        onClick={() => onSave(settings)}
+        className="w-full active:scale-[0.96]"
+        size="sm"
+      >
+        {t("builder.settings.saveSettings")}
       </Button>
     </div>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Integrations editor
-// ---------------------------------------------------------------------------
-
 const integrationMeta: Record<
   IntegrationType,
   {
-    label: string;
+    labelKey: string;
     icon: typeof IconWebhook;
     logoSrc?: string;
     placeholder: string;
-    blurb: string;
-    help: string;
+    blurbKey: string;
+    helpKey: string;
   }
 > = {
   slack: {
-    label: "Slack",
+    labelKey: "builder.integrations.slackLabel",
     icon: IconHash,
     logoSrc: "/brands/slack.svg",
     placeholder: "https://hooks.slack.com/services/...",
-    blurb: "Drop new submissions straight into a channel.",
-    help: "Create an Incoming Webhook in your Slack app settings",
+    blurbKey: "builder.integrations.slackBlurb",
+    helpKey: "builder.integrations.slackHelp",
   },
   discord: {
-    label: "Discord",
+    labelKey: "builder.integrations.discordLabel",
     icon: IconHash,
     logoSrc: "/brands/discord.svg",
     placeholder: "https://discord.com/api/webhooks/...",
-    blurb: "Send submissions to your community or ops server.",
-    help: "Channel Settings > Integrations > Webhooks",
+    blurbKey: "builder.integrations.discordBlurb",
+    helpKey: "builder.integrations.discordHelp",
   },
   webhook: {
-    label: "Webhook",
+    labelKey: "builder.integrations.webhookLabel",
     icon: IconWebhook,
     placeholder: "https://...",
-    blurb: "POST JSON to Zapier, Make, n8n, or your own endpoint.",
-    help: "Sends a JSON POST with submission data. Works with Zapier, Make, n8n, etc.",
+    blurbKey: "builder.integrations.webhookBlurb",
+    helpKey: "builder.integrations.webhookHelp",
   },
   "google-sheets": {
-    label: "Google Sheets",
+    labelKey: "builder.integrations.googleSheetsLabel",
     icon: IconGlobe,
     logoSrc: "/brands/google-sheets.svg",
     placeholder: "https://script.google.com/macros/s/.../exec",
-    blurb: "Mirror every response into a spreadsheet your team can share.",
-    help: "Deploy an Apps Script web app that receives POST data",
+    blurbKey: "builder.integrations.googleSheetsBlurb",
+    helpKey: "builder.integrations.googleSheetsHelp",
   },
 };
 
@@ -1497,20 +1876,22 @@ function IntegrationBrandMark({
   type: IntegrationType;
   className?: string;
 }) {
+  const t = useT();
   const meta = integrationMeta[type];
+  const label = t(meta.labelKey);
   const Icon = meta.icon;
 
   if (meta.logoSrc) {
     return (
       <div
         className={cn(
-          "flex h-10 w-10 items-center justify-center rounded-xl border border-border/70 bg-background shadow-sm",
+          "flex h-10 w-10 items-center justify-center rounded-lg border border-border/70 bg-background",
           className,
         )}
       >
         <img
-          src={meta.logoSrc}
-          alt={`${meta.label} logo`}
+          src={appPath(meta.logoSrc)}
+          alt={t("builder.integrations.logoAlt", { label })}
           className="h-5 w-5 object-contain"
         />
       </div>
@@ -1520,7 +1901,7 @@ function IntegrationBrandMark({
   return (
     <div
       className={cn(
-        "flex h-10 w-10 items-center justify-center rounded-xl border border-border/70 bg-foreground text-background shadow-sm",
+        "flex h-10 w-10 items-center justify-center rounded-lg border border-border/70 bg-foreground text-background",
         className,
       )}
     >
@@ -1536,6 +1917,7 @@ function IntegrationsEditor({
   form: { settings: FormSettings };
   onSave: (settings: FormSettings) => void;
 }) {
+  const t = useT();
   const [settings, setSettings] = useState<FormSettings>({ ...form.settings });
   const integrations = settings.integrations ?? [];
   const selectedTypes = new Set(
@@ -1555,7 +1937,7 @@ function IntegrationsEditor({
     const integration: FormIntegration = {
       id: nanoid(8),
       type,
-      name: meta.label,
+      name: t(meta.labelKey),
       enabled: true,
       url: "",
     };
@@ -1579,30 +1961,31 @@ function IntegrationsEditor({
   }
 
   const saveLabel = hasIntegrations
-    ? `Save ${integrations.length === 1 ? "Integration" : "Integrations"}`
-    : "Choose an Integration First";
+    ? t("builder.integrations.saveIntegration", {
+        count: integrations.length,
+      })
+    : t("builder.integrations.chooseIntegrationFirst");
 
   return (
     <div className="space-y-4">
       <div className="space-y-1">
         <p className="text-xs font-medium uppercase tracking-[0.24em] text-muted-foreground/70">
-          Automations
+          {t("builder.integrations.automations")}
         </p>
         <p className="text-sm text-muted-foreground">
-          Send form submissions to external services automatically.
+          {t("builder.integrations.description")}
         </p>
       </div>
 
       {!hasIntegrations && (
-        <div className="rounded-xl border border-dashed border-border bg-muted/20 p-5">
+        <div className="rounded-lg border border-border/60 bg-muted/20 p-5">
           <div className="space-y-4">
             <div className="space-y-2">
               <h3 className="text-sm font-medium">
-                Add your first integration
+                {t("builder.integrations.addFirstIntegration")}
               </h3>
               <p className="text-sm text-muted-foreground">
-                Send new submissions to Slack, Discord, Google Sheets, or any
-                webhook endpoint.
+                {t("builder.integrations.emptyDescription")}
               </p>
             </div>
 
@@ -1617,18 +2000,18 @@ function IntegrationsEditor({
                   key={type}
                   type="button"
                   onClick={() => addIntegration(type)}
-                  className="cursor-pointer rounded-lg border bg-background p-3 text-left hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring min-h-[44px]"
+                  className="min-h-[44px] cursor-pointer rounded-lg border border-border/60 bg-background p-3 text-start transition-[background-color,border-color,box-shadow] duration-150 ease-out hover:border-primary/30 hover:bg-muted/40 hover:shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring active:scale-[0.96] motion-reduce:active:scale-100"
                 >
                   <div className="flex items-center gap-3">
                     <IntegrationBrandMark type={type} className="h-9 w-9" />
                     <div className="min-w-0">
                       <p className="truncate text-sm font-medium">
-                        {meta.label}
+                        {t(meta.labelKey)}
                       </p>
                       <p className="mt-0.5 text-xs text-muted-foreground">
                         {type === "webhook"
-                          ? "Custom endpoint"
-                          : "Built-in option"}
+                          ? t("builder.integrations.customEndpoint")
+                          : t("builder.integrations.builtInOption")}
                       </p>
                     </div>
                   </div>
@@ -1637,7 +2020,7 @@ function IntegrationsEditor({
             </div>
 
             <p className="text-xs text-muted-foreground">
-              You can add more than one destination and finish setup later.
+              {t("builder.integrations.addMoreHint")}
             </p>
           </div>
         </div>
@@ -1645,16 +2028,17 @@ function IntegrationsEditor({
 
       {integrations.map((integration) => {
         const meta = integrationMeta[integration.type];
+        const integrationLabel = t(meta.labelKey);
         return (
           <div
             key={integration.id}
-            className="rounded-xl border bg-card p-4 space-y-3"
+            className="space-y-3 rounded-lg border border-border/60 bg-card p-4"
           >
             <div className="flex items-start gap-3">
               <IntegrationBrandMark type={integration.type} />
               <div className="min-w-0 flex-1 space-y-1">
                 <div className="flex items-center gap-2">
-                  <p className="text-sm font-semibold">{meta.label}</p>
+                  <p className="text-sm font-semibold">{integrationLabel}</p>
                   <Badge
                     variant="secondary"
                     className={cn(
@@ -1664,11 +2048,13 @@ function IntegrationsEditor({
                         : "text-muted-foreground",
                     )}
                   >
-                    {integration.enabled ? "Enabled" : "Paused"}
+                    {integration.enabled
+                      ? t("builder.integrations.enabled")
+                      : t("builder.integrations.paused")}
                   </Badge>
                 </div>
                 <p className="text-xs leading-5 text-muted-foreground">
-                  {meta.blurb}
+                  {t(meta.blurbKey)}
                 </p>
               </div>
               <Switch
@@ -1679,8 +2065,8 @@ function IntegrationsEditor({
               />
               <Button
                 variant="ghost"
-                size="icon"
-                className="h-8 w-8 shrink-0 text-muted-foreground hover:text-destructive"
+                size="icon-lg"
+                className="shrink-0 text-muted-foreground hover:text-destructive active:scale-[0.96] motion-reduce:active:scale-100"
                 onClick={() => removeIntegration(integration.id)}
               >
                 <IconTrash className="h-4 w-4" />
@@ -1689,7 +2075,7 @@ function IntegrationsEditor({
 
             <div className="space-y-2">
               <Label className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground/70">
-                Label
+                {t("fieldProperties.label")}
               </Label>
               <Input
                 value={integration.name}
@@ -1698,13 +2084,13 @@ function IntegrationsEditor({
                     name: e.target.value,
                   })
                 }
-                className="h-9 text-sm font-medium"
+                className="text-sm font-medium"
               />
             </div>
 
             <div className="space-y-2">
               <Label className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground/70">
-                Destination URL
+                {t("builder.integrations.destinationUrl")}
               </Label>
               <Input
                 value={integration.url}
@@ -1712,11 +2098,13 @@ function IntegrationsEditor({
                   updateIntegration(integration.id, { url: e.target.value })
                 }
                 placeholder={meta.placeholder}
-                className="h-9 text-sm font-mono"
+                className="text-sm font-mono"
               />
             </div>
 
-            <p className="text-[11px] text-muted-foreground">{meta.help}</p>
+            <p className="text-[11px] text-muted-foreground">
+              {t(meta.helpKey)}
+            </p>
           </div>
         );
       })}
@@ -1726,10 +2114,12 @@ function IntegrationsEditor({
           <Button
             variant="outline"
             size="sm"
-            className="h-11 w-full rounded-xl"
+            className="h-11 w-full rounded-lg active:scale-[0.96]"
           >
-            <IconPlus className="h-3.5 w-3.5 mr-1.5" />
-            {hasIntegrations ? "Add Another Integration" : "Add Integration"}
+            <IconPlus className="h-3.5 w-3.5 me-1.5" />
+            {hasIntegrations
+              ? t("builder.integrations.addAnotherIntegration")
+              : t("builder.integrations.addIntegration")}
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="center" className="w-80 p-1.5">
@@ -1744,24 +2134,24 @@ function IntegrationsEditor({
                 key={type}
                 onClick={() => addIntegration(type)}
                 disabled={selectedTypes.has(type)}
-                className="rounded-md px-3 py-3"
+                className="px-3 py-3"
               >
                 <div className="flex items-center gap-3">
                   <IntegrationBrandMark type={type} />
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
-                      <p className="text-sm font-medium">{meta.label}</p>
+                      <p className="text-sm font-medium">{t(meta.labelKey)}</p>
                       {selectedTypes.has(type) && (
                         <Badge
                           variant="secondary"
                           className="px-2 py-0 text-[10px]"
                         >
-                          Added
+                          {t("builder.integrations.added")}
                         </Badge>
                       )}
                     </div>
                     <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
-                      {meta.blurb}
+                      {t(meta.blurbKey)}
                     </p>
                   </div>
                 </div>
@@ -1775,15 +2165,15 @@ function IntegrationsEditor({
         <div className="space-y-2">
           <Button
             onClick={() => onSave(settings)}
-            className="h-10 w-full"
+            className="h-10 w-full active:scale-[0.96]"
             size="sm"
           >
             {saveLabel}
           </Button>
           <p className="text-center text-xs text-muted-foreground">
             {configuredCount === integrations.length
-              ? "Everything here is ready to receive new form submissions."
-              : "You can save partial setup now and finish the remaining URLs later."}
+              ? t("builder.integrations.readyHint")
+              : t("builder.integrations.partialSetupHint")}
           </p>
         </div>
       )}

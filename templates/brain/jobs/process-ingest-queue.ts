@@ -1,8 +1,11 @@
-import { and, asc, eq, isNull, lte, or } from "drizzle-orm";
+import { getDbExec } from "@agent-native/core/db";
 import { runWithRequestContext } from "@agent-native/core/server/request-context";
+import { and, asc, eq, isNull, lte, or } from "drizzle-orm";
+
 import { getDb, schema } from "../server/db/index.js";
 import {
   nowIso,
+  nanoid,
   parseJson,
   readBrainAgentGuidance,
   stableJson,
@@ -14,6 +17,7 @@ type SourceRow = typeof schema.brainSources.$inferSelect;
 
 export interface DistillationAgentContext {
   queue: QueueRow;
+  claimToken: string;
   capture: CaptureRow;
   source: SourceRow;
   payload: Record<string, unknown>;
@@ -26,6 +30,7 @@ export type DistillationAgentRunner = (
 export interface ProcessBrainIngestQueueOptions {
   limit?: number;
   runDistillation?: boolean;
+  maxDistillations?: number;
   distillationRunner?: DistillationAgentRunner;
 }
 
@@ -38,12 +43,12 @@ const HEADLESS_DISTILLATION_SYSTEM_PROMPT = `You are the Brain distillation work
 Convert raw company captures into durable, cited institutional knowledge.
 Use only Brain actions. Never invent facts. Start by calling get-capture with
 includeRawContent=true for the provided capture id when exact quote validation
-is needed. Write supported durable entries with write-knowledge;
-that action will route uncertain, sensitive, or low-confidence items through
-the review queue when needed. Preserve exact short evidence quotes from the
-capture. Exclude personal or out-of-scope material. Always finish by calling
-mark-capture-distilled with status distilled, or status ignored when the capture
-should not become company knowledge.`;
+is needed. Write supported durable entries with write-knowledge. Preserve exact
+short evidence quotes from the capture. A brief, dated company or product
+go-live announcement can become knowledge about the announced plan, not proof
+that the launch happened. Exclude personal or out-of-scope material. Always
+finish by calling mark-capture-distilled with status distilled after writing
+knowledge, or status ignored only when no company-relevant fact remains.`;
 
 function recheckAt(now: string) {
   return new Date(Date.parse(now) + DISTILLATION_RECHECK_MS).toISOString();
@@ -90,7 +95,26 @@ async function loadCaptureAndSource(row: QueueRow) {
   return { capture, source };
 }
 
-async function markFailed(row: QueueRow, message: string, payload: object) {
+function claimedRowCondition(row: QueueRow, claimToken?: string) {
+  return claimToken
+    ? and(
+        eq(schema.brainIngestQueue.id, row.id),
+        eq(schema.brainIngestQueue.status, "processing"),
+        eq(schema.brainIngestQueue.leaseToken, claimToken),
+      )
+    : and(
+        eq(schema.brainIngestQueue.id, row.id),
+        eq(schema.brainIngestQueue.status, row.status),
+        eq(schema.brainIngestQueue.updatedAt, row.updatedAt),
+      );
+}
+
+async function markFailed(
+  row: QueueRow,
+  message: string,
+  payload: object,
+  claimToken?: string,
+) {
   const now = nowIso();
   await getDb()
     .update(schema.brainIngestQueue)
@@ -98,15 +122,18 @@ async function markFailed(row: QueueRow, message: string, payload: object) {
       status: "failed",
       payloadJson: stableJson(payload),
       error: message,
+      leaseToken: null,
+      leaseExpiresAt: null,
       updatedAt: now,
     })
-    .where(eq(schema.brainIngestQueue.id, row.id));
+    .where(claimedRowCondition(row, claimToken));
 }
 
 async function requeueDistillation(
   row: QueueRow,
   message: string,
   payload: object,
+  claimToken: string,
 ) {
   const now = nowIso();
   await getDb()
@@ -116,24 +143,86 @@ async function requeueDistillation(
       payloadJson: stableJson(payload),
       error: message,
       runAfter: recheckAt(now),
+      leaseToken: null,
+      leaseExpiresAt: null,
       updatedAt: now,
     })
-    .where(eq(schema.brainIngestQueue.id, row.id));
+    .where(claimedRowCondition(row, claimToken));
 }
 
-async function claimForHeadlessRunner(row: QueueRow, payload: object) {
+export async function claimForHeadlessRunner(row: QueueRow, payload: object) {
   const now = nowIso();
-  await getDb()
-    .update(schema.brainIngestQueue)
-    .set({
-      status: "processing",
-      attempts: row.attempts + 1,
-      payloadJson: stableJson(payload),
-      error: null,
-      runAfter: null,
-      updatedAt: now,
-    })
-    .where(eq(schema.brainIngestQueue.id, row.id));
+  const claimToken = nanoid(16);
+  const leaseExpiresAt = new Date(
+    Date.parse(now) + STALE_PROCESSING_MS,
+  ).toISOString();
+  const result = await getDbExec().execute({
+    sql: `UPDATE brain_ingest_queue
+      SET status = $1, attempts = $2, payload_json = $3, error = NULL,
+          run_after = NULL, lease_token = $4, lease_expires_at = $5, updated_at = $6
+      WHERE id = $7 AND status = $8 AND updated_at = $9`,
+    args: [
+      "processing",
+      row.attempts + 1,
+      stableJson(payload),
+      claimToken,
+      leaseExpiresAt,
+      now,
+      row.id,
+      row.status,
+      row.updatedAt,
+    ],
+  });
+  return result.rowsAffected > 0 ? claimToken : null;
+}
+
+async function runDeterministicOperation(
+  row: QueueRow,
+  context: NonNullable<Awaited<ReturnType<typeof loadCaptureAndSource>>>,
+  payload: Record<string, unknown>,
+) {
+  if (row.operation === "search-index") {
+    const { indexBrainCapture, readCaptureEmbeddingCoverage } =
+      await import("../server/lib/search-index.js");
+    const requiredEmbeddingSetId =
+      typeof payload.requiredEmbeddingSetId === "string"
+        ? payload.requiredEmbeddingSetId
+        : null;
+    const result = await indexBrainCapture(
+      context.capture.id,
+      requiredEmbeddingSetId ?? undefined,
+    );
+    if (requiredEmbeddingSetId) {
+      if (!result.indexed) {
+        throw new Error(
+          `Embedding backfill indexing failed: ${result.reason ?? "unknown"}.`,
+        );
+      }
+      const coverage = await readCaptureEmbeddingCoverage(
+        context.capture.id,
+        requiredEmbeddingSetId,
+      );
+      if (!coverage.complete) {
+        throw new Error(
+          `Embedding backfill incomplete: artifact=${coverage.artifactEmbedded}, bursts=${coverage.embeddedBursts}/${coverage.expectedBursts}.`,
+        );
+      }
+    }
+    return;
+  }
+  if (row.operation === "search-unindex") {
+    const { unindexBrainCapture } =
+      await import("../server/lib/search-index.js");
+    await unindexBrainCapture(context.capture.id);
+    return;
+  }
+  if (row.operation === "slack-thread-refresh") {
+    const { refreshSlackThreadCapture } =
+      await import("../server/lib/connectors.js");
+    await refreshSlackThreadCapture(context.source, row.payloadJson);
+    return;
+  }
+  throw new Error(`Unsupported ingest queue operation: ${row.operation}`);
 }
 
 async function latestQueueRow(rowId: string) {
@@ -143,6 +232,19 @@ async function latestQueueRow(rowId: string) {
     .where(eq(schema.brainIngestQueue.id, rowId))
     .limit(1);
   return updated;
+}
+
+async function markOperationDone(row: QueueRow, claimToken: string) {
+  await getDb()
+    .update(schema.brainIngestQueue)
+    .set({
+      status: "done",
+      leaseToken: null,
+      leaseExpiresAt: null,
+      error: null,
+      updatedAt: nowIso(),
+    })
+    .where(claimedRowCondition(row, claimToken));
 }
 
 function buildDistillationMessage(
@@ -164,18 +266,13 @@ function buildDistillationMessage(
     `Tone: ${guidance.response.toneInstruction}`,
     `Citation policy: ${guidance.response.citationInstruction}`,
     `Default publish tier: ${guidance.distillation.defaultPublishTier}`,
-    `Review policy: ${
-      guidance.distillation.requireApprovalForCompanyKnowledge
-        ? "company-tier knowledge normally requires review"
-        : "company-tier knowledge can publish directly when write-knowledge allows it"
-    }`,
     `Workspace distillation instructions: ${guidance.distillation.instructions}`,
     instructions,
     "Required workflow:",
     "1. Call get-capture with includeRawContent=true for this capture id when exact quote validation is needed.",
     "2. Extract only durable company knowledge with exact source quotes.",
-    "3. Call write-knowledge for supported entries or proposals.",
-    "4. Call mark-capture-distilled when finished, or mark ignored if excluded.",
+    "3. Call write-knowledge for supported entries.",
+    `4. Call mark-capture-distilled with captureId=${context.capture.id}, queueId=${context.queue.id}, and claimToken=${context.claimToken} when finished, or mark ignored if excluded.`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -194,7 +291,7 @@ async function defaultDistillationRunner(context: DistillationAgentContext) {
   const tools = core.actionsToEngineTools(actions);
   const userApiKey = await core.getOwnerActiveApiKey(context.source.ownerEmail);
   const engine = await core.resolveEngine({
-    apiKey: userApiKey ?? process.env.ANTHROPIC_API_KEY,
+    apiKey: userApiKey,
     appId: "brain",
   });
   const model =
@@ -255,15 +352,28 @@ export async function processBrainIngestQueueOnce(
     const processed: string[] = [];
     const deferred: string[] = [];
     const failed: string[] = [];
+    const maxDistillations = Math.max(
+      0,
+      Math.floor(options.maxDistillations ?? Number.POSITIVE_INFINITY),
+    );
+    let distillationsStarted = 0;
     for (const row of rows) {
       const payload = parseJson<Record<string, unknown>>(row.payloadJson, {});
       if (row.operation === "distill") {
+        if (
+          options.runDistillation &&
+          distillationsStarted >= maxDistillations
+        ) {
+          continue;
+        }
         if (!options.runDistillation) {
-          await claimForHeadlessRunner(row, payload);
+          const claimToken = await claimForHeadlessRunner(row, payload);
+          if (!claimToken) continue;
           await requeueDistillation(
             row,
             "Distillation is still queued; no distillation worker completed this item.",
             { ...payload, lastDistillationCheckAt: now },
+            claimToken,
           );
           deferred.push(row.id);
           continue;
@@ -287,7 +397,9 @@ export async function processBrainIngestQueueOnce(
               ? payload.headlessClaimCount + 1
               : 1,
         };
-        await claimForHeadlessRunner(row, nextPayload);
+        const claimToken = await claimForHeadlessRunner(row, nextPayload);
+        if (!claimToken) continue;
+        distillationsStarted += 1;
 
         try {
           const runner =
@@ -299,7 +411,14 @@ export async function processBrainIngestQueueOnce(
             },
             () =>
               runner({
-                queue: row,
+                queue: {
+                  ...row,
+                  attempts: row.attempts + 1,
+                  payloadJson: stableJson(nextPayload),
+                  status: "processing",
+                  leaseToken: claimToken,
+                },
+                claimToken,
                 capture: contextRows.capture,
                 source: contextRows.source,
                 payload: nextPayload,
@@ -309,16 +428,23 @@ export async function processBrainIngestQueueOnce(
           const message = err instanceof Error ? err.message : String(err);
           const failedPermanently = row.attempts + 1 >= MAX_ATTEMPTS;
           if (failedPermanently) {
-            await markFailed(row, message, {
-              ...nextPayload,
-              failedAt: nowIso(),
-            });
+            await markFailed(
+              row,
+              message,
+              { ...nextPayload, failedAt: nowIso() },
+              claimToken,
+            );
             failed.push(row.id);
           } else {
-            await requeueDistillation(row, message, {
-              ...nextPayload,
-              lastHeadlessDistillationErrorAt: nowIso(),
-            });
+            await requeueDistillation(
+              row,
+              message,
+              {
+                ...nextPayload,
+                lastHeadlessDistillationErrorAt: nowIso(),
+              },
+              claimToken,
+            );
             deferred.push(row.id);
           }
           continue;
@@ -332,6 +458,7 @@ export async function processBrainIngestQueueOnce(
             row,
             "Headless distillation agent did not mark this capture distilled or ignored.",
             { ...nextPayload, failedAt: nowIso() },
+            claimToken,
           );
           failed.push(row.id);
         } else {
@@ -339,22 +466,163 @@ export async function processBrainIngestQueueOnce(
             row,
             "Headless distillation agent did not mark this capture distilled or ignored.",
             { ...nextPayload, lastHeadlessDistillationAt: nowIso() },
+            claimToken,
           );
           deferred.push(row.id);
         }
         continue;
       }
-
-      await claimForHeadlessRunner(row, payload);
-      await markFailed(
-        row,
-        `Unsupported ingest queue operation: ${row.operation}`,
-        {
+      if (row.operation === "search-unindex") {
+        if (!row.captureId) {
+          await markFailed(row, "Search unindex operation had no capture id.", {
+            ...payload,
+            failedAt: now,
+          });
+          failed.push(row.id);
+          continue;
+        }
+        const claimToken = await claimForHeadlessRunner(row, payload);
+        if (!claimToken) continue;
+        try {
+          const { unindexBrainCapture } =
+            await import("../server/lib/search-index.js");
+          await unindexBrainCapture(row.captureId);
+          await markOperationDone(row, claimToken);
+          processed.push(row.id);
+        } catch (error) {
+          await markFailed(
+            row,
+            error instanceof Error ? error.message : String(error),
+            { ...payload, failedAt: nowIso() },
+            claimToken,
+          );
+          failed.push(row.id);
+        }
+        continue;
+      }
+      if (row.operation === "slack-thread-refresh") {
+        const [source] = row.sourceId
+          ? await db
+              .select()
+              .from(schema.brainSources)
+              .where(eq(schema.brainSources.id, row.sourceId))
+              .limit(1)
+          : [];
+        if (!source) {
+          await markFailed(row, "Slack refresh source was missing.", {
+            ...payload,
+            failedAt: now,
+          });
+          failed.push(row.id);
+          continue;
+        }
+        const claimToken = await claimForHeadlessRunner(row, payload);
+        if (!claimToken) continue;
+        try {
+          const { refreshSlackThreadCapture } =
+            await import("../server/lib/connectors.js");
+          await runWithRequestContext(
+            {
+              userEmail: source.ownerEmail,
+              orgId: source.orgId ?? undefined,
+            },
+            () => refreshSlackThreadCapture(source, row.payloadJson),
+          );
+          await markOperationDone(row, claimToken);
+          processed.push(row.id);
+        } catch (error) {
+          await markFailed(
+            row,
+            error instanceof Error ? error.message : String(error),
+            { ...payload, failedAt: nowIso() },
+            claimToken,
+          );
+          failed.push(row.id);
+        }
+        continue;
+      }
+      if (row.operation === "sync") {
+        const [source] = row.sourceId
+          ? await db
+              .select()
+              .from(schema.brainSources)
+              .where(eq(schema.brainSources.id, row.sourceId))
+              .limit(1)
+          : [];
+        if (!source) {
+          await markFailed(row, "Source sync operation had no source.", {
+            ...payload,
+            failedAt: now,
+          });
+          failed.push(row.id);
+          continue;
+        }
+        const claimToken = await claimForHeadlessRunner(row, payload);
+        if (!claimToken) continue;
+        try {
+          const { runConnectorSync } =
+            await import("../server/lib/connectors.js");
+          await runWithRequestContext(
+            {
+              userEmail: source.ownerEmail,
+              orgId: source.orgId ?? undefined,
+            },
+            () => runConnectorSync(source),
+          );
+          await markOperationDone(row, claimToken);
+          processed.push(row.id);
+        } catch (error) {
+          await markFailed(
+            row,
+            error instanceof Error ? error.message : String(error),
+            { ...payload, failedAt: nowIso() },
+            claimToken,
+          );
+          failed.push(row.id);
+        }
+        continue;
+      }
+      const contextRows = await loadCaptureAndSource(row);
+      if (!contextRows) {
+        await markFailed(row, "Queue capture or source was missing.", {
           ...payload,
           failedAt: now,
-        },
-      );
-      failed.push(row.id);
+        });
+        failed.push(row.id);
+        continue;
+      }
+      const claimToken = await claimForHeadlessRunner(row, payload);
+      if (!claimToken) continue;
+      try {
+        await runWithRequestContext(
+          {
+            userEmail: contextRows.source.ownerEmail,
+            orgId: contextRows.source.orgId ?? undefined,
+          },
+          () => runDeterministicOperation(row, contextRows, payload),
+        );
+        await markOperationDone(row, claimToken);
+        processed.push(row.id);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (row.attempts + 1 >= MAX_ATTEMPTS) {
+          await markFailed(
+            row,
+            message,
+            { ...payload, failedAt: nowIso() },
+            claimToken,
+          );
+          failed.push(row.id);
+        } else {
+          await requeueDistillation(
+            row,
+            message,
+            { ...payload, lastOperationErrorAt: nowIso() },
+            claimToken,
+          );
+          deferred.push(row.id);
+        }
+      }
     }
 
     return { processed, deferred, failed };

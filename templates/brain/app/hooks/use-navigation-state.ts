@@ -1,17 +1,15 @@
-import {
-  appBasePath,
-  appPath,
-  markAgentChatHomeHandoff,
-  useAgentRouteState,
-} from "@agent-native/core/client";
-import { useLocation } from "react-router";
+import { appBasePath, appPath } from "@agent-native/core/client/api-path";
+import { useAgentRouteState } from "@agent-native/core/client/navigation";
+
 import { pathFromView, viewFromPath, type BrainView } from "@/lib/brain";
+import { brainSettingsSectionFromPath } from "@/lib/settings-navigation";
 import { TAB_ID } from "@/lib/tab-id";
 
 export interface NavigationState {
   view: BrainView;
   path?: string;
   query?: string;
+  projectId?: string;
   source?: string;
   sourceType?: string;
   type?: string;
@@ -33,7 +31,6 @@ export interface NavigationState {
 }
 
 export function useNavigationState() {
-  const location = useLocation();
   useAgentRouteState<NavigationState>({
     browserTabId: TAB_ID,
     requestSource: TAB_ID,
@@ -44,6 +41,7 @@ export function useNavigationState() {
         view: viewFromPath(localPathname),
         path: appPath(`${localPathname}${search}`),
         query: params.get("q") || undefined,
+        projectId: params.get("projectId") || undefined,
         source: params.get("source") || undefined,
         sourceType: params.get("type") || undefined,
         type: params.get("type") || undefined,
@@ -56,13 +54,15 @@ export function useNavigationState() {
         sourceId: params.get("sourceId") || undefined,
         selectedKnowledgeId: params.get("knowledgeId") || undefined,
         reviewItemId: params.get("reviewItemId") || undefined,
-        settingsSection: params.get("section") || undefined,
+        settingsSection:
+          params.get("section") || brainSettingsSectionFromPath(localPathname),
         extensionId: extensionIdFromPath(localPathname),
       };
     },
     getCommandPath: (navCommand) => {
       const params = new URLSearchParams();
       if (navCommand.query) params.set("q", navCommand.query);
+      if (navCommand.projectId) params.set("projectId", navCommand.projectId);
       if (navCommand.source) params.set("source", navCommand.source);
       if (navCommand.type || navCommand.sourceType) {
         params.set("type", navCommand.type ?? navCommand.sourceType ?? "");
@@ -79,10 +79,6 @@ export function useNavigationState() {
       if (knowledgeId) {
         params.set("knowledgeId", knowledgeId);
       }
-      // Captures have no dedicated detail route — they live in the Search
-      // surface. Deep links from ask-brain / search-everything use
-      // `view: "capture"` + `captureId`; carry the id through and resolve the
-      // view to /search below so the user lands where captures are shown.
       if (navCommand.captureId) {
         params.set("captureId", navCommand.captureId);
       }
@@ -104,23 +100,9 @@ export function useNavigationState() {
       );
       return `${path}${params.size ? `?${params.toString()}` : ""}`;
     },
-    onNavigate: (_command, path) => {
-      if (location.pathname === "/" && pathnameFromPath(path) !== "/") {
-        markAgentChatHomeHandoff("brain");
-      }
-    },
   });
 }
 
-function pathnameFromPath(path: string): string {
-  return path.split(/[?#]/, 1)[0] || "/";
-}
-
-/**
- * Resolve a navigate command `view` to a router path. `view: "capture"` (or any
- * command that only carries a `captureId`) resolves to the Search surface,
- * since Brain has no standalone capture-detail route.
- */
 function pathFromNavView(
   view?: string,
   captureId?: string,

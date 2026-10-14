@@ -1,8 +1,5 @@
-/**
- * useEventType — fetch one event type by id or slug via a consumer-provided
- * callback (typically calling the `get-event-type` action).
- */
 import { useEffect, useState } from "react";
+
 import type { EventType } from "../../shared/index.js";
 
 export interface UseEventTypeOpts {

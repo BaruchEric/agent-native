@@ -1,3 +1,7 @@
+import {
+  normalizeActionChatUIConfig,
+  type ActionChatUIConfig,
+} from "../action-ui.js";
 import type { CodeAgentTranscriptEvent } from "../cli/code-agent-runs.js";
 import type { AgentMcpAppPayload } from "../mcp-client/app-result.js";
 
@@ -47,15 +51,12 @@ export interface NormalizedCodeAgentToolEvent extends NormalizedCodeAgentTranscr
   input?: unknown;
   result?: unknown;
   mcpApp?: AgentMcpAppPayload;
+  chatUI?: ActionChatUIConfig;
   activities: string[];
   startedAt?: string;
   completedAt?: string;
-  /**
-   * Structured metadata from the tool execution side-channel.  Present on
-   * bash/edit/write/read tool events when the executor is new enough to emit
-   * it.  Absent on old transcript events — UI must handle both cases.
-   */
   structuredMeta?: Record<string, unknown>;
+  pendingApprovalKey?: string;
 }
 
 export interface NormalizedCodeAgentStatusEvent extends NormalizedCodeAgentTranscriptBase {
@@ -65,16 +66,30 @@ export interface NormalizedCodeAgentStatusEvent extends NormalizedCodeAgentTrans
   statusKind: CodeAgentTranscriptEvent["kind"];
   status?: string;
   phase?: string;
+  signal?: CodeAgentTranscriptEvent["signal"];
   metadata?: Record<string, unknown>;
 }
 
-/**
- * Accumulated reasoning/thinking text emitted during a model's extended
- * thinking phase.  Rendered as a collapsed-by-default "Thinking…" cell.
- */
 export interface NormalizedCodeAgentThinkingEvent extends NormalizedCodeAgentTranscriptBase {
   type: "thinking";
   text: string;
+}
+
+export const CREDENTIAL_GAP_SIGNAL: NonNullable<
+  CodeAgentTranscriptEvent["signal"]
+> = "credential-gap";
+
+export function isCredentialGapCodeAgentEvent(event: {
+  signal?: string;
+  text?: string;
+  message?: string;
+}): boolean {
+  if (event.signal === CREDENTIAL_GAP_SIGNAL) return true;
+  return isLegacyCredentialGapHintText(event.text ?? event.message ?? "");
+}
+
+function isLegacyCredentialGapHintText(value: string): boolean {
+  return /No LLM provider key was found|Missing credentials/i.test(value);
 }
 
 export function normalizeCodeAgentTranscript(
@@ -87,6 +102,12 @@ export function normalizeCodeAgentTranscript(
 
   for (const event of events) {
     const currentTurnIndex = Math.max(turnIndex, 0);
+    if (isAgentChatClearEvent(event)) {
+      clearNormalizedAgentDraftItems(items, currentTurnIndex);
+      hiddenEvents.push(event);
+      continue;
+    }
+
     if (event.kind === "user") {
       turnIndex = turnIndex < 0 ? (items.length === 0 ? 0 : 1) : turnIndex + 1;
       items.push(createUserTurn(event, turnIndex));
@@ -137,6 +158,7 @@ export function normalizeCodeAgentTranscript(
   hiddenEvents.sort(
     (a, b) => (eventOrder.get(a.id) ?? 0) - (eventOrder.get(b.id) ?? 0),
   );
+  applyPendingCodeAgentApprovalKeys(dedupedItems, events);
 
   return {
     items: dedupedItems,
@@ -144,6 +166,28 @@ export function normalizeCodeAgentTranscript(
     hiddenEvents,
   };
 }
+
+function applyPendingCodeAgentApprovalKeys(
+  items: NormalizedCodeAgentTranscriptItem[],
+  events: readonly CodeAgentTranscriptEvent[],
+): void {
+  const resolvedApprovalIds = new Set<string>();
+  for (const event of events) {
+    const approvalId = stringMetadata(event.metadata, "approvalId");
+    if (approvalId) resolvedApprovalIds.add(approvalId);
+  }
+  for (const item of items) {
+    if (item.type !== "tool" || item.state !== "completed") continue;
+    if (typeof item.result !== "string") continue;
+    const match = CODE_AGENT_APPROVAL_ID_RESULT_PATTERN.exec(item.result);
+    const id = match?.[1];
+    if (id && !resolvedApprovalIds.has(id)) {
+      item.pendingApprovalKey = id;
+    }
+  }
+}
+
+const CODE_AGENT_APPROVAL_ID_RESULT_PATTERN = /Approval id:\s*(\S+)/;
 
 function createUserTurn(
   event: CodeAgentTranscriptEvent,
@@ -209,7 +253,6 @@ function appendThinkingChunk(
 ): void {
   const previous = items.at(-1);
   if (previous?.type === "thinking" && previous.turnIndex === turnIndex) {
-    // Accumulate consecutive thinking chunks into one cell.
     previous.text = `${previous.text}${event.message}`;
     previous.updatedAt = event.createdAt;
     previous.eventIds.push(event.id);
@@ -242,6 +285,7 @@ function createStatusEvent(
     statusKind: event.kind,
     status: stringMetadata(metadata, "status"),
     phase: stringMetadata(metadata, "phase"),
+    signal: event.signal,
     metadata,
     createdAt: event.createdAt,
     updatedAt: event.createdAt,
@@ -297,6 +341,8 @@ function appendToolEvent(
   }
   const mcpApp = mcpAppMetadata(event.metadata);
   if (mcpApp) item.mcpApp = mcpApp;
+  const chatUI = chatUIMetadata(event.metadata);
+  if (chatUI) item.chatUI = chatUI;
   const doneMeta = structuredMetadata(event.metadata);
   if (doneMeta) item.structuredMeta = doneMeta;
 }
@@ -322,6 +368,7 @@ function createToolEvent(
     input: hasMetadataKey(metadata, "input") ? metadata?.input : undefined,
     result: hasMetadataKey(metadata, "result") ? metadata?.result : undefined,
     mcpApp: mcpAppMetadata(metadata),
+    chatUI: chatUIMetadata(metadata),
     activities: toolType === "activity" ? [event.message] : [],
     startedAt: toolType === "tool_start" ? event.createdAt : undefined,
     completedAt: toolType === "tool_done" ? event.createdAt : undefined,
@@ -349,6 +396,31 @@ function findOpenToolEvent(
     return item;
   }
   return null;
+}
+
+function isAgentChatClearEvent(event: CodeAgentTranscriptEvent): boolean {
+  return stringMetadata(event.metadata, "agentChatEventType") === "clear";
+}
+
+function clearNormalizedAgentDraftItems(
+  items: NormalizedCodeAgentTranscriptItem[],
+  turnIndex: number,
+): void {
+  for (let index = items.length - 1; index >= 0; index--) {
+    const item = items[index];
+    if (!item || item.turnIndex !== turnIndex) continue;
+    if (
+      item.type === "assistant" ||
+      item.type === "thinking" ||
+      item.type === "status"
+    ) {
+      items.splice(index, 1);
+      continue;
+    }
+    if (item.type === "tool" && item.state !== "completed") {
+      items.splice(index, 1);
+    }
+  }
 }
 
 function suppressDuplicateFinalAssistantText(
@@ -402,8 +474,6 @@ function suppressDuplicateFinalAssistantText(
 function shouldShowStatusEvent(event: CodeAgentTranscriptEvent): boolean {
   if (event.kind === "artifact" || event.kind === "note") return true;
   if (event.kind !== "status") return false;
-  // Thinking events are handled separately by appendThinkingChunk; never
-  // render them again as plain status entries.
   if (isThinkingEvent(event)) return false;
   if (isLowSignalLifecycleEvent(event)) return false;
   return true;
@@ -545,9 +615,6 @@ function stripRunnerDiagnostics(
 const RUNNER_DIAGNOSTIC_LINE_PATTERNS = {
   engineDetect: /^\[engine-detect\][^\r\n]*(?:\r?\n|$)/gm,
   builderEngine: /^\[builder-engine\]\s*[←→][^\r\n]*(?:\r?\n|$)/gm,
-  // Strip the "Agent-Native Code session started." banner block that the CLI
-  // prints to stdout at the start of every run. It is informational for
-  // terminal users but clutters the chat transcript.
   sessionStartedBanner:
     /\n?Agent-Native Code session started\.[\s\S]*?Streaming output below\. The transcript is saved with this run\.\n?/,
 };
@@ -568,7 +635,7 @@ function joinAssistantChunks(previous: string, next: string): string {
   if (!next) return previous;
   if (/\s$/.test(previous) || /^\s/.test(next)) return `${previous}${next}`;
   if (/^[.,!?;:)\]}'"`]/.test(next)) return `${previous}${next}`;
-  if (/[(\[{'"`]$/.test(previous)) return `${previous}${next}`;
+  if (/[([{'"`]$/.test(previous)) return `${previous}${next}`;
   return `${previous} ${next}`;
 }
 
@@ -626,4 +693,10 @@ function mcpAppMetadata(
     return undefined;
   }
   return candidate as AgentMcpAppPayload;
+}
+
+function chatUIMetadata(
+  metadata: Record<string, unknown> | undefined,
+): ActionChatUIConfig | undefined {
+  return normalizeActionChatUIConfig(metadata?.chatUI);
 }

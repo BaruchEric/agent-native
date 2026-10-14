@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+
 import type { DeviceFrameType } from "./types";
 
 interface DeviceFrameProps {
@@ -7,7 +8,6 @@ interface DeviceFrameProps {
   title?: string;
 }
 
-/** macOS window chrome with traffic light dots */
 function DesktopFrame({
   children,
   title,
@@ -46,7 +46,6 @@ function DesktopFrame({
   );
 }
 
-/** iPad-like tablet frame */
 function TabletFrame({
   children,
   title,
@@ -77,7 +76,6 @@ function TabletFrame({
   );
 }
 
-/** iPhone-like mobile frame */
 function MobileFrame({
   children,
   title,
@@ -90,7 +88,7 @@ function MobileFrame({
       {/* Status bar with notch */}
       <div className="relative flex items-center justify-between px-6 h-10 bg-black">
         {/* Time */}
-        <span className="text-[11px] font-semibold text-white">9:41</span>
+        <span className="!text-[11px] font-semibold text-white">9:41</span>
         {/* Dynamic Island / Notch */}
         <div className="absolute left-1/2 -translate-x-1/2 top-1.5 w-24 h-6 rounded-full bg-zinc-900" />
         {/* Status icons */}

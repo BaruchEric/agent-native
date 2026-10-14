@@ -1,13 +1,16 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
-import { resolveAccess } from "@agent-native/core/sharing";
+import { defineAction } from "@agent-native/core/action";
 import {
   getRequestUserEmail,
   getRequestOrgId,
 } from "@agent-native/core/server/request-context";
+import { resolveAccess } from "@agent-native/core/sharing";
+import { eq } from "drizzle-orm";
 import { nanoid } from "nanoid";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
+import { annotateScreenHtmlForPersist } from "../shared/screen-annotation.js";
+import { trackDesignCreated } from "./_design-tracking.js";
 
 export default defineAction({
   description:
@@ -20,7 +23,7 @@ export default defineAction({
       .optional()
       .describe("Title for the copy (defaults to 'Copy of ...')"),
   }),
-  run: async ({ id, title }) => {
+  run: async ({ id, title }, ctx) => {
     const access = await resolveAccess("design", id);
     if (!access) throw new Error(`Design not found: ${id}`);
 
@@ -30,41 +33,81 @@ export default defineAction({
     const now = new Date().toISOString();
     const newTitle = title || `Copy of ${source.title}`;
 
-    // Copy the design
-    await db.insert(schema.designs).values({
-      id: newId,
-      title: newTitle,
-      description: source.description,
-      projectType: source.projectType,
-      designSystemId: source.designSystemId ?? null,
-      data: source.data,
-      ownerEmail: (() => {
-        const e = getRequestUserEmail();
-        if (!e) throw new Error("no authenticated user");
-        return e;
-      })(),
-      orgId: getRequestOrgId() || null,
-      createdAt: now,
-      updatedAt: now,
-    });
-
-    // Copy all associated files with new IDs
     const files = await db
       .select()
       .from(schema.designFiles)
       .where(eq(schema.designFiles.designId, id));
 
-    for (const file of files) {
-      await db.insert(schema.designFiles).values({
-        id: nanoid(),
-        designId: newId,
-        filename: file.filename,
-        fileType: file.fileType,
-        content: file.content,
+    const idMap = new Map<string, string>(
+      files.map((file) => [file.id, nanoid()]),
+    );
+
+    let newData = source.data;
+    try {
+      const parsed =
+        typeof source.data === "string" ? JSON.parse(source.data) : source.data;
+      if (parsed && typeof parsed === "object" && parsed.canvasFrames) {
+        const remapped: Record<string, unknown> = {};
+        for (const [oldId, geometry] of Object.entries(parsed.canvasFrames)) {
+          const newFileId = idMap.get(oldId);
+          remapped[newFileId ?? oldId] = geometry;
+        }
+        newData =
+          typeof source.data === "string"
+            ? JSON.stringify({ ...parsed, canvasFrames: remapped })
+            : { ...parsed, canvasFrames: remapped };
+      }
+    } catch {
+      // If data is unparseable, fall back to copying verbatim
+    }
+
+    const orgId = getRequestOrgId() || null;
+    const ownerEmail = (() => {
+      const e = getRequestUserEmail();
+      if (!e) throw new Error("no authenticated user");
+      return e;
+    })();
+
+    await db.transaction(async (tx) => {
+      await tx.insert(schema.designs).values({
+        id: newId,
+        title: newTitle,
+        description: source.description,
+        projectType: source.projectType,
+        designSystemId: source.designSystemId ?? null,
+        data: newData,
+        ownerEmail,
+        orgId,
+        visibility: orgId ? "org" : "private",
         createdAt: now,
         updatedAt: now,
       });
-    }
+
+      if (files.length > 0) {
+        await tx.insert(schema.designFiles).values(
+          files.map((file) => ({
+            id: idMap.get(file.id)!,
+            designId: newId,
+            filename: file.filename,
+            fileType: file.fileType,
+            content: annotateScreenHtmlForPersist(file.content, file.fileType),
+            createdAt: now,
+            updatedAt: now,
+          })),
+        );
+      }
+    });
+
+    trackDesignCreated(
+      newId,
+      {
+        creationMethod: "duplicate",
+        projectType: source.projectType,
+        designSystemId: source.designSystemId,
+        sourceDesignId: id,
+      },
+      ctx,
+    );
 
     return {
       id: newId,

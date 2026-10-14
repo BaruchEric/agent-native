@@ -5,13 +5,21 @@ import {
   now,
   ownableColumns,
   createSharesTable,
+  index,
+  uniqueIndex,
 } from "@agent-native/core/db/schema";
+import { sql } from "drizzle-orm";
+import { boolean } from "drizzle-orm/pg-core";
 
 export const documents = table("documents", {
   id: text("id").primaryKey(),
+  spaceId: text("space_id"),
   parentId: text("parent_id"),
   title: text("title").notNull().default("Untitled"),
   content: text("content").notNull().default(""),
+  bodyRevision: integer("body_revision").notNull().default(0),
+  collabBodyRevision: integer("collab_body_revision"),
+  description: text("description").notNull().default(""),
   icon: text("icon"),
   position: integer("position").notNull().default(0),
   isFavorite: integer("is_favorite").notNull().default(0),
@@ -21,19 +29,223 @@ export const documents = table("documents", {
   sourcePath: text("source_path"),
   sourceRootPath: text("source_root_path"),
   sourceUpdatedAt: text("source_updated_at"),
+  creationRequestDigest: text("creation_request_digest"),
+  creationCreativeContext: text("creation_creative_context"),
+  trashedAt: text("trashed_at"),
+  trashRootId: text("trash_root_id"),
+  trashedBy: text("trashed_by"),
+  trashOrigin: text("trash_origin"),
+  trashParentId: text("trash_parent_id"),
+  createdBy: text("created_by"),
+  updatedBy: text("updated_by"),
   createdAt: text("created_at").notNull().default(now()),
   updatedAt: text("updated_at").notNull().default(now()),
   ...ownableColumns(),
 });
 
-export const documentVersions = table("document_versions", {
-  id: text("id").primaryKey(),
-  ownerEmail: text("owner_email").notNull().default("local@localhost"),
-  documentId: text("document_id").notNull(),
-  title: text("title").notNull(),
-  content: text("content").notNull(),
-  createdAt: text("created_at").notNull().default(now()),
-});
+export const privateIconReferences = table(
+  "content_private_icon_references",
+  {
+    elementType: text("element_type").notNull(),
+    elementId: text("element_id").notNull(),
+    assetId: text("asset_id").notNull(),
+    documentId: text("document_id").notNull(),
+    ownerEmail: text("owner_email").notNull(),
+    orgId: text("org_id"),
+    createdAt: text("created_at").notNull().default(now()),
+  },
+  (reference) => [
+    uniqueIndex("content_private_icon_reference_element_unique").on(
+      reference.elementType,
+      reference.elementId,
+    ),
+    index("content_private_icon_reference_asset_idx").on(reference.assetId),
+    index("content_private_icon_reference_document_idx").on(
+      reference.documentId,
+    ),
+  ],
+);
+
+export const contentSpaces = table(
+  "content_spaces",
+  {
+    id: text("id").primaryKey(),
+    name: text("name").notNull(),
+    kind: text("kind").notNull(),
+    ownerEmail: text("owner_email").notNull(),
+    orgId: text("org_id"),
+    filesDatabaseId: text("files_database_id").notNull(),
+    createdBy: text("created_by").notNull(),
+    archivedAt: text("archived_at"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (space) => [
+    uniqueIndex("content_spaces_files_database_unique").on(
+      space.filesDatabaseId,
+    ),
+    index("content_spaces_owner_org_idx").on(space.ownerEmail, space.orgId),
+    index("content_spaces_org_idx").on(space.orgId),
+  ],
+);
+
+export const contentSpaceCatalogItems = table(
+  "content_space_catalog_items",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull(),
+    catalogDatabaseId: text("catalog_database_id").notNull(),
+    databaseItemId: text("database_item_id").notNull(),
+    documentId: text("document_id").notNull(),
+    spaceId: text("space_id").notNull(),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (catalogItem) => [
+    uniqueIndex("content_space_catalog_items_catalog_space_unique").on(
+      catalogItem.catalogDatabaseId,
+      catalogItem.spaceId,
+    ),
+    uniqueIndex("content_space_catalog_items_catalog_item_unique").on(
+      catalogItem.catalogDatabaseId,
+      catalogItem.databaseItemId,
+    ),
+    index("content_space_catalog_items_owner_catalog_idx").on(
+      catalogItem.ownerEmail,
+      catalogItem.catalogDatabaseId,
+    ),
+    index("content_space_catalog_items_space_idx").on(catalogItem.spaceId),
+  ],
+);
+
+export const documentVersions = table(
+  "document_versions",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull().default("local@localhost"),
+    documentId: text("document_id").notNull(),
+    title: text("title").notNull(),
+    content: text("content").notNull(),
+    bodyRevision: integer("body_revision"),
+    chatContext: text("chat_context"),
+    actorEmail: text("actor_email"),
+    actorKind: text("actor_kind"),
+    origin: text("origin"),
+    groupKind: text("group_kind"),
+    groupId: text("group_id"),
+    operation: text("operation"),
+    checkpointKind: text("checkpoint_kind"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at"),
+  },
+  (version) => [
+    index("document_versions_owner_document_created_idx").on(
+      version.ownerEmail,
+      version.documentId,
+      version.createdAt,
+      version.id,
+    ),
+    index("document_versions_owner_document_group_idx").on(
+      version.ownerEmail,
+      version.documentId,
+      version.groupId,
+      version.createdAt,
+      version.id,
+    ),
+    index("document_versions_owner_document_body_revision_idx").on(
+      version.ownerEmail,
+      version.documentId,
+      version.bodyRevision,
+    ),
+  ],
+);
+
+/**
+ * Where an imported page came from. The original file stays in private blob
+ * storage for the page's lifetime so a better importer can re-run it. Undo
+ * compares the page's state with what the import wrote before trashing it, and
+ * a retried import must match the request that wrote these rows.
+ */
+export const documentImports = table(
+  "document_imports",
+  {
+    documentId: text("document_id").primaryKey(),
+    ownerEmail: text("owner_email").notNull(),
+    importId: text("import_id").notNull(),
+    requestSha256: text("request_sha256").notNull(),
+    sourceName: text("source_name").notNull(),
+    sourceFormat: text("source_format").notNull(),
+    sourceBytes: integer("source_bytes").notNull(),
+    sourceSha256: text("source_sha256").notNull(),
+    originalBlob: text("original_blob").notNull(),
+    importedTitle: text("imported_title").notNull(),
+    importedStateSha256: text("imported_state_sha256").notNull(),
+    reportJson: text("report_json").notNull(),
+    createdAt: text("created_at").notNull().default(now()),
+  },
+  (row) => [index("document_imports_import_idx").on(row.importId)],
+);
+
+export const documentPreviewDrafts = table(
+  "document_preview_drafts",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull(),
+    orgId: text("org_id").notNull().default(""),
+    documentId: text("document_id").notNull(),
+    title: text("title").notNull(),
+    content: text("content").notNull(),
+    baseDocumentUpdatedAt: text("base_document_updated_at"),
+    loadedContentWasEmpty: integer("loaded_content_was_empty")
+      .notNull()
+      .default(0),
+    deferredReason: text("deferred_reason"),
+    editorSessionId: text("editor_session_id"),
+    editGeneration: integer("edit_generation"),
+    version: integer("version").notNull().default(1),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (draft) => [
+    uniqueIndex("document_preview_drafts_owner_org_document_unique").on(
+      draft.ownerEmail,
+      draft.orgId,
+      draft.documentId,
+    ),
+    index("document_preview_drafts_owner_org_document_idx").on(
+      draft.ownerEmail,
+      draft.orgId,
+      draft.documentId,
+    ),
+  ],
+);
+
+export const documentPreviewDraftSettlements = table(
+  "document_preview_draft_settlements",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull(),
+    orgId: text("org_id").notNull().default(""),
+    documentId: text("document_id").notNull(),
+    editorSessionId: text("editor_session_id").notNull(),
+    settledGeneration: integer("settled_generation").notNull(),
+    discardedGeneration: integer("discarded_generation"),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (settlement) => [
+    uniqueIndex("document_preview_draft_settlements_scope_unique").on(
+      settlement.ownerEmail,
+      settlement.orgId,
+      settlement.documentId,
+      settlement.editorSessionId,
+    ),
+    index("document_preview_draft_settlements_document_idx").on(
+      settlement.ownerEmail,
+      settlement.orgId,
+      settlement.documentId,
+    ),
+  ],
+);
 
 export const documentComments = table("document_comments", {
   id: text("id").primaryKey(),
@@ -49,11 +261,131 @@ export const documentComments = table("document_comments", {
   mentionsJson: text("mentions_json"),
   authorEmail: text("author_email").notNull(),
   authorName: text("author_name"),
+  submissionSource: text("submission_source"),
+  submissionRunId: text("submission_run_id"),
+  actorKind: text("actor_kind"),
+  authorModel: text("author_model"),
   resolved: integer("resolved").notNull().default(0),
   createdAt: text("created_at").notNull().default(now()),
   updatedAt: text("updated_at").notNull().default(now()),
   notionCommentId: text("notion_comment_id"),
+  notionDiscussionId: text("notion_discussion_id"),
 });
+
+/**
+ * One person's emoji reaction on one Page comment. Access follows the
+ * comment's document; a person reacts with each emoji at most once.
+ */
+export const documentCommentReactions = table(
+  "document_comment_reactions",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull(),
+    documentId: text("document_id").notNull(),
+    commentId: text("comment_id").notNull(),
+    actorEmail: text("actor_email").notNull(),
+    reaction: text("reaction").notNull(),
+    createdAt: text("created_at").notNull().default(now()),
+  },
+  (reaction) => [
+    uniqueIndex("document_comment_reactions_actor_unique").on(
+      reaction.commentId,
+      reaction.actorEmail,
+      reaction.reaction,
+    ),
+    index("document_comment_reactions_document_idx").on(
+      reaction.ownerEmail,
+      reaction.documentId,
+    ),
+  ],
+);
+
+export const commentAiRequests = table(
+  "comment_ai_requests",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull(),
+    requesterEmail: text("requester_email").notNull(),
+    documentId: text("document_id").notNull(),
+    threadId: text("thread_id").notNull(),
+    rootCommentId: text("root_comment_id").notNull(),
+    fieldId: text("field_id").notNull(),
+    intent: text("intent").notNull(),
+    submittedMode: text("submitted_mode").notNull().default("reply"),
+    instructions: text("instructions").notNull().default(""),
+    submittedProvider: text("submitted_provider"),
+    submittedModel: text("submitted_model"),
+    submittedEngine: text("submitted_engine"),
+    classificationThreadId: text("classification_thread_id"),
+    classificationTurnId: text("classification_turn_id"),
+    continuationOfRequestId: text("continuation_of_request_id"),
+    status: text("status").notNull().default("queued"),
+    threadDigest: text("thread_digest").notNull(),
+    snapshotJson: text("snapshot_json").notNull(),
+    baseRevision: text("base_revision").notNull(),
+    suggestionRevision: text("suggestion_revision").notNull(),
+    runId: text("run_id"),
+    agentThreadId: text("agent_thread_id"),
+    agentTurnId: text("agent_turn_id"),
+    submittedThreadDigest: text("submitted_thread_digest"),
+    submittedSnapshotJson: text("submitted_snapshot_json"),
+    model: text("model"),
+    engine: text("engine"),
+    activeAttemptId: text("active_attempt_id"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    resultJson: text("result_json"),
+    payloadJson: text("payload_json"),
+    errorCode: text("error_code"),
+    error: text("error"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (request) => [
+    uniqueIndex("comment_ai_requests_active_thread_idx")
+      .on(request.documentId, request.threadId, request.requesterEmail)
+      .where(
+        sql`${request.status} IN ('classifying', 'classified', 'queued', 'running')`,
+      ),
+    uniqueIndex("comment_ai_requests_active_comment_idx")
+      .on(request.documentId, request.rootCommentId)
+      .where(
+        sql`${request.status} IN ('classifying', 'classified', 'queued', 'running', 'refreshing')`,
+      ),
+    index("comment_ai_requests_document_requester_idx").on(
+      request.documentId,
+      request.requesterEmail,
+    ),
+  ],
+);
+
+export const commentAiAttempts = table(
+  "comment_ai_attempts",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull(),
+    requestId: text("request_id").notNull(),
+    attemptNumber: integer("attempt_number").notNull(),
+    status: text("status").notNull().default("reasoning"),
+    sourceRevision: text("source_revision").notNull(),
+    suggestionRevision: text("suggestion_revision").notNull(),
+    threadDigest: text("thread_digest").notNull(),
+    snapshotJson: text("snapshot_json").notNull(),
+    payloadJson: text("payload_json"),
+    runId: text("run_id"),
+    model: text("model"),
+    errorCode: text("error_code"),
+    error: text("error"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (attempt) => [
+    uniqueIndex("comment_ai_attempts_request_number_unique").on(
+      attempt.requestId,
+      attempt.attemptNumber,
+    ),
+    index("comment_ai_attempts_request_idx").on(attempt.requestId),
+  ],
+);
 
 export const documentSyncLinks = table("document_sync_links", {
   documentId: text("document_id").primaryKey(),
@@ -65,15 +397,32 @@ export const documentSyncLinks = table("document_sync_links", {
   lastPulledRemoteUpdatedAt: text("last_pulled_remote_updated_at"),
   lastPushedLocalUpdatedAt: text("last_pushed_local_updated_at"),
   lastKnownRemoteUpdatedAt: text("last_known_remote_updated_at"),
-  // Hash of the canonical content that is currently identical on both sides.
-  // Content-based change detection is immune to timestamp jitter and the
-  // normalization mismatches that previously caused no-op syncs to look like
-  // real edits (the root of the bidirectional drift).
   lastSyncedContentHash: text("last_synced_content_hash"),
   lastError: text("last_error"),
   warningsJson: text("warnings_json"),
   hasConflict: integer("has_conflict").notNull().default(0),
   syncComments: integer("sync_comments").notNull().default(0),
+  // Best-effort cross-instance claim: set to "now" (ISO) by pull/push right
+  // before making Notion API calls, cleared afterward. A conditional UPDATE
+  // (claim only succeeds if unset or stale) keeps two concurrent syncs for
+  // the same document — different tabs, different serverless instances —
+  // from racing Notion mutations against each other and corrupting the
+  // stored baseline. Best-effort because it does not serialize writes from
+  // hosts that skip the claim (e.g. legacy in-flight calls); it narrows the
+  // race window rather than eliminating it outright.
+  syncClaimedAt: text("sync_claimed_at"),
+  createdAt: text("created_at").notNull().default(now()),
+  updatedAt: text("updated_at").notNull().default(now()),
+});
+
+export const builderDocSidecars = table("builder_doc_sidecars", {
+  id: text("id").primaryKey(),
+  ownerEmail: text("owner_email").notNull().default("local@localhost"),
+  orgId: text("org_id"),
+  documentId: text("document_id").notNull(),
+  path: text("path").notNull(),
+  content: text("content").notNull(),
+  contentHash: text("content_hash").notNull(),
   createdAt: text("created_at").notNull().default(now()),
   updatedAt: text("updated_at").notNull().default(now()),
 });
@@ -85,37 +434,226 @@ export const documentPropertyDefinitions = table(
     ownerEmail: text("owner_email").notNull().default("local@localhost"),
     orgId: text("org_id"),
     databaseId: text("database_id"),
+    systemRole: text("system_role"),
     name: text("name").notNull(),
     type: text("type").notNull(),
+    description: text("description").notNull().default(""),
+    icon: text("icon"),
     visibility: text("visibility").notNull().default("always_show"),
     optionsJson: text("options_json").notNull().default("{}"),
     position: integer("position").notNull().default(0),
     createdAt: text("created_at").notNull().default(now()),
     updatedAt: text("updated_at").notNull().default(now()),
   },
+  (property) => [
+    uniqueIndex("document_property_definitions_database_system_role_unique").on(
+      property.databaseId,
+      property.systemRole,
+    ),
+  ],
 );
 
-export const contentDatabases = table("content_databases", {
-  id: text("id").primaryKey(),
-  ownerEmail: text("owner_email").notNull().default("local@localhost"),
-  orgId: text("org_id"),
-  documentId: text("document_id").notNull(),
-  title: text("title").notNull().default("Untitled database"),
-  viewConfigJson: text("view_config_json").notNull().default("{}"),
-  createdAt: text("created_at").notNull().default(now()),
-  updatedAt: text("updated_at").notNull().default(now()),
-});
+export const contentDatabases = table(
+  "content_databases",
+  {
+    id: text("id").primaryKey(),
+    spaceId: text("space_id"),
+    ownerEmail: text("owner_email").notNull().default("local@localhost"),
+    orgId: text("org_id"),
+    documentId: text("document_id").notNull(),
+    ownerDocumentId: text("owner_document_id"),
+    ownerBlockId: text("owner_block_id"),
+    title: text("title").notNull().default("Untitled database"),
+    systemRole: text("system_role"),
+    naturalKeyPropertyId: text("natural_key_property_id"),
+    viewConfigJson: text("view_config_json").notNull().default("{}"),
+    filesSystemPropertiesSeeded: integer("files_system_properties_seeded")
+      .notNull()
+      .default(0),
+    // Single source of truth for the primary "Content" Blocks field — the one
+    // backed by `documents.content`. A DB-enforced single-primary invariant: at
+    // most one property id lives here, so two concurrent seeds can never produce
+    // two aliasing primaries. NULL means there is currently no primary Blocks
+    // field (never seeded, or the primary was intentionally deleted).
+    primaryBlocksPropertyId: text("primary_blocks_property_id"),
+    blocksSeeded: integer("blocks_seeded").notNull().default(0),
+    deletedAt: text("deleted_at"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (database) => [
+    uniqueIndex("content_databases_space_system_role_unique").on(
+      database.spaceId,
+      database.systemRole,
+    ),
+    index("content_databases_document_idx").on(database.documentId),
+  ],
+);
 
-export const contentDatabaseItems = table("content_database_items", {
-  id: text("id").primaryKey(),
-  ownerEmail: text("owner_email").notNull().default("local@localhost"),
-  orgId: text("org_id"),
-  databaseId: text("database_id").notNull(),
-  documentId: text("document_id").notNull(),
-  position: integer("position").notNull().default(0),
-  createdAt: text("created_at").notNull().default(now()),
-  updatedAt: text("updated_at").notNull().default(now()),
-});
+export const contentDatabaseItems = table(
+  "content_database_items",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull().default("local@localhost"),
+    orgId: text("org_id"),
+    databaseId: text("database_id").notNull(),
+    documentId: text("document_id").notNull(),
+    position: integer("position").notNull().default(0),
+    bodyHydrationStatus: text("body_hydration_status")
+      .notNull()
+      .default("hydrated"),
+    bodyHydrationAttemptedAt: text("body_hydration_attempted_at"),
+    bodyHydrationError: text("body_hydration_error"),
+    bodyHydrationVersion: text("body_hydration_version"),
+    bodyHydrationReason: text("body_hydration_reason"),
+    bodyHydrationProviderStatus: text("body_hydration_provider_status"),
+    bodyHydrationAttemptCount: integer("body_hydration_attempt_count")
+      .notNull()
+      .default(0),
+    bodyHydrationRetryable: integer("body_hydration_retryable"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (item) => [
+    uniqueIndex("content_database_items_database_document_unique").on(
+      item.databaseId,
+      item.documentId,
+    ),
+  ],
+);
+
+export const contentDatabaseItemKeyClaims = table(
+  "content_database_item_key_claims",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull().default("local@localhost"),
+    orgId: text("org_id"),
+    databaseId: text("database_id").notNull(),
+    propertyId: text("property_id").notNull(),
+    keyValueJson: text("key_value_json").notNull(),
+    itemId: text("item_id").notNull(),
+    documentId: text("document_id").notNull(),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (claim) => [
+    uniqueIndex(
+      "content_database_item_key_claims_database_property_value_unique",
+    ).on(claim.databaseId, claim.propertyId, claim.keyValueJson),
+    uniqueIndex(
+      "content_database_item_key_claims_database_property_document_unique",
+    ).on(claim.databaseId, claim.propertyId, claim.documentId),
+  ],
+);
+
+export const contentDatabaseBodyHydrationQueue = table(
+  "content_database_body_hydration_queue",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull().default("local@localhost"),
+    orgId: text("org_id"),
+    sourceId: text("source_id").notNull(),
+    databaseItemId: text("database_item_id").notNull(),
+    documentId: text("document_id").notNull(),
+    sourceRowId: text("source_row_id").notNull(),
+    sourceTable: text("source_table").notNull(),
+    sourceEntryJson: text("source_entry_json").notNull().default("{}"),
+    priority: integer("priority").notNull().default(10),
+    attempts: integer("attempts").notNull().default(0),
+    lastAttemptedAt: text("last_attempted_at"),
+    lastError: text("last_error"),
+    nextAttemptAt: text("next_attempt_at"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+);
+
+export const contentTrashPurgePlans = table(
+  "content_trash_purge_plans",
+  {
+    id: text("id").primaryKey(),
+    actorEmail: text("actor_email").notNull(),
+    orgId: text("org_id"),
+    mode: text("mode").notNull(),
+    spaceId: text("space_id"),
+    filtersJson: text("filters_json").notNull().default("{}"),
+    state: text("state").notNull().default("ready"),
+    scopeTokenHash: text("scope_token_hash").notNull(),
+    eligibleCount: integer("eligible_count").notNull().default(0),
+    blockedCount: integer("blocked_count").notNull().default(0),
+    expiresAt: text("expires_at").notNull(),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (plan) => [index("content_trash_purge_plans_actor_idx").on(plan.actorEmail)],
+);
+
+export const contentTrashPurgePlanItems = table(
+  "content_trash_purge_plan_items",
+  {
+    id: text("id").primaryKey(),
+    planId: text("plan_id").notNull(),
+    unitId: text("unit_id").notNull(),
+    rootDocumentId: text("root_document_id").notNull(),
+    documentId: text("document_id").notNull(),
+    ownerEmail: text("owner_email").notNull(),
+    title: text("title").notNull(),
+    spaceId: text("space_id"),
+    expectedTrashedAt: text("expected_trashed_at").notNull(),
+    expectedParentId: text("expected_parent_id"),
+    expectedScopeFingerprint: text("expected_scope_fingerprint").notNull(),
+    ancestorUnitIdsJson: text("ancestor_unit_ids_json").notNull().default("[]"),
+    survivorEffect: text("survivor_effect"),
+    eligibility: text("eligibility").notNull(),
+    blocker: text("blocker"),
+    outcome: text("outcome").notNull().default("pending"),
+    outcomeDetail: text("outcome_detail"),
+    completedAt: text("completed_at"),
+    createdAt: text("created_at").notNull().default(now()),
+  },
+  (item) => [
+    uniqueIndex("content_trash_purge_plan_items_plan_document_unique").on(
+      item.planId,
+      item.documentId,
+    ),
+    index("content_trash_purge_plan_items_plan_unit_idx").on(
+      item.planId,
+      item.unitId,
+    ),
+  ],
+);
+
+export const contentTrashPurgeOperations = table(
+  "content_trash_purge_operations",
+  {
+    id: text("id").primaryKey(),
+    planId: text("plan_id").notNull(),
+    actorEmail: text("actor_email").notNull(),
+    orgId: text("org_id"),
+    idempotencyKey: text("idempotency_key").notNull(),
+    status: text("status").notNull().default("queued"),
+    eligibleCount: integer("eligible_count").notNull().default(0),
+    deletedCount: integer("deleted_count").notNull().default(0),
+    blockedCount: integer("blocked_count").notNull().default(0),
+    conflictedCount: integer("conflicted_count").notNull().default(0),
+    leaseToken: text("lease_token"),
+    leaseExpiresAt: text("lease_expires_at"),
+    lastError: text("last_error"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+    completedAt: text("completed_at"),
+  },
+  (operation) => [
+    uniqueIndex("content_trash_purge_operations_actor_key_unique").on(
+      operation.actorEmail,
+      operation.idempotencyKey,
+    ),
+    uniqueIndex("content_trash_purge_operations_plan_unique").on(
+      operation.planId,
+    ),
+    index("content_trash_purge_operations_plan_idx").on(operation.planId),
+  ],
+);
 
 export const contentDatabaseSources = table("content_database_sources", {
   id: text("id").primaryKey(),
@@ -227,10 +765,205 @@ export const contentDatabaseSourceExecutions = table(
     idempotencyKey: text("idempotency_key").notNull(),
     summary: text("summary").notNull(),
     payloadJson: text("payload_json").notNull().default("{}"),
+    attemptToken: text("attempt_token"),
     lastError: text("last_error"),
     createdAt: text("created_at").notNull().default(now()),
     updatedAt: text("updated_at").notNull().default(now()),
   },
+);
+
+export const contentDatabaseSourceExecutionClaims = table(
+  "content_database_source_execution_claims",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull().default("local@localhost"),
+    sourceId: text("source_id").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    executionId: text("execution_id").notNull(),
+    createdAt: text("created_at").notNull().default(now()),
+  },
+);
+
+export const contentDatabaseMigrationReceipts = table(
+  "content_database_migration_receipts",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull().default("local@localhost"),
+    orgId: text("org_id"),
+    databaseId: text("database_id").notNull(),
+    databaseDocumentId: text("database_document_id").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    planHash: text("plan_hash").notNull(),
+    state: text("state").notNull(),
+    preDigest: text("pre_digest").notNull(),
+    postDigest: text("post_digest").notNull(),
+    rollbackJson: text("rollback_json").notNull().default("{}"),
+    resultJson: text("result_json").notNull().default("{}"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (receipt) => [
+    uniqueIndex("content_database_migration_receipts_database_key_unique").on(
+      receipt.databaseId,
+      receipt.idempotencyKey,
+    ),
+    index("content_database_migration_receipts_owner_database_idx").on(
+      receipt.ownerEmail,
+      receipt.databaseId,
+    ),
+  ],
+);
+
+export const contentDatabaseRowMutationReceipts = table(
+  "content_database_row_mutation_receipts",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull().default("local@localhost"),
+    orgId: text("org_id"),
+    spaceId: text("space_id").notNull(),
+    databaseId: text("database_id").notNull(),
+    databaseDocumentId: text("database_document_id").notNull(),
+    operation: text("operation").notNull(),
+    itemId: text("item_id").notNull(),
+    documentId: text("document_id").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    payloadDigest: text("payload_digest").notNull(),
+    schemaRevision: text("schema_revision").notNull(),
+    preRowRevision: text("pre_row_revision"),
+    postRowRevision: text("post_row_revision").notNull(),
+    resultJson: text("result_json").notNull().default("{}"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (receipt) => [
+    uniqueIndex(
+      "content_database_row_mutation_receipts_database_key_unique",
+    ).on(receipt.databaseId, receipt.idempotencyKey),
+    index("content_database_row_mutation_receipts_owner_database_idx").on(
+      receipt.ownerEmail,
+      receipt.databaseId,
+    ),
+    index("content_database_row_mutation_receipts_document_idx").on(
+      receipt.documentId,
+    ),
+  ],
+);
+
+export const contentDatabaseSetupReceipts = table(
+  "content_database_setup_receipts",
+  {
+    id: text("id").primaryKey(),
+    actorEmail: text("actor_email").notNull(),
+    operation: text("operation").notNull(),
+    scopeId: text("scope_id").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    payloadDigest: text("payload_digest").notNull(),
+    databaseId: text("database_id"),
+    resultJson: text("result_json"),
+    createdAt: text("created_at").notNull().default(now()),
+  },
+  (receipt) => [
+    uniqueIndex("content_database_setup_receipts_actor_operation_key").on(
+      receipt.actorEmail,
+      receipt.operation,
+      receipt.scopeId,
+      receipt.idempotencyKey,
+    ),
+  ],
+);
+
+export const documentEditReceipts = table(
+  "document_edit_receipts",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull().default("local@localhost"),
+    orgId: text("org_id"),
+    documentId: text("document_id").notNull(),
+    callerScope: text("caller_scope").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    payloadDigest: text("payload_digest").notNull(),
+    baseRevision: integer("base_revision").notNull(),
+    resultRevision: integer("result_revision").notNull(),
+    beforeHash: text("before_hash").notNull(),
+    afterHash: text("after_hash").notNull(),
+    rangesJson: text("ranges_json").notNull().default("[]"),
+    actorJson: text("actor_json").notNull().default("{}"),
+    resultJson: text("result_json").notNull().default("{}"),
+    createdAt: text("created_at").notNull().default(now()),
+  },
+  (receipt) => [
+    uniqueIndex("document_edit_receipts_document_scope_key_unique").on(
+      receipt.documentId,
+      receipt.callerScope,
+      receipt.idempotencyKey,
+    ),
+    index("document_edit_receipts_owner_document_idx").on(
+      receipt.ownerEmail,
+      receipt.documentId,
+    ),
+  ],
+);
+
+export const documentBrowserSaveAttempts = table(
+  "document_browser_save_attempts",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull(),
+    orgId: text("org_id").notNull().default(""),
+    documentId: text("document_id").notNull(),
+    actorEmail: text("actor_email").notNull(),
+    attemptId: text("attempt_id").notNull(),
+    payloadDigest: text("payload_digest").notNull(),
+    resultJson: text("result_json").notNull(),
+    createdAt: text("created_at").notNull().default(now()),
+  },
+  (attempt) => [
+    uniqueIndex("document_browser_save_attempts_scope_unique").on(
+      attempt.documentId,
+      attempt.actorEmail,
+      attempt.orgId,
+      attempt.attemptId,
+    ),
+    index("document_browser_save_attempts_owner_document_idx").on(
+      attempt.ownerEmail,
+      attempt.documentId,
+    ),
+  ],
+);
+
+export const documentBodyIntents = table(
+  "document_body_intents",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull(),
+    orgId: text("org_id").notNull().default(""),
+    documentId: text("document_id").notNull(),
+    writerId: text("writer_id").notNull(),
+    operationId: text("operation_id").notNull(),
+    candidateHash: text("candidate_hash"),
+    metadataHash: text("metadata_hash"),
+    generation: integer("generation"),
+    authoredBaseRevision: integer("authored_base_revision").notNull(),
+    committedRevision: integer("committed_revision").notNull(),
+    displacedCheckpointId: text("displaced_checkpoint_id"),
+    affectedBlockIndexesJson: text("affected_block_indexes_json")
+      .notNull()
+      .default("[]"),
+    canonicalChanged: boolean("canonical_changed").notNull().default(false),
+    createdAt: text("created_at").notNull().default(now()),
+  },
+  (intent) => [
+    uniqueIndex("document_body_intents_document_writer_operation_unique").on(
+      intent.documentId,
+      intent.writerId,
+      intent.operationId,
+    ),
+    index("document_body_intents_owner_document_revision_idx").on(
+      intent.ownerEmail,
+      intent.documentId,
+      intent.committedRevision,
+    ),
+  ],
 );
 
 export const documentPropertyValues = table("document_property_values", {
@@ -242,5 +975,71 @@ export const documentPropertyValues = table("document_property_values", {
   createdAt: text("created_at").notNull().default(now()),
   updatedAt: text("updated_at").notNull().default(now()),
 });
+
+export const documentBlockFieldContents = table(
+  "document_block_field_contents",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull().default("local@localhost"),
+    documentId: text("document_id").notNull(),
+    propertyId: text("property_id").notNull(),
+    content: text("content").notNull().default(""),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+);
+
+export const documentBlockFields = table(
+  "document_block_fields",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull().default("local@localhost"),
+    documentId: text("document_id").notNull(),
+    propertyId: text("property_id").notNull(),
+    revision: integer("revision").notNull().default(0),
+    contentHash: text("content_hash").notNull(),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (field) => [
+    uniqueIndex("document_block_fields_document_property_unique").on(
+      field.documentId,
+      field.propertyId,
+    ),
+    index("document_block_fields_owner_document_idx").on(
+      field.ownerEmail,
+      field.documentId,
+    ),
+  ],
+);
+
+export const documentBlocks = table(
+  "document_blocks",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull().default("local@localhost"),
+    fieldId: text("field_id").notNull(),
+    parentId: text("parent_id"),
+    kind: text("kind").notNull(),
+    position: integer("position").notNull(),
+    sortIndex: integer("sort_index").notNull(),
+    addressable: boolean("addressable").notNull().default(true),
+    contentHash: text("content_hash").notNull(),
+    markdown: text("markdown").notNull().default(""),
+    state: text("state").notNull().default("live"),
+    deletedAtRevision: integer("deleted_at_revision"),
+    recoveredAtRevision: integer("recovered_at_revision"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (block) => [
+    index("document_blocks_field_state_sort_idx").on(
+      block.fieldId,
+      block.state,
+      block.sortIndex,
+    ),
+    index("document_blocks_parent_idx").on(block.parentId),
+  ],
+);
 
 export const documentShares = createSharesTable("document_shares");

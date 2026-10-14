@@ -1,8 +1,5 @@
-/**
- * Serve an uploaded media file by id (brand logos, etc.).
- *
- * GET /api/media/:id
- */
+import fs from "node:fs";
+import path from "node:path";
 
 import {
   defineEventHandler,
@@ -11,8 +8,6 @@ import {
   setResponseStatus,
   type H3Event,
 } from "h3";
-import fs from "node:fs";
-import path from "node:path";
 
 const UPLOADS_DIR = path.resolve("data/uploads");
 

@@ -1,4 +1,3 @@
-import type { MetaDescriptor } from "react-router";
 import {
   AGENT_NATIVE_DEFAULT_SOCIAL_IMAGE,
   AGENT_NATIVE_SOCIAL_IMAGE_PATH,
@@ -6,6 +5,7 @@ import {
   withAgentNativeSocialImageCacheBuster,
   withDefaultSocialImage as coreWithDefaultSocialImage,
 } from "@agent-native/core/shared";
+import type { MetaDescriptor } from "react-router";
 
 const SITE_URL = "https://www.agent-native.com";
 const DOCS_SOCIAL_IMAGE_ACCENT = "Agent-Native Docs";
@@ -31,11 +31,48 @@ export function defaultSocialImageMeta(): MetaDescriptor[] {
   return coreDefaultSocialImageMeta() as MetaDescriptor[];
 }
 
+function hasMetaProperty(meta: MetaDescriptor[], property: string): boolean {
+  return meta.some((item) => "property" in item && item.property === property);
+}
+
+function titleFrom(meta: MetaDescriptor[]): string | undefined {
+  const entry = meta.find((item) => "title" in item);
+  return entry && "title" in entry ? (entry.title as string) : undefined;
+}
+
+function descriptionFrom(meta: MetaDescriptor[]): string | undefined {
+  const entry = meta.find(
+    (item) => "name" in item && item.name === "description",
+  );
+  return entry && "content" in entry ? (entry.content as string) : undefined;
+}
+
 export function withDefaultSocialImage(
   meta: MetaDescriptor[],
   image = DEFAULT_SOCIAL_IMAGE,
 ): MetaDescriptor[] {
-  return coreWithDefaultSocialImage(meta as any, image) as MetaDescriptor[];
+  const withOgText: MetaDescriptor[] = [...meta];
+
+  if (!hasMetaProperty(meta, "og:title")) {
+    const title = titleFrom(meta);
+    if (title) withOgText.push({ property: "og:title", content: title });
+  }
+
+  if (!hasMetaProperty(meta, "og:description")) {
+    const description = descriptionFrom(meta);
+    if (description) {
+      withOgText.push({ property: "og:description", content: description });
+    }
+  }
+
+  if (!hasMetaProperty(meta, "og:type")) {
+    withOgText.push({ property: "og:type", content: "website" });
+  }
+
+  return coreWithDefaultSocialImage(
+    withOgText as any,
+    image,
+  ) as MetaDescriptor[];
 }
 
 export function withTemplateSocialImage(

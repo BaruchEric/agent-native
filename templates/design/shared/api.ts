@@ -1,26 +1,41 @@
-/**
- * Shared types between client and server for the design template.
- */
-
 export const API_BASE = "/api";
 
-// --- Design Systems / Brand Kits ---
-
-// The shared, template-agnostic token model lives in
-// `@agent-native/core/brand-kit` (a "Brand Kit" = design tokens + brand assets
-// + custom instructions). This template narrows it with the page-oriented
-// `spacing.pagePadding` and `defaults` keys it persists.
 import type {
   BrandKitData,
   BrandKitDefaults,
 } from "@agent-native/core/brand-kit";
 
+export type {
+  DesignBridgeCapability,
+  DesignBridgeOperation,
+  DesignBridgeOperationStatus,
+  DesignBridgeRequest,
+  DesignBridgeResponse,
+  DesignSourceDescriptor,
+  DesignSourceType,
+  FlowCanvasArtboard,
+  FlowCanvasEdge,
+  FlowCanvasSnapshotRef,
+  FusionDesignSource,
+  InlineDesignSource,
+  LocalhostDesignConnectionConfig,
+  LocalhostDesignRoute,
+  LocalhostDesignRouteManifest,
+  LocalhostDesignSource,
+} from "./source-mode";
+export {
+  DESIGN_BRIDGE_OPERATIONS,
+  DESIGN_SOURCE_TYPES,
+  isDesignSourceType,
+  makeLocalhostRouteId,
+  normalizeDesignSourceType,
+  titleFromRoutePath,
+} from "./source-mode";
+
 export interface DesignSystemData extends BrandKitData {
   spacing: { pagePadding: string; elementGap: string };
   defaults: BrandKitDefaults;
 }
-
-// --- Design Projects ---
 
 export interface DesignProject {
   id: string;
@@ -42,8 +57,6 @@ export interface DesignFile {
   fileType: "html" | "css" | "jsx" | "asset";
 }
 
-// --- Tweaks ---
-
 export interface TweakDefinition {
   id: string;
   label: string;
@@ -54,9 +67,8 @@ export interface TweakDefinition {
   step?: number;
   defaultValue: string | number | boolean;
   cssVar?: string;
+  unit?: string;
 }
-
-// --- Question Flow ---
 
 export interface QuestionFlowQuestion {
   id: string;

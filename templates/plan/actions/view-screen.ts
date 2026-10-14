@@ -1,17 +1,9 @@
-/**
- * See what the user is currently looking at on screen.
- *
- * Reads and returns the current navigation state from application state.
- *
- * Usage:
- *   pnpm action view-screen
- */
-
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { readAppState } from "@agent-native/core/application-state";
 import { accessFilter, currentAccess } from "@agent-native/core/sharing";
 import { and, desc, isNull } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
 import {
   isLocalPlanRuntime,
@@ -34,6 +26,11 @@ export default defineAction({
     const screen: Record<string, unknown> = {};
     if (navigation) screen.navigation = navigation;
     if (localCodebase) screen.localCodebase = localCodebase;
+    screen.brandingCustomization = {
+      surface: "sidebar brand header",
+      workflow:
+        "The Customize branding popover sends a source-code request. In local Code mode it routes to the local code agent; on hosted/live surfaces it should guide the user to Desktop or Builder for source edits.",
+    };
     const nav = navigation as {
       planId?: string;
       localPlanSlug?: string;
@@ -131,8 +128,6 @@ export default defineAction({
 
     if (!nav?.planId || nav.view === "plans" || nav.view === "chat") {
       try {
-        // Only the summary columns — never the large html/markdown/content
-        // blobs — so the agent's screen context stays lean.
         const rows = await getDb()
           .select({
             id: schema.plans.id,
@@ -146,6 +141,8 @@ export default defineAction({
             hostedPlanId: schema.plans.hostedPlanId,
             hostedPlanUrl: schema.plans.hostedPlanUrl,
             sourceUrl: schema.plans.sourceUrl,
+            sourceAuthorName: schema.plans.sourceAuthorName,
+            sourceAuthorLogin: schema.plans.sourceAuthorLogin,
             createdAt: schema.plans.createdAt,
             updatedAt: schema.plans.updatedAt,
             approvedAt: schema.plans.approvedAt,

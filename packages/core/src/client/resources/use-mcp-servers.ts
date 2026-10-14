@@ -1,15 +1,16 @@
-/**
- * React-query hooks for remote MCP servers surfaced inside the Workspace
- * tab as a virtual `mcp-servers/` folder.
- *
- * MCP servers live in the settings store (user- and org-scope), not the
- * resources table. These hooks wrap the existing `/_agent-native/mcp/servers`
- * endpoints so the Workspace UI can list, create, and delete them with the
- * same keys/invalidations the old Settings panel used.
- */
-
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  createContext,
+  createElement,
+  useContext,
+  useEffect,
+  type ReactNode,
+} from "react";
+
 import { agentNativePath } from "../api-path.js";
+import { useAfterPaint } from "../use-after-paint.js";
+import { hasPendingMcpConnection } from "./mcp-connection-refresh.js";
+import { addMcpConnectionCompleteListener } from "./mcp-connection-resume.js";
 
 export type McpServerScope = "user" | "org";
 
@@ -19,7 +20,9 @@ export interface McpServer {
   name: string;
   url: string;
   headers?: Record<string, { set: true }>;
+  authMode: "none" | "headers" | "oauth";
   description?: string;
+  firstParty?: boolean;
   createdAt: number;
   mergedId: string;
   status:
@@ -35,18 +38,180 @@ export interface McpServersList {
   role: string | null;
 }
 
-const ENDPOINT = agentNativePath("/_agent-native/mcp/servers");
+function mcpServersEndpoint(): string {
+  return agentNativePath("/_agent-native/mcp/servers");
+}
+
 const LIST_KEY = ["mcp-servers"] as const;
 
-export function useMcpServers() {
+export interface McpServersApi {
+  list: () => Promise<McpServersList>;
+  create: (args: CreateMcpServerArgs) => Promise<McpServer>;
+  delete: (args: { id: string; scope: McpServerScope }) => Promise<void>;
+  reconnect: (args: ReconnectMcpServerArgs) => Promise<void>;
+  test: (
+    url: string,
+    headers?: Record<string, string>,
+  ) => Promise<TestMcpUrlResult>;
+  testExisting: (args: {
+    id: string;
+    scope: McpServerScope;
+  }) => Promise<TestMcpUrlResult>;
+}
+
+const McpServersApiContext = createContext<McpServersApi | null>(null);
+
+export function McpServersApiProvider({
+  api,
+  children,
+}: {
+  api: McpServersApi;
+  children: ReactNode;
+}) {
+  return createElement(McpServersApiContext.Provider, { value: api }, children);
+}
+
+export function useMcpServersApi(): McpServersApi {
+  return useContext(McpServersApiContext) ?? defaultMcpServersApi;
+}
+
+async function listMcpServers(): Promise<McpServersList> {
+  const res = await fetch(mcpServersEndpoint(), { credentials: "include" });
+  if (!res.ok) throw new Error(`Failed to load (${res.status})`);
+  return (await res.json()) as McpServersList;
+}
+
+async function createMcpServer(args: CreateMcpServerArgs): Promise<McpServer> {
+  const res = await fetch(mcpServersEndpoint(), {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(args),
+  });
+  const body = (await res.json().catch((error: unknown) => {
+    throw new Error("MCP create returned invalid JSON.", { cause: error });
+  })) as {
+    ok?: boolean;
+    error?: string;
+    server?: McpServer;
+  };
+  if (!res.ok || !body.ok) {
+    throw new Error(body.error || `Create failed (${res.status})`);
+  }
+  return body.server!;
+}
+
+async function deleteMcpServer(args: {
+  id: string;
+  scope: McpServerScope;
+}): Promise<void> {
+  const res = await fetch(
+    `${mcpServersEndpoint()}/${encodeURIComponent(args.id)}?scope=${args.scope}`,
+    {
+      method: "DELETE",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+    },
+  );
+  const body = (await res.json().catch((error: unknown) => {
+    throw new Error("MCP delete returned invalid JSON.", { cause: error });
+  })) as {
+    ok?: boolean;
+    error?: string;
+  };
+  if (!res.ok || !body.ok) {
+    throw new Error(body.error || `Delete failed (${res.status})`);
+  }
+}
+
+async function reconnectMcpServer(args: ReconnectMcpServerArgs): Promise<void> {
+  const res = await fetch(reconnectMcpServerUrl(args), {
+    method: "POST",
+    credentials: "include",
+  });
+  const body = await readMcpMutationBody(res);
+  const error =
+    typeof body?.error === "string" && body.error.trim()
+      ? body.error.trim()
+      : undefined;
+  if (!res.ok || body?.ok !== true) {
+    throw new Error(error || `Reconnect failed (${res.status})`);
+  }
+}
+
+async function testExistingMcpServer(args: {
+  id: string;
+  scope: McpServerScope;
+}): Promise<TestMcpUrlResult> {
+  const res = await fetch(
+    agentNativePath(
+      `/_agent-native/mcp/servers/${encodeURIComponent(args.id)}/test?scope=${args.scope}`,
+    ),
+    {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+    },
+  );
+  const body = (await res.json().catch((error: unknown) => {
+    throw new Error("MCP test returned invalid JSON.", { cause: error });
+  })) as TestMcpUrlResult;
+  return res.ok ? body : { ok: false, error: body.error };
+}
+
+const defaultMcpServersApi: McpServersApi = {
+  list: listMcpServers,
+  create: createMcpServer,
+  delete: deleteMcpServer,
+  reconnect: reconnectMcpServer,
+  test: testMcpServerUrl,
+  testExisting: testExistingMcpServer,
+};
+
+export interface UseMcpServersOptions {
+  defer?: boolean;
+}
+
+export type McpServersQuery = ReturnType<typeof useMcpServers>;
+
+/**
+ * True until a list read has settled (success or error). Deferred call sites
+ * must treat this as pending: hold empty states, permission derivation, and
+ * connect affordances until it clears instead of reading the undefined data
+ * as "no servers".
+ */
+export function isMcpServersPending(query: McpServersQuery): boolean {
+  return !query.isSuccess && !query.isError;
+}
+
+export function useMcpServers(options: UseMcpServersOptions = {}) {
+  const api = useMcpServersApi();
+  const defer = options.defer === true;
+  const afterPaint = useAfterPaint();
+  const qc = useQueryClient();
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const revalidate = () => {
+      if (!hasPendingMcpConnection()) return;
+      void qc.invalidateQueries({ queryKey: LIST_KEY });
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") revalidate();
+    };
+    window.addEventListener("focus", revalidate);
+    document.addEventListener("visibilitychange", onVisibility);
+    const removeCompleteListener = addMcpConnectionCompleteListener(revalidate);
+    return () => {
+      window.removeEventListener("focus", revalidate);
+      document.removeEventListener("visibilitychange", onVisibility);
+      removeCompleteListener();
+    };
+  }, [qc]);
   return useQuery<McpServersList>({
     queryKey: LIST_KEY,
-    queryFn: async () => {
-      const res = await fetch(ENDPOINT, { credentials: "include" });
-      if (!res.ok) throw new Error(`Failed to load (${res.status})`);
-      return (await res.json()) as McpServersList;
-    },
+    queryFn: api.list,
     staleTime: 10_000,
+    enabled: defer ? afterPaint : true,
   });
 }
 
@@ -60,48 +225,52 @@ export interface CreateMcpServerArgs {
 
 export function useCreateMcpServer() {
   const qc = useQueryClient();
+  const api = useMcpServersApi();
   return useMutation({
-    mutationFn: async (args: CreateMcpServerArgs) => {
-      const res = await fetch(ENDPOINT, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(args),
-      });
-      const body = (await res.json().catch(() => ({}))) as {
-        ok?: boolean;
-        error?: string;
-        server?: McpServer;
-      };
-      if (!res.ok || !body.ok) {
-        throw new Error(body.error || `Create failed (${res.status})`);
-      }
-      return body.server!;
-    },
+    mutationFn: api.create,
     onSuccess: () => qc.invalidateQueries({ queryKey: LIST_KEY }),
   });
 }
 
+export interface ReconnectMcpServerArgs {
+  id: string;
+  scope: McpServerScope;
+}
+
 export function useDeleteMcpServer() {
   const qc = useQueryClient();
+  const api = useMcpServersApi();
   return useMutation({
-    mutationFn: async (args: { id: string; scope: McpServerScope }) => {
-      const res = await fetch(
-        `${ENDPOINT}/${encodeURIComponent(args.id)}?scope=${args.scope}`,
-        {
-          method: "DELETE",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-        },
-      );
-      const body = (await res.json().catch(() => ({}))) as {
-        ok?: boolean;
-        error?: string;
-      };
-      if (!res.ok || !body.ok) {
-        throw new Error(body.error || `Delete failed (${res.status})`);
-      }
-    },
+    mutationFn: api.delete,
+    onSuccess: () => qc.invalidateQueries({ queryKey: LIST_KEY }),
+  });
+}
+
+async function readMcpMutationBody(res: Response): Promise<{
+  ok?: unknown;
+  error?: unknown;
+} | null> {
+  const text = (await res.text()).trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text) as { ok?: unknown; error?: unknown };
+  } catch (cause) {
+    throw new Error(
+      `Reconnect response was not valid JSON (HTTP ${res.status}).`,
+      { cause },
+    );
+  }
+}
+
+function reconnectMcpServerUrl(args: ReconnectMcpServerArgs): string {
+  return `${mcpServersEndpoint()}/${encodeURIComponent(args.id)}/reconnect?scope=${args.scope}`;
+}
+
+export function useReconnectMcpServer() {
+  const qc = useQueryClient();
+  const api = useMcpServersApi();
+  return useMutation({
+    mutationFn: api.reconnect,
     onSuccess: () => qc.invalidateQueries({ queryKey: LIST_KEY }),
   });
 }
@@ -115,7 +284,7 @@ export interface TestMcpUrlResult {
 
 export function getMcpUrlValidationError(rawUrl: string): string | null {
   const trimmed = rawUrl.trim();
-  if (!trimmed) return "Enter the Streamable HTTP MCP server URL.";
+  if (!trimmed) return "Enter the Streamable HTTP agent integration URL.";
   let url: URL;
   try {
     url = new URL(trimmed);
@@ -123,13 +292,13 @@ export function getMcpUrlValidationError(rawUrl: string): string | null {
     return "Enter a full URL, including https://.";
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") {
-    return "MCP server URLs must start with https://.";
+    return "Agent integration URLs must start with https://.";
   }
   if (
     url.protocol === "http:" &&
     !["localhost", "127.0.0.1"].includes(url.hostname)
   ) {
-    return "Use https:// for remote MCP servers. Plain http:// is only allowed for localhost.";
+    return "Use https:// for remote agent integrations. Plain http:// is only allowed for localhost.";
   }
   return null;
 }
@@ -142,7 +311,7 @@ export function formatMcpServerError(error: unknown): string {
         ? error.message
         : String(error ?? "");
   const text = raw.trim();
-  if (!text) return "Could not connect to that MCP server.";
+  if (!text) return "Could not connect to that agent integration.";
   if (
     /<!doctype|<html[\s>]|<\/html>|unexpected token '<'|is not valid json/i.test(
       text,
@@ -161,13 +330,28 @@ export function formatMcpServerError(error: unknown): string {
       text,
     )
   ) {
-    return "Could not reach that MCP server. Check the URL and make sure it is publicly reachable from this app.";
+    return "Could not reach that agent integration. Check the URL and make sure it is publicly reachable from this app.";
   }
   if (/401|403|unauthorized|forbidden/i.test(text)) {
-    return "The MCP server rejected the request. Add or update the required Authorization header.";
+    return "The agent integration rejected the request. Add or update the required Authorization header.";
   }
   if (/404|not found|405|method not allowed/i.test(text)) {
     return "That URL is reachable, but it does not look like the MCP endpoint. Check the server's Streamable HTTP path.";
+  }
+  return text.length > 240 ? `${text.slice(0, 237).trimEnd()}...` : text;
+}
+
+export function formatMcpServersLoadError(error: unknown): string {
+  const raw =
+    typeof error === "string"
+      ? error
+      : error instanceof Error
+        ? error.message
+        : String(error ?? "");
+  const text = raw.trim();
+  if (!text) return "Could not load agent integrations.";
+  if (/401|unauthorized|signed-in workspace app|workspace app/i.test(text)) {
+    return "Sign in to a workspace app, then retry loading agent integrations.";
   }
   return text.length > 240 ? `${text.slice(0, 237).trimEnd()}...` : text;
 }
@@ -178,7 +362,7 @@ export async function testMcpServerUrl(
 ): Promise<TestMcpUrlResult> {
   const validationError = getMcpUrlValidationError(url);
   if (validationError) return { ok: false, error: validationError };
-  const res = await fetch(`${ENDPOINT}/test`, {
+  const res = await fetch(`${mcpServersEndpoint()}/test`, {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
@@ -196,11 +380,6 @@ export async function testMcpServerUrl(
     : body;
 }
 
-/**
- * Virtual tree-node id used when a server is surfaced in the Workspace tree.
- * Shape: `mcp:<scope>:<serverId>`. Not a real resource row; purely a handle
- * the panel uses to route clicks/delete back to the MCP endpoints.
- */
 export function mcpVirtualId(scope: McpServerScope, serverId: string): string {
   return `mcp:${scope}:${serverId}`;
 }

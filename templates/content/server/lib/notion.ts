@@ -1,17 +1,34 @@
 import crypto from "node:crypto";
+
+import { parseIconValue, type IconValue } from "@agent-native/core/icons";
+import { findConnectedMcpServersForProvider } from "@agent-native/core/mcp-client";
 import {
   deleteOAuthTokens,
   listOAuthAccountsByOwner,
   saveOAuthTokens,
 } from "@agent-native/core/oauth-tokens";
+import {
+  getRequestOrgId,
+  getSession,
+  resolveSecret,
+  runWithRequestContext,
+} from "@agent-native/core/server";
 import { assertAccess } from "@agent-native/core/sharing";
-import { getSession, runWithRequestContext } from "@agent-native/core/server";
-import { createError, type H3Event } from "h3";
+import {
+  createError,
+  getHeader,
+  getRequestURL,
+  setCookie,
+  type H3Event,
+} from "h3";
+
 import { canonicalizeNfm } from "../../shared/nfm.js";
 
 export const NOTION_PROVIDER = "notion";
 export const NOTION_API_BASE = "https://api.notion.com/v1";
 export const NOTION_API_VERSION = "2026-03-11";
+
+export const NOTION_OAUTH_STATE_COOKIE = "notion_oauth_state";
 
 type NotionTokens = {
   access_token?: string;
@@ -24,7 +41,13 @@ type NotionTokens = {
 type NotionPage = {
   id: string;
   url?: string;
-  icon?: { type: string; emoji?: string } | null;
+  icon?: {
+    type: string;
+    emoji?: string;
+    external?: { url?: string };
+    file?: { url?: string };
+    custom_emoji?: { url?: string; name?: string };
+  } | null;
   last_edited_time?: string;
   properties?: Record<string, any>;
   parent?: Record<string, any>;
@@ -41,7 +64,7 @@ export type NotionPageMarkdown = {
 export type NotionPageContent = {
   pageId: string;
   title: string;
-  icon: string | null;
+  icon: IconValue | null;
   content: string;
   lastEditedTime: string | null;
   warnings: string[];
@@ -64,34 +87,113 @@ export class NotionApiError extends Error {
   }
 }
 
-function getOrigin(event: H3Event): string {
-  const req = event.node?.req;
-  const host = req?.headers["x-forwarded-host"] || req?.headers.host;
-  const proto = req?.headers["x-forwarded-proto"] || "http";
-  return `${proto}://${host}`;
+function iconFromNotion(icon: NotionPage["icon"]): IconValue | null {
+  if (icon?.type === "emoji" && icon.emoji) {
+    return { version: 1, kind: "emoji", emoji: icon.emoji };
+  }
+  const url = icon?.external?.url;
+  return url
+    ? {
+        version: 1,
+        kind: "image",
+        authority: "notion",
+        assetId: url,
+        alt: icon?.custom_emoji?.name,
+      }
+    : null;
 }
 
-function encodeState(data: Record<string, string>): string {
-  const payload = { ...data, n: crypto.randomBytes(8).toString("hex") };
+function iconForNotion(icon: IconValue | string | null | undefined) {
+  if (!icon) return undefined;
+  const parsed = parseIconValue(icon);
+  if (!parsed) return undefined;
+  if (parsed.kind === "emoji") return { type: "emoji", emoji: parsed.emoji };
+  if (parsed.kind === "image") {
+    if (parsed.authority === "private-icon") {
+      throw new Error(
+        "Private image icons cannot be pushed to Notion until an authorized export is available.",
+      );
+    }
+    return { type: "external", external: { url: parsed.assetId } };
+  }
+  return undefined;
+}
+
+function getOrigin(event: H3Event): string {
+  return getRequestURL(event, {
+    xForwardedHost: true,
+    xForwardedProto: true,
+  }).origin;
+}
+
+/**
+ * Mirrors the `isSecureRequest`/proto-sniffing convention used elsewhere in
+ * this app (see `public-documents.ts`, and `plan`'s `public-plans.ts`):
+ * prefer `x-forwarded-proto` (set by the hosting proxy in production), then
+ * fall back to the `origin` header's scheme, defaulting to insecure. A
+ * hardcoded `secure: true` here would make browsers silently drop the
+ * cookie on any plain-http origin (Safari does this even for
+ * `http://localhost`), making `buildNotionAuthUrl`'s CSRF-binding cookie
+ * never arrive and Connect Notion permanently fail in http dev.
+ */
+function isSecureRequest(event: H3Event): boolean {
+  const proto =
+    getHeader(event, "x-forwarded-proto") ??
+    (getHeader(event, "origin")?.startsWith("https://") ? "https" : "http");
+  return proto === "https";
+}
+
+function getStateSecret(): string | null {
+  return (
+    process.env.NOTION_STATE_SECRET ||
+    process.env.BETTER_AUTH_SECRET ||
+    process.env.AUTH_SECRET ||
+    null
+  );
+}
+
+function signRedirectPath(redirectPath: string): string | null {
+  const secret = getStateSecret();
+  if (!secret) return null;
+  return crypto
+    .createHmac("sha256", secret)
+    .update(`redirectPath:${redirectPath}`)
+    .digest("base64url");
+}
+
+function encodeState(data: Record<string, string>, nonce: string): string {
+  const payload = { ...data, n: nonce };
   return Buffer.from(JSON.stringify(payload)).toString("base64url");
 }
 
-function decodeState(stateParam: string | undefined): Record<string, string> {
-  if (!stateParam) return {};
-  try {
-    return JSON.parse(Buffer.from(stateParam, "base64url").toString());
-  } catch {
-    return {};
-  }
+async function resolveNotionOAuthCredentials(event: H3Event): Promise<{
+  clientId: string;
+  clientSecret: string;
+} | null> {
+  const session = await getSession(event).catch(() => null);
+  return runWithRequestContext(
+    { userEmail: session?.email, orgId: session?.orgId },
+    async () => {
+      const [clientId, clientSecret] = await Promise.all([
+        resolveSecret("NOTION_CLIENT_ID"),
+        resolveSecret("NOTION_CLIENT_SECRET"),
+      ]);
+      if (!clientId || !clientSecret) return null;
+      return { clientId, clientSecret };
+    },
+  );
 }
 
-function notionBasicAuthHeader(): string {
-  const clientId = process.env.NOTION_CLIENT_ID;
-  const clientSecret = process.env.NOTION_CLIENT_SECRET;
+async function notionBasicAuthHeader(event: H3Event): Promise<string> {
+  const credentials = await resolveNotionOAuthCredentials(event);
+  const clientId = credentials?.clientId;
+  const clientSecret = credentials?.clientSecret;
   if (!clientId || !clientSecret) {
-    throw new Error(
-      "Notion OAuth credentials are not configured. Set NOTION_CLIENT_ID and NOTION_CLIENT_SECRET.",
-    );
+    throw createError({
+      statusCode: 400,
+      statusMessage:
+        "Notion OAuth credentials are not configured. Save NOTION_CLIENT_ID and NOTION_CLIENT_SECRET in settings.",
+    });
   }
   return `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`;
 }
@@ -266,6 +368,9 @@ export function normalizeNotionPageId(input: string): string {
   throw new Error("Invalid Notion page ID or URL.");
 }
 
+const NOTION_FETCH_TIMEOUT_MS = 15_000;
+const NOTION_RETRY_AFTER_CAP_SECONDS = 5;
+
 export async function notionFetch<T>(
   path: string,
   accessToken: string,
@@ -273,19 +378,28 @@ export async function notionFetch<T>(
 ): Promise<T> {
   const MAX_RETRIES = 2;
   for (let attempt = 0; ; attempt++) {
+    const headers = new Headers({
+      Authorization: `Bearer ${accessToken}`,
+      "Notion-Version": NOTION_API_VERSION,
+      "Content-Type": "application/json",
+    });
+    new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
     const response = await fetch(`${NOTION_API_BASE}${path}`, {
       ...init,
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Notion-Version": NOTION_API_VERSION,
-        "Content-Type": "application/json",
-        ...(init?.headers || {}),
-      },
+      signal: init?.signal ?? AbortSignal.timeout(NOTION_FETCH_TIMEOUT_MS),
+      headers,
     });
     if (response.status === 429 && attempt < MAX_RETRIES) {
-      const retryAfter = Number(response.headers.get("retry-after")) || 1;
-      await new Promise((r) => setTimeout(r, Math.max(retryAfter, 1) * 1000));
-      continue;
+      const rawRetryAfter = Number(response.headers.get("retry-after"));
+      const retryAfterSeconds =
+        Number.isFinite(rawRetryAfter) && rawRetryAfter > 0 ? rawRetryAfter : 1;
+      if (retryAfterSeconds <= NOTION_RETRY_AFTER_CAP_SECONDS) {
+        await new Promise((r) => setTimeout(r, retryAfterSeconds * 1000));
+        continue;
+      }
+      // Retry-After exceeds what we're willing to block a request for —
+      // surface the 429 immediately so the caller can record lastError
+      // instead of stalling the handler.
     }
     const body = await response.json().catch(() => null);
     if (!response.ok) {
@@ -335,7 +449,7 @@ export async function readNotionPageAsDocument(
   return {
     pageId: page.id,
     title: extractPageTitle(page),
-    icon: page.icon?.type === "emoji" ? page.icon.emoji || null : null,
+    icon: iconFromNotion(page.icon),
     content: markdown,
     lastEditedTime: page.last_edited_time || null,
     warnings,
@@ -347,16 +461,11 @@ export async function pushDocumentToNotionPage(args: {
   pageId: string;
   title: string;
   content: string;
-  icon?: string | null;
+  icon?: IconValue | string | null;
 }): Promise<NotionPageContent> {
+  const notionIcon = iconForNotion(args.icon);
   const page = await fetchNotionPage(args.accessToken, args.pageId);
 
-  // The canonical content already contains `<page>`/`<database>` tags for any
-  // child pages/databases (they round-trip through the converter), so they stay
-  // in place. We must NOT re-append them — per the NFM spec an existing-URL
-  // `<page>` tag MOVES that child, which previously reordered children to the
-  // bottom of the page on every push. `allow_deleting_content: false` remains
-  // the backstop against accidental removal.
   const markdown = canonicalizeNfm(args.content);
 
   try {
@@ -388,9 +497,7 @@ export async function pushDocumentToNotionPage(args: {
     },
   };
 
-  if (args.icon) {
-    updateBody.icon = { type: "emoji", emoji: args.icon };
-  }
+  if (args.icon === null || notionIcon) updateBody.icon = notionIcon ?? null;
 
   await notionFetch(`/pages/${args.pageId}`, args.accessToken, {
     method: "PATCH",
@@ -405,7 +512,7 @@ export async function createNotionPageWithMarkdown(args: {
   parentPageId: string;
   title: string;
   content: string;
-  icon?: string | null;
+  icon?: IconValue | string | null;
 }): Promise<{ id: string; url: string }> {
   const body: Record<string, unknown> = {
     parent: { page_id: args.parentPageId },
@@ -422,9 +529,8 @@ export async function createNotionPageWithMarkdown(args: {
     markdown: canonicalizeNfm(args.content),
   };
 
-  if (args.icon) {
-    body.icon = { type: "emoji", emoji: args.icon };
-  }
+  const notionIcon = iconForNotion(args.icon);
+  if (notionIcon) body.icon = notionIcon;
 
   return notionFetch<{ id: string; url: string }>("/pages", args.accessToken, {
     method: "POST",
@@ -475,6 +581,35 @@ export async function getNotionConnectionForOwner(owner: string) {
   };
 }
 
+export async function requireNotionConnectionForOwner(
+  owner: string,
+  intent: string,
+) {
+  const connection = await getNotionConnectionForOwner(owner);
+  if (connection) return connection;
+
+  const mcp = await findConnectedMcpServersForProvider({
+    providerId: NOTION_PROVIDER,
+    userEmail: owner,
+    orgId: getRequestOrgId() ?? null,
+    // coercion-ok: null is the typed "status unreadable" answer and produces a
+    // different error below than an empty, successfully-read server list.
+  }).catch(() => null);
+
+  const base = `Connect your Notion account before ${intent}.`;
+  if (mcp === null) {
+    throw new Error(
+      `${base} Notion MCP connection status could not be read, so this may be the separate MCP connection rather than the account grant.`,
+    );
+  }
+  if (mcp.servers.length > 0) {
+    throw new Error(
+      `${base} The Notion MCP server shown under Settings > Integrations is connected, but that is a separate connection and does not grant Content the account access it needs to link and sync documents.`,
+    );
+  }
+  throw new Error(base);
+}
+
 export async function disconnectNotionForOwner(owner: string) {
   const accounts = await listOAuthAccountsByOwner(NOTION_PROVIDER, owner);
   let deleted = 0;
@@ -484,28 +619,48 @@ export async function disconnectNotionForOwner(owner: string) {
   return deleted;
 }
 
-export function buildNotionAuthUrl(event: H3Event, redirectPath = "/"): string {
-  const clientId = process.env.NOTION_CLIENT_ID;
-  if (!clientId) {
-    throw new Error(
-      "Notion OAuth credentials are not configured. Set NOTION_CLIENT_ID and NOTION_CLIENT_SECRET.",
-    );
+export async function hasNotionOAuthCredentials(
+  event: H3Event,
+): Promise<boolean> {
+  return !!(await resolveNotionOAuthCredentials(event));
+}
+
+export async function buildNotionAuthUrl(
+  event: H3Event,
+  redirectPath = "/",
+): Promise<string> {
+  const credentials = await resolveNotionOAuthCredentials(event);
+  if (!credentials?.clientId) {
+    throw createError({
+      statusCode: 400,
+      statusMessage:
+        "Notion OAuth credentials are not configured. Save NOTION_CLIENT_ID and NOTION_CLIENT_SECRET in settings.",
+    });
   }
   const redirectUri = `${getOrigin(event)}/api/notion/callback`;
-  const state = encodeState({ redirectPath });
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const sig = signRedirectPath(redirectPath);
+  const state = encodeState(
+    sig ? { redirectPath, sig } : { redirectPath },
+    nonce,
+  );
+
+  setCookie(event, NOTION_OAUTH_STATE_COOKIE, nonce, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: isSecureRequest(event),
+    path: "/",
+    maxAge: 600,
+  });
+
   const params = new URLSearchParams({
     owner: "user",
-    client_id: clientId,
+    client_id: credentials.clientId,
     redirect_uri: redirectUri,
     response_type: "code",
     state,
   });
   return `https://api.notion.com/v1/oauth/authorize?${params.toString()}`;
-}
-
-export function getNotionRedirectPath(stateParam: string | undefined): string {
-  const state = decodeState(stateParam);
-  return state.redirectPath || "/";
 }
 
 export async function exchangeNotionCodeForTokens(
@@ -515,8 +670,9 @@ export async function exchangeNotionCodeForTokens(
   const redirectUri = `${getOrigin(event)}/api/notion/callback`;
   const response = await fetch(`${NOTION_API_BASE}/oauth/token`, {
     method: "POST",
+    signal: AbortSignal.timeout(NOTION_FETCH_TIMEOUT_MS),
     headers: {
-      Authorization: notionBasicAuthHeader(),
+      Authorization: await notionBasicAuthHeader(event),
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -546,50 +702,100 @@ export async function saveNotionTokensForOwner(
     tokens as Record<string, unknown>,
     owner,
   );
+
+  const accounts = await listOAuthAccountsByOwner(NOTION_PROVIDER, owner);
+  await Promise.all(
+    accounts
+      .filter((account) => account.accountId !== accountId)
+      .map((account) => deleteOAuthTokens(NOTION_PROVIDER, account.accountId)),
+  );
+
   return accountId;
 }
-
-// ─── Notion Comments API ────────────────────────────────────────
 
 export interface NotionComment {
   id: string;
   rich_text: Array<{ plain_text: string }>;
   created_time: string;
   created_by: { id: string };
+  discussion_id?: string;
 }
 
-/** List open comments on a Notion page. */
+const MAX_COMMENT_PAGES = 20;
+
 export async function listNotionComments(
   pageId: string,
   accessToken: string,
 ): Promise<NotionComment[]> {
-  try {
-    const data = await notionFetch<{ results?: NotionComment[] }>(
-      `/comments?block_id=${pageId}`,
-      accessToken,
-    );
-    return data.results ?? [];
-  } catch {
-    return [];
+  const results: NotionComment[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_COMMENT_PAGES; page++) {
+    try {
+      const query = new URLSearchParams({ block_id: pageId, page_size: "100" });
+      if (cursor) query.set("start_cursor", cursor);
+      const data = await notionFetch<{
+        results?: NotionComment[];
+        has_more?: boolean;
+        next_cursor?: string | null;
+      }>(`/comments?${query.toString()}`, accessToken);
+      results.push(...(data.results ?? []));
+      if (!data.has_more || !data.next_cursor) break;
+      cursor = data.next_cursor;
+    } catch (error) {
+      if (
+        error instanceof NotionApiError &&
+        [401, 403, 404, 429].includes(error.status)
+      ) {
+        throw error;
+      }
+      if (results.length > 0) break;
+      throw error;
+    }
   }
+  return results;
 }
 
-/** Add a comment to a Notion page. */
+export type AddedNotionComment = {
+  id: string;
+  discussionId: string | null;
+};
+
 export async function addNotionComment(
   pageId: string,
   text: string,
   accessToken: string,
-): Promise<string | null> {
+  discussionId?: string | null,
+): Promise<AddedNotionComment | null> {
   try {
-    const data = await notionFetch<{ id?: string }>("/comments", accessToken, {
-      method: "POST",
-      body: JSON.stringify({
-        parent: { page_id: pageId },
-        rich_text: [{ text: { content: text } }],
-      }),
-    });
-    return data.id ?? null;
-  } catch {
+    const body = discussionId
+      ? {
+          discussion_id: discussionId,
+          rich_text: [{ text: { content: text } }],
+        }
+      : {
+          parent: { page_id: pageId },
+          rich_text: [{ text: { content: text } }],
+        };
+    const data = await notionFetch<{ id?: string; discussion_id?: string }>(
+      "/comments",
+      accessToken,
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      },
+    );
+    if (!data.id) return null;
+    return {
+      id: data.id,
+      discussionId: data.discussion_id ?? discussionId ?? null,
+    };
+  } catch (error) {
+    if (
+      error instanceof NotionApiError &&
+      [401, 403, 404, 429].includes(error.status)
+    ) {
+      throw error;
+    }
     return null;
   }
 }

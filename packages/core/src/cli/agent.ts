@@ -1,28 +1,31 @@
 import fs from "node:fs";
 import path from "node:path";
-import { autoDiscoverActions } from "../server/action-discovery.js";
-import { createGitHubRepoToolEntries } from "../provider-api/github-repo.js";
+
+import { DEFAULT_MODEL } from "../agent/default-model.js";
 import {
-  getRequestOrgId,
-  getRequestUserEmail,
-  runWithRequestContext,
-} from "../server/request-context.js";
-import { resolveDevUserEmail } from "../scripts/dev-session.js";
-import { loadEnv } from "../scripts/utils.js";
+  registerBuiltinEngines,
+  resolveEngine,
+} from "../agent/engine/index.js";
+import type { EngineMessage } from "../agent/engine/types.js";
 import {
   actionsToEngineTools,
   type AgentLoopUsage,
   type ActionEntry,
 } from "../agent/production-agent.js";
 import { runAgentLoopDirectWithSoftTimeout } from "../agent/run-loop-with-resume.js";
-import {
-  registerBuiltinEngines,
-  resolveEngine,
-} from "../agent/engine/index.js";
-import { DEFAULT_MODEL } from "../agent/default-model.js";
 import type { AgentChatEvent } from "../agent/types.js";
-import type { EngineMessage } from "../agent/engine/types.js";
+import { getAppConfig } from "../app-config/index.js";
+import { createGitHubRepoToolEntries } from "../provider-api/github-repo.js";
+import { loadCliBootstrap } from "../scripts/cli-bootstrap.js";
+import { resolveDevUserEmail } from "../scripts/dev-session.js";
+import { loadEnv, serializeCliArgs } from "../scripts/utils.js";
+import { autoDiscoverActions } from "../server/action-discovery.js";
 import { captureCliOutput } from "../server/cli-capture.js";
+import {
+  getRequestOrgId,
+  getRequestUserEmail,
+  runWithRequestContext,
+} from "../server/request-context.js";
 
 export interface ParsedAgentArgs {
   prompt?: string;
@@ -157,6 +160,7 @@ export async function runAgent(
 ): Promise<number> {
   loadEnv();
   registerBuiltinEngines();
+  await loadCliBootstrap();
 
   const stdout = io.stdout ?? console.log;
   const stderr = io.stderr ?? console.error;
@@ -210,7 +214,7 @@ async function runLocalAgentLoop(parsed: ParsedAgentArgs): Promise<{
   const localActions = await autoDiscoverActions("auto");
   const builtinActions = await createHeadlessBuiltinActions();
   const repoActions = createGitHubRepoToolEntries({
-    appId: process.env.AGENT_NATIVE_APP_ID ?? process.env.APP_ID ?? "app",
+    appId: getAppConfig().app.id ?? "app",
   });
   const actions = { ...builtinActions, ...localActions, ...repoActions };
   const tools = actionsToEngineTools(actions);
@@ -276,7 +280,8 @@ function buildHeadlessSystemPrompt(actionNames: string[]): string {
   return [
     "You are the app agent for this Agent-Native project.",
     "Use the registered app actions as your source of truth for doing work.",
-    "Use docs-search before implementing or answering advanced Agent Native framework questions; it reads the version-matched docs bundled with @agent-native/core.",
+    "Use framework-search first for questions that may span the version-matched docs and source; it supports bounded substring, wildcard, SQL-like, and safe-regex matching.",
+    "Use docs-search or source-search for a focused page/file read after framework-search identifies the relevant evidence.",
     "Use connected GitHub repository tools for repo context when a repository is configured; do not assume a local clone or sandbox exists.",
     "You are running headlessly from the command line, so reply with the final useful result in plain text.",
     actionList,
@@ -287,28 +292,72 @@ function buildHeadlessSystemPrompt(actionNames: string[]): string {
 }
 
 function cliArgsFromToolArgs(args: Record<string, unknown>): string[] {
-  const cliArgs: string[] = [];
-  for (const [key, value] of Object.entries(args)) {
-    if (value === undefined) continue;
-    const normalized =
-      value != null && typeof value === "object"
-        ? JSON.stringify(value)
-        : String(value);
-    cliArgs.push(`--${key}`, normalized);
-  }
-  return cliArgs;
+  return serializeCliArgs(
+    Object.fromEntries(
+      Object.entries(args).filter(([, value]) => value !== undefined),
+    ),
+  );
 }
 
 export async function createHeadlessBuiltinActions(): Promise<
   Record<string, ActionEntry>
 > {
   const docsSearch = await import("../scripts/docs/search.js");
+  const sourceSearch = await import("../scripts/docs/source-search.js");
+  const frameworkSearch = await import("../scripts/docs/framework-search.js");
   return {
+    "framework-search": {
+      readOnly: true,
+      tool: {
+        description:
+          "Search version-matched Agent-Native docs and readable Core, Toolkit, and first-party template source together. Use this first when a docs answer may require implementation evidence; supports substring, glob, SQL-like, and safe regex modes.",
+        parameters: {
+          type: "object",
+          properties: {
+            pattern: {
+              type: "string",
+              description: "Text pattern to search across docs and source.",
+            },
+            scope: {
+              type: "string",
+              description:
+                "Search corpus: all, docs, or source (default: all).",
+              enum: ["all", "docs", "source"],
+            },
+            mode: {
+              type: "string",
+              description:
+                "Match mode: substring, glob, sql-like, or safe regex (default: substring).",
+              enum: ["substring", "glob", "sql-like", "regex"],
+            },
+            path: {
+              type: "string",
+              description: "Optional glob path filter.",
+            },
+            limit: {
+              type: "string",
+              description: "Maximum matching files to return, from 1 to 50.",
+            },
+            list: {
+              type: "string",
+              description:
+                'Set to "true" to list searchable docs and source roots.',
+              enum: ["true"],
+            },
+          },
+        },
+      },
+      run: async (args: Record<string, unknown>): Promise<string> => {
+        return captureCliOutput(() =>
+          frameworkSearch.default(cliArgsFromToolArgs(args)),
+        );
+      },
+    },
     "docs-search": {
       readOnly: true,
       tool: {
         description:
-          "Search and read version-matched Agent Native framework documentation bundled in @agent-native/core, plus bundled AGENTS.md and codebase skills. Use --list to see pages, --query to search, and --slug to read a page.",
+          "Search and read version-matched Agent-Native framework documentation bundled in @agent-native/core, plus bundled AGENTS.md and codebase skills. Use --list to see pages, --query to search, and --slug to read a page.",
         parameters: {
           type: "object",
           properties: {
@@ -333,6 +382,38 @@ export async function createHeadlessBuiltinActions(): Promise<
       run: async (args: Record<string, unknown>): Promise<string> => {
         return captureCliOutput(() =>
           docsSearch.default(cliArgsFromToolArgs(args)),
+        );
+      },
+    },
+    "source-search": {
+      readOnly: true,
+      tool: {
+        description:
+          "Search and read readable version-matched Core, Toolkit, and first-party template source. Use framework-search for one combined docs/source search with glob, SQL-like, or regex matching; use --list, --query, or --path for focused source lookup.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description:
+                "Search term to find relevant template source, for example defineAction, useActionQuery, view-screen, or AgentComposerFrame.",
+            },
+            path: {
+              type: "string",
+              description:
+                "Read a specific corpus file or list a directory, for example templates/plan/AGENTS.md or templates/chat/actions/hello.ts.",
+            },
+            list: {
+              type: "string",
+              description: 'Set to "true" to list corpus sections.',
+              enum: ["true"],
+            },
+          },
+        },
+      },
+      run: async (args: Record<string, unknown>): Promise<string> => {
+        return captureCliOutput(() =>
+          sourceSearch.default(cliArgsFromToolArgs(args)),
         );
       },
     },

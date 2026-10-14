@@ -1,6 +1,7 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { getLocalArtifactApp } from "@agent-native/core/local-artifacts";
 import { z } from "zod";
+
 import {
   localComponentWorkspaceId,
   localComponentWorkspaceScope,

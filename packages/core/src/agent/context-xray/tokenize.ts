@@ -1,18 +1,32 @@
-import type { EngineContentPart, EngineMessage } from "../engine/types.js";
 import type { ContextTokenCountMethod } from "../../shared/context-xray.js";
+import type { EngineContentPart, EngineMessage } from "../engine/types.js";
 
 type TokenCounter = (text: string) => number;
 
 let tokenizerPromise: Promise<TokenCounter | null> | undefined;
+const TOKENIZER_MODULE_ID = "@anthropic-ai/tokenizer";
 
 async function loadTokenizer(): Promise<TokenCounter | null> {
   if (!tokenizerPromise) {
-    tokenizerPromise = import("@anthropic-ai/tokenizer")
-      .then((mod) =>
-        typeof mod.countTokens === "function"
+    // Token counting is server-only. Keep this optional dependency out of
+    // browser bundles: tiktoken's WASM entry cannot be loaded by Rolldown's
+    // browser fallback, while the documented estimate below is sufficient
+    // when an edge runtime cannot resolve the tokenizer.
+    tokenizerPromise = import(/* @vite-ignore */ TOKENIZER_MODULE_ID)
+      .then((mod): TokenCounter | null => {
+        // The package's countTokens rebuilds the BPE encoder on every call
+        // (~20 ms); counting a whole context part by part before each model
+        // call turned that into seconds of dead time per turn.
+        if (typeof mod.getTokenizer === "function") {
+          const encoder = mod.getTokenizer() as {
+            encode(text: string, allowedSpecial: "all"): ArrayLike<number>;
+          };
+          return (text) => encoder.encode(text.normalize("NFKC"), "all").length;
+        }
+        return typeof mod.countTokens === "function"
           ? (mod.countTokens as TokenCounter)
-          : null,
-      )
+          : null;
+      })
       .catch(() => null);
   }
   return tokenizerPromise;

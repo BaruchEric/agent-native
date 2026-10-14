@@ -1,4 +1,7 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
+import { getRequestUserEmail } from "@agent-native/core/server/request-context";
+import { getUserProfiles } from "@agent-native/core/user-profile/server";
+import { resolveRecordingKind } from "@shared/recording-kind";
 import {
   and,
   asc,
@@ -7,34 +10,106 @@ import {
   inArray,
   isNull,
   isNotNull,
+  not,
   notInArray,
   sql,
 } from "drizzle-orm";
 import { z } from "zod";
+
+import { effectiveDuration, parseEdits } from "../app/lib/timestamp-mapping.js";
+import { parseRedactions } from "../app/lib/video-redactions.js";
 import { getDb, schema } from "../server/db/index.js";
-import { accessFilter } from "@agent-native/core/sharing";
-import { getRequestUserEmail } from "@agent-native/core/server/request-context";
 import {
+  agentRecordingAccessFilter,
+  isAgentRecordingCaller,
+} from "../server/lib/agent-recording-access.js";
+import { resolvePlayerThumbnailUrl } from "../server/lib/player-thumbnail-url.js";
+import { resolvePlayerVideoUrl } from "../server/lib/player-video-url.js";
+import {
+  countedViewCondition,
   getActiveOrganizationId,
+  ownerEmailMatches,
   parseSpaceIds,
 } from "../server/lib/recordings.js";
+import { profileNameFor } from "../server/lib/user-identities.js";
+import { transcriptHasTextSql } from "./lib/transcript-text.js";
 
 function escapeLike(s: string): string {
   return s.replace(/([\\%_])/g, "\\$1");
 }
 
+type RecordingMediaFields = {
+  id: string;
+  sourceAppName?: string | null;
+  sourceWindowTitle?: string | null;
+  videoUrl?: string | null;
+  videoFormat?: string | null;
+};
+
+export function resolveListRecordingMedia(
+  recording: RecordingMediaFields,
+  includeMedia: boolean,
+): { videoUrl: string | null; videoFormat: "webm" | "mp4" | null } {
+  if (!includeMedia) {
+    return { videoUrl: null, videoFormat: null };
+  }
+
+  return {
+    videoUrl: resolvePlayerVideoUrl(
+      {
+        id: recording.id,
+        sourceAppName: recording.sourceAppName,
+        sourceWindowTitle: recording.sourceWindowTitle,
+        videoUrl: recording.videoUrl,
+      },
+      { proxyRemoteMedia: true },
+    ),
+    videoFormat:
+      recording.videoFormat === "webm" || recording.videoFormat === "mp4"
+        ? recording.videoFormat
+        : null,
+  };
+}
+
+type ViewCountRow = { recordingId: string; count: number | string | null };
+
+/**
+ * `recording_views` only exists from migration v46, so pre-migration clips have
+ * no log rows and must fall back to their counted-viewer count instead of
+ * dropping to 0. Same floor as `countRecordingViews`, so a library card and the
+ * clip page always agree.
+ */
+export function mergeViewCounts(
+  countedViewerRows: ViewCountRow[],
+  viewLogRows: ViewCountRow[],
+): Record<string, number> {
+  const merged: Record<string, number> = {};
+  for (const row of countedViewerRows) {
+    merged[row.recordingId] = Number(row.count ?? 0);
+  }
+  for (const row of viewLogRows) {
+    merged[row.recordingId] = Math.max(
+      merged[row.recordingId] ?? 0,
+      Number(row.count ?? 0),
+    );
+  }
+  return merged;
+}
+
 export default defineAction({
   description:
-    "List recordings visible to the current user. Supports filtering by view (library/space/archive/trash/all), folder, space, tag, free-text, and sort.",
+    "List recordings visible to the current user. Supports filtering by view (library/shared/space/archive/trash/all), folder, space, tag, free-text, and sort. Public/unlisted recordings are discoverable only when owned by or previously viewed by the current user; the shared view returns accessible recordings owned by someone else.",
   schema: z.object({
     view: z
-      .enum(["library", "space", "archive", "trash", "all"])
+      .enum(["library", "shared", "space", "archive", "trash", "all"])
       .default("library")
       .describe("Which list to show"),
     folderId: z
       .string()
       .nullish()
-      .describe("Folder id (null = root). Only applies to library/space view."),
+      .describe(
+        "Folder id. Omit/null for the unified library or space view; pass a folder id to show only that folder.",
+      ),
     spaceId: z
       .string()
       .nullish()
@@ -43,6 +118,17 @@ export default defineAction({
       .string()
       .nullish()
       .describe("Filter to recordings carrying this tag"),
+    recordingIds: z
+      .array(z.string().min(1))
+      .max(100)
+      .optional()
+      .describe("Restrict results to these recording IDs"),
+    kind: z
+      .enum(["video", "image", "all"])
+      .default("all")
+      .describe(
+        'Filter by what the row holds: "video" for clips, "image" for screenshots, "all" (the default) for both',
+      ),
     search: z
       .string()
       .nullish()
@@ -53,14 +139,46 @@ export default defineAction({
       .describe("Sort order"),
     limit: z.coerce.number().int().min(1).max(500).default(100),
     offset: z.coerce.number().int().min(0).default(0),
+    countOnly: z
+      // Robust coercion: a GET query param arrives as the string "true"/"false",
+      // and z.coerce.boolean would treat "false" as true. Map strings explicitly.
+      .preprocess(
+        (v) => (typeof v === "string" ? v === "true" : v),
+        z.boolean(),
+      )
+      .default(false)
+      .describe("Return only the total count, skipping the row payload"),
+    includeMedia: z
+      .preprocess(
+        (v) => (typeof v === "string" ? v === "true" : v),
+        z.boolean(),
+      )
+      .default(false)
+      .describe("Include playable media fields for editor workflows"),
   }),
   http: { method: "GET" },
-  run: async (args) => {
+  run: async (args, ctx) => {
     const db = getDb();
 
     const whereClauses = [
-      accessFilter(schema.recordings, schema.recordingShares),
+      agentRecordingAccessFilter(
+        schema.recordings,
+        schema.recordingShares,
+        schema.recordingViewers,
+        {
+          agentOnly: isAgentRecordingCaller(ctx?.caller),
+          userEmail: ctx?.userEmail,
+        },
+      ),
     ];
+
+    if (args.recordingIds) {
+      whereClauses.push(
+        args.recordingIds.length
+          ? inArray(schema.recordings.id, args.recordingIds)
+          : sql`1 = 0`,
+      );
+    }
 
     const orgId = await getActiveOrganizationId();
 
@@ -70,26 +188,38 @@ export default defineAction({
     if (args.view === "library") {
       const email = getRequestUserEmail();
       if (email) {
-        whereClauses.push(eq(schema.recordings.ownerEmail, email));
+        whereClauses.push(
+          ownerEmailMatches(schema.recordings.ownerEmail, email),
+        );
       }
       if (orgId) {
         whereClauses.push(eq(schema.recordings.organizationId, orgId));
       }
-      // Meeting recordings are transcript-only (no playable media) and live on
-      // the /meetings surface, so keep them out of the Library list. The link
-      // is meetings.recordingId (no meetingId column on recordings), so exclude
-      // any recording referenced by a meeting. The subquery filters out NULLs
-      // so NOT IN doesn't collapse to an empty result under SQL NULL semantics.
-      const meetingRecordingIds = db
+    }
+
+    if (args.view === "shared") {
+      const email = getRequestUserEmail();
+      whereClauses.push(
+        email
+          ? not(ownerEmailMatches(schema.recordings.ownerEmail, email))
+          : sql`1 = 0`,
+      );
+    }
+
+    if (args.view === "library" || args.view === "shared") {
+      const resolvedDb = await Promise.resolve(db);
+      const meetingRecordingIds = resolvedDb
         .select({ id: schema.meetings.recordingId })
         .from(schema.meetings)
         .where(isNotNull(schema.meetings.recordingId));
       whereClauses.push(notInArray(schema.recordings.id, meetingRecordingIds));
     }
 
-    // Lifecycle view filters
     if (args.view === "trash") {
       whereClauses.push(isNotNull(schema.recordings.trashedAt));
+      if (orgId) {
+        whereClauses.push(eq(schema.recordings.organizationId, orgId));
+      }
     } else {
       whereClauses.push(isNull(schema.recordings.trashedAt));
       if (args.view === "archive") {
@@ -99,12 +229,10 @@ export default defineAction({
       }
     }
 
-    // Folder scoping
     if (args.view === "library" || args.view === "space") {
       if (args.folderId !== undefined && args.folderId !== null) {
         whereClauses.push(eq(schema.recordings.folderId, args.folderId));
       } else {
-        // Root of this view
         whereClauses.push(isNull(schema.recordings.folderId));
       }
     }
@@ -116,8 +244,6 @@ export default defineAction({
       if (orgId) {
         whereClauses.push(eq(schema.recordings.organizationId, orgId));
       }
-      // Match recordings where spaceIds JSON array contains spaceId.
-      // Use a LIKE check — works across SQLite/Postgres without JSON ops.
       const needle = `%"${args.spaceId.replace(/%/g, "")}"%`;
       whereClauses.push(sql`${schema.recordings.spaceIds} LIKE ${needle}`);
     }
@@ -129,6 +255,12 @@ export default defineAction({
       );
     }
 
+    // Screenshots and clips live in one table; the Screenshots view is this
+    // filter, and the unified library passes "all" so it still shows both.
+    if (args.kind === "image" || args.kind === "video") {
+      whereClauses.push(eq(schema.recordings.kind, args.kind));
+    }
+
     // Tag filter — join-ish via subquery
     if (args.tag) {
       whereClauses.push(
@@ -136,30 +268,44 @@ export default defineAction({
       );
     }
 
-    // Sort
-    const viewCountOrder = sql<number>`(
+    if (args.countOnly) {
+      const totalRows = await db
+        .select({ count: sql<number>`COUNT(1)` })
+        .from(schema.recordings)
+        .where(and(...whereClauses));
+      return { recordings: [], total: Number(totalRows[0]?.count ?? 0) };
+    }
+
+    const countedViewerCount = sql<number>`(
       SELECT COUNT(1)
       FROM ${schema.recordingViewers}
       WHERE ${schema.recordingViewers.recordingId} = ${schema.recordings.id}
-        AND ${eq(schema.recordingViewers.countedView, true)}
+        AND ${countedViewCondition()}
+    )`;
+    const viewLogCount = sql<number>`(
+      SELECT COUNT(1)
+      FROM ${schema.recordingViews}
+      WHERE ${schema.recordingViews.recordingId} = ${schema.recordings.id}
+    )`;
+    // Same floor as `countRecordingViews`: `recording_views` only exists from
+    // migration v46, so pre-migration clips have no log rows and must fall back
+    // to the counted-viewer count instead of sorting as zero. CASE keeps the
+    // ordering expression explicit about which count wins.
+    const viewCountOrder = sql<number>`(
+      CASE WHEN ${viewLogCount} > ${countedViewerCount}
+        THEN ${viewLogCount}
+        ELSE ${countedViewerCount}
+      END
     )`;
     const orderBy =
       args.sort === "oldest"
         ? [asc(schema.recordings.createdAt)]
         : args.sort === "views"
-          ? // views are not on recordings row — use subquery count
-            [desc(viewCountOrder), desc(schema.recordings.createdAt)]
+          ? [desc(viewCountOrder), desc(schema.recordings.createdAt)]
           : [desc(schema.recordings.createdAt)];
 
     const rows = await db
       .select({
-        // Project only the columns the list grid renders. Bare
-        // `.select({ recording: schema.recordings })` would pull the whole row
-        // — including the potentially large `edits_json` / `chapters_json`
-        // blobs, `password`, and `video_url` — over the wire for every card,
-        // even though the mapper below drops them. The detail/editor/player
-        // paths (`get-recording-player-data`, `view-screen`) still read the
-        // full row.
         recording: {
           id: schema.recordings.id,
           title: schema.recordings.title,
@@ -167,13 +313,23 @@ export default defineAction({
           sourceAppName: schema.recordings.sourceAppName,
           sourceWindowTitle: schema.recordings.sourceWindowTitle,
           description: schema.recordings.description,
+          kind: schema.recordings.kind,
           thumbnailUrl: schema.recordings.thumbnailUrl,
           animatedThumbnailUrl: schema.recordings.animatedThumbnailUrl,
+          mediaUpdatedAt: schema.recordings.mediaUpdatedAt,
           durationMs: schema.recordings.durationMs,
+          editsJson: schema.recordings.editsJson,
           status: schema.recordings.status,
           uploadProgress: schema.recordings.uploadProgress,
           failureReason: schema.recordings.failureReason,
           visibility: schema.recordings.visibility,
+          hasPassword: sql<number>`(
+            CASE WHEN ${schema.recordings.password} IS NOT NULL
+              AND ${schema.recordings.password} <> ''
+              THEN 1 ELSE 0
+            END
+          )`,
+          expiresAt: schema.recordings.expiresAt,
           ownerEmail: schema.recordings.ownerEmail,
           folderId: schema.recordings.folderId,
           spaceIds: schema.recordings.spaceIds,
@@ -185,17 +341,16 @@ export default defineAction({
           hasCamera: schema.recordings.hasCamera,
           width: schema.recordings.width,
           height: schema.recordings.height,
+          videoUrl: args.includeMedia
+            ? schema.recordings.videoUrl
+            : sql<string | null>`NULL`,
+          videoFormat: args.includeMedia
+            ? schema.recordings.videoFormat
+            : sql<string | null>`NULL`,
         },
         transcriptStatus: schema.recordingTranscripts.status,
-        // Compute the has-text signal in SQL instead of shipping the full
-        // transcript text + segments JSON per card just to derive a boolean.
-        // Mirrors the old `transcriptHasText()` helper: non-empty trimmed
-        // `full_text`, or a segment carrying a non-empty `"text"` value.
         transcriptHasText: sql<number>`(
-          CASE WHEN (
-            TRIM(COALESCE(${schema.recordingTranscripts.fullText}, '')) <> ''
-            OR COALESCE(${schema.recordingTranscripts.segmentsJson}, '') LIKE '%"text":"_%'
-          ) THEN 1 ELSE 0 END
+          CASE WHEN ${transcriptHasTextSql()} THEN 1 ELSE 0 END
         )`,
       })
       .from(schema.recordings)
@@ -209,43 +364,74 @@ export default defineAction({
       .offset(args.offset);
 
     const ids = rows.map((r) => r.recording.id);
+    const ownerProfilesPromise = getUserProfiles(
+      rows.map((row) => row.recording.ownerEmail),
+    );
 
-    // Gather tags for the result set in one query
-    let tagsByRec: Record<string, string[]> = {};
-    if (ids.length) {
-      const tagRows = await db
-        .select()
-        .from(schema.recordingTags)
-        .where(inArray(schema.recordingTags.recordingId, ids));
-      for (const t of tagRows) {
-        tagsByRec[t.recordingId] ??= [];
-        tagsByRec[t.recordingId].push(t.tag);
-      }
+    const tagRowsPromise = ids.length
+      ? db
+          .select()
+          .from(schema.recordingTags)
+          .where(inArray(schema.recordingTags.recordingId, ids))
+      : Promise.resolve([]);
+    const viewRowsPromise = ids.length
+      ? Promise.all([
+          db
+            .select({
+              recordingId: schema.recordingViewers.recordingId,
+              count: sql<number>`COUNT(1)`,
+            })
+            .from(schema.recordingViewers)
+            .where(
+              and(
+                inArray(schema.recordingViewers.recordingId, ids),
+                countedViewCondition(),
+              ),
+            )
+            .groupBy(schema.recordingViewers.recordingId),
+          db
+            .select({
+              recordingId: schema.recordingViews.recordingId,
+              count: sql<number>`COUNT(1)`,
+            })
+            .from(schema.recordingViews)
+            .where(inArray(schema.recordingViews.recordingId, ids))
+            .groupBy(schema.recordingViews.recordingId),
+          db
+            .select({
+              recordingId: schema.recordingAgentViews.recordingId,
+              count: sql<number>`COUNT(1)`,
+            })
+            .from(schema.recordingAgentViews)
+            .where(inArray(schema.recordingAgentViews.recordingId, ids))
+            .groupBy(schema.recordingAgentViews.recordingId),
+        ])
+      : Promise.resolve(null);
+    const [ownerProfiles, tagRows, viewRows] = await Promise.all([
+      ownerProfilesPromise,
+      tagRowsPromise,
+      viewRowsPromise,
+    ]);
+
+    const tagsByRec: Record<string, string[]> = {};
+    for (const t of tagRows) {
+      tagsByRec[t.recordingId] ??= [];
+      tagsByRec[t.recordingId].push(t.tag);
     }
 
-    // Count views per recording
     let viewsByRec: Record<string, number> = {};
-    if (ids.length) {
-      const viewRows = await db
-        .select({
-          recordingId: schema.recordingViewers.recordingId,
-          count: sql<number>`COUNT(1)`,
-        })
-        .from(schema.recordingViewers)
-        .where(
-          and(
-            inArray(schema.recordingViewers.recordingId, ids),
-            eq(schema.recordingViewers.countedView, true),
-          ),
-        )
-        .groupBy(schema.recordingViewers.recordingId);
-      for (const v of viewRows) {
-        viewsByRec[v.recordingId] = Number(v.count ?? 0);
-      }
+    let agentViewsByRec: Record<string, number> = {};
+    if (viewRows) {
+      const [countedViewerRows, viewLogRows, agentViewRows] = viewRows;
+      viewsByRec = mergeViewCounts(countedViewerRows, viewLogRows);
+      agentViewsByRec = Object.fromEntries(
+        agentViewRows.map((r) => [r.recordingId, Number(r.count ?? 0)]),
+      );
     }
 
     const recordings = rows.map((row) => {
       const r = row.recording;
+      const edits = parseEdits(r.editsJson);
       return {
         id: r.id,
         title: r.title,
@@ -253,18 +439,29 @@ export default defineAction({
         sourceAppName: r.sourceAppName,
         sourceWindowTitle: r.sourceWindowTitle,
         description: r.description,
-        thumbnailUrl: r.thumbnailUrl,
-        animatedThumbnailUrl: r.animatedThumbnailUrl,
+        // A screenshot card has no duration, play affordance or transcript,
+        // so the grid has to be able to tell the two apart.
+        kind: resolveRecordingKind(r.kind),
+        thumbnailUrl: resolvePlayerThumbnailUrl(r),
+        animatedThumbnailUrl: r.animatedThumbnailUrl
+          ? resolvePlayerThumbnailUrl(r, { animated: true })
+          : null,
         durationMs: r.durationMs,
+        effectiveDurationMs: effectiveDuration(r.durationMs, edits),
         status: r.status,
         uploadProgress: r.uploadProgress,
         failureReason: r.failureReason,
         visibility: r.visibility,
+        hasPassword: Number(r.hasPassword ?? 0) > 0,
+        expiresAt: r.expiresAt,
         ownerEmail: r.ownerEmail,
+        ownerName: profileNameFor(r.ownerEmail, null, ownerProfiles),
         folderId: r.folderId,
         spaceIds: parseSpaceIds(r.spaceIds),
         tags: tagsByRec[r.id] ?? [],
+        pendingRedactions: parseRedactions(edits.overlays).length,
         viewCount: viewsByRec[r.id] ?? 0,
+        agentViewCount: agentViewsByRec[r.id] ?? 0,
         createdAt: r.createdAt,
         updatedAt: r.updatedAt,
         archivedAt: r.archivedAt,
@@ -273,6 +470,7 @@ export default defineAction({
         hasCamera: Boolean(r.hasCamera),
         width: r.width,
         height: r.height,
+        ...resolveListRecordingMedia(r, args.includeMedia),
         transcriptStatus: row.transcriptStatus ?? null,
         transcriptHasText: Number(row.transcriptHasText ?? 0) > 0,
       };

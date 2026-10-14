@@ -1,25 +1,15 @@
-/**
- * Plan helper commands.
- *
- * The `plan local` commands are intentionally separate from the Plan app
- * actions. They do not call MCP, hosted write actions, SQLite, or hosted
- * storage; they only read local files or serve them from a localhost bridge so
- * privacy-focused users have an auditable no-DB path. The top-level
- * `plan blocks` command is a schema-only, no-auth helper for fetching the
- * public block catalog before authoring local MDX; it never sends plan content.
- */
-
-import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import http, {
   type IncomingMessage,
   type Server,
   type ServerResponse,
 } from "node:http";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
+import { getUrlOpenerCommand } from "./open-url.js";
 import {
   DEFAULT_PLAN_APP_URL,
   defaultPlanBlocksOut,
@@ -74,6 +64,52 @@ type LocalPlanBridgeMdxFolder = {
   "assets/"?: Record<string, string>;
 };
 
+type LocalPlanBridgeComment = {
+  id: string;
+  planId: string;
+  parentCommentId: string | null;
+  sectionId: string | null;
+  kind: string;
+  status: string;
+  anchor: string | null;
+  message: string;
+  createdBy: string;
+  authorEmail: string | null;
+  authorName: string | null;
+  resolutionTarget: string | null;
+  mentions: unknown[];
+  mentionsJson: string | null;
+  resolvedBy: string | null;
+  resolvedAt: string | null;
+  consumedAt: string | null;
+  deletedAt: string | null;
+  deletedBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type LocalPlanBridgeCommentInput = {
+  id?: string;
+  parentCommentId?: string | null;
+  sectionId?: string | null;
+  kind?: string;
+  status?: string;
+  anchor?: string | null;
+  message?: string;
+  createdBy?: string;
+  authorEmail?: string | null;
+  authorName?: string | null;
+  resolutionTarget?: string | null;
+  mentions?: unknown[];
+  resolvedBy?: string | null;
+  resolvedAt?: string | null;
+};
+
+type LocalPlanBridgeCommentUpdate = {
+  comments?: LocalPlanBridgeCommentInput[];
+  deletedCommentIds?: string[];
+};
+
 type VisualAnswerSourcePayload = {
   question?: string;
   title?: string;
@@ -117,6 +153,7 @@ export type LocalPlanBridgePayload = {
   updatedAt: string;
   files: string[];
   mdx: LocalPlanBridgeMdxFolder;
+  comments: LocalPlanBridgeComment[];
 };
 
 export type LocalPlanServeResult = {
@@ -139,6 +176,19 @@ export type LocalPlanServeResult = {
 export type LocalPlanBridgeServer = {
   server: Server;
   result: LocalPlanServeResult;
+};
+
+export type RendererValidationIssue = {
+  path: string;
+  message: string;
+};
+
+export type RendererValidation = {
+  ran: boolean;
+  endpoint: string;
+  valid?: boolean;
+  issues?: RendererValidationIssue[];
+  error?: string;
 };
 
 export type LocalPlanVerifyResult = {
@@ -165,6 +215,7 @@ export type LocalPlanVerifyResult = {
     mdxFiles?: string[];
     error?: string;
   };
+  validation: RendererValidation;
   warnings: string[];
 };
 
@@ -173,6 +224,10 @@ type OpenLocalUrlResult = {
   command: string;
   error?: string;
 };
+
+const LOCAL_PLAN_COMMENTS_FILE = "comments.json";
+const LOCAL_PLAN_OWNER_EMAIL = "local@agent-native.local";
+const LOCAL_PLAN_BRIDGE_COMMENT_BODY_LIMIT = 1024 * 1024;
 
 const LOCAL_PLAN_ASSET_MAX_SINGLE_BYTES = 2 * 1024 * 1024;
 const LOCAL_PLAN_ASSET_MAX_TOTAL_BYTES = 10 * 1024 * 1024;
@@ -474,9 +529,14 @@ function localPlanBridgePageUrl(input: {
   bridgeUrl: string;
   appUrl?: string;
 }): string {
-  return `${normalizeBridgeAppUrl(input.appUrl)}/local-plans/${encodeURIComponent(
-    path.basename(path.resolve(input.dir)),
-  )}?bridge=${encodeURIComponent(input.bridgeUrl)}`;
+  const bridgeId = crypto
+    .createHash("sha256")
+    .update(input.bridgeUrl)
+    .digest("hex")
+    .slice(0, 16);
+  return `${normalizeBridgeAppUrl(input.appUrl)}/local-plans/local-${bridgeId}#bridge=${encodeURIComponent(
+    input.bridgeUrl,
+  )}`;
 }
 
 function writeLocalPlanUrlFile(dir: string, url: string, urlFile?: string) {
@@ -488,6 +548,7 @@ function writeLocalPlanUrlFile(dir: string, url: string, urlFile?: string) {
 function runOpenCommand(command: string, args: string[]): OpenLocalUrlResult {
   const result = spawnSync(command, args, {
     stdio: "ignore",
+    shell: false,
     windowsHide: true,
   });
   const commandDisplay = [command, ...args].join(" ");
@@ -522,10 +583,8 @@ function openLocalUrl(url: string): OpenLocalUrlResult {
     }
     return runOpenCommand("open", [url]);
   }
-  if (platform === "win32") {
-    return runOpenCommand("cmd", ["/c", "start", "", url]);
-  }
-  return runOpenCommand("xdg-open", [url]);
+  const { command, args } = getUrlOpenerCommand(url, platform);
+  return runOpenCommand(command, args);
 }
 
 function escapeHtml(value: string): string {
@@ -1023,16 +1082,21 @@ function lintColumnsBlocks(
     const start = match.index;
     const openingEnd = findJsxOpeningTagEnd(scanSource, start);
     if (openingEnd < 0) continue;
-    const opening = scanSource.slice(start, openingEnd + 1);
-    if (/\bcolumns\s*=/.test(opening)) {
-      addValidationIssue(
-        issues,
-        file,
-        source,
-        start,
-        'Columns must use <Column> children, not a columns= prop. Use <Columns><Column label="Before">...</Column><Column label="After">...</Column></Columns>.',
-      );
-    }
+    const opening = source.slice(start, openingEnd + 1);
+    const columnsAttr = readJsxAttribute(opening, "columns");
+    if (!columnsAttr) continue;
+    const entries =
+      columnsAttr.kind === "expression"
+        ? extractTopLevelObjectLiterals(columnsAttr.value)
+        : null;
+    if (entries && entries.length > 0) continue;
+    addValidationIssue(
+      issues,
+      file,
+      source,
+      start,
+      'Columns must use <Column> children or a columns={[{ id, label, blocks }]} array, not a bare columns= prop. Use <Columns><Column label="Before">...</Column><Column label="After">...</Column></Columns>.',
+    );
   }
 }
 
@@ -1318,6 +1382,116 @@ function hasRequiredEnumLiteral(
   return allowed.includes(trimmed.slice(1, -1).trim());
 }
 
+function checkChecklistItemList(
+  items: Array<{ source: string; start: number }>,
+  listBase: number,
+  file: string,
+  source: string,
+  issues: LocalPlanValidationIssue[],
+) {
+  items.forEach((item, index) => {
+    const base = listBase + item.start;
+    if (!hasRequiredStaticId(item.source)) {
+      addValidationIssue(
+        issues,
+        file,
+        source,
+        base,
+        `Checklist items[${index}].id is required by the Plan renderer schema; add a stable string id.`,
+      );
+    }
+    if (!hasRequiredStaticString(item.source, "label")) {
+      addValidationIssue(
+        issues,
+        file,
+        source,
+        base,
+        `Checklist items[${index}].label is required by the Plan renderer schema; add a non-empty string label.`,
+      );
+    }
+  });
+}
+
+function checkQuestionObjectList(
+  questionObjects: Array<{ source: string; start: number }>,
+  listBase: number,
+  tag: string,
+  file: string,
+  source: string,
+  issues: LocalPlanValidationIssue[],
+) {
+  questionObjects.forEach((question, questionIndex) => {
+    const questionBase = listBase + question.start;
+    if (!hasRequiredStaticId(question.source)) {
+      addValidationIssue(
+        issues,
+        file,
+        source,
+        questionBase,
+        `${tag} questions[${questionIndex}].id is required by the Plan renderer schema; add a stable string id.`,
+      );
+    }
+    if (!hasRequiredStaticString(question.source, "title")) {
+      addValidationIssue(
+        issues,
+        file,
+        source,
+        questionBase,
+        `${tag} questions[${questionIndex}].title is required by the Plan renderer schema; add a non-empty string title.`,
+      );
+    }
+    if (
+      !hasRequiredEnumLiteral(question.source, "mode", [
+        "single",
+        "multi",
+        "freeform",
+      ])
+    ) {
+      addValidationIssue(
+        issues,
+        file,
+        source,
+        questionBase,
+        `${tag} questions[${questionIndex}].mode is required by the Plan renderer schema; use "single", "multi", or "freeform".`,
+      );
+    }
+    const options = readTopLevelObjectProperty(question.source, "options");
+    if (!options) return;
+    const optionObjects = extractTopLevelObjectLiterals(options.value);
+    if (!optionObjects) {
+      addValidationIssue(
+        issues,
+        file,
+        source,
+        questionBase + options.valueStart,
+        `${tag} questions[${questionIndex}].options must be an inline array of object literals.`,
+      );
+      return;
+    }
+    optionObjects.forEach((option, optionIndex) => {
+      const optionBase = questionBase + options.valueStart + option.start;
+      if (!hasRequiredStaticId(option.source)) {
+        addValidationIssue(
+          issues,
+          file,
+          source,
+          optionBase,
+          `${tag} questions[${questionIndex}].options[${optionIndex}].id is required by the Plan renderer schema; add a stable string id.`,
+        );
+      }
+      if (!hasRequiredStaticString(option.source, "label")) {
+        addValidationIssue(
+          issues,
+          file,
+          source,
+          optionBase,
+          `${tag} questions[${questionIndex}].options[${optionIndex}].label is required by the Plan renderer schema; add a non-empty string label.`,
+        );
+      }
+    });
+  });
+}
+
 function lintChecklistShape(
   file: string,
   source: string,
@@ -1354,27 +1528,7 @@ function lintChecklistShape(
       );
       continue;
     }
-    objects.forEach((item, index) => {
-      const base = start + items.start + item.start;
-      if (!hasRequiredStaticId(item.source)) {
-        addValidationIssue(
-          issues,
-          file,
-          source,
-          base,
-          `Checklist items[${index}].id is required by the Plan renderer schema; add a stable string id.`,
-        );
-      }
-      if (!hasRequiredStaticString(item.source, "label")) {
-        addValidationIssue(
-          issues,
-          file,
-          source,
-          base,
-          `Checklist items[${index}].label is required by the Plan renderer schema; add a non-empty string label.`,
-        );
-      }
-    });
+    checkChecklistItemList(objects, start + items.start, file, source, issues);
   }
 }
 
@@ -1424,90 +1578,165 @@ function lintQuestionFormShape(
       );
       continue;
     }
-    questionObjects.forEach((question, questionIndex) => {
-      const questionBase = start + questions.start + question.start;
-      if (!hasRequiredStaticId(question.source)) {
-        addValidationIssue(
-          issues,
-          file,
-          source,
-          questionBase,
-          `${tag} questions[${questionIndex}].id is required by the Plan renderer schema; add a stable string id.`,
-        );
-      }
-      if (!hasRequiredStaticString(question.source, "title")) {
-        addValidationIssue(
-          issues,
-          file,
-          source,
-          questionBase,
-          `${tag} questions[${questionIndex}].title is required by the Plan renderer schema; add a non-empty string title.`,
-        );
-      }
-      if (
-        !hasRequiredEnumLiteral(question.source, "mode", [
-          "single",
-          "multi",
-          "freeform",
-        ])
-      ) {
-        addValidationIssue(
-          issues,
-          file,
-          source,
-          questionBase,
-          `${tag} questions[${questionIndex}].mode is required by the Plan renderer schema; use "single", "multi", or "freeform".`,
-        );
-      }
-      const options = readTopLevelObjectProperty(question.source, "options");
-      if (!options) return;
-      const optionObjects = extractTopLevelObjectLiterals(options.value);
-      if (!optionObjects) {
-        addValidationIssue(
-          issues,
-          file,
-          source,
-          start + questions.start + question.start + options.valueStart,
-          `${tag} questions[${questionIndex}].options must be an inline array of object literals.`,
-        );
-        return;
-      }
-      optionObjects.forEach((option, optionIndex) => {
-        const optionBase =
-          start +
-          questions.start +
-          question.start +
-          options.valueStart +
-          option.start;
-        if (!hasRequiredStaticId(option.source)) {
-          addValidationIssue(
-            issues,
-            file,
-            source,
-            optionBase,
-            `${tag} questions[${questionIndex}].options[${optionIndex}].id is required by the Plan renderer schema; add a stable string id.`,
-          );
-        }
-        if (!hasRequiredStaticString(option.source, "label")) {
-          addValidationIssue(
-            issues,
-            file,
-            source,
-            optionBase,
-            `${tag} questions[${questionIndex}].options[${optionIndex}].label is required by the Plan renderer schema; add a non-empty string label.`,
-          );
-        }
-      });
-    });
+    checkQuestionObjectList(
+      questionObjects,
+      start + questions.start,
+      tag,
+      file,
+      source,
+      issues,
+    );
   }
 }
 
-// Blank out fenced code blocks and inline code spans (preserving newlines and
-// length) so block-tag linters don't trip on documentation examples written in
-// prose — e.g. an inline `<WireframeBlock><Screen>...</Screen></WireframeBlock>`
-// example is not a real block to validate. Real blocks (outside code) are left
-// intact, so their offsets/line numbers stay correct. Without this the default
-// `plan local init` scaffold fails its own `plan local check`/`serve` lint.
+function staticStringLiteralValue(
+  value: string | undefined,
+): string | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  const quote = trimmed[0];
+  if (quote !== '"' && quote !== "'" && quote !== "`") return undefined;
+  if (!trimmed.endsWith(quote) || trimmed.length < 2) return undefined;
+  if (quote === "`" && /\$\{/.test(trimmed)) return undefined;
+  return trimmed.slice(1, -1);
+}
+
+const NESTED_CONTAINER_TAGS: ReadonlyArray<{ tag: string; attr: string }> = [
+  { tag: "TabsBlock", attr: "tabs" },
+  { tag: "Tabs", attr: "tabs" },
+  { tag: "Columns", attr: "columns" },
+];
+
+function lintNestedContainerEntry(
+  entrySource: string,
+  entryBase: number,
+  file: string,
+  source: string,
+  issues: LocalPlanValidationIssue[],
+) {
+  const blocksProp = readTopLevelObjectProperty(entrySource, "blocks");
+  if (!blocksProp) return;
+  const blockObjects = extractTopLevelObjectLiterals(blocksProp.value);
+  if (!blockObjects) return;
+  const blocksBase = entryBase + blocksProp.valueStart;
+  for (const block of blockObjects) {
+    lintNestedBlock(
+      block.source,
+      blocksBase + block.start,
+      file,
+      source,
+      issues,
+    );
+  }
+}
+
+function lintNestedBlock(
+  blockSource: string,
+  blockBase: number,
+  file: string,
+  source: string,
+  issues: LocalPlanValidationIssue[],
+) {
+  const typeProp = readTopLevelObjectProperty(blockSource, "type");
+  const type = staticStringLiteralValue(typeProp?.value);
+  if (!hasRequiredStaticId(blockSource)) {
+    addValidationIssue(
+      issues,
+      file,
+      source,
+      blockBase,
+      `Nested ${type ?? "block"} is missing a required string \`id\`; the Plan renderer schema validates every nested block.`,
+    );
+  }
+  const dataProp = readTopLevelObjectProperty(blockSource, "data");
+  if (!dataProp) return;
+  const dataBase = blockBase + dataProp.valueStart;
+
+  if (type === "checklist") {
+    const itemsProp = readTopLevelObjectProperty(dataProp.value, "items");
+    if (!itemsProp) return;
+    const items = extractTopLevelObjectLiterals(itemsProp.value);
+    if (items) {
+      checkChecklistItemList(
+        items,
+        dataBase + itemsProp.valueStart,
+        file,
+        source,
+        issues,
+      );
+    }
+    return;
+  }
+  if (type === "question-form" || type === "visual-questions") {
+    const questionsProp = readTopLevelObjectProperty(
+      dataProp.value,
+      "questions",
+    );
+    if (!questionsProp) return;
+    const questionObjects = extractTopLevelObjectLiterals(questionsProp.value);
+    if (questionObjects) {
+      checkQuestionObjectList(
+        questionObjects,
+        dataBase + questionsProp.valueStart,
+        type,
+        file,
+        source,
+        issues,
+      );
+    }
+    return;
+  }
+  if (type === "tabs" || type === "columns") {
+    const innerAttr = type === "tabs" ? "tabs" : "columns";
+    const innerProp = readTopLevelObjectProperty(dataProp.value, innerAttr);
+    if (!innerProp) return;
+    const innerEntries = extractTopLevelObjectLiterals(innerProp.value);
+    if (!innerEntries) return;
+    const innerBase = dataBase + innerProp.valueStart;
+    for (const entry of innerEntries) {
+      lintNestedContainerEntry(
+        entry.source,
+        innerBase + entry.start,
+        file,
+        source,
+        issues,
+      );
+    }
+  }
+}
+
+function lintNestedContainerBlocks(
+  file: string,
+  source: string,
+  issues: LocalPlanValidationIssue[],
+) {
+  const scanSource = maskCodeRegions(source);
+  for (const { tag, attr } of NESTED_CONTAINER_TAGS) {
+    const re = new RegExp(`<${tag}\\b`, "g");
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(scanSource))) {
+      const start = match.index;
+      const openingEnd = findJsxOpeningTagEnd(scanSource, start);
+      if (openingEnd < 0) continue;
+      const opening = source.slice(start, openingEnd + 1);
+      const attrValue = readJsxAttribute(opening, attr);
+      if (!attrValue || attrValue.kind !== "expression") continue;
+      const entries = extractTopLevelObjectLiterals(attrValue.value);
+      if (!entries) continue;
+      const entriesBase = start + attrValue.start;
+      for (const entry of entries) {
+        lintNestedContainerEntry(
+          entry.source,
+          entriesBase + entry.start,
+          file,
+          source,
+          issues,
+        );
+      }
+    }
+  }
+}
+
 function maskCodeRegions(source: string): string {
   const blank = (s: string) => s.replace(/[^\n]/g, " ");
   return source.replace(/```[\s\S]*?```/g, blank).replace(/`[^`\n]*`/g, blank);
@@ -1523,6 +1752,7 @@ export function validateLocalPlanFiles(
     lintColumnsBlocks(entry.file, source, issues);
     lintChecklistShape(entry.file, entry.source, issues);
     lintQuestionFormShape(entry.file, entry.source, issues);
+    lintNestedContainerBlocks(entry.file, entry.source, issues);
   }
   return issues;
 }
@@ -1698,15 +1928,164 @@ export function writeLocalPlanPreview(input: {
   };
 }
 
+function readLocalPlanBridgeComments(dir: string): LocalPlanBridgeComment[] {
+  try {
+    const raw = fs.readFileSync(
+      path.join(dir, LOCAL_PLAN_COMMENTS_FILE),
+      "utf-8",
+    );
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? (parsed as LocalPlanBridgeComment[]).filter(
+          (comment) => comment && typeof comment.id === "string",
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalPlanBridgeComments(
+  dir: string,
+  comments: LocalPlanBridgeComment[],
+): void {
+  const target = path.join(dir, LOCAL_PLAN_COMMENTS_FILE);
+  if (comments.length === 0) {
+    fs.rmSync(target, { force: true });
+    return;
+  }
+  fs.writeFileSync(target, `${JSON.stringify(comments, null, 2)}\n`, "utf-8");
+}
+
+function normalizeBridgeCommentString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function normalizeBridgeCommentNullableString(value: unknown): string | null {
+  const text = typeof value === "string" ? value.trim() : "";
+  return text || null;
+}
+
+function normalizeBridgeCommentStatus(value: unknown): string {
+  return value === "resolved" ? "resolved" : "open";
+}
+
+function newLocalBridgeCommentId(): string {
+  return `cmt_${crypto.randomBytes(8).toString("hex")}`;
+}
+
+function applyLocalPlanBridgeCommentUpdate(
+  dir: string,
+  update: LocalPlanBridgeCommentUpdate,
+): LocalPlanBridgeComment[] {
+  const existing = readLocalPlanBridgeComments(dir);
+  const byId = new Map(existing.map((comment) => [comment.id, comment]));
+  const now = new Date().toISOString();
+  const planId = `local-${path.basename(dir)}`;
+
+  for (const input of update.comments ?? []) {
+    const id =
+      normalizeBridgeCommentNullableString(input.id) ??
+      newLocalBridgeCommentId();
+    const prev = byId.get(id);
+    const status = normalizeBridgeCommentStatus(input.status ?? prev?.status);
+    const message =
+      typeof input.message === "string" ? input.message : prev?.message;
+    if (!message?.trim()) continue;
+
+    if (prev) {
+      byId.set(id, {
+        ...prev,
+        parentCommentId:
+          normalizeBridgeCommentNullableString(input.parentCommentId) ??
+          prev.parentCommentId,
+        sectionId:
+          normalizeBridgeCommentNullableString(input.sectionId) ??
+          prev.sectionId,
+        kind: normalizeBridgeCommentString(input.kind, prev.kind),
+        status,
+        anchor:
+          typeof input.anchor === "string" || input.anchor === null
+            ? input.anchor
+            : prev.anchor,
+        message,
+        authorEmail:
+          normalizeBridgeCommentNullableString(input.authorEmail) ??
+          prev.authorEmail,
+        authorName:
+          normalizeBridgeCommentNullableString(input.authorName) ??
+          prev.authorName,
+        resolutionTarget: "agent",
+        mentions: [],
+        mentionsJson: null,
+        resolvedAt:
+          status === "resolved"
+            ? (input.resolvedAt ?? prev.resolvedAt ?? now)
+            : null,
+        resolvedBy:
+          status === "resolved"
+            ? (input.resolvedBy ?? prev.resolvedBy ?? LOCAL_PLAN_OWNER_EMAIL)
+            : null,
+        updatedAt: now,
+      });
+      continue;
+    }
+
+    byId.set(id, {
+      id,
+      planId,
+      parentCommentId: normalizeBridgeCommentNullableString(
+        input.parentCommentId,
+      ),
+      sectionId: normalizeBridgeCommentNullableString(input.sectionId),
+      kind: normalizeBridgeCommentString(input.kind, "annotation"),
+      status,
+      anchor: normalizeBridgeCommentNullableString(input.anchor),
+      message,
+      createdBy: "human",
+      authorEmail:
+        normalizeBridgeCommentNullableString(input.authorEmail) ??
+        LOCAL_PLAN_OWNER_EMAIL,
+      authorName: normalizeBridgeCommentNullableString(input.authorName),
+      resolutionTarget: "agent",
+      mentions: [],
+      mentionsJson: null,
+      resolvedBy: status === "resolved" ? LOCAL_PLAN_OWNER_EMAIL : null,
+      resolvedAt: status === "resolved" ? now : null,
+      consumedAt: null,
+      deletedAt: null,
+      deletedBy: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+
+  for (const id of update.deletedCommentIds ?? []) {
+    byId.delete(id);
+    for (const comment of byId.values()) {
+      if (comment.parentCommentId === id) byId.delete(comment.id);
+    }
+  }
+
+  const comments = [...byId.values()].sort((a, b) =>
+    a.createdAt === b.createdAt
+      ? a.id.localeCompare(b.id)
+      : a.createdAt.localeCompare(b.createdAt),
+  );
+  writeLocalPlanBridgeComments(dir, comments);
+  return comments;
+}
+
 function buildLocalPlanBridgePayload(input: {
   dir: string;
   kind?: LocalPlanKind;
   title?: string;
   brief?: string;
+  skipSourceValidation?: boolean;
 }): LocalPlanBridgePayload {
   const dir = path.resolve(input.dir);
   const files = readLocalPlanFiles(dir);
-  assertLocalPlanFilesValid(files);
+  if (!input.skipSourceValidation) assertLocalPlanFilesValid(files);
   const parsed = stripFrontmatter(files.planMdx);
   const kind = input.kind || normalizeKind(parsed.frontmatter.kind);
   const title =
@@ -1715,6 +2094,7 @@ function buildLocalPlanBridgePayload(input: {
     firstHeading(parsed.body) ||
     path.basename(dir);
   const brief = input.brief || parsed.frontmatter.brief || "";
+  const comments = readLocalPlanBridgeComments(dir);
 
   return {
     ok: true,
@@ -1729,6 +2109,7 @@ function buildLocalPlanBridgePayload(input: {
     updatedAt: latestLocalPlanMtime(dir, files),
     files: localPlanFileList(files),
     mdx: localPlanMdxFolder(files),
+    comments,
   };
 }
 
@@ -1738,6 +2119,7 @@ function latestLocalPlanMtime(dir: string, files: LocalPlanFiles): string {
     ...(files.canvasMdx ? [path.join(dir, "canvas.mdx")] : []),
     ...(files.prototypeMdx ? [path.join(dir, "prototype.mdx")] : []),
     ...(files.stateJson ? [path.join(dir, ".plan-state.json")] : []),
+    path.join(dir, LOCAL_PLAN_COMMENTS_FILE),
     ...Object.keys(files.assets ?? {}).map((filename) =>
       path.join(dir, "assets", filename),
     ),
@@ -1760,15 +2142,53 @@ function sendBridgeJson(
 ): void {
   res.writeHead(status, {
     "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, OPTIONS",
+    "access-control-allow-methods": "GET, POST, OPTIONS",
     "access-control-allow-headers": "content-type",
-    // Required when the hosted HTTPS Plan UI fetches this localhost bridge.
     "access-control-allow-private-network": "true",
     "cache-control": "no-store",
     "content-type": "application/json; charset=utf-8",
     "x-agent-native-local-bridge": "1",
   });
   res.end(`${JSON.stringify(payload)}\n`);
+}
+
+function readBridgeJsonBody(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.setEncoding("utf-8");
+    req.on("data", (chunk) => {
+      raw += chunk;
+      if (raw.length > LOCAL_PLAN_BRIDGE_COMMENT_BODY_LIMIT) {
+        reject(new Error("Local plan comment update is too large."));
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (!raw.trim()) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        reject(new Error("Local plan comment update must be JSON."));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function normalizeBridgeCommentUpdatePayload(
+  payload: unknown,
+): LocalPlanBridgeCommentUpdate {
+  if (!payload || typeof payload !== "object") return {};
+  const input = payload as LocalPlanBridgeCommentUpdate;
+  return {
+    comments: Array.isArray(input.comments) ? input.comments : [],
+    deletedCommentIds: Array.isArray(input.deletedCommentIds)
+      ? input.deletedCommentIds.filter((id) => typeof id === "string")
+      : [],
+  };
 }
 
 function bridgeRequestUrl(req: IncomingMessage): URL {
@@ -1792,6 +2212,7 @@ export async function startLocalPlanBridge(input: {
   open?: boolean;
   urlFile?: string | false;
   openUrl?: (url: string) => OpenLocalUrlResult;
+  skipSourceValidation?: boolean;
 }): Promise<LocalPlanBridgeServer> {
   const dir = path.resolve(input.dir);
   const initialPayload = buildLocalPlanBridgePayload({
@@ -1799,6 +2220,7 @@ export async function startLocalPlanBridge(input: {
     kind: input.kind,
     title: input.title,
     brief: input.brief,
+    skipSourceValidation: input.skipSourceValidation,
   });
   const token = input.token || crypto.randomBytes(24).toString("base64url");
   const host = input.host || "127.0.0.1";
@@ -1808,13 +2230,12 @@ export async function startLocalPlanBridge(input: {
       sendBridgeJson(res, 204, "");
       return;
     }
-    if (req.method !== "GET") {
-      sendBridgeJson(res, 405, { ok: false, error: "Method not allowed." });
-      return;
-    }
 
     const url = bridgeRequestUrl(req);
-    if (url.pathname !== "/local-plan.json") {
+    if (
+      url.pathname !== "/local-plan.json" &&
+      url.pathname !== "/local-plan-comments.json"
+    ) {
       sendBridgeJson(res, 404, { ok: false, error: "Not found." });
       return;
     }
@@ -1822,24 +2243,42 @@ export async function startLocalPlanBridge(input: {
       sendBridgeJson(res, 403, { ok: false, error: "Invalid bridge token." });
       return;
     }
-
-    try {
-      sendBridgeJson(
-        res,
-        200,
-        buildLocalPlanBridgePayload({
-          dir,
-          kind: input.kind,
-          title: input.title,
-          brief: input.brief,
-        }),
-      );
-    } catch (error) {
-      sendBridgeJson(res, 500, {
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      });
+    if (url.pathname === "/local-plan.json" && req.method !== "GET") {
+      sendBridgeJson(res, 405, { ok: false, error: "Method not allowed." });
+      return;
     }
+    if (url.pathname === "/local-plan-comments.json" && req.method !== "POST") {
+      sendBridgeJson(res, 405, { ok: false, error: "Method not allowed." });
+      return;
+    }
+
+    void (async () => {
+      try {
+        if (url.pathname === "/local-plan-comments.json") {
+          const body = await readBridgeJsonBody(req);
+          applyLocalPlanBridgeCommentUpdate(
+            dir,
+            normalizeBridgeCommentUpdatePayload(body),
+          );
+        }
+        sendBridgeJson(
+          res,
+          200,
+          buildLocalPlanBridgePayload({
+            dir,
+            kind: input.kind,
+            title: input.title,
+            brief: input.brief,
+            skipSourceValidation: input.skipSourceValidation,
+          }),
+        );
+      } catch (error) {
+        sendBridgeJson(res, 500, {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    })();
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -1909,6 +2348,9 @@ function localPlanBridgeWarnings(input: {
     const bridgeUrl = new URL(input.bridgeUrl);
     if (appUrl.protocol === "https:" && bridgeUrl.protocol === "http:") {
       warnings.push(
+        `Chrome/Edge will ask for Local Network access so ${appUrl.hostname} can read this loopback bridge. Allow it; if you denied it, re-enable Local Network access in the ${appUrl.hostname} site settings, then retry.`,
+      );
+      warnings.push(
         "Safari may block the hosted HTTPS Plan UI from reading the HTTP localhost bridge. Use Chrome/Chromium/Edge, or pass --app-url http://localhost:8096 when running a local Plan app.",
       );
     }
@@ -1916,6 +2358,121 @@ function localPlanBridgeWarnings(input: {
     // The URLs were normalized earlier; ignore defensive parse failures.
   }
   return warnings;
+}
+
+const VALIDATE_LOCAL_PLAN_ACTION = "validate-local-plan-source";
+
+function isLoopbackAppUrl(value: string): boolean {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return (
+      hostname === "localhost" ||
+      hostname === "[::1]" ||
+      hostname === "::1" ||
+      hostname === "0.0.0.0" ||
+      hostname.startsWith("127.")
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchRendererValidation(input: {
+  appUrl: string;
+  files: LocalPlanFiles;
+  fetchFn?: typeof fetch;
+}): Promise<RendererValidation> {
+  const fetchFn = input.fetchFn ?? fetch;
+  const endpoint = planActionEndpoint(input.appUrl, VALIDATE_LOCAL_PLAN_ACTION);
+  if (!isLoopbackAppUrl(input.appUrl)) {
+    return {
+      ran: false,
+      endpoint,
+      error:
+        "Skipped remote renderer validation to keep local plan source on this device.",
+    };
+  }
+  try {
+    const response = await fetchActionWithTimeout(
+      endpoint,
+      {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ mdx: localPlanMdxFolder(input.files) }),
+      },
+      fetchFn,
+    );
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      return {
+        ran: false,
+        endpoint,
+        error: `${VALIDATE_LOCAL_PLAN_ACTION} failed ${response.status} ${
+          response.statusText
+        }: ${sanitizeHttpDetail(detail, 300)}`,
+      };
+    }
+    const json = (await response.json().catch(() => null)) as
+      | (Record<string, unknown> & { result?: Record<string, unknown> })
+      | null;
+    const body =
+      json && isRecord(json.result) ? json.result : (json ?? undefined);
+    if (!body || typeof body.valid !== "boolean") {
+      return {
+        ran: false,
+        endpoint,
+        error: `${VALIDATE_LOCAL_PLAN_ACTION} returned an unexpected payload.`,
+      };
+    }
+    const issues = Array.isArray(body.issues)
+      ? body.issues.filter(isRecord).map((issue) => ({
+          path: typeof issue.path === "string" ? issue.path : "",
+          message:
+            typeof issue.message === "string" ? issue.message : "Invalid value",
+        }))
+      : [];
+    return { ran: true, endpoint, valid: body.valid, issues };
+  } catch (err) {
+    return {
+      ran: false,
+      endpoint,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+function rendererValidationWarnings(
+  validation: RendererValidation,
+  offlineIssues: LocalPlanValidationIssue[],
+): string[] {
+  if (!validation.ran) {
+    const base = `Plan content was NOT validated against a local renderer schema (${
+      validation.error ?? "validate endpoint unavailable"
+    }). Fell back to the offline lint. For authoritative validation without data egress, run a local Plan app that exposes ${VALIDATE_LOCAL_PLAN_ACTION} and pass --app-url http://localhost:8096.`;
+    if (offlineIssues.length === 0) return [base];
+    const preview = offlineIssues
+      .slice(0, 8)
+      .map((issue) => `${issue.file}:${issue.line} ${issue.message}`)
+      .join("; ");
+    const overflow =
+      offlineIssues.length > 8 ? ` (+${offlineIssues.length - 8} more)` : "";
+    return [base, `Offline lint rejected this plan: ${preview}${overflow}`];
+  }
+  if (validation.valid) return [];
+  const issues = validation.issues ?? [];
+  const preview = issues
+    .slice(0, 8)
+    .map((issue) =>
+      issue.path ? `${issue.path}: ${issue.message}` : issue.message,
+    )
+    .join("; ");
+  const overflow = issues.length > 8 ? ` (+${issues.length - 8} more)` : "";
+  return [
+    `Renderer schema rejected this plan — it will not render. ${preview}${overflow}`,
+  ];
 }
 
 export async function verifyLocalPlanBridge(input: {
@@ -1931,6 +2488,7 @@ export async function verifyLocalPlanBridge(input: {
   fetchFn?: typeof fetch;
 }): Promise<LocalPlanVerifyResult> {
   const fetchFn = input.fetchFn ?? fetch;
+  const files = readLocalPlanFiles(input.dir);
   const bridge = await startLocalPlanBridge({
     dir: input.dir,
     kind: input.kind,
@@ -1941,6 +2499,7 @@ export async function verifyLocalPlanBridge(input: {
     port: input.port,
     token: input.token,
     urlFile: input.urlFile,
+    skipSourceValidation: true,
   });
 
   try {
@@ -1972,8 +2531,17 @@ export async function verifyLocalPlanBridge(input: {
       preflight.status === 204 &&
       preflight.headers.get("access-control-allow-origin") === "*" &&
       preflight.headers.get("access-control-allow-private-network") === "true";
+    const validation = await fetchRendererValidation({
+      appUrl: bridge.result.appUrl,
+      files,
+      fetchFn,
+    });
+    const offlineIssues = validation.ran ? [] : validateLocalPlanFiles(files);
+    const contentOk = validation.ran
+      ? validation.valid === true
+      : offlineIssues.length === 0;
     return {
-      ok: bridgeOk && preflightOk,
+      ok: bridgeOk && preflightOk && contentOk,
       dir: bridge.result.dir,
       url: bridge.result.url,
       ...(bridge.result.urlFile ? { urlFile: bridge.result.urlFile } : {}),
@@ -2000,10 +2568,14 @@ export async function verifyLocalPlanBridge(input: {
         ...(mdxFiles ? { mdxFiles } : {}),
         ...(payload?.error ? { error: payload.error } : {}),
       },
-      warnings: localPlanBridgeWarnings({
-        appUrl: bridge.result.appUrl,
-        bridgeUrl: bridge.result.bridgeUrl,
-      }),
+      validation,
+      warnings: [
+        ...localPlanBridgeWarnings({
+          appUrl: bridge.result.appUrl,
+          bridgeUrl: bridge.result.bridgeUrl,
+        }),
+        ...rendererValidationWarnings(validation, offlineIssues),
+      ],
     };
   } finally {
     await new Promise<void>((resolve) => bridge.server.close(() => resolve()));
@@ -2090,7 +2662,9 @@ function runCheck(args: Record<string, string | boolean>): void {
   const result = {
     ok: true,
     noDb: true,
-    validation: "passed",
+    validation: "lint-passed",
+    validationScope: "offline-lint",
+    note: "Quick offline lint only — NOT the full Plan renderer schema. A green here does not guarantee the plan renders. Run `plan local verify` against a Plan app for authoritative validation before handing off.",
     dir: files.dir,
     title: parsed.frontmatter.title || firstHeading(parsed.body),
     kind: normalizeKind(parsed.frontmatter.kind),
@@ -2332,7 +2906,8 @@ async function runServe(args: Record<string, string | boolean>): Promise<void> {
         appUrl: bridge.result.appUrl,
         bridgeUrl: bridge.result.bridgeUrl,
       }),
-      "Press Ctrl+C to stop.",
+      "Keep this bridge command running while the Plan page is open; stopping it makes this URL unreachable.",
+      "Press Ctrl C to stop.",
     ]
       .filter(Boolean)
       .join("\n") + "\n",
@@ -2462,7 +3037,7 @@ the local repo, the Plan bridge, or GitHub and authored structured Plan blocks.
 The local subcommands are the privacy-focused no-DB path. They only read and
 write local files: plan.mdx, optional canvas.mdx, optional prototype.mdx, and
 optional .plan-state.json. They do not call the Plan MCP server, the Plan app
-write actions, hosted storage, or SQLite.
+write actions, or hosted storage.
 
 Common flow:
   agent-native plan blocks --out plan-blocks.md
@@ -2473,8 +3048,12 @@ Common flow:
 against that local-only source. The hosted app fetches the MDX from localhost in
 the browser; it does not write plan content to the hosted database. The served
 URL is written to \`.plan-url\` by default; pass \`--url-file\` to choose a
-different local-only file. On macOS, \`--open\` prefers Chromium browsers because
-Safari may block the hosted HTTPS page from reading the HTTP localhost bridge.
+different local-only file. On macOS, \`--open\` prefers Chromium browsers.
+Chrome/Edge will ask for Local Network access to read the loopback bridge; if
+you deny it, re-enable Local Network access in the plan.agent-native.com site
+settings and retry. Keep the bridge command running while the page is open.
+Safari may block the hosted HTTPS page from reading the HTTP localhost bridge;
+use a Chromium browser or a local Plan app via \`--app-url http://localhost:8096\`.
 Use \`plan local verify\` for headless bridge/CORS diagnostics that exit cleanly.
 Use \`plan local preview\` for a local Plan dev server route. \`preview --out\` is
 a legacy/debug escape hatch that writes a standalone static HTML file.
@@ -2501,8 +3080,6 @@ export async function runPlan(argv: string[]): Promise<void> {
     return;
   }
   if (area !== "local") {
-    // Bare `agent-native plan` / `plan help` / `plan --help` → show help on
-    // stdout and exit 0 (informational, not an error).
     if (
       area === undefined ||
       area === "help" ||
@@ -2512,16 +3089,10 @@ export async function runPlan(argv: string[]): Promise<void> {
       process.stdout.write(HELP);
       return;
     }
-    // A non-empty, unrecognised area (e.g. `agent-native plan lokal`) is an
-    // error: print to stderr so the CI log captures it, and exit 1 so callers
-    // can detect the failure. This mirrors the existing behaviour for unknown
-    // subcommands inside `plan local`.
     process.stderr.write(`Unknown plan area: ${area}\n${HELP}`);
     process.exit(1);
   }
   const args = parseArgs(rest);
-  // `plan local <sub> --help` / `-h` shows help instead of running the
-  // subcommand (e.g. `plan local init --help` must not scaffold a folder).
   if (args.help === true || args.h === true) {
     process.stdout.write(HELP);
     return;

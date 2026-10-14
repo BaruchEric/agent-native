@@ -1,9 +1,10 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import {
   getRequestUserEmail,
   getRequestOrgId,
 } from "@agent-native/core/server";
 import { z } from "zod";
+
 import { hideAnalysis, unhideAnalysis } from "../server/lib/dashboards-store";
 import { cliBoolean } from "./schema-helpers";
 

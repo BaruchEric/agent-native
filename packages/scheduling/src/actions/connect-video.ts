@@ -15,9 +15,10 @@
  * Google Calendar credential) do not expose `startOAuth` and should be
  * installed via `install-conferencing-app` instead.
  */
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { getRequestUserEmail } from "@agent-native/core/server/request-context";
 import { z } from "zod";
+
 import { getVideoProvider } from "../server/providers/registry.js";
 import { signVideoOAuthState } from "../server/video-oauth-state.js";
 

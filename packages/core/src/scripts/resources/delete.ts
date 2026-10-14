@@ -1,20 +1,68 @@
-/**
- * Core script: resource-delete
- *
- * Delete a resource from the SQL store.
- *
- * Usage:
- *   pnpm action resource-delete --path <path> [--scope personal|shared]
- */
-
-import { parseArgs, fail } from "../utils.js";
+import { getOrgRoleForEmail } from "../../mcp/actions/service-token-access.js";
+import { canManageOrg } from "../../org/permissions.js";
 import {
   canWriteLocalWorkspaceResourcePath,
+  isLegacyOrganizationWorkspaceFile,
   resourceDeleteByPath,
+  resourceDeleteIfCurrent,
+  resourceGetByPath,
   SHARED_OWNER,
+  sharedResourceOwner,
   WORKSPACE_OWNER,
 } from "../../resources/store.js";
-import { getRequestUserEmail } from "../../server/request-context.js";
+import {
+  getAmbientUserEmail,
+  getRequestOrgId,
+  getRequestUserEmail,
+} from "../../server/request-context.js";
+import { parseArgs, fail } from "../utils.js";
+
+async function assertCanDeleteSharedResource(): Promise<void> {
+  const orgId = getRequestOrgId();
+  if (!orgId) return;
+
+  const email = getRequestUserEmail()?.trim() ?? getAmbientUserEmail()?.trim();
+  const role = email ? await getOrgRoleForEmail(orgId, email) : null;
+  if (!email || !canManageOrg(role)) {
+    fail("Only organization owners and admins can edit organization files");
+  }
+}
+
+async function deleteSharedResource(resourcePath: string): Promise<boolean> {
+  const orgId = getRequestOrgId() ?? null;
+  const owner = sharedResourceOwner(orgId);
+  if (owner === SHARED_OWNER) {
+    return resourceDeleteByPath(owner, resourcePath);
+  }
+
+  const options = { orgId };
+  const organizationResource = await resourceGetByPath(
+    owner,
+    resourcePath,
+    options,
+  );
+  if (organizationResource) {
+    const deleted = await resourceDeleteIfCurrent(organizationResource);
+    if (!deleted) return false;
+
+    const legacy = await resourceGetByPath(SHARED_OWNER, resourcePath, options);
+    if (
+      legacy &&
+      isLegacyOrganizationWorkspaceFile(legacy, orgId) &&
+      typeof legacy.metadata === "string"
+    ) {
+      await resourceDeleteIfCurrent(legacy);
+    }
+    return true;
+  }
+
+  const legacy = await resourceGetByPath(SHARED_OWNER, resourcePath, options);
+  return legacy &&
+    isLegacyOrganizationWorkspaceFile(legacy, orgId) &&
+    typeof legacy.metadata === "string"
+    ? resourceDeleteIfCurrent(legacy)
+    : false;
+}
 
 export default async function resourceDeleteScript(
   args: string[],
@@ -45,22 +93,22 @@ Options:
       );
     }
   }
-  let owner: string;
+  let deleted: boolean;
   if (scope === "shared") {
-    owner = SHARED_OWNER;
+    await assertCanDeleteSharedResource();
+    deleted = await deleteSharedResource(resourcePath);
   } else if (scope === "workspace") {
-    owner = WORKSPACE_OWNER;
+    deleted = await resourceDeleteByPath(WORKSPACE_OWNER, resourcePath);
   } else {
-    const personalOwner = getRequestUserEmail() ?? process.env.AGENT_USER_EMAIL;
+    const personalOwner = getRequestUserEmail() ?? getAmbientUserEmail();
     if (!personalOwner) {
       fail(
         "resource-delete --scope=personal requires an authenticated user (request context or AGENT_USER_EMAIL env var).",
       );
     }
-    owner = personalOwner;
+    deleted = await resourceDeleteByPath(personalOwner, resourcePath);
   }
 
-  const deleted = await resourceDeleteByPath(owner, resourcePath);
   if (deleted) {
     console.log(`Deleted resource: ${resourcePath}`);
   } else {

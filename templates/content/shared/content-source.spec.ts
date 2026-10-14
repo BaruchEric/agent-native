@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
+
 import {
   buildContentSourceBundle,
   contentSourcePathForDocument,
+  isBuilderMdxSourcePath,
+  isContentSourcePath,
   parseContentSourceFile,
   serializeContentSourceDocument,
 } from "./content-source";
@@ -47,6 +50,19 @@ describe("content source files", () => {
       parentId: null,
       title: "Launch Plan",
       content: "First line\n\nSecond line",
+      visibility: "private",
+    });
+  });
+
+  it("rejects invalid visibility frontmatter", () => {
+    expect(
+      parseContentSourceFile(
+        "content/pricing-page.mdx",
+        '---\nid: "doc_1234"\nvisibility: "team"\n---\n\nBody',
+      ),
+    ).toMatchObject({
+      visibility: undefined,
+      errors: ["Invalid visibility frontmatter."],
     });
   });
 
@@ -108,5 +124,15 @@ describe("content source files", () => {
     expect(Object.keys(bundle.files)).toEqual([
       "content/hello-world--abc123.mdx",
     ]);
+  });
+
+  it("reserves Builder MDX files for Builder-specific actions", () => {
+    expect(
+      isBuilderMdxSourcePath("content/builder/docs/intro.builder.mdx"),
+    ).toBe(true);
+    expect(isContentSourcePath("content/builder/docs/intro.builder.mdx")).toBe(
+      false,
+    );
+    expect(isContentSourcePath("content/plain.mdx")).toBe(true);
   });
 });

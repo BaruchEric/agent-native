@@ -1,100 +1,171 @@
-import { useState, useMemo, useEffect, useCallback, useRef } from "react";
-import { Link } from "react-router";
-import { cn } from "@/lib/utils";
-import { isMcpEmbedSurface } from "@/lib/mcp-embed";
+import { trackEvent } from "@agent-native/core/client/analytics";
+import { agentNativePath } from "@agent-native/core/client/api-path";
+import { useT } from "@agent-native/core/client/i18n";
+import { buildSettingsRoute } from "@agent-native/core/client/navigation";
+import type {
+  CalendarEvent,
+  CalendarEventDraft,
+  UpdateEventScope,
+} from "@shared/api";
+import { getWeekStartsOn } from "@shared/calendar-week";
+import { isCalendarEventOrganizer } from "@shared/event-permissions";
 import {
-  format,
-  startOfMonth,
-  endOfMonth,
-  startOfWeek,
-  endOfWeek,
-  addMonths,
-  subMonths,
-  addWeeks,
-  subWeeks,
-  addDays,
-  subDays,
-  parseISO,
-  startOfDay,
-} from "date-fns";
-import {
+  IconCalendarDot,
   IconCheck,
   IconChevronLeft,
   IconChevronRight,
   IconChevronDown,
   IconMenu2,
   IconSearch,
+  IconUsers,
 } from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  format,
+  startOfWeek,
+  addMonths,
+  subMonths,
+  addWeeks,
+  subWeeks,
+  addDays,
+  subDays,
+} from "date-fns";
+import { useState, useMemo, useEffect, useCallback, useRef } from "react";
+import { Link } from "react-router";
+import { toast } from "sonner";
+
+import type { QuickCreateEvent } from "@/components/calendar/CommandPalette";
+import { CommandPalette } from "@/components/calendar/CommandPalette";
+import { CreateEventPopover } from "@/components/calendar/CreateEventDialog";
+import { DayView } from "@/components/calendar/DayView";
+import { DeleteEventDialog } from "@/components/calendar/DeleteEventDialog";
+import { EventDetailPanel } from "@/components/calendar/EventDetailPanel";
+import { GoogleConnectBanner } from "@/components/calendar/GoogleConnectBanner";
+import {
+  shouldPromptGuests,
+  useGuestNotificationPrompt,
+} from "@/components/calendar/GuestNotificationDialog";
+import { MonthView } from "@/components/calendar/MonthView";
+import { PeopleSearchDialog } from "@/components/calendar/PeopleSearchDialog";
+import { TimezoneSwitchDialog } from "@/components/calendar/TimezoneSwitchDialog";
+import { WeekView } from "@/components/calendar/WeekView";
+import { useCalendarContext } from "@/components/layout/AppLayout";
+import type { ViewMode } from "@/components/layout/AppLayout";
+import { HeaderActions } from "@/components/layout/HeaderActions";
 import { Button } from "@/components/ui/button";
 import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Spinner } from "@/components/ui/spinner";
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { Spinner } from "@/components/ui/spinner";
-import { MonthView } from "@/components/calendar/MonthView";
-import { WeekView } from "@/components/calendar/WeekView";
-import { DayView } from "@/components/calendar/DayView";
-import { CreateEventPopover } from "@/components/calendar/CreateEventDialog";
-import { CommandPalette } from "@/components/calendar/CommandPalette";
-import { GoogleConnectBanner } from "@/components/calendar/GoogleConnectBanner";
-import { PeopleSearchDialog } from "@/components/calendar/PeopleSearchDialog";
-import { EventDetailPanel } from "@/components/calendar/EventDetailPanel";
-import { DeleteEventDialog } from "@/components/calendar/DeleteEventDialog";
-import {
-  shouldPromptGuests,
-  useGuestNotificationPrompt,
-} from "@/components/calendar/GuestNotificationDialog";
-import { useCalendarContext } from "@/components/layout/AppLayout";
 import {
   useEvents,
   useCreateEvent,
   useUpdateEvent,
   useDeleteEvent,
+  useRsvpEvent,
+  findEventByCurrentOrReplacedId,
+  findVisibleSelectedEvent,
   prefetchEvents,
   shouldShowEventsSkeleton,
 } from "@/hooks/use-events";
-import { useOverlayPeople } from "@/hooks/use-overlay-people";
 import { useGoogleAuthStatus } from "@/hooks/use-google-auth";
-import { useSettings } from "@/hooks/use-settings";
-import { useViewPreferences } from "@/hooks/use-view-preferences";
+import { useGoogleCalendars } from "@/hooks/use-google-calendars";
 import { useMeetingStartNotifications } from "@/hooks/use-meeting-start-notifications";
-import { useQueryClient } from "@tanstack/react-query";
-import {
-  AgentToggleButton,
-  agentNativePath,
-  NotificationsBell,
-} from "@agent-native/core/client";
 import { useIsMobile } from "@/hooks/use-mobile";
-import { toast } from "sonner";
+import { useOverlayPeople } from "@/hooks/use-overlay-people";
+import { useSettings, useUpdateSettings } from "@/hooks/use-settings";
 import { setUndoAction, runUndo } from "@/hooks/use-undo";
-import type { CalendarEvent, CalendarEventDraft } from "@shared/api";
+import { useViewPreferences } from "@/hooks/use-view-preferences";
 import {
+  buildAllDayEventDraft,
+  buildWorkingLocationDraft,
+  resolveDraftWorkingLocation,
+} from "@/lib/calendar-drafts";
+import {
+  getCalendarEventRenderKey,
+  withCalendarEventSourceIdentity,
+} from "@/lib/calendar-event-identity";
+import { navigateCalendarDate } from "@/lib/calendar-navigation";
+import {
+  calendarSlotDraftId,
+  createOrLoadCalendarSlotDraft,
+  type CalendarSlotPrefill,
+} from "@/lib/calendar-slot-prefill";
+import {
+  addCalendarDays,
+  dateKeyToDate,
+  dateToCalendarDateKey,
+  eventOverlapsCalendarDay,
+  getBrowserTimezone,
+  getDateKeyInTimezone,
+  getEventDateKey,
+  getViewDateRange,
+  moveEventToCalendarDate,
+  normalizeTimezone,
+} from "@/lib/calendar-timezone";
+import {
+  DEFAULT_CALENDAR_DAYS,
+  isEventVisibleForDeclinedPreference,
+  MAX_CALENDAR_DAYS,
+  MIN_CALENDAR_DAYS,
+  normalizeNumberOfDays,
+} from "@/lib/calendar-view-preferences";
+import { resolveEventAccountEmail } from "@/lib/event-account-selection";
+import {
+  applyOverlayOwnerMarkers,
+  getGoogleEventColorHex,
+} from "@/lib/event-colors";
+import {
+  buildEventTitleUpdate,
   dateTimeInTimezoneToIso,
-  getLocalTimezone,
+  getEditableEventTitle,
+  UNNAMED_EVENT_TITLE,
+  resolveEventTimezone,
 } from "@/lib/event-form-utils";
-import { getGoogleEventColorHex } from "@/lib/event-colors";
-
-import type { ViewMode } from "@/components/layout/AppLayout";
-
-const viewModeLabels: Record<ViewMode, string> = {
-  month: "Month",
-  week: "Week",
-  day: "Day",
-};
+import { buildDeleteEventMutationInput } from "@/lib/event-mutation-inputs";
+import { isCalendarShortcutSuppressedTarget } from "@/lib/keyboard-shortcuts";
+import { getLocationSuggestions } from "@/lib/location-suggestions";
+import { isMcpEmbedSurface } from "@/lib/mcp-embed";
+import { isPersonCalendarId } from "@/lib/person-calendar";
+import { cn } from "@/lib/utils";
+import {
+  buildWorkingLocationProperties,
+  findOwnedWorkingLocationForDay,
+} from "@/lib/working-location";
 
 const CALENDAR_DRAFT_EVENT_PREFIX = "calendar-draft-event:";
+const TIMEZONE_DISMISSAL_PREFIX = "calendar.timezone.dismissed.";
+
+function timezoneDismissalKey(savedTimezone: string, browserTimezone: string) {
+  return `${TIMEZONE_DISMISSAL_PREFIX}${encodeURIComponent(
+    savedTimezone,
+  )}:${encodeURIComponent(browserTimezone)}`;
+}
 
 type DraftEventPatch = Partial<CalendarEvent> & {
+  fullDay?: boolean;
   addGoogleMeet?: boolean;
   addZoom?: boolean;
   workingLocationType?: "homeOffice" | "officeLocation" | "customLocation";
@@ -102,7 +173,7 @@ type DraftEventPatch = Partial<CalendarEvent> & {
 };
 
 function safeCalendarDraftId(id: string | undefined): string | null {
-  return id && /^[a-zA-Z0-9_-]{1,64}$/.test(id) ? id : null;
+  return id && /^[a-zA-Z0-9_-]{1,96}$/.test(id) ? id : null;
 }
 
 function calendarDraftEventId(id: string) {
@@ -133,6 +204,16 @@ function fallbackDraftRange(fallbackDate: Date) {
   return { start, end };
 }
 
+function isRecurringCalendarEvent(event: CalendarEvent): boolean {
+  return Boolean(event.recurringEventId || event.recurrence?.length);
+}
+
+function updateScopePayload(scope: UpdateEventScope | undefined): {
+  scope?: UpdateEventScope;
+} {
+  return scope ? { scope } : {};
+}
+
 function addMinutesToDateTimeParts(
   date: string,
   time: string,
@@ -157,8 +238,43 @@ function addMinutesToDateTimeParts(
 
 function draftRange(draft: CalendarEventDraft, fallbackDate: Date) {
   const fallback = fallbackDraftRange(fallbackDate);
-  const start = parseValidDate(draft.start) ?? fallback.start;
-  const parsedEnd = parseValidDate(draft.end);
+  const fullDayTimezone = draft.startTimeZone ?? draft.endTimeZone;
+  const fullDayDatePattern = /^\d{4}-\d{2}-\d{2}$/;
+  const semanticFullDay =
+    draft.eventType === "outOfOffice" &&
+    draft.fullDay &&
+    fullDayTimezone &&
+    draft.start &&
+    draft.end &&
+    fullDayDatePattern.test(draft.start) &&
+    fullDayDatePattern.test(draft.end);
+  const dateOnlyAllDay =
+    draft.allDay === true &&
+    !semanticFullDay &&
+    Boolean(
+      draft.start &&
+      draft.end &&
+      fullDayDatePattern.test(draft.start) &&
+      fullDayDatePattern.test(draft.end),
+    );
+  const start = dateOnlyAllDay
+    ? dateKeyToDate(draft.start!)
+    : semanticFullDay
+      ? new Date(
+          dateTimeInTimezoneToIso(draft.start!, "00:00", fullDayTimezone!),
+        )
+      : (parseValidDate(draft.start) ?? fallback.start);
+  const parsedEnd = dateOnlyAllDay
+    ? dateKeyToDate(draft.end!)
+    : semanticFullDay
+      ? new Date(
+          dateTimeInTimezoneToIso(
+            addCalendarDays(draft.end!, 1),
+            "00:00",
+            fullDayTimezone!,
+          ),
+        )
+      : parseValidDate(draft.end);
   const end =
     parsedEnd && parsedEnd.getTime() > start.getTime()
       ? parsedEnd
@@ -171,16 +287,38 @@ function draftToCalendarEvent(
   fallbackDate: Date,
 ): CalendarEvent {
   const { start, end } = draftRange(draft, fallbackDate);
+  const editableTitle = draft.title?.trim() ?? "";
+  const allDay =
+    draft.eventType === "outOfOffice" && draft.fullDay
+      ? false
+      : (draft.allDay ?? false);
+  const dateOnlyAllDay =
+    allDay &&
+    Boolean(
+      draft.start &&
+      draft.end &&
+      /^\d{4}-\d{2}-\d{2}$/.test(draft.start) &&
+      /^\d{4}-\d{2}-\d{2}$/.test(draft.end),
+    );
+  const { workingLocationType, workingLocationLabel } =
+    resolveDraftWorkingLocation(draft);
   return {
     id: calendarDraftEventId(draft.id),
-    title: draft.title?.trim() || "(No title)",
+    title:
+      editableTitle ||
+      (draft.eventType === "outOfOffice"
+        ? "Out of office"
+        : draft.eventType === "workingLocation"
+          ? "Working location"
+          : UNNAMED_EVENT_TITLE),
+    titleIsGenerated: !editableTitle,
     description: draft.description ?? "",
-    start: start.toISOString(),
-    end: end.toISOString(),
+    start: dateOnlyAllDay ? draft.start! : start.toISOString(),
+    end: dateOnlyAllDay ? draft.end! : end.toISOString(),
     startTimeZone: draft.startTimeZone,
     endTimeZone: draft.endTimeZone ?? draft.startTimeZone,
-    location: draft.location ?? draft.workingLocationLabel ?? "",
-    allDay: draft.allDay ?? false,
+    location: draft.location || workingLocationLabel,
+    allDay,
     source: "local",
     accountEmail: draft.accountEmail,
     colorId: draft.colorId,
@@ -188,6 +326,18 @@ function draftToCalendarEvent(
     transparency: draft.transparency,
     visibility: draft.visibility,
     eventType: draft.eventType ?? "default",
+    workingLocationProperties:
+      draft.eventType === "workingLocation"
+        ? buildWorkingLocationProperties(
+            { workingLocationProperties: undefined },
+            {
+              type: workingLocationType,
+              label: workingLocationLabel,
+            },
+          )
+        : undefined,
+    outOfOfficeProperties: draft.outOfOfficeProperties,
+    recurrence: draft.recurrence,
     attendees: draft.attendees,
     reminders: draft.reminders,
     remindersUseDefault: draft.remindersUseDefault,
@@ -224,10 +374,17 @@ function applyDraftPatch(
   copy("endTimeZone");
   copy("location");
   copy("allDay");
+  copy("fullDay");
   copy("eventType");
+  if (patch.allDay === true && next.eventType !== "outOfOffice") {
+    delete next.startTimeZone;
+    delete next.endTimeZone;
+  }
+  copy("outOfOfficeProperties");
   copy("transparency");
   copy("visibility");
   copy("colorId");
+  copy("recurrence");
   copy("reminders");
   copy("remindersUseDefault");
   copy("attachments");
@@ -277,7 +434,12 @@ function deletePersistedCalendarDraft(id: string) {
   ).catch(() => {});
 }
 
-export default function CalendarView() {
+export default function CalendarView({
+  slotPrefill,
+}: {
+  slotPrefill: CalendarSlotPrefill | null;
+}) {
+  const t = useT();
   const isMobile = useIsMobile();
   const {
     selectedDate,
@@ -286,6 +448,7 @@ export default function CalendarView() {
     setViewMode,
     peopleSearchOpen,
     setPeopleSearchOpen,
+    addCalendarOpen,
     setAddCalendarOpen,
     setAddCalendarDefaultTab,
     eventDetailSidebar,
@@ -308,56 +471,231 @@ export default function CalendarView() {
     Record<string, string>
   >({});
   const openedDraftIdRef = useRef<string | null>(null);
+  const appliedSlotPrefillRef = useRef<string | null>(null);
+  const preserveDraftViewRef = useRef(false);
   const committingDraftIdsRef = useRef<Set<string>>(new Set());
   const discardedCommittingDraftsRef = useRef<Map<string, CalendarEventDraft>>(
     new Map(),
   );
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [customDaysOpen, setCustomDaysOpen] = useState(false);
+  const [customDaysInput, setCustomDaysInput] = useState(
+    String(DEFAULT_CALENDAR_DAYS),
+  );
+  const openCommandPalette = useCallback(() => {
+    if (commandPaletteOpen) return;
+    trackEvent("calendar_search_opened", {
+      app_name: "calendar",
+      template_name: "calendar",
+      surface: "calendar_view",
+    });
+    setCommandPaletteOpen(true);
+  }, [commandPaletteOpen]);
   const [deleteDialogEvent, setDeleteDialogEvent] =
     useState<CalendarEvent | null>(null);
 
+  useEffect(() => {
+    if (!slotPrefill) {
+      appliedSlotPrefillRef.current = null;
+      return;
+    }
+
+    const prefillKey = `${slotPrefill.start}|${slotPrefill.end}|${slotPrefill.timezone}`;
+    if (appliedSlotPrefillRef.current === prefillKey) return;
+    let cancelled = false;
+    const draftAtStart = eventDraft;
+    const draftId = calendarSlotDraftId(slotPrefill);
+    appliedSlotPrefillRef.current = prefillKey;
+    void createOrLoadCalendarSlotDraft(slotPrefill, draftId)
+      .then((draft) => {
+        if (cancelled || eventDraft !== draftAtStart) return;
+        setEventDraft(draft);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          appliedSlotPrefillRef.current = null;
+          toast.error(t("common.loadFailed"));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    setEventDraft,
+    eventDraft,
+    slotPrefill?.end,
+    slotPrefill?.start,
+    slotPrefill?.timezone,
+    t,
+  ]);
+
+  useEffect(() => {
+    trackEvent("calendar_viewed", {
+      app_name: "calendar",
+      template_name: "calendar",
+      view_type: viewMode,
+    });
+  }, [viewMode]);
+
   const queryClient = useQueryClient();
   const googleStatus = useGoogleAuthStatus();
+  const googleCalendars = useGoogleCalendars();
+  const defaultAccountEmail = googleStatus.data?.accounts?.[0]?.email;
   const settingsQuery = useSettings();
   const { data: settings } = settingsQuery;
+  const weekStartsOn = getWeekStartsOn(settings?.weekStart);
+  const updateSettings = useUpdateSettings();
+  const displayTimezone = normalizeTimezone(settings?.timezone);
+  const [timezonePrompt, setTimezonePrompt] = useState<{
+    savedTimezone: string;
+    browserTimezone: string;
+  } | null>(null);
   const { data: rawOverlayPeople } = useOverlayPeople();
-  const overlayPeople = Array.isArray(rawOverlayPeople) ? rawOverlayPeople : [];
-  const overlayEmails = useMemo(
-    () => overlayPeople.map((p) => p.email),
-    [overlayPeople],
+  const overlayPeople = useMemo(
+    () => (Array.isArray(rawOverlayPeople) ? rawOverlayPeople : []),
+    [rawOverlayPeople],
   );
+  const enabledGoogleSources = useMemo(() => {
+    if (!googleCalendars.enabled || !googleCalendars.data) return undefined;
+    return googleCalendars.data.filter((source) => {
+      if (source.accessRole === "freeBusyReader") {
+        return false;
+      }
+      return (
+        viewPrefs.googleCalendarVisibility[source.canonicalKey] ??
+        (source.primary || source.selected)
+      );
+    });
+  }, [
+    googleCalendars.data,
+    googleCalendars.enabled,
+    viewPrefs.googleCalendarVisibility,
+  ]);
+  const enabledGoogleCalendarSourceKeys = useMemo(
+    () => enabledGoogleSources?.map((source) => source.sourceKey),
+    [enabledGoogleSources],
+  );
+  const googleHiddenPersonEmails = useMemo(() => {
+    const hidden = new Set<string>();
+    for (const source of googleCalendars.data ?? []) {
+      if (!isPersonCalendarId(source.calendarId)) continue;
+      if (source.accessRole === "freeBusyReader") continue;
+      const explicitVisible =
+        viewPrefs.googleCalendarVisibility[source.canonicalKey];
+      if (explicitVisible === false)
+        hidden.add(source.calendarId.toLowerCase());
+    }
+    return hidden;
+  }, [googleCalendars.data, viewPrefs.googleCalendarVisibility]);
+  const overlayEmails = useMemo(() => {
+    const coveredByGoogle = new Set(
+      (enabledGoogleSources ?? []).map((source) =>
+        source.calendarId.toLowerCase(),
+      ),
+    );
+    return overlayPeople
+      .map((person) => person.email)
+      .filter((email) => !coveredByGoogle.has(email.toLowerCase()));
+  }, [overlayPeople, enabledGoogleSources]);
   const createEvent = useCreateEvent();
   const updateEvent = useUpdateEvent();
   const deleteEvent = useDeleteEvent();
+  const rsvpEvent = useRsvpEvent();
   const { promptGuestNotification, guestNotificationDialog } =
     useGuestNotificationPrompt();
+  const viewModeLabels: Record<ViewMode, string> = {
+    month: t("calendarView.month"),
+    week: t("calendarView.week"),
+    day: t("calendarView.day"),
+  };
 
-  // Compute date range for query based on view
-  const { from, to } = useMemo(() => {
-    switch (viewMode) {
-      case "month": {
-        const ms = startOfMonth(selectedDate);
-        const me = endOfMonth(selectedDate);
-        return {
-          from: startOfWeek(ms).toISOString(),
-          to: endOfWeek(me).toISOString(),
-        };
+  useEffect(() => {
+    if (!settings?.timezone || typeof window === "undefined") return;
+
+    const checkBrowserTimezone = () => {
+      const browserTimezone = getBrowserTimezone();
+      if (browserTimezone === settings.timezone) {
+        setTimezonePrompt(null);
+        return;
       }
-      case "week": {
-        return {
-          from: startOfWeek(selectedDate).toISOString(),
-          to: endOfWeek(selectedDate).toISOString(),
-        };
+
+      const dismissalKey = timezoneDismissalKey(
+        settings.timezone,
+        browserTimezone,
+      );
+      try {
+        if (window.localStorage.getItem(dismissalKey) === "1") {
+          setTimezonePrompt(null);
+          return;
+        }
+      } catch (error) {
+        console.warn(
+          "Calendar timezone dismissal could not be read from local storage.",
+          error,
+        );
       }
-      case "day": {
-        const dayStart = new Date(selectedDate);
-        dayStart.setHours(0, 0, 0, 0);
-        const dayEnd = new Date(selectedDate);
-        dayEnd.setHours(23, 59, 59, 999);
-        return { from: dayStart.toISOString(), to: dayEnd.toISOString() };
-      }
+      setTimezonePrompt({
+        savedTimezone: settings.timezone,
+        browserTimezone,
+      });
+    };
+
+    checkBrowserTimezone();
+    window.addEventListener("focus", checkBrowserTimezone);
+    document.addEventListener("visibilitychange", checkBrowserTimezone);
+    return () => {
+      window.removeEventListener("focus", checkBrowserTimezone);
+      document.removeEventListener("visibilitychange", checkBrowserTimezone);
+    };
+  }, [settings?.timezone]);
+
+  const keepSavedTimezone = useCallback(() => {
+    if (!timezonePrompt) return;
+    try {
+      window.localStorage.setItem(
+        timezoneDismissalKey(
+          timezonePrompt.savedTimezone,
+          timezonePrompt.browserTimezone,
+        ),
+        "1",
+      );
+    } catch (error) {
+      console.warn(
+        "Calendar timezone dismissal could not be saved to local storage.",
+        error,
+      );
     }
-  }, [viewMode, selectedDate]);
+    setTimezonePrompt(null);
+  }, [timezonePrompt]);
+
+  const switchToBrowserTimezone = useCallback(() => {
+    if (!timezonePrompt || !settings) return;
+    updateSettings.mutate(
+      { ...settings, timezone: timezonePrompt.browserTimezone },
+      {
+        onSuccess: () => setTimezonePrompt(null),
+        onError: () => toast.error(t("settings.saveFailed")),
+      },
+    );
+  }, [settings, t, timezonePrompt, updateSettings]);
+
+  const { from, to } = useMemo(
+    () =>
+      getViewDateRange(
+        viewMode,
+        selectedDate,
+        displayTimezone,
+        weekStartsOn,
+        viewPrefs.numberOfDays,
+      ),
+    [
+      displayTimezone,
+      selectedDate,
+      viewMode,
+      viewPrefs.numberOfDays,
+      weekStartsOn,
+    ],
+  );
 
   const {
     data: rawEventsData,
@@ -365,7 +703,7 @@ export default function CalendarView() {
     isLoading,
     isFetching,
     isPlaceholderData,
-  } = useEvents(from, to, overlayEmails);
+  } = useEvents(from, to, overlayEmails, enabledGoogleCalendarSourceKeys);
   const rawEvents = Array.isArray(rawEventsData) ? rawEventsData : [];
   const draftEvent = useMemo(
     () => (eventDraft ? draftToCalendarEvent(eventDraft, selectedDate) : null),
@@ -376,11 +714,28 @@ export default function CalendarView() {
     [draftEvent],
   );
 
-  // Warm the adjacent ranges so j/k (and the chevron buttons) feel instant.
-  // Borrowed from the mail template's background-warm pattern — fire-and-forget
-  // prefetch that lets React Query dedupe and reuse the response when the user
-  // actually navigates. Only runs once the current range has loaded so we
-  // don't fight the primary fetch for bandwidth.
+  useEffect(() => {
+    if (!eventDraft || !defaultAccountEmail) return;
+    const resolvedAccountEmail = resolveEventAccountEmail(
+      googleStatus.data?.accounts ?? [],
+      eventDraft.accountEmail,
+    );
+    if (
+      !resolvedAccountEmail ||
+      eventDraft.accountEmail === resolvedAccountEmail
+    ) {
+      return;
+    }
+    const nextDraft = { ...eventDraft, accountEmail: resolvedAccountEmail };
+    setEventDraft(nextDraft);
+    persistCalendarDraft(nextDraft);
+  }, [
+    defaultAccountEmail,
+    eventDraft,
+    googleStatus.data?.accounts,
+    setEventDraft,
+  ]);
+
   useEffect(() => {
     if (isLoading) return;
     const ranges = (() => {
@@ -388,48 +743,63 @@ export default function CalendarView() {
         case "month": {
           const next = addMonths(selectedDate, 1);
           const prev = subMonths(selectedDate, 1);
-          return [next, prev].map((d) => ({
-            from: startOfWeek(startOfMonth(d)).toISOString(),
-            to: endOfWeek(endOfMonth(d)).toISOString(),
-          }));
+          return [next, prev].map((date) =>
+            getViewDateRange("month", date, displayTimezone, weekStartsOn),
+          );
         }
         case "week": {
-          // Two weeks forward so rapid `j j` stays instant, plus one back.
-          const next = addWeeks(selectedDate, 1);
-          const next2 = addWeeks(selectedDate, 2);
-          const prev = subWeeks(selectedDate, 1);
-          return [next, next2, prev].map((d) => ({
-            from: startOfWeek(d).toISOString(),
-            to: endOfWeek(d).toISOString(),
-          }));
+          const step = normalizeNumberOfDays(viewPrefs.numberOfDays);
+          const currentPeriodStart =
+            step === 7
+              ? dateKeyToDate(
+                  dateToCalendarDateKey(
+                    startOfWeek(selectedDate, { weekStartsOn }),
+                  ),
+                )
+              : selectedDate;
+          const next = addDays(currentPeriodStart, step);
+          const next2 = addDays(currentPeriodStart, step * 2);
+          const prev = subDays(currentPeriodStart, step);
+          return [next, next2, prev].map((date) =>
+            getViewDateRange(
+              "week",
+              date,
+              displayTimezone,
+              weekStartsOn,
+              viewPrefs.numberOfDays,
+            ),
+          );
         }
         case "day": {
           const next = addDays(selectedDate, 1);
           const prev = subDays(selectedDate, 1);
-          return [next, prev].map((d) => {
-            const start = new Date(d);
-            start.setHours(0, 0, 0, 0);
-            const end = new Date(d);
-            end.setHours(23, 59, 59, 999);
-            return { from: start.toISOString(), to: end.toISOString() };
-          });
+          return [next, prev].map((date) =>
+            getViewDateRange("day", date, displayTimezone, weekStartsOn),
+          );
         }
       }
     })();
     for (const range of ranges) {
-      void prefetchEvents(queryClient, range.from, range.to, overlayEmails);
+      void prefetchEvents(
+        queryClient,
+        range.from,
+        range.to,
+        overlayEmails,
+        enabledGoogleCalendarSourceKeys,
+      );
     }
-  }, [isLoading, viewMode, selectedDate, overlayEmails, queryClient]);
+  }, [
+    displayTimezone,
+    enabledGoogleCalendarSourceKeys,
+    isLoading,
+    overlayEmails,
+    queryClient,
+    selectedDate,
+    viewMode,
+    viewPrefs.numberOfDays,
+    weekStartsOn,
+  ]);
 
-  // Show the skeleton only when there is genuinely nothing to show for the
-  // current date range — the first load, or navigating to a range we have not
-  // fetched yet. Crucially, do NOT show it when only the *set* of calendars
-  // changes (adding/removing a feed or person overlay). Those swaps change the
-  // query key, so `keepPreviousData` keeps the user's existing events on screen
-  // as placeholder data; flashing a skeleton over them is the bug. Instead we
-  // keep the events visible and let the refreshed set merge in. We track the
-  // last date range we settled real (non-placeholder) data for, so a skeleton
-  // only appears when the range itself differs.
   const rangeKey = `${from}|${to}`;
   const settledRangeRef = useRef<string | null>(null);
   useEffect(() => {
@@ -443,37 +813,49 @@ export default function CalendarView() {
     settledRangeKey: settledRangeRef.current,
     rangeKey,
   });
-  // A quiet background refresh is in flight (e.g. a newly added calendar's
-  // events are still loading) while the existing events stay visible. Drives a
-  // small non-blocking spinner instead of hiding everything behind a skeleton.
   const eventsRefreshing = isFetching && !eventsLoading;
 
-  // Apply overlay colors and filter hidden calendars
   const events = useMemo(() => {
-    const colorMap = new Map(overlayPeople.map((p) => [p.email, p.color]));
     const sourceEvents = draftEvent
       ? [...rawEvents.filter((e) => e.id !== draftEvent.id), draftEvent]
       : rawEvents;
-    return sourceEvents
+    return applyOverlayOwnerMarkers(sourceEvents, overlayPeople)
       .map((e) => {
-        if (e.overlayEmail && colorMap.has(e.overlayEmail)) {
-          return { ...e, color: colorMap.get(e.overlayEmail) };
-        }
         const tempId = quickEditTempIds[e.id];
         return tempId && !e._tempId ? { ...e, _tempId: tempId } : e;
       })
       .filter((e) => {
-        // Hide events from hidden people overlays
         if (e.overlayEmail && hiddenCalendars.people.includes(e.overlayEmail))
           return false;
-        // Hide events from hidden Google accounts
         if (
-          e.accountEmail &&
-          !e.overlayEmail &&
-          hiddenCalendars.accounts.includes(e.accountEmail)
+          e.overlayEmail &&
+          googleHiddenPersonEmails.has(e.overlayEmail.toLowerCase())
         )
           return false;
-        // Hide events from hidden external calendars
+        if (
+          e.source === "google" &&
+          e.canonicalKey &&
+          viewPrefs.googleCalendarVisibility[e.canonicalKey] === false
+        ) {
+          return false;
+        }
+        if (
+          e.source === "google" &&
+          e.calendarId &&
+          hiddenCalendars.people.some(
+            (email) => email.toLowerCase() === e.calendarId!.toLowerCase(),
+          )
+        ) {
+          return false;
+        }
+        if (
+          !isEventVisibleForDeclinedPreference(
+            e.responseStatus,
+            viewPrefs.showDeclinedEvents,
+          )
+        ) {
+          return false;
+        }
         if (e.source === "ical") {
           const hiddenMatch = hiddenCalendars.external.some((calId) =>
             e.id.startsWith(`ical-${calId}-`),
@@ -482,31 +864,42 @@ export default function CalendarView() {
         }
         return true;
       });
-  }, [rawEvents, draftEvent, overlayPeople, hiddenCalendars, quickEditTempIds]);
+  }, [
+    rawEvents,
+    draftEvent,
+    overlayPeople,
+    hiddenCalendars,
+    quickEditTempIds,
+    viewPrefs.showDeclinedEvents,
+    viewPrefs.googleCalendarVisibility,
+    googleHiddenPersonEmails,
+  ]);
 
-  // Filter events for day view — use overlap check so multi-day continuation
-  // events (started on a prior day) still appear on the selected day.
-  const dayEvents = useMemo(
-    () =>
-      viewMode === "day"
-        ? events.filter((e) => {
-            const evStart = parseISO(e.start);
-            const evEnd = parseISO(e.end);
-            const dayStart = startOfDay(selectedDate);
-            const dayEnd = addDays(dayStart, 1);
-            return evStart < dayEnd && evEnd > dayStart;
-          })
-        : events,
-    [events, viewMode, selectedDate],
+  const dayEvents = useMemo(() => {
+    if (viewMode !== "day") return events;
+    return events.filter((event) =>
+      eventOverlapsCalendarDay(event, selectedDate, displayTimezone),
+    );
+  }, [displayTimezone, events, selectedDate, viewMode]);
+  const locationSuggestions = useMemo(
+    () => getLocationSuggestions(events),
+    [events],
   );
   const openNotificationEvent = useCallback(
     (event: CalendarEvent) => {
-      setSelectedDate(parseISO(event.start));
+      const eventDate = getEventDateKey(event, displayTimezone);
+      if (eventDate) setSelectedDate(dateKeyToDate(eventDate));
       setViewMode("day");
       setSidebarEvent(event);
       setFocusedEvent(event);
     },
-    [setFocusedEvent, setSelectedDate, setSidebarEvent, setViewMode],
+    [
+      displayTimezone,
+      setFocusedEvent,
+      setSelectedDate,
+      setSidebarEvent,
+      setViewMode,
+    ],
   );
   useMeetingStartNotifications(events, openNotificationEvent);
 
@@ -517,10 +910,17 @@ export default function CalendarView() {
     }
     if (openedDraftIdRef.current === eventDraft.id) return;
     openedDraftIdRef.current = eventDraft.id;
+    const preserveView = preserveDraftViewRef.current;
+    preserveDraftViewRef.current = false;
 
-    const { start } = draftRange(eventDraft, selectedDate);
-    setSelectedDate(start);
-    if (isMobile || viewMode === "month") {
+    const draftDate = getEventDateKey(
+      draftToCalendarEvent(eventDraft, selectedDate),
+      displayTimezone,
+    );
+    if (!preserveView && draftDate) {
+      setSelectedDate(dateKeyToDate(draftDate));
+    }
+    if (!preserveView && (isMobile || viewMode === "month")) {
       setViewMode("day");
     }
     setCreateDefaultStart(undefined);
@@ -531,6 +931,7 @@ export default function CalendarView() {
     setQuickEditEventId(calendarDraftEventId(eventDraft.id));
   }, [
     eventDraft,
+    displayTimezone,
     isMobile,
     selectedDate,
     setEventDetailSidebar,
@@ -546,60 +947,103 @@ export default function CalendarView() {
       if (!draftId || !eventDraft || eventDraft.id !== draftId) return;
       if (committingDraftIdsRef.current.has(draftId)) return;
       committingDraftIdsRef.current.add(draftId);
-      const draft = pendingPatch
+      const pendingDraft = pendingPatch
         ? applyDraftPatch(eventDraft, pendingPatch)
         : eventDraft;
+      const accountEmail = resolveEventAccountEmail(
+        googleStatus.data?.accounts ?? [],
+        pendingDraft.accountEmail,
+      );
+      if (!accountEmail) {
+        committingDraftIdsRef.current.delete(draftId);
+        toast.error(t("calendarView.calendarSettingsLoading"));
+        return;
+      }
+      const draft =
+        pendingDraft.accountEmail === accountEmail
+          ? pendingDraft
+          : { ...pendingDraft, accountEmail };
       discardedCommittingDraftsRef.current.delete(draftId);
-      if (pendingPatch) {
+      if (pendingPatch || draft !== pendingDraft) {
         setEventDraft(draft);
         persistCalendarDraft(draft);
       }
-      const trimmedTitle = draft.title?.trim();
+      const editableTitle = draft.title?.trim() ?? "";
+      const eventType = draft.eventType ?? "default";
       const title =
-        trimmedTitle && trimmedTitle !== "(No title)" ? trimmedTitle : "";
-      if (!title && !isSlotDraftId(draftId)) {
+        editableTitle || (eventType === "outOfOffice" ? "Out of office" : "");
+      if (
+        !title &&
+        eventType !== "workingLocation" &&
+        !isSlotDraftId(draftId)
+      ) {
         committingDraftIdsRef.current.delete(draftId);
-        toast.error("Add a title before creating the event");
+        toast.error(t("calendarView.addTitleBeforeCreate"));
         return;
       }
 
       const { start, end } = draftRange(draft, selectedDate);
       if (end.getTime() <= start.getTime()) {
         committingDraftIdsRef.current.delete(draftId);
-        toast.error("End time must be after start time");
+        toast.error(t("calendarView.endTimeAfterStart"));
         return;
       }
 
-      const eventType = draft.eventType ?? "default";
-      const location = draft.location ?? draft.workingLocationLabel ?? "";
-      const timezone = draft.startTimeZone ?? getLocalTimezone();
+      const { workingLocationType, workingLocationLabel } =
+        resolveDraftWorkingLocation(draft);
+      const location =
+        eventType === "workingLocation"
+          ? workingLocationLabel
+          : (draft.location ?? "");
+      const timezone = resolveEventTimezone(
+        draft.startTimeZone ?? draft.endTimeZone ?? displayTimezone,
+      );
+      const semanticFullDay =
+        eventType === "outOfOffice" &&
+        draft.fullDay === true &&
+        /^\d{4}-\d{2}-\d{2}$/.test(draft.start ?? "") &&
+        /^\d{4}-\d{2}-\d{2}$/.test(draft.end ?? "");
+      const dateOnlyAllDay =
+        draft.allDay === true &&
+        /^\d{4}-\d{2}-\d{2}$/.test(draft.start ?? "") &&
+        /^\d{4}-\d{2}-\d{2}$/.test(draft.end ?? "");
       const statusPatch =
         eventType === "default"
           ? {}
           : {
               eventType,
-              workingLocationType:
-                draft.workingLocationType ?? "customLocation",
-              workingLocationLabel:
-                (draft.workingLocationType ?? "customLocation") ===
-                "customLocation"
-                  ? location
-                  : draft.workingLocationLabel,
+              workingLocationType,
+              workingLocationLabel,
+              autoDeclineMode:
+                eventType === "outOfOffice"
+                  ? draft.outOfOfficeProperties?.autoDeclineMode
+                  : undefined,
+              declineMessage:
+                eventType === "outOfOffice"
+                  ? draft.outOfOfficeProperties?.declineMessage
+                  : undefined,
             };
 
       const payload: Parameters<typeof createEvent.mutate>[0] = {
         _tempId: eventId,
         title,
-        description: draft.description ?? "",
-        start: start.toISOString(),
-        end: end.toISOString(),
-        startTimeZone: draft.allDay ? undefined : timezone,
-        endTimeZone: draft.allDay
-          ? undefined
-          : (draft.endTimeZone ?? draft.startTimeZone ?? timezone),
-        location,
-        accountEmail: draft.accountEmail,
+        titleIsGenerated: !editableTitle,
+        description:
+          eventType === "outOfOffice" ? "" : (draft.description ?? ""),
+        start:
+          semanticFullDay || dateOnlyAllDay
+            ? draft.start!
+            : start.toISOString(),
+        end: semanticFullDay || dateOnlyAllDay ? draft.end! : end.toISOString(),
+        startTimeZone: draft.allDay && !semanticFullDay ? undefined : timezone,
+        endTimeZone:
+          draft.allDay && !semanticFullDay
+            ? undefined
+            : (draft.endTimeZone ?? draft.startTimeZone ?? timezone),
+        location: eventType === "outOfOffice" ? "" : location,
+        accountEmail,
         allDay: draft.allDay ?? false,
+        fullDay: draft.fullDay,
         transparency:
           eventType === "workingLocation"
             ? "transparent"
@@ -611,14 +1055,16 @@ export default function CalendarView() {
         reminders: draft.reminders,
         remindersUseDefault: draft.remindersUseDefault,
         ...statusPatch,
-        addGoogleMeet: draft.addGoogleMeet,
-        addZoom: draft.addZoom,
+        addGoogleMeet:
+          eventType === "outOfOffice" ? undefined : draft.addGoogleMeet,
+        addZoom: eventType === "outOfOffice" ? undefined : draft.addZoom,
         color: draft.colorId
           ? getGoogleEventColorHex(draft.colorId)
           : undefined,
         colorId: draft.colorId,
+        recurrence: draft.recurrence,
         attachments: draft.attachments,
-        attendees: draft.attendees,
+        attendees: eventType === "outOfOffice" ? undefined : draft.attendees,
       };
 
       deletePersistedCalendarDraft(draftId);
@@ -627,14 +1073,25 @@ export default function CalendarView() {
       createEvent.mutate(payload, {
         onSuccess: (result) => {
           discardedCommittingDraftsRef.current.delete(draftId);
+          if (result?.videoConferenceError === "zoom") {
+            toast.error(t("eventForm.zoomAddFailed"));
+          }
           const createdEventId = result?.id;
           if (createdEventId) {
             const undo = () => {
-              deleteEvent.mutate({
-                id: createdEventId,
-                scope: "single",
-                sendUpdates: "none",
-              });
+              deleteEvent.mutate(
+                buildDeleteEventMutationInput(
+                  {
+                    ...result,
+                    id: createdEventId,
+                    accountEmail:
+                      result.accountEmail ??
+                      draft.accountEmail ??
+                      defaultAccountEmail,
+                  },
+                  { scope: "single", sendUpdates: "none" },
+                ),
+              );
             };
             setUndoAction(undo);
           }
@@ -649,7 +1106,9 @@ export default function CalendarView() {
             setQuickEditEventId(calendarDraftEventId(draftId));
           }
           toast.error(
-            error instanceof Error ? error.message : "Failed to create event",
+            error instanceof Error
+              ? error.message
+              : t("eventForm.createFailed"),
           );
         },
         onSettled: () => {
@@ -657,7 +1116,17 @@ export default function CalendarView() {
         },
       });
     },
-    [createEvent, deleteEvent, eventDraft, selectedDate, setEventDraft],
+    [
+      createEvent,
+      defaultAccountEmail,
+      deleteEvent,
+      eventDraft,
+      displayTimezone,
+      googleStatus.data?.accounts,
+      selectedDate,
+      setEventDraft,
+      t,
+    ],
   );
 
   const updateDraftEvent = useCallback(
@@ -699,30 +1168,94 @@ export default function CalendarView() {
     ],
   );
 
+  useEffect(() => {
+    if (sidebarEvent) {
+      const rebound = findVisibleSelectedEvent(
+        events,
+        sidebarEvent,
+        viewPrefs.showDeclinedEvents,
+      );
+      if (!rebound) setSidebarEvent(null);
+      else if (rebound.id !== sidebarEvent.id) setSidebarEvent(rebound);
+    }
+    if (focusedEvent) {
+      const rebound = findVisibleSelectedEvent(
+        events,
+        focusedEvent,
+        viewPrefs.showDeclinedEvents,
+      );
+      if (!rebound) setFocusedEvent(null);
+      else if (rebound.id !== focusedEvent.id) setFocusedEvent(rebound);
+    }
+  }, [
+    events,
+    focusedEvent,
+    setFocusedEvent,
+    setSidebarEvent,
+    sidebarEvent,
+    viewPrefs.showDeclinedEvents,
+  ]);
+
   const selectedEvent = useMemo(() => {
     const candidate = sidebarEvent ?? focusedEvent;
     if (!candidate) return null;
-    return events.find((event) => event.id === candidate.id) ?? candidate;
-  }, [events, sidebarEvent, focusedEvent]);
+    return (
+      findVisibleSelectedEvent(
+        events,
+        candidate,
+        viewPrefs.showDeclinedEvents,
+      ) ?? null
+    );
+  }, [events, sidebarEvent, focusedEvent, viewPrefs.showDeclinedEvents]);
+
+  const refreshedSidebarEvent = useMemo(() => {
+    if (!sidebarEvent) return null;
+    return (
+      findVisibleSelectedEvent(
+        events,
+        sidebarEvent,
+        viewPrefs.showDeclinedEvents,
+      ) ?? null
+    );
+  }, [events, sidebarEvent, viewPrefs.showDeclinedEvents]);
 
   function handleNavigate(direction: "prev" | "next") {
-    const fns =
-      direction === "next"
-        ? { month: addMonths, week: addWeeks, day: addDays }
-        : { month: subMonths, week: subWeeks, day: subDays };
-    setSelectedDate(fns[viewMode](selectedDate, 1));
+    trackEvent("calendar_date_navigated", {
+      app_name: "calendar",
+      template_name: "calendar",
+      direction,
+      view_type: viewMode,
+    });
+    setSelectedDate(
+      navigateCalendarDate(
+        viewMode,
+        selectedDate,
+        direction,
+        weekStartsOn,
+        viewPrefs.numberOfDays,
+      ),
+    );
   }
 
   function handleToday() {
-    setSelectedDate(new Date());
+    trackEvent("calendar_today_clicked", {
+      app_name: "calendar",
+      template_name: "calendar",
+      view_type: viewMode,
+    });
+    const today = getDateKeyInTimezone(new Date(), displayTimezone);
+    if (today) setSelectedDate(dateKeyToDate(today));
   }
 
-  function handleDateSelect(date: Date) {
-    setSelectedDate(date);
-    if (viewMode === "month") {
-      setViewMode("day");
-    }
-  }
+  const handleDateSelect = useCallback(
+    (date: Date) => {
+      setSelectedDate(date);
+      if (viewMode === "month") {
+        setViewMode("day");
+      }
+    },
+    [viewMode, setSelectedDate, setViewMode],
+  );
 
   function handleGoToDate(date: Date) {
     setSelectedDate(date);
@@ -731,7 +1264,7 @@ export default function CalendarView() {
 
   function handleOpenSelectedEventInGoogleCalendar(event: CalendarEvent) {
     if (!event.htmlLink) {
-      toast.error("Google Calendar link unavailable");
+      toast.error(t("calendarView.googleCalendarLinkUnavailable"));
       return;
     }
 
@@ -744,7 +1277,7 @@ export default function CalendarView() {
             url.pathname.startsWith("/calendar/")));
 
       if (!isGoogleCalendarUrl) {
-        toast.error("Google Calendar link unavailable");
+        toast.error(t("calendarView.googleCalendarLinkUnavailable"));
         return;
       }
 
@@ -757,384 +1290,637 @@ export default function CalendarView() {
         window.location.assign(url.toString());
       }
     } catch {
-      toast.error("Google Calendar link unavailable");
+      toast.error(t("calendarView.googleCalendarLinkUnavailable"));
     }
   }
 
-  async function handleDirectDelete(
-    ev: CalendarEvent,
-    notificationOptions?: {
-      sendUpdates: "all" | "none";
-      notificationMessage?: string;
-    },
-  ) {
-    const isOrganizer =
-      ev.organizer?.self ||
-      ev.attendees?.find((a) => a.self)?.organizer ||
-      !ev.attendees?.length;
-    const hasOtherAttendees =
-      ev.attendees && ev.attendees.filter((a) => !a.self).length > 0;
-    const removeOnly = !isOrganizer && !!hasOtherAttendees;
-    const shouldAskGuests = !removeOnly && shouldPromptGuests(ev);
-    const guestNotification =
-      notificationOptions ??
-      (shouldAskGuests
-        ? await promptGuestNotification({
-            event: ev,
-            action: "cancellation",
-          })
-        : { sendUpdates: "none" as const });
-    if (!guestNotification) return;
-
-    // Snapshot for undo — preserve all event fields so undo recreates faithfully
-    const { id: _id, source: _source, ...snapshot } = ev;
-    const undo = () => {
-      createEvent.mutate(snapshot);
-    };
-
-    deleteEvent.mutate(
-      {
-        id: ev.id,
-        scope: "single",
-        ...guestNotification,
-        removeOnly,
+  const handleDirectDelete = useCallback(
+    async (
+      ev: CalendarEvent,
+      notificationOptions?: {
+        sendUpdates: "all" | "none";
+        notificationMessage?: string;
       },
-      {
-        onSuccess: () => {
-          if (sidebarEvent?.id === ev.id) setSidebarEvent(null);
-          setUndoAction(undo);
-          toast(`Event ${removeOnly ? "removed" : "deleted"}`, {
-            action: { label: "Undo", onClick: undo },
-          });
-        },
-        onError: () => toast.error("Failed to delete event"),
-      },
-    );
-  }
-
-  function handleDeleteEvent(eventId: string) {
-    if (calendarDraftIdFromEventId(eventId)) {
-      discardDraftEvent(eventId);
-      return;
-    }
-    const ev = events.find((e) => e.id === eventId);
-    if (!ev) return;
-    const isRecurring = !!(ev.recurringEventId || ev.recurrence?.length);
-    const isOrganizer =
-      ev.organizer?.self ||
-      ev.attendees?.find((a) => a.self)?.organizer ||
-      !ev.attendees?.length;
-    const hasOtherAttendees =
-      ev.attendees && ev.attendees.filter((a) => !a.self).length > 0;
-    const removeOnly = !isOrganizer && !!hasOtherAttendees;
-    if (isRecurring || (!removeOnly && shouldPromptGuests(ev))) {
-      setDeleteDialogEvent(ev);
-    } else {
-      void handleDirectDelete(ev);
-    }
-  }
-
-  // Move event to a new date (drag-and-drop from MonthView)
-  async function handleEventDrop(eventId: string, newDate: Date) {
-    const event = events.find((e) => e.id === eventId);
-    if (!event) return;
-
-    if (calendarDraftIdFromEventId(eventId)) {
-      const originalStart = parseISO(event.start);
-      const originalEnd = parseISO(event.end);
-      const newStart = new Date(originalStart);
-      const newEnd = new Date(originalEnd);
-      newStart.setFullYear(
-        newDate.getFullYear(),
-        newDate.getMonth(),
-        newDate.getDate(),
-      );
-      newEnd.setFullYear(
-        newDate.getFullYear(),
-        newDate.getMonth(),
-        newDate.getDate(),
-      );
-      updateDraftEvent(eventId, {
-        start: newStart.toISOString(),
-        end: newEnd.toISOString(),
-      });
-      return;
-    }
-
-    const oldStartISO = event.start;
-    const oldEndISO = event.end;
-    const originalStart = parseISO(event.start);
-    const originalEnd = parseISO(event.end);
-    const newStart = new Date(originalStart);
-    const newEnd = new Date(originalEnd);
-
-    newStart.setFullYear(
-      newDate.getFullYear(),
-      newDate.getMonth(),
-      newDate.getDate(),
-    );
-    newEnd.setFullYear(
-      newDate.getFullYear(),
-      newDate.getMonth(),
-      newDate.getDate(),
-    );
-
-    const undo = () => {
-      updateEvent.mutate({
-        id: eventId,
-        start: oldStartISO,
-        end: oldEndISO,
-        sendUpdates: "none",
-      });
-    };
-    const updates = {
-      start: newStart.toISOString(),
-      end: newEnd.toISOString(),
-    };
-    const guestNotification = await promptGuestNotification({
-      event,
-      action: "update",
-      updates,
-    });
-    if (!guestNotification) return;
-
-    updateEvent.mutate(
-      {
-        id: eventId,
-        ...updates,
-        ...guestNotification,
-      },
-      {
-        onSuccess: () => {
-          setUndoAction(undo);
-          toast("Event moved", {
-            action: { label: "Undo", onClick: undo },
-          });
-        },
-        onError: () => toast.error("Failed to move event"),
-      },
-    );
-  }
-
-  // Move/resize event to new start/end times (drag from Week/Day views)
-  async function handleEventTimeChange(
-    eventId: string,
-    newStart: Date,
-    newEnd: Date,
-  ) {
-    // Skip no-op drags (dropped back in same spot)
-    const event = events.find((e) => e.id === eventId);
-    if (!event) return;
-
-    if (calendarDraftIdFromEventId(eventId)) {
-      const timezone = settings?.timezone || getLocalTimezone();
-      updateDraftEvent(eventId, {
-        start: newStart.toISOString(),
-        end: newEnd.toISOString(),
-        allDay: false,
-        startTimeZone: timezone,
-        endTimeZone: timezone,
-      });
-      return;
-    }
-
-    const oldStart = parseISO(event.start).getTime();
-    const oldEnd = parseISO(event.end).getTime();
-    if (oldStart === newStart.getTime() && oldEnd === newEnd.getTime()) {
-      return;
-    }
-
-    const oldStartISO = event.start;
-    const oldEndISO = event.end;
-    const undo = () => {
-      updateEvent.mutate({
-        id: eventId,
-        start: oldStartISO,
-        end: oldEndISO,
-        sendUpdates: "none",
-      });
-    };
-    const updates = {
-      start: newStart.toISOString(),
-      end: newEnd.toISOString(),
-    };
-    const guestNotification = await promptGuestNotification({
-      event,
-      action: "update",
-      updates,
-    });
-    if (!guestNotification) return;
-
-    updateEvent.mutate(
-      {
-        id: eventId,
-        ...updates,
-        ...guestNotification,
-      },
-      {
-        onSuccess: () => {
-          setUndoAction(undo);
-          toast("Event updated", {
-            action: { label: "Undo", onClick: undo },
-          });
-        },
-        onError: () => toast.error("Failed to update event"),
-      },
-    );
-  }
-
-  async function handleClickTimeSlot(
-    clickedDate: Date,
-    startTime: string,
-    _endTime: string,
-  ) {
-    let activeSettings = settings;
-    if (!activeSettings) {
-      const result = await settingsQuery.refetch();
-      activeSettings = result.data;
-    }
-    if (!activeSettings?.timezone) {
-      toast.error(
-        "Calendar settings are still loading. Try again in a moment.",
-      );
-      return;
-    }
-
-    setSelectedDate(clickedDate);
-    const defaultDuration = Math.max(
-      5,
-      activeSettings.defaultEventDuration ?? 30,
-    );
-    const timezone = activeSettings.timezone;
-    setCreateDefaultStart(startTime);
-    setCreateDialogOpen(false);
-
-    const dateStr = format(clickedDate, "yyyy-MM-dd");
-    const end = addMinutesToDateTimeParts(dateStr, startTime, defaultDuration);
-    setCreateDefaultEnd(end.time);
-    const startISO = dateTimeInTimezoneToIso(dateStr, startTime, timezone);
-    const endISO = dateTimeInTimezoneToIso(end.date, end.time, timezone);
-    const now = new Date().toISOString();
-    const draftId = `slot-${Date.now()}`;
-    const draft: CalendarEventDraft = {
-      id: draftId,
-      title: "",
-      description: "",
-      location: "",
-      start: startISO,
-      end: endISO,
-      startTimeZone: timezone,
-      endTimeZone: timezone,
-      allDay: false,
-      eventType: "default",
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    persistCalendarDraft(draft);
-    setEventDraft(draft);
-    setQuickEditEventId(calendarDraftEventId(draftId));
-  }
-
-  async function handleQuickEditSave(eventId: string, title: string) {
-    setQuickEditEventId(null);
-    if (calendarDraftIdFromEventId(eventId)) {
-      updateDraftEvent(eventId, { title: title.trim() });
-      return;
-    }
-    setQuickEditTempIds((current) => {
-      if (!current[eventId]) return current;
-      const { [eventId]: _removed, ...next } = current;
-      return next;
-    });
-    if (title.trim() && title.trim() !== "(No title)") {
-      const event = events.find((e) => e.id === eventId);
-      const updates = { title: title.trim() };
-      const guestNotification = event
-        ? await promptGuestNotification({
-            event,
-            action: "update",
-            updates,
-          })
-        : { sendUpdates: "none" as const };
+    ) => {
+      if (ev.calendarPrimary === false || ev.calendarReadOnly) return;
+      const isOrganizer = isCalendarEventOrganizer(ev);
+      const hasOtherAttendees =
+        ev.attendees && ev.attendees.filter((a) => !a.self).length > 0;
+      const removeOnly = !isOrganizer && !!hasOtherAttendees;
+      const shouldAskGuests = !removeOnly && shouldPromptGuests(ev);
+      const guestNotification =
+        notificationOptions ??
+        (shouldAskGuests
+          ? await promptGuestNotification({
+              event: ev,
+              action: "cancellation",
+            })
+          : { sendUpdates: "none" as const });
       if (!guestNotification) return;
-      updateEvent.mutate({ id: eventId, ...updates, ...guestNotification });
-    }
-  }
 
-  async function handleTitleSave(eventId: string, title: string) {
+      const { id: _id, source: _source, ...snapshot } = ev;
+      const undo = removeOnly
+        ? () => {
+            rsvpEvent.mutate(
+              withCalendarEventSourceIdentity(
+                {
+                  id: ev.id,
+                  status: "accepted",
+                  accountEmail: ev.accountEmail,
+                  sendUpdates: "none",
+                },
+                ev,
+              ),
+              {
+                onError: () =>
+                  toast.error(t("calendarView.failedRestoreAttendance")),
+              },
+            );
+          }
+        : () => {
+            createEvent.mutate(snapshot);
+          };
+
+      deleteEvent.mutate(
+        buildDeleteEventMutationInput(ev, {
+          scope: "single",
+          ...guestNotification,
+          removeOnly,
+        }),
+        {
+          onSuccess: () => {
+            if (
+              sidebarEvent &&
+              getCalendarEventRenderKey(sidebarEvent) ===
+                getCalendarEventRenderKey(ev)
+            ) {
+              setSidebarEvent(null);
+            }
+            setUndoAction(undo);
+            toast(
+              removeOnly
+                ? t("calendarView.eventRemoved")
+                : t("calendarView.eventDeleted"),
+              {
+                action: { label: t("calendarView.undo"), onClick: undo },
+              },
+            );
+          },
+          onError: () => toast.error(t("calendarView.failedDeleteEvent")),
+        },
+      );
+    },
+    [
+      createEvent,
+      deleteEvent,
+      promptGuestNotification,
+      rsvpEvent,
+      setSidebarEvent,
+      sidebarEvent,
+      t,
+    ],
+  );
+
+  const handleDeleteEvent = useCallback(
+    (selectedEvent: CalendarEvent) => {
+      const eventId = selectedEvent.id;
+      if (deleteEvent.isPending) return;
+      if (calendarDraftIdFromEventId(eventId)) {
+        discardDraftEvent(eventId);
+        return;
+      }
+      const ev = findEventByCurrentOrReplacedId(events, selectedEvent);
+      if (!ev || ev.calendarPrimary === false || ev.calendarReadOnly) return;
+      const isRecurring = !!(ev.recurringEventId || ev.recurrence?.length);
+      const isOrganizer = isCalendarEventOrganizer(ev);
+      const hasOtherAttendees =
+        ev.attendees && ev.attendees.filter((a) => !a.self).length > 0;
+      const removeOnly = !isOrganizer && !!hasOtherAttendees;
+      if (isRecurring || (!removeOnly && shouldPromptGuests(ev))) {
+        setDeleteDialogEvent(ev);
+      } else {
+        void handleDirectDelete(ev);
+      }
+    },
+    [deleteEvent.isPending, discardDraftEvent, events, handleDirectDelete],
+  );
+
+  async function handleEventDrop(selectedEvent: CalendarEvent, newDate: Date) {
+    const event = findEventByCurrentOrReplacedId(events, selectedEvent);
+    if (!event) return;
+    const eventId = event.id;
+    if (
+      event.calendarPrimary === false ||
+      event.calendarReadOnly ||
+      !isCalendarEventOrganizer(event) ||
+      updateEvent.isPending
+    )
+      return;
+
+    const moved = moveEventToCalendarDate(event, newDate, displayTimezone);
+    if (!moved) return;
+
     if (calendarDraftIdFromEventId(eventId)) {
-      updateDraftEvent(eventId, { title });
+      updateDraftEvent(eventId, moved);
       return;
     }
-    const event = events.find((e) => e.id === eventId);
-    const updates = { title };
-    const guestNotification = event
-      ? await promptGuestNotification({
-          event,
-          action: "update",
-          updates,
-        })
-      : { sendUpdates: "none" as const };
-    if (!guestNotification) return;
-    updateEvent.mutate({ id: eventId, ...updates, ...guestNotification });
-  }
 
-  function handleQuickEditCancel(eventId: string) {
-    setQuickEditEventId(null);
-    if (calendarDraftIdFromEventId(eventId)) {
-      discardDraftEvent(eventId);
-      return;
-    }
-    setQuickEditTempIds((current) => {
-      if (!current[eventId]) return current;
-      const { [eventId]: _removed, ...next } = current;
-      return next;
+    const oldStartISO = event.start;
+    const oldEndISO = event.end;
+    const newStart = new Date(moved.start);
+    const newEnd = new Date(moved.end);
+
+    if (newEnd.getTime() <= newStart.getTime()) return;
+
+    const updates = moved;
+    const isRecurring = isRecurringCalendarEvent(event);
+    const guestNotification = await promptGuestNotification({
+      event,
+      action: "update",
+      updates,
+      recurrenceScope: isRecurring,
     });
-    // Delete the event if title was never set
-    const ev = events.find((e) => e.id === eventId);
-    if (!ev || ev.title === "(No title)") {
-      deleteEvent.mutate({ id: eventId, scope: "single", sendUpdates: "none" });
-    }
+    if (!guestNotification) return;
+
+    const undoScope = guestNotification.scope;
+    const undo = () => {
+      updateEvent.mutate(
+        withCalendarEventSourceIdentity(
+          {
+            id: eventId,
+            accountEmail: event.accountEmail,
+            start: oldStartISO,
+            end: oldEndISO,
+            sendUpdates: "none",
+            ...updateScopePayload(undoScope),
+          },
+          event,
+        ),
+      );
+    };
+    const toastId = toast.loading(
+      isRecurring
+        ? t("calendarView.updatingRecurringEvent")
+        : t("calendarView.movingEvent"),
+    );
+
+    updateEvent.mutate(
+      withCalendarEventSourceIdentity(
+        {
+          id: eventId,
+          accountEmail: event.accountEmail,
+          ...updates,
+          ...guestNotification,
+        },
+        event,
+      ),
+      {
+        onSuccess: () => {
+          setUndoAction(undo);
+          toast.success(t("calendarView.eventMoved"), {
+            id: toastId,
+            action: { label: t("calendarView.undo"), onClick: undo },
+          });
+        },
+        onError: () =>
+          toast.error(t("calendarView.failedMoveEvent"), { id: toastId }),
+      },
+    );
   }
 
-  // IconKeyboard shortcuts — don't fire when user is typing in an input
-  const isTypingInInput = useCallback((e: KeyboardEvent) => {
-    const target = e.target as HTMLElement;
-    return (
-      target.tagName === "INPUT" ||
-      target.tagName === "TEXTAREA" ||
-      target.isContentEditable
-    );
-  }, []);
+  const handleEventTimeChange = useCallback(
+    async (selectedEvent: CalendarEvent, newStart: Date, newEnd: Date) => {
+      const event = findEventByCurrentOrReplacedId(events, selectedEvent);
+      if (!event) return;
+      const eventId = event.id;
+      if (
+        event.calendarPrimary === false ||
+        event.calendarReadOnly ||
+        !isCalendarEventOrganizer(event) ||
+        updateEvent.isPending
+      )
+        return;
 
-  useEffect(() => {
-    function handleKeyDown(e: KeyboardEvent) {
-      // Cmd+K / Ctrl+K — always open command palette
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
-        e.preventDefault();
-        setCommandPaletteOpen(true);
+      if (newEnd.getTime() <= newStart.getTime()) return;
+
+      if (calendarDraftIdFromEventId(eventId)) {
+        const timezone = resolveEventTimezone(
+          event.startTimeZone ?? event.endTimeZone ?? displayTimezone,
+        );
+        updateDraftEvent(eventId, {
+          start: newStart.toISOString(),
+          end: newEnd.toISOString(),
+          allDay: false,
+          startTimeZone: timezone,
+          endTimeZone: timezone,
+        });
         return;
       }
 
-      // Skip all other shortcuts when typing or when a dialog is open
-      if (isTypingInInput(e)) return;
+      const oldStart = new Date(event.start).getTime();
+      const oldEnd = new Date(event.end).getTime();
+      if (oldStart === newStart.getTime() && oldEnd === newEnd.getTime()) {
+        return;
+      }
+
+      const oldStartISO = event.start;
+      const oldEndISO = event.end;
+      const updates = {
+        start: newStart.toISOString(),
+        end: newEnd.toISOString(),
+      };
+      const isRecurring = isRecurringCalendarEvent(event);
+      const guestNotification = await promptGuestNotification({
+        event,
+        action: "update",
+        updates,
+        recurrenceScope: isRecurring,
+      });
+      if (!guestNotification) return;
+
+      const undoScope = guestNotification.scope;
+      const undo = () => {
+        updateEvent.mutate(
+          withCalendarEventSourceIdentity(
+            {
+              id: eventId,
+              accountEmail: event.accountEmail,
+              start: oldStartISO,
+              end: oldEndISO,
+              sendUpdates: "none",
+              ...updateScopePayload(undoScope),
+            },
+            event,
+          ),
+        );
+      };
+      const toastId = toast.loading(
+        isRecurring
+          ? t("calendarView.updatingRecurringEvent")
+          : t("calendarView.updatingEvent"),
+      );
+
+      try {
+        await updateEvent.mutateAsync(
+          withCalendarEventSourceIdentity(
+            {
+              id: eventId,
+              accountEmail: event.accountEmail,
+              ...updates,
+              ...guestNotification,
+            },
+            event,
+          ),
+        );
+        setUndoAction(undo);
+        toast.success(t("calendarView.eventUpdated"), {
+          id: toastId,
+          action: { label: t("calendarView.undo"), onClick: undo },
+        });
+      } catch {
+        toast.error(t("calendarView.failedUpdateEvent"), { id: toastId });
+      }
+    },
+    [
+      displayTimezone,
+      events,
+      updateDraftEvent,
+      promptGuestNotification,
+      updateEvent,
+      t,
+    ],
+  );
+
+  const handleClickTimeSlot = useCallback(
+    async (
+      clickedDate: Date,
+      startTime: string,
+      endTime: string,
+      options?: { allDay?: boolean; explicitDuration?: boolean },
+    ) => {
+      let activeSettings = settings;
+      if (!activeSettings) {
+        const result = await settingsQuery.refetch();
+        activeSettings = result.data;
+      }
+      if (!activeSettings?.timezone) {
+        toast.error(t("calendarView.calendarSettingsLoading"));
+        return;
+      }
+
+      setSelectedDate(clickedDate);
+      const defaultDuration = Math.max(
+        5,
+        activeSettings.defaultEventDuration ?? 30,
+      );
+      const timezone = activeSettings.timezone;
+      const dateStr = dateToCalendarDateKey(clickedDate);
+      const now = new Date().toISOString();
+      const draftId = `slot-${Date.now()}`;
+      setCreateDialogOpen(false);
+
+      if (options?.allDay) {
+        setCreateDefaultStart(undefined);
+        setCreateDefaultEnd(undefined);
+        const draft = buildAllDayEventDraft({
+          id: draftId,
+          date: clickedDate,
+          accountEmail: defaultAccountEmail,
+          now,
+        });
+
+        persistCalendarDraft(draft);
+        setEventDraft(draft);
+        setQuickEditEventId(calendarDraftEventId(draftId));
+        return;
+      }
+
+      setCreateDefaultStart(startTime);
+
+      const end = options?.explicitDuration
+        ? { date: dateStr, time: endTime }
+        : addMinutesToDateTimeParts(dateStr, startTime, defaultDuration);
+      setCreateDefaultEnd(end.time);
+      const startISO = dateTimeInTimezoneToIso(dateStr, startTime, timezone);
+      const endISO = dateTimeInTimezoneToIso(end.date, end.time, timezone);
+      const draft: CalendarEventDraft = {
+        id: draftId,
+        title: "",
+        description: "",
+        location: "",
+        start: startISO,
+        end: endISO,
+        startTimeZone: timezone,
+        endTimeZone: timezone,
+        allDay: false,
+        eventType: "default",
+        accountEmail: defaultAccountEmail,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      persistCalendarDraft(draft);
+      setEventDraft(draft);
+      setQuickEditEventId(calendarDraftEventId(draftId));
+    },
+    [
+      defaultAccountEmail,
+      settings,
+      settingsQuery,
+      t,
+      setSelectedDate,
+      setEventDraft,
+    ],
+  );
+
+  const handleCreateWorkingLocation = useCallback(
+    (date: Date) => {
+      const existing = findOwnedWorkingLocationForDay(
+        events,
+        date,
+        displayTimezone,
+        defaultAccountEmail,
+      );
+
+      preserveDraftViewRef.current = true;
+      setCreateDefaultStart(undefined);
+      setCreateDefaultEnd(undefined);
+
+      if (existing) {
+        const existingDraftId = calendarDraftIdFromEventId(existing.id);
+        if (!existingDraftId && eventDraft) {
+          discardDraftEvent(calendarDraftEventId(eventDraft.id));
+        }
+        setQuickEditEventId(getCalendarEventRenderKey(existing));
+        return;
+      }
+
+      if (eventDraft) {
+        discardDraftEvent(calendarDraftEventId(eventDraft.id));
+      }
+
+      const draftId = `slot-working-location-${Date.now()}`;
+      const draft = buildWorkingLocationDraft({
+        id: draftId,
+        date,
+        accountEmail: defaultAccountEmail,
+      });
+
+      persistCalendarDraft(draft);
+      setEventDraft(draft);
+      setQuickEditEventId(calendarDraftEventId(draftId));
+    },
+    [
+      defaultAccountEmail,
+      discardDraftEvent,
+      displayTimezone,
+      eventDraft,
+      events,
+      setEventDraft,
+    ],
+  );
+
+  const handleCreateEventFromText = useCallback(
+    async (quickCreate: QuickCreateEvent) => {
+      let activeSettings = settings;
+      if (!activeSettings) {
+        const result = await settingsQuery.refetch();
+        activeSettings = result.data;
+      }
+      if (!activeSettings?.timezone) {
+        toast.error(t("calendarView.calendarSettingsLoading"));
+        return;
+      }
+
+      const timezone = activeSettings.timezone;
+      const defaultDuration = Math.max(
+        5,
+        activeSettings.defaultEventDuration ?? 30,
+      );
+      const startTime = quickCreate.hasExplicitTime
+        ? format(quickCreate.start, "HH:mm")
+        : "09:00";
+      const dateStr = format(quickCreate.start, "yyyy-MM-dd");
+      const end = addMinutesToDateTimeParts(
+        dateStr,
+        startTime,
+        defaultDuration,
+      );
+      const startISO = dateTimeInTimezoneToIso(dateStr, startTime, timezone);
+      const endISO = dateTimeInTimezoneToIso(end.date, end.time, timezone);
+
+      setSelectedDate(quickCreate.start);
+      setViewMode("day");
+      setCreateDefaultStart(startTime);
+      setCreateDefaultEnd(end.time);
+      setCreateDialogOpen(false);
+
+      const now = new Date().toISOString();
+      const draftId = `slot-${Date.now()}`;
+      const draft: CalendarEventDraft = {
+        id: draftId,
+        title: quickCreate.title,
+        description: "",
+        location: "",
+        start: startISO,
+        end: endISO,
+        startTimeZone: timezone,
+        endTimeZone: timezone,
+        allDay: false,
+        eventType: "default",
+        accountEmail: defaultAccountEmail,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      persistCalendarDraft(draft);
+      setEventDraft(draft);
+      setQuickEditEventId(calendarDraftEventId(draftId));
+    },
+    [
+      defaultAccountEmail,
+      settings,
+      settingsQuery,
+      t,
+      setSelectedDate,
+      setViewMode,
+      setEventDraft,
+    ],
+  );
+
+  const handleQuickEditSave = useCallback(
+    async (selectedEvent: CalendarEvent, title: string) => {
+      const eventId = selectedEvent.id;
+      setQuickEditEventId(null);
+      const trimmedTitle = title.trim();
+      if (calendarDraftIdFromEventId(eventId)) {
+        updateDraftEvent(eventId, { title: trimmedTitle });
+        return;
+      }
+      setQuickEditTempIds((current) => {
+        if (!current[eventId]) return current;
+        const { [eventId]: _removed, ...next } = current;
+        return next;
+      });
+      if (trimmedTitle) {
+        const event = findEventByCurrentOrReplacedId(events, selectedEvent);
+        if (!event) return;
+        const updates = buildEventTitleUpdate(trimmedTitle);
+        const guestNotification = await promptGuestNotification({
+          event,
+          action: "update",
+          updates,
+        });
+        if (!guestNotification) return;
+        updateEvent.mutate(
+          withCalendarEventSourceIdentity(
+            {
+              id: event.id,
+              accountEmail: event.accountEmail,
+              ...updates,
+              ...guestNotification,
+            },
+            event,
+          ),
+        );
+      }
+    },
+    [events, updateDraftEvent, promptGuestNotification, updateEvent],
+  );
+
+  const handleTitleSave = useCallback(
+    async (selectedEvent: CalendarEvent, title: string) => {
+      const eventId = selectedEvent.id;
+      const trimmedTitle = title.trim();
+      if (!trimmedTitle) return;
+      if (calendarDraftIdFromEventId(eventId)) {
+        updateDraftEvent(eventId, { title: trimmedTitle });
+        return;
+      }
+      const event = findEventByCurrentOrReplacedId(events, selectedEvent);
+      if (!event) return;
+      const updates = buildEventTitleUpdate(trimmedTitle);
+      const guestNotification = await promptGuestNotification({
+        event,
+        action: "update",
+        updates,
+      });
+      if (!guestNotification) return;
+      updateEvent.mutate(
+        withCalendarEventSourceIdentity(
+          {
+            id: event.id,
+            accountEmail: event.accountEmail,
+            ...updates,
+            ...guestNotification,
+          },
+          event,
+        ),
+      );
+    },
+    [events, updateDraftEvent, promptGuestNotification, updateEvent],
+  );
+
+  const handleQuickEditCancel = useCallback(
+    (event: CalendarEvent) => {
+      const eventId = event.id;
+      setQuickEditEventId(null);
+      if (calendarDraftIdFromEventId(eventId)) {
+        discardDraftEvent(eventId);
+        return;
+      }
+      setQuickEditTempIds((current) => {
+        if (!current[eventId]) return current;
+        const { [eventId]: _removed, ...next } = current;
+        return next;
+      });
+      const currentEvent =
+        findEventByCurrentOrReplacedId(events, event) ?? event;
+      if (!getEditableEventTitle(currentEvent).trim()) {
+        deleteEvent.mutate(
+          buildDeleteEventMutationInput(currentEvent, {
+            scope: "single",
+            sendUpdates: "none",
+          }),
+        );
+      }
+    },
+    [discardDraftEvent, events, deleteEvent],
+  );
+
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (isCalendarShortcutSuppressedTarget(e.target)) return;
+
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        openCommandPalette();
+        return;
+      }
+
       if (createDialogOpen || deleteDialogEvent) return;
 
-      // Delete/Backspace — delete the selected event
       if (e.key === "Delete" || e.key === "Backspace") {
         const targetEvent = sidebarEvent || focusedEvent;
         if (!targetEvent) return;
         e.preventDefault();
-        handleDeleteEvent(targetEvent.id);
+        handleDeleteEvent(targetEvent);
         return;
       }
 
-      // Don't intercept keyboard shortcuts with modifier keys (Cmd+C, Ctrl+V, etc.)
       if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-      // `?` / shift+/ opens the keyboard shortcuts help — that listener now
-      // lives in AppLayout so it works on every tab. Don't double-handle here.
+      const isArrowKey =
+        e.key === "ArrowLeft" ||
+        e.key === "ArrowRight" ||
+        e.key === "ArrowUp" ||
+        e.key === "ArrowDown";
+      if (
+        isArrowKey &&
+        (commandPaletteOpen || peopleSearchOpen || addCalendarOpen)
+      ) {
+        return;
+      }
 
       switch (e.key) {
         case "z":
@@ -1142,12 +1928,30 @@ export default function CalendarView() {
           runUndo();
           break;
         case "j":
+        case "ArrowRight":
           e.preventDefault();
           handleNavigate("next");
           break;
         case "k":
+        case "ArrowLeft":
           e.preventDefault();
           handleNavigate("prev");
+          break;
+        case "ArrowDown":
+          e.preventDefault();
+          setSelectedDate(
+            viewMode === "month"
+              ? addWeeks(selectedDate, 1)
+              : addDays(selectedDate, 1),
+          );
+          break;
+        case "ArrowUp":
+          e.preventDefault();
+          setSelectedDate(
+            viewMode === "month"
+              ? subWeeks(selectedDate, 1)
+              : subDays(selectedDate, 1),
+          );
           break;
         case "p":
           e.preventDefault();
@@ -1174,7 +1978,7 @@ export default function CalendarView() {
           break;
         case "/":
           e.preventDefault();
-          setCommandPaletteOpen(true);
+          openCommandPalette();
           break;
       }
     }
@@ -1184,12 +1988,15 @@ export default function CalendarView() {
   }, [
     createDialogOpen,
     deleteDialogEvent,
-    isTypingInInput,
+    openCommandPalette,
     viewMode,
     selectedDate,
     sidebarEvent,
     focusedEvent,
     events,
+    commandPaletteOpen,
+    peopleSearchOpen,
+    addCalendarOpen,
   ]);
 
   const headerLabel = (() => {
@@ -1199,8 +2006,12 @@ export default function CalendarView() {
           ? format(selectedDate, "MMM yyyy")
           : format(selectedDate, "MMMM yyyy");
       case "week": {
-        const ws = startOfWeek(selectedDate);
-        const we = endOfWeek(selectedDate);
+        const displayedDays = normalizeNumberOfDays(viewPrefs.numberOfDays);
+        const ws =
+          displayedDays === 7
+            ? startOfWeek(selectedDate, { weekStartsOn })
+            : selectedDate;
+        const we = addDays(ws, displayedDays - 1);
         return isMobile
           ? `${format(ws, "MMM d")} – ${format(we, "d")}`
           : `${format(ws, "MMM d")} – ${format(we, "d, yyyy")}`;
@@ -1211,6 +2022,18 @@ export default function CalendarView() {
           : format(selectedDate, "EEEE, MMMM d, yyyy");
     }
   })();
+
+  function applyCustomDays() {
+    const value = Number(customDaysInput);
+    if (!Number.isInteger(value)) return;
+    setViewPrefs({
+      numberOfDays: Math.min(
+        MAX_CALENDAR_DAYS,
+        Math.max(MIN_CALENDAR_DAYS, value),
+      ),
+    });
+    setCustomDaysOpen(false);
+  }
 
   return (
     <TooltipProvider delayDuration={500}>
@@ -1235,16 +2058,16 @@ export default function CalendarView() {
                 <TooltipTrigger asChild>
                   <Button
                     variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 lg:hidden"
+                    size="icon-sm"
+                    className="lg:hidden"
                     onClick={openSidebar}
-                    aria-label="Open navigation"
+                    aria-label={t("calendarView.openNavigation")}
                   >
                     <IconMenu2 className="h-4 w-4" />
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom">
-                  <p>Open navigation</p>
+                  <p>{t("calendarView.openNavigation")}</p>
                 </TooltipContent>
               </Tooltip>
               <DropdownMenu>
@@ -1252,46 +2075,119 @@ export default function CalendarView() {
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="h-8 gap-1 px-2 text-sm font-semibold sm:px-2.5"
+                    className="gap-1 px-2 text-sm font-semibold sm:px-2.5"
                   >
-                    {viewModeLabels[viewMode]}
+                    {/* Phones have no room for a separate date label next to
+                        the header actions, so the date names the view menu. */}
+                    <span className="whitespace-nowrap sm:hidden">
+                      {headerLabel}
+                      <span className="sr-only">
+                        , {viewModeLabels[viewMode]}
+                      </span>
+                    </span>
+                    <span className="hidden sm:inline">
+                      {viewModeLabels[viewMode]}
+                    </span>
                     <IconChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start">
                   <DropdownMenuItem onClick={() => setViewMode("day")}>
-                    Day
+                    {t("calendarView.day")}
                     <kbd className="ml-auto text-[10px] text-muted-foreground">
                       D
                     </kbd>
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => setViewMode("week")}>
-                    Week
+                    {t("calendarView.week")}
                     <kbd className="ml-auto text-[10px] text-muted-foreground">
                       W
                     </kbd>
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => setViewMode("month")}>
-                    Month
+                    {t("calendarView.month")}
                     <kbd className="ml-auto text-[10px] text-muted-foreground">
                       M
                     </kbd>
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
-                  <DropdownMenuLabel className="text-[10px] font-normal uppercase tracking-wider text-muted-foreground">
-                    Display
-                  </DropdownMenuLabel>
-                  <DropdownMenuItem
-                    onSelect={(e) => {
-                      e.preventDefault();
-                      setViewPrefs({ hideWeekends: !viewPrefs.hideWeekends });
-                    }}
-                  >
-                    Hide weekends
-                    {viewPrefs.hideWeekends && (
-                      <IconCheck className="ml-auto h-3.5 w-3.5 text-muted-foreground" />
-                    )}
-                  </DropdownMenuItem>
+                  <DropdownMenuSub>
+                    <DropdownMenuSubTrigger>
+                      {t("calendarView.numberOfDays")}
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent>
+                      {Array.from({ length: 8 }, (_, index) => index + 2).map(
+                        (count) => (
+                          <DropdownMenuItem
+                            key={count}
+                            onSelect={() =>
+                              setViewPrefs({ numberOfDays: count })
+                            }
+                          >
+                            {t("calendarView.daysCount", { count })}
+                            {viewPrefs.numberOfDays === count && (
+                              <IconCheck className="ml-auto h-3.5 w-3.5 text-muted-foreground" />
+                            )}
+                          </DropdownMenuItem>
+                        ),
+                      )}
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        onSelect={() => {
+                          setCustomDaysInput(String(viewPrefs.numberOfDays));
+                          setCustomDaysOpen(true);
+                        }}
+                      >
+                        {t("calendarView.other")}
+                        {!Array.from(
+                          { length: 8 },
+                          (_, index) => index + 2,
+                        ).includes(viewPrefs.numberOfDays) && (
+                          <IconCheck className="ml-auto h-3.5 w-3.5 text-muted-foreground" />
+                        )}
+                      </DropdownMenuItem>
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
+                  <DropdownMenuSub>
+                    <DropdownMenuSubTrigger>
+                      {t("calendarView.viewSettings")}
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent>
+                      <DropdownMenuCheckboxItem
+                        checked={!viewPrefs.hideWeekends}
+                        onCheckedChange={(checked) =>
+                          setViewPrefs({ hideWeekends: !checked })
+                        }
+                      >
+                        {t("calendarView.weekends")}
+                      </DropdownMenuCheckboxItem>
+                      <DropdownMenuCheckboxItem
+                        checked={viewPrefs.showDeclinedEvents}
+                        onCheckedChange={(checked) =>
+                          setViewPrefs({ showDeclinedEvents: checked })
+                        }
+                      >
+                        {t("calendarView.declinedEvents")}
+                      </DropdownMenuCheckboxItem>
+                      <DropdownMenuCheckboxItem
+                        checked={viewPrefs.showWeekNumbers}
+                        onCheckedChange={(checked) =>
+                          setViewPrefs({ showWeekNumbers: checked })
+                        }
+                      >
+                        {t("calendarView.weekNumbers")}
+                      </DropdownMenuCheckboxItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem asChild>
+                        <Link
+                          to={buildSettingsRoute("app")}
+                          className="flex w-full items-center"
+                        >
+                          {t("calendarView.generalSettings")}
+                        </Link>
+                      </DropdownMenuItem>
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
@@ -1304,14 +2200,18 @@ export default function CalendarView() {
                     variant="outline"
                     size="sm"
                     onClick={handleToday}
-                    className="h-7 px-2 text-xs font-medium sm:px-2.5"
+                    aria-label={t("calendarView.today")}
+                    className="h-7 px-1.5 text-xs font-medium sm:px-2.5"
                   >
-                    Today
+                    <IconCalendarDot className="size-4 sm:hidden" />
+                    <span className="hidden sm:inline">
+                      {t("calendarView.today")}
+                    </span>
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom">
                   <p>
-                    Go to today{" "}
+                    {t("eventForm.goToToday")}{" "}
                     <kbd className="ml-1 rounded border border-border bg-muted px-1 font-mono text-[10px]">
                       T
                     </kbd>
@@ -1321,50 +2221,70 @@ export default function CalendarView() {
 
               <Button
                 variant="ghost"
-                size="icon"
+                size="icon-sm"
                 onClick={() => handleNavigate("prev")}
-                className="h-8 w-8 sm:h-7 sm:w-7"
+                className="sm:h-7 sm:w-7"
               >
                 <IconChevronLeft className="h-4 w-4" />
               </Button>
 
               <Button
                 variant="ghost"
-                size="icon"
+                size="icon-sm"
                 onClick={() => handleNavigate("next")}
-                className="h-8 w-8 sm:h-7 sm:w-7"
+                className="sm:h-7 sm:w-7"
               >
                 <IconChevronRight className="h-4 w-4" />
               </Button>
 
-              <span className="ml-0.5 min-w-0 flex-1 truncate whitespace-nowrap text-center text-xs font-semibold sm:ml-1 sm:text-sm">
+              <span className="ml-1 hidden min-w-0 flex-1 truncate whitespace-nowrap text-center text-sm font-semibold sm:block">
                 {headerLabel}
               </span>
 
               {eventsRefreshing && (
                 <Spinner
                   className="ml-1 size-3.5 shrink-0 text-muted-foreground"
-                  aria-label="Loading calendars"
+                  aria-label={t("calendarView.loadingCalendars")}
                 />
               )}
             </div>
 
             {/* Right: search, new event */}
             <div className="flex shrink-0 items-center gap-0.5 sm:gap-1">
+              {overlayPeople.length > 0 && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      className="sm:h-7 sm:w-7"
+                      asChild
+                    >
+                      <Link to="/booking-links?tab=shared">
+                        <IconUsers className="h-4 w-4" />
+                      </Link>
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">
+                    <p>{t("sidebar.managePeerAvailability")}</p>
+                  </TooltipContent>
+                </Tooltip>
+              )}
+
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
                     variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 sm:h-7 sm:w-7"
-                    onClick={() => setCommandPaletteOpen(true)}
+                    size="icon-sm"
+                    className="sm:h-7 sm:w-7"
+                    onClick={openCommandPalette}
                   >
                     <IconSearch className="h-4 w-4" />
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom">
                   <p>
-                    Search{" "}
+                    {t("root.commandSearch")}{" "}
                     <kbd className="ml-1 rounded border border-border bg-muted px-1 font-mono text-[10px]">
                       /
                     </kbd>
@@ -1372,12 +2292,6 @@ export default function CalendarView() {
                 </TooltipContent>
               </Tooltip>
 
-              {!isMobile && (
-                <NotificationsBell
-                  browserNotifications
-                  emptyDescription="Calendar can pop browser alerts while this app is open. Clips desktop handles fuller meeting prompts with one-click notes."
-                />
-              )}
               <CreateEventPopover
                 open={createDialogOpen}
                 onOpenChange={(open) => {
@@ -1393,9 +2307,10 @@ export default function CalendarView() {
                 defaultDate={selectedDate}
                 defaultStartTime={createDefaultStart}
                 defaultEndTime={createDefaultEnd}
+                locationSuggestions={locationSuggestions}
               />
               <AccountAvatars />
-              <AgentToggleButton />
+              <HeaderActions />
             </div>
           </div>
 
@@ -1405,7 +2320,9 @@ export default function CalendarView() {
               <MonthView
                 events={events}
                 selectedDate={selectedDate}
+                timezone={displayTimezone}
                 onDateSelect={handleDateSelect}
+                onCreateWorkingLocation={handleCreateWorkingLocation}
                 onDeleteEvent={handleDeleteEvent}
                 onEventDrop={handleEventDrop}
                 draftEventIds={draftEventIds}
@@ -1413,16 +2330,19 @@ export default function CalendarView() {
                 onDraftCreate={createDraftEvent}
                 onDraftDiscard={discardDraftEvent}
                 isLoading={eventsLoading}
+                weekStartsOn={weekStartsOn}
               />
             )}
             {viewMode === "week" && (
               <WeekView
                 events={events}
                 selectedDate={selectedDate}
+                timezone={displayTimezone}
                 onDateSelect={handleDateSelect}
                 onDeleteEvent={handleDeleteEvent}
                 onEventTimeChange={handleEventTimeChange}
                 onClickTimeSlot={handleClickTimeSlot}
+                onCreateWorkingLocation={handleCreateWorkingLocation}
                 quickEditEventId={quickEditEventId}
                 onQuickEditSave={handleQuickEditSave}
                 onQuickEditCancel={handleQuickEditCancel}
@@ -1431,15 +2351,19 @@ export default function CalendarView() {
                 onDraftCreate={createDraftEvent}
                 onDraftDiscard={discardDraftEvent}
                 isLoading={eventsLoading}
+                weekStartsOn={weekStartsOn}
+                numberOfDays={viewPrefs.numberOfDays}
               />
             )}
             {viewMode === "day" && (
               <DayView
                 events={dayEvents}
                 date={selectedDate}
+                timezone={displayTimezone}
                 onDeleteEvent={handleDeleteEvent}
                 onEventTimeChange={handleEventTimeChange}
                 onClickTimeSlot={handleClickTimeSlot}
+                onCreateWorkingLocation={handleCreateWorkingLocation}
                 quickEditEventId={quickEditEventId}
                 onQuickEditSave={handleQuickEditSave}
                 onQuickEditCancel={handleQuickEditCancel}
@@ -1456,14 +2380,28 @@ export default function CalendarView() {
         {/* Event detail sidebar — full height, outside the calendar column */}
         {eventDetailSidebar && (
           <EventDetailPanel
-            event={sidebarEvent}
+            event={refreshedSidebarEvent}
             onClose={() => setSidebarEvent(null)}
             onDelete={handleDeleteEvent}
             onTitleSave={handleTitleSave}
+            timezone={displayTimezone}
           />
         )}
 
         {/* Dialogs */}
+        {timezonePrompt && (
+          <TimezoneSwitchDialog
+            open
+            savedTimezone={timezonePrompt.savedTimezone}
+            browserTimezone={timezonePrompt.browserTimezone}
+            isSwitching={updateSettings.isPending}
+            onKeep={keepSavedTimezone}
+            onSwitch={switchToBrowserTimezone}
+            onOpenChange={(open) => {
+              if (!open) keepSavedTimezone();
+            }}
+          />
+        )}
         <CommandPalette
           open={commandPaletteOpen}
           onClose={() => setCommandPaletteOpen(false)}
@@ -1471,12 +2409,17 @@ export default function CalendarView() {
           onGoToDate={handleGoToDate}
           onEventClick={(event) => {
             setCommandPaletteOpen(false);
-            handleGoToDate(parseISO(event.start));
+            const eventDate = getEventDateKey(event, displayTimezone);
+            if (eventDate) handleGoToDate(dateKeyToDate(eventDate));
           }}
           onCreateEvent={() => {
             setCommandPaletteOpen(false);
             setEventDraft(null);
             setCreateDialogOpen(true);
+          }}
+          onCreateEventFromText={(quickCreate) => {
+            setCommandPaletteOpen(false);
+            void handleCreateEventFromText(quickCreate);
           }}
           onViewChange={setViewMode}
           onToday={handleToday}
@@ -1506,7 +2449,6 @@ export default function CalendarView() {
           onConfirm={(options) => {
             if (!deleteDialogEvent) return;
             const snapshot = { ...deleteDialogEvent };
-            const eventId = deleteDialogEvent.id;
             const undo = () => {
               createEvent.mutate({
                 title: snapshot.title,
@@ -1525,38 +2467,82 @@ export default function CalendarView() {
                 visibility: snapshot.visibility,
                 reminders: snapshot.reminders,
                 remindersUseDefault: snapshot.remindersUseDefault,
+                accountEmail: snapshot.accountEmail,
                 outOfOfficeProperties: snapshot.outOfOfficeProperties,
                 focusTimeProperties: snapshot.focusTimeProperties,
                 workingLocationProperties: snapshot.workingLocationProperties,
               });
             };
-            // Optimistic: close dialog immediately
             setDeleteDialogEvent(null);
-            if (sidebarEvent?.id === eventId) {
+            if (
+              sidebarEvent &&
+              getCalendarEventRenderKey(sidebarEvent) ===
+                getCalendarEventRenderKey(snapshot)
+            ) {
               setSidebarEvent(null);
             }
             deleteEvent.mutate(
-              { id: eventId, ...options },
+              buildDeleteEventMutationInput(snapshot, options),
               {
                 onSuccess: () => {
-                  const label = options.removeOnly ? "removed" : "deleted";
                   setUndoAction(undo);
-                  toast(`Event ${label}`, {
-                    action: { label: "Undo", onClick: undo },
-                  });
+                  toast(
+                    options.removeOnly
+                      ? t("calendarView.eventRemoved")
+                      : t("calendarView.eventDeleted"),
+                    {
+                      action: { label: t("calendarView.undo"), onClick: undo },
+                    },
+                  );
                 },
-                onError: () => toast.error("Failed to delete event"),
+                onError: () => toast.error(t("calendarView.failedDeleteEvent")),
               },
             );
           }}
         />
         {guestNotificationDialog}
+        <Dialog open={customDaysOpen} onOpenChange={setCustomDaysOpen}>
+          <DialogContent className="sm:max-w-[320px]">
+            <DialogHeader>
+              <DialogTitle>{t("calendarView.numberOfDays")}</DialogTitle>
+            </DialogHeader>
+            <form
+              className="grid gap-4"
+              onSubmit={(event) => {
+                event.preventDefault();
+                applyCustomDays();
+              }}
+            >
+              <Input
+                type="number"
+                min={MIN_CALENDAR_DAYS}
+                max={MAX_CALENDAR_DAYS}
+                step={1}
+                value={customDaysInput}
+                onChange={(event) => setCustomDaysInput(event.target.value)}
+                autoFocus
+                aria-label={t("calendarView.numberOfDays")}
+              />
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setCustomDaysOpen(false)}
+                >
+                  {t("eventForm.cancel")}
+                </Button>
+                <Button type="submit">{t("eventForm.save")}</Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
       </div>
     </TooltipProvider>
   );
 }
 
 function AccountAvatars() {
+  const t = useT();
   const googleStatus = useGoogleAuthStatus();
   const accounts = googleStatus.data?.accounts ?? [];
   if (accounts.length === 0) return null;
@@ -1565,15 +2551,15 @@ function AccountAvatars() {
     <Tooltip>
       <TooltipTrigger asChild>
         <Link
-          to="/settings"
-          className="flex items-center hover:opacity-90 ml-1"
-          aria-label="Manage accounts"
+          to={buildSettingsRoute("app", "calendars")}
+          className="ml-1 hidden items-center hover:opacity-90 sm:flex"
+          aria-label={t("calendarView.manageAccounts")}
         >
           <div className="flex items-center">
             {accounts.map((account, i) => (
               <div
                 key={account.email}
-                className={cn("relative rounded-full ring-2 ring-card")}
+                className={cn("relative rounded-full ring-1 ring-card")}
                 style={{
                   marginLeft: i === 0 ? 0 : -8,
                   zIndex: accounts.length - i,
@@ -1587,11 +2573,6 @@ function AccountAvatars() {
                     referrerPolicy="no-referrer"
                   />
                 ) : (
-                  // MCP host iframes (ChatGPT / Claude) ship strict COEP/CORP
-                  // headers that block cross-origin googleusercontent.com
-                  // avatars and produce noisy console errors. Fall back to a
-                  // same-origin initial chip when embedded. See
-                  // `templates/calendar/app/lib/mcp-embed.ts`.
                   <div className="flex h-7 w-7 items-center justify-center rounded-full bg-primary/20 text-[11px] font-semibold text-primary">
                     {account.email[0]?.toUpperCase()}
                   </div>

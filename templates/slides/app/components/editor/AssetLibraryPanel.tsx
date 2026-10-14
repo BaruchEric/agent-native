@@ -1,9 +1,16 @@
+import { appBasePath } from "@agent-native/core/client/api-path";
+import { useT } from "@agent-native/core/client/i18n";
+import { IconUpload, IconTrash, IconLoader2, IconX } from "@tabler/icons-react";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
-import { IconUpload, IconTrash, IconLoader2, IconX } from "@tabler/icons-react";
-import { appBasePath } from "@agent-native/core/client";
+import { toast } from "sonner";
+
+import { UploadStorageGate } from "@/components/editor/UploadStorageGate";
+import { useSlideFileStorageStatus } from "@/hooks/use-slide-file-storage-status";
+import { isMissingUploadProviderError } from "@/lib/image-drop-to-agent";
 
 interface Asset {
+  id: string;
   url: string;
   filename: string;
   size: number;
@@ -23,9 +30,15 @@ export default function AssetLibraryPanel({
   onSelectAsset,
   anchorRef,
 }: AssetLibraryPanelProps) {
+  const t = useT();
+  const storageQuery = useSlideFileStorageStatus(open);
+  const fileStorageConfigured =
+    storageQuery.data?.configured === true && !storageQuery.isError;
   const [assets, setAssets] = useState<Asset[]>([]);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [storagePromptOpen, setStoragePromptOpen] = useState(false);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -58,40 +71,91 @@ export default function AssetLibraryPanel({
   }, []);
 
   useEffect(() => {
-    if (open) fetchAssets();
+    if (open) void fetchAssets();
   }, [open, fetchAssets]);
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
+    if (!fileStorageConfigured) {
+      e.target.value = "";
+      return;
+    }
     setUploading(true);
+    const failures: string[] = [];
+    let storageSetupRequired = false;
     try {
       for (const file of Array.from(files)) {
         const form = new FormData();
         form.append("file", file);
-        await fetch(`${appBasePath()}/api/assets/upload`, {
-          method: "POST",
-          body: form,
-        });
+        try {
+          const res = await fetch(`${appBasePath()}/api/assets/upload`, {
+            method: "POST",
+            body: form,
+          });
+          if (!res.ok) {
+            const body = await res.json().catch(() => null);
+            if (
+              isMissingUploadProviderError(
+                res.status,
+                typeof body?.error === "string" ? body.error : undefined,
+              )
+            ) {
+              storageSetupRequired = true;
+            }
+            failures.push(
+              `${file.name}: ${body?.error || `HTTP ${res.status}`}`,
+            );
+          }
+        } catch {
+          failures.push(`${file.name}: upload failed`);
+        }
       }
       await fetchAssets();
-    } catch {
+      if (storageSetupRequired) {
+        const status = await storageQuery.refetch();
+        if (status.isSuccess && status.data.configured === true) {
+          toast.error(t("raw.assetUploadFailed"), {
+            description: t("home.fileStorageSetupRequired"),
+          });
+        } else {
+          setStoragePromptOpen(true);
+        }
+        return;
+      }
+      if (failures.length > 0) {
+        toast.error(t("raw.assetUploadFailed"), {
+          description: failures.join("\n"),
+        });
+      }
     } finally {
       setUploading(false);
       e.target.value = "";
     }
   };
 
-  const handleDelete = async (filename: string) => {
+  const requestUpload = () => {
+    if (uploading) return;
+    if (fileStorageConfigured) uploadInputRef.current?.click();
+    else setStoragePromptOpen(true);
+  };
+
+  const handleDelete = async (id: string) => {
     try {
-      await fetch(
-        `${appBasePath()}/api/assets/${encodeURIComponent(filename)}`,
+      const res = await fetch(
+        `${appBasePath()}/api/assets/${encodeURIComponent(id)}`,
         {
           method: "DELETE",
         },
       );
-      setAssets((prev) => prev.filter((a) => a.filename !== filename));
-    } catch {}
+      if (!res.ok) {
+        toast.error(t("raw.assetDeleteFailed"));
+        return;
+      }
+      setAssets((prev) => prev.filter((a) => a.id !== id));
+    } catch {
+      toast.error(t("raw.assetDeleteFailed"));
+    }
   };
 
   const handleSelect = (url: string) => {
@@ -137,7 +201,9 @@ export default function AssetLibraryPanel({
       className="w-[min(20rem,calc(100vw-24px))] max-h-[420px] bg-popover border border-border rounded-xl shadow-2xl shadow-black/60 overflow-hidden flex flex-col"
     >
       <div className="px-4 pt-3 pb-2 flex items-center justify-between flex-shrink-0">
-        <h3 className="text-sm font-semibold text-foreground">Asset Library</h3>
+        <h3 className="text-sm font-semibold text-foreground">
+          {t("editorToolbar.assetLibrary")}
+        </h3>
         <button
           onClick={() => onOpenChange(false)}
           className="text-muted-foreground/70 hover:text-muted-foreground transition-colors"
@@ -149,7 +215,12 @@ export default function AssetLibraryPanel({
 
       <div className="px-4 pb-4 space-y-3 overflow-y-auto flex-1">
         {/* Upload */}
-        <label className="flex items-center justify-center gap-2 w-full px-3 py-2 rounded-lg border border-dashed border-border hover:border-[#609FF8]/40 hover:bg-accent cursor-pointer transition-all">
+        <button
+          type="button"
+          onClick={requestUpload}
+          disabled={uploading}
+          className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-border px-3 py-2 transition-colors hover:border-primary/40 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
+        >
           {uploading ? (
             <IconLoader2 className="w-3.5 h-3.5 text-muted-foreground animate-spin" />
           ) : (
@@ -158,15 +229,23 @@ export default function AssetLibraryPanel({
           <span className="text-xs text-muted-foreground">
             {uploading ? "Uploading..." : "Upload images"}
           </span>
-          <input
-            type="file"
-            accept="image/*"
-            multiple
-            onChange={handleUpload}
-            className="hidden"
-            disabled={uploading}
-          />
-        </label>
+        </button>
+        <input
+          ref={uploadInputRef}
+          type="file"
+          accept="image/*,.svg"
+          multiple
+          onChange={handleUpload}
+          className="hidden"
+          disabled={uploading || !fileStorageConfigured}
+        />
+        <UploadStorageGate
+          configured={fileStorageConfigured}
+          unavailable={!storageQuery.isSuccess}
+          open={storagePromptOpen}
+          onOpenChange={setStoragePromptOpen}
+          onRetry={() => void storageQuery.refetch()}
+        />
 
         {/* Grid */}
         {loading ? (
@@ -175,13 +254,13 @@ export default function AssetLibraryPanel({
           </div>
         ) : assets.length === 0 ? (
           <div className="text-center py-8 text-muted-foreground text-xs">
-            No assets yet.
+            {t("raw.noAssetsYet")}
           </div>
         ) : (
           <div className="grid grid-cols-3 gap-2">
             {assets.map((asset) => (
               <div
-                key={asset.filename}
+                key={asset.id}
                 className="group relative aspect-square rounded-md overflow-hidden border border-border bg-muted"
               >
                 <button
@@ -200,7 +279,7 @@ export default function AssetLibraryPanel({
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    handleDelete(asset.filename);
+                    void handleDelete(asset.id);
                   }}
                   className="absolute top-0.5 right-0.5 w-5 h-5 bg-black/70 text-white/70 hover:text-red-400 flex items-center justify-center rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
                   aria-label={`Delete ${asset.filename}`}

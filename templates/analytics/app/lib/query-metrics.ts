@@ -1,7 +1,8 @@
+import { appApiPath } from "@agent-native/core/client/api-path";
 import { useQuery } from "@tanstack/react-query";
-import { addBytesProcessed } from "./cost-tracker";
+
 import { getIdToken } from "./auth";
-import { appApiPath } from "@agent-native/core/client";
+import { addBytesProcessed } from "./cost-tracker";
 
 export interface QueryMetricsResult {
   rows: Record<string, unknown>[];
@@ -40,9 +41,6 @@ export async function queryMetrics(sql: string): Promise<QueryMetricsResult> {
   };
 }
 
-/**
- * React Query hook for metrics queries.
- */
 export function useMetricsQuery(
   queryKey: string[],
   sql: string,

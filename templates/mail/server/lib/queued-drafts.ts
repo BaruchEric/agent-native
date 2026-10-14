@@ -1,19 +1,22 @@
-import { and, asc, desc, eq, or, sql } from "drizzle-orm";
-import { nanoid } from "nanoid";
 import { writeAppState } from "@agent-native/core/application-state";
 import { notify } from "@agent-native/core/notifications";
 import { orgMembers } from "@agent-native/core/org";
-import { getUserSetting } from "@agent-native/core/settings";
 import {
   getAppProductionUrl,
   getRequestOrgId,
   getRequestUserEmail,
   withConfiguredAppBasePath,
 } from "@agent-native/core/server";
-import { getDb, schema } from "../db/index.js";
+import { getUserSetting } from "@agent-native/core/settings";
+import { and, asc, desc, eq, or, sql } from "drizzle-orm";
+import { nanoid } from "nanoid";
+
 import { appendSignatureToBody } from "../../shared/signature.js";
+import { getDb, schema } from "../db/index.js";
 
 export type QueuedDraftStatus = "queued" | "in_review" | "sent" | "dismissed";
+
+const SEND_CLAIM_TTL_MS = 15 * 60 * 1000;
 
 export type QueueScope = "review" | "requested" | "all";
 export type QueueStatusFilter = QueuedDraftStatus | "active" | "all";
@@ -226,8 +229,6 @@ export async function createQueuedDraft(input: {
 
   await getDb().insert(schema.queuedEmailDrafts).values(row);
 
-  // Best-effort notify the owner so they see a bell badge and can click
-  // through to review the draft. Self-queued drafts skip the notification.
   if (ownerEmail !== ctx.userEmail) {
     try {
       const requesterLabel = input.requesterName?.trim() || ctx.userEmail;
@@ -462,13 +463,129 @@ export async function openQueuedDraftInComposer(
   return { draft: updated, composeId };
 }
 
+export type QueuedDraftClaim =
+  | {
+      claimed: true;
+      ctx: QueueContext;
+      draft: QueuedEmailDraft;
+      claimId: string;
+      priorStatus: QueuedDraftStatus;
+    }
+  | { claimed: false; reason: "sent" | "sending" | "dismissed" };
+
+export async function claimQueuedDraftForSending(
+  id: string,
+): Promise<QueuedDraftClaim> {
+  const { ctx, draft: preClaimDraft } = await requireQueuedDraft(id, {
+    ownerOnly: true,
+  });
+  const priorStatus: QueuedDraftStatus =
+    preClaimDraft.status === "queued" || preClaimDraft.status === "in_review"
+      ? preClaimDraft.status
+      : "queued";
+  const claimId = nanoid();
+  const claimedAt = Date.now();
+  const staleClaimBefore = claimedAt - SEND_CLAIM_TTL_MS;
+
+  const claimed = await getDb()
+    .update(schema.queuedEmailDrafts)
+    .set({
+      sendClaimId: claimId,
+      sendClaimedAt: claimedAt,
+      updatedAt: claimedAt,
+    })
+    .where(
+      and(
+        eq(schema.queuedEmailDrafts.id, id),
+        eq(schema.queuedEmailDrafts.orgId, ctx.orgId),
+        or(
+          eq(schema.queuedEmailDrafts.status, "queued"),
+          eq(schema.queuedEmailDrafts.status, "in_review"),
+        ),
+        sql`(${schema.queuedEmailDrafts.sendClaimId} IS NULL OR ${schema.queuedEmailDrafts.sendClaimedAt} < ${staleClaimBefore})`,
+      ),
+    )
+    .returning({ sendClaimId: schema.queuedEmailDrafts.sendClaimId });
+
+  if (claimed.length > 0) {
+    const draft = await getQueuedDraft(id, ctx);
+    if (!draft) throw new Error("Queued draft not found after claim.");
+    return { claimed: true, ctx, draft, claimId, priorStatus };
+  }
+
+  const [current] = await getDb()
+    .select({
+      status: schema.queuedEmailDrafts.status,
+      sendClaimId: schema.queuedEmailDrafts.sendClaimId,
+    })
+    .from(schema.queuedEmailDrafts)
+    .where(
+      and(
+        eq(schema.queuedEmailDrafts.id, id),
+        eq(schema.queuedEmailDrafts.orgId, ctx.orgId),
+      ),
+    )
+    .limit(1);
+  if (
+    current?.sendClaimId &&
+    (current.status === "queued" || current.status === "in_review")
+  ) {
+    return { claimed: false, reason: "sending" };
+  }
+  if (current?.status === "sent") return { claimed: false, reason: "sent" };
+  return { claimed: false, reason: "dismissed" };
+}
+
+export async function releaseQueuedDraftClaim(
+  id: string,
+  ctx: QueueContext,
+  claimId: string,
+  priorStatus: QueuedDraftStatus,
+): Promise<void> {
+  await getDb()
+    .update(schema.queuedEmailDrafts)
+    .set({
+      status: priorStatus,
+      sendClaimId: null,
+      sendClaimedAt: null,
+      updatedAt: Date.now(),
+    })
+    .where(
+      and(
+        eq(schema.queuedEmailDrafts.id, id),
+        eq(schema.queuedEmailDrafts.orgId, ctx.orgId),
+        eq(schema.queuedEmailDrafts.sendClaimId, claimId),
+      ),
+    );
+}
+
 export async function markQueuedDraftSent(
   id: string,
+  ctx: QueueContext,
+  claimId: string,
   sentMessageId?: string,
 ): Promise<QueuedEmailDraft> {
-  await requireQueuedDraft(id, { ownerOnly: true });
-  return updateQueuedDraft(id, {
+  const updates: Record<string, unknown> = {
     status: "sent",
-    sentMessageId,
-  });
+    sendClaimId: null,
+    sendClaimedAt: null,
+    sentAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  if (sentMessageId !== undefined) {
+    updates.sentMessageId = sentMessageId.trim() || null;
+  }
+  await getDb()
+    .update(schema.queuedEmailDrafts)
+    .set(updates)
+    .where(
+      and(
+        eq(schema.queuedEmailDrafts.id, id),
+        eq(schema.queuedEmailDrafts.orgId, ctx.orgId),
+        eq(schema.queuedEmailDrafts.sendClaimId, claimId),
+      ),
+    );
+  const updated = await getQueuedDraft(id, ctx);
+  if (!updated) throw new Error("Queued draft not found after send.");
+  return updated;
 }

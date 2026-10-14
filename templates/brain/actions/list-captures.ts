@@ -1,8 +1,10 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
+import { accessFilter, resolveAccess } from "@agent-native/core/sharing";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
-import { accessFilter, resolveAccess } from "@agent-native/core/sharing";
+
 import { getDb, schema } from "../server/db/index.js";
+import { listAccessibleAudienceIds } from "../server/lib/audiences.js";
 import {
   latestDistillationQueuesForCaptures,
   parseJson,
@@ -97,9 +99,13 @@ export default defineAction({
 
     const sourceIds = sourceRows.map((source) => source.id);
     if (!sourceIds.length) return { count: 0, captures: [] };
+    const audienceIds = await listAccessibleAudienceIds(sourceIds);
+    if (!audienceIds.length) return { count: 0, captures: [] };
     const sourceMap = new Map(sourceRows.map((source) => [source.id, source]));
     const captureClauses = [
       inArray(schema.brainRawCaptures.sourceId, sourceIds),
+      eq(schema.brainRawCaptures.sensitivityDisposition, "allowed"),
+      inArray(schema.brainCaptureAudiences.audienceId, audienceIds),
     ];
     if (args.status) {
       captureClauses.push(eq(schema.brainRawCaptures.status, args.status));
@@ -108,16 +114,11 @@ export default defineAction({
       captureClauses.push(eq(schema.brainRawCaptures.kind, args.kind));
     }
 
-    // Project only the columns the list path uses. The heavy `content` blob is
-    // never fetched unless a preview was explicitly requested, and even then we
-    // pull only a truncated slice via substr (portable across Postgres and
-    // SQLite, both 1-indexed). `contentPreview` collapses whitespace, so we
-    // over-fetch a margin so the trimmed preview still reaches previewLength.
     const previewSliceLength = args.includePreview
       ? Math.min(args.previewLength * 4, 4000)
       : 0;
     const rows = await db
-      .select({
+      .selectDistinct({
         id: schema.brainRawCaptures.id,
         sourceId: schema.brainRawCaptures.sourceId,
         externalId: schema.brainRawCaptures.externalId,
@@ -135,6 +136,10 @@ export default defineAction({
           : {}),
       })
       .from(schema.brainRawCaptures)
+      .innerJoin(
+        schema.brainCaptureAudiences,
+        eq(schema.brainCaptureAudiences.captureId, schema.brainRawCaptures.id),
+      )
       .where(and(...captureClauses))
       .orderBy(desc(schema.brainRawCaptures.capturedAt))
       .limit(args.limit);

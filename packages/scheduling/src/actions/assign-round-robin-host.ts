@@ -1,9 +1,11 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
+import { defineAction } from "@agent-native/core/action";
+import { assertAccess } from "@agent-native/core/sharing";
 import { eq } from "drizzle-orm";
-import { getSchedulingContext } from "../server/context.js";
-import { countBookingsByHostInRange } from "../server/bookings-repo.js";
+import { z } from "zod";
+
 import { assignRoundRobin, type HostMetrics } from "../core/round-robin.js";
+import { countBookingsByHostInRange } from "../server/bookings-repo.js";
+import { getSchedulingContext } from "../server/context.js";
 import type { Host } from "../shared/index.js";
 
 export default defineAction({
@@ -16,6 +18,11 @@ export default defineAction({
       .default("lowest-recent-bookings"),
   }),
   run: async (args) => {
+    const eventTypeAccess = await assertAccess(
+      "event-type",
+      args.eventTypeId,
+      "viewer",
+    );
     const { getDb, schema } = getSchedulingContext();
     const hostRows = await getDb()
       .select()
@@ -37,9 +44,11 @@ export default defineAction({
     for (const h of hosts) {
       metrics.set(h.userEmail, {
         recentBookingCount: await countBookingsByHostInRange(
+          args.eventTypeId,
           h.userEmail,
           from,
           to,
+          eventTypeAccess.resource.orgId,
         ),
         noShowRate: 0,
       });

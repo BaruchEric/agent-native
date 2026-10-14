@@ -1,26 +1,11 @@
-/**
- * Record a personal-vocabulary correction.
- *
- * Wispr-style auto-learn: after a dictation paste the desktop renderer
- * watches the focused field for ~10s. If the user edits a word during that
- * window, the diffed `{term, replacement}` pair is sent here. Future
- * dictations bias the recognizer's `contextualStrings` toward the
- * `replacement` so the user's preferred spelling wins next time.
- *
- * Idempotent: if the same term already exists for this owner, bumps
- * `usesCount` and refreshes the replacement / confidence.
- *
- * Usage:
- *   pnpm action add-vocabulary-term --term="kubectl" --replacement="kubectl"
- */
-
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
+import { defineAction } from "@agent-native/core/action";
+import { getRequestUserEmail } from "@agent-native/core/server/request-context";
 import { and, eq } from "drizzle-orm";
 import { createError } from "h3";
+import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
-import { nanoid } from "../server/lib/recordings.js";
-import { getRequestUserEmail } from "@agent-native/core/server/request-context";
+import { nanoid, ownerEmailMatches } from "../server/lib/recordings.js";
 
 export default defineAction({
   description:
@@ -44,7 +29,7 @@ export default defineAction({
       .describe("How confident this correction is (0..1)"),
   }),
   run: async (args) => {
-    const ownerEmail = await getRequestUserEmail();
+    const ownerEmail = getRequestUserEmail();
     if (!ownerEmail) {
       throw createError({
         statusCode: 401,
@@ -55,17 +40,16 @@ export default defineAction({
     const db = getDb();
     const term = args.term.trim();
     const replacement = args.replacement.trim();
-    if (!term || !replacement || term === replacement) {
+    if (!term || !replacement) {
       return { id: null, skipped: true };
     }
     const now = new Date().toISOString();
-    // Look up an existing entry for this owner+term — bump usesCount.
     const [existing] = await db
       .select()
       .from(schema.vocabulary)
       .where(
         and(
-          eq(schema.vocabulary.ownerEmail, ownerEmail),
+          ownerEmailMatches(schema.vocabulary.ownerEmail, ownerEmail),
           eq(schema.vocabulary.term, term),
         ),
       )

@@ -2,6 +2,7 @@ import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+
 import {
   appendCodeAgentTranscriptEvent,
   codeAgentRunArtifactsDir,
@@ -1247,9 +1248,7 @@ function createLocalProjectIr(sourceRoot: string): ProjectIRLike {
         provider: inferLlmProvider(text),
       });
     }
-    if (
-      /\b(drizzle|prisma|postgres|supabase|mysql|sqlite|mongoose)\b/i.test(text)
-    ) {
+    if (/\b(drizzle|prisma|postgres|supabase)\b/i.test(text)) {
       behavior.dataStores.push({
         id: stableId(`${file}:data`),
         name: path.basename(file),

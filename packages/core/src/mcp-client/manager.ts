@@ -1,49 +1,42 @@
-/**
- * McpClientManager — connects to configured MCP servers (stdio or remote
- * Streamable HTTP), enumerates their tools, and exposes a flat tool registry
- * prefixed with `mcp__<server-id>__` so the agent's tool-use loop can call them.
- *
- * Stdio servers are a strict no-op in non-Node runtimes (Cloudflare Workers,
- * browsers). HTTP servers work in any runtime with `fetch`; `reconfigure()`
- * lets callers add or remove servers at runtime without restarting the process.
- */
-
+import {
+  MCP_APP_EXTENSION_ID,
+  MCP_APP_MIME_TYPE,
+  type ActionAuthorize,
+  type ActionRunContext,
+} from "../action.js";
 import type { McpConfig, McpServerConfig } from "./config.js";
-import { formatMcpConnectError } from "./errors.js";
-import { MCP_APP_EXTENSION_ID, MCP_APP_MIME_TYPE } from "../action.js";
+import { formatMcpConnectError, httpStatusFromError } from "./errors.js";
+import {
+  isFirstPartyRemoteEndpointTrusted,
+  parseMergedKey,
+} from "./remote-store.js";
 
 export const MCP_TOOL_PREFIX = "mcp__";
 
 export interface McpTool {
-  /** Server id the tool belongs to */
   source: string;
-  /** Prefixed tool name (e.g. "mcp__claude-in-chrome__navigate") */
   name: string;
-  /** Original name as reported by the MCP server */
   originalName: string;
-  /** Human-readable description */
   description: string;
-  /** JSON-Schema input spec forwarded verbatim from the server */
   inputSchema: Record<string, unknown>;
-  /** Optional title as reported by the MCP server */
   title?: string;
-  /** JSON-Schema output spec forwarded verbatim from the server */
   outputSchema?: Record<string, unknown>;
-  /** MCP tool annotations forwarded verbatim from the server */
   annotations?: Record<string, unknown>;
-  /** MCP metadata forwarded verbatim from the server */
   _meta?: Record<string, unknown>;
-  /** Full raw tool object for extensions that depend on fields core does not know yet. */
   raw: Record<string, unknown>;
 }
 
 interface ServerEntry {
   id: string;
   config: McpServerConfig;
-  client: any | null;
-  transport: any | null;
+  client: any;
+  transport: any;
   tools: McpTool[];
   error?: string;
+  pendingRequests: number;
+  pendingRequestsDrained: Promise<void>;
+  resolvePendingRequests?: () => void;
+  replacement?: ServerEntry;
 }
 
 type ErrorSink = (error: unknown) => void;
@@ -64,10 +57,6 @@ export function buildMcpToolName(serverId: string, toolName: string): string {
   return buildPrefixedName(serverId, toolName);
 }
 
-/**
- * Parse a prefixed tool name back into its server id and original tool name.
- * Returns `null` if the name doesn't match the MCP prefix convention.
- */
 export function parseMcpToolName(
   prefixedName: string,
 ): { serverId: string; toolName: string } | null {
@@ -82,9 +71,20 @@ export function parseMcpToolName(
 }
 
 export interface McpClientManagerOptions {
-  /** Emit debug logs on startup */
   debug?: boolean;
+  connectTimeoutMs?: number;
 }
+
+export interface McpToolCallOptions {
+  /** Identity and invocation source forwarded to the authorization callback. */
+  context?: ActionRunContext;
+  /** Fallback used by standalone action wrappers without a manager resolver. */
+  authorize?: ActionAuthorize<Record<string, unknown>>;
+}
+
+export type McpToolAuthorizationResolver = (
+  tool: McpTool,
+) => ActionAuthorize<Record<string, unknown>> | undefined;
 
 function sameServerConfig(a: McpServerConfig, b: McpServerConfig): boolean {
   const typeA = a.type ?? "stdio";
@@ -93,7 +93,10 @@ function sameServerConfig(a: McpServerConfig, b: McpServerConfig): boolean {
   if (typeA === "http" && b.type === "http" && a.type === "http") {
     return (
       a.url === b.url &&
-      JSON.stringify(a.headers ?? {}) === JSON.stringify(b.headers ?? {})
+      JSON.stringify(a.headers ?? {}) === JSON.stringify(b.headers ?? {}) &&
+      a.firstParty === b.firstParty &&
+      a.firstPartyAppId === b.firstPartyAppId &&
+      a.firstPartyOrgId === b.firstPartyOrgId
     );
   }
   if (a.type !== "http" && b.type !== "http") {
@@ -136,61 +139,95 @@ function guardClose(
 
 type SdkModules = {
   Client: any;
-  StdioClientTransport: any | null;
-  StreamableHTTPClientTransport: any | null;
+  StdioClientTransport: any;
+  StreamableHTTPClientTransport: any;
 };
+
+const DEFAULT_MCP_CONNECT_TIMEOUT_MS = 5_000;
+
+function mcpConnectTimeoutMs(configured?: number): number {
+  const raw =
+    typeof process !== "undefined"
+      ? process.env.AGENT_NATIVE_MCP_CLIENT_CONNECT_TIMEOUT_MS ||
+        process.env.MCP_CLIENT_CONNECT_TIMEOUT_MS
+      : undefined;
+  const parsed = raw ? Number(raw) : NaN;
+  if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  if (Number.isFinite(configured) && (configured as number) >= 0) {
+    return configured as number;
+  }
+  return DEFAULT_MCP_CONNECT_TIMEOUT_MS;
+}
+
+async function withConnectTimeout<T>(
+  work: Promise<T>,
+  label: string,
+  timeoutMs: number,
+): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return work;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export class McpClientManager {
   private readonly servers: Map<string, ServerEntry> = new Map();
   private readonly debug: boolean;
+  private readonly connectTimeoutMs: number | undefined;
   private started = false;
   private config: McpConfig | null;
   private sdk: SdkModules | null = null;
   private readonly listeners: Set<() => void> = new Set();
-  /** Serialises reconfigure()/start() — two concurrent callers would
-   * otherwise race on `this.config` and on connect/disconnect ordering. */
+  private resolveToolAuthorization?: McpToolAuthorizationResolver;
   private reconfigureQueue: Promise<unknown> = Promise.resolve();
 
   constructor(config: McpConfig | null, options: McpClientManagerOptions = {}) {
     this.config = config;
     this.debug = !!options.debug;
+    this.connectTimeoutMs = options.connectTimeoutMs;
   }
 
-  /** True when the manager has any configured servers. */
+  /**
+   * Install the app-owned authorization resolver used by every MCP tool-call
+   * surface. Passing `undefined` restores the backwards-compatible no-policy
+   * behavior.
+   */
+  setToolAuthorizationResolver(resolver?: McpToolAuthorizationResolver): void {
+    this.resolveToolAuthorization = resolver;
+  }
+
   get enabled(): boolean {
     return !!this.config && Object.keys(this.config.servers).length > 0;
   }
 
-  /** Return the current config (read-only snapshot for callers that need to
-   *  merge new servers into the existing set before calling reconfigure). */
   getConfig(): McpConfig | null {
     return this.config;
   }
 
-  /** List of configured server ids (whether or not they're connected). */
   get configuredServers(): string[] {
     if (!this.config) return [];
     return Object.keys(this.config.servers);
   }
 
-  /** List of server ids that successfully connected and enumerated tools. */
   get connectedServers(): string[] {
     return Array.from(this.servers.values())
       .filter((s) => s.client && !s.error)
       .map((s) => s.id);
   }
 
-  /**
-   * Load MCP SDK modules lazily so non-Node bundles don't pull them in.
-   * Stdio transport is only loaded when a stdio server is actually configured.
-   */
   private async loadSdk(needStdio: boolean): Promise<SdkModules | null> {
     if (this.sdk) {
-      // If we previously loaded without stdio and now need it, top up.
       if (needStdio && !this.sdk.StdioClientTransport && isNode()) {
         try {
-          const stdioMod =
-            await import("@modelcontextprotocol/sdk/client/stdio.js");
+          const stdioMod = await import("@modelcontextprotocol/client/stdio");
           this.sdk.StdioClientTransport = stdioMod.StdioClientTransport;
         } catch (err: any) {
           console.warn(
@@ -201,15 +238,11 @@ export class McpClientManager {
       return this.sdk;
     }
     try {
-      const clientMod =
-        await import("@modelcontextprotocol/sdk/client/index.js");
-      const httpMod =
-        await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+      const clientMod = await import("@modelcontextprotocol/client");
       let StdioClientTransport: any = null;
       if (needStdio && isNode()) {
         try {
-          const stdioMod =
-            await import("@modelcontextprotocol/sdk/client/stdio.js");
+          const stdioMod = await import("@modelcontextprotocol/client/stdio");
           StdioClientTransport = stdioMod.StdioClientTransport;
         } catch (err: any) {
           console.warn(
@@ -220,7 +253,7 @@ export class McpClientManager {
       this.sdk = {
         Client: clientMod.Client,
         StdioClientTransport,
-        StreamableHTTPClientTransport: httpMod.StreamableHTTPClientTransport,
+        StreamableHTTPClientTransport: clientMod.StreamableHTTPClientTransport,
       };
       return this.sdk;
     } catch (err: any) {
@@ -231,11 +264,6 @@ export class McpClientManager {
     }
   }
 
-  /**
-   * Subscribe to tool-set changes (e.g. after `reconfigure()` adds/removes
-   * servers). The listener is called *after* connect/disconnect completes.
-   * Returns an unsubscribe function.
-   */
   onChange(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => {
@@ -289,10 +317,6 @@ export class McpClientManager {
     this.emitChange();
   }
 
-  /**
-   * Create a new ServerEntry and attempt to connect. Logs and records errors
-   * on the entry rather than throwing — callers iterate many servers.
-   */
   private async addServer(
     id: string,
     cfg: McpServerConfig,
@@ -309,6 +333,8 @@ export class McpClientManager {
       client: null,
       transport: null,
       tools: [],
+      pendingRequests: 0,
+      pendingRequestsDrained: Promise.resolve(),
     };
     this.servers.set(id, entry);
     try {
@@ -335,12 +361,33 @@ export class McpClientManager {
         throw new Error("HTTP transport not available");
       }
       const requestInit: Record<string, unknown> = {};
-      if (cfg.headers && Object.keys(cfg.headers).length > 0) {
-        requestInit.headers = cfg.headers;
+      const staticHeaders = { ...(cfg.headers ?? {}) };
+      const transportOptions: Record<string, unknown> = { requestInit };
+      if (this.shouldInjectFirstPartyIdentity(entry)) {
+        const baselineHeaders = { ...staticHeaders };
+        removeAuthorizationHeaders(baselineHeaders);
+        if (Object.keys(baselineHeaders).length > 0) {
+          requestInit.headers = baselineHeaders;
+        }
+        if (typeof fetch === "function") {
+          const nativeFetch = fetch.bind(globalThis);
+          transportOptions.fetch = async (input: unknown, init?: unknown) =>
+            nativeFetch(
+              input as Parameters<typeof fetch>[0],
+              await buildFirstPartyRequestInit(
+                staticHeaders,
+                init,
+                this.firstPartyTrust(entry),
+              ),
+            );
+        }
+      } else if (Object.keys(staticHeaders).length > 0) {
+        requestInit.headers = staticHeaders;
       }
-      transport = new sdk.StreamableHTTPClientTransport(new URL(cfg.url), {
-        requestInit,
-      });
+      transport = new sdk.StreamableHTTPClientTransport(
+        new URL(cfg.url),
+        transportOptions,
+      );
     } else {
       if (!sdk.StdioClientTransport) {
         throw new Error(
@@ -390,29 +437,54 @@ export class McpClientManager {
             },
           },
         },
+        versionNegotiation: { mode: "auto" },
       } as any,
     );
-    const recordConnectionError: ErrorSink = () => {};
+    let handshakeComplete = false;
+    let callbackError: unknown;
+    let callbackErrorsAreHttp400 = true;
+    const recordConnectionError: ErrorSink = (error) => {
+      const message = formatMcpConnectError(error);
+      entry.error = message;
+      callbackError ??= error;
+      callbackErrorsAreHttp400 &&= httpStatusFromError(error) === 400;
+      if (handshakeComplete) this.emitChange();
+      if (this.debug) {
+        console.warn(
+          `[mcp-client] ${handshakeComplete ? "runtime" : "handshake"} error from ${entry.id}: ${message}`,
+        );
+      }
+    };
     const restoreClientClose = guardClose(client, recordConnectionError);
     const restoreTransportClose = guardClose(transport, recordConnectionError);
     client.onerror = recordConnectionError;
-    // Attach a transport-level error handler before connect() so the SDK's
-    // internal fire-and-forget paths (initial SSE stream open, scheduled
-    // reconnects, message-handler-triggered reconnects — see processStream()
-    // in @modelcontextprotocol/sdk/client/streamableHttp.js) cannot leak as
-    // unhandled promise rejections. On AWS Lambda the long-lived socket
-    // gets reaped ~60s after the function returns; without this handler the
-    // resulting `socket hang up` surfaces as an unhandledRejection and
-    // pollutes Sentry. Client.connect() chains its own onerror on top of
-    // ours (see protocol.js: const _onerror = transport.onerror; ...).
     transport.onerror = recordConnectionError;
 
-    // If connect or listTools throws, we still need to release the child
-    // process (stdio) or pending HTTP session — otherwise repeated failures
-    // leak transports. Assign to the entry only after the handshake succeeds.
     try {
-      await client.connect(transport);
-      const listed = await client.listTools();
+      const timeoutMs = mcpConnectTimeoutMs(this.connectTimeoutMs);
+      await withConnectTimeout(
+        Promise.resolve(client.connect(transport)),
+        `MCP server ${entry.id} connect`,
+        timeoutMs,
+      );
+      if (callbackError) {
+        // Auto-negotiation can report its rejected probe before fallback succeeds.
+        const negotiatedAfterProbe =
+          cfg.type === "http" &&
+          httpStatusFromError(callbackError) === 400 &&
+          callbackErrorsAreHttp400 &&
+          typeof client.getNegotiatedProtocolVersion === "function" &&
+          Boolean(client.getNegotiatedProtocolVersion());
+        if (!negotiatedAfterProbe) throw callbackError;
+        callbackError = undefined;
+        entry.error = undefined;
+      }
+      const listed = await withConnectTimeout(
+        Promise.resolve(client.listTools()),
+        `MCP server ${entry.id} tools/list`,
+        timeoutMs,
+      );
+      if (callbackError) throw callbackError;
       const rawTools: Array<{
         name: string;
         title?: string;
@@ -440,14 +512,7 @@ export class McpClientManager {
         ...(t._meta ? { _meta: t._meta } : {}),
         raw: { ...t },
       }));
-      client.onerror = (error: unknown) => {
-        entry.error = formatMcpConnectError(error);
-        if (this.debug) {
-          console.warn(
-            `[mcp-client] runtime error from ${entry.id}: ${entry.error}`,
-          );
-        }
-      };
+      handshakeComplete = true;
     } catch (err) {
       await safelyClose(client, recordConnectionError);
       await safelyClose(transport, recordConnectionError);
@@ -458,18 +523,115 @@ export class McpClientManager {
     }
   }
 
-  /**
-   * Replace the configured server set. Servers that appear in the new config
-   * under a different shape are reconnected; unchanged entries stay live;
-   * removed entries are disconnected. Safe to call while `start()` is in
-   * flight or after it has completed.
-   *
-   * Serialised against `start()` and any other `reconfigure()` call via the
-   * internal queue — two concurrent mutations would otherwise interleave on
-   * `this.config` and on connect/disconnect ordering.
-   *
-   * Returns a summary describing what happened for logging / UI feedback.
-   */
+  private async closeEntry(entry: ServerEntry): Promise<void> {
+    if (entry.client) entry.client.onerror = undefined;
+    if (entry.transport) entry.transport.onerror = undefined;
+    await safelyClose(entry.client);
+    await safelyClose(entry.transport);
+  }
+
+  private beginRequest(entry: ServerEntry): void {
+    if (entry.pendingRequests === 0) {
+      entry.pendingRequestsDrained = new Promise<void>((resolve) => {
+        entry.resolvePendingRequests = resolve;
+      });
+    }
+    entry.pendingRequests += 1;
+  }
+
+  private endRequest(entry: ServerEntry): void {
+    entry.pendingRequests -= 1;
+    if (entry.pendingRequests === 0) {
+      entry.resolvePendingRequests?.();
+      entry.resolvePendingRequests = undefined;
+    }
+  }
+
+  private async runRequest<T>(
+    entry: ServerEntry,
+    operation: (entry: ServerEntry) => Promise<T>,
+  ): Promise<T> {
+    this.beginRequest(entry);
+    try {
+      return await operation(entry);
+    } finally {
+      this.endRequest(entry);
+    }
+  }
+
+  private async reconnectExpiredSession(
+    entry: ServerEntry,
+    failedTransport: any,
+  ): Promise<ServerEntry | null> {
+    const task = this.reconfigureQueue.then(async () => {
+      if (
+        this.servers.get(entry.id) !== entry ||
+        entry.transport !== failedTransport
+      ) {
+        return this.servers.get(entry.id) === entry.replacement
+          ? (entry.replacement ?? null)
+          : null;
+      }
+
+      await entry.pendingRequestsDrained;
+      if (
+        this.servers.get(entry.id) !== entry ||
+        entry.transport !== failedTransport
+      ) {
+        return this.servers.get(entry.id) === entry.replacement
+          ? (entry.replacement ?? null)
+          : null;
+      }
+      this.servers.delete(entry.id);
+      await this.closeEntry(entry);
+      const sdk = await this.loadSdk(
+        (entry.config.type ?? "stdio") === "stdio",
+      );
+      if (!sdk) throw new Error("MCP SDK is unavailable");
+      await this.addServer(entry.id, entry.config, sdk);
+      entry.replacement = this.servers.get(entry.id);
+      this.emitChange();
+      return entry.replacement ?? null;
+    });
+    this.reconfigureQueue = task.catch(() => {
+      /* failures surface on the caller, not on the queue */
+    });
+    await task;
+    return task;
+  }
+
+  private async withExpiredSessionRetry<T>(
+    entry: ServerEntry,
+    operation: (entry: ServerEntry) => Promise<T>,
+  ): Promise<T> {
+    const failedTransport = entry.transport;
+    const sessionId = failedTransport?.sessionId;
+    try {
+      return await this.runRequest(entry, operation);
+    } catch (error) {
+      if (
+        typeof sessionId !== "string" ||
+        sessionId.length === 0 ||
+        httpStatusFromError(error) !== 404
+      ) {
+        throw error;
+      }
+      const replacement = await this.reconnectExpiredSession(
+        entry,
+        failedTransport,
+      );
+      if (!replacement) throw error;
+      if (!replacement.client) {
+        throw new Error(
+          `MCP server "${entry.id}" is not connected${
+            replacement.error ? `: ${replacement.error}` : ""
+          }`,
+        );
+      }
+      return this.runRequest(replacement, operation);
+    }
+  }
+
   async reconfigure(newConfig: McpConfig | null): Promise<{
     added: string[];
     removed: string[];
@@ -502,14 +664,15 @@ export class McpClientManager {
     const unchanged: string[] = [];
     const reconnected: string[] = [];
 
-    // Remove entries that vanished or changed shape.
     for (const id of Object.keys(prevServers)) {
       if (!(id in nextServers)) {
         removed.push(id);
       } else if (!sameServerConfig(prevServers[id], nextServers[id])) {
         reconnected.push(id);
       } else {
-        unchanged.push(id);
+        const entry = this.servers.get(id);
+        if (entry?.error) reconnected.push(id);
+        else unchanged.push(id);
       }
     }
     for (const id of Object.keys(nextServers)) {
@@ -522,16 +685,7 @@ export class McpClientManager {
         const entry = this.servers.get(id);
         if (!entry) return;
         this.servers.delete(id);
-        try {
-          if (entry.client?.close) await entry.client.close();
-        } catch {
-          // ignore
-        }
-        try {
-          if (entry.transport?.close) await entry.transport.close();
-        } catch {
-          // ignore
-        }
+        await this.closeEntry(entry);
       }),
     );
 
@@ -548,8 +702,6 @@ export class McpClientManager {
       }
     }
 
-    // If the manager was never started (e.g. empty initial config) but now has
-    // servers, mark it started so subsequent start() calls don't duplicate work.
     if (!this.started && Object.keys(nextServers).length > 0) {
       this.started = true;
     }
@@ -558,7 +710,6 @@ export class McpClientManager {
     return { added, removed, unchanged, reconnected };
   }
 
-  /** Flattened tool list across all connected servers. */
   getTools(): McpTool[] {
     if (!this.enabled) return [];
     const out: McpTool[] = [];
@@ -579,16 +730,21 @@ export class McpClientManager {
     return [...(this.servers.get(serverId)?.tools ?? [])];
   }
 
+  /** The config the server's current tools were loaded from. */
+  getServerConfig(serverId: string): McpServerConfig | null {
+    return this.servers.get(serverId)?.config ?? null;
+  }
+
   hasServer(serverId: string): boolean {
     const entry = this.servers.get(serverId);
     return !!entry?.client && !entry.error;
   }
 
-  /**
-   * Invoke an MCP tool by prefixed name. Routes to the owning server based on
-   * the `mcp__<serverId>__` prefix.
-   */
-  async callTool(prefixedName: string, args: unknown): Promise<unknown> {
+  async callTool(
+    prefixedName: string,
+    args: unknown,
+    options: McpToolCallOptions = {},
+  ): Promise<unknown> {
     const parsed = parseMcpToolName(prefixedName);
     if (!parsed) {
       throw new Error(
@@ -603,22 +759,49 @@ export class McpClientManager {
         }`,
       );
     }
-    // Look up the tool so we fail loud for unknown names instead of forwarding
-    // garbage through to the server.
-    const known = entry.tools.find((t) => t.name === prefixedName);
-    if (!known) {
-      throw new Error(
-        `MCP server "${parsed.serverId}" does not expose tool "${parsed.toolName}"`,
+    const normalizedArgs =
+      args && typeof args === "object" ? (args as Record<string, unknown>) : {};
+    // The expired-session retry replays this attempt on a reconnected entry
+    // whose tool metadata was reloaded, so authorization must run per attempt.
+    return this.withExpiredSessionRetry(entry, async (current) => {
+      const known = current.tools.find((t) => t.name === prefixedName);
+      if (!known) {
+        throw new Error(
+          `MCP server "${parsed.serverId}" does not expose tool "${parsed.toolName}"`,
+        );
+      }
+      const client = current.client;
+      const authorize =
+        this.resolveToolAuthorization?.(known) ?? options.authorize;
+      if (authorize) {
+        const verdict = await authorize(normalizedArgs, options.context);
+        if (verdict === false) {
+          const error = new Error("Not authorized") as Error & {
+            statusCode: number;
+          };
+          error.name = "ForbiddenError";
+          error.statusCode = 403;
+          throw error;
+        }
+      }
+      const liveEntry = this.servers.get(parsed.serverId);
+      const liveTool = liveEntry?.tools.find(
+        (tool) => tool.name === prefixedName,
       );
-    }
-    const result = await entry.client.callTool({
-      name: parsed.toolName,
-      arguments:
-        args && typeof args === "object"
-          ? (args as Record<string, unknown>)
-          : {},
+      if (
+        liveEntry !== current ||
+        liveEntry.client !== client ||
+        liveTool !== known
+      ) {
+        throw new Error(
+          `MCP server "${parsed.serverId}" changed while authorizing tool "${parsed.toolName}"`,
+        );
+      }
+      return client.callTool({
+        name: parsed.toolName,
+        arguments: normalizedArgs,
+      });
     });
-    return result;
   }
 
   async readResource(serverId: string, uri: string): Promise<unknown> {
@@ -633,16 +816,20 @@ export class McpClientManager {
         }`,
       );
     }
-    if (typeof entry.client.readResource === "function") {
-      return entry.client.readResource({ uri });
-    }
-    if (typeof entry.client.request === "function") {
-      return entry.client.request({
-        method: "resources/read",
-        params: { uri },
-      });
-    }
-    throw new Error(`MCP server "${serverId}" does not support resources/read`);
+    return this.withExpiredSessionRetry(entry, (current) => {
+      if (typeof current.client.readResource === "function") {
+        return current.client.readResource({ uri });
+      }
+      if (typeof current.client.request === "function") {
+        return current.client.request({
+          method: "resources/read",
+          params: { uri },
+        });
+      }
+      throw new Error(
+        `MCP server "${serverId}" does not support resources/read`,
+      );
+    });
   }
 
   async readResourceForTool(
@@ -658,28 +845,19 @@ export class McpClientManager {
     return this.readResource(parsed.serverId, uri);
   }
 
-  /** Cleanly close all MCP clients and child processes. */
   async stop(): Promise<void> {
-    const entries = Array.from(this.servers.values());
-    this.servers.clear();
-    this.started = false;
-    await Promise.all(
-      entries.map(async (entry) => {
-        try {
-          if (entry.client?.close) await entry.client.close();
-        } catch {
-          // ignore
-        }
-        try {
-          if (entry.transport?.close) await entry.transport.close();
-        } catch {
-          // ignore
-        }
-      }),
-    );
+    const task = this.reconfigureQueue.then(async () => {
+      const entries = Array.from(this.servers.values());
+      this.servers.clear();
+      this.started = false;
+      await Promise.all(entries.map((entry) => this.closeEntry(entry)));
+    });
+    this.reconfigureQueue = task.catch(() => {
+      /* failures surface on the caller, not on the queue */
+    });
+    await task;
   }
 
-  /** Diagnostic snapshot used by `/_agent-native/mcp/status`. */
   getStatus(): {
     configuredServers: string[];
     connectedServers: string[];
@@ -703,5 +881,198 @@ export class McpClientManager {
       tools,
       errors,
     };
+  }
+
+  private shouldInjectFirstPartyIdentity(entry: ServerEntry): boolean {
+    return this.firstPartyTrust(entry) !== null;
+  }
+
+  private firstPartyTrust(
+    entry: ServerEntry,
+  ): { orgId: string; appId: string; url: string } | null {
+    if (entry.config.type !== "http" || entry.config.firstParty !== true) {
+      return null;
+    }
+    const parsed = parseMergedKey(entry.id);
+    if (parsed?.scope !== "org") return null;
+    return {
+      orgId: entry.config.firstPartyOrgId ?? parsed.owner,
+      appId: entry.config.firstPartyAppId ?? parsed.name,
+      url: entry.config.url,
+    };
+  }
+}
+
+function removeAuthorizationHeaders(headers: Record<string, string>): void {
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === "authorization") delete headers[key];
+  }
+}
+
+function headersToRecord(value: unknown): Record<string, string> {
+  if (!value) return {};
+  if (typeof Headers !== "undefined" && value instanceof Headers) {
+    return Object.fromEntries(value.entries());
+  }
+  if (Array.isArray(value)) {
+    return Object.fromEntries(
+      value
+        .filter((entry) => Array.isArray(entry) && entry.length >= 2)
+        .map(([key, headerValue]) => [String(key), String(headerValue)]),
+    );
+  }
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(
+        ([key, headerValue]) => [key, String(headerValue)],
+      ),
+    );
+  }
+  return {};
+}
+
+async function buildFirstPartyRequestInit(
+  staticHeaders: Record<string, string>,
+  rawInit: unknown,
+  trust: { orgId: string; appId: string; url: string } | null,
+): Promise<RequestInit> {
+  const init =
+    rawInit && typeof rawInit === "object" ? (rawInit as RequestInit) : {};
+  const headers = {
+    ...headersToRecord(staticHeaders),
+    ...headersToRecord(init.headers),
+  };
+  removeAuthorizationHeaders(headers);
+  const token = await mintFirstPartyMcpIdentityToken(trust).catch(() => null);
+  if (token) headers.Authorization = `Bearer ${token}`;
+  headers["x-agent-native-mcp-inline-apps"] = "1";
+  return { ...init, headers };
+}
+
+function randomJti(): string {
+  return (
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+  );
+}
+
+const FIRST_PARTY_TRUST_TTL_MS = 60_000;
+const FIRST_PARTY_TRUST_FAILURE_TTL_MS = 10_000;
+const ORG_SIGNING_CONTEXT_TTL_MS = 60_000;
+
+const firstPartyTrustCache = new Map<
+  string,
+  { ok: boolean; expiresAt: number }
+>();
+const orgSigningContextCache = new Map<
+  string,
+  { orgDomain?: string; orgSecret?: string; expiresAt: number }
+>();
+
+async function isFirstPartyTrustCached(trust: {
+  orgId: string;
+  appId: string;
+  url: string;
+}): Promise<boolean> {
+  const key = `${trust.orgId}\n${trust.appId}\n${trust.url}`;
+  const cached = firstPartyTrustCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.ok;
+  const result = await isFirstPartyRemoteEndpointTrusted(
+    trust.orgId,
+    trust.appId,
+    trust.url,
+  );
+  const ok = result.ok === true;
+  firstPartyTrustCache.set(key, {
+    ok,
+    expiresAt:
+      Date.now() +
+      (ok ? FIRST_PARTY_TRUST_TTL_MS : FIRST_PARTY_TRUST_FAILURE_TTL_MS),
+  });
+  return ok;
+}
+
+async function resolveOrgSigningContext(orgId: string): Promise<{
+  orgDomain?: string;
+  orgSecret?: string;
+}> {
+  const cached = orgSigningContextCache.get(orgId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { orgDomain: cached.orgDomain, orgSecret: cached.orgSecret };
+  }
+  let orgDomain: string | undefined;
+  let orgSecret: string | undefined;
+  try {
+    const { getOrgDomain, getOrgA2ASecret } = await import("../org/context.js");
+    orgDomain = (await getOrgDomain(orgId)) ?? undefined;
+    orgSecret = (await getOrgA2ASecret(orgId)) ?? undefined;
+  } catch {
+    // Global A2A_SECRET remains the hosted/common path.
+  }
+  orgSigningContextCache.set(orgId, {
+    orgDomain,
+    orgSecret,
+    expiresAt: Date.now() + ORG_SIGNING_CONTEXT_TTL_MS,
+  });
+  return { orgDomain, orgSecret };
+}
+
+async function mintFirstPartyMcpIdentityToken(
+  trust: { orgId: string; appId: string; url: string } | null,
+): Promise<string | null> {
+  if (!trust) return null;
+  const [
+    { getRequestOrgId, getRequestUserEmail },
+    { getGlobalA2ASecret, signA2AOrganizationToken, signA2AToken },
+  ] = await Promise.all([
+    import("../server/request-context.js"),
+    import("../a2a/client.js"),
+  ]);
+  const userEmail = getRequestUserEmail();
+  const requestOrgId = getRequestOrgId();
+  if (requestOrgId && requestOrgId !== trust.orgId) {
+    return null;
+  }
+  const orgId = requestOrgId ?? trust.orgId;
+  if (!orgId) return null;
+  if (!(await isFirstPartyTrustCached({ ...trust, orgId }))) return null;
+
+  const { orgDomain, orgSecret } = await resolveOrgSigningContext(orgId);
+  if (!orgDomain?.trim()) return null;
+  const extraClaims = {
+    jti: randomJti(),
+    scope: "mcp-connect",
+    agent_native_first_party_mcp: true,
+  };
+  const audience = firstPartyMcpAudienceForUrl(trust.url);
+  if (userEmail && requestOrgId && getGlobalA2ASecret()) {
+    return signA2AToken(userEmail, orgDomain, undefined, {
+      expiresIn: "5m",
+      audience,
+      preferGlobalSecret: true,
+      extraClaims,
+    });
+  }
+  return signA2AOrganizationToken(orgDomain, orgSecret, undefined, {
+    expiresIn: "5m",
+    audience,
+    extraClaims,
+  });
+}
+
+function firstPartyMcpAudienceForUrl(rawUrl: string): string | undefined {
+  try {
+    const url = new URL(rawUrl);
+    const pathname = url.pathname.replace(/\/+$/, "");
+    if (pathname.endsWith("/_agent-native/mcp")) {
+      url.pathname = `${pathname.slice(0, -"/_agent-native/mcp".length)}/mcp`;
+    } else {
+      url.pathname = pathname.endsWith("/mcp") ? pathname : `${pathname}/mcp`;
+    }
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return undefined;
   }
 }

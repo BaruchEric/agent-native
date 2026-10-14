@@ -1,13 +1,14 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction, fail } from "@agent-native/core/action";
 import { z } from "zod";
-import {
-  readAppStateForCurrentTab,
-  writeAppStateForCurrentTab,
-} from "./_tab-state.js";
+
 import {
   FORMS_NAVIGATION_VIEWS,
   formsRoutePath,
 } from "../shared/navigation.js";
+import {
+  readAppStateForCurrentTab,
+  writeAppStateForCurrentTab,
+} from "./_tab-state.js";
 
 interface NavigationState {
   formId?: string;
@@ -19,13 +20,13 @@ function writeId() {
 
 export default defineAction({
   description:
-    "Navigate the UI to a view or form. Views: home, forms, form, responses, response-insights, team, extensions, form-preview. Use view=responses with a formId when the user asks to see/open all responses for a form. Use view=form with tab=edit|responses|settings|integrations to open a form builder sub-tab.",
+    "Navigate the UI to a view or form. Views: ask, home, forms, form, responses, response-insights, team, extensions, form-preview. Use view=ask/home for the Ask Forms chat tab. Use view=forms to open the forms list/table. Use view=responses with a formId when the user asks to see/open all responses for a form. Use view=form with tab=edit|responses|settings|integrations to open a form builder sub-tab.",
   schema: z.object({
     view: z
       .enum(FORMS_NAVIGATION_VIEWS)
       .optional()
       .describe(
-        "View to navigate to (home, forms, form, responses, response-insights, team, extensions, form-preview)",
+        "View to navigate to (ask, home, forms, form, responses, response-insights, team, extensions, form-preview)",
       ),
     formId: z
       .string()
@@ -54,16 +55,22 @@ export default defineAction({
         : undefined);
 
     if (!view && !formId && !tab) {
-      throw new Error("At least --view, --formId, or --tab is required.");
+      fail("At least --view, --formId, or --tab is required.", {
+        errorCode: "navigate_target_required",
+      });
     }
     if (tab && resolvedView !== "form") {
-      throw new Error("--tab can only be used with --view form.");
+      fail("--tab can only be used with --view form.", {
+        errorCode: "invalid_navigate_tab",
+      });
     }
     if (
       (resolvedView === "form" || resolvedView === "responses") &&
       !resolvedFormId
     ) {
-      throw new Error(`${resolvedView} navigation requires a formId.`);
+      fail(`${resolvedView} navigation requires a formId.`, {
+        errorCode: "form_id_required",
+      });
     }
 
     const path = formsRoutePath({
@@ -72,7 +79,9 @@ export default defineAction({
       tab,
     });
     if (!path) {
-      throw new Error(`Unsupported navigation target: ${resolvedView}.`);
+      fail(`Unsupported navigation target: ${resolvedView}.`, {
+        errorCode: "unsupported_navigate_target",
+      });
     }
 
     const nav: Record<string, string> = {};

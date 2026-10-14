@@ -1,11 +1,12 @@
-import { useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { IconX } from "@tabler/icons-react";
-import { cn } from "@/lib/utils";
+import { useMemo, useRef, useState, type KeyboardEvent } from "react";
+
 import {
   Popover,
   PopoverTrigger,
   PopoverContent,
 } from "@/components/ui/popover";
+import { cn } from "@/lib/utils";
 
 interface TagInputProps {
   value: string[];
@@ -13,6 +14,7 @@ interface TagInputProps {
   placeholder?: string;
   onChange: (next: string[]) => void;
   className?: string;
+  "aria-label"?: string;
 }
 
 export function TagInput({
@@ -21,6 +23,7 @@ export function TagInput({
   placeholder = "Add tag…",
   onChange,
   className,
+  "aria-label": ariaLabel,
 }: TagInputProps) {
   const [draft, setDraft] = useState("");
   const [showDrop, setShowDrop] = useState(false);
@@ -73,7 +76,7 @@ export function TagInput({
             {value.map((tag) => (
               <span
                 key={tag}
-                className="inline-flex items-center gap-1 rounded-full bg-primary/10 text-primary text-xs pl-2 pr-1 py-0.5"
+                className="inline-flex items-center gap-1 rounded-full bg-primary/10 text-primary text-xs ps-2 pe-1 py-0.5"
               >
                 {tag}
                 <button
@@ -98,6 +101,7 @@ export function TagInput({
               onFocus={() => setShowDrop(true)}
               onBlur={() => setTimeout(() => setShowDrop(false), 100)}
               onKeyDown={handleKeyDown}
+              aria-label={ariaLabel}
               placeholder={value.length === 0 ? placeholder : ""}
               className="flex-1 min-w-[8rem] bg-transparent text-sm outline-none"
             />

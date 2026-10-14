@@ -5,6 +5,7 @@ description: >-
   granular server-side merge. Use when adding real-time collaborative editing to
   a template, debugging sync issues, or understanding how the agent and humans
   edit documents simultaneously.
+scope: dev
 metadata:
   internal: true
 ---
@@ -15,7 +16,7 @@ metadata:
 
 Collaborative editing uses Yjs CRDT via TipTap. The agent and human users are
 equal participants — both edit the same Y.Doc and changes merge cleanly without
-conflicts. Always set `resourceType` on `createCollabPlugin`.
+conflicts. Always choose an explicit `access` mode on `createCollabPlugin`.
 
 ## How It Works
 
@@ -27,13 +28,26 @@ conflicts. Always set `resourceType` on `createCollabPlugin`.
 - **SSE fast-path** — `/_agent-native/poll-events` `EventSource` delivers collab
   events push-style; while SSE is healthy the collab poll interval relaxes to
   ~12 s
-- **Polling fallback** — `/_agent-native/poll` is polled every 2 s when SSE is
-  unavailable; this is the universal serverless fallback
+- **Polling fallback** — `/_agent-native/poll` is polled every 2 s when SSE
+  drops mid-session. On serverless, `/events` answers 204 up front (poll-live)
+  and this client relaxes to ~12 s, because `/poll` is the only channel.
+- **Collab poll boost** — while the awareness set shows another visible human
+  on the doc (agent and hidden tabs do not count), the connection holds
+  `acquireCollabPollBoost()` and the shared transport polls every 2.5 s
+  whenever no stream is connected: a no-op while SSE or the hosted gateway is
+  live. A joiner is noticed on the existing user's next ~12 s collab poll
+  (the joiner sees them at once), a leaver within one poll plus the 30 s
+  awareness TTL. The boost lapses after 3 minutes with no input and no remote
+  events. Lone tabs pay nothing extra. A read-only viewer must join the doc too (Design's
+  `useViewerPresence`; it never uses the `ydoc`), or it never sees an editor
+  and stays on the idle cadence. A viewer on a different screen than the
+  editor shares no doc with them; its own collab poll sees the design's
+  resource-scoped events from other tabs and starts the boost (60 s) itself.
 - **Update batching** — local Yjs updates are debounced ~80 ms and coalesced
   with `Y.mergeUpdates` before sending; flushed immediately on
   `visibilitychange` / `pagehide`
-- **SQL `_collab_docs` table** persists Yjs state as base64 (SQLite/Postgres
-  compatible). Tombstone compaction fires automatically when the stored blob
+- **SQL `_collab_docs` table** persists Yjs state as base64 in Postgres. Tombstone
+  compaction fires automatically when the stored blob
   exceeds 4× the fresh encoded size.
 
 ## Agent + Human Editing
@@ -81,7 +95,7 @@ Exactly ONE connected client applies the authoritative snapshot; the rest
 receive it through Yjs sync:
 
 ```ts
-import { isReconcileLeadClient } from "@agent-native/core/client";
+import { isReconcileLeadClient } from "@agent-native/core/client/collab";
 
 if (
   loaded.updatedAt > lastAppliedUpdatedAt.current &&
@@ -95,6 +109,16 @@ The agent's awareness entry (`AGENT_CLIENT_ID`, max int) can never be the
 lead. A sole client is always the lead. The election is deterministic with no
 coordination round-trip.
 
+A lead that sees another visible human waits `PEER_SETTLE_MS` (2.5 s) before
+adopting a newer snapshot, so that peer's in-flight typing lands first. The wait
+is skipped only when the host passes `isEditorClean(liveMarkdown)` to
+`useCollabReconcile`, it returns true, and the live doc still equals the last
+authoritative snapshot the hook adopted. Do not substitute
+`lastAppliedSerialized`: local emits update it, so it cannot say whether the
+doc holds unsaved text. Content's `isEditorClean` also requires no queued or
+in-flight save, no reconcile recovery draft, and no journaled draft that
+differs from the live doc.
+
 ### v1 limitation
 
 Full-content reconcile is **last-writer-wins** for the rare case where a human
@@ -103,7 +127,16 @@ in **different** regions merge fine through the CRDT.
 
 ## Security
 
-### Always set `resourceType`
+### Always choose an explicit access mode
+
+Inspect the schema and sharing registration before configuring collaboration:
+
+- For owned or shareable records, use `mode: "resource"` and the resource type
+  registered through `registerShareableResource`.
+- For records deliberately visible to every authenticated user on the
+  deployment, use `mode: "all-authenticated"`.
+- Never invent a `resourceType` merely to silence a warning. Resource mode is
+  correct only when the matching ownership and sharing model exists.
 
 ```ts
 // server/plugins/collab.ts
@@ -113,14 +146,23 @@ export default createCollabPlugin({
   table: "documents",
   contentColumn: "content",
   idColumn: "id",
-  resourceType: "document", // required
+  access: { mode: "resource", resourceType: "document" },
 });
 ```
 
-Without `resourceType`, the server logs a one-time warning and collab push
-events are delivered to **all authenticated users** without document-level
-scoping. Set it to the resource type name registered via
-`registerShareableResource`.
+For intentionally deployment-wide authenticated collaboration:
+
+```ts
+createCollabPlugin({
+  table: "todos",
+  contentColumn: "content",
+  access: { mode: "all-authenticated" },
+});
+```
+
+Omitting `access` is supported only for legacy compatibility and is deprecated.
+It behaves like `all-authenticated`, logs a warning, and is flagged by Doctor.
+Choose the mode explicitly so access intent is reviewable.
 
 Non-owner sharees who have explicit access fall back to state-vector catch-up
 (safe, slightly higher latency). Awareness routes require the same viewer
@@ -132,7 +174,10 @@ Write routes reject payloads exceeding `maxPayloadBytes` (default 2 MB) with
 HTTP 413. Override:
 
 ```ts
-createCollabPlugin({ resourceType: "document", maxPayloadBytes: 512 * 1024 });
+createCollabPlugin({
+  access: { mode: "resource", resourceType: "document" },
+  maxPayloadBytes: 512 * 1024,
+});
 ```
 
 ## Enabling Collaboration
@@ -143,7 +188,7 @@ createCollabPlugin({ resourceType: "document", maxPayloadBytes: 512 * 1024 });
 pnpm add @tiptap/extension-collaboration @tiptap/extension-collaboration-caret @tiptap/y-tiptap @tiptap/core
 ```
 
-### 2. Add collab server plugin (with `resourceType`)
+### 2. Add collab server plugin (with explicit access)
 
 ```ts
 // server/plugins/collab.ts
@@ -153,14 +198,14 @@ export default createCollabPlugin({
   table: "documents",
   contentColumn: "content",
   idColumn: "id",
-  resourceType: "document",
+  access: { mode: "resource", resourceType: "document" },
 });
 ```
 
 ### 3. Use the client hook
 
 ```ts
-import { useCollaborativeDoc, emailToColor, emailToName } from "@agent-native/core/client";
+import { useCollaborativeDoc, emailToColor, emailToName } from "@agent-native/core/client/collab";
 
 const { ydoc, awareness, activeUsers, agentActive, agentPresent } =
   useCollaborativeDoc({
@@ -248,40 +293,104 @@ type PatchDeckOp =
 Concurrent edits to different slides both succeed at the action level; there
 is no whole-deck LWW. Forms use the same shape with field-level ops.
 
-## Collaborative Undo Scoping (Y.UndoManager)
+## Agent Presence & Lingering Edit Highlights
 
-Scope undo/redo to the local user's own edits so peer and agent changes are
-never accidentally reversed:
+The agent is a *visible* collaborator, not a silent content-swapper. Core
+handles most of this automatically:
 
-```ts
-import * as Y from "yjs";
+- **Auto-presence on agent writes** — any `applyText` / `searchAndReplace` /
+  `applyJson` / `applyPatchOps` call with `requestSource: "agent"` publishes
+  an agent awareness entry plus a `recentEdits` attribution describing what
+  changed. Actions that route writes through the collab layer get full
+  presence UX with zero extra wiring.
+- **Linger** — `agentLeaveDocument` (and the auto-presence path) keeps the
+  agent's awareness entry alive for ~6s (`AGENT_PRESENCE_LINGER_MS`) after the
+  last edit so viewers see who just changed what. Pass `{ lingerMs: 0 }` to
+  clear immediately. On serverless the linger degrades to the 30s awareness
+  expiry.
+- **`agentTouchDocument(docId, { edit, metadata })`** — refcount-neutral
+  presence + attribution for actions that write SQL directly (no collab doc).
+  `edit.descriptor` is one of `{kind:"text",quote}`, `{kind:"selector",selector}`,
+  `{kind:"paths",paths}`, `{kind:"doc"}`.
+- **Durable across instances** — awareness is mirrored to the additive
+  `_collab_awareness` table, so presence written by an action in one
+  serverless invocation is visible to clients polling any other instance.
 
-const LOCAL_EDIT_ORIGIN = "local";
+Client rendering:
 
-const undoManager = new Y.UndoManager(ydoc.getText("content"), {
-  trackedOrigins: new Set([LOCAL_EDIT_ORIGIN]),
-  captureTimeout: 800, // coalesces rapid slider drags into one undo step
-});
+```tsx
+import {
+  usePresence, useRecentEdits, RecentEditHighlights,
+  PresenceBar, LiveCursorOverlay, RemoteSelectionRings,
+} from "@agent-native/core/client/collab";
 
-// Mark local edits with the tracked origin
-ydoc.transact(() => {
-  // apply local change
-}, LOCAL_EDIT_ORIGIN);
+const { others, setPresence } = usePresence(awareness, ydoc?.clientID);
+const recentEdits = useRecentEdits(others); // non-expired, ~6s TTL
 
-undoManager.undo(); // only reverses LOCAL_EDIT_ORIGIN transactions
-undoManager.redo();
+<RecentEditHighlights
+  edits={recentEdits}
+  containerRef={containerRef}
+  resolveRect={(edit) => /* map descriptor → DOMRect, or null */ null}
+/>
 ```
 
-Rules:
-- Pass a `Set` to `trackedOrigins` — not an array.
-- Remote (`"remote"`) and agent (`"agent"`) origins are never captured.
-- Recreate and destroy the manager when the active document changes.
+Humans get the same treatment: call `publishRecentEdit(awareness, { descriptor })`
+from local mutation paths so peers see lingering highlights for human edits
+too. `CollabUser.avatarUrl` puts faces on avatars, cursors, and edit tags.
+
+## Per-User Undo (never revert someone else's work)
+
+Undo must only reverse the local user's edits — and must never restore a
+whole-document snapshot (that clobbers concurrent edits by peers/the agent).
+Core ships two primitives:
+
+**Yjs surfaces — `useCollabUndo`** (wraps `Y.UndoManager` lifecycle):
+
+```ts
+import { useCollabUndo } from "@agent-native/core/client/collab";
+
+const { undo, redo, canUndo, canRedo, transactLocal, localOrigin } =
+  useCollabUndo({
+    ydoc,
+    scope: (doc) => doc.getText("content"),
+    captureTimeout: 500,
+    enableKeyboardShortcuts: true, // Mod+Z / Shift+Mod+Z / Mod+Y
+  });
+
+// Tag every local mutation so it is captured:
+transactLocal(() => { /* mutate shared types */ });
+```
+
+Remote (`"remote"`) and agent (`"agent"`/`"server"`) origins are never
+captured. The manager is recreated/destroyed automatically when `ydoc`
+changes. (TipTap's Collaboration extension already provides this behavior
+for its own editor content.)
+
+**Op-based surfaces (slides/forms) — `useLocalOpUndo`**: record inverse
+granular ops for each local mutation; undo replays the inverse ops through
+your normal granular mutation path:
+
+```ts
+const { push, undo, redo, canUndo, canRedo } = useLocalOpUndo({
+  apply: (ops) => applyGranularOps(ops), // your patch path
+});
+
+push({
+  undo: [{ type: "patch", slideId, fields: prevFields }],
+  redo: [{ type: "patch", slideId, fields: nextFields }],
+  coalesceKey: `${slideId}:content`, // merge rapid bursts into one step
+});
+```
+
+Entries whose target no longer exists should fail soft (skip), never reset
+the whole history — external/agent edits must not wipe the user's undo stack.
 
 ## Common Pitfalls
 
-- **Missing `resourceType`** — The server logs a warning on startup and
-  delivers collab events to all authenticated users without access scoping.
-  Always set `resourceType`.
+- **Missing `access`** — Legacy omission behaves like `all-authenticated`, logs
+  a startup warning, and is flagged by Doctor. Choose `resource` for records
+  backed by ownership/sharing, or explicit `all-authenticated` for intentionally
+  deployment-wide records. Never invent a resource type to silence the warning.
 - **Don't pass `content` as a TipTap prop** when Collaboration is enabled —
   Yjs owns the content. Seed via `editor.commands.setContent()` only when the
   Y.XmlFragment is empty.
@@ -289,6 +398,17 @@ Rules:
   sanctioned `setContent` is gated by `updatedAt` and guarded by
   `isReconcileLeadClient`. Calling it from elsewhere duplicates content across
   the CRDT or re-applies stale snapshots.
+- **Save to SQL only after the edit reached the document** — a client that
+  saves the same text to SQL while its Yjs update is still queued (offline,
+  backoff) lets peers adopt the saved copy and then apply the late update
+  again, duplicating the text. Await `flushUpdates()` from
+  `useCollaborativeDoc` before the save; `false` means delivery failed, so retry
+  later instead of saving. Build the saved value from the live document at that
+  moment, not from a snapshot taken at the last keystroke.
+- **Seed an empty document on the server** — two editors opening a new doc each
+  seed it locally and the copies merge into duplicated text. Pass
+  `requestInitialSeed` (backed by `seedXmlFragmentIfEmpty`) so the server seeds
+  once and every editor adopts that copy.
 - **Add packages to `optimizeDeps`** — Vite won't pre-bundle Yjs correctly
   otherwise, causing runtime errors in dev.
 - **One `Y.Doc` per document** — Don't create multiple Y.Doc instances for the

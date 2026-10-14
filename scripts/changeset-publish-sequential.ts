@@ -1,9 +1,14 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { NPM_PUBLISH_PACKAGE_NAMES } from "./public-package-names.ts";
+
+export { NPM_PUBLISH_PACKAGE_NAMES } from "./public-package-names.ts";
 
 type PackageJson = {
   name?: string;
@@ -37,13 +42,14 @@ const rootDir = path.resolve(
   "..",
 );
 const registry = "https://registry.npmjs.org";
-const npmPublishAllowlist = new Set([
-  "@agent-native/core",
-  "@agent-native/dispatch",
-  "@agent-native/pinpoint",
-  "@agent-native/scheduling",
-  "@agent-native/skills",
-]);
+const npmDistTag = process.env.AGENT_NATIVE_NPM_DIST_TAG ?? "latest";
+const availabilityPollIntervalMs = 10_000;
+export const DEFAULT_NPM_AVAILABILITY_TIMEOUT_MS = 30 * 60_000;
+const availabilityTimeoutMs = Number(
+  process.env.AGENT_NATIVE_NPM_AVAILABILITY_TIMEOUT_MS ??
+    DEFAULT_NPM_AVAILABILITY_TIMEOUT_MS,
+);
+const npmPublishAllowlist = new Set(NPM_PUBLISH_PACKAGE_NAMES);
 
 async function readJson<T>(filePath: string): Promise<T> {
   return JSON.parse(await readFile(filePath, "utf8")) as T;
@@ -52,12 +58,12 @@ async function readJson<T>(filePath: string): Promise<T> {
 function run(
   command: string,
   args: string[],
-  options: { cwd?: string; stream?: boolean } = {},
+  options: { cwd?: string; stream?: boolean; env?: NodeJS.ProcessEnv } = {},
 ): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd ?? rootDir,
-      env: process.env,
+      env: { ...process.env, ...options.env },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -82,6 +88,14 @@ function run(
       resolve({ code: code ?? 1, stdout, stderr });
     });
   });
+}
+
+function isRegistryNotFound(output: string): boolean {
+  return (
+    output.includes("E404") ||
+    output.includes("404 Not Found") ||
+    output.includes("No match found")
+  );
 }
 
 function parseJsonOutput(output: string, context: string): unknown {
@@ -269,15 +283,34 @@ async function isPublished(pkg: PublishPackage): Promise<boolean> {
     return true;
   }
   const output = `${result.stdout}\n${result.stderr}`;
-  if (
-    output.includes("E404") ||
-    output.includes("404 Not Found") ||
-    output.includes("No match found")
-  ) {
+  if (isRegistryNotFound(output)) {
     return false;
   }
   throw new Error(
     `Unable to check whether ${pkg.name}@${pkg.version} is published:\n${output}`,
+  );
+}
+
+async function packageExistsOnRegistry(pkg: PublishPackage): Promise<boolean> {
+  const result = await run(
+    "npm",
+    ["view", pkg.name, "version", `--registry=${registry}`, "--json"],
+    { stream: false },
+  );
+  if (result.code === 0) return true;
+  const output = `${result.stdout}\n${result.stderr}`;
+  if (isRegistryNotFound(output)) return false;
+  throw new Error(
+    `Unable to check whether ${pkg.name} exists on npm:\n${output}`,
+  );
+}
+
+function firstPublishToken(): string | null {
+  return (
+    process.env.AGENT_NATIVE_NPM_BOOTSTRAP_TOKEN ||
+    process.env.NODE_AUTH_TOKEN ||
+    process.env.NPM_TOKEN ||
+    null
   );
 }
 
@@ -288,6 +321,13 @@ function isAlreadyPublished(output: string): boolean {
       output.includes(
         "You cannot publish over the previously published versions",
       ))
+  );
+}
+
+export function isAlreadyStaged(output: string): boolean {
+  return (
+    output.includes("E409") &&
+    output.includes("Cannot publish over previously staged version")
   );
 }
 
@@ -312,6 +352,62 @@ function makePublishError(message: string, isMissingPackage: boolean): Error {
 
 function tagName(pkg: PublishPackage): string {
   return `${pkg.name}@${pkg.version}`;
+}
+
+async function waitForPackageAvailability(pkg: PublishPackage): Promise<void> {
+  const startedAt = Date.now();
+  let attempt = 0;
+  let lastOutput = "";
+
+  while (Date.now() - startedAt <= availabilityTimeoutMs) {
+    attempt += 1;
+    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "agent-native-npm-"));
+    try {
+      const result = await run(
+        "npm",
+        [
+          "pack",
+          tagName(pkg),
+          "--pack-destination",
+          tmpRoot,
+          `--registry=${registry}`,
+          "--json",
+          "--prefer-online",
+          "--cache",
+          path.join(tmpRoot, "cache"),
+        ],
+        { stream: false },
+      );
+      if (result.code === 0) {
+        console.log(
+          `${tagName(pkg)} is fetchable from npm after ${attempt} attempt(s)`,
+        );
+        return;
+      }
+      lastOutput = `${result.stdout}\n${result.stderr}`.trim();
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+
+    const elapsedMs = Date.now() - startedAt;
+    const remainingMs = availabilityTimeoutMs - elapsedMs;
+    if (remainingMs <= 0) {
+      break;
+    }
+    const waitMs = Math.min(availabilityPollIntervalMs, remainingMs);
+    console.warn(
+      `${tagName(pkg)} is published but not fetchable yet; retrying in ${Math.ceil(
+        waitMs / 1000,
+      )}s`,
+    );
+    await sleep(waitMs);
+  }
+
+  throw new Error(
+    `${tagName(pkg)} was published but npm could not fetch it within ${Math.ceil(
+      availabilityTimeoutMs / 1000,
+    )}s:\n${lastOutput}`,
+  );
 }
 
 export function localRuntimeDependencyNames(pkg: PublishPackage): string[] {
@@ -382,8 +478,22 @@ async function publishPackage(pkg: PublishPackage): Promise<boolean> {
     pkg.packageJson.publishConfig?.directory ?? ".",
   );
   const access = pkg.packageJson.publishConfig?.access ?? "public";
+  const packageExists = await packageExistsOnRegistry(pkg);
+  const bootstrapToken = packageExists ? null : firstPublishToken();
+
+  if (!packageExists && !bootstrapToken) {
+    throw makePublishError(
+      `${pkg.name} does not exist on npm yet, and no first-publish token is configured. Set AGENT_NATIVE_NPM_BOOTSTRAP_TOKEN, NODE_AUTH_TOKEN, or NPM_TOKEN for the one-time package creation publish.`,
+      true,
+    );
+  }
 
   console.log(`Publishing \"${pkg.name}\" at \"${pkg.version}\"`);
+  if (bootstrapToken) {
+    console.log(
+      `${pkg.name} does not exist on npm yet; bootstrapping the first publish with a token and --no-provenance.`,
+    );
+  }
   const packDir = await mkdtemp(path.join(os.tmpdir(), "agent-native-pack-"));
   let result: RunResult | undefined;
   try {
@@ -403,17 +513,29 @@ async function publishPackage(pkg: PublishPackage): Promise<boolean> {
 
     const tarballPath = parsePackJson(packResult.stdout, pkg);
     await assertPackedManifestIsPublishable(tarballPath, pkg);
-    result = await run("npm", [
+    const publishArgs = [
       "publish",
       tarballPath,
       "--access",
       access,
       "--tag",
-      "latest",
+      npmDistTag,
       `--registry=${registry}`,
-      "--provenance",
+      bootstrapToken ? "--no-provenance" : "--provenance",
       "--json",
-    ]);
+    ];
+    result = await run(
+      "npm",
+      publishArgs,
+      bootstrapToken
+        ? {
+            env: {
+              NODE_AUTH_TOKEN: bootstrapToken,
+              NPM_CONFIG_PROVENANCE: "false",
+            },
+          }
+        : undefined,
+    );
   } finally {
     await rm(packDir, { recursive: true, force: true });
   }
@@ -427,6 +549,14 @@ async function publishPackage(pkg: PublishPackage): Promise<boolean> {
   }
 
   const output = `${result.stdout}\n${result.stderr}`;
+  if (isAlreadyStaged(output)) {
+    console.warn(
+      tagName(pkg) +
+        " was already staged on npm; verifying availability before tagging.",
+    );
+    return true;
+  }
+
   if (isAlreadyPublished(output)) {
     console.warn(
       `${pkg.name}@${pkg.version} was already published by the time npm responded; skipping tag creation.`,
@@ -438,6 +568,19 @@ async function publishPackage(pkg: PublishPackage): Promise<boolean> {
     `Failed to publish ${pkg.name}@${pkg.version} with exit code ${result.code}`,
     isMissingPackageOnPublish(output),
   );
+}
+
+async function writePublishedPackagesOutput(
+  packages: PublishPackage[],
+): Promise<void> {
+  const outputPath = process.env.GITHUB_OUTPUT;
+  if (!outputPath) {
+    return;
+  }
+  const payload = JSON.stringify(
+    packages.map((pkg) => ({ name: pkg.name, version: pkg.version })),
+  );
+  await appendFile(outputPath, `published-packages=${payload}\n`);
 }
 
 async function main() {
@@ -481,9 +624,6 @@ async function main() {
     console.log(
       `${pkg.name} is being published because local version ${pkg.version} has not been published on npm`,
     );
-    // Don't let one package's failure abort the whole release: keep going so
-    // packages that DID publish still get their git tags, then fail the run
-    // at the end with a summary of what broke.
     try {
       if (await publishPackage(pkg)) {
         packagesNeedingTags.push(pkg);
@@ -496,17 +636,22 @@ async function main() {
       if ((error as { isMissingPackage?: boolean }).isMissingPackage) {
         console.error(
           `${pkg.name} does not exist on npm yet, and OIDC trusted publishing ` +
-            `cannot create a brand-new package (npm/cli#8544). Bootstrap it ` +
-            `once: publish its first version manually with a token ` +
-            `(\`cd ${path.relative(rootDir, pkg.dir)} && npm publish --access public --no-provenance\`), ` +
-            `then add a Trusted Publisher for it on npmjs.com matching the other ` +
-            `@agent-native packages (repo BuilderIO/agent-native, workflow ` +
+            `cannot create a brand-new package (npm/cli#8544). Configure ` +
+            `AGENT_NATIVE_NPM_BOOTSTRAP_TOKEN, NODE_AUTH_TOKEN, or NPM_TOKEN ` +
+            `for a one-time token publish, or bootstrap it manually ` +
+            `(\`cd ${path.relative(rootDir, pkg.dir)} && npm publish --access public --no-provenance\`). ` +
+            `Then add a Trusted Publisher for it on npmjs.com matching the ` +
+            `other @agent-native packages (repo BuilderIO/agent-native, workflow ` +
             `auto-publish.yml, environment npm-publish). After that, OIDC ` +
             `publishes every future version automatically.`,
         );
       }
     }
   }
+
+  await Promise.all(
+    packagesNeedingTags.map((pkg) => waitForPackageAvailability(pkg)),
+  );
 
   if (packagesNeedingTags.length === 0) {
     console.log("No unpublished packages found");
@@ -521,6 +666,8 @@ async function main() {
       console.log(`New tag:  ${tagName(pkg)}`);
     }
   }
+
+  await writePublishedPackagesOutput(packagesNeedingTags);
 
   if (failures.length > 0) {
     throw new Error(

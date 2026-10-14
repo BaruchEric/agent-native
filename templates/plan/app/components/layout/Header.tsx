@@ -1,21 +1,27 @@
-import { useLocation } from "react-router";
+import { useT } from "@agent-native/core/client/i18n";
+import {
+  useHeaderTitle,
+  useHeaderActions,
+} from "@agent-native/toolkit/app-shell";
+import { AgentToggleButton } from "@agent-native/toolkit/app/chat";
 import { IconMenu2 } from "@tabler/icons-react";
-import { useHeaderTitle, useHeaderActions } from "./HeaderActions";
-import { AgentToggleButton } from "@agent-native/core/client";
-import { APP_TITLE } from "@/lib/app-config";
+import { useLocation } from "react-router";
 
-const pageTitles: Record<string, string> = {
-  "/": "Plan",
-  "/plans": "Plan",
-  "/settings": "Settings",
-  "/team": "Team",
+import { APP_TITLE } from "@/lib/app-config";
+import { isPlanChatPath } from "@/lib/chat-route";
+
+const pageTitleKeys: Record<string, string> = {
+  "/plans": "header.plan",
+  "/agent": "settings.agentTitle",
+  "/settings": "header.settings",
 };
 
 function resolveTitle(pathname: string): string {
-  if (pageTitles[pathname]) return pageTitles[pathname];
-  if (pathname.startsWith("/plans")) return "Plan";
-  if (pathname.startsWith("/extensions")) return "Extensions";
-  return APP_TITLE;
+  if (isPlanChatPath(pathname)) return "header.plan";
+  if (pageTitleKeys[pathname]) return pageTitleKeys[pathname];
+  if (pathname.startsWith("/plans")) return "header.plan";
+  if (pathname.startsWith("/extensions")) return "header.extensions";
+  return "header.appTitle";
 }
 
 interface HeaderProps {
@@ -26,6 +32,8 @@ export function Header({ onOpenMobileSidebar }: HeaderProps) {
   const location = useLocation();
   const title = useHeaderTitle();
   const actions = useHeaderActions();
+  const t = useT();
+  const resolvedTitle = resolveTitle(location.pathname);
 
   return (
     <header className="flex h-12 items-center gap-3 border-b border-border bg-background px-4 lg:px-6 shrink-0">
@@ -33,7 +41,7 @@ export function Header({ onOpenMobileSidebar }: HeaderProps) {
         <button
           type="button"
           onClick={onOpenMobileSidebar}
-          aria-label="Open navigation"
+          aria-label={t("sidebar.openNavigation")}
           className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-accent md:hidden"
         >
           <IconMenu2 className="h-4 w-4" />
@@ -42,7 +50,7 @@ export function Header({ onOpenMobileSidebar }: HeaderProps) {
       <div className="flex items-center gap-3 flex-1 min-w-0">
         {title ?? (
           <h1 className="text-lg font-semibold tracking-tight truncate">
-            {resolveTitle(location.pathname)}
+            {resolvedTitle === "header.appTitle" ? APP_TITLE : t(resolvedTitle)}
           </h1>
         )}
       </div>

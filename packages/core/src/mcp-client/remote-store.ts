@@ -21,23 +21,28 @@
  */
 
 import { createHash } from "node:crypto";
-import {
-  getUserSetting,
-  putUserSetting,
-  deleteUserSetting,
-} from "../settings/user-settings.js";
-import {
-  getOrgSetting,
-  putOrgSetting,
-  deleteOrgSetting,
-} from "../settings/org-settings.js";
+
+import type { SecretScope } from "../secrets/register.js";
 import {
   writeAppSecret,
   readAppSecret,
   deleteAppSecret,
 } from "../secrets/storage.js";
-import type { SecretScope } from "../secrets/register.js";
+import { getOrgSetting, mutateOrgSetting } from "../settings/org-settings.js";
+import {
+  getUserSetting,
+  mutateUserSetting,
+} from "../settings/user-settings.js";
 import type { McpHttpServerConfig } from "./config.js";
+import {
+  getMcpOAuthAccessToken,
+  revokeMcpOAuthCredentials,
+  saveMcpOAuthCredentials,
+  type McpOAuthCredentialBundle,
+} from "./oauth-client.js";
+import { validateRemoteUrl } from "./remote-url.js";
+
+export { validateRemoteUrl } from "./remote-url.js";
 
 const SETTINGS_KEY = "mcp-servers-remote";
 
@@ -48,11 +53,8 @@ function toSecretScope(scope: RemoteMcpScope): SecretScope {
 }
 
 export interface StoredRemoteMcpServer {
-  /** Stable unique id — used for removal / URLs. */
   id: string;
-  /** Human-readable name. Also used as the MCP server id (prefixed with scope). */
   name: string;
-  /** Streamable HTTP MCP server URL. */
   url: string;
   /**
    * Optional non-secret headers to pass to the MCP server. SECURITY: secret
@@ -62,25 +64,14 @@ export interface StoredRemoteMcpServer {
    * are honored read-only.
    */
   headers?: Record<string, string>;
-  /**
-   * Reference to the encrypted secret holding the JSON-stringified secret
-   * headers map (e.g. `{"Authorization":"Bearer …"}`). Resolved at request
-   * time via `readAppSecret`. Undefined when no secret-class headers were
-   * supplied (or for legacy cleartext rows).
-   */
   headerSecretKey?: string;
-  /** Optional description shown in the UI. */
+  oauthSecretKey?: string;
+  firstParty?: boolean;
+  firstPartyAppId?: string;
   description?: string;
-  /** ms since epoch. */
   createdAt: number;
 }
 
-/**
- * Header names that are routed through the encrypted-at-rest secrets store
- * instead of being written to the plaintext `settings` row. Match is
- * case-insensitive and substring-based to catch one-off names like
- * `x-zapier-api-key`.
- */
 const SECRET_HEADER_NAME_PATTERNS = [
   /authorization/i,
   /api[-_]?key/i,
@@ -94,7 +85,6 @@ function isSecretHeaderName(name: string): boolean {
   return SECRET_HEADER_NAME_PATTERNS.some((re) => re.test(name));
 }
 
-/** Split a headers map into (cleartext, secret) buckets. */
 function partitionHeaders(headers: Record<string, string> | undefined): {
   cleartext: Record<string, string> | undefined;
   secret: Record<string, string> | undefined;
@@ -113,7 +103,6 @@ function partitionHeaders(headers: Record<string, string> | undefined): {
   };
 }
 
-/** Tiny nanoid — matches the inline helper used elsewhere in this package. */
 function shortId(): string {
   const rand =
     globalThis.crypto?.randomUUID?.().replace(/-/g, "") ??
@@ -121,15 +110,6 @@ function shortId(): string {
   return rand.slice(0, 16);
 }
 
-/**
- * Validate a candidate MCP server name — used as a key in the merged config
- * and as part of the prefixed tool name (`mcp__<merged-key>__<tool>`).
- *
- * Allowed: letters, digits, hyphen; 1–40 chars. Lowercased. Underscores are
- * excluded on purpose — the merged-key format uses `_` as a separator between
- * `<scope>`, `<owner>`, and `<name>`, so allowing `_` in names would make the
- * parse ambiguous.
- */
 export function normalizeServerName(input: string): string {
   return input
     .trim()
@@ -138,11 +118,6 @@ export function normalizeServerName(input: string): string {
     .slice(0, 40);
 }
 
-/**
- * Short, deterministic, URL-safe hash of an email. Used as the owner
- * discriminator in user-scope merged keys so two users with the same server
- * name don't collide in the global MCP manager.
- */
 export function hashEmail(email: string): string {
   return createHash("sha256")
     .update(email.toLowerCase().trim())
@@ -150,155 +125,42 @@ export function hashEmail(email: string): string {
     .slice(0, 10);
 }
 
-/**
- * Sanitise an org id to the character set allowed in merged keys.
- * Org ids are already nanoid-style alphanumeric, but we normalise defensively.
- */
 function sanitiseOrgId(orgId: string): string {
   return orgId.toLowerCase().replace(/[^a-z0-9-]/g, "-");
-}
-
-/**
- * Hostname patterns that are always rejected to prevent SSRF via DNS rebinding
- * or well-known internal service names.
- */
-const BLOCKED_HOSTNAME_PATTERNS: RegExp[] = [
-  /^localhost$/i,
-  /\.localhost$/i,
-  /\.local$/i,
-  /\.internal$/i,
-  // DNS rebind services
-  /\.nip\.io$/i,
-  /\.sslip\.io$/i,
-  /\.xip\.io$/i,
-  /\.localtest\.me$/i,
-  /\.lvh\.me$/i,
-  // Cloud metadata hosts
-  /^metadata\.google\.internal$/i,
-  /^instance-data$/i,
-];
-
-/** Literal IPs that are always rejected (cloud metadata endpoints). */
-const BLOCKED_IPS = new Set([
-  "169.254.169.254", // AWS/GCP/Azure IMDS
-  "100.100.100.200", // Alibaba Cloud metadata
-  "::1",
-]);
-
-/** Parse a dotted-decimal IPv4 string to a 32-bit integer for range checks. */
-function ipv4ToInt(ip: string): number | null {
-  const parts = ip.split(".");
-  if (parts.length !== 4) return null;
-  let n = 0;
-  for (const part of parts) {
-    const byte = parseInt(part, 10);
-    if (isNaN(byte) || byte < 0 || byte > 255) return null;
-    n = (n << 8) | byte;
-  }
-  return n >>> 0;
-}
-
-function isPrivateIpv4(hostname: string): boolean {
-  const n = ipv4ToInt(hostname);
-  if (n === null) return false;
-  // 10.0.0.0/8
-  if ((n & 0xff000000) >>> 0 === 0x0a000000) return true;
-  // 172.16.0.0/12
-  if ((n & 0xfff00000) >>> 0 === 0xac100000) return true;
-  // 192.168.0.0/16
-  if ((n & 0xffff0000) >>> 0 === 0xc0a80000) return true;
-  // 169.254.0.0/16 (link-local, includes AWS/GCP metadata)
-  if ((n & 0xffff0000) >>> 0 === 0xa9fe0000) return true;
-  // 127.0.0.0/8 (loopback)
-  if ((n & 0xff000000) >>> 0 === 0x7f000000) return true;
-  return false;
-}
-
-function isBlockedHostname(hostname: string): boolean {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (BLOCKED_IPS.has(normalized)) return true;
-  if (isPrivateIpv4(normalized)) return true;
-  // IPv6 ULA (fc00::/7) and link-local (fe80::/10)
-  if (normalized === "::1") return true;
-  if (normalized.startsWith("fc") || normalized.startsWith("fd")) return true;
-  if (normalized.startsWith("fe80")) return true;
-  if (normalized.startsWith("::ffff:")) {
-    const mapped = normalized.slice("::ffff:".length);
-    if (isPrivateIpv4(mapped)) return true;
-    const hexMatch = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(mapped);
-    if (hexMatch) {
-      const value =
-        (parseInt(hexMatch[1], 16) << 16) | parseInt(hexMatch[2], 16);
-      const dotted = [
-        (value >>> 24) & 0xff,
-        (value >>> 16) & 0xff,
-        (value >>> 8) & 0xff,
-        value & 0xff,
-      ].join(".");
-      if (isPrivateIpv4(dotted)) return true;
-    }
-  }
-  for (const pattern of BLOCKED_HOSTNAME_PATTERNS) {
-    if (pattern.test(normalized)) return true;
-  }
-  return false;
-}
-
-/** Reject obviously-wrong URLs. Allows http only for localhost. */
-export function validateRemoteUrl(raw: string): {
-  ok: boolean;
-  url?: URL;
-  error?: string;
-} {
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    return { ok: false, error: "Not a valid URL" };
-  }
-  if (url.protocol === "https:") {
-    if (isBlockedHostname(url.hostname)) {
-      return {
-        ok: false,
-        error: `Host "${url.hostname}" is not allowed (private/internal address)`,
-      };
-    }
-    return { ok: true, url };
-  }
-  if (url.protocol === "http:") {
-    const host = url.hostname;
-    if (host === "localhost" || host === "127.0.0.1") {
-      return { ok: true, url };
-    }
-    return { ok: false, error: "Plain http is only allowed for localhost" };
-  }
-  return { ok: false, error: `Unsupported protocol: ${url.protocol}` };
 }
 
 async function readList(
   scope: RemoteMcpScope,
   scopeId: string,
 ): Promise<StoredRemoteMcpServer[]> {
-  const raw =
+  return parseServerList(
     scope === "user"
       ? await getUserSetting(scopeId, SETTINGS_KEY)
-      : await getOrgSetting(scopeId, SETTINGS_KEY);
+      : await getOrgSetting(scopeId, SETTINGS_KEY),
+  );
+}
+
+function parseServerList(
+  raw: Record<string, unknown> | null,
+): StoredRemoteMcpServer[] {
   if (!raw || !Array.isArray((raw as any).servers)) return [];
   return ((raw as any).servers as StoredRemoteMcpServer[]).filter(
     (s) => s && typeof s.id === "string" && typeof s.url === "string",
   );
 }
 
-async function writeList(
+async function mutateServerList(
   scope: RemoteMcpScope,
   scopeId: string,
-  servers: StoredRemoteMcpServer[],
-): Promise<void> {
-  if (scope === "user") {
-    await putUserSetting(scopeId, SETTINGS_KEY, { servers });
-  } else {
-    await putOrgSetting(scopeId, SETTINGS_KEY, { servers });
-  }
+  updater: (
+    servers: StoredRemoteMcpServer[],
+  ) => StoredRemoteMcpServer[] | Promise<StoredRemoteMcpServer[]>,
+): Promise<StoredRemoteMcpServer[]> {
+  const mutate = scope === "user" ? mutateUserSetting : mutateOrgSetting;
+  const next = await mutate(scopeId, SETTINGS_KEY, async (raw) => ({
+    servers: await updater(parseServerList(raw)),
+  }));
+  return parseServerList(next);
 }
 
 export async function listRemoteServers(
@@ -316,12 +178,227 @@ export async function addRemoteServer(
     url: string;
     headers?: Record<string, string>;
     description?: string;
+    firstParty?: boolean;
+  },
+): Promise<
+  { ok: true; server: StoredRemoteMcpServer } | { ok: false; error: string }
+> {
+  if (input.firstParty) {
+    return {
+      ok: false,
+      error:
+        "First-party MCP servers must be registered through the trusted first-party registration path",
+    };
+  }
+  return addRemoteServerInternal(scope, scopeId, input);
+}
+
+/**
+ * Persist a remote MCP server whose authorization is managed by the MCP
+ * server's OAuth 2.1 metadata and token endpoints. OAuth credentials are
+ * stored separately from the settings row and never returned to clients.
+ */
+export async function addOAuthRemoteServer(
+  scope: RemoteMcpScope,
+  scopeId: string,
+  input: {
+    name: string;
+    url: string;
+    description?: string;
+    credentials: McpOAuthCredentialBundle;
+  },
+): Promise<
+  { ok: true; server: StoredRemoteMcpServer } | { ok: false; error: string }
+> {
+  const serverUrl = validateRemoteUrl(input.url);
+  const credentialResource = validateRemoteUrl(input.credentials.serverUrl);
+  if (
+    !serverUrl.ok ||
+    !serverUrl.url ||
+    !credentialResource.ok ||
+    !credentialResource.url ||
+    serverUrl.url.toString() !== credentialResource.url.toString()
+  ) {
+    return {
+      ok: false,
+      error: "MCP server URL must match the OAuth credential resource URL",
+    };
+  }
+  const credentials = {
+    ...input.credentials,
+    serverUrl: credentialResource.url.toString(),
+  };
+  const oauthSecretKey = `mcp_oauth:${shortId()}`;
+  try {
+    await saveMcpOAuthCredentials({
+      key: oauthSecretKey,
+      scope,
+      scopeId,
+      credentials,
+    });
+    const result = await addRemoteServerInternal(scope, scopeId, {
+      name: input.name,
+      url: credentials.serverUrl,
+      description: input.description,
+      oauthSecretKey,
+    });
+    if (!result.ok) {
+      await revokeMcpOAuthCredentials({
+        key: oauthSecretKey,
+        scope,
+        scopeId,
+        serverUrl: credentials.serverUrl,
+      }).catch(() => undefined);
+    }
+    return result;
+  } catch (err: any) {
+    await revokeMcpOAuthCredentials({
+      key: oauthSecretKey,
+      scope,
+      scopeId,
+      serverUrl: credentials.serverUrl,
+    }).catch(() => undefined);
+    return {
+      ok: false,
+      error: `Failed to save MCP OAuth credentials: ${err?.message ?? err}`,
+    };
+  }
+}
+
+export async function replaceOAuthRemoteServer(
+  scope: RemoteMcpScope,
+  scopeId: string,
+  serverId: string,
+  credentials: McpOAuthCredentialBundle,
+): Promise<
+  { ok: true; server: StoredRemoteMcpServer } | { ok: false; error: string }
+> {
+  const credentialResource = validateRemoteUrl(credentials.serverUrl);
+  if (!credentialResource.ok || !credentialResource.url) {
+    return {
+      ok: false,
+      error: "MCP server URL must match the OAuth credential resource URL",
+    };
+  }
+  const existing = await readList(scope, scopeId);
+  const index = existing.findIndex((server) => server.id === serverId);
+  const current = index >= 0 ? existing[index] : undefined;
+  if (!current) return { ok: false, error: "MCP server was not found" };
+  if (!current.oauthSecretKey) {
+    return {
+      ok: false,
+      error: "This MCP server does not use OAuth credentials",
+    };
+  }
+  if (current.url !== credentialResource.url.toString()) {
+    return {
+      ok: false,
+      error: "MCP server URL must match the saved OAuth connection",
+    };
+  }
+
+  const nextSecretKey = `mcp_oauth:${shortId()}`;
+  const nextCredentials = {
+    ...credentials,
+    serverUrl: credentialResource.url.toString(),
+  };
+  let updated: StoredRemoteMcpServer[];
+  try {
+    await saveMcpOAuthCredentials({
+      key: nextSecretKey,
+      scope,
+      scopeId,
+      credentials: nextCredentials,
+    });
+    updated = await mutateServerList(scope, scopeId, (servers) => {
+      const latestIndex = servers.findIndex((server) => server.id === serverId);
+      const latest = latestIndex >= 0 ? servers[latestIndex] : undefined;
+      if (
+        !latest ||
+        latest.oauthSecretKey !== current.oauthSecretKey ||
+        latest.url !== current.url
+      ) {
+        throw new Error("MCP server changed while reconnecting");
+      }
+      const next = [...servers];
+      next[latestIndex] = {
+        ...latest,
+        url: nextCredentials.serverUrl,
+        oauthSecretKey: nextSecretKey,
+      };
+      return next;
+    });
+  } catch (err: any) {
+    await revokeMcpOAuthCredentials({
+      key: nextSecretKey,
+      scope,
+      scopeId,
+      serverUrl: nextCredentials.serverUrl,
+    }).catch(() => undefined);
+    return {
+      ok: false,
+      error: `Failed to replace MCP OAuth credentials: ${err?.message ?? err}`,
+    };
+  }
+
+  await revokeMcpOAuthCredentials({
+    key: current.oauthSecretKey,
+    scope,
+    scopeId,
+    serverUrl: current.url,
+  }).catch(() => undefined);
+  const server = updated.find((candidate) => candidate.id === serverId);
+  return server
+    ? { ok: true, server }
+    : { ok: false, error: "MCP server was not found" };
+}
+
+export async function addFirstPartyRemoteServer(
+  orgId: string,
+  input: {
+    appId: string;
+    name: string;
+    url: string;
+    description?: string;
+  },
+): Promise<
+  { ok: true; server: StoredRemoteMcpServer } | { ok: false; error: string }
+> {
+  const trust = await isFirstPartyRemoteEndpointTrusted(
+    orgId,
+    input.appId,
+    input.url,
+  );
+  if (!trust.ok) return { ok: false, error: trust.error };
+  return addRemoteServerInternal("org", orgId, {
+    name: input.name,
+    url: input.url,
+    description: input.description,
+    firstParty: true,
+    firstPartyAppId: input.appId.trim().toLowerCase(),
+  });
+}
+
+async function addRemoteServerInternal(
+  scope: RemoteMcpScope,
+  scopeId: string,
+  input: {
+    name: string;
+    url: string;
+    headers?: Record<string, string>;
+    description?: string;
+    firstParty?: boolean;
+    firstPartyAppId?: string;
+    oauthSecretKey?: string;
   },
 ): Promise<
   { ok: true; server: StoredRemoteMcpServer } | { ok: false; error: string }
 > {
   const name = normalizeServerName(input.name);
   if (!name) return { ok: false, error: "Name is required" };
+  if (input.firstParty && scope !== "org") {
+    return { ok: false, error: "First-party MCP servers must be org-scoped" };
+  }
   const urlCheck = validateRemoteUrl(input.url);
   if (!urlCheck.ok) return { ok: false, error: urlCheck.error ?? "Bad URL" };
 
@@ -360,11 +437,109 @@ export async function addRemoteServer(
     url: urlCheck.url!.toString(),
     headers: cleartext,
     headerSecretKey,
+    ...(input.firstParty ? { firstParty: true } : {}),
+    ...(input.firstPartyAppId
+      ? { firstPartyAppId: input.firstPartyAppId }
+      : {}),
+    ...(input.oauthSecretKey ? { oauthSecretKey: input.oauthSecretKey } : {}),
     description: input.description?.trim() || undefined,
     createdAt: Date.now(),
   };
-  await writeList(scope, scopeId, [...existing, server]);
+  try {
+    await mutateServerList(scope, scopeId, (servers) => {
+      if (servers.some((candidate) => candidate.name === name)) {
+        throw new Error(`A server named "${name}" already exists`);
+      }
+      return [...servers, server];
+    });
+  } catch (err: any) {
+    if (headerSecretKey) {
+      await deleteAppSecret({
+        key: headerSecretKey,
+        scope: toSecretScope(scope),
+        scopeId,
+      }).catch(() => undefined);
+    }
+    return { ok: false, error: err?.message ?? String(err) };
+  }
   return { ok: true, server };
+}
+
+function normalizeEndpointPath(pathname: string): string {
+  return pathname.replace(/\/+$/, "") || "/";
+}
+
+function expectedFirstPartyMcpUrls(appUrl: string): URL[] {
+  try {
+    const base = appUrl.replace(/\/+$/, "");
+    return [new URL(`${base}/mcp`), new URL(`${base}/_agent-native/mcp`)];
+  } catch {
+    return [];
+  }
+}
+
+function sameFirstPartyMcpEndpoint(endpointUrl: URL, appUrl: string): boolean {
+  return expectedFirstPartyMcpUrls(appUrl).some(
+    (expected) =>
+      endpointUrl.origin === expected.origin &&
+      normalizeEndpointPath(endpointUrl.pathname) ===
+        normalizeEndpointPath(expected.pathname) &&
+      endpointUrl.search === expected.search,
+  );
+}
+
+export async function isFirstPartyRemoteEndpointTrusted(
+  orgId: string,
+  appId: string,
+  endpoint: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const normalizedAppId = appId.trim().toLowerCase();
+  if (!orgId.trim()) {
+    return { ok: false, error: "Organization id is required" };
+  }
+  if (!normalizedAppId) {
+    return { ok: false, error: "First-party app id is required" };
+  }
+
+  let endpointUrl: URL;
+  try {
+    endpointUrl = new URL(endpoint);
+  } catch {
+    return { ok: false, error: "Not a valid URL" };
+  }
+
+  try {
+    const { getRequestOrgId } = await import("../server/request-context.js");
+    const requestOrgId = getRequestOrgId();
+    if (requestOrgId && requestOrgId !== orgId) {
+      return {
+        ok: false,
+        error:
+          "First-party MCP server org does not match the active request organization",
+      };
+    }
+  } catch {
+    // No request context helper available: the org-directory lookup below will
+    // still fail closed if it cannot authenticate a first-party app list.
+  }
+
+  const { fetchOrgApps } = await import("../mcp/org-directory.js");
+  const apps = await fetchOrgApps({ serviceOrgId: orgId });
+  const app = apps.find((candidate) => candidate.id === normalizedAppId);
+  if (!app) {
+    return {
+      ok: false,
+      error: "Could not verify the first-party app in the org directory",
+    };
+  }
+  if (!sameFirstPartyMcpEndpoint(endpointUrl, app.url)) {
+    return {
+      ok: false,
+      error:
+        "First-party MCP URL does not match the org-directory app endpoint",
+    };
+  }
+  return { ok: true };
 }
 
 export async function removeRemoteServer(
@@ -373,17 +548,54 @@ export async function removeRemoteServer(
   id: string,
 ): Promise<boolean> {
   const existing = await readList(scope, scopeId);
-  const removed = existing.find((s) => s.id === id);
-  const next = existing.filter((s) => s.id !== id);
-  if (next.length === existing.length) return false;
-  if (next.length === 0) {
-    if (scope === "user") {
-      await deleteUserSetting(scopeId, SETTINGS_KEY);
-    } else {
-      await deleteOrgSetting(scopeId, SETTINGS_KEY);
+  const expected = existing.find((s) => s.id === id);
+  if (!expected) return false;
+  let removed: StoredRemoteMcpServer | undefined;
+  try {
+    await mutateServerList(scope, scopeId, (servers) => {
+      removed = undefined;
+      const latest = servers.find((server) => server.id === id);
+      if (!latest) return servers;
+      if (latest.oauthSecretKey !== expected.oauthSecretKey) {
+        throw new Error(
+          `MCP OAuth credentials changed while removing ${expected.name}`,
+        );
+      }
+      removed = latest;
+      return servers.filter((server) => server.id !== id);
+    });
+  } catch (err: any) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[mcp-client] Failed to remove MCP server ${expected.name}: ${err?.message ?? err}`,
+    );
+    return false;
+  }
+  if (!removed) return false;
+  if (removed?.oauthSecretKey) {
+    try {
+      const result = await revokeMcpOAuthCredentials({
+        key: removed.oauthSecretKey,
+        scope,
+        scopeId,
+        serverUrl: removed.url,
+      });
+      if (result.local === "replaced") {
+        console.warn(
+          `[mcp-client] MCP OAuth credentials changed while removing ${removed.name}; the server row was already removed.`,
+        );
+      }
+      if (result.remote === "failed") {
+        console.warn(
+          `[mcp-client] MCP OAuth revocation failed for ${removed.name}; local credentials were removed.`,
+        );
+      }
+    } catch (err: any) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[mcp-client] Failed to delete MCP OAuth credentials ${removed.oauthSecretKey}: ${err?.message ?? err}`,
+      );
     }
-  } else {
-    await writeList(scope, scopeId, next);
   }
   // Best-effort: drop the encrypted-headers secret too. Errors are logged
   // but don't fail the deletion — the settings row is already gone, so a
@@ -405,15 +617,6 @@ export async function removeRemoteServer(
   return true;
 }
 
-/**
- * Resolve the full headers map (cleartext + decrypted secret headers) for a
- * stored MCP server. Used when projecting the stored record into the
- * runtime `McpHttpServerConfig` shape that `McpClientManager` consumes.
- *
- * For legacy rows that wrote secrets cleartext into `headers`, this
- * returns those cleartext values unchanged — they should be re-saved
- * through `addRemoteServer` to migrate to encrypted storage.
- */
 export async function materializeHeaders(
   scope: RemoteMcpScope,
   scopeId: string,
@@ -463,27 +666,43 @@ export function toHttpServerConfig(
     type: "http",
     url: stored.url,
     headers: stored.headers,
+    ...(stored.firstParty ? { firstParty: true } : {}),
+    ...(stored.firstPartyAppId
+      ? { firstPartyAppId: stored.firstPartyAppId }
+      : {}),
     description: stored.description,
   };
 }
 
-/**
- * Async variant of `toHttpServerConfig` that resolves any encrypted
- * `headerSecretKey` reference from `app_secrets` and returns the full
- * cleartext headers map for use at runtime. Use this when actually
- * configuring an MCP client; use the sync variant only when serializing
- * stored data (e.g. for read-only listings that shouldn't disclose
- * secrets).
- */
 export async function toHttpServerConfigAsync(
   scope: RemoteMcpScope,
   scopeId: string,
   stored: StoredRemoteMcpServer,
 ): Promise<McpHttpServerConfig> {
+  let headers = await materializeHeaders(scope, scopeId, stored);
+  if (stored.oauthSecretKey) {
+    const accessToken = await getMcpOAuthAccessToken({
+      key: stored.oauthSecretKey,
+      scope,
+      scopeId,
+      serverUrl: stored.url,
+    });
+    if (accessToken) {
+      headers ??= {};
+      headers.Authorization = `Bearer ${accessToken}`;
+    }
+  }
   return {
     type: "http",
     url: stored.url,
-    headers: await materializeHeaders(scope, scopeId, stored),
+    headers,
+    ...(stored.firstParty ? { firstParty: true } : {}),
+    ...(stored.firstPartyAppId
+      ? { firstPartyAppId: stored.firstPartyAppId }
+      : {}),
+    ...(stored.firstParty && scope === "org"
+      ? { firstPartyOrgId: scopeId }
+      : {}),
     description: stored.description,
   };
 }
@@ -510,17 +729,6 @@ export function mergedConfigKey(
   return `${scope}_${owner}_${stored.name}`;
 }
 
-/**
- * Parse a merged key (or a full prefixed tool name like
- * `mcp__user_abcd1234ef_zapier__run-task`) back into its scope + owner + name
- * components. Returns null for non-merged keys (e.g. stdio file-config servers
- * like `claude-in-chrome`) so callers can treat them as always-visible.
- *
- * `hub_<orgId>_<name>` entries (pulled from a remote hub via
- * `hub-client.ts`) project to `scope: "org"` so they pass through the same
- * per-request visibility gate as locally-stored org servers — the tool is
- * only visible to requests whose active org matches the hub entry's org.
- */
 export function parseMergedKey(
   keyOrToolName: string,
 ): { scope: RemoteMcpScope; owner: string; name: string } | null {
@@ -533,8 +741,6 @@ export function parseMergedKey(
   const m = /^(user|org|hub)_([^_]+)_(.+)$/.exec(key);
   if (!m) return null;
   const prefix = m[1];
-  // Hub-sourced servers are scoped to the org they came from — treat them
-  // as org-scope for visibility purposes (see isMcpToolAllowedForRequest).
   const scope: RemoteMcpScope = prefix === "user" ? "user" : "org";
   return {
     scope,

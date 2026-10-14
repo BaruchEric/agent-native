@@ -1,39 +1,25 @@
 import { useEffect, useRef } from "react";
 
+import {
+  clampZoomFactor,
+  normalizeWheelDeltaPx,
+  resolveZoomGestureDevice,
+  zoomFactorForWheelDelta,
+  type ZoomGestureDevice,
+} from "./zoom-gesture.js";
+
 export interface UsePinchZoomOptions {
-  /** Scrolling viewport that receives the gesture. The scaled content should
-   *  live inside this element. */
   containerRef: React.RefObject<HTMLElement | null>;
-  /** Current zoom as a percentage (100 = 100%). */
   zoom: number;
-  /** Setter for the zoom value (called with the next percentage). */
   setZoom: (next: number) => void;
-  /** Minimum zoom percentage. Default 25. */
+  onZoomFrame?: (next: number) => void;
+  onZoomEnd?: (next: number) => void;
   min?: number;
-  /** Maximum zoom percentage. Default 400. */
   max?: number;
-  /** When true (default), adjusts container scroll so the point under the
-   *  cursor stays under the cursor during wheel-zoom. Assumes the scaled
-   *  content uses `transform-origin: top left` (or equivalent — e.g. resizing
-   *  the inner container's width proportionally to zoom). Disable for layouts
-   *  with `transform-origin: center center`. */
   zoomToCursor?: boolean;
-  /** Disable the hook entirely without unmounting it. */
   enabled?: boolean;
 }
 
-/**
- * Pinch-to-zoom for canvas-style editors. Wires the trackpad pinch / Cmd+scroll
- * wheel gesture and 2-pointer touchscreen pinch onto a scrolling container.
- *
- * Trackpad pinch is detected via `wheel` events with `ctrlKey: true` — browsers
- * have synthesized that since ~2015 specifically so web apps can intercept the
- * gesture. `metaKey` is also accepted so Cmd+scroll on Mac feels native.
- *
- * The hook only calls `setZoom(next)` — it doesn't render anything. Templates
- * decide how to translate the zoom percentage into visual scaling (CSS
- * `transform: scale()`, width/height, etc.).
- */
 export function usePinchZoom({
   containerRef,
   zoom,
@@ -42,11 +28,31 @@ export function usePinchZoom({
   max = 400,
   zoomToCursor = true,
   enabled = true,
+  onZoomFrame,
+  onZoomEnd,
 }: UsePinchZoomOptions) {
   const zoomRef = useRef(zoom);
+  const imperativeZoomRef = useRef<number | null>(null);
   const setZoomRef = useRef(setZoom);
-  zoomRef.current = zoom;
+  const onZoomFrameRef = useRef(onZoomFrame);
+  const onZoomEndRef = useRef(onZoomEnd);
+  const zoomPropRef = useRef(zoom);
+  const zoomGestureGenerationRef = useRef(0);
+  if (zoomPropRef.current !== zoom) {
+    zoomPropRef.current = zoom;
+    if (imperativeZoomRef.current !== zoom) {
+      imperativeZoomRef.current = null;
+      zoomRef.current = zoom;
+      zoomGestureGenerationRef.current += 1;
+    }
+  }
+  if (imperativeZoomRef.current === zoom) {
+    imperativeZoomRef.current = null;
+  }
+  zoomRef.current = imperativeZoomRef.current ?? zoom;
   setZoomRef.current = setZoom;
+  onZoomFrameRef.current = onZoomFrame;
+  onZoomEndRef.current = onZoomEnd;
 
   useEffect(() => {
     if (!enabled) return;
@@ -55,32 +61,103 @@ export function usePinchZoom({
 
     const clamp = (n: number) => Math.max(min, Math.min(max, n));
 
+    let pendingZoom: number | null = null;
+    let pendingScrollDelta: { dx: number; dy: number } | null = null;
+    let simScrollLeft = 0;
+    let simScrollTop = 0;
+    let rafId: number | null = null;
+    let settleTimerId: number | null = null;
+    let gestureDevice: ZoomGestureDevice | null = null;
+
+    const scheduleGestureEnd = () => {
+      if (!onZoomFrameRef.current && !onZoomEndRef.current) return;
+      if (settleTimerId !== null) window.clearTimeout(settleTimerId);
+      const generation = zoomGestureGenerationRef.current;
+      const expectedZoom = zoomRef.current;
+      settleTimerId = window.setTimeout(() => {
+        settleTimerId = null;
+        if (
+          generation !== zoomGestureGenerationRef.current ||
+          zoomRef.current !== expectedZoom
+        ) {
+          return;
+        }
+        onZoomEndRef.current?.(zoomRef.current);
+      }, 120);
+    };
+
+    const flush = () => {
+      rafId = null;
+      if (pendingZoom === null) return;
+      const nextZoom = pendingZoom;
+      const scrollDelta = pendingScrollDelta;
+      pendingZoom = null;
+      pendingScrollDelta = null;
+      zoomRef.current = nextZoom;
+      if (onZoomFrameRef.current) {
+        imperativeZoomRef.current = nextZoom;
+        onZoomFrameRef.current(nextZoom);
+        scheduleGestureEnd();
+      } else {
+        setZoomRef.current(nextZoom);
+      }
+      if (scrollDelta) {
+        container.scrollLeft += scrollDelta.dx;
+        container.scrollTop += scrollDelta.dy;
+      }
+    };
+
+    const scheduleFlush = () => {
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(flush);
+    };
+
     const handleWheel = (e: WheelEvent) => {
       if (!(e.ctrlKey || e.metaKey)) return;
-      e.preventDefault();
+      if (e.cancelable) e.preventDefault();
 
-      const currentZoom = zoomRef.current;
-      const clampedDelta = Math.max(-50, Math.min(50, e.deltaY));
-      const factor = Math.exp(-clampedDelta * 0.01);
+      gestureDevice = resolveZoomGestureDevice({
+        deltaY: e.deltaY,
+        deltaMode: e.deltaMode,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        atMs: e.timeStamp,
+        previous: gestureDevice,
+      });
+      const currentZoom = pendingZoom ?? zoomRef.current;
+      const factor = clampZoomFactor(
+        zoomFactorForWheelDelta(
+          normalizeWheelDeltaPx(e.deltaY, e.deltaMode),
+          gestureDevice.pinch,
+        ),
+      );
       const nextZoom = clamp(currentZoom * factor);
 
       if (nextZoom === currentZoom) return;
 
       if (zoomToCursor) {
+        if (pendingScrollDelta === null) {
+          simScrollLeft = container.scrollLeft;
+          simScrollTop = container.scrollTop;
+        }
         const rect = container.getBoundingClientRect();
-        const cx = e.clientX - rect.left + container.scrollLeft;
-        const cy = e.clientY - rect.top + container.scrollTop;
+        const cx = e.clientX - rect.left + simScrollLeft;
+        const cy = e.clientY - rect.top + simScrollTop;
         const ratio = nextZoom / currentZoom;
         const dx = cx * (ratio - 1);
         const dy = cy * (ratio - 1);
-        setZoomRef.current(nextZoom);
-        requestAnimationFrame(() => {
-          container.scrollLeft += dx;
-          container.scrollTop += dy;
-        });
+        simScrollLeft += dx;
+        simScrollTop += dy;
+        pendingZoom = nextZoom;
+        const prevDelta = pendingScrollDelta;
+        pendingScrollDelta = {
+          dx: (prevDelta?.dx ?? 0) + dx,
+          dy: (prevDelta?.dy ?? 0) + dy,
+        };
       } else {
-        setZoomRef.current(nextZoom);
+        pendingZoom = nextZoom;
       }
+      scheduleFlush();
     };
 
     const activePointers = new Map<number, { x: number; y: number }>();
@@ -105,10 +182,11 @@ export function usePinchZoom({
         const [p1, p2] = Array.from(activePointers.values());
         const distance = Math.hypot(p2.x - p1.x, p2.y - p1.y);
         const nextZoom = clamp(initialZoom * (distance / initialDistance));
-        if (nextZoom !== zoomRef.current) {
-          setZoomRef.current(nextZoom);
+        if (nextZoom !== (pendingZoom ?? zoomRef.current)) {
+          pendingZoom = nextZoom;
+          scheduleFlush();
         }
-        e.preventDefault();
+        if (e.cancelable) e.preventDefault();
       }
     };
 
@@ -132,6 +210,11 @@ export function usePinchZoom({
       container.removeEventListener("pointermove", handlePointerMove);
       container.removeEventListener("pointerup", handlePointerEnd);
       container.removeEventListener("pointercancel", handlePointerEnd);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      if (settleTimerId !== null) window.clearTimeout(settleTimerId);
+      pendingZoom = null;
+      pendingScrollDelta = null;
+      imperativeZoomRef.current = null;
     };
   }, [containerRef, enabled, min, max, zoomToCursor]);
 }

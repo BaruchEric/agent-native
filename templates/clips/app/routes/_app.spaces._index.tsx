@@ -1,14 +1,23 @@
-import { useState } from "react";
+import { useT } from "@agent-native/core/client/i18n";
+import { useOrgRole } from "@agent-native/core/client/org";
 import { IconPlus, IconUsersGroup } from "@tabler/icons-react";
-import { Button } from "@/components/ui/button";
-import { SpaceCard, type SpaceCardData } from "@/components/library/space-card";
-import { useSpaces, useOrganizations } from "@/hooks/use-library";
-import { EmptyState } from "@/components/library/empty-state";
-import { PageHeader } from "@/components/library/page-header";
+import { useEffect, useState } from "react";
+
 import { CreateSpaceDialog } from "@/components/library/create-space-dialog";
+import { AppEmptyState } from "@/components/library/empty-state";
+import {
+  PageBreadcrumb,
+  PageHeader,
+  PageHeaderPrimaryAction,
+} from "@/components/library/page-header";
+import { SpaceCard, type SpaceCardData } from "@/components/library/space-card";
+import { Button } from "@/components/ui/button";
+import { useSpaces, useOrganizations } from "@/hooks/use-library";
+import enMessages from "@/i18n/en-US";
+import { OPEN_CREATE_SPACE_EVENT } from "@/lib/command-events";
 
 export function meta() {
-  return [{ title: "Spaces · Clips" }];
+  return [{ title: enMessages.clipsFinalRaw.spacesPageTitle }];
 }
 
 function Skeleton() {
@@ -24,11 +33,25 @@ function Skeleton() {
 }
 
 export default function SpacesIndexRoute() {
+  const t = useT();
   const [createOpen, setCreateOpen] = useState(false);
+  const { canManageOrg, role } = useOrgRole();
   const { data: organizations } = useOrganizations();
   const currentOrganizationId =
     organizations?.currentId ?? organizations?.organizations?.[0]?.id;
-  const { data, isLoading } = useSpaces(currentOrganizationId);
+  const { data, isLoading, refetch } = useSpaces(currentOrganizationId);
+  const createSpaceLabel = t("createSpaceDialog.newSpace");
+
+  useEffect(() => {
+    if (!canManageOrg) return;
+    const handleOpenCreateSpace = () => setCreateOpen(true);
+    window.addEventListener(OPEN_CREATE_SPACE_EVENT, handleOpenCreateSpace);
+    return () =>
+      window.removeEventListener(
+        OPEN_CREATE_SPACE_EVENT,
+        handleOpenCreateSpace,
+      );
+  }, [canManageOrg]);
 
   const spaces: SpaceCardData[] = (data?.spaces ?? []).map((s: any) => ({
     id: s.id,
@@ -39,26 +62,28 @@ export default function SpacesIndexRoute() {
     recordingCount: s.recordingCount ?? 0,
     memberEmails: s.memberEmails ?? [],
   }));
+  const emptyStateDescription = [
+    t("createSpaceDialog.description"),
+    ...(!canManageOrg && role === "member"
+      ? [t("navigation.noSpacesAdminCta")]
+      : []),
+  ].join(" ");
 
   return (
     <div className="flex flex-1 flex-col min-h-0">
       <PageHeader>
-        <div className="flex items-center gap-2">
-          <IconUsersGroup className="h-4 w-4 text-primary" />
-          <h1 className="text-base font-semibold text-foreground">Spaces</h1>
-        </div>
-        <div className="ml-auto">
-          <Button
-            size="sm"
-            className="gap-1.5 bg-primary text-primary-foreground hover:bg-primary/90"
-            onClick={() => setCreateOpen(true)}
-          >
-            <IconPlus className="h-4 w-4" /> New space
-          </Button>
-        </div>
+        <PageBreadcrumb items={[{ label: t("navigation.spaces") }]} />
+        {canManageOrg && spaces.length > 0 && (
+          <div className="ml-auto">
+            <PageHeaderPrimaryAction onClick={() => setCreateOpen(true)}>
+              <IconPlus />
+              {createSpaceLabel}
+            </PageHeaderPrimaryAction>
+          </div>
+        )}
       </PageHeader>
 
-      <div className="flex-1 overflow-y-auto p-5">
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-5">
         {isLoading ? (
           <div className="grid gap-4 [grid-template-columns:repeat(auto-fill,minmax(240px,1fr))]">
             {Array.from({ length: 4 }).map((_, i) => (
@@ -66,11 +91,26 @@ export default function SpacesIndexRoute() {
             ))}
           </div>
         ) : spaces.length === 0 ? (
-          <EmptyState kind="space" />
+          <AppEmptyState
+            icon={IconUsersGroup}
+            title={t("navigation.noSpaces")}
+            description={emptyStateDescription}
+            content={
+              canManageOrg ? (
+                <Button onClick={() => setCreateOpen(true)} size="sm">
+                  {createSpaceLabel}
+                </Button>
+              ) : null
+            }
+          />
         ) : (
           <div className="grid gap-4 [grid-template-columns:repeat(auto-fill,minmax(240px,1fr))]">
             {spaces.map((s) => (
-              <SpaceCard key={s.id} space={s} />
+              <SpaceCard
+                key={s.id}
+                space={s}
+                onMutationSuccess={() => refetch?.()}
+              />
             ))}
           </div>
         )}

@@ -1,21 +1,24 @@
-import { useEffect, useRef, useState } from "react";
+import { useActionMutation } from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
 import {
   IconBookmarks,
   IconPlus,
   IconTrash,
   IconGripVertical,
 } from "@tabler/icons-react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { cn } from "@/lib/utils";
-import { formatMs } from "@/lib/timestamp-mapping";
-import { useActionMutation } from "@agent-native/core/client";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+
+import { Button } from "@/components/ui/button";
+import { Empty, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
+import { Input } from "@/components/ui/input";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { formatMs } from "@/lib/timestamp-mapping";
+import { cn } from "@/lib/utils";
 
 export interface Chapter {
   startMs: number;
@@ -37,6 +40,7 @@ export function ChaptersEditor({
   onSeek,
   className,
 }: ChaptersEditorProps) {
+  const t = useT();
   const [local, setLocal] = useState<Chapter[]>(chapters);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -44,7 +48,6 @@ export function ChaptersEditor({
   const mutation = useActionMutation("set-chapters");
 
   useEffect(() => {
-    // Sync from server while we're not actively dragging.
     if (dragIndex == null) setLocal(chapters);
   }, [chapters, dragIndex]);
 
@@ -59,7 +62,7 @@ export function ChaptersEditor({
         });
       } catch (err: any) {
         console.error(err);
-        toast.error(err?.message ?? "Failed to save chapters");
+        toast.error(err?.message ?? t("chapters.saveFailed"));
       }
     }, 300);
   };
@@ -68,10 +71,10 @@ export function ChaptersEditor({
     const startMs = Math.round(currentMs);
     const existingAt = local.some((c) => c.startMs === startMs);
     if (existingAt) {
-      toast.info("A chapter already exists at this point");
+      toast.info(t("chapters.duplicateAtPoint"));
       return;
     }
-    const title = `Chapter ${local.length + 1}`;
+    const title = t("chapters.defaultTitle", { count: local.length + 1 });
     commit(
       [...local, { startMs, title }].sort((a, b) => a.startMs - b.startMs),
     );
@@ -98,7 +101,6 @@ export function ChaptersEditor({
     setLocal(next);
   };
   const handleDragEnd = () => {
-    // Re-sort by startMs after drag so ordering always matches timeline.
     setDragIndex(null);
     commit([...local].sort((a, b) => a.startMs - b.startMs));
   };
@@ -108,19 +110,23 @@ export function ChaptersEditor({
       <div className="flex items-center justify-between px-3 py-2 border-b border-border">
         <div className="flex items-center gap-1.5 text-sm font-medium">
           <IconBookmarks className="w-4 h-4 text-primary" />
-          Chapters
+          {t("chapters.title")}
         </div>
         <Button size="sm" variant="secondary" onClick={addAtCurrent}>
           <IconPlus className="w-3.5 h-3.5 mr-1" />
-          Add here
+          {t("chapters.addHere")}
         </Button>
       </div>
 
       <div className="flex-1 overflow-auto">
         {local.length === 0 ? (
-          <div className="px-3 py-4 text-xs text-muted-foreground">
-            No chapters yet.
-          </div>
+          <Empty className="gap-2 rounded-none px-3 py-6 md:p-6">
+            <EmptyHeader>
+              <EmptyTitle className="text-xs font-normal text-muted-foreground">
+                {t("chapters.empty")}
+              </EmptyTitle>
+            </EmptyHeader>
+          </Empty>
         ) : (
           local.map((c, i) => (
             <div
@@ -145,7 +151,9 @@ export function ChaptersEditor({
                     {formatMs(c.startMs)}
                   </button>
                 </TooltipTrigger>
-                <TooltipContent>{`Seek to ${formatMs(c.startMs)}`}</TooltipContent>
+                <TooltipContent>
+                  {t("chapters.seekTo", { time: formatMs(c.startMs) })}
+                </TooltipContent>
               </Tooltip>
               <Input
                 value={c.title}
@@ -163,7 +171,7 @@ export function ChaptersEditor({
                     <IconTrash className="w-3.5 h-3.5" />
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent>Remove chapter</TooltipContent>
+                <TooltipContent>{t("chapters.remove")}</TooltipContent>
               </Tooltip>
             </div>
           ))

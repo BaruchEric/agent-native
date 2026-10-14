@@ -1,8 +1,10 @@
+import fs from "node:fs/promises";
+
 import {
   deleteLocalArtifactFile,
   ensureLocalArtifactRoot,
   getLocalArtifactApp,
-  isAgentNativeLocalFileMode,
+  loadAgentNativeManifest,
   listLocalArtifactFiles,
   readLocalArtifactFile,
   writeLocalArtifactFile,
@@ -10,6 +12,7 @@ import {
   type LocalArtifactFileMeta,
   type LocalArtifactOptions,
 } from "@agent-native/core/local-artifacts";
+
 import type {
   Document,
   DocumentCreateRequest,
@@ -19,6 +22,7 @@ import type {
 import { parseContentSourceFile } from "../shared/content-source.js";
 
 const CONTENT_APP_ID = "content";
+const CONTENT_PROFILE_DOCS_NO_BOOKKEEPING = "docs/no-bookkeeping";
 const LOCAL_FILE_ID_PREFIX = "local-file:";
 const LOCAL_FOLDER_ID_PREFIX = "local-folder:";
 const FRONTMATTER_RE =
@@ -52,11 +56,9 @@ function localOptions(): LocalArtifactOptions {
   };
 }
 
-export async function isContentLocalFileMode() {
-  return isAgentNativeLocalFileMode({
-    appId: CONTENT_APP_ID,
-    defaults: CONTENT_LOCAL_DEFAULTS,
-  });
+export async function getContentSourceMode() {
+  const app = await getLocalArtifactApp(localOptions());
+  return app.mode;
 }
 
 function encodeIdPath(filePath: string): string {
@@ -149,6 +151,7 @@ function documentFromFolder(folderPath: string, position: number): Document {
     parentId: folderParentId(folderPath),
     title: titleFromSegment(basename(folderPath)),
     content: "",
+    description: "",
     icon: null,
     position,
     isFavorite: false,
@@ -184,6 +187,7 @@ function documentFromLocalFile(
     parentId: parentFolderId(file.path),
     title: parsed.title,
     content: parsed.content,
+    description: parsed.description ?? "",
     icon: parsed.icon ?? null,
     position,
     isFavorite: parsed.isFavorite ?? false,
@@ -201,6 +205,7 @@ function documentFromLocalFile(
       absolutePath,
       rootName: file.rootName,
       rootPath: file.rootPath,
+      profile: file.profile,
       hash: file.hash,
       contentType: file.contentType,
       sizeBytes: file.sizeBytes,
@@ -222,8 +227,155 @@ function folderDocumentsForFiles(files: LocalArtifactFileMeta[]) {
     .map((folderPath, index) => documentFromFolder(folderPath, index));
 }
 
+let localFileDocumentsCache: {
+  scope: string;
+  signature: string;
+  documents: Document[];
+  cachedAt: number;
+} | null = null;
+const LOCAL_FILE_DOCUMENTS_CACHE_TTL_MS = 5_000;
+
+function localFileDocumentsCacheScope() {
+  return JSON.stringify({
+    manifest: process.env.AGENT_NATIVE_MANIFEST,
+    manifestPath: process.env.AGENT_NATIVE_MANIFEST_PATH,
+  });
+}
+
+function localFileDocumentsSignature(files: LocalArtifactFileMeta[]) {
+  return JSON.stringify(
+    files.map((file) => ({
+      absolutePath: file.absolutePath,
+      contentType: file.contentType,
+      hash: file.hash,
+      path: file.path,
+      profile: file.profile,
+      rootName: file.rootName,
+      rootPath: file.rootPath,
+      sizeBytes: file.sizeBytes,
+      updatedAt: file.updatedAt,
+    })),
+  );
+}
+
+function cloneLocalDocument(document: Document): Document {
+  return {
+    ...document,
+    source: document.source ? { ...document.source } : undefined,
+  };
+}
+
+export function invalidateLocalFileDocumentsCache() {
+  localFileDocumentsCache = null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeRootPath(rootPath: string) {
+  return rootPath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+}
+
+export async function removeContentLocalFileRoots(
+  sourceRootPath?: string | null,
+) {
+  const app = await getLocalArtifactApp(localOptions());
+  if (app.mode !== "local-files") {
+    return { removed: 0, roots: [] as string[], manifestPath: null };
+  }
+
+  const loaded = await loadAgentNativeManifest({
+    ...localOptions(),
+    optional: false,
+  });
+  if (!loaded) {
+    throw new Error("No agent-native.json file is available to update.");
+  }
+
+  const raw = JSON.parse(await fs.readFile(loaded.path, "utf8")) as unknown;
+  const manifest = isRecord(raw) ? raw : {};
+  const apps = isRecord(manifest.apps) ? manifest.apps : {};
+  const existingContentApp = isRecord(apps[CONTENT_APP_ID])
+    ? apps[CONTENT_APP_ID]
+    : {};
+  const roots = Array.isArray(existingContentApp.roots)
+    ? existingContentApp.roots.filter(
+        (root): root is Record<string, unknown> =>
+          isRecord(root) && typeof root.path === "string",
+      )
+    : [];
+
+  if (roots.length === 0) {
+    throw new Error(
+      "Local file roots are not declared in agent-native.json for Content.",
+    );
+  }
+
+  const targetRootPath = sourceRootPath
+    ? normalizeRootPath(sourceRootPath)
+    : null;
+  const removedRoots = roots.filter((root) => {
+    if (!targetRootPath) return true;
+    return normalizeRootPath(root.path as string) === targetRootPath;
+  });
+
+  if (removedRoots.length === 0) {
+    throw new Error("No matching local file root was found.");
+  }
+
+  const nextRoots = roots.filter((root) => !removedRoots.includes(root));
+  const nextContentApp = {
+    ...existingContentApp,
+    mode: nextRoots.length > 0 ? "local-files" : "database",
+    roots: nextRoots,
+  };
+
+  await fs.writeFile(
+    loaded.path,
+    `${JSON.stringify(
+      {
+        ...manifest,
+        apps: {
+          ...apps,
+          [CONTENT_APP_ID]: nextContentApp,
+        },
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  invalidateLocalFileDocumentsCache();
+
+  return {
+    removed: removedRoots.length,
+    roots: removedRoots.map((root) => root.path as string),
+    manifestPath: loaded.path,
+  };
+}
+
 export async function listLocalFileDocuments(): Promise<Document[]> {
+  const scope = localFileDocumentsCacheScope();
+  if (
+    localFileDocumentsCache &&
+    localFileDocumentsCache.scope === scope &&
+    Date.now() - localFileDocumentsCache.cachedAt <
+      LOCAL_FILE_DOCUMENTS_CACHE_TTL_MS
+  ) {
+    return localFileDocumentsCache.documents.map(cloneLocalDocument);
+  }
+
   const files = await listLocalArtifactFiles(localOptions());
+  const signature = localFileDocumentsSignature(files);
+  if (
+    localFileDocumentsCache?.scope === scope &&
+    localFileDocumentsCache.signature === signature
+  ) {
+    localFileDocumentsCache.cachedAt = Date.now();
+    return localFileDocumentsCache.documents.map(cloneLocalDocument);
+  }
+
   const folderDocuments = folderDocumentsForFiles(files);
   const fileDocuments = await Promise.all(
     files.map(async (meta, index) => {
@@ -234,7 +386,14 @@ export async function listLocalFileDocuments(): Promise<Document[]> {
       return documentFromLocalFile(file ?? meta, file?.content ?? "", index);
     }),
   );
-  return [...folderDocuments, ...fileDocuments];
+  const documents = [...folderDocuments, ...fileDocuments];
+  localFileDocumentsCache = {
+    scope,
+    signature,
+    documents,
+    cachedAt: Date.now(),
+  };
+  return documents.map(cloneLocalDocument);
 }
 
 export async function getLocalFileDocument(id: string): Promise<Document> {
@@ -246,6 +405,33 @@ export async function getLocalFileDocument(id: string): Promise<Document> {
   const file = await readLocalArtifactFile({ ...localOptions(), path });
   if (!file) throw new Error(`Local file "${path}" not found`);
   return documentFromLocalFile(file, file.content, 0);
+}
+
+export async function getLocalDocumentContextPath(id: string) {
+  const documents = await listLocalFileDocuments();
+  const byId = new Map(documents.map((document) => [document.id, document]));
+  const current = byId.get(id) ?? (await getLocalFileDocument(id));
+  const path: Array<{
+    id: string;
+    kind: "page" | "database";
+    title: string;
+    description: string;
+  }> = [];
+  const seen = new Set([current.id]);
+  let parentId = current.parentId;
+  while (parentId && !seen.has(parentId)) {
+    seen.add(parentId);
+    const parent = byId.get(parentId);
+    if (!parent) break;
+    path.unshift({
+      id: parent.id,
+      kind: "page",
+      title: parent.title,
+      description: parent.description ?? "",
+    });
+    parentId = parent.parentId;
+  }
+  return path;
 }
 
 function splitFrontmatter(source: string) {
@@ -263,13 +449,26 @@ function frontmatterLine(key: string, value: unknown) {
   if (typeof value === "boolean" || typeof value === "number") {
     return `${key}: ${String(value)}`;
   }
-  return `${key}: ${JSON.stringify(String(value))}`;
+  return `${key}: ${JSON.stringify(typeof value === "string" ? value : (JSON.stringify(value) ?? ""))}`;
+}
+
+function shouldAddMissingFrontmatterKey(
+  key: string,
+  addMissingKeys: UpsertFrontmatterOptions["addMissingKeys"],
+) {
+  if (typeof addMissingKeys === "function") return addMissingKeys(key);
+  return addMissingKeys ?? true;
+}
+
+interface UpsertFrontmatterOptions {
+  addMissingKeys?: boolean | ((key: string) => boolean);
 }
 
 function upsertFrontmatter(
   original: string,
   fields: Record<string, unknown>,
   body: string,
+  options: UpsertFrontmatterOptions = {},
 ) {
   const { frontmatter } = splitFrontmatter(original);
   const lines = frontmatter ? frontmatter.split(/\r?\n/) : [];
@@ -285,10 +484,16 @@ function upsertFrontmatter(
 
   for (const [key, value] of Object.entries(fields)) {
     if (usedKeys.has(key) || value === undefined) continue;
+    if (!shouldAddMissingFrontmatterKey(key, options.addMissingKeys)) continue;
     nextLines.push(frontmatterLine(key, value));
   }
 
-  return `---\n${nextLines.filter(Boolean).join("\n")}\n---\n\n${body}`;
+  if (!frontmatter && nextLines.filter(Boolean).length === 0) {
+    return body;
+  }
+
+  const frontmatterBlock = `---\n${nextLines.filter(Boolean).join("\n")}\n---\n`;
+  return body ? `${frontmatterBlock}\n${body}` : frontmatterBlock;
 }
 
 function stripDuplicateTitleHeading(content: string, title: string) {
@@ -301,6 +506,89 @@ function stripDuplicateTitleHeading(content: string, title: string) {
     return content.slice(h1Match[0].length).trimStart();
   }
   return content;
+}
+
+function nextContentForLocalUpdate(
+  file: LocalArtifactFile,
+  args: DocumentUpdateRequest,
+  current: Document,
+  nextTitle: string,
+) {
+  if (args.content === undefined) return current.content;
+  if (usesDocsNoBookkeepingProfile(file.profile)) return args.content;
+  return stripDuplicateTitleHeading(args.content, nextTitle);
+}
+
+function contentForLocalCreate(
+  profile: string | undefined,
+  args: DocumentCreateRequest,
+  title: string,
+) {
+  const content = args.content ?? "";
+  if (usesDocsNoBookkeepingProfile(profile)) return content;
+  return stripDuplicateTitleHeading(content, title);
+}
+
+function usesDocsNoBookkeepingProfile(profile?: string) {
+  return profile === CONTENT_PROFILE_DOCS_NO_BOOKKEEPING;
+}
+
+function updateFrontmatterFields(
+  file: LocalArtifactFile,
+  current: Document,
+  args: DocumentUpdateRequest,
+  nextTitle: string,
+  titleChanged: boolean,
+  iconChanged: boolean,
+  favoriteChanged: boolean,
+  descriptionChanged: boolean,
+) {
+  if (usesDocsNoBookkeepingProfile(file.profile)) {
+    return {
+      ...(titleChanged ? { title: nextTitle || "Untitled" } : {}),
+      ...(iconChanged ? { icon: args.icon ?? null } : {}),
+      ...(favoriteChanged ? { isFavorite: args.isFavorite ?? false } : {}),
+      ...(descriptionChanged
+        ? { description: args.description?.trim() ?? "" }
+        : {}),
+    };
+  }
+
+  return {
+    title: nextTitle || "Untitled",
+    icon: args.icon !== undefined ? args.icon : current.icon,
+    isFavorite:
+      args.isFavorite !== undefined ? args.isFavorite : current.isFavorite,
+    description:
+      args.description !== undefined
+        ? args.description.trim()
+        : current.description,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function createFrontmatterFields(
+  profile: string | undefined,
+  args: DocumentCreateRequest,
+  title: string,
+) {
+  if (usesDocsNoBookkeepingProfile(profile)) {
+    return {
+      title,
+      ...(args.icon !== undefined ? { icon: args.icon || null } : {}),
+      ...(args.description !== undefined
+        ? { description: args.description.trim() }
+        : {}),
+    };
+  }
+
+  return {
+    title,
+    icon: args.icon || null,
+    isFavorite: false,
+    description: args.description?.trim() ?? "",
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 export async function updateLocalFileDocument(
@@ -317,30 +605,39 @@ export async function updateLocalFileDocument(
 
   const current = documentFromLocalFile(file, file.content, 0);
   const nextTitle = args.title ?? current.title;
-  const nextContent =
-    args.content === undefined
-      ? current.content
-      : stripDuplicateTitleHeading(args.content, nextTitle);
+  const nextContent = nextContentForLocalUpdate(file, args, current, nextTitle);
   const titleChanged = args.title !== undefined && args.title !== current.title;
   const contentChanged =
     args.content !== undefined && nextContent !== current.content;
   const iconChanged = args.icon !== undefined && args.icon !== current.icon;
   const favoriteChanged =
     args.isFavorite !== undefined && args.isFavorite !== current.isFavorite;
+  const descriptionChanged =
+    args.description !== undefined &&
+    args.description.trim() !== current.description;
 
-  if (!titleChanged && !contentChanged && !iconChanged && !favoriteChanged) {
+  if (
+    !titleChanged &&
+    !contentChanged &&
+    !iconChanged &&
+    !favoriteChanged &&
+    !descriptionChanged
+  ) {
     return current;
   }
 
   const nextSource = upsertFrontmatter(
     file.content,
-    {
-      title: nextTitle || "Untitled",
-      icon: args.icon !== undefined ? args.icon : current.icon,
-      isFavorite:
-        args.isFavorite !== undefined ? args.isFavorite : current.isFavorite,
-      updatedAt: new Date().toISOString(),
-    },
+    updateFrontmatterFields(
+      file,
+      current,
+      args,
+      nextTitle,
+      titleChanged,
+      iconChanged,
+      favoriteChanged,
+      descriptionChanged,
+    ),
     nextContent,
   );
 
@@ -350,6 +647,7 @@ export async function updateLocalFileDocument(
     content: nextSource,
     expectedHash: file.hash,
   });
+  invalidateLocalFileDocumentsCache();
   return getLocalFileDocument(id);
 }
 
@@ -361,6 +659,16 @@ async function chooseCreateDirectory(parentId?: string | null) {
     return dirname(localDocumentPathFromId(parentId));
   }
   return (await ensureLocalArtifactRoot(localOptions())).path;
+}
+
+async function profileForDirectory(directory: string) {
+  const app = await getLocalArtifactApp(localOptions());
+  const root = app.roots.find(
+    (candidate) =>
+      directory === candidate.path ||
+      directory.startsWith(`${candidate.path}/`),
+  );
+  return root?.profile ?? app.profile;
 }
 
 async function uniqueFilePath(directory: string, title: string) {
@@ -386,15 +694,11 @@ export async function createLocalFileDocument(
 ): Promise<Document> {
   const title = args.title || "Untitled";
   const directory = await chooseCreateDirectory(args.parentId ?? null);
-  const content = stripDuplicateTitleHeading(args.content ?? "", title);
+  const profile = await profileForDirectory(directory);
+  const content = contentForLocalCreate(profile, args, title);
   const source = upsertFrontmatter(
     "",
-    {
-      title,
-      icon: args.icon || null,
-      isFavorite: false,
-      updatedAt: new Date().toISOString(),
-    },
+    createFrontmatterFields(profile, args, title),
     content,
   );
 
@@ -407,6 +711,7 @@ export async function createLocalFileDocument(
         content: source,
         ifNotExists: true,
       });
+      invalidateLocalFileDocumentsCache();
       return getLocalFileDocument(localFileDocumentId(path));
     } catch (error) {
       if (isAlreadyExistsError(error)) continue;
@@ -423,6 +728,7 @@ export async function deleteLocalFileDocument(id: string) {
   }
   const path = localDocumentPathFromId(id);
   await deleteLocalArtifactFile({ ...localOptions(), path });
+  invalidateLocalFileDocumentsCache();
   return { success: true, deleted: 1 };
 }
 
@@ -445,12 +751,14 @@ export async function localContentViewScreenSummary() {
       name: root.name,
       path: root.path,
       kind: root.kind,
+      profile: root.profile,
       extensions: root.extensions,
     })),
     documents: documents.map((document) => ({
       id: document.id,
       parentId: document.parentId,
       title: document.title,
+      description: document.description,
       source: document.source,
     })),
   };

@@ -1,6 +1,10 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import { z } from "zod";
-import { updateSecret } from "../server/lib/vault-store.js";
+
+import {
+  toVaultSecretMetadata,
+  updateSecret,
+} from "../server/lib/vault-store.js";
 
 export default defineAction({
   description:
@@ -14,7 +18,11 @@ export default defineAction({
         .min(1)
         .optional()
         .describe("Environment variable name, e.g. GOOGLE_CLIENT_ID"),
-      value: z.string().min(1).optional().describe("New secret value"),
+      value: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("New secret value; omit to keep the existing value"),
       name: z
         .string()
         .trim()
@@ -41,5 +49,8 @@ export default defineAction({
         description !== undefined,
       "At least one secret field must be updated",
     ),
-  run: async (args) => updateSecret(args.id, args),
+  // Carries a secret `value`. Record THAT the secret changed, never the value —
+  // keep the audit trail from becoming a second credential store.
+  audit: { recordInputs: false },
+  run: async (args) => toVaultSecretMetadata(await updateSecret(args.id, args)),
 });

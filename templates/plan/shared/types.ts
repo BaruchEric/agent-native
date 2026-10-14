@@ -1,9 +1,9 @@
-import type { PlanContent } from "./plan-content.js";
 import {
   PLAN_COMMENT_RESOLUTION_TARGETS,
   type PlanCommentMention,
   type PlanCommentResolutionTarget,
 } from "./comment-context.js";
+import type { PlanContent } from "./plan-content.js";
 
 export {
   PLAN_COMMENT_RESOLUTION_TARGETS,
@@ -29,11 +29,7 @@ export const PLAN_SOURCES = [
   "imported",
 ] as const;
 
-// A plan is either a forward-looking `plan` (the default) or a read-only
-// `recap` — a reverse plan that recaps a code change/PR diff for review. Recaps
-// render as "Visual Recap", live at `/recaps/:id`, use `recap-` ids, and are
-// not text-editable in the browser (highlight + comment still work).
-export const PLAN_KINDS = ["plan", "recap"] as const;
+export const PLAN_KINDS = ["plan", "recap", "edition"] as const;
 
 export const PLAN_SECTION_TYPES = [
   "summary",
@@ -98,11 +94,14 @@ export interface PlanSummary {
   hostedPlanId?: string | null;
   hostedPlanUrl?: string | null;
   sourceUrl?: string | null;
+  sourceAuthorName?: string | null;
+  sourceAuthorLogin?: string | null;
   createdAt: string;
   updatedAt: string;
   approvedAt?: string | null;
   deletedAt?: string | null;
   deletedBy?: string | null;
+  ownerEmail?: string | null;
   canDelete?: boolean;
   sectionCounts: Record<string, number>;
   commentCount: number;
@@ -121,6 +120,8 @@ export interface Plan {
   hostedPlanId?: string | null;
   hostedPlanUrl?: string | null;
   sourceUrl?: string | null;
+  sourceAuthorName?: string | null;
+  sourceAuthorLogin?: string | null;
   html?: string | null;
   markdown?: string | null;
   content?: PlanContent | null;
@@ -195,7 +196,7 @@ export interface PlanReport {
 export interface PlanBundle {
   plan: Plan;
   access?: {
-    role: "owner" | "viewer" | "editor" | "admin";
+    role: "owner" | "viewer" | "commenter" | "editor" | "admin";
     ownerEmail?: string | null;
     orgId?: string | null;
     visibility?: "private" | "org" | "public" | null;

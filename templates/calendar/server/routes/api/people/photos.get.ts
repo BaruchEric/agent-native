@@ -1,14 +1,9 @@
-import { defineEventHandler, getQuery } from "h3";
 import { getSession } from "@agent-native/core/server";
-import { getClient } from "../../../lib/google-calendar.js";
-import { peopleSearchDirectoryPeople } from "../../../lib/google-api.js";
+import { defineEventHandler, getQuery } from "h3";
 
-/**
- * GET /api/people/photos?emails=a@foo.com,b@foo.com
- *
- * Batch-resolves profile photos from Google Workspace directory.
- * Returns { [email]: photoUrl } for any found.
- */
+import { peopleSearchDirectoryPeople } from "../../../lib/google-api.js";
+import { getClient } from "../../../lib/google-calendar.js";
+
 export default defineEventHandler(async (event) => {
   const session = await getSession(event);
   if (!session?.email) {
@@ -33,7 +28,6 @@ export default defineEventHandler(async (event) => {
   const accessToken = client.accessToken;
   const results: Record<string, string> = {};
 
-  // Search for each email in the workspace directory
   await Promise.all(
     emails.map(async (email) => {
       try {
@@ -43,7 +37,6 @@ export default defineEventHandler(async (event) => {
         });
         const person = data?.people?.[0];
         if (!person) return;
-        // Verify email matches
         const matchesEmail = person.emailAddresses?.some(
           (e: any) => e.value?.toLowerCase() === email,
         );

@@ -1,21 +1,12 @@
-/**
- * Toggle the current user's emoji reaction on a comment.
- *
- * Stores reactions as a JSON map of emoji -> [emails] on the comment row's
- * `emojiReactionsJson` column. Calling with the same emoji twice removes the
- * user from that bucket.
- *
- * Usage:
- *   pnpm action react-to-comment --commentId=<id> --emoji="🔥"
- */
-
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { and, eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { getRequestUserEmail } from "@agent-native/core/server/request-context";
 import { assertAccess } from "@agent-native/core/sharing";
+import { and, eq } from "drizzle-orm";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
+import { notifyRecordingReaction } from "../server/lib/activity-notifications.js";
 
 const MAX_CAS_ATTEMPTS = 3;
 
@@ -71,9 +62,6 @@ export default defineAction({
         next[args.emoji] = nextBucket;
       }
 
-      // Compare-and-swap: only commit if the JSON column still matches what
-      // we read. A concurrent reaction that landed first will have changed
-      // it, so the WHERE will not match and we retry the read-modify-write.
       const updated = await db
         .update(schema.recordingComments)
         .set({
@@ -89,12 +77,23 @@ export default defineAction({
         .returning({ id: schema.recordingComments.id });
 
       if (updated.length > 0) {
+        const notified = had
+          ? null
+          : await notifyRecordingReaction({
+              recordingId: existing.recordingId,
+              emoji: args.emoji,
+              viewerEmail,
+              videoTimestampMs: existing.videoTimestampMs,
+              extraRecipients: [existing.authorEmail],
+            });
+
         await writeAppState("refresh-signal", { ts: Date.now() });
         return {
           id: args.commentId,
           emoji: args.emoji,
           reacted: !had,
           reactions: next,
+          notified,
         };
       }
     }

@@ -1,9 +1,11 @@
-import AnalysesList from "@/pages/analyses/AnalysesList";
+import { Navigate } from "react-router";
+
+import enUSMessages from "@/i18n/en-US";
 
 export function meta() {
-  return [{ title: "Analyses — Analytics" }];
+  return [{ title: enUSMessages.routeTitles.analyses }];
 }
 
 export default function AnalysesRoute() {
-  return <AnalysesList />;
+  return <Navigate to="/dashboards" replace />;
 }

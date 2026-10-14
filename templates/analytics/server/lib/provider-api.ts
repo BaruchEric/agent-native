@@ -1,5 +1,6 @@
 import {
   createProviderApiRuntime,
+  listCustomProviders,
   listProviderApiIdsForTemplateUse,
   type ProviderApiCredentialResolver,
   type ProviderApiDocsOptions,
@@ -7,11 +8,19 @@ import {
   type ProviderApiMethod,
   type ProviderApiRequestArgs,
 } from "@agent-native/core/provider-api";
-import { requireRequestCredentialContext } from "./credentials-context";
+
+import {
+  requireRequestCredentialContext,
+  tryRequestCredentialContext,
+} from "./credentials-context";
 import { resolveAnalyticsProviderCredential } from "./provider-credentials";
 
-export const ANALYTICS_PROVIDER_API_IDS = listProviderApiIdsForTemplateUse(
-  "analytics",
+export const ANALYTICS_PROVIDER_API_IDS = Array.from(
+  new Set([
+    ...listProviderApiIdsForTemplateUse("analytics"),
+    "google_drive" as ProviderApiId,
+    "google_sheets" as ProviderApiId,
+  ]),
 ) as [ProviderApiId, ...ProviderApiId[]];
 export type AnalyticsProviderApiId = ProviderApiId;
 export type { ProviderApiMethod, ProviderApiRequestArgs };
@@ -39,6 +48,7 @@ const resolveAnalyticsCredential: ProviderApiCredentialResolver = async ({
     connectionId: credential.connectionId,
     connectionLabel: credential.connectionLabel,
     scope: credential.scope,
+    scopeId: credential.scopeId,
   };
 };
 
@@ -49,6 +59,21 @@ const runtime = createProviderApiRuntime({
   getCredentialContext: () =>
     requireRequestCredentialContext("provider API credential"),
   resolveCredential: resolveAnalyticsCredential,
+  getCustomProviders: async () => {
+    const ctx = tryRequestCredentialContext();
+    if (!ctx) return [];
+
+    const orgProviders = ctx.orgId
+      ? await listCustomProviders("org", ctx.orgId)
+      : [];
+    const userProviders = await listCustomProviders("user", ctx.userEmail);
+    const seen = new Set<string>();
+    return [...orgProviders, ...userProviders].filter((provider) => {
+      if (seen.has(provider.id)) return false;
+      seen.add(provider.id);
+      return true;
+    });
+  },
 });
 
 export function getAnalyticsProviderApiRuntime() {

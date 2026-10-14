@@ -8,7 +8,7 @@ export interface StoredUpload {
   mimeType: string;
   size: number;
   url?: string;
-  dataBase64: string;
+  dataBase64?: string;
   createdAt: number;
 }
 

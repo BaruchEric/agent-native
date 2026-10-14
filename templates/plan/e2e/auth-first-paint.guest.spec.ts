@@ -1,17 +1,9 @@
 import { test, expect } from "@playwright/test";
 
-/*
- * AUTH FIRST PAINT
- *
- * Regression coverage for the reviewer report that clicking signup initially
- * showed a raw `true` message. These entrypoints should always render the
- * framework auth page, never a bare boolean response.
- */
-
 const AUTH_ENTRYPOINTS = [
   { path: "/signup", label: "signup" },
   { path: "/login", label: "login" },
-  { path: "/_agent-native/sign-in?return=%2Fplans", label: "sign-in" },
+  { path: "/sign-in?return=%2Fplans", label: "sign-in" },
 ];
 
 for (const entrypoint of AUTH_ENTRYPOINTS) {

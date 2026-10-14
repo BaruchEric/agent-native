@@ -1,21 +1,18 @@
-/**
- * Core script: resource-list
- *
- * List resources stored in the SQL resource store.
- *
- * Usage:
- *   pnpm action resource-list [--prefix <path>] [--scope personal|shared|workspace|all] [--format json|text] [--include-agent-scratch true]
- */
-
-import { parseArgs, fail } from "../utils.js";
 import {
   resourceList,
   resourceListAccessible,
   ensurePersonalDefaults,
+  isWorkspaceResourceOwner,
   SHARED_OWNER,
   WORKSPACE_OWNER,
+  sharedResourceOwner,
 } from "../../resources/store.js";
-import { getRequestUserEmail } from "../../server/request-context.js";
+import {
+  getAmbientUserEmail,
+  getRequestOrgId,
+  getRequestUserEmail,
+} from "../../server/request-context.js";
+import { parseArgs, fail } from "../utils.js";
 
 export default async function resourceListScript(
   args: string[],
@@ -42,14 +39,13 @@ Options:
     parsed["include-agent-scratch"] === "true" ||
     parsed.includeAgentScratch === "true" ||
     parsed.includeScratch === "true";
-  const owner = getRequestUserEmail() ?? process.env.AGENT_USER_EMAIL;
+  const owner = getRequestUserEmail() ?? getAmbientUserEmail();
   if (!owner) {
     fail(
       "resource-list requires an authenticated user (request context or AGENT_USER_EMAIL env var).",
     );
   }
 
-  // Seed personal AGENTS.md + LEARNINGS.md on first access
   if (scope !== "shared" && scope !== "workspace") {
     await ensurePersonalDefaults(owner);
   }
@@ -60,21 +56,43 @@ Options:
       ? await resourceList(owner, prefix, { includeAgentScratch: true })
       : await resourceList(owner, prefix);
   } else if (scope === "shared") {
-    resources = includeAgentScratch
-      ? await resourceList(SHARED_OWNER, prefix, { includeAgentScratch: true })
-      : await resourceList(SHARED_OWNER, prefix);
+    const orgId = getRequestOrgId() ?? null;
+    const sharedOwner = sharedResourceOwner(orgId);
+    const resourceOptions = {
+      ...(includeAgentScratch ? { includeAgentScratch: true } : {}),
+      orgId,
+    };
+    const primary = await resourceList(sharedOwner, prefix, resourceOptions);
+    if (sharedOwner === SHARED_OWNER) {
+      resources = primary;
+    } else {
+      const inherited = await resourceList(
+        SHARED_OWNER,
+        prefix,
+        resourceOptions,
+      );
+      const seen = new Set(primary.map((resource) => resource.path));
+      resources = [
+        ...primary,
+        ...inherited.filter((resource) => !seen.has(resource.path)),
+      ];
+    }
   } else if (scope === "workspace") {
+    const orgId = getRequestOrgId() ?? null;
     resources = includeAgentScratch
       ? await resourceList(WORKSPACE_OWNER, prefix, {
           includeAgentScratch: true,
+          orgId,
         })
-      : await resourceList(WORKSPACE_OWNER, prefix);
+      : await resourceList(WORKSPACE_OWNER, prefix, { orgId });
   } else {
+    const orgId = getRequestOrgId() ?? null;
     resources = includeAgentScratch
       ? await resourceListAccessible(owner, prefix, {
           includeAgentScratch: true,
+          orgId,
         })
-      : await resourceListAccessible(owner, prefix);
+      : await resourceListAccessible(owner, prefix, { orgId });
   }
 
   if (format === "json") {
@@ -82,7 +100,6 @@ Options:
     return;
   }
 
-  // Human-readable output
   if (resources.length === 0) {
     console.log("No resources found.");
     return;
@@ -91,12 +108,11 @@ Options:
   console.log(`Resources: ${resources.length}\n`);
 
   for (const r of resources) {
-    const ownerLabel =
-      r.owner === WORKSPACE_OWNER
-        ? "[workspace]"
-        : r.owner === SHARED_OWNER
-          ? "[shared]"
-          : `[${r.owner}]`;
+    const ownerLabel = isWorkspaceResourceOwner(r.owner)
+      ? "[workspace]"
+      : r.owner === SHARED_OWNER
+        ? "[shared]"
+        : `[${r.owner}]`;
     const sizeLabel = r.size != null ? ` (${r.size} bytes)` : "";
     console.log(`  ${r.path}  ${ownerLabel}${sizeLabel}  ${r.mimeType}`);
   }

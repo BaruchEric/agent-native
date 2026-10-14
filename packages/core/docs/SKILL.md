@@ -1,23 +1,31 @@
 ---
 name: agent-native-docs
-description: "How to look up version-matched Agent Native framework docs in node_modules. Use before coding against @agent-native/core APIs or advanced features."
+description: "How to look up version-matched Agent-Native framework docs and source in node_modules. Use before coding against @agent-native/core APIs or advanced features."
 ---
 
-# Agent Native Docs Lookup
+# Agent-Native Docs Lookup
 
 ## Rule
 
-Before implementing non-trivial Agent Native functionality, read the
-version-matched docs installed with `@agent-native/core`.
+Before implementing non-trivial Agent-Native functionality, read the
+version-matched docs installed with `@agent-native/core`. When implementation
+examples or template patterns matter, inspect the packaged source corpus too.
 
 ## How
 
 1. Start from the generated app root.
-2. Search with `pnpm action docs-search --query "<feature>"`.
-3. Read a specific page with `pnpm action docs-search --slug <slug>`.
-4. If the action runner is unavailable, search
+2. Start cross-corpus discovery with `pnpm action framework-search --pattern "<feature>"`.
+3. Use `--scope docs` or `--scope source` and `--mode glob`, `--mode sql-like`,
+   or `--mode regex` when the question needs a narrower pattern.
+4. Read a specific page with `pnpm action docs-search --slug <slug>`.
+5. Search source examples with `pnpm action source-search --query "<pattern>"`
+   or read a file with `pnpm action source-search --path <path>`. If it reports
+   that template source is unavailable, install the matching corpus package:
+   `pnpm add -D @agent-native/core-corpus@<installed-core-version>`.
+6. If the action runner is unavailable, search
    `node_modules/@agent-native/core/docs` directly with `rg`.
-5. For app-specific rules, also read the app's own `AGENTS.md` and any relevant
+   Search `node_modules/@agent-native/core-corpus/corpus` for source examples.
+7. For app-specific rules, also read the app's own `AGENTS.md` and any relevant
    `.agents/skills/<name>/SKILL.md`.
 
 ## Useful Slugs

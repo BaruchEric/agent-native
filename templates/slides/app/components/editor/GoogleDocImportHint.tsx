@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { agentNativePath, oauthRedirectUri } from "@agent-native/core/client";
+import { agentNativePath } from "@agent-native/core/client/api-path";
+import { useT } from "@agent-native/core/client/i18n";
+import { startWorkspaceProviderOAuth } from "@agent-native/core/client/integrations";
+import { extractGoogleDocUrls } from "@shared/google-docs";
 import {
   IconAlertCircle,
   IconBrandGoogleDrive,
@@ -8,7 +10,7 @@ import {
   IconLoader2,
   IconPlugConnected,
 } from "@tabler/icons-react";
-import { extractGoogleDocUrls } from "@shared/google-docs";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 declare global {
   interface Window {
@@ -118,7 +120,7 @@ function buildSourceContext(doc: ImportedGoogleDoc): string {
   const title = doc.title.replace(/"/g, "'");
   return [
     "Imported Google Docs source material:",
-    `<google-doc title="${title}" documentId="${doc.documentId}" source="${doc.source}" charCount="${doc.charCount}" truncated="${doc.truncated}">`,
+    `<google-doc title="${title}" documentId="${doc.documentId}" source="${doc.source}" charCount="${doc.charCount}" truncated="${doc.truncated}">`, // i18n-ignore source-context wrapper, not UI copy
     doc.text,
     "</google-doc>",
     doc.note ?? "",
@@ -131,6 +133,7 @@ export function GoogleDocImportHint({
   promptText,
   onSourceContextChange,
 }: GoogleDocImportHintProps) {
+  const t = useT();
   const googleDocUrl = useMemo(
     () => extractGoogleDocUrls(promptText)[0] ?? "",
     [promptText],
@@ -225,60 +228,15 @@ export function GoogleDocImportHint({
     return () => onSourceContextChange("");
   }, [onSourceContextChange]);
 
-  const connect = useCallback(async () => {
+  const connect = useCallback(() => {
     setConnecting(true);
     setError(null);
-    const popup = window.open(
-      "about:blank",
-      "google-docs-oauth",
-      "popup,width=520,height=720",
-    );
-    try {
-      const callbackUrl = oauthRedirectUri(
-        "/_agent-native/google-docs/callback",
-      );
-      const authUrl = new URL(endpoint("/_agent-native/google-docs/auth-url"));
-      authUrl.searchParams.set("redirect_uri", callbackUrl);
-      authUrl.searchParams.set(
-        "return",
-        window.location.pathname + window.location.search,
-      );
-      const response = await fetch(authUrl.toString(), {
-        credentials: "same-origin",
-      });
-      const data = await readJson<{
-        url?: string;
-        error?: string;
-        message?: string;
-      }>(response);
-      if (!response.ok || !data.url) {
-        throw new Error(
-          errorFromResponse(response, data, "Could not start Google OAuth"),
-        );
-      }
-      if (!popup) {
-        window.location.href = data.url;
-        return;
-      }
-      popup.location.href = data.url;
-
-      const deadline = Date.now() + 90_000;
-      while (Date.now() < deadline && !popup.closed) {
-        await new Promise((resolve) => window.setTimeout(resolve, 1200));
-        const next = await refreshStatus();
-        if (next?.connected) {
-          popup.close();
-          return;
-        }
-      }
-      await refreshStatus();
-    } catch (caught) {
-      popup?.close();
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setConnecting(false);
-    }
-  }, [refreshStatus]);
+    startWorkspaceProviderOAuth("google_drive", {
+      appId: "slides",
+      returnPath: `${window.location.pathname}${window.location.search}`,
+      scope: "user",
+    });
+  }, []);
 
   const chooseDocument = useCallback(async () => {
     setChoosing(true);
@@ -384,13 +342,12 @@ export function GoogleDocImportHint({
           </p>
           {!configured && (
             <p className="mt-1 text-[11px] text-amber-500">
-              Google OAuth is not configured for this deployment.
+              {t("raw.googleOAuthNotConfigured")}
             </p>
           )}
           {pickerMissing && (
             <p className="mt-1 text-[11px] text-amber-500">
-              Google Picker needs GOOGLE_PICKER_API_KEY and
-              GOOGLE_PICKER_APP_ID.
+              {t("raw.googlePickerNeedsKeys")}
             </p>
           )}
         </div>

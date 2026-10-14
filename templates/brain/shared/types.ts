@@ -4,7 +4,8 @@ export type BrainSourceProvider =
   | "clips"
   | "slack"
   | "granola"
-  | "github";
+  | "github"
+  | "zoom";
 export type BrainSourceStatus = "active" | "paused" | "archived" | "error";
 export type BrainCaptureKind =
   | "transcript"
@@ -62,6 +63,12 @@ export interface BrainSettings {
   captureSanitizationEnabled?: boolean;
   captureSanitizationModel?: string;
   captureSanitizationInstructions?: string;
+  privacyClassifier?: "jev" | "model" | "deterministic";
+  privacyClassifierModel?: string;
+  privacyClassifierEngine?: string;
+  sensitivityCustomInstructions?: string;
+  publicChannelExclusionPatterns?: string[];
+  quarantineRetentionHours?: number;
   connectorPollMinutes: number;
   requireCitations?: boolean;
   autoArchiveResolved?: boolean;
@@ -82,6 +89,12 @@ export const DEFAULT_BRAIN_SETTINGS: BrainSettings = {
   captureSanitizationModel: "",
   captureSanitizationInstructions:
     "Keep durable company-relevant information and remove personal, recruiting, hiring, candidate-evaluation, sensitive, or casual content before storage.",
+  privacyClassifier: "jev",
+  privacyClassifierModel: "",
+  privacyClassifierEngine: "",
+  sensitivityCustomInstructions: "",
+  publicChannelExclusionPatterns: [],
+  quarantineRetentionHours: 72,
   connectorPollMinutes: 60,
   requireCitations: true,
   autoArchiveResolved: true,

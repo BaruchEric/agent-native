@@ -73,41 +73,76 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 const CONNECT_TIMEOUT_MS = 3000;
 
+const BUBBLE_START_BITRATE_KBPS = 2500;
+const BUBBLE_MIN_BITRATE_KBPS = 1200;
+const BUBBLE_MAX_BITRATE_KBPS = 5000;
+
+async function configureBubbleSender(
+  sender: RTCRtpSender | null,
+): Promise<void> {
+  if (!sender) return;
+  try {
+    const params = sender.getParameters();
+    if (!params.encodings || params.encodings.length === 0) {
+      params.encodings = [{}];
+    }
+    params.encodings[0].maxBitrate = BUBBLE_MAX_BITRATE_KBPS * 1000;
+    params.encodings[0].maxFramerate = 30;
+    (params.encodings[0] as { minBitrate?: number }).minBitrate =
+      BUBBLE_MIN_BITRATE_KBPS * 1000;
+    params.degradationPreference = "maintain-resolution";
+    await sender.setParameters(params);
+  } catch (err) {
+    console.warn("[clips-bubble-webrtc] setParameters failed", err);
+  }
+}
+
+function boostBubbleVideoBitrate(sdp: string | undefined): string {
+  if (!sdp) return sdp ?? "";
+  const eol = sdp.includes("\r\n") ? "\r\n" : "\n";
+  const lines = sdp.split(/\r\n|\n/);
+  const out: string[] = [];
+  let inVideo = false;
+  for (const line of lines) {
+    if (line.startsWith("m=")) {
+      inVideo = line.startsWith("m=video");
+      out.push(line);
+      continue;
+    }
+    if (inVideo && line.startsWith("c=")) {
+      out.push(line);
+      out.push(`b=AS:${BUBBLE_MAX_BITRATE_KBPS}`);
+      out.push(`b=TIAS:${BUBBLE_MAX_BITRATE_KBPS * 1000}`);
+      continue;
+    }
+    if (
+      inVideo &&
+      line.startsWith("a=fmtp:") &&
+      !line.includes("apt=") &&
+      !line.includes("x-google-start-bitrate")
+    ) {
+      out.push(
+        `${line};x-google-start-bitrate=${BUBBLE_START_BITRATE_KBPS}` +
+          `;x-google-min-bitrate=${BUBBLE_MIN_BITRATE_KBPS}` +
+          `;x-google-max-bitrate=${BUBBLE_MAX_BITRATE_KBPS}`,
+      );
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join(eol);
+}
+
 export interface BubbleWebrtcHandle {
-  /** Tear down the peer connection and unsubscribe listeners. */
   stop(): void;
 }
 
 export interface StartBubbleWebrtcParams {
-  /** Live camera stream owned by the popover. We borrow one video track. */
   stream: MediaStream;
-  /**
-   * Called if ICE fails to reach `connected` in time, or flips to
-   * `failed` later. Caller should start the canvas fallback pump.
-   */
   onFailure: (reason: string) => void;
-  /**
-   * Called once the peer connection reaches `connected`. Informational —
-   * useful for logging / metrics.
-   */
   onConnected?: () => void;
 }
 
-/**
- * Start a WebRTC sender for the bubble overlay.
- *
- * Coordination flow:
- *   1. Subscribe to `clips:bubble-ready` — bubble emits this when its
- *      receiver is ready to accept an offer. Bubble may re-emit on
- *      re-mount; we tear down the old peer and start fresh each time.
- *   2. On `bubble-ready`: create RTCPeerConnection, add the camera
- *      video track, createOffer, setLocalDescription, emit offer.
- *   3. On `clips:webrtc-answer`: setRemoteDescription.
- *   4. On `clips:webrtc-ice-from-bubble`: addIceCandidate.
- *   5. `pc.onicecandidate` → emit `clips:webrtc-ice-from-popover`.
- *   6. If `iceConnectionState` doesn't reach `connected`/`completed`
- *      within CONNECT_TIMEOUT_MS, call onFailure and tear down.
- */
 export function startBubbleWebrtc(
   params: StartBubbleWebrtcParams,
 ): BubbleWebrtcHandle {
@@ -123,10 +158,6 @@ export function startBubbleWebrtc(
   let connectTimer: ReturnType<typeof setTimeout> | null = null;
   const unlistens: UnlistenFn[] = [];
   let connected = false;
-  // The bubble emits `clips:bubble-ready` every time it (re)mounts.
-  // Any stale peer connection we had must be torn down and rebuilt with
-  // a new offer — otherwise the new receiver and our old peer talk past
-  // each other forever.
   let handshakeId = 0;
 
   function cleanupPeer() {
@@ -135,11 +166,6 @@ export function startBubbleWebrtc(
       connectTimer = null;
     }
     if (pc) {
-      // Explicitly drop all senders before close so WebKit doesn't hold
-      // onto encoder state for the (already-borrowed) video track. The
-      // video track itself belongs to the popover's MediaStream — the
-      // bubble-session effect in app.tsx stops it — so we must NOT stop
-      // it here. Just detach from this peer.
       try {
         const senders = pc.getSenders ? pc.getSenders() : [];
         for (const s of senders) {
@@ -156,8 +182,6 @@ export function startBubbleWebrtc(
       } catch (err) {
         console.warn("[clips-bubble-webrtc] removeTrack failed", err);
       }
-      // Null out the handlers so WebKit doesn't keep the closure alive
-      // through a dangling event reference.
       try {
         pc.onicecandidate = null;
         pc.oniceconnectionstatechange = null;
@@ -185,25 +209,16 @@ export function startBubbleWebrtc(
         // ignore
       }
     }
-    // Empty the array so we don't retain listener closures if something
-    // holds a stale reference to this handle after stop().
     unlistens.length = 0;
     console.log("[clips-bubble-webrtc] stopped");
   }
 
   async function startHandshake(): Promise<void> {
-    // Each handshake gets a fresh id. If the bubble re-emits
-    // bubble-ready while we're mid-handshake, we bump the id, tear
-    // down, and start over — old answers / ICE for the previous id
-    // are ignored.
     handshakeId += 1;
     const myId = handshakeId;
     cleanupPeer();
     connected = false;
 
-    // `iceServers: []` + `iceTransportPolicy: "all"` — we're connecting
-    // over loopback. No STUN/TURN needed, and explicitly empty saves
-    // WebKit from a pointless "resolve server" round-trip on startup.
     const localPc = new RTCPeerConnection({
       iceServers: [],
       iceTransportPolicy: "all",
@@ -235,19 +250,20 @@ export function startBubbleWebrtc(
           onConnected?.();
         }
       } else if (state === "failed" || state === "disconnected") {
-        // `disconnected` can be transient on a flaky network, but on
-        // loopback there IS no network — a disconnect means something
-        // actually broke. Treat as failure for fallback purposes.
         onFailure(`ice-${state}`);
         stop();
       }
     };
 
-    // Add the camera video track. WebRTC will renegotiate if the track
-    // id changes, but we only add once per handshake so this is a
-    // one-shot.
     try {
-      localPc.addTrack(videoTrack, stream);
+      videoTrack.contentHint = "detail";
+    } catch {
+      // contentHint is a harmless no-op on older WebViews.
+    }
+
+    let sender: RTCRtpSender | null = null;
+    try {
+      sender = localPc.addTrack(videoTrack, stream);
     } catch (err) {
       console.warn("[clips-bubble-webrtc] addTrack failed:", err);
       onFailure("add-track-failed");
@@ -258,6 +274,7 @@ export function startBubbleWebrtc(
     let offer: RTCSessionDescriptionInit;
     try {
       offer = await localPc.createOffer();
+      offer = { ...offer, sdp: boostBubbleVideoBitrate(offer.sdp) };
       await localPc.setLocalDescription(offer);
     } catch (err) {
       console.warn(
@@ -268,6 +285,9 @@ export function startBubbleWebrtc(
       stop();
       return;
     }
+    if (stopped || myId !== handshakeId) return;
+
+    await configureBubbleSender(sender);
     if (stopped || myId !== handshakeId) return;
 
     try {
@@ -283,9 +303,6 @@ export function startBubbleWebrtc(
       return;
     }
 
-    // Fail-closed timer. If ICE hasn't connected in CONNECT_TIMEOUT_MS,
-    // let the caller fall back to the canvas pump. Cleared when we
-    // reach `connected`.
     connectTimer = setTimeout(() => {
       if (stopped || myId !== handshakeId) return;
       if (connected) return;
@@ -324,8 +341,6 @@ export function startBubbleWebrtc(
   trackListen(
     listen<{ handshakeId?: number }>("clips:bubble-ready", (ev) => {
       if (stopped) return;
-      // If the bubble re-mounts (it emits bubble-ready on every mount),
-      // restart the handshake from scratch.
       console.log(
         "[clips-bubble-webrtc] bubble-ready received — starting handshake",
         ev.payload,
@@ -389,18 +404,11 @@ export function startBubbleWebrtc(
           sdpMLineIndex: sdpMLineIndex ?? undefined,
         });
       } catch (err) {
-        // Some candidates fail to add (e.g. already-closed peer, stale
-        // handshake). Not fatal — the surviving candidates can still form
-        // a connection on loopback.
         console.warn("[clips-bubble-webrtc] addIceCandidate failed", err);
       }
     }),
   );
 
-  // If the bubble window was already alive when we started (e.g. a
-  // re-start of the session), it might not re-emit bubble-ready. Ping
-  // for a fresh emit — the bubble responds by firing bubble-ready
-  // again.
   emit("clips:bubble-handshake-request", {}).catch(() => {});
 
   return { stop };

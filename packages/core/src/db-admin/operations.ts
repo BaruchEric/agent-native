@@ -1,22 +1,7 @@
-/**
- * Dev-mode database admin operations.
- *
- * Pure, dialect-agnostic, RAW/UNSCOPED helpers backing the Supabase-Studio-like
- * DB admin. These run the FULL database with no per-user `accessFilter`
- * scoping — they are a developer tool, gated to dev + localhost at the route
- * and agent-tool layers. Do NOT call these from any production-reachable
- * surface.
- *
- * All access goes through the unified `getDbExec()` client, which uses `?`
- * placeholders (auto-converted to `$1,$2,…` for Postgres) and returns rows
- * keyed by column name. Identifiers are validated against a strict pattern and
- * always double-quoted; values are ALWAYS parameterized — never interpolated.
- */
-import { getDbExec, getDialect, isPostgres } from "../db/client.js";
+import { getDbExec, type DbExec } from "../db/client.js";
 import { notifyActionChange } from "../server/action-change.js";
 import type {
   DbAdminColumn,
-  DbAdminDialect,
   DbAdminFilter,
   DbAdminForeignKey,
   DbAdminIndex,
@@ -29,13 +14,16 @@ import type {
   DbAdminTableSummary,
 } from "./types.js";
 
-// ---------------------------------------------------------------------------
-// Identifier validation + quoting
-// ---------------------------------------------------------------------------
-
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const LARGE_CELL_PREVIEW_CHARS = 16 * 1024;
+const LARGE_CELL_SUFFIX =
+  "\n...[db-admin truncated large cell; request includeLargeCells=true for the full value]";
 
-/** Throw on any identifier that isn't a plain `[A-Za-z_][A-Za-z0-9_]*`. */
+export interface DbAdminRuntime {
+  db?: DbExec;
+  notifyChange?: () => Promise<void>;
+}
+
 function assertIdent(name: string, kind = "identifier"): string {
   if (typeof name !== "string" || !IDENT_RE.test(name)) {
     throw new Error(`Invalid ${kind}: ${JSON.stringify(name)}`);
@@ -43,80 +31,165 @@ function assertIdent(name: string, kind = "identifier"): string {
   return name;
 }
 
-/** Double-quote an already-validated identifier (valid in PG and SQLite). */
 function quoteIdent(name: string): string {
   return `"${assertIdent(name)}"`;
 }
 
-function dialect(): DbAdminDialect {
-  return getDialect();
+function db(runtime?: DbAdminRuntime): DbExec {
+  return runtime?.db ?? getDbExec();
 }
 
-// ---------------------------------------------------------------------------
-// Notify the UI after a real mutation so polling refetches.
-// ---------------------------------------------------------------------------
+function isPreviewableLargeColumn(column: DbAdminColumn): boolean {
+  const type = column.type.toLowerCase();
+  return /\b(text|char|varchar|character|jsonb?|xml|clob)\b/.test(type);
+}
 
-async function notifyDbAdminChange(): Promise<void> {
-  // The UI keys on useChangeVersions(["db-admin","action"]). notifyActionChange
-  // records a "db-admin" change AND a marker; the action route layer's generic
-  // "action" source is covered by passing the db-admin action name through the
-  // same primitive that the action surface uses.
+function markLargeValuePreviewColumns(
+  columns: DbAdminColumn[],
+  includeLargeCells: boolean,
+): DbAdminColumn[] {
+  if (includeLargeCells) return columns;
+  return columns.map((column) =>
+    isPreviewableLargeColumn(column)
+      ? { ...column, largeValuePreview: true }
+      : column,
+  );
+}
+
+function buildRowsSelectList(
+  columns: DbAdminColumn[],
+  includeLargeCells: boolean,
+): string {
+  if (includeLargeCells) {
+    return columns.map((column) => quoteIdent(column.name)).join(", ");
+  }
+
+  return columns
+    .map((column) => {
+      const quoted = quoteIdent(column.name);
+      if (!isPreviewableLargeColumn(column)) return quoted;
+      const textValue = `CAST(${quoted} AS TEXT)`;
+      return `CASE WHEN length(${textValue}) > ${LARGE_CELL_PREVIEW_CHARS} THEN substr(${textValue}, 1, ${LARGE_CELL_PREVIEW_CHARS}) || '${LARGE_CELL_SUFFIX.replace(/'/g, "''")}' ELSE ${textValue} END AS ${quoted}`;
+    })
+    .join(", ");
+}
+
+function truncateLargeResultCells(rows: Record<string, unknown>[]): {
+  rows: Record<string, unknown>[];
+  truncatedCells: number;
+} {
+  let truncatedCells = 0;
+  const mapped = rows.map((row) => {
+    let changed = false;
+    const next: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(row)) {
+      if (
+        typeof value === "string" &&
+        value.length > LARGE_CELL_PREVIEW_CHARS
+      ) {
+        next[key] =
+          `${value.slice(0, LARGE_CELL_PREVIEW_CHARS)}${LARGE_CELL_SUFFIX}`;
+        truncatedCells += 1;
+        changed = true;
+      } else {
+        next[key] = value;
+      }
+    }
+    return changed ? next : row;
+  });
+  return { rows: mapped, truncatedCells };
+}
+
+function countTruncatedResultCells(rows: Record<string, unknown>[]): number {
+  let truncatedCells = 0;
+  for (const row of rows) {
+    for (const value of Object.values(row)) {
+      if (typeof value === "string" && value.endsWith(LARGE_CELL_SUFFIX)) {
+        truncatedCells += 1;
+      }
+    }
+  }
+  return truncatedCells;
+}
+
+function containsLargeCellPreview(value: unknown): boolean {
+  if (typeof value === "string") return value.endsWith(LARGE_CELL_SUFFIX);
+  if (Array.isArray(value)) return value.some(containsLargeCellPreview);
+  if (value && typeof value === "object") {
+    return Object.values(value as Record<string, unknown>).some(
+      containsLargeCellPreview,
+    );
+  }
+  return false;
+}
+
+function assertNoLargeCellPreviewMutation(
+  row: Record<string, unknown>,
+  context: string,
+): void {
+  for (const [column, value] of Object.entries(row)) {
+    if (containsLargeCellPreview(value)) {
+      throw new Error(
+        `Refusing to ${context} with previewed large-cell value in column "${column}". Reload the row with includeLargeCells=true before saving.`,
+      );
+    }
+  }
+}
+
+async function notifyDbAdminChange(runtime?: DbAdminRuntime): Promise<void> {
+  if (runtime?.notifyChange) {
+    await runtime.notifyChange();
+    return;
+  }
   await notifyActionChange({ actionName: "db-admin" }).catch(() => {});
 }
 
-// ---------------------------------------------------------------------------
-// listTables
-// ---------------------------------------------------------------------------
-
-export async function listTables(): Promise<{
-  dialect: DbAdminDialect;
-  tables: DbAdminTableSummary[];
-}> {
-  const db = getDbExec();
+export async function listTables(
+  runtime?: DbAdminRuntime,
+  options: { maxRowCounts?: number } = {},
+): Promise<{ tables: DbAdminTableSummary[] }> {
+  const client = db(runtime);
   const summaries: DbAdminTableSummary[] = [];
+  const maxRowCounts = Number.isFinite(options.maxRowCounts)
+    ? Math.max(0, Math.floor(options.maxRowCounts!))
+    : Number.POSITIVE_INFINITY;
+  let rowCountQueries = 0;
+  const rowCount = async (
+    name: string,
+    type: "table" | "view",
+  ): Promise<number | null> => {
+    if (type === "view" || rowCountQueries >= maxRowCounts) return null;
+    rowCountQueries += 1;
+    return safeRowCount(name, runtime);
+  };
 
-  if (isPostgres()) {
-    const res = await db.execute(
-      `SELECT table_name AS name, table_type AS type
-       FROM information_schema.tables
-       WHERE table_schema = 'public'
-         AND table_type IN ('BASE TABLE', 'VIEW')
-       ORDER BY table_name`,
-    );
-    for (const row of res.rows) {
-      const name = String((row as any).name);
-      const type = (row as any).type === "VIEW" ? "view" : "table";
-      summaries.push({
-        name,
-        type,
-        rowCount: type === "view" ? null : await safeRowCount(name),
-      });
-    }
-  } else {
-    const res = await db.execute(
-      `SELECT name, type FROM sqlite_master
-       WHERE type IN ('table', 'view')
-         AND name NOT LIKE 'sqlite_%'
-       ORDER BY name`,
-    );
-    for (const row of res.rows) {
-      const name = String((row as any).name);
-      const type = (row as any).type === "view" ? "view" : "table";
-      summaries.push({
-        name,
-        type,
-        rowCount: type === "view" ? null : await safeRowCount(name),
-      });
-    }
+  const res = await client.execute(
+    `SELECT table_name AS name, table_type AS type
+     FROM information_schema.tables
+     WHERE table_schema = 'public'
+       AND table_type IN ('BASE TABLE', 'VIEW')
+     ORDER BY table_name`,
+  );
+  for (const row of res.rows) {
+    const name = String((row as any).name);
+    const type = (row as any).type === "VIEW" ? "view" : "table";
+    summaries.push({
+      name,
+      type,
+      rowCount: await rowCount(name, type),
+    });
   }
 
-  return { dialect: dialect(), tables: summaries };
+  return { tables: summaries };
 }
 
-async function safeRowCount(table: string): Promise<number | null> {
+async function safeRowCount(
+  table: string,
+  runtime?: DbAdminRuntime,
+): Promise<number | null> {
   try {
-    const db = getDbExec();
-    const res = await db.execute(
+    const client = db(runtime);
+    const res = await client.execute(
       `SELECT COUNT(*) AS c FROM ${quoteIdent(table)}`,
     );
     const c = (res.rows[0] as any)?.c;
@@ -127,32 +200,28 @@ async function safeRowCount(table: string): Promise<number | null> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// getTableSchema
-// ---------------------------------------------------------------------------
-
 export async function getTableSchema(
   table: string,
+  runtime?: DbAdminRuntime,
 ): Promise<DbAdminTableSchema> {
   assertIdent(table, "table name");
-  return isPostgres()
-    ? getTableSchemaPostgres(table)
-    : getTableSchemaSqlite(table);
+  return getTableSchemaPostgres(table, runtime);
 }
 
 async function getTableSchemaPostgres(
   table: string,
+  runtime?: DbAdminRuntime,
 ): Promise<DbAdminTableSchema> {
-  const db = getDbExec();
+  const client = db(runtime);
 
-  const typeRes = await db.execute({
+  const typeRes = await client.execute({
     sql: `SELECT table_type AS type FROM information_schema.tables
           WHERE table_schema = 'public' AND table_name = ?`,
     args: [table],
   });
   const type = (typeRes.rows[0] as any)?.type === "VIEW" ? "view" : "table";
 
-  const colRes = await db.execute({
+  const colRes = await client.execute({
     sql: `SELECT
             column_name AS name,
             data_type AS type,
@@ -164,7 +233,7 @@ async function getTableSchemaPostgres(
     args: [table],
   });
 
-  const pkRes = await db.execute({
+  const pkRes = await client.execute({
     sql: `SELECT kcu.column_name AS col
           FROM information_schema.table_constraints tc
           JOIN information_schema.key_column_usage kcu
@@ -179,7 +248,7 @@ async function getTableSchemaPostgres(
   const primaryKey = pkRes.rows.map((r) => String((r as any).col));
   const pkSet = new Set(primaryKey);
 
-  const fkRes = await db.execute({
+  const fkRes = await client.execute({
     sql: `SELECT
             kcu.column_name AS col,
             ccu.table_name AS ref_table,
@@ -202,7 +271,7 @@ async function getTableSchemaPostgres(
     refColumn: String((r as any).ref_col),
   }));
 
-  const idxRes = await db.execute({
+  const idxRes = await client.execute({
     sql: `SELECT indexname AS name, indexdef AS def
           FROM pg_indexes
           WHERE schemaname = 'public' AND tablename = ?`,
@@ -234,7 +303,6 @@ async function getTableSchemaPostgres(
       nullable: Number((r as any).nullable) === 1,
       pk: pkSet.has(name),
       defaultValue,
-      // Postgres serial/identity columns default to a sequence call.
       autoIncrement:
         defaultValue != null &&
         (/nextval\(/i.test(defaultValue) || /identity/i.test(defaultValue)),
@@ -248,90 +316,9 @@ async function getTableSchemaPostgres(
     primaryKey,
     foreignKeys,
     indexes,
-    rowCount: type === "view" ? null : await safeRowCount(table),
+    rowCount: type === "view" ? null : await safeRowCount(table, runtime),
   };
 }
-
-async function getTableSchemaSqlite(
-  table: string,
-): Promise<DbAdminTableSchema> {
-  const db = getDbExec();
-
-  const typeRes = await db.execute({
-    sql: `SELECT type FROM sqlite_master WHERE name = ? AND type IN ('table','view')`,
-    args: [table],
-  });
-  const type = (typeRes.rows[0] as any)?.type === "view" ? "view" : "table";
-
-  const colRes = await db.execute(`PRAGMA table_info(${quoteIdent(table)})`);
-  const columns: DbAdminColumn[] = colRes.rows.map((r) => {
-    const name = String((r as any).name);
-    const dflt = (r as any).dflt_value;
-    return {
-      name,
-      type: String((r as any).type ?? "ANY") || "ANY",
-      nullable: Number((r as any).notnull) === 0,
-      pk: Number((r as any).pk) > 0,
-      defaultValue: dflt == null ? null : String(dflt),
-    };
-  });
-
-  // PK order follows the pk index from table_info (1-based, 0 = not pk).
-  const primaryKey = colRes.rows
-    .filter((r) => Number((r as any).pk) > 0)
-    .sort((a, b) => Number((a as any).pk) - Number((b as any).pk))
-    .map((r) => String((r as any).name));
-
-  // INTEGER PRIMARY KEY in SQLite is an alias for the rowid (autoincrementing).
-  if (primaryKey.length === 1) {
-    const pkCol = columns.find((c) => c.name === primaryKey[0]);
-    if (pkCol && /^integer$/i.test(pkCol.type)) {
-      pkCol.autoIncrement = true;
-    }
-  }
-
-  const fkRes = await db.execute(
-    `PRAGMA foreign_key_list(${quoteIdent(table)})`,
-  );
-  const foreignKeys: DbAdminForeignKey[] = fkRes.rows.map((r) => ({
-    column: String((r as any).from),
-    refTable: String((r as any).table),
-    refColumn: String((r as any).to),
-  }));
-
-  const idxListRes = await db.execute(
-    `PRAGMA index_list(${quoteIdent(table)})`,
-  );
-  const indexes: DbAdminIndex[] = [];
-  for (const idx of idxListRes.rows) {
-    const idxName = String((idx as any).name);
-    if (idxName.startsWith("sqlite_")) continue;
-    const infoRes = await db.execute(
-      `PRAGMA index_info(${quoteIdent(idxName)})`,
-    );
-    indexes.push({
-      name: idxName,
-      unique: Number((idx as any).unique) === 1,
-      columns: infoRes.rows
-        .map((c) => (c as any).name)
-        .filter((n): n is string => typeof n === "string"),
-    });
-  }
-
-  return {
-    name: table,
-    type,
-    columns,
-    primaryKey,
-    foreignKeys,
-    indexes,
-    rowCount: type === "view" ? null : await safeRowCount(table),
-  };
-}
-
-// ---------------------------------------------------------------------------
-// getRows
-// ---------------------------------------------------------------------------
 
 const SAFE_OPS = new Set([
   "eq",
@@ -357,7 +344,6 @@ const OP_SQL: Record<string, string> = {
   like: "LIKE",
 };
 
-/** Build a parameterized WHERE clause + args from filters. */
 function buildWhere(filters: DbAdminFilter[] | undefined): {
   clause: string;
   args: unknown[];
@@ -380,7 +366,6 @@ function buildWhere(filters: DbAdminFilter[] | undefined): {
       case "in": {
         const values = Array.isArray(f.value) ? f.value : [f.value];
         if (values.length === 0) {
-          // `col IN ()` is invalid SQL; an empty set matches nothing.
           parts.push(`1 = 0`);
           break;
         }
@@ -389,13 +374,7 @@ function buildWhere(filters: DbAdminFilter[] | undefined): {
         break;
       }
       case "ilike": {
-        // SQLite LIKE is case-insensitive for ASCII by default; Postgres has
-        // a dedicated ILIKE operator.
-        if (isPostgres()) {
-          parts.push(`${col} ILIKE ?`);
-        } else {
-          parts.push(`${col} LIKE ?`);
-        }
+        parts.push(`${col} ILIKE ?`);
         args.push(f.value);
         break;
       }
@@ -421,10 +400,11 @@ function buildOrderBy(sort: DbAdminRowsRequest["sort"]): string {
 export async function getRows(
   table: string,
   req: DbAdminRowsRequest,
+  runtime?: DbAdminRuntime,
 ): Promise<DbAdminRowsResult> {
   assertIdent(table, "table name");
-  const db = getDbExec();
-  const schema = await getTableSchema(table);
+  const client = db(runtime);
+  const schema = await getTableSchema(table, runtime);
 
   const page = Math.max(1, Math.floor(req.page) || 1);
   const pageSize = Math.min(1000, Math.max(1, Math.floor(req.pageSize) || 50));
@@ -433,30 +413,30 @@ export async function getRows(
   const where = buildWhere(req.filters);
   const orderBy = buildOrderBy(req.sort);
   const quoted = quoteIdent(table);
+  const includeLargeCells = req.includeLargeCells === true;
+  const selectList = buildRowsSelectList(schema.columns, includeLargeCells);
 
-  const countRes = await db.execute({
+  const countRes = await client.execute({
     sql: `SELECT COUNT(*) AS c FROM ${quoted}${where.clause}`,
     args: where.args,
   });
   const total = Number((countRes.rows[0] as any)?.c ?? 0) || 0;
 
-  const rowsRes = await db.execute({
-    sql: `SELECT * FROM ${quoted}${where.clause}${orderBy} LIMIT ? OFFSET ?`,
+  const rowsRes = await client.execute({
+    sql: `SELECT ${selectList} FROM ${quoted}${where.clause}${orderBy} LIMIT ? OFFSET ?`,
     args: [...where.args, pageSize, offset],
   });
+  const rows = rowsRes.rows as Record<string, unknown>[];
 
   return {
-    columns: schema.columns,
-    rows: rowsRes.rows as Record<string, unknown>[],
+    columns: markLargeValuePreviewColumns(schema.columns, includeLargeCells),
+    rows,
     total,
     page,
     pageSize,
+    truncatedCells: includeLargeCells ? 0 : countTruncatedResultCells(rows),
   };
 }
-
-// ---------------------------------------------------------------------------
-// applyMutations
-// ---------------------------------------------------------------------------
 
 function buildInsert(
   table: string,
@@ -466,6 +446,7 @@ function buildInsert(
   if (cols.length === 0) {
     throw new Error("Cannot insert an empty row");
   }
+  assertNoLargeCellPreviewMutation(row, "insert");
   cols.forEach((c) => assertIdent(c, "column name"));
   const sql = `INSERT INTO ${quoteIdent(table)} (${cols
     .map(quoteIdent)
@@ -484,6 +465,8 @@ function buildUpdate(
   if (whereCols.length === 0) {
     throw new Error("Update requires a non-empty where clause");
   }
+  assertNoLargeCellPreviewMutation(set, "update");
+  assertNoLargeCellPreviewMutation(where, "match rows");
   setCols.forEach((c) => assertIdent(c, "column name"));
   whereCols.forEach((c) => assertIdent(c, "column name"));
   const setSql = setCols.map((c) => `${quoteIdent(c)} = ?`).join(", ");
@@ -503,6 +486,7 @@ function buildDelete(
   if (whereCols.length === 0) {
     throw new Error("Delete requires a non-empty where clause");
   }
+  assertNoLargeCellPreviewMutation(where, "delete");
   whereCols.forEach((c) => assertIdent(c, "column name"));
   const whereSql = whereCols.map((c) => `${quoteIdent(c)} = ?`).join(" AND ");
   const sql = `DELETE FROM ${quoteIdent(table)} WHERE ${whereSql}`;
@@ -512,6 +496,7 @@ function buildDelete(
 export async function applyMutations(
   table: string,
   m: DbAdminMutation,
+  runtime?: DbAdminRuntime,
 ): Promise<DbAdminMutationResult> {
   assertIdent(table, "table name");
 
@@ -532,21 +517,16 @@ export async function applyMutations(
   };
 
   if (m.dryRun) {
-    // dryRun returns the SQL strings WITHOUT executing.
     return result;
   }
 
-  // getDbExec() does not expose a transaction handle, so statements run
-  // sequentially. A failure mid-batch surfaces as a thrown error with the
-  // counts accumulated so far; callers should treat a partial batch as a
-  // failure and re-run with a corrected payload.
-  const db = getDbExec();
+  const client = db(runtime);
   const insertCount = m.inserts?.length ?? 0;
   const updateCount = m.updates?.length ?? 0;
 
   let executed = 0;
   for (const stmt of statements) {
-    const res = await db.execute({ sql: stmt.sql, args: stmt.args });
+    const res = await client.execute({ sql: stmt.sql, args: stmt.args });
     if (executed < insertCount) {
       result.inserted += 1;
     } else if (executed < insertCount + updateCount) {
@@ -557,15 +537,10 @@ export async function applyMutations(
     executed += 1;
   }
 
-  if (statements.length > 0) await notifyDbAdminChange();
+  if (statements.length > 0) await notifyDbAdminChange(runtime);
   return result;
 }
 
-// ---------------------------------------------------------------------------
-// runSql
-// ---------------------------------------------------------------------------
-
-/** Error thrown when a destructive statement is run without confirmation. */
 export class DbAdminConfirmRequiredError extends Error {
   readonly needsConfirm = true;
   constructor(message: string) {
@@ -574,19 +549,15 @@ export class DbAdminConfirmRequiredError extends Error {
   }
 }
 
-/** Strip `--` line comments and `/* *\/` block comments from SQL. */
 function stripComments(sql: string): string {
   return sql.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--[^\n\r]*/g, " ");
 }
 
 function isMutatingSql(sql: string): boolean {
   const head = stripComments(sql).trim().toLowerCase();
-  return /^(insert|update|delete|replace|create|alter|drop|truncate|merge|pragma\s+\w+\s*=)/.test(
-    head,
-  );
+  return /^(insert|update|delete|create|alter|drop|truncate|merge)/.test(head);
 }
 
-/** Detect destructive ops on comment-stripped SQL. */
 function isDestructiveSql(sql: string): boolean {
   const cleaned = stripComments(sql).trim();
   const lower = cleaned.toLowerCase();
@@ -597,7 +568,6 @@ function isDestructiveSql(sql: string): boolean {
   return false;
 }
 
-/** A leading SELECT (or CTE that ends in SELECT) with no LIMIT clause. */
 function isBareSelectWithoutLimit(sql: string): boolean {
   const cleaned = stripComments(sql).trim();
   const lower = cleaned.toLowerCase();
@@ -611,6 +581,7 @@ export async function runSql(
   sql: string,
   params: unknown[] | undefined,
   opts: { confirmDestructive?: boolean } = {},
+  runtime?: DbAdminRuntime,
 ): Promise<DbAdminQueryResult> {
   if (typeof sql !== "string" || !sql.trim()) {
     throw new Error("SQL is required");
@@ -622,32 +593,34 @@ export async function runSql(
     );
   }
 
-  // Guardrail: auto-append LIMIT 100 to a bare SELECT so an accidental
-  // full-table scan can't dump a huge result set.
   let finalSql = sql.trim().replace(/;\s*$/, "");
   if (isBareSelectWithoutLimit(finalSql)) {
     finalSql = `${finalSql} LIMIT 100`;
   }
 
-  const db = getDbExec();
+  const client = db(runtime);
   const started = Date.now();
-  const res = await db.execute(
+  const res = await client.execute(
     params && params.length > 0 ? { sql: finalSql, args: params } : finalSql,
   );
   const durationMs = Date.now() - started;
 
-  const rows = (res.rows ?? []) as Record<string, unknown>[];
+  const truncation = truncateLargeResultCells(
+    (res.rows ?? []) as Record<string, unknown>[],
+  );
+  const rows = truncation.rows;
   const columns =
     rows.length > 0 && rows[0] && typeof rows[0] === "object"
       ? Object.keys(rows[0])
       : [];
 
-  if (isMutatingSql(finalSql)) await notifyDbAdminChange();
+  if (isMutatingSql(finalSql)) await notifyDbAdminChange(runtime);
 
   return {
     columns,
     rows,
     rowsAffected: res.rowsAffected ?? 0,
     durationMs,
+    truncatedCells: truncation.truncatedCells,
   };
 }

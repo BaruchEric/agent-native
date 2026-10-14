@@ -1,20 +1,6 @@
-/**
- * Navigate the UI to a view.
- *
- * Writes a navigate command to application state which the UI reads and auto-deletes.
- *
- * Usage:
- *   pnpm action navigate --view=chat
- *   pnpm action navigate --path=/some/route
- *
- * Options:
- *   --view   View name to navigate to
- *   --path   URL path to navigate to
- */
-
 import { defineAction } from "@agent-native/core/action";
+import { writeAppStateForCurrentTab } from "@agent-native/core/application-state";
 import { z } from "zod";
-import { writeAppState } from "@agent-native/core/application-state";
 
 export default defineAction({
   description:
@@ -22,6 +8,7 @@ export default defineAction({
   schema: z.object({
     view: z.string().optional().describe("View name to navigate to"),
     path: z.string().optional().describe("URL path to navigate to"),
+    threadId: z.string().optional().describe("Chat thread ID to open"),
   }),
   http: false,
   run: async (args) => {
@@ -31,8 +18,9 @@ export default defineAction({
     const nav: Record<string, string> = {};
     if (args.view) nav.view = args.view;
     if (args.path) nav.path = args.path;
+    if (args.threadId) nav.threadId = args.threadId;
     nav._writeId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    await writeAppState("navigate", nav);
+    await writeAppStateForCurrentTab("navigate", nav);
     return `Navigating to ${args.view || args.path}`;
   },
 });

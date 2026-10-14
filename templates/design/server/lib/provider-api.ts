@@ -1,13 +1,14 @@
 import {
   createProviderApiRuntime,
   listProviderApiIdsForTemplateUse,
-  type ProviderApiCredentialResolver,
   type ProviderApiDocsOptions,
   type ProviderApiId,
   type ProviderApiMethod,
   type ProviderApiRequestArgs,
 } from "@agent-native/core/provider-api";
-import { getCredentialContext, resolveSecret } from "@agent-native/core/server";
+import { getCredentialContext } from "@agent-native/core/server";
+
+import { rethrowFigmaProviderFailure } from "./figma-import-errors.js";
 
 export const DESIGN_APP_ID = "design";
 export const DESIGN_PROVIDER_API_IDS = listProviderApiIdsForTemplateUse(
@@ -15,25 +16,6 @@ export const DESIGN_PROVIDER_API_IDS = listProviderApiIdsForTemplateUse(
 ) as [ProviderApiId, ...ProviderApiId[]];
 export type DesignProviderApiId = (typeof DESIGN_PROVIDER_API_IDS)[number];
 export type { ProviderApiMethod, ProviderApiRequestArgs };
-
-const resolveDesignCredential: ProviderApiCredentialResolver = async (
-  options,
-) => {
-  if (options.provider !== "github" || options.key !== "GITHUB_TOKEN") {
-    return null;
-  }
-
-  const value = await resolveSecret("GITHUB_TOKEN");
-  if (!value) return null;
-
-  return {
-    key: "GITHUB_TOKEN",
-    value,
-    source: `${DESIGN_APP_ID}_secret`,
-    provider: "github",
-    scope: "request",
-  };
-};
 
 const runtime = createProviderApiRuntime({
   appId: DESIGN_APP_ID,
@@ -48,7 +30,6 @@ const runtime = createProviderApiRuntime({
     }
     return ctx;
   },
-  resolveCredential: resolveDesignCredential,
 });
 
 export function getDesignProviderApiRuntime() {
@@ -65,6 +46,14 @@ export function fetchProviderApiDocs(
   return runtime.fetchDocs(options);
 }
 
-export function executeProviderApiRequest(args: ProviderApiRequestArgs) {
-  return runtime.executeRequest(args);
+export async function executeProviderApiRequest(args: ProviderApiRequestArgs) {
+  try {
+    return await runtime.executeRequest(args);
+  } catch (error) {
+    // Credential resolution throws before any HTTP envelope exists, so the
+    // envelope reader never sees it. Classify here, at the one place every
+    // Design provider request passes through.
+    if (args.provider === "figma") rethrowFigmaProviderFailure(error);
+    throw error;
+  }
 }

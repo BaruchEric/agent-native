@@ -1,17 +1,28 @@
 import { describe, expect, it } from "vitest";
+
 import {
+  CREATABLE_DOCUMENT_PROPERTY_TYPES,
+  EDITABLE_DOCUMENT_PROPERTY_TYPES,
+  blocksRenderMode,
+  blocksStorageTarget,
+  countWords,
   defaultPropertyOptions,
   documentPropertyDateIncludesTime,
   documentPropertyDateKey,
   evaluateNormalizationFormula,
   evaluateNumericExpression,
   evaluatePropertyFormula,
+  formatWordCount,
+  isBlocksPropertyType,
   isEmptyPropertyValue,
   isComputedPropertyType,
+  isOnlyBlocksFieldDeletion,
+  isPrimaryBlocksField,
   normalizePropertyValue,
   normalizePropertyVisibility,
   parsePropertyOptions,
   parsePropertyValue,
+  resolveBlocksFieldValue,
   sanitizeNormalizationFormula,
   serializePropertyOptions,
   serializePropertyValue,
@@ -65,7 +76,6 @@ describe("document properties", () => {
       end: "2026-05-29T16:00",
       includeTime: true,
     });
-    // Builder CMS date fields arrive as epoch-millis numbers.
     const epochResult = normalizePropertyValue(
       "date",
       Date.parse("2026-05-28T15:30:00.000Z"),
@@ -186,7 +196,6 @@ describe("document properties", () => {
         URL: "site.com/blog/foo/",
       }),
     ).toBe("/blog/foo");
-    // The canonical case: host-qualified and relative URLs collapse to one key.
     expect(
       evaluatePropertyFormula('replace(striphost({URL}), "/blog/", "")', {
         URL: "https://site.com/blog/foo",
@@ -213,10 +222,8 @@ describe("document properties", () => {
     expect(evaluateNormalizationFormula("lower({slug})", { slug: "FOO" })).toBe(
       "foo",
     );
-    // Empty result collapses to null so empty keys never match each other.
     expect(evaluateNormalizationFormula("trim({k})", { k: "   " })).toBeNull();
     expect(evaluateNormalizationFormula("", { k: "x" })).toBeNull();
-    // A broken regex pattern fails as a null key rather than a garbage literal.
     expect(
       evaluateNormalizationFormula('regexextract({k}, "(", 1)', { k: "foo" }),
     ).toBeNull();
@@ -276,5 +283,127 @@ describe("document properties", () => {
     expect(isEmptyPropertyValue({ start: "", includeTime: false })).toBe(true);
     expect(isEmptyPropertyValue(false)).toBe(false);
     expect(isEmptyPropertyValue(0)).toBe(false);
+  });
+});
+
+describe("Blocks property type", () => {
+  it("is a creatable, editable, non-computed property type", () => {
+    expect(isBlocksPropertyType("blocks")).toBe(true);
+    expect(isBlocksPropertyType("text")).toBe(false);
+    expect(EDITABLE_DOCUMENT_PROPERTY_TYPES).toContain("blocks");
+    expect(CREATABLE_DOCUMENT_PROPERTY_TYPES).toContain("blocks");
+    expect(isComputedPropertyType("blocks")).toBe(false);
+  });
+
+  it("normalizes a Blocks value to its markdown string", () => {
+    expect(normalizePropertyValue("blocks", "# Heading\n\nBody")).toBe(
+      "# Heading\n\nBody",
+    );
+    expect(normalizePropertyValue("blocks", "")).toBeNull();
+  });
+
+  it("defaults a manually-added Blocks field to non-primary", () => {
+    const options = defaultPropertyOptions("blocks");
+    expect(options).toEqual({ blocks: { primary: false } });
+    expect(isPrimaryBlocksField(options)).toBe(false);
+  });
+
+  it("round-trips the primary flag through JSON storage", () => {
+    const primary = parsePropertyOptions(
+      serializePropertyOptions({ blocks: { primary: true } }),
+    );
+    expect(primary).toEqual({ blocks: { primary: true } });
+    expect(isPrimaryBlocksField(primary)).toBe(true);
+
+    const additional = parsePropertyOptions(
+      serializePropertyOptions({ blocks: { primary: false } }),
+    );
+    expect(isPrimaryBlocksField(additional)).toBe(false);
+    expect(isPrimaryBlocksField({})).toBe(false);
+  });
+
+  it("counts words from markdown, ignoring syntax", () => {
+    expect(countWords("")).toBe(0);
+    expect(countWords(null)).toBe(0);
+    expect(countWords("one two three")).toBe(3);
+    expect(countWords("# Heading with five words here")).toBe(5);
+    expect(
+      countWords("- a\n- b\n- c\n\n**bold** _italic_ [link](https://x.com)"),
+    ).toBe(7);
+    expect(countWords("```\ncode block ignored\n```\nreal words here")).toBe(3);
+  });
+
+  it("formats a word count for table cells", () => {
+    expect(formatWordCount("")).toBe("Empty");
+    expect(formatWordCount("just one word here")).toBe("4 words");
+    expect(formatWordCount("solo")).toBe("1 word");
+    expect(formatWordCount("a ".repeat(412))).toBe("412 words");
+  });
+
+  it("renders solo vs multi by Blocks field count", () => {
+    expect(blocksRenderMode(0)).toBe("solo");
+    expect(blocksRenderMode(1)).toBe("solo");
+    expect(blocksRenderMode(2)).toBe("multi");
+    expect(blocksRenderMode(5)).toBe("multi");
+  });
+
+  it("warns only when deleting the last Blocks field", () => {
+    expect(
+      isOnlyBlocksFieldDeletion({ type: "blocks", blocksFieldCount: 1 }),
+    ).toBe(true);
+    expect(
+      isOnlyBlocksFieldDeletion({ type: "blocks", blocksFieldCount: 2 }),
+    ).toBe(false);
+    expect(
+      isOnlyBlocksFieldDeletion({ type: "text", blocksFieldCount: 1 }),
+    ).toBe(false);
+  });
+
+  it("routes the primary field to the document body and others to their own store", () => {
+    expect(blocksStorageTarget({ blocks: { primary: true } })).toBe(
+      "document_body",
+    );
+    expect(blocksStorageTarget({ blocks: { primary: false } })).toBe(
+      "block_field_store",
+    );
+    expect(blocksStorageTarget({})).toBe("block_field_store");
+  });
+
+  it("resolves each Blocks field to its OWN independent content", () => {
+    const documentBody = "PRIMARY body content";
+    const blockFieldContent = "ADDITIONAL field content";
+
+    expect(
+      resolveBlocksFieldValue({
+        options: { blocks: { primary: true } },
+        documentBody,
+        blockFieldContent,
+      }),
+    ).toBe(documentBody);
+
+    expect(
+      resolveBlocksFieldValue({
+        options: { blocks: { primary: false } },
+        documentBody,
+        blockFieldContent,
+      }),
+    ).toBe(blockFieldContent);
+
+    expect(
+      resolveBlocksFieldValue({
+        options: { blocks: { primary: false } },
+        documentBody,
+        blockFieldContent: undefined,
+      }),
+    ).toBe("");
+
+    const editedBlockFieldContent = "edited additional content";
+    expect(
+      resolveBlocksFieldValue({
+        options: { blocks: { primary: true } },
+        documentBody,
+        blockFieldContent: editedBlockFieldContent,
+      }),
+    ).toBe(documentBody);
   });
 });

@@ -1,7 +1,12 @@
 type DictionaryEntry = Record<string, unknown>;
 
+const MAX_INJECTED_ENTRIES = 40;
+const MAX_DICTIONARY_CONTEXT_CHARS = 10_000;
+
 function compact(value: unknown, max = 240): string {
-  const text = String(value ?? "")
+  const text = (
+    typeof value === "string" ? value : (JSON.stringify(value) ?? "")
+  )
     .replace(/\s+/g, " ")
     .trim();
   if (text.length <= max) return text;
@@ -16,7 +21,14 @@ function boolValue(value: unknown): boolean {
 
 function sortByMetric(entries: DictionaryEntry[]): DictionaryEntry[] {
   return [...entries].sort((a, b) =>
-    String(a.metric ?? "").localeCompare(String(b.metric ?? "")),
+    (typeof a.metric === "string"
+      ? a.metric
+      : (JSON.stringify(a.metric) ?? "")
+    ).localeCompare(
+      typeof b.metric === "string"
+        ? b.metric
+        : (JSON.stringify(b.metric) ?? ""),
+    ),
   );
 }
 
@@ -43,8 +55,61 @@ function renderEntry(
 
   const table = compact(entry.table, 240);
   if (table) lines.push(`  - table: ${table}`);
+  const entryType = compact(entry.entryType, 80);
+  if (entryType) lines.push(`  - entry type: ${entryType}`);
+  const status = compact(entry.status, 80);
+  if (status) lines.push(`  - source status: ${status}`);
+  const sourceKind = compact(entry.sourceKind, 80);
+  if (sourceKind) lines.push(`  - source kind: ${sourceKind}`);
+  const grain = compact(entry.grain, 240);
+  if (grain) lines.push(`  - grain: ${grain}`);
+  const primaryEntity = compact(entry.primaryEntity, 160);
+  if (primaryEntity) lines.push(`  - primary entity: ${primaryEntity}`);
+  const timeDimension = compact(entry.timeDimension, 160);
+  if (timeDimension) lines.push(`  - time dimension: ${timeDimension}`);
+  const semanticModel = compact(entry.semanticModel, 160);
+  if (semanticModel) lines.push(`  - semantic model: ${semanticModel}`);
+  const source = compact(entry.source, 240);
+  if (source) lines.push(`  - source: ${source}`);
+  const action = compact(entry.action, 160);
+  if (action) lines.push(`  - query action: ${action}`);
   const columns = compact(entry.columnsUsed, 360);
   if (columns) lines.push(`  - columns: ${columns}`);
+  const sqlProjectedColumns = compact(entry.sqlProjectedColumns, 360);
+  if (sqlProjectedColumns) {
+    lines.push(
+      `  - SQL projected columns (inferred; verify against schema): ${sqlProjectedColumns}`,
+    );
+  }
+  const inferredMembershipKeys = Array.isArray(entry.inferredMembershipKeys)
+    ? compact(
+        entry.inferredMembershipKeys
+          .filter((key): key is string => typeof key === "string")
+          .join(", "),
+        240,
+      )
+    : compact(entry.inferredMembershipKeys, 240);
+  if (inferredMembershipKeys) {
+    lines.push(
+      `  - membership row keys inferred from structural dbt SQL analysis: ${inferredMembershipKeys}`,
+    );
+  }
+  const membershipKeyRoles =
+    entry.inferredMembershipKeyRoles &&
+    typeof entry.inferredMembershipKeyRoles === "object" &&
+    !Array.isArray(entry.inferredMembershipKeyRoles)
+      ? (entry.inferredMembershipKeyRoles as Record<string, unknown>)
+      : null;
+  const userMembershipKey = compact(membershipKeyRoles?.user, 120);
+  const organizationMembershipKey = compact(
+    membershipKeyRoles?.organization,
+    120,
+  );
+  if (userMembershipKey && organizationMembershipKey) {
+    lines.push(
+      `  - inferred membership key roles: user key ${userMembershipKey}; organization key ${organizationMembershipKey}`,
+    );
+  }
   const cuts = compact(entry.cuts, 240);
   if (cuts) lines.push(`  - standard cuts: ${cuts}`);
   const template = compact(entry.queryTemplate, 240);
@@ -72,16 +137,85 @@ function renderEntry(
   return lines;
 }
 
-/**
- * Render data-dictionary entries as compact prompt context.
- *
- * Trust tiers:
- * - approved entries are canonical and should be used verbatim.
- * - human-authored entries without approval still stay visible so an org with
- *   no review workflow does not lose its dictionary.
- * - AI-generated unapproved entries are suggestions; they are only injected in
- *   full when there is no human-authored dictionary context at all.
- */
+function takeWithinBudget<T>(
+  entries: T[],
+  renderedCount: number,
+): { entries: T[]; renderedCount: number; omitted: number } {
+  const remaining = Math.max(0, MAX_INJECTED_ENTRIES - renderedCount);
+  const selected = entries.slice(0, remaining);
+  return {
+    entries: selected,
+    renderedCount: renderedCount + selected.length,
+    omitted: entries.length - selected.length,
+  };
+}
+
+function renderOmittedDictionaryEntries(omitted: number): string[] {
+  if (omitted <= 0) return [];
+  return [
+    `${omitted} additional data-dictionary entr${
+      omitted === 1 ? "y was" : "ies were"
+    } omitted from prompt context for efficiency. Call \`find-data\` with the user's focused metric or entity question before writing SQL or making claims that may depend on omitted definitions.`,
+    "",
+  ];
+}
+
+function renderedTextLength(lines: string[]): number {
+  return lines.reduce((total, line) => total + line.length + 1, 0);
+}
+
+type TrustLabel = "approved/canonical" | "unreviewed/human" | "ai-suggestion";
+
+function renderGroupWithinBudget(
+  lines: string[],
+  title: string,
+  groupEntries: DictionaryEntry[],
+  trustLabel: TrustLabel,
+  renderedCount: number,
+  state: { charBudgetExceeded: boolean; anyEntryRendered: boolean },
+): { renderedCount: number; omitted: number } {
+  if (!groupEntries.length) return { renderedCount, omitted: 0 };
+
+  const budgeted = takeWithinBudget(groupEntries, renderedCount);
+  let omitted = budgeted.omitted;
+  const bodyLines: string[] = [];
+  let includedFromGroup = 0;
+
+  for (const entry of budgeted.entries) {
+    if (state.charBudgetExceeded) {
+      omitted += 1;
+      continue;
+    }
+
+    const entryLines = renderEntry(entry, trustLabel);
+    const headerAddition = includedFromGroup === 0 ? title.length + 1 : 0;
+    const prospectiveTotal =
+      renderedTextLength(lines) +
+      headerAddition +
+      renderedTextLength(bodyLines) +
+      renderedTextLength(entryLines);
+
+    if (
+      prospectiveTotal > MAX_DICTIONARY_CONTEXT_CHARS &&
+      state.anyEntryRendered
+    ) {
+      state.charBudgetExceeded = true;
+      omitted += 1;
+      continue;
+    }
+
+    bodyLines.push(...entryLines);
+    includedFromGroup += 1;
+    state.anyEntryRendered = true;
+  }
+
+  if (includedFromGroup > 0) {
+    lines.push(title, ...bodyLines, "");
+  }
+
+  return { renderedCount: budgeted.renderedCount, omitted };
+}
+
 export function renderDataDictionary(entries: DictionaryEntry[]): string {
   const usable = entries.filter((entry) => compact(entry.metric, 120));
   if (!usable.length) return "";
@@ -100,46 +234,61 @@ export function renderDataDictionary(entries: DictionaryEntry[]): string {
     ),
   );
   const includeAiSuggestions = approved.length + humanUnreviewed.length === 0;
+  let renderedCount = 0;
+  let omittedEntries = 0;
+  const budgetState = { charBudgetExceeded: false, anyEntryRendered: false };
 
   const lines: string[] = [
     "<data-dictionary>",
     "Canonical metric/table/column definitions for this organization.",
     "Trust tiers: approved entries are canonical and should be used verbatim; unreviewed human entries are usable but should be verified for high-stakes numbers; AI-generated unapproved entries are suggestions only.",
-    "If the metric you need is not here, call `list-data-dictionary`, inspect configured schemas with `search-bigquery-schema`, or ask the user before guessing.",
+    "If the metric you need is not here, call `find-data`, inspect configured schemas with `search-bigquery-schema`, or ask one business-definition question when the intended meaning remains ambiguous. Never ask the user for internal schema identifiers.",
     "",
   ];
 
-  if (approved.length) {
-    lines.push("## Approved canonical entries");
-    for (const entry of approved) {
-      lines.push(...renderEntry(entry, "approved/canonical"));
-    }
-    lines.push("");
-  }
+  const approvedResult = renderGroupWithinBudget(
+    lines,
+    "## Approved canonical entries",
+    approved,
+    "approved/canonical",
+    renderedCount,
+    budgetState,
+  );
+  renderedCount = approvedResult.renderedCount;
+  omittedEntries += approvedResult.omitted;
 
-  if (humanUnreviewed.length) {
-    lines.push("## Unreviewed human-authored entries");
-    for (const entry of humanUnreviewed) {
-      lines.push(...renderEntry(entry, "unreviewed/human"));
-    }
-    lines.push("");
-  }
+  const humanResult = renderGroupWithinBudget(
+    lines,
+    "## Unreviewed human-authored entries",
+    humanUnreviewed,
+    "unreviewed/human",
+    renderedCount,
+    budgetState,
+  );
+  renderedCount = humanResult.renderedCount;
+  omittedEntries += humanResult.omitted;
 
   if (includeAiSuggestions && aiSuggestions.length) {
-    lines.push("## AI-generated suggestions");
-    for (const entry of aiSuggestions) {
-      lines.push(...renderEntry(entry, "ai-suggestion"));
-    }
-    lines.push("");
+    const aiResult = renderGroupWithinBudget(
+      lines,
+      "## AI-generated suggestions",
+      aiSuggestions,
+      "ai-suggestion",
+      renderedCount,
+      budgetState,
+    );
+    renderedCount = aiResult.renderedCount;
+    omittedEntries += aiResult.omitted;
   } else if (aiSuggestions.length) {
     lines.push(
       `${aiSuggestions.length} AI-generated unapproved suggestion${
         aiSuggestions.length === 1 ? "" : "s"
-      } available via \`list-data-dictionary\`; do not treat them as canonical without verification.`,
+      } searchable through \`find-data\` and browsable with \`list-data-dictionary\`; do not treat them as canonical without verification.`,
       "",
     );
   }
 
+  lines.push(...renderOmittedDictionaryEntries(omittedEntries));
   lines.push("</data-dictionary>");
   return lines.join("\n");
 }

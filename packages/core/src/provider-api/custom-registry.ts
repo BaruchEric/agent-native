@@ -20,12 +20,11 @@
  * cannot be expressed in the simple header/key model.
  */
 
-import { getDbExec, isPostgres } from "../db/client.js";
+import { getDbExec } from "../db/client.js";
+import { ensureTableExists } from "../db/ddl-guard.js";
+import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import { widenIntColumnsToBigInt } from "../db/widen-columns.js";
 import { isBlockedExtensionUrlWithDns } from "../extensions/url-safety.js";
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 export type CustomProviderScope = "user" | "org";
 
@@ -53,7 +52,6 @@ export interface CustomProviderConfig {
 export interface UpsertCustomProviderArgs {
   scope: CustomProviderScope;
   scopeId: string;
-  /** Slug used as the provider id (e.g. "my-api"). Must be lowercase, letters/digits/hyphens. */
   id: string;
   label: string;
   baseUrl: string;
@@ -62,11 +60,8 @@ export interface UpsertCustomProviderArgs {
   allowedHostSuffixes?: string[];
   defaultHeaders?: Record<string, string>;
   notes?: string;
+  orgRole: string | null;
 }
-
-// ---------------------------------------------------------------------------
-// Table bootstrap
-// ---------------------------------------------------------------------------
 
 const CREATE_SQL = `CREATE TABLE IF NOT EXISTS custom_api_providers (
   id TEXT NOT NULL,
@@ -79,40 +74,33 @@ const CREATE_SQL = `CREATE TABLE IF NOT EXISTS custom_api_providers (
   allowed_host_suffixes_json TEXT NOT NULL,
   default_headers_json TEXT NOT NULL,
   notes TEXT NOT NULL DEFAULT '',
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL,
   PRIMARY KEY (scope, scope_id, id)
 )`;
 
 let _initPromise: Promise<void> | undefined;
 
-async function ensureTable(): Promise<void> {
+export async function ensureTable(): Promise<void> {
   if (!_initPromise) {
-    _initPromise = (async () => {
-      const client = getDbExec();
-      const sql = isPostgres()
-        ? CREATE_SQL.replace(/\bINTEGER\b/g, "BIGINT")
-        : CREATE_SQL;
-      await client.execute(sql);
+    const _initPromiseWithRequestDbPoolScope = (async () => {
+      await ensureTableExists("custom_api_providers", CREATE_SQL);
+      await widenIntColumnsToBigInt("custom_api_providers", [
+        "created_at",
+        "updated_at",
+      ]);
     })().catch((err) => {
       _initPromise = undefined;
       throw err;
     });
+    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
   }
   return _initPromise;
 }
 
-// ---------------------------------------------------------------------------
-// Validation
-// ---------------------------------------------------------------------------
-
 const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$|^[a-z0-9]$/;
 const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
-/**
- * Validate and normalise a custom provider base URL. Throws when the URL is
- * invalid, uses a non-http(s) scheme, or resolves to a private/internal host.
- */
 export async function validateCustomBaseUrl(rawUrl: string): Promise<URL> {
   let url: URL;
   try {
@@ -214,11 +202,6 @@ const FORBIDDEN_HOST_SUFFIXES = new Set([
 const HOST_SUFFIX_RE =
   /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
 
-/**
- * Validate user-supplied allowed host suffixes. Each suffix must look like a
- * real registrable domain (at least two labels) and must not be a bare TLD or
- * shared-hosting public suffix where unrelated parties control subdomains.
- */
 export function validateAllowedHostSuffixes(suffixes: string[]): string[] {
   const normalized: string[] = [];
   for (const raw of suffixes) {
@@ -239,17 +222,49 @@ export function validateAllowedHostSuffixes(suffixes: string[]): string[] {
   return normalized;
 }
 
-// ---------------------------------------------------------------------------
-// CRUD
-// ---------------------------------------------------------------------------
+export class CustomProviderAuthError extends Error {
+  constructor(
+    readonly statusCode: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "CustomProviderAuthError";
+  }
+}
 
 /**
- * Create or update a custom provider. Validates the base URL against SSRF
- * rules at write time. Returns the provider id.
+ * Defense-in-depth authorization guard for custom-provider mutations. Mirrors
+ * `assertCanMutateScope` in `server/scoped-key-storage.ts`: user-scoped writes
+ * need no role check (each user only ever mutates their own row), but
+ * org-scoped writes require the caller to be an owner or admin of the target
+ * org (`scopeId`) — otherwise a plain member could repoint an org-wide
+ * provider's base URL or attach a different credential key name that other
+ * members' agents then trust. `scopeId` is accepted (unused today) for
+ * signature parity with `assertCanMutateScope` in case a future scope value
+ * needs it (e.g. a solo-workspace carve-out).
+ *
+ * The only caller today is `provider-api-register.ts`, which resolves
+ * `orgRole` itself and enforces this same check before calling in; this
+ * function is the second, harder-to-bypass layer so a future caller can't
+ * reintroduce the gap by forgetting to check.
  */
+export function assertCanMutateCustomProviderScope(
+  scope: CustomProviderScope,
+  _scopeId: string,
+  orgRole: string | null,
+): void {
+  if (scope === "user") return;
+  if (orgRole === "owner" || orgRole === "admin") return;
+  throw new CustomProviderAuthError(
+    403,
+    "Only organization owners and admins can register or modify org-scoped custom providers.",
+  );
+}
+
 export async function upsertCustomProvider(
   args: UpsertCustomProviderArgs,
 ): Promise<string> {
+  assertCanMutateCustomProviderScope(args.scope, args.scopeId, args.orgRole);
   await ensureTable();
   validateProviderId(args.id);
   validateAuth(args.auth);
@@ -307,14 +322,13 @@ export async function upsertCustomProvider(
   return args.id;
 }
 
-/**
- * Delete a custom provider. Returns true if a row was deleted.
- */
 export async function deleteCustomProvider(
   scope: CustomProviderScope,
   scopeId: string,
   id: string,
+  orgRole: string | null,
 ): Promise<boolean> {
+  assertCanMutateCustomProviderScope(scope, scopeId, orgRole);
   await ensureTable();
   const client = getDbExec();
   const { rowsAffected } = await client.execute({
@@ -324,9 +338,6 @@ export async function deleteCustomProvider(
   return rowsAffected > 0;
 }
 
-/**
- * List all custom providers visible to a given (scope, scopeId) pair.
- */
 export async function listCustomProviders(
   scope: CustomProviderScope,
   scopeId: string,
@@ -340,9 +351,6 @@ export async function listCustomProviders(
   return rows.map(rowToConfig);
 }
 
-/**
- * Look up one custom provider. Returns null when not found.
- */
 export async function getCustomProvider(
   scope: CustomProviderScope,
   scopeId: string,

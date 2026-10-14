@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+
 import { CliRegistry } from "./registry.js";
 import type { CliAdapter, CliResult } from "./types.js";
 
@@ -44,7 +45,7 @@ describe("CliRegistry", () => {
 
   it("unregister is a no-op for unknown name", () => {
     const registry = new CliRegistry();
-    registry.unregister("nonexistent"); // should not throw
+    registry.unregister("nonexistent");
     expect(registry.list()).toHaveLength(0);
   });
 

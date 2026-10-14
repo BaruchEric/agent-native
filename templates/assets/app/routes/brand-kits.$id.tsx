@@ -1,74 +1,80 @@
-import { Link, useNavigate, useParams, useSearchParams } from "react-router";
+import { sendToAgentChat } from "@agent-native/core/client/agent-chat";
 import {
-  type Dispatch,
-  type DragEvent,
-  type ReactNode,
-  type SetStateAction,
-  useEffect,
-  useRef,
-  useState,
-} from "react";
-import {
-  type QueryClient,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
-import { toast } from "sonner";
-import {
-  ShareButton,
   appBasePath,
   agentNativePath,
-  sendToAgentChat,
+} from "@agent-native/core/client/api-path";
+import {
+  getBrowserTabId,
+  readClientAppState,
   useActionMutation,
   useActionQuery,
-} from "@agent-native/core/client";
+  useSession,
+} from "@agent-native/core/client/hooks";
+import { useT } from "@agent-native/core/client/i18n";
+import { useFileUploadStatus } from "@agent-native/core/client/uploads";
+import { withSsrHtmlContentType } from "@agent-native/core/shared";
 import {
+  CreativeContextShareSheet,
+  useCreativeContextLab,
+} from "@agent-native/creative-context/client";
+import { ShareButton } from "@agent-native/toolkit/app/sharing";
+import {
+  IconCheck,
+  IconClipboard,
   IconCopy,
   IconDotsVertical,
+  IconArrowUpRight,
   IconArchive,
   IconFolder,
   IconFolderPlus,
   IconLayoutBottombar,
   IconLayoutGrid,
+  IconLink,
   IconMessageCircle,
   IconPencil,
   IconPhoto,
   IconPhotoPlus,
   IconRefresh,
   IconSearch,
+  IconSettings,
   IconTrash,
   IconUpload,
-  IconVideo,
   IconX,
 } from "@tabler/icons-react";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Textarea } from "@/components/ui/textarea";
-import { Label } from "@/components/ui/label";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+  type QueryClient,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
+  type Dispatch,
+  type DragEvent,
+  type ReactNode,
+  type SetStateAction,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { createPortal } from "react-dom";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+  Link,
+  LoaderFunctionArgs,
+  redirect,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router";
+import { toast } from "sonner";
+
+import {
+  AssetPreviewDialog,
+  type PreviewAsset,
+} from "@/components/asset/AssetPreviewDialog";
+import {
+  FileUploadStorageGate,
+  getFileUploadStorageState,
+} from "@/components/FileUploadStorageGate";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -79,13 +85,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import {
-  chunkAssetUploads,
-  getFailedUploadCount,
-  getSkippedDuplicateCount,
-  getUploadedAssetCount,
-  type AssetUploadResult,
-} from "@/lib/upload-results";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -94,42 +96,51 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Separator } from "@/components/ui/separator";
-import { Checkbox } from "@/components/ui/checkbox";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { EditLibraryDialog } from "@/components/library/EditLibraryDialog";
-import { assetMediaUrl } from "@/lib/asset-urls";
 import { assetPreviewSources } from "@/lib/asset-preview-sources";
-import { getLibraryCustomInstructions } from "@/lib/libraries";
+import { assetMediaUrl } from "@/lib/asset-urls";
 import {
-  IMAGE_CATEGORIES,
-  ASPECT_RATIOS,
-  IMAGE_MODELS,
-  IMAGE_SIZES,
-  VIDEO_ASPECT_RATIOS,
-  VIDEO_DURATIONS,
-  VIDEO_MODELS,
-  VIDEO_RESOLUTIONS,
-  type AspectRatio,
-  type ImageCategory,
+  chunkAssetUploads,
+  getFailedUploadCount,
+  getSkippedDuplicateCount,
+  getUploadedAssetCount,
+  type AssetUploadResult,
+} from "@/lib/upload-results";
+
+import {
+  canApproveWithRole,
+  MAX_ASSET_UPLOAD_BATCH_BYTES,
+  type AssetVariantState,
   type ImageRole,
 } from "../../shared/api";
 
-function candidateSaveKey(slot: any): string {
-  if (typeof slot?.assetId === "string" && slot.assetId) {
-    return `asset:${slot.assetId}`;
-  }
-  if (typeof slot?.slotId === "string" && slot.slotId) {
-    return `slot:${slot.slotId}`;
-  }
-  return "";
-}
+export type VariantSlot = AssetVariantState["slots"][number];
 
 function referencePromotionKey(asset: any, slot?: any): string {
   if (typeof slot?.slotId === "string" && slot.slotId) {
@@ -289,62 +300,44 @@ function removeVariantSlotsByScopeFromCache(
   );
 }
 
-function variantSlotTime(slot: any): number {
-  const raw = slot?.createdAt ?? slot?.updatedAt ?? "";
-  const time = Date.parse(String(raw));
-  return Number.isNaN(time) ? 0 : time;
-}
-
-function compareVariantSlotsNewestFirst(left: any, right: any): number {
-  return (
-    variantSlotTime(right) - variantSlotTime(left) ||
-    String(right?.slotId ?? "").localeCompare(String(left?.slotId ?? ""))
-  );
-}
-
-function stalePendingVariantRunId(slot: any): string | null {
-  if (slot?.status !== "pending") return null;
-  if (typeof slot?.runId !== "string" || !slot.runId) return null;
-  const timestamp = variantSlotTime(slot);
-  if (!timestamp) return null;
-  return Date.now() - timestamp >= 2 * 60 * 1000 ? slot.runId : null;
-}
-
-function paletteDraftFromColors(colors: unknown): string {
-  return Array.isArray(colors)
-    ? colors.filter((color) => typeof color === "string").join(", ")
-    : "";
-}
-
 function referenceRoleForAsset(asset: any): ImageRole {
   if (asset?.mediaType === "video" || asset?.mimeType?.startsWith("video/")) {
     return "video_reference";
   }
-  const category = asset?.metadata?.category;
+  const category = asset?.metadata?.category ?? asset?.category;
   if (category === "logo") return "logo_reference";
   if (category === "product") return "product_reference";
   if (category === "diagram") return "diagram_reference";
   return "style_reference";
 }
 
-function parsePaletteDraft(value: string): string[] {
-  const seen = new Set<string>();
-  const colors: string[] = [];
-  for (const raw of value.split(/[\s,]+/)) {
-    const trimmed = raw.trim();
-    if (!trimmed) continue;
-    const color = trimmed.startsWith("#") ? trimmed : `#${trimmed}`;
-    if (!/^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(color)) continue;
-    const normalized = color.toLowerCase();
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
-    colors.push(normalized);
-  }
-  return colors;
+function variantSlotTime(slot: VariantSlot): number {
+  const raw = slot.createdAt ?? slot.updatedAt ?? "";
+  const time = Date.parse(raw);
+  return Number.isNaN(time) ? 0 : time;
+}
+
+function assetUpdatedTime(asset: any): number {
+  const raw = asset?.updatedAt ?? asset?.createdAt ?? "";
+  const time = Date.parse(String(raw));
+  return Number.isNaN(time) ? 0 : time;
+}
+
+export function loader({ params, request }: LoaderFunctionArgs) {
+  const url = new URL(request.url);
+  return withSsrHtmlContentType(
+    redirect(`/library/${params.id}${url.search}`),
+    { varyByQuery: true },
+  );
+}
+
+export default function BrandKitDetailRedirect() {
+  return null;
 }
 
 function libraryTabFromValue(value: unknown): LibraryTab | null {
-  return value === "references" ||
+  return value === "drafts" ||
+    value === "references" ||
     value === "generated" ||
     value === "runs" ||
     value === "settings"
@@ -352,43 +345,56 @@ function libraryTabFromValue(value: unknown): LibraryTab | null {
     : null;
 }
 
-export default function LibraryPage() {
+export function BrandKitDetailRoute({
+  libraryId: explicitLibraryId = null,
+  headerMode = "full",
+}: {
+  libraryId?: string | null;
+  headerMode?: "full" | "actions";
+} = {}) {
+  const t = useT();
+  const fileUploadStatus = useFileUploadStatus();
+  const fileStorageState = getFileUploadStorageState(fileUploadStatus);
+  const canUploadFiles = fileStorageState === "configured";
   const { id } = useParams();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const urlTab = libraryTabFromValue(searchParams.get("tab"));
-  const libraryId = id!;
+  const libraryId = explicitLibraryId ?? id!;
+  const { session } = useSession();
   const { data } = useActionQuery("get-library", { id: libraryId }) as any;
-  const updateLibrary = useActionMutation("update-library");
+
   const archiveLibrary = useActionMutation("archive-library");
   const duplicateLibrary = useActionMutation("duplicate-library");
-  const saveGenerated = useActionMutation("save-generated-image");
   const updateAsset = useActionMutation("update-asset");
+  const saveGenerated = useActionMutation("save-generated-image");
   const rerunGeneration = useActionMutation("rerun-generation-run");
   const refreshGeneration = useActionMutation("refresh-generation-run");
   const createSession = useActionMutation("create-generation-session");
   const prepareSessionContinuation = useActionMutation(
     "prepare-generation-session-continuation",
   );
-  const { data: variants } = useVariantState();
-  const { data: presetData } = useActionQuery("list-generation-presets", {
+  const { data: presetData } = useActionQuery("list-templates", {
     libraryId,
   }) as any;
   const { data: sessionData } = useActionQuery("list-generation-sessions", {
     libraryId,
   }) as any;
   const queryClient = useQueryClient();
-  const [generateOpen, setGenerateOpen] = useState(false);
   const [folderOpen, setFolderOpen] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [storageSetupOpen, setStorageSetupOpen] = useState(false);
   const [pendingUploads, setPendingUploads] = useState<PendingUpload[]>([]);
-  const [editOpen, setEditOpen] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(false);
+  const [headerPrimaryActionsTarget, setHeaderPrimaryActionsTarget] =
+    useState<HTMLElement | null>(null);
+  const [headerMoreActionsTarget, setHeaderMoreActionsTarget] =
+    useState<HTMLElement | null>(null);
   const [activeFolderId, setActiveFolderId] = useState<string | null>("all");
   const [activeTab, setActiveTab] = useState<LibraryTab>(
-    () => urlTab ?? "references",
+    () => urlTab ?? "generated",
   );
-  const [assetViewMode, setAssetViewMode] = useState<AssetViewMode>("lanes");
+  const [assetViewMode, setAssetViewMode] = useState<AssetViewMode>("cards");
   const [assetScope, setAssetScope] = useState<AssetLibraryScope>("all");
   const [selectedAssetIds, setSelectedAssetIds] = useState<Set<string>>(
     () => new Set(),
@@ -397,44 +403,64 @@ export default function LibraryPage() {
     useState<Set<string>>(() => new Set());
   const [optimisticallySavedAssetIds, setOptimisticallySavedAssetIds] =
     useState<Set<string>>(() => new Set());
-  const [savingCandidateKeys, setSavingCandidateKeys] = useState<Set<string>>(
-    () => new Set(),
-  );
   const [promotingReferenceKeys, setPromotingReferenceKeys] = useState<
     Set<string>
   >(() => new Set());
+  const [savingCandidateSlotId, setSavingCandidateSlotId] = useState<
+    string | null
+  >(null);
   const [mediaFilter, setMediaFilter] = useState<"all" | "image" | "video">(
     "all",
   );
   const [search, setSearch] = useState("");
-  const [styleDescriptionDraft, setStyleDescriptionDraft] = useState("");
-  const [customInstructionsDraft, setCustomInstructionsDraft] = useState("");
-  const [paletteDraft, setPaletteDraft] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const refreshingVariantRunIdsRef = useRef<Set<string>>(new Set());
+  const pendingStorageUploadRef = useRef<File[] | null>(null);
   const dragCounterRef = useRef(0);
   const [isDragOver, setIsDragOver] = useState(false);
   const createFolder = useActionMutation("create-folder");
+  const { data: liveVariants } = useQuery({
+    queryKey: ["app-state", "asset-variants"],
+    queryFn: ({ signal }) => {
+      return readClientAppState<AssetVariantState>("asset-variants", {
+        signal,
+      });
+    },
+  });
 
   useEffect(() => {
+    if (urlTab === "settings") {
+      void navigate(`/brand-kits/${libraryId}/settings`, { replace: true });
+      return;
+    }
     if (!urlTab) return;
     setActiveTab((current) => (current === urlTab ? current : urlTab));
-  }, [urlTab]);
+  }, [urlTab, libraryId, navigate]);
+
+  useEffect(() => {
+    if (headerMode !== "actions" || typeof document === "undefined") {
+      setHeaderPrimaryActionsTarget(null);
+      setHeaderMoreActionsTarget(null);
+      return;
+    }
+    setHeaderPrimaryActionsTarget(
+      document.getElementById("assets-library-detail-primary-actions"),
+    );
+    setHeaderMoreActionsTarget(
+      document.getElementById("assets-library-detail-more-actions"),
+    );
+  }, [headerMode, libraryId]);
 
   const library = data?.library;
+  const canApprove = canApproveWithRole(library?.accessRole);
+  const canRerunRun = (run: { ownerEmail?: string | null }) => {
+    if (canApprove) return true;
+    const mine = session?.email?.trim().toLowerCase();
+    return Boolean(mine) && run.ownerEmail?.trim().toLowerCase() === mine;
+  };
   const folders = (data?.folders ?? []) as any[];
-  const generationPresets = ((presetData as any)?.presets ?? []) as any[];
+  const generationPresets = ((presetData as any)?.templates ?? []) as any[];
   const generationSessions = ((sessionData as any)?.sessions ?? []) as any[];
   const serverAssets = (data?.assets ?? []) as any[];
-  const finishedVariantAssetIds = new Set(
-    serverAssets
-      .filter(
-        (asset) =>
-          asset.status !== "candidate" ||
-          optimisticallySavedAssetIds.has(asset.id),
-      )
-      .map((asset) => asset.id),
-  );
   const assets = serverAssets
     .map((asset) =>
       optimisticallySavedAssetIds.has(asset.id)
@@ -442,9 +468,6 @@ export default function LibraryPage() {
         : asset,
     )
     .filter((asset) => !optimisticallyDeletedAssetIds.has(asset.id));
-  const candidateAssets = assets.filter(
-    (asset) => asset.role === "generated" && asset.status === "candidate",
-  );
   const libraryAssets = assets.filter((asset) => asset.status !== "candidate");
   const visibleAssets = libraryAssets.filter((asset) => {
     if (activeFolderId !== "all") {
@@ -485,64 +508,52 @@ export default function LibraryPage() {
       (asset.status === "reference" && !isContentOnlyReference(asset)),
   );
   const unfiledCount = libraryAssets.filter((asset) => !asset.folderId).length;
-  const customInstructions = getLibraryCustomInstructions(library);
-  const libraryStyleDescription = library?.styleBrief?.description ?? "";
-  const libraryPaletteDraft = paletteDraftFromColors(
-    library?.styleBrief?.palette,
+  const liveVariantsForLibrary =
+    liveVariants?.libraryId === libraryId ? liveVariants : null;
+  const liveCandidateSlots = useMemo(
+    () =>
+      (liveVariantsForLibrary?.slots ?? [])
+        .filter(
+          (slot) =>
+            slot.status === "pending" ||
+            slot.status === "ready" ||
+            slot.status === "failed",
+        )
+        .slice()
+        .sort(
+          (left, right) =>
+            variantSlotTime(right) - variantSlotTime(left) ||
+            right.slotId.localeCompare(left.slotId),
+        ),
+    [liveVariantsForLibrary?.slots],
   );
+  const draftCandidateAssets = useMemo(() => {
+    const liveAssetIds = new Set(
+      liveCandidateSlots
+        .map((slot) => slot.assetId)
+        .filter((assetId): assetId is string => typeof assetId === "string"),
+    );
+    return assets
+      .filter(
+        (asset) =>
+          asset.status === "candidate" &&
+          asset.role === "generated" &&
+          !liveAssetIds.has(asset.id),
+      )
+      .slice()
+      .sort(
+        (left, right) =>
+          assetUpdatedTime(right) - assetUpdatedTime(left) ||
+          String(right.id).localeCompare(String(left.id)),
+      );
+  }, [assets, liveCandidateSlots]);
 
-  useEffect(() => {
-    setStyleDescriptionDraft(libraryStyleDescription);
-  }, [library?.id, libraryStyleDescription]);
-
-  useEffect(() => {
-    setCustomInstructionsDraft(customInstructions ?? "");
-  }, [library?.id, customInstructions]);
-
-  useEffect(() => {
-    setPaletteDraft(libraryPaletteDraft);
-  }, [library?.id, libraryPaletteDraft]);
   const pendingVisibleUploads = pendingUploads.filter((upload) => {
     if (mediaFilter !== "all" && upload.mediaType !== mediaFilter) return false;
     if (activeFolderId === "all") return true;
     if (activeFolderId === null) return !upload.folderId;
     return upload.folderId === activeFolderId;
   });
-
-  const pendingVariants =
-    variants?.libraryId === libraryId
-      ? (variants.slots ?? [])
-          .filter(
-            (slot: any) =>
-              !slot.assetId || !finishedVariantAssetIds.has(slot.assetId),
-          )
-          .sort(compareVariantSlotsNewestFirst)
-      : [];
-
-  useEffect(() => {
-    if (refreshGeneration.isPending) return;
-    const runId = pendingVariants
-      .map(stalePendingVariantRunId)
-      .find((id: string | null): id is string =>
-        Boolean(id && !refreshingVariantRunIdsRef.current.has(id)),
-      );
-    if (!runId) return;
-    refreshingVariantRunIdsRef.current.add(runId);
-    refreshGeneration.mutate(
-      { runId },
-      {
-        onSettled: () => {
-          window.setTimeout(() => {
-            refreshingVariantRunIdsRef.current.delete(runId);
-          }, 30_000);
-          void queryClient.invalidateQueries({
-            queryKey: ["app-state", "asset-variants"],
-            refetchType: "active",
-          });
-        },
-      },
-    );
-  }, [pendingVariants, queryClient, refreshGeneration]);
 
   function markAssetsOptimisticallyDeleted(ids: string[]) {
     setOptimisticallyDeletedAssetIds((current) => {
@@ -586,18 +597,6 @@ export default function LibraryPage() {
     });
   }, [serverAssets]);
 
-  function setCandidateSaving(key: string, saving: boolean) {
-    setSavingCandidateKeys((current) => {
-      const next = new Set(current);
-      if (saving) {
-        next.add(key);
-      } else {
-        next.delete(key);
-      }
-      return next.size === current.size ? current : next;
-    });
-  }
-
   function setReferencePromoting(key: string, promoting: boolean) {
     setPromotingReferenceKeys((current) => {
       const next = new Set(current);
@@ -610,48 +609,101 @@ export default function LibraryPage() {
     });
   }
 
-  async function handleSaveCandidate(slot: any) {
-    const key = candidateSaveKey(slot);
-    if (!key || savingCandidateKeys.has(key)) return;
-
-    setCandidateSaving(key, true);
+  async function handleSaveLiveCandidate(
+    slot: VariantSlot,
+    folderId?: string | null,
+  ) {
+    if (savingCandidateSlotId || (!slot.assetId && !slot.slotId)) return;
+    setSavingCandidateSlotId(slot.slotId);
     try {
       const savedAsset = await saveGenerated.mutateAsync({
-        ...(slot.assetId ? { assetId: slot.assetId } : {}),
-        ...(slot.slotId ? { slotId: slot.slotId } : {}),
-        ...(slot.folderId !== undefined ? { folderId: slot.folderId } : {}),
+        assetId: slot.assetId,
+        slotId: slot.slotId,
+        folderId,
       });
-      const savedAssetId =
-        typeof (savedAsset as any)?.id === "string"
-          ? (savedAsset as any).id
-          : slot.assetId;
-
-      if (savedAssetId) {
+      if (slot.assetId) {
         setOptimisticallySavedAssetIds((current) => {
           const next = new Set(current);
-          next.add(savedAssetId);
+          next.add(slot.assetId!);
           return next;
         });
         markLibraryAssetSavedInCache(
           queryClient,
           libraryId,
-          savedAssetId,
+          slot.assetId,
           savedAsset,
         );
       }
       removeVariantSlotFromCache(queryClient, slot);
       void queryClient.invalidateQueries({
-        queryKey: ["app-state", "asset-variants"],
+        queryKey: ["action", "get-library", { id: libraryId }],
         refetchType: "active",
       });
-      toast.success("Saved to Generated.");
+      void queryClient.invalidateQueries({
+        queryKey: ["app-state"],
+        refetchType: "active",
+      });
+      toast.success(t("library.savedToLibrary"));
     } catch (error) {
       toast.error(
-        error instanceof Error ? error.message : "Could not save candidate.",
+        error instanceof Error
+          ? error.message
+          : t("library.couldNotSaveCandidate"),
       );
     } finally {
-      setCandidateSaving(key, false);
+      setSavingCandidateSlotId(null);
     }
+  }
+
+  async function handleSaveDraftCandidate(
+    asset: any,
+    folderId?: string | null,
+  ) {
+    if (!asset?.id || savingCandidateSlotId) return;
+    const key = `draft:${asset.id}`;
+    setSavingCandidateSlotId(key);
+    try {
+      const savedAsset = await saveGenerated.mutateAsync({
+        assetId: asset.id,
+        folderId,
+      });
+      setOptimisticallySavedAssetIds((current) => {
+        const next = new Set(current);
+        next.add(asset.id);
+        return next;
+      });
+      markLibraryAssetSavedInCache(
+        queryClient,
+        libraryId,
+        asset.id,
+        savedAsset,
+      );
+      void queryClient.invalidateQueries({
+        queryKey: ["action", "get-library", { id: libraryId }],
+        refetchType: "active",
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["app-state"],
+        refetchType: "active",
+      });
+      toast.success(t("library.savedToLibrary"));
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : t("library.couldNotSaveDraft"),
+      );
+    } finally {
+      setSavingCandidateSlotId(null);
+    }
+  }
+
+  function handleMoveLiveCandidateToReferences(slot: VariantSlot) {
+    if (!slot.assetId) return;
+    const asset = assetById.get(slot.assetId) ?? {
+      id: slot.assetId,
+      mediaType: "image",
+      status: "candidate",
+    };
+    void handleMoveToReferences(asset, slot);
   }
 
   async function handleMoveToReferences(asset: any, slot?: any) {
@@ -677,15 +729,15 @@ export default function LibraryPage() {
         refetchType: "active",
       });
       void queryClient.invalidateQueries({
-        queryKey: ["app-state", "asset-variants"],
+        queryKey: ["app-state"],
         refetchType: "active",
       });
-      toast.success("Added to References.");
+      toast.success(t("brandKitDetail.addedToReferences"));
     } catch (error) {
       toast.error(
         error instanceof Error
           ? error.message
-          : "Could not add asset to References.",
+          : t("brandKitDetail.couldNotAddToReferences"),
       );
     } finally {
       setReferencePromoting(key, false);
@@ -707,12 +759,12 @@ export default function LibraryPage() {
         queryKey: ["action", "get-library", { id: libraryId }],
         refetchType: "active",
       });
-      toast.success("Removed from References.");
+      toast.success(t("brandKitDetail.removedFromReferences"));
     } catch (error) {
       toast.error(
         error instanceof Error
           ? error.message
-          : "Could not remove asset from References.",
+          : t("brandKitDetail.couldNotRemoveFromReferences"),
       );
     } finally {
       setReferencePromoting(key, false);
@@ -721,7 +773,7 @@ export default function LibraryPage() {
 
   useEffect(() => {
     const selectableAssets =
-      activeTab === "runs" || activeTab === "settings"
+      activeTab === "runs" || activeTab === "settings" || activeTab === "drafts"
         ? []
         : libraryBoardAssets;
     const selectableIds = new Set(selectableAssets.map((asset) => asset.id));
@@ -734,24 +786,29 @@ export default function LibraryPage() {
   }, [activeTab, libraryBoardAssets]);
 
   useEffect(() => {
-    fetch(agentNativePath("/_agent-native/application-state/navigation"), {
-      method: "PUT",
-      headers: {
-        "content-type": "application/json",
-        "x-request-source": "assets-ui",
+    fetch(
+      agentNativePath(
+        `/_agent-native/application-state/navigation:${getBrowserTabId()}`,
+      ),
+      {
+        method: "PUT",
+        headers: {
+          "content-type": "application/json",
+          "x-request-source": "assets-ui",
+        },
+        body: JSON.stringify({
+          view: "library",
+          libraryId,
+          activeTab,
+          assetViewMode,
+          assetScope,
+          folderId: activeFolderId,
+          mediaFilter,
+          search,
+          selectedAssetIds: [...selectedAssetIds],
+        }),
       },
-      body: JSON.stringify({
-        view: "library",
-        libraryId,
-        activeTab,
-        assetViewMode,
-        assetScope,
-        folderId: activeFolderId,
-        mediaFilter,
-        search,
-        selectedAssetIds: [...selectedAssetIds],
-      }),
-    }).catch(() => {});
+    ).catch(() => {});
   }, [
     activeFolderId,
     activeTab,
@@ -774,40 +831,21 @@ export default function LibraryPage() {
       );
   }
 
-  function analyzeBrand() {
-    if (!library) return;
-    const anchorIds = assets
-      .filter(
-        (asset) =>
-          asset.metadata?.isStyleAnchor ||
-          library.settings?.canonicalStyleAssetIds?.includes(asset.id),
-      )
-      .map((asset) => asset.id);
-    sendToAgentChat({
-      message: [
-        "Analyze this Assets library brand.",
-        `Call analyze-collection-style with libraryId: ${library.id}.`,
-        "Update the reusable style brief with palette and visual traits, then summarize what changed.",
-      ].join("\n"),
-      context: [
-        "## Assets library context",
-        `Library: ${library.title} (${library.id})`,
-        `Description: ${library.description || ""}`,
-        `Reference assets: ${references.length}`,
-        `Anchor assets: ${anchorIds.length ? anchorIds.join(", ") : "none"}`,
-        `Current style brief: ${JSON.stringify(library.styleBrief ?? {})}`,
-        customInstructions
-          ? `Custom instructions: ${customInstructions}`
-          : "Custom instructions: none",
-      ].join("\n"),
-      submit: true,
-      newTab: true,
-    });
-  }
-
-  async function upload(files: FileList | null, category = "style-only") {
-    if (!files?.length || uploading) return;
+  async function upload(
+    files: FileList | File[] | null,
+    category = "style-only",
+  ) {
+    if (!canUploadFiles || !files?.length || uploading) return;
     const selectedFiles = Array.from(files);
+    const oversizedFile = selectedFiles.find(
+      (file) => file.size > MAX_ASSET_UPLOAD_BATCH_BYTES,
+    );
+    if (oversizedFile) {
+      toast.error(
+        `${t("library.uploadFailed")}: ${oversizedFile.name} (${(oversizedFile.size / 1024 / 1024).toFixed(1)} MB > ${MAX_ASSET_UPLOAD_BATCH_BYTES / 1024 / 1024} MB)`,
+      );
+      return;
+    }
     const uploadChunks = chunkAssetUploads(selectedFiles);
     const selectedFolderId =
       activeFolderId && activeFolderId !== "all" ? activeFolderId : null;
@@ -835,12 +873,14 @@ export default function LibraryPage() {
     setUploading(true);
     let keepPending = false;
     const toastId = toast.loading(
-      `Uploading ${selectedFiles.length} asset${selectedFiles.length === 1 ? "" : "s"}...`,
+      t("brandKitDetail.uploadProgress", { count: selectedFiles.length }),
       {
         description:
           uploadChunks.length > 1
-            ? `Processing in ${uploadChunks.length} batches.`
-            : "Processing previews and saving them to the brand kit.",
+            ? t("brandKitDetail.processingBatches", {
+                count: uploadChunks.length,
+              })
+            : t("brandKitDetail.processingPreviews"),
       },
     );
     try {
@@ -875,47 +915,49 @@ export default function LibraryPage() {
       }
       if (failedCount > 0) {
         toast.warning(
-          `Uploaded ${uploadedCount} asset${uploadedCount === 1 ? "" : "s"}; ${failedCount} failed.`,
+          t("library.uploadedWithFailures", {
+            uploadedCount,
+            failedCount,
+          }),
           {
             id: toastId,
             description:
               skippedCount > 0
-                ? `Skipped ${skippedCount} duplicate${skippedCount === 1 ? "" : "s"}.`
+                ? t("library.skippedDuplicates", { count: skippedCount })
                 : null,
           },
         );
       } else if (uploadedCount > 0 && skippedCount > 0) {
         toast.success(
-          `Uploaded ${uploadedCount} asset${uploadedCount === 1 ? "" : "s"}; skipped ${skippedCount} duplicate${skippedCount === 1 ? "" : "s"}.`,
+          t("library.uploadedAndSkippedDuplicates", {
+            uploadedCount,
+            skippedCount,
+          }),
           { id: toastId, description: null },
         );
       } else if (uploadedCount > 0) {
-        toast.success(
-          `Uploaded ${uploadedCount} asset${uploadedCount === 1 ? "" : "s"}.`,
-          {
-            id: toastId,
-            description: null,
-          },
-        );
+        toast.success(t("library.uploadedAssets", { count: uploadedCount }), {
+          id: toastId,
+          description: null,
+        });
       } else if (skippedCount > 0) {
         toast.warning(
-          `Skipped ${skippedCount} duplicate asset${
-            skippedCount === 1 ? "" : "s"
-          }.`,
+          t("library.skippedDuplicateAssets", { count: skippedCount }),
           {
             id: toastId,
-            description: "Already in this brand kit.",
+            description: t("library.alreadyInThisBrandKit"),
           },
         );
       } else {
-        toast.warning("No new assets were uploaded.", {
+        toast.warning(t("library.noNewAssetsUploaded"), {
           id: toastId,
           description: null,
         });
       }
       await refreshLibrary();
     } catch (e) {
-      const message = e instanceof Error ? e.message : "Upload failed";
+      const message =
+        e instanceof Error ? e.message : t("library.uploadFailed");
       const indeterminate =
         /(?:\b408\b|\b504\b|timeout|timed out|network|failed to fetch|load failed)/i.test(
           message,
@@ -925,10 +967,9 @@ export default function LibraryPage() {
         setPendingUploads(
           pending.map((upload) => ({ ...upload, status: "checking" })),
         );
-        toast.warning("Upload is taking longer than expected.", {
+        toast.warning(t("library.uploadTakingLonger"), {
           id: toastId,
-          description:
-            "The server may still finish saving these assets. We will keep checking this brand kit.",
+          description: t("library.uploadTakingLongerDescription"),
         });
         void refreshLibrary();
         window.setTimeout(() => void refreshLibrary(), 4_000);
@@ -946,15 +987,39 @@ export default function LibraryPage() {
     }
   }
 
+  function requestUpload(files: FileList | null = null) {
+    if (uploading) return;
+    if (canUploadFiles) {
+      if (files?.length) void upload(files);
+      else fileInputRef.current?.click();
+      return;
+    }
+    const selectedFiles = Array.from(files ?? []);
+    if (selectedFiles.length > 0) {
+      pendingStorageUploadRef.current = selectedFiles;
+    }
+    setStorageSetupOpen(true);
+  }
+
+  useEffect(() => {
+    if (!canUploadFiles) return;
+    setStorageSetupOpen(false);
+    const pendingFiles = pendingStorageUploadRef.current;
+    pendingStorageUploadRef.current = null;
+    if (pendingFiles) void upload(pendingFiles);
+  }, [canUploadFiles, upload]);
+
   async function archiveCurrentLibrary() {
     if (!library || archiveLibrary.isPending) return;
     try {
       await archiveLibrary.mutateAsync({ id: library.id });
-      toast.success("Brand kit archived.");
-      navigate("/brand-kits");
+      toast.success(t("library.brandKitArchived"));
+      void navigate("/library");
     } catch (error) {
       toast.error(
-        error instanceof Error ? error.message : "Could not archive brand kit.",
+        error instanceof Error
+          ? error.message
+          : t("brandKitDetail.couldNotArchiveBrandKit"),
       );
     }
   }
@@ -965,70 +1030,15 @@ export default function LibraryPage() {
       const copy = (await duplicateLibrary.mutateAsync({
         id: library.id,
       })) as any;
-      toast.success("Private brand kit copy created");
-      navigate(`/brand-kits/${copy.id}`);
+      toast.success(t("library.privateBrandKitCopyCreated"));
+      void navigate(`/library/${copy.id}`);
     } catch (error) {
       toast.error(
         error instanceof Error
           ? error.message
-          : "Could not duplicate brand kit.",
+          : t("brandKitDetail.couldNotDuplicateBrandKit"),
       );
     }
-  }
-
-  function generate(prompt: string, options: GenerateOptions) {
-    const selectedPreset = options.presetId
-      ? generationPresets.find((preset) => preset.id === options.presetId)
-      : null;
-    const trimmedPrompt = prompt.trim();
-    const chatMessage =
-      trimmedPrompt ||
-      (options.mediaType === "video"
-        ? "Generate a video for this library."
-        : "Generate images for this library.");
-    const context = [
-      "## Assets library context",
-      options.mediaType === "video"
-        ? "Requested output: 1 video candidate for this library"
-        : `Requested output: ${options.count} image candidate${options.count === 1 ? "" : "s"} for this library`,
-      `User prompt: ${trimmedPrompt || "(no text prompt provided)"}`,
-      options.presetId ? `Preset ID: ${options.presetId}` : "Preset ID: none",
-      `Aspect ratio: ${options.aspectRatio}`,
-      options.mediaType === "video"
-        ? `Duration: ${options.durationSeconds}s\nResolution: ${options.resolution}`
-        : `Image size: ${options.imageSize}`,
-      `Model: ${options.model}`,
-      activeFolderId && activeFolderId !== "all"
-        ? `Folder ID: ${activeFolderId}`
-        : "Folder ID: none",
-      `Reference categories: ${options.category}`,
-      `Include canonical logo: ${options.includeLogo ? "yes" : "no"}`,
-      "",
-      "## Selected library",
-      `Library: ${library.title} (${library.id})`,
-      `Description: ${library.description || ""}`,
-      `Folder: ${activeFolderId && activeFolderId !== "all" ? folders.find((folder) => folder.id === activeFolderId)?.title : "All assets"}`,
-      `References: ${references.length}`,
-      `Saved assets: ${saved.length}`,
-      `Style brief: ${JSON.stringify(library.styleBrief ?? {})}`,
-      customInstructions
-        ? `Custom instructions: ${customInstructions}`
-        : "Custom instructions: none",
-      selectedPreset
-        ? `Generation preset: ${selectedPreset.title} (${selectedPreset.id}); ${selectedPreset.aspectRatio}; text policy: ${selectedPreset.textPolicy || "none"}`
-        : "Generation preset: none",
-      "",
-      options.mediaType === "video"
-        ? "Use generate-video, then call refresh-generation-run until the run completes and returns a video asset. Use save-generated-asset when the user approves it."
-        : "Use the asset generation actions. If a generation preset ID is present, pass presetId to generate-image or generate-image-batch. Generate candidates, show previews, ask for feedback, and refine by assetId until the user is happy.",
-    ].join("\n");
-    sendToAgentChat({
-      message: chatMessage,
-      context,
-      submit: true,
-      newTab: true,
-    });
-    setGenerateOpen(false);
   }
 
   function continueSession(sessionId: string) {
@@ -1044,7 +1054,7 @@ export default function LibraryPage() {
           });
         },
         onError: (error: Error) => {
-          toast.error(error.message || "Could not prepare handoff.");
+          toast.error(error.message || t("library.couldNotPrepareHandoff"));
         },
       },
     );
@@ -1053,10 +1063,11 @@ export default function LibraryPage() {
   function createHandoffFromRun(run: any) {
     const outputIds = outputAssetIds(run);
     if (!outputIds.length) {
-      toast.error("This run does not have generated assets to hand off.");
+      toast.error(t("library.runHasNoGeneratedAssets"));
       return;
     }
-    const prompt = run.originalPrompt || run.prompt || "Generated asset";
+    const prompt =
+      run.originalPrompt || run.prompt || t("library.generatedAsset");
     createSession.mutate(
       {
         libraryId,
@@ -1067,12 +1078,15 @@ export default function LibraryPage() {
         activeAssetId: outputIds[0],
         assetIds: outputIds,
         runIds: [run.id],
-        feedback: "Needs design refinement.",
+        feedback: t("brandKitDetail.needsDesignRefinement"),
       },
       {
-        onSuccess: () => toast.success("Handoff session created."),
+        onSuccess: () =>
+          toast.success(t("brandKitDetail.handoffSessionCreated")),
         onError: (error: Error) => {
-          toast.error(error.message || "Could not create handoff.");
+          toast.error(
+            error.message || t("brandKitDetail.couldNotCreateHandoff"),
+          );
         },
       },
     );
@@ -1081,125 +1095,253 @@ export default function LibraryPage() {
   if (!library) {
     return (
       <div className="p-6 text-sm text-muted-foreground">
-        Loading brand kit...
+        {t("library.loadingBrandKit")}
       </div>
     );
   }
   const assetById = new Map(assets.map((asset) => [asset.id, asset]));
-  const activeSurfaceTab =
-    activeTab === "runs" || activeTab === "settings" ? activeTab : "assets";
+  const surfaceTab: LibraryTab =
+    activeTab === "settings" ? "generated" : activeTab;
+  const draftsCount = liveCandidateSlots.length + draftCandidateAssets.length;
   const hideEmptyLanes =
     activeFolderId !== "all" || mediaFilter !== "all" || search.trim() !== "";
-
-  return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="border-b border-border px-6 py-4">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <h2 className="truncate text-2xl font-semibold tracking-tight">
-                {library.title}
-              </h2>
-              <Badge variant="outline">{library.visibility}</Badge>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-8 w-8 text-muted-foreground hover:text-foreground"
-                onClick={() => setEditOpen(true)}
-                aria-label="Edit brand kit name and description"
+  const assetsToolbar = (
+    <section className="space-y-3">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <FolderChip
+            active={activeFolderId === "all"}
+            label={t("library.allAssets")}
+            count={libraryAssets.length}
+            onClick={() => setActiveFolderId("all")}
+          />
+          <FolderChip
+            active={activeFolderId === null}
+            label={t("library.unfiled")}
+            count={unfiledCount}
+            onClick={() => setActiveFolderId(null)}
+          />
+          {folders.map((folder) => (
+            <FolderChip
+              key={folder.id}
+              active={activeFolderId === folder.id}
+              label={folder.title}
+              count={
+                libraryAssets.filter((asset) => asset.folderId === folder.id)
+                  .length
+              }
+              onClick={() => setActiveFolderId(folder.id)}
+            />
+          ))}
+        </div>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <div className="relative">
+            <IconSearch className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder={t("library.searchAssets")}
+              className="w-full pl-8 pr-8 sm:w-64"
+            />
+            {search && (
+              <button
+                type="button"
+                aria-label={t("library.clearSearch")}
+                className="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                onClick={() => setSearch("")}
               >
-                <IconPencil className="h-4 w-4" />
-              </Button>
-            </div>
-            <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
-              {library.description ||
-                "Upload, generate, describe, and organize reusable assets across agents."}
-            </p>
+                <IconX className="h-3.5 w-3.5" />
+              </button>
+            )}
           </div>
-          <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:flex-nowrap lg:shrink-0">
-            <ShareButton
-              resourceType="asset-library"
-              resourceId={library.id}
-              resourceTitle={library.title}
-            />
-            <Button
-              variant="outline"
-              className="gap-2"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={uploading}
-            >
-              {uploading ? (
-                <Spinner className="h-4 w-4" />
-              ) : (
-                <IconUpload className="h-4 w-4" />
-              )}
-              {uploading ? `Uploading ${pendingUploads.length}` : "Upload"}
-            </Button>
-            <Button
-              variant="outline"
-              className="hidden gap-2 xl:inline-flex"
-              onClick={() => setFolderOpen(true)}
-            >
-              <IconFolderPlus className="h-4 w-4" />
-              Folder
-            </Button>
-            <GeneratePopover
-              open={generateOpen}
-              onOpenChange={setGenerateOpen}
-              onSubmit={generate}
-              hasLogo={!!library.canonicalLogoAssetId}
-              presets={generationPresets}
-            />
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="outline"
-                  size="icon"
-                  aria-label="Brand kit actions"
-                  disabled={
-                    archiveLibrary.isPending || duplicateLibrary.isPending
-                  }
-                >
-                  <IconDotsVertical className="h-4 w-4" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem
-                  className="xl:hidden"
-                  onSelect={(event) => {
-                    event.preventDefault();
-                    setFolderOpen(true);
-                  }}
-                >
-                  <IconFolderPlus className="mr-2 h-4 w-4 shrink-0" />
-                  New folder
-                </DropdownMenuItem>
-                <DropdownMenuSeparator className="xl:hidden" />
-                <DropdownMenuItem
-                  disabled={duplicateLibrary.isPending}
-                  onSelect={(event) => {
-                    event.preventDefault();
-                    void duplicateCurrentLibrary();
-                  }}
-                >
-                  <IconCopy className="mr-2 h-4 w-4 shrink-0" />
-                  {duplicateLibrary.isPending ? "Duplicating..." : "Duplicate"}
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  onSelect={(event) => {
-                    event.preventDefault();
-                    setArchiveOpen(true);
-                  }}
-                >
-                  <IconArchive className="mr-2 h-4 w-4 shrink-0" />
-                  Archive brand kit
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
+          <Select
+            value={mediaFilter}
+            onValueChange={(value) =>
+              setMediaFilter(value as "all" | "image" | "video")
+            }
+          >
+            <SelectTrigger className="w-full sm:w-32">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">
+                {t("brandKitDetail.allMedia")}
+              </SelectItem>
+              <SelectItem value="image">
+                {t("brandKitDetail.images")}
+              </SelectItem>
+              <SelectItem value="video">
+                {t("brandKitDetail.videos")}
+              </SelectItem>
+            </SelectContent>
+          </Select>
         </div>
       </div>
+    </section>
+  );
+  const renderAssetsBoard = (boardAssets: any[], uploads: PendingUpload[]) => (
+    <AssetSwimlaneBoard
+      libraryId={libraryId}
+      viewMode={assetViewMode}
+      onViewModeChange={setAssetViewMode}
+      scope="all"
+      onScopeChange={setAssetScope}
+      showScopeToggle={false}
+      hideEmptyLanes={hideEmptyLanes}
+      assets={boardAssets}
+      pendingUploads={uploads}
+      folders={folders}
+      promotingReferenceKeys={promotingReferenceKeys}
+      onUploadClick={() => requestUpload()}
+      onDrop={(files) => requestUpload(files)}
+      onMoveToReferences={(asset, slot) => {
+        void handleMoveToReferences(asset, slot);
+      }}
+      onRemoveFromReferences={(asset) => {
+        void handleRemoveFromReferences(asset);
+      }}
+      selectedIds={selectedAssetIds}
+      onSelectedIdsChange={setSelectedAssetIds}
+      onOptimisticDelete={markAssetsOptimisticallyDeleted}
+      onRestoreOptimisticDelete={restoreOptimisticallyDeletedAssets}
+    />
+  );
+  const uploadAction = (
+    <Button
+      variant="outline"
+      className="gap-2"
+      onClick={() => requestUpload()}
+      disabled={uploading}
+    >
+      {uploading ? (
+        <Spinner className="h-4 w-4" />
+      ) : (
+        <IconUpload className="h-4 w-4" />
+      )}
+      {uploading
+        ? t("library.uploadingCount", { count: pendingUploads.length })
+        : t("library.upload")}
+    </Button>
+  );
+  const moreActions = (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="icon"
+          aria-label={t("library.kitActions")}
+          disabled={archiveLibrary.isPending || duplicateLibrary.isPending}
+        >
+          <IconDotsVertical className="h-4 w-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem asChild>
+          <Link to={`/brand-kits/${libraryId}/settings`}>
+            <IconSettings className="mr-2 h-4 w-4 shrink-0" />
+            {t("library.settings")}
+          </Link>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          onSelect={(event) => {
+            event.preventDefault();
+            setFolderOpen(true);
+          }}
+        >
+          <IconFolderPlus className="mr-2 h-4 w-4 shrink-0" />
+          {t("library.newFolder")}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          disabled={duplicateLibrary.isPending}
+          onSelect={(event) => {
+            event.preventDefault();
+            void duplicateCurrentLibrary();
+          }}
+        >
+          <IconCopy className="mr-2 h-4 w-4 shrink-0" />
+          {duplicateLibrary.isPending
+            ? t("library.duplicating")
+            : t("library.duplicate")}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          onSelect={(event) => {
+            event.preventDefault();
+            setArchiveOpen(true);
+          }}
+        >
+          <IconArchive className="mr-2 h-4 w-4 shrink-0" />
+          {t("library.archiveBrandKit")}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+  const shareAction = (
+    <ShareButton
+      resourceType="asset-library"
+      resourceId={library.id}
+      allowedRoles={["viewer", "editor", "admin"]}
+      resourceTitle={library.title}
+      triggerClassName="h-10 px-4 border-input bg-background hover:bg-accent hover:text-accent-foreground"
+    />
+  );
+  const headerActions = (
+    <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap lg:shrink-0">
+      {uploadAction}
+      {shareAction}
+      {moreActions}
+    </div>
+  );
+  const headerPrimaryActionsPortal =
+    headerMode === "actions" && headerPrimaryActionsTarget
+      ? createPortal(
+          <>
+            {uploadAction}
+            {shareAction}
+          </>,
+          headerPrimaryActionsTarget,
+        )
+      : null;
+  const headerMoreActionsPortal =
+    headerMode === "actions" && headerMoreActionsTarget
+      ? createPortal(moreActions, headerMoreActionsTarget)
+      : null;
+
+  return (
+    <div className="flex min-w-0 flex-col">
+      {headerPrimaryActionsPortal}
+      {headerMoreActionsPortal}
+      {headerMode === "full" ? (
+        <div className="border-b border-border px-6 py-4">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <h2 className="truncate text-2xl font-semibold tracking-tight">
+                  {library.title}
+                </h2>
+                <Badge variant="outline">{library.visibility}</Badge>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  className="text-muted-foreground hover:text-foreground"
+                  asChild
+                  aria-label={t("library.editBrandKit")}
+                >
+                  <Link to={`/brand-kits/${libraryId}/settings`}>
+                    <IconPencil className="h-4 w-4" />
+                  </Link>
+                </Button>
+              </div>
+              <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
+                {library.description || t("library.defaultKitDescription")}
+              </p>
+            </div>
+            {headerActions}
+          </div>
+        </div>
+      ) : null}
 
       <input
         ref={fileInputRef}
@@ -1207,32 +1349,32 @@ export default function LibraryPage() {
         accept="image/png,image/jpeg,image/webp,image/avif,video/mp4,video/quicktime,video/x-m4v,video/webm"
         multiple
         className="hidden"
-        onChange={(event) => upload(event.target.files)}
+        disabled={!canUploadFiles}
+        onChange={(event) => {
+          requestUpload(event.currentTarget.files);
+          event.currentTarget.value = "";
+        }}
       />
 
-      <EditLibraryDialog
-        library={library}
-        open={editOpen}
-        onOpenChange={setEditOpen}
-      />
       <AlertDialog open={archiveOpen} onOpenChange={setArchiveOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Archive this brand kit?</AlertDialogTitle>
+            <AlertDialogTitle>{t("library.archiveKitTitle")}</AlertDialogTitle>
             <AlertDialogDescription>
-              This removes the brand kit from the main Brand Kits list. Its
-              assets and generation history stay stored.
+              {t("library.archiveKitDescription")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogCancel>{t("library.cancel")}</AlertDialogCancel>
             <AlertDialogAction
               disabled={archiveLibrary.isPending}
               onClick={() => {
                 void archiveCurrentLibrary();
               }}
             >
-              {archiveLibrary.isPending ? "Archiving..." : "Archive"}
+              {archiveLibrary.isPending
+                ? t("library.archiving")
+                : t("library.archive")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -1258,7 +1400,7 @@ export default function LibraryPage() {
       ) : null}
 
       <div
-        className="relative flex-1 overflow-y-auto px-6 py-5"
+        className="relative px-6 py-5"
         onDragEnter={(e: DragEvent<HTMLDivElement>) => {
           if (!e.dataTransfer.types.includes("Files")) return;
           e.preventDefault();
@@ -1277,134 +1419,100 @@ export default function LibraryPage() {
           e.preventDefault();
           dragCounterRef.current = 0;
           setIsDragOver(false);
-          void upload(e.dataTransfer.files);
+          requestUpload(e.dataTransfer.files);
         }}
       >
-        {isDragOver && (
+        <FileUploadStorageGate
+          state={fileStorageState}
+          open={storageSetupOpen}
+          onOpenChange={setStorageSetupOpen}
+          onDismiss={() => {
+            pendingStorageUploadRef.current = null;
+          }}
+          onRetry={() => void fileUploadStatus.refetch()}
+        />
+        {canUploadFiles && isDragOver && (
           <div className="pointer-events-none absolute inset-0 z-50 flex flex-col items-center justify-center gap-3 rounded-lg border-2 border-dashed border-primary bg-primary/5 backdrop-blur-[1px]">
             <IconUpload className="h-10 w-10 text-primary" />
             <span className="text-base font-semibold text-primary">
-              Drop to upload
+              {t("brandKitDetail.dropToUpload")}
             </span>
           </div>
         )}
         <Tabs
-          value={activeSurfaceTab}
-          onValueChange={(value) =>
-            setActiveTab(
-              value === "assets" ? "references" : (value as LibraryTab),
-            )
-          }
+          value={surfaceTab}
+          onValueChange={(value) => setActiveTab(value as LibraryTab)}
           className="space-y-4"
         >
           <TabsList>
-            <TabsTrigger value="assets">Assets</TabsTrigger>
-            <TabsTrigger value="runs">Runs</TabsTrigger>
-            <TabsTrigger value="settings">Settings</TabsTrigger>
+            <TabsTrigger value="drafts" className="gap-1.5">
+              {t("library.drafts")}
+              {draftsCount > 0 ? (
+                <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] leading-none text-muted-foreground">
+                  {draftsCount}
+                </span>
+              ) : null}
+            </TabsTrigger>
+            <TabsTrigger value="generated">
+              {t("library.generated")}
+            </TabsTrigger>
+            <TabsTrigger value="references">
+              {t("library.references")}
+            </TabsTrigger>
+            <TabsTrigger value="runs">{t("library.runs")}</TabsTrigger>
           </TabsList>
 
-          <TabsContent value="assets" className="space-y-5">
-            <CandidateStage
-              candidates={candidateAssets}
-              pendingVariants={pendingVariants}
-              libraryId={libraryId}
-              folders={folders}
-              savingCandidateKeys={savingCandidateKeys}
-              onSaveCandidate={(slot) => {
-                void handleSaveCandidate(slot);
-              }}
-            />
-            <section className="space-y-3">
-              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                <div className="flex min-w-0 flex-wrap items-center gap-2">
-                  <FolderChip
-                    active={activeFolderId === "all"}
-                    label="All assets"
-                    count={libraryAssets.length}
-                    onClick={() => setActiveFolderId("all")}
-                  />
-                  <FolderChip
-                    active={activeFolderId === null}
-                    label="Unfiled"
-                    count={unfiledCount}
-                    onClick={() => setActiveFolderId(null)}
-                  />
-                  {folders.map((folder) => (
-                    <FolderChip
-                      key={folder.id}
-                      active={activeFolderId === folder.id}
-                      label={folder.title}
-                      count={
-                        libraryAssets.filter(
-                          (asset) => asset.folderId === folder.id,
-                        ).length
+          <TabsContent value="drafts" className="space-y-4">
+            {draftsCount > 0 ? (
+              <LiveCandidatesStage
+                slots={liveCandidateSlots}
+                draftAssets={draftCandidateAssets}
+                libraryId={libraryId}
+                folders={folders}
+                savingSlotId={savingCandidateSlotId}
+                promotingReferenceKeys={promotingReferenceKeys}
+                onSave={
+                  canApprove
+                    ? (slot, folderId) => {
+                        void handleSaveLiveCandidate(slot, folderId);
                       }
-                      onClick={() => setActiveFolderId(folder.id)}
-                    />
-                  ))}
-                </div>
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                  <div className="relative">
-                    <IconSearch className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                    <Input
-                      value={search}
-                      onChange={(event) => setSearch(event.target.value)}
-                      placeholder="Search assets"
-                      className="h-9 w-full pl-8 pr-8 sm:w-64"
-                    />
-                    {search && (
-                      <button
-                        type="button"
-                        aria-label="Clear search"
-                        className="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
-                        onClick={() => setSearch("")}
-                      >
-                        <IconX className="h-3.5 w-3.5" />
-                      </button>
-                    )}
-                  </div>
-                  <Select
-                    value={mediaFilter}
-                    onValueChange={(value) =>
-                      setMediaFilter(value as "all" | "image" | "video")
-                    }
-                  >
-                    <SelectTrigger className="h-9 w-full sm:w-32">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">All media</SelectItem>
-                      <SelectItem value="image">Images</SelectItem>
-                      <SelectItem value="video">Videos</SelectItem>
-                    </SelectContent>
-                  </Select>
+                    : undefined
+                }
+                onSaveDraft={
+                  canApprove
+                    ? (asset, folderId) => {
+                        void handleSaveDraftCandidate(asset, folderId);
+                      }
+                    : undefined
+                }
+                onMoveToReferences={
+                  canApprove ? handleMoveLiveCandidateToReferences : undefined
+                }
+                onMoveDraftToReferences={
+                  canApprove
+                    ? (asset) => {
+                        void handleMoveToReferences(asset);
+                      }
+                    : undefined
+                }
+              />
+            ) : (
+              <div className="flex min-h-64 items-center justify-center rounded-lg border border-dashed border-border bg-muted/20 p-8 text-center">
+                <div className="max-w-sm text-sm text-muted-foreground">
+                  {t("library.noDrafts")}
                 </div>
               </div>
-            </section>
-            <AssetSwimlaneBoard
-              libraryId={libraryId}
-              viewMode={assetViewMode}
-              onViewModeChange={setAssetViewMode}
-              scope={assetScope}
-              onScopeChange={setAssetScope}
-              hideEmptyLanes={hideEmptyLanes}
-              assets={libraryBoardAssets}
-              pendingUploads={pendingVisibleUploads}
-              folders={folders}
-              promotingReferenceKeys={promotingReferenceKeys}
-              onUploadClick={() => fileInputRef.current?.click()}
-              onDrop={(files) => void upload(files)}
-              onMoveToReferences={(asset, slot) => {
-                void handleMoveToReferences(asset, slot);
-              }}
-              onRemoveFromReferences={(asset) => {
-                void handleRemoveFromReferences(asset);
-              }}
-              selectedIds={selectedAssetIds}
-              onSelectedIdsChange={setSelectedAssetIds}
-              onOptimisticDelete={markAssetsOptimisticallyDeleted}
-              onRestoreOptimisticDelete={restoreOptimisticallyDeletedAssets}
-            />
+            )}
+          </TabsContent>
+
+          <TabsContent value="generated" className="space-y-5">
+            {assetsToolbar}
+            {renderAssetsBoard(saved, pendingVisibleUploads)}
+          </TabsContent>
+
+          <TabsContent value="references" className="space-y-5">
+            {assetsToolbar}
+            {renderAssetsBoard(references, [])}
           </TabsContent>
 
           <TabsContent value="runs">
@@ -1415,11 +1523,10 @@ export default function LibraryPage() {
                     <div className="mb-3 flex items-center justify-between gap-3">
                       <div className="min-w-0">
                         <h3 className="text-sm font-semibold">
-                          Handoff sessions
+                          {t("brandKitDetail.handoffSessions")}
                         </h3>
                         <p className="text-xs text-muted-foreground">
-                          Shared context for designers to continue a candidate
-                          without the original chat thread.
+                          {t("brandKitDetail.handoffSessionsDescription")}
                         </p>
                       </div>
                     </div>
@@ -1440,147 +1547,42 @@ export default function LibraryPage() {
                   <RunCard
                     key={run.id}
                     run={run}
-                    outputAssets={assetById}
+                    assetById={assetById}
                     rerunning={
                       rerunGeneration.isPending || refreshGeneration.isPending
                     }
                     onCreateHandoff={() => createHandoffFromRun(run)}
-                    onRerun={() =>
-                      run.mediaType === "video"
-                        ? refreshGeneration.mutate({ runId: run.id })
-                        : rerunGeneration.mutate({
-                            runId: run.id,
-                            source: "ui",
-                          })
+                    onRerun={
+                      canRerunRun(run)
+                        ? () =>
+                            run.mediaType === "video"
+                              ? refreshGeneration.mutate({ runId: run.id })
+                              : rerunGeneration.mutate({
+                                  runId: run.id,
+                                  source: "ui",
+                                })
+                        : undefined
                     }
                   />
                 ))}
               </div>
             ) : (
-              <div className="flex min-h-[260px] flex-col items-center justify-center rounded-lg border border-dashed border-border bg-muted/20 p-8 text-center">
+              <div className="flex min-h-65 flex-col items-center justify-center rounded-lg border border-dashed border-border bg-muted/20 p-8 text-center">
                 <IconMessageCircle className="h-10 w-10 text-muted-foreground" />
-                <h3 className="mt-4 text-base font-semibold">No runs yet</h3>
+                <h3 className="mt-4 text-base font-semibold">
+                  {t("brandKitDetail.noRunsYet")}
+                </h3>
                 <p className="mt-2 max-w-md text-sm text-muted-foreground">
-                  Generate from this brand kit to capture prompt, output,
-                  references, and settings.
+                  {t("brandKitDetail.noRunsDescription")}
                 </p>
               </div>
             )}
-          </TabsContent>
-
-          <TabsContent value="settings">
-            <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
-              <div className="space-y-4 rounded-lg border border-border p-4">
-                <Label>Style description</Label>
-                <Textarea
-                  value={styleDescriptionDraft}
-                  onChange={(event) =>
-                    setStyleDescriptionDraft(event.target.value)
-                  }
-                  onBlur={() =>
-                    updateLibrary.mutate({
-                      id: library.id,
-                      styleBrief: {
-                        ...library.styleBrief,
-                        description: styleDescriptionDraft,
-                      },
-                    })
-                  }
-                  className="min-h-40"
-                />
-                <Separator />
-                <Label>Custom instructions</Label>
-                <Textarea
-                  value={customInstructionsDraft}
-                  onChange={(event) =>
-                    setCustomInstructionsDraft(event.target.value)
-                  }
-                  onBlur={() =>
-                    updateLibrary.mutate({
-                      id: library.id,
-                      customInstructions: customInstructionsDraft,
-                    })
-                  }
-                  placeholder="Preferences the agent should apply whenever it uses this brand kit."
-                  className="min-h-28"
-                />
-                <Separator />
-                <div className="flex items-center justify-between">
-                  <div>
-                    <div className="text-sm font-medium">Palette</div>
-                    <div className="mt-2 flex flex-wrap gap-2">
-                      {(library.styleBrief?.palette ?? []).map(
-                        (color: string) => (
-                          <span
-                            key={color}
-                            className="h-7 w-7 rounded-md border border-border"
-                            style={{ backgroundColor: color }}
-                            title={color}
-                          />
-                        ),
-                      )}
-                    </div>
-                    <Input
-                      value={paletteDraft}
-                      onChange={(event) => setPaletteDraft(event.target.value)}
-                      onBlur={() => {
-                        const palette = parsePaletteDraft(paletteDraft);
-                        setPaletteDraft(palette.join(", "));
-                        updateLibrary.mutate({
-                          id: library.id,
-                          styleBrief: {
-                            ...library.styleBrief,
-                            palette,
-                          },
-                        });
-                      }}
-                      placeholder="#111827, #f8fafc, #2563eb"
-                      className="mt-3 h-9 max-w-md text-xs"
-                    />
-                  </div>
-                  <Button variant="outline" onClick={analyzeBrand}>
-                    {library.settings?.brandAnalysis?.analyzedAt
-                      ? "Refresh brand"
-                      : "Analyze brand"}
-                  </Button>
-                </div>
-              </div>
-              <div className="space-y-4">
-                <GenerationPresetsPanel
-                  libraryId={libraryId}
-                  presets={generationPresets}
-                />
-                <div className="rounded-lg border border-border p-4">
-                  <h3 className="text-sm font-semibold">Agent usage</h3>
-                  <p className="mt-2 text-sm text-muted-foreground">
-                    Other agents can call Assets over A2A with this brand kit
-                    ID.
-                  </p>
-                  <code className="mt-3 block rounded-md bg-muted p-3 text-xs">
-                    {library.id}
-                  </code>
-                </div>
-              </div>
-            </div>
           </TabsContent>
         </Tabs>
       </div>
     </div>
   );
 }
-
-type GenerateOptions = {
-  mediaType: "image" | "video";
-  presetId?: string;
-  count: number;
-  aspectRatio: string;
-  imageSize: string;
-  durationSeconds: number;
-  resolution: string;
-  model: string;
-  category: string;
-  includeLogo: boolean;
-};
 
 type PendingUpload = {
   id: string;
@@ -1590,7 +1592,7 @@ type PendingUpload = {
   status: "uploading" | "checking";
 };
 
-type LibraryTab = "references" | "generated" | "runs" | "settings";
+type LibraryTab = "drafts" | "references" | "generated" | "runs" | "settings";
 type AssetViewMode = "lanes" | "cards";
 type AssetLibraryScope = "all" | "references";
 
@@ -1600,44 +1602,51 @@ type LaneGalleryItem = {
   subtitle?: string | null;
   metadata?: string | null;
   status?: string | null;
+  asset?: any;
   mediaType?: "image" | "video";
   href?: string;
+  onOpen?: () => void;
   selected?: boolean;
   busy?: boolean;
+  showBusyOverlay?: boolean;
   deleting?: boolean;
   preview: ReactNode;
-  thumbnail: ReactNode;
+  thumbnail: ReactNode; // i18n-ignore structural preview slot name
   menu?: ReactNode;
   primaryActions?: ReactNode;
+  headerActions?: ReactNode;
   onToggle?: (checked: boolean) => void;
 };
 
 function RunCard({
   run,
-  outputAssets,
+  assetById,
   onRerun,
   onCreateHandoff,
   rerunning,
 }: {
   run: any;
-  outputAssets?: Map<string, any>;
-  onRerun: () => void;
+  assetById?: Map<string, any>;
+  onRerun?: () => void;
   onCreateHandoff: () => void;
   rerunning?: boolean;
 }) {
+  const t = useT();
   const settings = (run.settingsUsed ?? {}) as Record<string, unknown>;
   const referenceSelection = (run.referenceSelection ?? {}) as Record<
     string,
     unknown
   >;
-  const selectedReferenceIds = Array.isArray(
+  const selectedReferenceIds: string[] = Array.isArray(
     referenceSelection.selectedAssetIds,
   )
     ? referenceSelection.selectedAssetIds.filter(
         (id): id is string => typeof id === "string",
       )
     : Array.isArray(run.referenceAssetIds)
-      ? run.referenceAssetIds
+      ? run.referenceAssetIds.filter(
+          (id: unknown): id is string => typeof id === "string",
+        )
       : [];
   const outputIds = Array.isArray(run.output?.assetIds)
     ? run.output.assetIds.filter(
@@ -1674,7 +1683,7 @@ function RunCard({
           </div>
           <div>
             <div className="text-xs font-medium text-muted-foreground">
-              Prompt
+              {t("brandKitDetail.prompt")}
             </div>
             <p className="mt-1 line-clamp-3 text-sm leading-relaxed text-foreground">
               {prompt}
@@ -1690,32 +1699,37 @@ function RunCard({
               onClick={onCreateHandoff}
             >
               <IconMessageCircle className="h-4 w-4" />
-              Handoff
+              {t("brandKitDetail.handoff")}
             </Button>
           ) : null}
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-2"
-            disabled={rerunning}
-            onClick={onRerun}
-          >
-            <IconRefresh className="h-4 w-4" />
-            {mediaType === "video" && run.status !== "completed"
-              ? "Refresh"
-              : "Rerun this"}
-          </Button>
+          {onRerun ? (
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-2"
+              disabled={rerunning}
+              onClick={onRerun}
+            >
+              <IconRefresh className="h-4 w-4" />
+              {mediaType === "video" && run.status !== "completed"
+                ? t("brandKitDetail.refresh")
+                : t("brandKitDetail.rerunThis")}
+            </Button>
+          ) : null}
         </div>
       </div>
 
       <div className="mt-4 grid gap-3 md:grid-cols-3 xl:grid-cols-6">
-        <RunFact label="Model" value={String(settings.model ?? run.model)} />
         <RunFact
-          label="Aspect"
+          label={t("brandKitDetail.model")}
+          value={String(settings.model ?? run.model)}
+        />
+        <RunFact
+          label={t("brandKitDetail.aspect")}
           value={String(settings.aspectRatio ?? run.aspectRatio)}
         />
         <RunFact
-          label="Size"
+          label={t("brandKitDetail.size")}
           value={
             mediaType === "video"
               ? `${String(settings.durationSeconds ?? run.durationSeconds ?? "?")}s ${String(settings.resolution ?? run.resolution ?? run.imageSize)}`
@@ -1723,15 +1737,15 @@ function RunCard({
           }
         />
         <RunFact
-          label="Refs"
-          value={`${selectedReferenceIds.length} ${String(referenceSelection.mode ?? "selected")}`}
+          label={t("brandKitDetail.refs")}
+          value={`${selectedReferenceIds.length} ${typeof referenceSelection.mode === "string" ? referenceSelection.mode : "selected"}`}
         />
         <RunFact
-          label="Grounding"
+          label={t("brandKitDetail.grounding")}
           value={String(settings.groundingMode ?? run.groundingMode)}
         />
         <RunFact
-          label="Categories"
+          label={t("brandKitDetail.categories")}
           value={categories.length ? categories.join(", ") : "auto"}
         />
       </div>
@@ -1739,12 +1753,12 @@ function RunCard({
       <div className="mt-4 grid gap-3 lg:grid-cols-2">
         <div className="rounded-md border bg-muted/20 p-3">
           <div className="text-xs font-medium text-muted-foreground">
-            Output
+            {t("brandKitDetail.output")}
           </div>
           {outputIds.length ? (
             <div className="mt-2 flex flex-wrap gap-2">
               {outputIds.map((assetId: any) => {
-                const outputAsset = outputAssets?.get(assetId);
+                const outputAsset = assetById?.get(assetId);
                 return (
                   <Button
                     key={assetId}
@@ -1762,32 +1776,44 @@ function RunCard({
             </div>
           ) : (
             <p className="mt-2 text-xs text-muted-foreground">
-              {run.error || "No output captured yet."}
+              {run.error || t("brandKitDetail.noOutputCaptured")}
             </p>
           )}
           {provider ? (
             <p className="mt-2 text-xs text-muted-foreground">
-              Provider: {String(provider)}
+              {t("brandKitDetail.providerLabel", {
+                provider: String(provider),
+              })}
             </p>
           ) : null}
         </div>
 
         <div className="rounded-md border bg-muted/20 p-3">
           <div className="text-xs font-medium text-muted-foreground">
-            References
+            {t("brandKitDetail.references")}
           </div>
-          <p className="mt-2 line-clamp-2 text-xs text-muted-foreground">
-            {selectedReferenceIds.length
-              ? selectedReferenceIds.map(shortId).join(", ")
-              : "None selected"}
-          </p>
+          {selectedReferenceIds.length ? (
+            <div className="mt-2 flex flex-wrap gap-2">
+              {selectedReferenceIds.map((assetId) => (
+                <RunReferenceTile
+                  key={assetId}
+                  assetId={assetId}
+                  asset={assetById?.get(assetId)}
+                />
+              ))}
+            </div>
+          ) : (
+            <p className="mt-2 text-xs text-muted-foreground">
+              {t("brandKitDetail.noneSelected")}
+            </p>
+          )}
         </div>
       </div>
 
       {run.compiledPrompt ? (
         <details className="mt-3 rounded-md border bg-background">
           <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-muted-foreground">
-            Compiled prompt
+            {t("brandKitDetail.compiledPrompt")}
           </summary>
           <pre className="max-h-64 overflow-auto whitespace-pre-wrap border-t px-3 py-2 text-xs leading-relaxed text-muted-foreground">
             {run.compiledPrompt}
@@ -1795,6 +1821,49 @@ function RunCard({
         </details>
       ) : null}
     </article>
+  );
+}
+
+function RunReferenceTile({
+  assetId,
+  asset,
+}: {
+  assetId: string;
+  asset?: any;
+}) {
+  const label = asset ? assetDisplayTitle(asset) : shortId(assetId);
+  return (
+    <Link
+      to={asset ? `/asset/${asset.id}` : "#"}
+      title={asset ? `${label} · ${asset.id}` : assetId}
+      aria-disabled={!asset}
+      className={[
+        "group block w-20 overflow-hidden rounded-md border bg-background text-left transition",
+        asset
+          ? "hover:border-foreground/30 hover:shadow-sm"
+          : "pointer-events-none border-dashed",
+      ].join(" ")}
+    >
+      <div className="aspect-square bg-muted/40">
+        {asset ? (
+          <AssetPreview asset={asset} fit="cover" />
+        ) : (
+          <div className="flex h-full w-full items-center justify-center">
+            <IconPhoto className="h-5 w-5 text-muted-foreground" />
+          </div>
+        )}
+      </div>
+      <div className="border-t px-1.5 py-1">
+        <div className="truncate text-[11px] font-medium text-foreground">
+          {label}
+        </div>
+        {asset ? (
+          <div className="truncate text-[10px] text-muted-foreground">
+            {shortId(assetId)}
+          </div>
+        ) : null}
+      </div>
+    </Link>
   );
 }
 
@@ -1825,9 +1894,6 @@ function assetDisplayTitle(asset: any): string {
   );
 }
 
-// Content-only references are images attached as subject/content for a single
-// request. They are not part of the curated brand kit, so they are kept out of
-// the References grid (matching how list-libraries excludes them from counts).
 function isContentOnlyReference(asset: any): boolean {
   return (
     asset?.role === "subject_reference" || asset?.metadata?.intent === "subject"
@@ -1838,9 +1904,10 @@ function assetCategoryLabel(asset: any): string | null {
   if (isContentOnlyReference(asset)) {
     return "content only";
   }
-  const category = asset?.metadata?.category;
+  const category = asset?.metadata?.category ?? asset?.category;
   if (typeof category !== "string") return null;
   if (category === "style-only") return "style reference";
+  if (category === "skeleton") return "skeleton plate";
   return category.replace(/-/g, " ");
 }
 
@@ -1849,6 +1916,63 @@ function assetLineageSourceText(asset: any): string | null {
   return lineage?.kind === "variation" && lineage.sourceLabel
     ? `from ${lineage.sourceLabel}`
     : null;
+}
+
+function detailAssetPayload(asset: any) {
+  const mediaType =
+    asset?.mediaType === "video" || asset?.mimeType?.startsWith("video/")
+      ? "video"
+      : "image";
+  const title = assetDisplayTitle(asset);
+  const url = assetMediaUrl(
+    asset?.previewUrl ?? asset?.downloadUrl ?? asset?.url,
+  );
+  const width = Number(asset?.width);
+  const height = Number(asset?.height);
+  return {
+    assetId: asset?.id,
+    title,
+    mediaType,
+    url,
+    previewUrl: assetMediaUrl(asset?.previewUrl),
+    downloadUrl: assetMediaUrl(asset?.downloadUrl),
+    ...(Number.isFinite(width) && Number.isFinite(height) && width && height
+      ? { width, height }
+      : {}),
+  };
+}
+
+function detailAssetClipboardText(asset: any) {
+  const payload = detailAssetPayload(asset);
+  const url = payload.url ?? payload.downloadUrl ?? payload.previewUrl;
+  const previewTip =
+    payload.mediaType === "image" && url
+      ? [
+          `Markdown preview: ![Selected asset](${url})`,
+          "If this remote preview does not render in Codex or Claude Code, download the image locally and embed the absolute local file path.",
+        ]
+      : [];
+  return [
+    `Use this selected ${payload.mediaType} in the current work: ${payload.title}`,
+    url ? `URL: ${url}` : null,
+    ...previewTip,
+    "",
+    JSON.stringify(
+      {
+        assetId: payload.assetId,
+        title: payload.title,
+        mediaType: payload.mediaType,
+        url,
+        ...(payload.width && payload.height
+          ? { width: payload.width, height: payload.height }
+          : {}),
+      },
+      null,
+      2,
+    ),
+  ]
+    .filter((line): line is string => line !== null)
+    .join("\n");
 }
 
 function shortId(id: string) {
@@ -1875,6 +1999,7 @@ function SessionCard({
   continuing?: boolean;
   onContinue: () => void;
 }) {
+  const t = useT();
   const preset = presets.find((item) => item.id === session.presetId);
   const sessionItems = Array.isArray(session.items) ? session.items : [];
   const assetItems = sessionItems.filter((item: any) => item.assetId);
@@ -1887,7 +2012,9 @@ function SessionCard({
             <Badge variant="outline">{session.status}</Badge>
           </div>
           <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
-            {session.feedbackSummary || session.brief || "No feedback yet."}
+            {session.feedbackSummary ||
+              session.brief ||
+              t("brandKitDetail.noFeedbackYet")}
           </p>
         </div>
         <Button
@@ -1901,7 +2028,7 @@ function SessionCard({
           ) : (
             <IconMessageCircle className="h-4 w-4" />
           )}
-          Continue
+          {t("brandKitDetail.continue")}
         </Button>
       </div>
       <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-foreground">
@@ -1914,7 +2041,7 @@ function SessionCard({
             }
           >
             {item.assetId === session.activeAssetId
-              ? `${item.label} active`
+              ? `${item.label} ${t("brandKitDetail.active")}`
               : item.label}
           </Badge>
         ))}
@@ -1923,494 +2050,13 @@ function SessionCard({
         ) : null}
         {!assetItems.length && session.activeAssetId ? (
           <Badge variant="outline">
-            active {shortId(session.activeAssetId)}
+            {t("brandKitDetail.activeAsset", {
+              id: shortId(session.activeAssetId),
+            })}
           </Badge>
         ) : null}
       </div>
     </article>
-  );
-}
-
-function GeneratePopover({
-  open,
-  onOpenChange,
-  onSubmit,
-  hasLogo,
-  presets,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  onSubmit: (prompt: string, options: GenerateOptions) => void;
-  hasLogo: boolean;
-  presets: any[];
-}) {
-  const [prompt, setPrompt] = useState("");
-  const [mediaType, setMediaType] = useState<"image" | "video">("image");
-  const [presetId, setPresetId] = useState("none");
-  const [count, setCount] = useState(3);
-  const [aspectRatio, setAspectRatio] = useState("16:9");
-  const [imageSize, setImageSize] = useState("2K");
-  const [durationSeconds, setDurationSeconds] = useState(8);
-  const [resolution, setResolution] = useState("720p");
-  const [model, setModel] = useState("gemini-3.1-flash-image");
-  const [category, setCategory] = useState("hero");
-  const [includeLogo, setIncludeLogo] = useState(false);
-  const selectedPreset = presets.find((preset) => preset.id === presetId);
-
-  return (
-    <Popover open={open} onOpenChange={onOpenChange}>
-      <PopoverTrigger asChild>
-        <Button className="gap-2">
-          <IconMessageCircle className="h-4 w-4" />
-          Generate
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent
-        align="end"
-        className="w-[420px] max-w-[calc(100vw-2rem)]"
-      >
-        <div className="space-y-4">
-          <div>
-            <div className="text-sm font-semibold">Generate with chat</div>
-          </div>
-          {presets.length ? (
-            <Select
-              value={presetId}
-              onValueChange={(value) => {
-                setPresetId(value);
-                const preset = presets.find((item) => item.id === value);
-                if (!preset) return;
-                setMediaType(preset.mediaType === "video" ? "video" : "image");
-                setAspectRatio(preset.aspectRatio || "16:9");
-                setImageSize(preset.imageSize || "2K");
-                setModel(preset.model || "gemini-3.1-flash-image");
-                setCategory(preset.category || "hero");
-              }}
-            >
-              <SelectTrigger>
-                <SelectValue placeholder="Preset" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="none">No preset</SelectItem>
-                {presets.map((preset) => (
-                  <SelectItem key={preset.id} value={preset.id}>
-                    {preset.title}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          ) : null}
-          {selectedPreset?.textPolicy ? (
-            <p className="rounded-md bg-muted px-3 py-2 text-xs text-muted-foreground">
-              {selectedPreset.textPolicy}
-            </p>
-          ) : null}
-          <Select
-            value={mediaType}
-            onValueChange={(value) => {
-              const next = value as "image" | "video";
-              setMediaType(next);
-              setModel(
-                next === "video"
-                  ? "veo-3.1-generate-preview"
-                  : "gemini-3.1-flash-image",
-              );
-              setCategory(next === "video" ? "video" : "hero");
-              setAspectRatio(next === "video" ? "16:9" : aspectRatio);
-            }}
-          >
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="image">Image candidates</SelectItem>
-              <SelectItem value="video">Video candidate</SelectItem>
-            </SelectContent>
-          </Select>
-          <Textarea
-            autoGrow
-            value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
-            placeholder={
-              mediaType === "video"
-                ? "Eight-second product reveal with slow camera push-in"
-                : "Blog hero for an article about cold-start latency"
-            }
-            className="min-h-28 max-h-48 resize-none overflow-y-auto"
-          />
-          <div className="grid grid-cols-2 gap-3">
-            {mediaType === "image" ? (
-              <Select
-                value={String(count)}
-                onValueChange={(v) => setCount(Number(v))}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {[1, 2, 3, 4].map((n) => (
-                    <SelectItem key={n} value={String(n)}>
-                      {n} variants
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            ) : (
-              <Select
-                value={String(durationSeconds)}
-                onValueChange={(v) => setDurationSeconds(Number(v))}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {VIDEO_DURATIONS.map((n) => (
-                    <SelectItem key={n} value={String(n)}>
-                      {n}s
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-            <Select value={aspectRatio} onValueChange={setAspectRatio}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {(mediaType === "video"
-                  ? VIDEO_ASPECT_RATIOS
-                  : ASPECT_RATIOS
-                ).map((ratio) => (
-                  <SelectItem key={ratio} value={ratio}>
-                    {ratio}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {mediaType === "image" ? (
-              <Select value={imageSize} onValueChange={setImageSize}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {IMAGE_SIZES.map((size) => (
-                    <SelectItem key={size} value={size}>
-                      {size}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            ) : (
-              <Select value={resolution} onValueChange={setResolution}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {VIDEO_RESOLUTIONS.map((item) => (
-                    <SelectItem key={item} value={item}>
-                      {item}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-            <Select value={category} onValueChange={setCategory}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {IMAGE_CATEGORIES.map((item) => (
-                  <SelectItem key={item} value={item}>
-                    {item}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <Select value={model} onValueChange={setModel}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {(mediaType === "video" ? VIDEO_MODELS : IMAGE_MODELS).map(
-                (item) => (
-                  <SelectItem key={item} value={item}>
-                    {item}
-                  </SelectItem>
-                ),
-              )}
-            </SelectContent>
-          </Select>
-          {mediaType === "image" && (
-            <label className="flex items-center gap-2 text-sm">
-              <Checkbox
-                checked={includeLogo}
-                disabled={!hasLogo}
-                onCheckedChange={(checked) => setIncludeLogo(checked === true)}
-              />
-              Composite canonical logo
-            </label>
-          )}
-          <Button
-            className="w-full"
-            disabled={!prompt.trim()}
-            onClick={() =>
-              onSubmit(prompt, {
-                mediaType,
-                presetId: presetId === "none" ? undefined : presetId,
-                count,
-                aspectRatio,
-                imageSize,
-                durationSeconds,
-                resolution,
-                model,
-                category,
-                includeLogo,
-              })
-            }
-          >
-            Open chat
-          </Button>
-        </div>
-      </PopoverContent>
-    </Popover>
-  );
-}
-
-function GenerationPresetsPanel({
-  libraryId,
-  presets,
-}: {
-  libraryId: string;
-  presets: any[];
-}) {
-  const createPreset = useActionMutation("create-generation-preset");
-  const deletePreset = useActionMutation("delete-generation-preset");
-  const [open, setOpen] = useState(false);
-  const [confirmPresetId, setConfirmPresetId] = useState<string | null>(null);
-  const [title, setTitle] = useState("");
-  const [category, setCategory] = useState<ImageCategory>("social");
-  const [aspectRatio, setAspectRatio] = useState<AspectRatio>("1:1");
-  const [promptTemplate, setPromptTemplate] = useState("");
-  const [textPolicy, setTextPolicy] = useState(
-    "Prefer no embedded text. Keep any requested text short and readable.",
-  );
-
-  function reset() {
-    setTitle("");
-    setCategory("social");
-    setAspectRatio("1:1");
-    setPromptTemplate("");
-    setTextPolicy(
-      "Prefer no embedded text. Keep any requested text short and readable.",
-    );
-  }
-
-  function submit() {
-    const trimmed = title.trim();
-    if (!trimmed) return;
-    createPreset.mutate(
-      {
-        libraryId,
-        title: trimmed,
-        category,
-        aspectRatio,
-        imageSize: "2K",
-        promptTemplate: promptTemplate.trim() || undefined,
-        textPolicy,
-        referencePolicy: "auto",
-      },
-      {
-        onSuccess: () => {
-          toast.success("Generation preset created.");
-          reset();
-          setOpen(false);
-        },
-        onError: (error: Error) => {
-          toast.error(error.message || "Could not create preset.");
-        },
-      },
-    );
-  }
-
-  return (
-    <div className="rounded-lg border border-border p-4">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <h3 className="text-sm font-semibold">Generation presets</h3>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Reusable deliverable rules for social images, heroes, and diagrams.
-          </p>
-        </div>
-        <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
-          New
-        </Button>
-      </div>
-      <div className="mt-3 space-y-2">
-        {presets.slice(0, 5).map((preset) => (
-          <div
-            key={preset.id}
-            className="flex items-start justify-between gap-3 rounded-md border border-border bg-background p-3"
-          >
-            <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="truncate text-sm font-medium">
-                  {preset.title}
-                </span>
-                <Badge variant="outline">{preset.aspectRatio}</Badge>
-              </div>
-              <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
-                {preset.textPolicy || preset.description || preset.category}
-              </p>
-            </div>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8 shrink-0 text-muted-foreground hover:text-destructive"
-              aria-label={`Delete ${preset.title}`}
-              onClick={() => setConfirmPresetId(preset.id)}
-            >
-              <IconTrash className="h-4 w-4" />
-            </Button>
-          </div>
-        ))}
-        {!presets.length ? (
-          <p className="rounded-md border border-dashed border-border p-3 text-sm text-muted-foreground">
-            No presets yet.
-          </p>
-        ) : null}
-      </div>
-
-      <AlertDialog
-        open={confirmPresetId !== null}
-        onOpenChange={(isOpen) => {
-          if (!isOpen) setConfirmPresetId(null);
-        }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete generation preset?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Existing runs keep their captured prompt and settings. New
-              generations will no longer offer this preset.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={!confirmPresetId || deletePreset.isPending}
-              onClick={(event) => {
-                event.preventDefault();
-                if (!confirmPresetId) return;
-                deletePreset.mutate(
-                  { id: confirmPresetId },
-                  {
-                    onSuccess: () => {
-                      setConfirmPresetId(null);
-                      toast.success("Generation preset deleted.");
-                    },
-                    onError: (error: Error) => {
-                      toast.error(error.message || "Could not delete preset.");
-                    },
-                  },
-                );
-              }}
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle>New generation preset</DialogTitle>
-            <DialogDescription>
-              Save the output format, aspect ratio, and text rules for repeated
-              image work.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="grid gap-4">
-            <div className="grid gap-2">
-              <Label htmlFor="preset-title">Name</Label>
-              <Input
-                id="preset-title"
-                value={title}
-                onChange={(event) => setTitle(event.target.value)}
-                placeholder="LinkedIn announcement"
-              />
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="grid gap-2">
-                <Label>Category</Label>
-                <Select
-                  value={category}
-                  onValueChange={(value) => setCategory(value as ImageCategory)}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {IMAGE_CATEGORIES.map((item) => (
-                      <SelectItem key={item} value={item}>
-                        {item}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="grid gap-2">
-                <Label>Aspect ratio</Label>
-                <Select
-                  value={aspectRatio}
-                  onValueChange={(value) =>
-                    setAspectRatio(value as AspectRatio)
-                  }
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {ASPECT_RATIOS.map((ratio) => (
-                      <SelectItem key={ratio} value={ratio}>
-                        {ratio}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="preset-template">Prompt template</Label>
-              <Textarea
-                id="preset-template"
-                value={promptTemplate}
-                onChange={(event) => setPromptTemplate(event.target.value)}
-                placeholder="Create a social post visual about {{prompt}}..."
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="preset-text-policy">Text policy</Label>
-              <Textarea
-                id="preset-text-policy"
-                value={textPolicy}
-                onChange={(event) => setTextPolicy(event.target.value)}
-              />
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setOpen(false)}>
-              Cancel
-            </Button>
-            <Button disabled={!title.trim()} onClick={submit}>
-              Create
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </div>
   );
 }
 
@@ -2452,6 +2098,7 @@ function AssetPreview({
   asset: any;
   fit?: "cover" | "contain";
 }) {
+  const t = useT();
   const [sourceIndex, setSourceIndex] = useState(0);
   const [unavailable, setUnavailable] = useState(false);
   const sources = assetPreviewSources(asset, "thumbnail");
@@ -2477,7 +2124,7 @@ function AssetPreview({
           }
         />
         <div className="absolute bottom-2 left-2 rounded-md bg-background/90 px-2 py-1 text-[11px] font-medium text-foreground shadow-sm">
-          Video
+          {t("brandKitDetail.video")}
         </div>
       </div>
     );
@@ -2488,7 +2135,7 @@ function AssetPreview({
       <div className="flex h-full w-full flex-col items-center justify-center gap-2 bg-muted/40 text-muted-foreground">
         <IconPhoto className="h-6 w-6" />
         <span className="px-3 text-center text-xs font-medium">
-          Preview unavailable
+          {t("brandKitDetail.previewUnavailable")}
         </span>
       </div>
     );
@@ -2513,620 +2160,13 @@ function AssetPreview({
   );
 }
 
-function CandidateStage({
-  candidates,
-  pendingVariants,
-  libraryId,
-  folders,
-  savingCandidateKeys,
-  onSaveCandidate,
-}: {
-  candidates: any[];
-  pendingVariants: any[];
-  libraryId: string;
-  folders: any[];
-  savingCandidateKeys: Set<string>;
-  onSaveCandidate: (slot: any) => void;
-}) {
-  const dismissSlot = useActionMutation("dismiss-variant-slots");
-  const deleteAsset = useActionMutation("delete-asset");
-  const queryClient = useQueryClient();
-  const [dismissTarget, setDismissTarget] = useState<{
-    kind: "slot" | "asset";
-    title: string;
-    slot?: any;
-    asset?: any;
-  } | null>(null);
-  const dismissing = dismissSlot.isPending || deleteAsset.isPending;
-
-  async function handleDismissCandidate() {
-    if (!dismissTarget || dismissing) return;
-    try {
-      if (dismissTarget.kind === "slot" && dismissTarget.slot) {
-        await dismissSlot.mutateAsync({ slotId: dismissTarget.slot.slotId });
-        removeVariantSlotFromCache(queryClient, dismissTarget.slot);
-        removeAssetsFromLibraryCache(queryClient, libraryId, [
-          dismissTarget.slot.assetId,
-        ]);
-        void queryClient.invalidateQueries({
-          queryKey: ["app-state", "asset-variants"],
-          refetchType: "active",
-        });
-      } else if (dismissTarget.kind === "asset" && dismissTarget.asset?.id) {
-        await deleteAsset.mutateAsync({ id: dismissTarget.asset.id });
-        removeAssetsFromLibraryCache(queryClient, libraryId, [
-          dismissTarget.asset.id,
-        ]);
-      }
-      setDismissTarget(null);
-      toast.success("Dismissed candidate.");
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : "Could not dismiss candidate.",
-      );
-    }
-  }
-
-  function slotItem(slot: any): LaneGalleryItem {
-    const isFailed = slot.status === "failed";
-    const saving = savingCandidateKeys.has(candidateSaveKey(slot));
-    const busy = saving;
-    return {
-      id: `slot:${slot.slotId}`,
-      title: isFailed
-        ? "Failed candidate"
-        : slot.status === "ready"
-          ? "Ready candidate"
-          : "Generating candidate",
-      subtitle: slot.slotId ? shortId(String(slot.slotId)) : "Live slot",
-      metadata: "Candidate",
-      status: slot.status,
-      mediaType: "image",
-      href: slot.assetId ? `/asset/${slot.assetId}` : undefined,
-      busy,
-      preview: <VariantPreview slot={slot} fit="contain" />,
-      thumbnail: <VariantPreview slot={slot} />,
-      menu: (
-        <VariantActionsMenu slot={slot} libraryId={libraryId} busy={busy} />
-      ),
-      primaryActions:
-        slot.status === "ready" ? (
-          <div className="grid grid-cols-2 gap-2">
-            <CandidateSaveMenu
-              libraryId={libraryId}
-              folders={folders}
-              saving={saving}
-              disabled={busy}
-              onSave={(folderId) => onSaveCandidate({ ...slot, folderId })}
-            />
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-8 px-2 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
-              onClick={() =>
-                setDismissTarget({
-                  kind: "slot",
-                  title: isFailed ? "Failed candidate" : "Ready candidate",
-                  slot,
-                })
-              }
-              disabled={busy || dismissing}
-            >
-              Dismiss
-            </Button>
-          </div>
-        ) : (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-8 w-full px-2 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
-            onClick={() =>
-              setDismissTarget({
-                kind: "slot",
-                title: isFailed ? "Failed candidate" : "Generating candidate",
-                slot,
-              })
-            }
-            disabled={busy || dismissing}
-          >
-            Dismiss
-          </Button>
-        ),
-    };
-  }
-
-  function candidateItem(asset: any): LaneGalleryItem {
-    const saving = savingCandidateKeys.has(`asset:${asset.id}`);
-    const busy = saving;
-    return {
-      id: `candidate:${asset.id}`,
-      title: assetDisplayTitle(asset),
-      subtitle: assetLineageSourceText(asset) || assetCategoryLabel(asset),
-      metadata:
-        asset.mediaType === "video"
-          ? "Video"
-          : asset.mimeType?.startsWith("image/")
-            ? "Image"
-            : "Candidate",
-      status: "candidate",
-      mediaType: asset.mediaType === "video" ? "video" : "image",
-      href: `/asset/${asset.id}`,
-      busy,
-      preview: <AssetPreview asset={asset} fit="contain" />,
-      thumbnail: <AssetPreview asset={asset} />,
-      primaryActions: (
-        <div className="grid grid-cols-2 gap-2">
-          <CandidateSaveMenu
-            libraryId={libraryId}
-            folders={folders}
-            saving={saving}
-            disabled={busy}
-            onSave={(folderId) =>
-              onSaveCandidate({ assetId: asset.id, folderId })
-            }
-          />
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-8 px-2 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
-            onClick={() =>
-              setDismissTarget({
-                kind: "asset",
-                title: assetDisplayTitle(asset),
-                asset,
-              })
-            }
-            disabled={busy || dismissing}
-          >
-            Dismiss
-          </Button>
-        </div>
-      ),
-    };
-  }
-
-  const pendingVariantAssetIds = new Set(
-    pendingVariants
-      .map((slot: any) => slot.assetId)
-      .filter(
-        (assetId: unknown): assetId is string => typeof assetId === "string",
-      ),
-  );
-  const detachedCandidates = candidates.filter(
-    (asset) => !pendingVariantAssetIds.has(asset.id),
-  );
-  const items = [
-    ...pendingVariants.map(slotItem),
-    ...detachedCandidates.map(candidateItem),
-  ];
-  const [activeItemId, setActiveItemId] = useState<string | null>(null);
-  const itemIds = items.map((item) => item.id).join("\n");
-  const activeItem =
-    items.find((item) => item.id === activeItemId) ?? items[0] ?? null;
-
-  useEffect(() => {
-    if (!items.length) {
-      setActiveItemId(null);
-      return;
-    }
-    setActiveItemId((current) =>
-      current && items.some((item) => item.id === current)
-        ? current
-        : items[0].id,
-    );
-  }, [itemIds, items]);
-
-  if (!items.length) return null;
-
-  return (
-    <>
-      <AlertDialog
-        open={dismissTarget !== null}
-        onOpenChange={(open) => {
-          if (!open && !dismissing) setDismissTarget(null);
-        }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Dismiss this candidate?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This removes {dismissTarget?.title ?? "this candidate"} from the
-              candidate stage. Saved library assets stay untouched.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={dismissing}>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={dismissing}
-              onClick={(event) => {
-                event.preventDefault();
-                void handleDismissCandidate();
-              }}
-            >
-              {dismissing ? (
-                <>
-                  <Spinner className="h-4 w-4" />
-                  Dismissing...
-                </>
-              ) : (
-                "Dismiss"
-              )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      <section className="overflow-hidden rounded-lg border border-border bg-background">
-        <div className="flex flex-col gap-3 border-b border-border px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <h3 className="truncate text-sm font-semibold">Candidates</h3>
-              <Badge variant="outline">{items.length}</Badge>
-            </div>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Generation queue
-            </p>
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <CandidateStageActions
-              slots={pendingVariants}
-              detachedCandidates={detachedCandidates}
-              libraryId={libraryId}
-            />
-          </div>
-        </div>
-        <div className="grid lg:grid-cols-[minmax(0,1fr)_300px]">
-          <div className="min-w-0 bg-muted/10 p-3">
-            <div
-              className={[
-                "group relative overflow-hidden rounded-lg border border-border bg-background",
-                activeItem?.busy ? "opacity-80" : "",
-              ].join(" ")}
-              aria-busy={activeItem?.busy}
-            >
-              <div className="aspect-[16/9] bg-muted/30">
-                {activeItem?.href ? (
-                  <Link to={activeItem.href} className="block h-full w-full">
-                    {activeItem.preview}
-                  </Link>
-                ) : (
-                  activeItem?.preview
-                )}
-              </div>
-              {activeItem?.menu ? (
-                <div className="absolute right-3 top-3 z-10">
-                  {activeItem.menu}
-                </div>
-              ) : null}
-              {activeItem?.busy ? (
-                <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/20">
-                  <Spinner className="h-5 w-5" />
-                </div>
-              ) : null}
-            </div>
-            <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
-              {items.map((item) => {
-                const active = item.id === activeItem?.id;
-                return (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => setActiveItemId(item.id)}
-                    className={[
-                      "group relative h-16 w-24 shrink-0 overflow-hidden rounded-md border bg-background transition",
-                      active
-                        ? "border-primary ring-2 ring-primary/25"
-                        : "border-border/80 hover:border-foreground/30",
-                    ].join(" ")}
-                    aria-label={`Show ${item.title}`}
-                    aria-pressed={active}
-                  >
-                    {item.thumbnail}
-                    <span className="pointer-events-none absolute inset-x-0 bottom-0 h-6 bg-gradient-to-t from-background/90 to-transparent" />
-                    {item.busy ? (
-                      <span className="absolute right-1.5 top-1.5 rounded-full bg-background/90 p-1 shadow-sm">
-                        <Spinner className="h-3 w-3" />
-                      </span>
-                    ) : null}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-          <aside className="flex min-h-56 flex-col justify-between gap-4 border-t border-border bg-background p-4 lg:border-l lg:border-t-0">
-            <div className="min-w-0 space-y-4">
-              <div className="min-w-0">
-                <div className="truncate text-sm font-medium">
-                  {activeItem?.title}
-                </div>
-                {activeItem?.subtitle ? (
-                  <div className="mt-1 truncate text-xs text-muted-foreground">
-                    {activeItem.subtitle}
-                  </div>
-                ) : null}
-              </div>
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                {activeItem?.status ? (
-                  <div className="rounded-md border border-border bg-muted/20 px-2 py-1.5">
-                    <div className="text-[10px] font-medium uppercase text-muted-foreground">
-                      Status
-                    </div>
-                    <div className="mt-0.5 truncate">{activeItem.status}</div>
-                  </div>
-                ) : null}
-                {activeItem?.metadata ? (
-                  <div className="rounded-md border border-border bg-muted/20 px-2 py-1.5">
-                    <div className="text-[10px] font-medium uppercase text-muted-foreground">
-                      Type
-                    </div>
-                    <div className="mt-0.5 truncate">{activeItem.metadata}</div>
-                  </div>
-                ) : null}
-              </div>
-              {activeItem?.primaryActions ? (
-                <div>{activeItem.primaryActions}</div>
-              ) : null}
-            </div>
-            {activeItem?.href ? (
-              <Button asChild variant="outline" size="sm">
-                <Link to={activeItem.href}>Open</Link>
-              </Button>
-            ) : null}
-          </aside>
-        </div>
-      </section>
-    </>
-  );
-}
-
-function CandidateSaveMenu({
-  libraryId,
-  folders,
-  saving,
-  disabled,
-  onSave,
-}: {
-  libraryId: string;
-  folders: any[];
-  saving?: boolean;
-  disabled?: boolean;
-  onSave: (folderId: string | null) => void;
-}) {
-  const createFolder = useActionMutation("create-folder");
-  const queryClient = useQueryClient();
-  const [createOpen, setCreateOpen] = useState(false);
-  const pending = saving || createFolder.isPending;
-
-  return (
-    <>
-      <CreateFolderDialog
-        open={createOpen}
-        onOpenChange={setCreateOpen}
-        onSubmit={async (title) => {
-          const folder = (await createFolder.mutateAsync({
-            libraryId,
-            title,
-            parentId: null,
-          })) as any;
-          void queryClient.invalidateQueries({
-            queryKey: ["action", "get-library", { id: libraryId }],
-            refetchType: "active",
-          });
-          setCreateOpen(false);
-          if (folder?.id) onSave(folder.id);
-        }}
-        pending={createFolder.isPending}
-      />
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button size="sm" className="h-8 px-2 text-xs" disabled={disabled}>
-            {pending ? <Spinner className="h-3.5 w-3.5" /> : "Save to..."}
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="start">
-          <DropdownMenuItem onSelect={() => onSave(null)}>
-            <IconFolder className="mr-2 h-4 w-4 shrink-0" />
-            Unfiled
-          </DropdownMenuItem>
-          {folders.map((folder) => (
-            <DropdownMenuItem
-              key={folder.id}
-              onSelect={() => onSave(folder.id)}
-            >
-              <IconFolder className="mr-2 h-4 w-4 shrink-0" />
-              Folder: {folder.title}
-            </DropdownMenuItem>
-          ))}
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            onSelect={(event) => {
-              event.preventDefault();
-              setCreateOpen(true);
-            }}
-          >
-            <IconFolderPlus className="mr-2 h-4 w-4 shrink-0" />
-            New folder...
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-    </>
-  );
-}
-
-function CandidateStageActions({
-  slots,
-  detachedCandidates,
-  libraryId,
-}: {
-  slots: any[];
-  detachedCandidates: any[];
-  libraryId: string;
-}) {
-  const dismissSlots = useActionMutation("dismiss-variant-slots");
-  const deleteAssets = useActionMutation("delete-assets");
-  const queryClient = useQueryClient();
-  const [pending, setPending] = useState<"failed" | "all" | null>(null);
-  const failedSlots = slots.filter((slot) => slot.status === "failed");
-  const failedCount = failedSlots.length;
-  const detachedCount = detachedCandidates.length;
-  const totalCount = slots.length + detachedCount;
-  const isClearing = dismissSlots.isPending || deleteAssets.isPending;
-  const actionLabel = pending === "failed" ? "Dismiss failed" : "Clear all";
-  const busyLabel = pending === "failed" ? "Dismissing..." : "Clearing...";
-
-  async function handleClear(scope: "failed" | "all") {
-    const slotAssetIds = slots
-      .filter((slot) => scope === "all" || slot.status === "failed")
-      .map((slot) => slot.assetId)
-      .filter(
-        (assetId: unknown): assetId is string => typeof assetId === "string",
-      );
-    const detachedAssetIds =
-      scope === "all" ? detachedCandidates.map((asset) => asset.id) : [];
-    const removedAssetIds = [
-      ...new Set([...slotAssetIds, ...detachedAssetIds]),
-    ];
-
-    if (
-      scope === "all" &&
-      slots.length === 0 &&
-      detachedAssetIds.length === 0
-    ) {
-      setPending(null);
-      return;
-    }
-    if (scope === "failed" && failedCount === 0) {
-      setPending(null);
-      return;
-    }
-
-    try {
-      if (slots.length > 0 && (scope === "all" || failedCount > 0)) {
-        await dismissSlots.mutateAsync({ scope });
-        removeVariantSlotsByScopeFromCache(queryClient, scope);
-      }
-      if (detachedAssetIds.length > 0) {
-        await deleteAssets.mutateAsync({ ids: detachedAssetIds });
-      }
-      if (removedAssetIds.length > 0) {
-        removeAssetsFromLibraryCache(queryClient, libraryId, removedAssetIds);
-      }
-      setPending(null);
-      void queryClient.invalidateQueries({
-        queryKey: ["app-state", "asset-variants"],
-        refetchType: "active",
-      });
-      if (scope === "failed") {
-        toast.success(
-          `Dismissed ${failedCount} failed candidate${failedCount === 1 ? "" : "s"}.`,
-        );
-      } else {
-        toast.success(
-          `Cleared ${totalCount} candidate${totalCount === 1 ? "" : "s"}.`,
-        );
-      }
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : "Could not clear candidates.",
-      );
-    }
-  }
-
-  if (totalCount === 0) return null;
-
-  return (
-    <>
-      <AlertDialog
-        open={pending !== null}
-        onOpenChange={(open) => {
-          if (!open && !isClearing) setPending(null);
-        }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {pending === "failed"
-                ? `Dismiss ${failedCount} failed candidate${failedCount === 1 ? "" : "s"}?`
-                : `Clear ${totalCount} candidate${totalCount === 1 ? "" : "s"}?`}
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {pending === "failed"
-                ? "Removes failed live slots from the candidate stage. Ready candidates stay."
-                : "Clears the candidate stage and deletes unsaved generated candidates. Saved library assets stay untouched."}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={isClearing}>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={isClearing || pending === null}
-              onClick={(event) => {
-                event.preventDefault();
-                if (pending) void handleClear(pending);
-              }}
-            >
-              {isClearing ? (
-                <>
-                  <Spinner className="h-4 w-4" />
-                  {busyLabel}
-                </>
-              ) : (
-                actionLabel
-              )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="gap-2"
-            aria-label="Candidate actions"
-            disabled={isClearing}
-          >
-            <IconDotsVertical className="h-4 w-4" />
-            Clear
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end">
-          <DropdownMenuItem
-            disabled={failedCount === 0 || isClearing}
-            onSelect={(event) => {
-              event.preventDefault();
-              setPending("failed");
-            }}
-          >
-            <IconTrash className="mr-2 h-4 w-4 shrink-0" />
-            Dismiss failed ({failedCount})
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            className="text-destructive focus:bg-destructive/10 focus:text-destructive"
-            disabled={isClearing}
-            onSelect={(event) => {
-              event.preventDefault();
-              setPending("all");
-            }}
-          >
-            <IconTrash className="mr-2 h-4 w-4 shrink-0" />
-            Clear all
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-    </>
-  );
-}
-
 function AssetSwimlaneBoard({
   libraryId,
   viewMode,
   onViewModeChange,
   scope,
   onScopeChange,
+  showScopeToggle = true,
   hideEmptyLanes,
   assets,
   pendingUploads,
@@ -3146,13 +2186,14 @@ function AssetSwimlaneBoard({
   onViewModeChange: (mode: AssetViewMode) => void;
   scope: AssetLibraryScope;
   onScopeChange: (scope: AssetLibraryScope) => void;
+  showScopeToggle?: boolean;
   hideEmptyLanes: boolean;
   assets: any[];
   pendingUploads: PendingUpload[];
   folders: any[];
   promotingReferenceKeys: Set<string>;
-  onUploadClick: () => void;
-  onDrop: (files: FileList) => void;
+  onUploadClick?: () => void;
+  onDrop?: (files: FileList) => void;
   onMoveToReferences: (asset: any, slot?: any) => void;
   onRemoveFromReferences: (asset: any) => void;
   selectedIds: Set<string>;
@@ -3160,6 +2201,10 @@ function AssetSwimlaneBoard({
   onOptimisticDelete?: (ids: string[]) => void;
   onRestoreOptimisticDelete?: (ids: string[]) => void;
 }) {
+  const t = useT();
+  const creativeContextEnabled = useCreativeContextLab();
+  const [bulkContextOpen, setBulkContextOpen] = useState(false);
+  const [previewAsset, setPreviewAsset] = useState<any>(null);
   const deleteAsset = useActionMutation("delete-asset");
   const deleteAssets = useActionMutation("delete-assets");
   const updateAsset = useActionMutation("update-asset");
@@ -3263,11 +2308,11 @@ function AssetSwimlaneBoard({
         {
           onSuccess: () => {
             finishDeleting(ids);
-            toast.success("Deleted asset.");
+            toast.success(t("library.deletedAsset"));
           },
           onError: (error) => {
             restoreAfterDeleteError(ids);
-            toast.error(error.message || "Could not delete asset.");
+            toast.error(error.message || t("library.couldNotDeleteAsset"));
           },
         },
       );
@@ -3282,11 +2327,13 @@ function AssetSwimlaneBoard({
         onSuccess: (result: any) => {
           finishDeleting(ids);
           const count = Number(result?.deletedCount ?? ids.length);
-          toast.success(`Deleted ${count} asset${count === 1 ? "" : "s"}.`);
+          toast.success(t("library.deletedAssets", { count }));
         },
         onError: (error) => {
           restoreAfterDeleteError(ids);
-          toast.error(error.message || "Could not delete selected assets.");
+          toast.error(
+            error.message || t("library.couldNotDeleteSelectedAssets"),
+          );
         },
       },
     );
@@ -3341,16 +2388,20 @@ function AssetSwimlaneBoard({
       }
       toast.success(
         enabled
-          ? `Added ${assetList.length} asset${assetList.length === 1 ? "" : "s"} to References.`
-          : `Removed ${assetList.length} asset${assetList.length === 1 ? "" : "s"} from References.`,
+          ? t("library.addedAssetsToReferences", {
+              count: assetList.length,
+            })
+          : t("library.removedAssetsFromReferences", {
+              count: assetList.length,
+            }),
       );
     } catch (error) {
       toast.error(
         error instanceof Error
           ? error.message
           : enabled
-            ? "Could not add selected assets to References."
-            : "Could not remove selected assets from References.",
+            ? t("library.couldNotAddSelectedToReferences")
+            : t("library.couldNotRemoveSelectedFromReferences"),
       );
       return;
     } finally {
@@ -3363,11 +2414,14 @@ function AssetSwimlaneBoard({
     return {
       id: `upload:${upload.id}`,
       title: upload.name,
-      subtitle: isChecking ? "Checking upload" : "Uploading",
-      status: isChecking ? "Checking" : "Uploading",
+      subtitle: isChecking
+        ? t("library.checkingUpload")
+        : t("library.uploading"),
+      status: isChecking ? t("library.checking") : t("library.uploading"),
       mediaType: upload.mediaType,
       busy: true,
-      preview: <PendingUploadPreview upload={upload} fit="contain" />,
+      showBusyOverlay: false,
+      preview: <PendingUploadPreview upload={upload} fit="contain" />, // i18n-ignore structural preview slot name
       thumbnail: <PendingUploadPreview upload={upload} />,
     };
   }
@@ -3403,20 +2457,22 @@ function AssetSwimlaneBoard({
       id: `asset:${asset.id}`,
       title: displayTitle,
       subtitle: sourceText || categoryLabel || asset.status,
+      asset,
       metadata:
         asset.mediaType === "video"
-          ? "Video"
+          ? t("library.video")
           : asset.mimeType?.startsWith("image/")
-            ? "Image"
-            : asset.mimeType || "Asset",
-      status: isReference ? "Reference" : "Saved",
+            ? t("library.image")
+            : asset.mimeType || t("library.asset"),
+      status: isReference ? t("library.reference") : t("library.saved"),
       mediaType: asset.mediaType === "video" ? "video" : "image",
       href: `/asset/${asset.id}`,
+      onOpen: () => setPreviewAsset(asset),
       selected: selectedIds.has(asset.id),
       deleting: deletingIds.has(asset.id),
       busy,
-      preview: <AssetPreview asset={asset} fit="contain" />,
-      thumbnail: <AssetPreview asset={asset} />,
+      preview: <AssetPreview asset={asset} fit="contain" />, // i18n-ignore structural preview slot name
+      thumbnail: <AssetPreview asset={asset} />, // i18n-ignore structural preview slot name
       onToggle: (checked) => toggleAsset(asset.id, checked),
       menu: (
         <AssetActionsMenu
@@ -3427,6 +2483,7 @@ function AssetSwimlaneBoard({
           onDelete={() => confirmDelete([asset.id])}
           onMoveToReferences={onMoveToReferences}
           onRemoveFromReferences={onRemoveFromReferences}
+          onOpenPreview={() => setPreviewAsset(asset)}
         />
       ),
       primaryActions:
@@ -3441,11 +2498,15 @@ function AssetSwimlaneBoard({
             {onSave ? (
               <Button
                 size="sm"
-                className="h-8 px-2 text-xs"
+                className="px-2 text-xs"
                 onClick={onSave}
                 disabled={busy}
               >
-                {saving ? <Spinner className="h-3.5 w-3.5" /> : "Save"}
+                {saving ? (
+                  <Spinner className="h-3.5 w-3.5" />
+                ) : (
+                  t("library.save")
+                )}
               </Button>
             ) : null}
             {canMoveToReferences ? (
@@ -3457,12 +2518,12 @@ function AssetSwimlaneBoard({
                 }
                 onClick={onMoveToReferences}
                 disabled={busy}
-                title="Add to References"
+                title={t("library.addToReferences")}
               >
                 {promoting ? (
                   <Spinner className="h-3.5 w-3.5" />
                 ) : (
-                  "Add to References"
+                  t("library.addToReferences")
                 )}
               </Button>
             ) : null}
@@ -3475,12 +2536,12 @@ function AssetSwimlaneBoard({
                 }
                 onClick={onRemoveFromReferences}
                 disabled={busy}
-                title="Remove from References"
+                title={t("library.removeFromReferences")}
               >
                 {promoting ? (
                   <Spinner className="h-3.5 w-3.5" />
                 ) : (
-                  "Remove from References"
+                  t("library.removeFromReferences")
                 )}
               </Button>
             ) : null}
@@ -3512,19 +2573,21 @@ function AssetSwimlaneBoard({
   if (!hasAnyBoardItem) {
     if (hideEmptyLanes) {
       return (
-        <div className="flex min-h-[280px] w-full flex-col items-center justify-center rounded-lg border border-dashed border-border bg-muted/15 p-8 text-center">
+        <div className="flex min-h-70 w-full flex-col items-center justify-center rounded-lg border border-dashed border-border bg-muted/15 p-8 text-center">
           <IconSearch className="h-9 w-9 text-muted-foreground" />
           <span className="mt-4 text-base font-semibold">
-            No assets match this view
+            {t("library.noAssetsMatchView")}
           </span>
           <span className="mt-2 max-w-md text-sm text-muted-foreground">
-            Try All assets, a different folder, or a broader search.
+            {t("library.noAssetsMatchViewBody")}
           </span>
         </div>
       );
     }
     return (
       <button
+        type="button"
+        disabled={!onUploadClick || !onDrop}
         onClick={onUploadClick}
         onDragOver={(e) => {
           if (e.dataTransfer.types.includes("Files")) e.preventDefault();
@@ -3532,15 +2595,16 @@ function AssetSwimlaneBoard({
         onDrop={(e) => {
           e.preventDefault();
           e.stopPropagation();
-          onDrop(e.dataTransfer.files);
+          onDrop?.(e.dataTransfer.files);
         }}
-        className="flex min-h-[360px] w-full flex-col items-center justify-center rounded-lg border border-dashed border-border bg-muted/20 p-8 text-center"
+        className="flex min-h-90 w-full flex-col items-center justify-center rounded-lg border border-dashed border-border bg-muted/20 p-8 text-center"
       >
         <IconPhotoPlus className="h-10 w-10 text-muted-foreground" />
-        <span className="mt-4 text-base font-semibold">Add assets</span>
+        <span className="mt-4 text-base font-semibold">
+          {t("library.addAssets")}
+        </span>
         <span className="mt-2 max-w-md text-sm text-muted-foreground">
-          Upload source material or generate candidates, then mark only the
-          assets that should guide future generations as references.
+          {t("library.addAssetsDescription")}
         </span>
       </button>
     );
@@ -3558,17 +2622,19 @@ function AssetSwimlaneBoard({
           <AlertDialogHeader>
             <AlertDialogTitle>
               {confirmDeleteIds.length > 1
-                ? `Delete ${confirmDeleteIds.length} assets?`
-                : "Delete asset?"}
+                ? t("library.deleteAssetsTitle", {
+                    count: confirmDeleteIds.length,
+                  })
+                : t("library.deleteAssetTitle")}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {confirmDeleteIds.length > 1
-                ? "This permanently removes the selected assets from the brand kit. To stop using an asset as a reference but keep it, use Remove from References instead."
-                : "This permanently removes the asset from the brand kit. To keep it in the library but stop using it as a reference, use Remove from References instead."}
+                ? t("library.deleteAssetsDescription")
+                : t("library.deleteAssetDescription")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogCancel>{t("library.cancel")}</AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               disabled={!confirmDeleteIds.length || deleting}
@@ -3577,7 +2643,7 @@ function AssetSwimlaneBoard({
                 handleDeleteConfirmed();
               }}
             >
-              Delete
+              {t("brandKitDetail.delete")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -3585,20 +2651,21 @@ function AssetSwimlaneBoard({
 
       <div className="mb-3 flex flex-col gap-3 rounded-md border border-border bg-background px-3 py-2 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <label className="flex h-8 cursor-pointer items-center gap-2 rounded-md border border-border px-2.5 text-sm font-medium text-foreground transition hover:border-foreground/30 has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-50">
+          <label className="flex h-8 cursor-pointer items-center gap-2 rounded-md border border-border px-2.5 text-sm font-medium text-foreground transition hover:border-foreground/30 has-disabled:cursor-not-allowed has-disabled:opacity-50">
             <Checkbox
               checked={allSelected}
               disabled={!boardAssets.length || deleting}
               onCheckedChange={(checked) => toggleAll(checked === true)}
-              aria-label="Select all visible assets"
+              aria-label={t("library.selectAllVisibleAssets")}
             />
-            {allSelected ? "Deselect all" : "Select all"}
+            {allSelected ? t("library.deselectAll") : t("library.selectAll")}
           </label>
           <span className="text-xs text-muted-foreground">
-            {boardAssets.length} visible asset
-            {boardAssets.length === 1 ? "" : "s"}
+            {t("library.visibleAssetsCount", { count: boardAssets.length })}
             {referenceAssets.length > 0
-              ? ` · ${referenceAssets.length} reference${referenceAssets.length === 1 ? "" : "s"}`
+              ? ` · ${t("library.referencesCount", {
+                  count: referenceAssets.length,
+                })}`
               : ""}
           </span>
           {selectedCount > 0 ? (
@@ -3608,17 +2675,19 @@ function AssetSwimlaneBoard({
               size="sm"
               onClick={() => onSelectedIdsChange(new Set())}
             >
-              Clear
+              {t("library.clear")}
             </Button>
           ) : null}
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2">
-          <AssetScopeToggle
-            value={scope}
-            onChange={onScopeChange}
-            allCount={assets.length}
-            referenceCount={referenceAssets.length}
-          />
+          {showScopeToggle ? (
+            <AssetScopeToggle
+              value={scope}
+              onChange={onScopeChange}
+              allCount={assets.length}
+              referenceCount={referenceAssets.length}
+            />
+          ) : null}
           <AssetViewModeToggle value={viewMode} onChange={onViewModeChange} />
         </div>
       </div>
@@ -3629,8 +2698,7 @@ function AssetSwimlaneBoard({
             <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
               <Spinner className="h-4 w-4" />
               <span className="truncate">
-                Deleting {pendingDeleteCount} asset
-                {pendingDeleteCount === 1 ? "" : "s"}...
+                {t("library.deletingAssets", { count: pendingDeleteCount })}
               </span>
             </div>
           ) : (
@@ -3638,15 +2706,18 @@ function AssetSwimlaneBoard({
               <Checkbox
                 checked={allSelected}
                 onCheckedChange={(checked) => toggleAll(checked === true)}
-                aria-label="Select all assets in this board"
+                aria-label={t("library.selectAllAssetsInBoard")}
               />
               <span className="truncate">
                 {selectedCount > 0
-                  ? `${selectedCount} selected`
-                  : `${boardAssets.length} asset${boardAssets.length === 1 ? "" : "s"}`}
+                  ? t("library.selectedCount", { count: selectedCount })
+                  : t("library.assetCount", { count: boardAssets.length })}
               </span>
               <span className="hidden text-xs text-muted-foreground sm:inline">
-                {referenceAssets.length} references · {savedAssets.length} saved
+                {t("library.referencesAndSavedCount", {
+                  referenceCount: referenceAssets.length,
+                  savedCount: savedAssets.length,
+                })}
               </span>
             </div>
           )}
@@ -3667,7 +2738,7 @@ function AssetSwimlaneBoard({
                   ) : (
                     <IconPhotoPlus className="h-4 w-4" />
                   )}
-                  Add to References
+                  {t("brandKitDetail.addToReferences")}
                 </Button>
               ) : null}
               {selectedReferenceAssets.length > 0 ? (
@@ -3685,7 +2756,20 @@ function AssetSwimlaneBoard({
                   ) : (
                     <IconX className="h-4 w-4" />
                   )}
-                  Remove from References
+                  {t("brandKitDetail.removeFromReferences")}
+                </Button>
+              ) : null}
+              {creativeContextEnabled ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setBulkContextOpen(true)}
+                  disabled={deleting || changingReference}
+                >
+                  <IconLink className="h-4 w-4" />
+                  Add to context
+                  {/* i18n-ignore assets template UI is raw-English pending template i18n pass */}
                 </Button>
               ) : null}
               <Button
@@ -3694,7 +2778,7 @@ function AssetSwimlaneBoard({
                 size="sm"
                 onClick={() => onSelectedIdsChange(new Set())}
               >
-                Clear
+                {t("brandKitDetail.clear")}
               </Button>
               <Button
                 type="button"
@@ -3710,48 +2794,68 @@ function AssetSwimlaneBoard({
                 ) : (
                   <IconTrash className="h-4 w-4" />
                 )}
-                Delete
+                {t("assetDetail.delete")}
               </Button>
             </div>
           ) : null}
         </div>
       )}
+      {creativeContextEnabled ? (
+        <CreativeContextShareSheet
+          open={bulkContextOpen}
+          onOpenChange={setBulkContextOpen}
+          resources={selectedAssets.map((asset) => ({
+            appId: "assets",
+            resourceType: "asset",
+            resourceId: asset.id,
+            title: assetDisplayTitle(asset),
+            updatedAt: asset.updatedAt,
+            preview: { kind: "document" as const, label: "Asset" },
+          }))}
+        />
+      ) : null}
 
       {viewMode === "cards" ? (
         <AssetCardsView items={visibleGalleryItems} />
       ) : (
         <SwimLane
-          title={scope === "references" ? "References" : "Library"}
+          title={
+            scope === "references"
+              ? t("library.references")
+              : t("library.library")
+          }
           eyebrow={
             scope === "references"
-              ? "Assets currently marked for generation reference."
-              : "Saved assets in this filtered view. Mark the ones that should guide future generations."
+              ? t("library.referencesEyebrow")
+              : t("library.libraryEyebrow")
           }
           items={visibleGalleryItems}
           action={
-            <Button variant="outline" size="sm" onClick={onUploadClick}>
-              Add
-            </Button>
+            onUploadClick ? (
+              <Button variant="outline" size="sm" onClick={onUploadClick}>
+                {t("library.add")}
+              </Button>
+            ) : undefined
           }
           empty={
             scope === "references" && assets.length > 0 ? (
               <LaneActionEmpty
-                title="No references in this view"
-                body="Switch back to all assets and mark the keepers as references."
+                title={t("library.noReferencesInView")}
+                body={t("library.noReferencesInViewBody")}
                 onClick={() => onScopeChange("all")}
-                action="Show all"
+                action={t("library.showAll")}
               />
             ) : hideEmptyLanes ? (
               <LaneActionEmpty
-                title="No assets match this view"
-                body="Try All assets, a different folder, or a broader search."
+                title={t("library.noAssetsMatchView")}
+                body={t("library.noAssetsMatchViewBody")}
                 onClick={() => onScopeChange("all")}
-                action="Show all"
+                action={t("library.showAll")}
               />
             ) : (
               <LaneDropTarget
-                title="Drop assets here"
-                body="Upload source material, generated exports, logos, products, or style boards."
+                title={t("library.dropAssetsHere")}
+                body={t("library.dropAssetsHereBody")}
                 onClick={onUploadClick}
                 onDrop={onDrop}
               />
@@ -3759,6 +2863,12 @@ function AssetSwimlaneBoard({
           }
         />
       )}
+
+      <AssetPreviewDialog
+        asset={previewAsset}
+        assets={boardAssets as PreviewAsset[]}
+        onAssetChange={setPreviewAsset}
+      />
     </>
   );
 }
@@ -3770,6 +2880,7 @@ function AssetViewModeToggle({
   value: AssetViewMode;
   onChange: (mode: AssetViewMode) => void;
 }) {
+  const t = useT();
   const options: Array<{
     value: AssetViewMode;
     label: string;
@@ -3777,12 +2888,12 @@ function AssetViewModeToggle({
   }> = [
     {
       value: "lanes",
-      label: "Lanes",
+      label: t("library.lanes"),
       icon: <IconLayoutBottombar className="h-4 w-4" />,
     },
     {
       value: "cards",
-      label: "Cards",
+      label: t("library.cards"),
       icon: <IconLayoutGrid className="h-4 w-4" />,
     },
   ];
@@ -3791,7 +2902,7 @@ function AssetViewModeToggle({
     <TooltipProvider delayDuration={150}>
       <div
         role="group"
-        aria-label="Asset view"
+        aria-label={t("library.assetView")}
         className="inline-flex shrink-0 gap-1 rounded-md border border-border bg-muted/20 p-1"
       >
         {options.map((option) => {
@@ -3808,14 +2919,18 @@ function AssetViewModeToggle({
                       ? "bg-background text-foreground shadow-sm"
                       : "text-muted-foreground hover:bg-background/60 hover:text-foreground",
                   ].join(" ")}
-                  aria-label={`${option.label} view`}
+                  aria-label={t("library.assetViewMode", {
+                    mode: option.label,
+                  })}
                   aria-pressed={active}
-                  title={`${option.label} view`}
+                  title={t("library.assetViewMode", { mode: option.label })}
                 >
                   {option.icon}
                 </button>
               </TooltipTrigger>
-              <TooltipContent side="bottom">{option.label} view</TooltipContent>
+              <TooltipContent side="bottom">
+                {t("library.assetViewMode", { mode: option.label })}
+              </TooltipContent>
             </Tooltip>
           );
         })}
@@ -3835,19 +2950,24 @@ function AssetScopeToggle({
   allCount: number;
   referenceCount: number;
 }) {
+  const t = useT();
   const options: Array<{
     value: AssetLibraryScope;
     label: string;
     count: number;
   }> = [
-    { value: "all", label: "All", count: allCount },
-    { value: "references", label: "References", count: referenceCount },
+    { value: "all", label: t("library.tabsAll"), count: allCount },
+    {
+      value: "references",
+      label: t("library.references"),
+      count: referenceCount,
+    },
   ];
 
   return (
     <div
       role="group"
-      aria-label="Asset scope"
+      aria-label={t("library.assetScope")}
       className="inline-flex shrink-0 gap-1 rounded-md border border-border bg-muted/20 p-1"
     >
       {options.map((option) => {
@@ -3884,76 +3004,150 @@ function AssetScopeToggle({
 }
 
 function AssetCardsView({ items }: { items: LaneGalleryItem[] }) {
+  const t = useT();
+  const [copiedItemId, setCopiedItemId] = useState<string | null>(null);
+
+  async function copyItem(item: LaneGalleryItem) {
+    if (!item.asset) return;
+    try {
+      await navigator.clipboard.writeText(detailAssetClipboardText(item.asset));
+      setCopiedItemId(item.id);
+      toast.success(t("library.selectionCopied"));
+      window.setTimeout(() => {
+        setCopiedItemId((current) => (current === item.id ? null : current));
+      }, 1400);
+    } catch {
+      toast.info(t("library.selectionReady"));
+    }
+  }
+
   if (!items.length) {
     return (
-      <div className="flex min-h-[220px] items-center justify-center rounded-lg border border-dashed border-border bg-muted/15 p-8 text-center text-sm text-muted-foreground">
-        No assets to show.
+      <div className="flex min-h-55 items-center justify-center rounded-lg border border-dashed border-border bg-muted/15 p-8 text-center text-sm text-muted-foreground">
+        {t("library.noAssetsToShow")}
       </div>
     );
   }
 
   return (
-    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
-      {items.map((item) => (
-        <article
-          key={item.id}
-          className={[
-            "group overflow-hidden rounded-lg border border-border/80 bg-background transition hover:border-foreground/25",
-            item.selected ? "border-primary ring-2 ring-primary/25" : "",
-            item.deleting ? "opacity-60" : "",
-          ].join(" ")}
-          aria-busy={item.busy}
-        >
-          <div className="relative aspect-[4/3] bg-muted/30">
-            {item.href ? (
-              <Link to={item.href} className="block h-full w-full">
-                {item.thumbnail}
-              </Link>
-            ) : (
-              item.thumbnail
-            )}
-            <div className="absolute left-2 top-2 z-10">
-              {item.onToggle ? (
-                <Checkbox
-                  checked={item.selected}
-                  onCheckedChange={(checked) =>
-                    item.onToggle?.(checked === true)
-                  }
-                  aria-label={`Select ${item.title}`}
-                  className="border-background bg-background/90 shadow-sm"
-                />
-              ) : null}
-            </div>
-            {item.menu ? (
-              <div className="absolute right-2 top-2 z-10">{item.menu}</div>
-            ) : null}
-            {item.busy ? (
-              <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/20">
-                <Spinner className="h-5 w-5" />
+    <div className="assets-brand-kit-item-grid grid gap-3">
+      {items.map((item) => {
+        const copied = copiedItemId === item.id;
+        const secondary =
+          item.subtitle &&
+          item.subtitle.toLowerCase() !== item.status?.toLowerCase()
+            ? item.subtitle
+            : null;
+        return (
+          <article
+            key={item.id}
+            className={[
+              "group overflow-hidden rounded-lg border border-border/80 bg-background transition hover:border-foreground/25",
+              item.selected ? "border-primary ring-2 ring-primary/25" : "",
+              item.deleting ? "opacity-60" : "",
+            ].join(" ")}
+            aria-busy={item.busy}
+          >
+            <div className="relative aspect-4/3 bg-muted/30">
+              {item.onOpen ? (
+                <button
+                  type="button"
+                  onClick={item.onOpen}
+                  className="block h-full w-full text-left"
+                >
+                  {item.thumbnail}
+                </button>
+              ) : item.href ? (
+                <Link to={item.href} className="block h-full w-full">
+                  {item.thumbnail}
+                </Link>
+              ) : (
+                item.thumbnail
+              )}
+              <div className="absolute left-2 top-2 z-10">
+                {item.onToggle ? (
+                  <Checkbox
+                    checked={item.selected}
+                    onCheckedChange={(checked) =>
+                      item.onToggle?.(checked === true)
+                    }
+                    aria-label={t("library.selectAsset", {
+                      title: item.title,
+                    })}
+                    className="border-2 border-foreground/40 bg-background/90 shadow-sm"
+                  />
+                ) : null}
               </div>
-            ) : null}
-          </div>
-          <div className="space-y-3 p-3">
-            <div className="min-w-0">
-              <div className="truncate text-sm font-medium">{item.title}</div>
-              {item.subtitle ? (
-                <div className="mt-1 truncate text-xs text-muted-foreground">
-                  {item.subtitle}
+              <div className="absolute right-2 top-2 z-10 flex items-center gap-1.5 opacity-100 transition md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+                {item.asset ? (
+                  <TooltipProvider delayDuration={200}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          size="icon-sm"
+                          variant="secondary"
+                          className="border border-border/80 bg-background/90 shadow-sm backdrop-blur hover:bg-background"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            void copyItem(item);
+                          }}
+                          aria-label={t("library.copyAsset", {
+                            title: item.title,
+                          })}
+                        >
+                          {copied ? (
+                            <IconCheck className="h-4 w-4" />
+                          ) : (
+                            <IconClipboard className="h-4 w-4" />
+                          )}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {copied
+                          ? t("library.copied")
+                          : t("library.copyToClipboard")}
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                ) : null}
+                {item.menu}
+              </div>
+              {item.busy && item.showBusyOverlay !== false ? (
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/20">
+                  <Spinner className="h-5 w-5" />
                 </div>
               ) : null}
             </div>
-            <div className="flex min-h-5 flex-wrap items-center gap-1.5">
-              {item.status ? (
-                <Badge variant="secondary">{item.status}</Badge>
-              ) : null}
-              {item.metadata ? (
-                <Badge variant="outline">{item.metadata}</Badge>
-              ) : null}
+            <div className="p-3">
+              <div className="min-w-0">
+                <div className="truncate text-sm font-medium">{item.title}</div>
+                <div className="mt-2 flex min-h-5 min-w-0 flex-wrap items-center gap-1.5">
+                  {item.status ? (
+                    <Badge
+                      variant="secondary"
+                      className="h-5 rounded-full px-2"
+                    >
+                      {item.status}
+                    </Badge>
+                  ) : null}
+                  {item.metadata ? (
+                    <Badge variant="outline" className="h-5 rounded-full px-2">
+                      {item.metadata}
+                    </Badge>
+                  ) : null}
+                  {secondary ? (
+                    <span className="min-w-0 truncate text-xs text-muted-foreground">
+                      {secondary}
+                    </span>
+                  ) : null}
+                </div>
+              </div>
             </div>
-            {item.primaryActions ? <div>{item.primaryActions}</div> : null}
-          </div>
-        </article>
-      ))}
+          </article>
+        );
+      })}
     </div>
   );
 }
@@ -3971,6 +3165,7 @@ function SwimLane({
   action?: ReactNode;
   empty: ReactNode;
 }) {
+  const t = useT();
   const [activeItemId, setActiveItemId] = useState<string | null>(null);
   const itemIds = items.map((item) => item.id).join("\n");
   const activeItem =
@@ -3991,11 +3186,11 @@ function SwimLane({
 
   return (
     <section className="overflow-hidden rounded-lg border border-border/80 bg-background">
-      <div className="grid min-h-[360px] xl:grid-cols-[minmax(0,1fr)_284px]">
+      <div className="assets-brand-kit-preview-grid grid min-h-90">
         <div className="flex min-w-0 flex-col bg-muted/10">
           {hasContent ? (
             <>
-              <div className="flex min-h-[272px] flex-1 items-center justify-center border-b border-border/70 p-4">
+              <div className="flex min-h-68 flex-1 items-center justify-center border-b border-border/70 p-4">
                 <div
                   className={[
                     "group relative w-full max-w-3xl overflow-hidden rounded-lg border bg-background shadow-sm",
@@ -4003,8 +3198,16 @@ function SwimLane({
                   ].join(" ")}
                   aria-busy={activeItem?.busy}
                 >
-                  <div className="aspect-[16/10] bg-muted/30">
-                    {activeItem?.href ? (
+                  <div className="aspect-16/10 bg-muted/30">
+                    {activeItem?.onOpen ? (
+                      <button
+                        type="button"
+                        onClick={activeItem.onOpen}
+                        className="block h-full w-full text-left"
+                      >
+                        {activeItem.preview}
+                      </button>
+                    ) : activeItem?.href ? (
                       <Link
                         to={activeItem.href}
                         className="block h-full w-full"
@@ -4042,12 +3245,14 @@ function SwimLane({
                           : "border-border/80 hover:border-foreground/30",
                         item.deleting ? "opacity-60" : "",
                       ].join(" ")}
-                      aria-label={`Show ${item.title}`}
+                      aria-label={t("brandKitDetail.showItem", {
+                        title: item.title,
+                      })}
                       aria-pressed={active}
                     >
                       {item.thumbnail}
-                      <span className="pointer-events-none absolute inset-x-0 bottom-0 h-6 bg-gradient-to-t from-background/90 to-transparent" />
-                      {item.busy ? (
+                      <span className="pointer-events-none absolute inset-x-0 bottom-0 h-6 bg-linear-to-t from-background/90 to-transparent" />
+                      {item.busy && item.showBusyOverlay !== false ? (
                         <span className="absolute right-1.5 top-1.5 rounded-full bg-background/90 p-1 shadow-sm">
                           <Spinner className="h-3 w-3" />
                         </span>
@@ -4058,10 +3263,10 @@ function SwimLane({
               </div>
             </>
           ) : (
-            <div className="min-h-[188px] p-3">{empty}</div>
+            <div className="min-h-47 p-3">{empty}</div>
           )}
         </div>
-        <aside className="order-first flex min-h-32 flex-col justify-between gap-4 border-b border-border bg-background/95 p-4 xl:order-none xl:min-h-[360px] xl:border-b-0 xl:border-l">
+        <aside className="order-first flex min-h-32 flex-col justify-between gap-4 border-b border-border bg-background/95 p-4 xl:order-0 xl:min-h-90 xl:border-b-0 xl:border-l">
           <div className="min-w-0 space-y-2">
             <div className="flex items-center justify-between gap-3">
               <h3 className="truncate text-sm font-semibold">{title}</h3>
@@ -4081,7 +3286,9 @@ function SwimLane({
                       onCheckedChange={(checked) =>
                         activeItem.onToggle?.(checked === true)
                       }
-                      aria-label={`Select ${activeItem.title}`}
+                      aria-label={t("brandKitDetail.selectItem", {
+                        title: activeItem.title,
+                      })}
                       className="mt-0.5"
                     />
                   ) : null}
@@ -4100,7 +3307,7 @@ function SwimLane({
                   {activeItem.status ? (
                     <div className="rounded-md border border-border bg-muted/20 px-2 py-1.5">
                       <div className="text-[10px] font-medium uppercase text-muted-foreground">
-                        Status
+                        {t("brandKitDetail.status")}
                       </div>
                       <div className="mt-0.5 truncate">{activeItem.status}</div>
                     </div>
@@ -4108,7 +3315,7 @@ function SwimLane({
                   {activeItem.metadata ? (
                     <div className="rounded-md border border-border bg-muted/20 px-2 py-1.5">
                       <div className="text-[10px] font-medium uppercase text-muted-foreground">
-                        Type
+                        {t("brandKitDetail.type")}
                       </div>
                       <div className="mt-0.5 truncate">
                         {activeItem.metadata}
@@ -4123,9 +3330,18 @@ function SwimLane({
             ) : null}
           </div>
           <div className="flex shrink-0 items-center gap-2">
-            {activeItem?.href ? (
+            {activeItem?.onOpen ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="flex-1"
+                onClick={activeItem.onOpen}
+              >
+                {t("brandKitDetail.open")}
+              </Button>
+            ) : activeItem?.href ? (
               <Button asChild variant="outline" size="sm" className="flex-1">
-                <Link to={activeItem.href}>Open</Link>
+                <Link to={activeItem.href}>{t("brandKitDetail.open")}</Link>
               </Button>
             ) : null}
             {action ? <div className="shrink-0">{action}</div> : null}
@@ -4144,12 +3360,13 @@ function LaneDropTarget({
 }: {
   title: string;
   body: string;
-  onClick: () => void;
-  onDrop: (files: FileList) => void;
+  onClick?: () => void;
+  onDrop?: (files: FileList) => void;
 }) {
   return (
     <button
       type="button"
+      disabled={!onClick || !onDrop}
       onClick={onClick}
       onDragOver={(e) => {
         if (e.dataTransfer.types.includes("Files")) e.preventDefault();
@@ -4157,9 +3374,9 @@ function LaneDropTarget({
       onDrop={(e) => {
         e.preventDefault();
         e.stopPropagation();
-        onDrop(e.dataTransfer.files);
+        onDrop?.(e.dataTransfer.files);
       }}
-      className="flex h-full min-h-[148px] w-full items-center justify-center rounded-md px-4 text-center transition hover:bg-muted/25"
+      className="flex h-full min-h-37 w-full items-center justify-center rounded-md px-4 text-center transition hover:bg-muted/25"
     >
       <span>
         <IconPhotoPlus className="mx-auto h-7 w-7 text-muted-foreground" />
@@ -4182,7 +3399,7 @@ function LaneActionEmpty({
   onClick: () => void;
 }) {
   return (
-    <div className="flex h-full min-h-[148px] items-center justify-between gap-3 rounded-md px-4">
+    <div className="flex h-full min-h-37 items-center justify-between gap-3 rounded-md px-4">
       <div className="min-w-0">
         <div className="text-sm font-medium">{title}</div>
         <div className="mt-1 text-xs text-muted-foreground">{body}</div>
@@ -4201,6 +3418,7 @@ function PendingUploadPreview({
   upload: PendingUpload;
   fit?: "cover" | "contain";
 }) {
+  const t = useT();
   const isChecking = upload.status === "checking";
   return (
     <div
@@ -4212,7 +3430,7 @@ function PendingUploadPreview({
       <div className="flex flex-col items-center gap-2 text-muted-foreground">
         <Spinner className={fit === "contain" ? "h-6 w-6" : "h-4 w-4"} />
         <span className="text-xs font-medium">
-          {isChecking ? "Checking" : "Uploading"}
+          {isChecking ? t("library.checking") : t("library.uploading")}
         </span>
       </div>
     </div>
@@ -4227,6 +3445,7 @@ function AssetActionsMenu({
   onDelete,
   onMoveToReferences,
   onRemoveFromReferences,
+  onOpenPreview,
 }: {
   asset: any;
   folders: any[];
@@ -4235,88 +3454,721 @@ function AssetActionsMenu({
   onDelete: () => void;
   onMoveToReferences?: () => void;
   onRemoveFromReferences?: () => void;
+  onOpenPreview?: () => void;
 }) {
+  const t = useT();
+  const creativeContextEnabled = useCreativeContextLab();
+  const [contextOpen, setContextOpen] = useState(false);
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button
-          type="button"
-          variant="secondary"
-          size="icon"
-          className="h-8 w-8 shadow-sm"
-          aria-label="Asset actions"
-          disabled={busy}
-        >
-          <IconDotsVertical className="h-4 w-4" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuItem asChild>
-          <Link to={`/asset/${asset.id}`}>View details</Link>
-        </DropdownMenuItem>
-        {onMoveToReferences ? (
-          <DropdownMenuItem
-            onSelect={(event) => {
-              event.preventDefault();
-              onMoveToReferences();
-            }}
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            type="button"
+            variant="secondary"
+            size="icon-sm"
+            className="shadow-sm"
+            aria-label={t("library.assetActions")}
+            disabled={busy}
           >
-            <IconPhotoPlus className="mr-2 h-4 w-4 shrink-0" />
-            Add to References
-          </DropdownMenuItem>
-        ) : null}
-        {onRemoveFromReferences ? (
-          <DropdownMenuItem
-            onSelect={(event) => {
-              event.preventDefault();
-              onRemoveFromReferences();
-            }}
-          >
-            <IconX className="mr-2 h-4 w-4 shrink-0" />
-            Remove from References
-          </DropdownMenuItem>
-        ) : null}
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger>
-            <IconFolder className="mr-2 h-4 w-4 shrink-0" />
-            Move to
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent>
+            <IconDotsVertical className="h-4 w-4" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          {onOpenPreview ? (
             <DropdownMenuItem
-              onSelect={() =>
-                updateAsset.mutate({
-                  id: asset.id,
-                  folderId: null,
-                })
-              }
+              onSelect={(event) => {
+                event.preventDefault();
+                onOpenPreview();
+              }}
             >
-              Unfiled
+              <IconArrowUpRight className="mr-2 h-4 w-4 shrink-0" />
+              {t("library.viewDetails")}
             </DropdownMenuItem>
-            {folders.map((folder) => (
+          ) : (
+            <DropdownMenuItem asChild>
+              <Link to={`/asset/${asset.id}`}>
+                <IconArrowUpRight className="mr-2 h-4 w-4 shrink-0" />
+                {t("library.viewDetails")}
+              </Link>
+            </DropdownMenuItem>
+          )}
+          {creativeContextEnabled ? (
+            <DropdownMenuItem
+              onSelect={(event) => {
+                event.preventDefault();
+                setContextOpen(true);
+              }}
+            >
+              <IconLink className="mr-2 h-4 w-4 shrink-0" />
+              Add to context
+              {/* i18n-ignore assets template UI is raw-English pending template i18n pass */}
+            </DropdownMenuItem>
+          ) : null}
+          {onMoveToReferences ? (
+            <DropdownMenuItem
+              onSelect={(event) => {
+                event.preventDefault();
+                onMoveToReferences();
+              }}
+            >
+              <IconPhotoPlus className="mr-2 h-4 w-4 shrink-0" />
+              {t("library.addToReferences")}
+            </DropdownMenuItem>
+          ) : null}
+          {onRemoveFromReferences ? (
+            <DropdownMenuItem
+              onSelect={(event) => {
+                event.preventDefault();
+                onRemoveFromReferences();
+              }}
+            >
+              <IconX className="mr-2 h-4 w-4 shrink-0" />
+              {t("library.removeFromReferences")}
+            </DropdownMenuItem>
+          ) : null}
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <IconFolder className="mr-2 h-4 w-4 shrink-0" />
+              {t("library.moveTo")}
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
               <DropdownMenuItem
-                key={folder.id}
                 onSelect={() =>
                   updateAsset.mutate({
                     id: asset.id,
-                    folderId: folder.id,
+                    folderId: null,
                   })
                 }
               >
-                {folder.title}
+                {t("library.unfiled")}
               </DropdownMenuItem>
-            ))}
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem
-          className="text-destructive focus:bg-destructive/10 focus:text-destructive"
-          onSelect={onDelete}
+              {folders.map((folder) => (
+                <DropdownMenuItem
+                  key={folder.id}
+                  onSelect={() =>
+                    updateAsset.mutate({
+                      id: asset.id,
+                      folderId: folder.id,
+                    })
+                  }
+                >
+                  {folder.title}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            className="text-destructive focus:bg-destructive/10 focus:text-destructive"
+            onSelect={onDelete}
+          >
+            <IconTrash className="mr-2 h-4 w-4 shrink-0" />
+            {t("assetDetail.delete")}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      {creativeContextEnabled ? (
+        <CreativeContextShareSheet
+          open={contextOpen}
+          onOpenChange={setContextOpen}
+          resource={{
+            appId: "assets",
+            resourceType: "asset",
+            resourceId: asset.id,
+            title: assetDisplayTitle(asset),
+            updatedAt: asset.updatedAt,
+            preview: { kind: "document", label: "Asset" },
+          }}
+        />
+      ) : null}
+    </>
+  );
+}
+
+export function LiveCandidatesStage({
+  slots,
+  draftAssets,
+  libraryId,
+  folders,
+  foldersByLibraryId = {},
+  allowCreateFolder = true,
+  savingSlotId,
+  promotingReferenceKeys,
+  canApproveLibrary,
+  onSave,
+  onSaveDraft,
+  onMoveToReferences,
+  onMoveDraftToReferences,
+  onUse,
+  onUseDraft,
+}: {
+  slots: VariantSlot[];
+  draftAssets: any[];
+  libraryId: string;
+  folders: any[];
+  foldersByLibraryId?: Record<string, any[]>;
+  allowCreateFolder?: boolean;
+  savingSlotId: string | null;
+  promotingReferenceKeys: Set<string>;
+  canApproveLibrary?: (libraryId?: string | null) => boolean;
+  onSave?: (slot: VariantSlot, folderId: string | null) => void;
+  onSaveDraft?: (asset: any, folderId: string | null) => void;
+  onMoveToReferences?: (slot: VariantSlot) => void;
+  onMoveDraftToReferences?: (asset: any) => void;
+  onUse?: (slot: VariantSlot) => void;
+  onUseDraft?: (asset: any) => void;
+}) {
+  const t = useT();
+  const mayApproveIn = (candidateLibraryId?: string | null) =>
+    canApproveLibrary
+      ? canApproveLibrary(candidateLibraryId ?? libraryId)
+      : true;
+  const dismissSlot = useActionMutation("dismiss-variant-slots");
+  const deleteAsset = useActionMutation("delete-asset");
+  const queryClient = useQueryClient();
+  const [dismissTarget, setDismissTarget] = useState<{
+    kind: "slot" | "asset";
+    title: string;
+    slot?: VariantSlot;
+    asset?: any;
+  } | null>(null);
+  const dismissing = dismissSlot.isPending || deleteAsset.isPending;
+
+  const [activeItemId, setActiveItemId] = useState<string | null>(null);
+
+  async function handleDismissCandidate() {
+    if (!dismissTarget || dismissing) return;
+    try {
+      if (dismissTarget.kind === "slot" && dismissTarget.slot) {
+        await dismissSlot.mutateAsync({ slotId: dismissTarget.slot.slotId });
+        removeVariantSlotFromCache(queryClient, dismissTarget.slot);
+        removeAssetsFromLibraryCache(queryClient, libraryId, [
+          dismissTarget.slot.assetId,
+        ]);
+        void queryClient.invalidateQueries({
+          queryKey: ["app-state"],
+          refetchType: "active",
+        });
+      } else if (dismissTarget.kind === "asset" && dismissTarget.asset?.id) {
+        await deleteAsset.mutateAsync({ id: dismissTarget.asset.id });
+        removeAssetsFromLibraryCache(queryClient, libraryId, [
+          dismissTarget.asset.id,
+        ]);
+      }
+      setDismissTarget(null);
+      void queryClient.invalidateQueries({
+        queryKey: ["action", "get-library", { id: libraryId }],
+        refetchType: "active",
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["action", "get-library"],
+        refetchType: "active",
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["action", "list-assets"],
+        refetchType: "active",
+      });
+      toast.success(t("library.dismissedCandidate"));
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t("library.couldNotDismissCandidate"),
+      );
+    }
+  }
+
+  function candidateActions({
+    canUseCandidate,
+    saving,
+    promoting,
+    candidateLibraryId,
+    onSaveCandidate,
+    onAddToReferences,
+    onUseCandidate,
+    onDismiss,
+  }: {
+    canUseCandidate: boolean;
+    saving?: boolean;
+    promoting?: boolean;
+    candidateLibraryId?: string | null;
+    onSaveCandidate?: (folderId: string | null) => void;
+    onAddToReferences?: () => void;
+    onUseCandidate?: () => void;
+    onDismiss: () => void;
+  }) {
+    const busy = saving || promoting || dismissing;
+    const actionLibraryId = candidateLibraryId || libraryId;
+    const candidateFolders =
+      foldersByLibraryId[actionLibraryId] ??
+      (actionLibraryId === libraryId ? folders : []);
+    if (!canUseCandidate) {
+      return (
+        <Button
+          variant="outline-destructive"
+          size="sm"
+          className="w-full justify-center px-2 text-xs"
+          onClick={onDismiss}
+          disabled={busy}
         >
-          <IconTrash className="mr-2 h-4 w-4 shrink-0" />
-          Delete
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
+          {t("library.dismiss")}
+        </Button>
+      );
+    }
+    return (
+      <div className="grid min-w-0 gap-2">
+        {onUseCandidate ? (
+          <Button
+            size="sm"
+            className="min-w-0 justify-center px-2 text-xs"
+            onClick={onUseCandidate}
+            disabled={busy}
+          >
+            {t("library.useCandidate")}
+          </Button>
+        ) : null}
+        <div className="grid min-w-0 grid-cols-1 gap-2 min-[420px]:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
+          {onSaveCandidate ? (
+            <CandidateSaveMenu
+              libraryId={actionLibraryId}
+              folders={candidateFolders}
+              allowCreateFolder={allowCreateFolder}
+              saving={saving}
+              disabled={busy}
+              onSave={(folderId) => onSaveCandidate(folderId)}
+            />
+          ) : null}
+          {onAddToReferences ? (
+            <Button
+              variant="outline"
+              size="sm"
+              className="min-w-0 px-2 text-xs"
+              onClick={onAddToReferences}
+              disabled={busy}
+            >
+              {promoting ? (
+                <Spinner className="h-3.5 w-3.5" />
+              ) : (
+                t("library.addToReferences")
+              )}
+            </Button>
+          ) : null}
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="min-w-0 justify-center px-2 text-xs text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+          onClick={onDismiss}
+          disabled={busy}
+        >
+          {t("library.dismiss")}
+        </Button>
+      </div>
+    );
+  }
+
+  function candidateHeaderActions({
+    canUseCandidate,
+    saving,
+    promoting,
+    candidateLibraryId,
+    onSaveCandidate,
+    onAddToReferences,
+    onUseCandidate,
+    onDismiss,
+  }: {
+    canUseCandidate: boolean;
+    saving?: boolean;
+    promoting?: boolean;
+    candidateLibraryId?: string | null;
+    onSaveCandidate?: (folderId: string | null) => void;
+    onAddToReferences?: () => void;
+    onUseCandidate?: () => void;
+    onDismiss: () => void;
+  }) {
+    const busy = saving || promoting || dismissing;
+    const actionLibraryId = candidateLibraryId || libraryId;
+    const candidateFolders =
+      foldersByLibraryId[actionLibraryId] ??
+      (actionLibraryId === libraryId ? folders : []);
+    if (!canUseCandidate) {
+      return (
+        <Button
+          variant="outline-destructive"
+          size="sm"
+          className="h-7 px-2 text-xs"
+          onClick={onDismiss}
+          disabled={busy}
+        >
+          {t("library.dismiss")}
+        </Button>
+      );
+    }
+    return (
+      <div className="flex flex-wrap items-center gap-1.5">
+        {onUseCandidate ? (
+          <Button
+            size="sm"
+            className="h-7 px-2 text-xs"
+            onClick={onUseCandidate}
+            disabled={busy}
+          >
+            {t("library.useCandidate")}
+          </Button>
+        ) : null}
+        {onSaveCandidate ? (
+          <CandidateSaveMenu
+            libraryId={actionLibraryId}
+            folders={candidateFolders}
+            allowCreateFolder={allowCreateFolder}
+            saving={saving}
+            disabled={busy}
+            onSave={(folderId) => onSaveCandidate(folderId)}
+          />
+        ) : null}
+        {onAddToReferences ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-2 text-xs"
+            onClick={onAddToReferences}
+            disabled={busy}
+          >
+            {promoting ? (
+              <Spinner className="h-3.5 w-3.5" />
+            ) : (
+              t("library.addToReferences")
+            )}
+          </Button>
+        ) : null}
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2 text-xs text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+          onClick={onDismiss}
+          disabled={busy}
+        >
+          {t("library.dismiss")}
+        </Button>
+      </div>
+    );
+  }
+
+  function slotItem(slot: VariantSlot): LaneGalleryItem {
+    const isFailed = slot.status === "failed";
+    const canUseCandidate = slot.status === "ready" && Boolean(slot.assetId);
+    const promotingKey = referencePromotionKey(
+      slot.assetId ? { id: slot.assetId } : null,
+      slot,
+    );
+    const saving = savingSlotId === slot.slotId;
+    const promoting =
+      Boolean(promotingKey) && promotingReferenceKeys.has(promotingKey);
+    const busy = saving || promoting || dismissing;
+    const title = isFailed
+      ? t("library.failedCandidate")
+      : slot.status === "ready"
+        ? t("library.readyCandidate")
+        : t("library.generatingCandidate");
+    return {
+      id: `slot:${slot.slotId}`,
+      title,
+      subtitle: slot.slotId
+        ? shortId(String(slot.slotId))
+        : t("library.liveSlot"),
+      metadata: t("library.live"),
+      status: slot.status,
+      mediaType: "image",
+      href: slot.assetId ? `/asset/${slot.assetId}` : undefined,
+      busy,
+      preview: <VariantPreview slot={slot} fit="contain" />, // i18n-ignore structural preview slot name
+      thumbnail: <VariantPreview slot={slot} />,
+      primaryActions: candidateActions({
+        canUseCandidate,
+        saving,
+        promoting,
+        candidateLibraryId: libraryId,
+        onSaveCandidate:
+          onSave && mayApproveIn(libraryId)
+            ? (folderId) => onSave(slot, folderId)
+            : undefined,
+        onAddToReferences:
+          onMoveToReferences && mayApproveIn(libraryId)
+            ? () => onMoveToReferences(slot)
+            : undefined,
+        onUseCandidate: onUse ? () => onUse(slot) : undefined,
+        onDismiss: () =>
+          setDismissTarget({
+            kind: "slot",
+            title,
+            slot,
+          }),
+      }),
+      headerActions: candidateHeaderActions({
+        canUseCandidate,
+        saving,
+        promoting,
+        candidateLibraryId: libraryId,
+        onSaveCandidate:
+          onSave && mayApproveIn(libraryId)
+            ? (folderId) => onSave(slot, folderId)
+            : undefined,
+        onAddToReferences:
+          onMoveToReferences && mayApproveIn(libraryId)
+            ? () => onMoveToReferences(slot)
+            : undefined,
+        onUseCandidate: onUse ? () => onUse(slot) : undefined,
+        onDismiss: () =>
+          setDismissTarget({
+            kind: "slot",
+            title,
+            slot,
+          }),
+      }),
+    };
+  }
+
+  function draftItem(asset: any): LaneGalleryItem {
+    const promotingKey = referencePromotionKey(asset);
+    const saving = savingSlotId === `draft:${asset.id}`;
+    const promoting =
+      Boolean(promotingKey) && promotingReferenceKeys.has(promotingKey);
+    const busy = saving || promoting || dismissing;
+    return {
+      id: `draft:${asset.id}`,
+      title: assetDisplayTitle(asset),
+      subtitle:
+        [asset.libraryTitle, assetLineageSourceText(asset)]
+          .filter(Boolean)
+          .join(" / ") || assetCategoryLabel(asset),
+      metadata:
+        asset.mediaType === "video"
+          ? t("library.video")
+          : asset.mimeType?.startsWith("image/")
+            ? t("library.image")
+            : t("library.draft"),
+      status: "draft",
+      mediaType: asset.mediaType === "video" ? "video" : "image",
+      href: `/asset/${asset.id}`,
+      onOpen: () => setPreviewAsset(asset),
+      busy,
+      preview: <AssetPreview asset={asset} fit="contain" />, // i18n-ignore structural preview slot name
+      thumbnail: <AssetPreview asset={asset} />,
+      primaryActions: candidateActions({
+        canUseCandidate: true,
+        saving,
+        promoting,
+        candidateLibraryId: asset.libraryId,
+        onSaveCandidate:
+          onSaveDraft && mayApproveIn(asset.libraryId)
+            ? (folderId) => onSaveDraft(asset, folderId)
+            : undefined,
+        onAddToReferences:
+          onMoveDraftToReferences && mayApproveIn(asset.libraryId)
+            ? () => onMoveDraftToReferences(asset)
+            : undefined,
+        onUseCandidate: onUseDraft ? () => onUseDraft(asset) : undefined,
+        onDismiss: () =>
+          setDismissTarget({
+            kind: "asset",
+            title: assetDisplayTitle(asset),
+            asset,
+          }),
+      }),
+      headerActions: candidateHeaderActions({
+        canUseCandidate: true,
+        saving,
+        promoting,
+        candidateLibraryId: asset.libraryId,
+        onSaveCandidate:
+          onSaveDraft && mayApproveIn(asset.libraryId)
+            ? (folderId) => onSaveDraft(asset, folderId)
+            : undefined,
+        onAddToReferences:
+          onMoveDraftToReferences && mayApproveIn(asset.libraryId)
+            ? () => onMoveDraftToReferences(asset)
+            : undefined,
+        onUseCandidate: onUseDraft ? () => onUseDraft(asset) : undefined,
+        onDismiss: () =>
+          setDismissTarget({
+            kind: "asset",
+            title: assetDisplayTitle(asset),
+            asset,
+          }),
+      }),
+    };
+  }
+
+  const [previewAsset, setPreviewAsset] = useState(null as any);
+  const items = [...slots.map(slotItem), ...draftAssets.map(draftItem)];
+  const itemIds = items.map((item) => item.id).join("\n");
+  const activeItem =
+    items.find((item) => item.id === activeItemId) ?? items[0] ?? null;
+
+  useEffect(() => {
+    if (!items.length) {
+      setActiveItemId(null);
+      return;
+    }
+    setActiveItemId((current) =>
+      current && items.some((item) => item.id === current)
+        ? current
+        : items[0].id,
+    );
+  }, [itemIds, items]);
+
+  return (
+    <>
+      <AlertDialog
+        open={dismissTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !dismissing) setDismissTarget(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t("library.dismissCandidateTitle")}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("library.dismissCandidateDescription", {
+                title: dismissTarget?.title ?? t("library.thisCandidate"),
+              })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={dismissing}>
+              {t("library.cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={dismissing}
+              onClick={(event) => {
+                event.preventDefault();
+                void handleDismissCandidate();
+              }}
+            >
+              {dismissing ? (
+                <>
+                  <Spinner className="h-4 w-4" />
+                  {t("library.dismissing")}
+                </>
+              ) : (
+                t("library.dismiss")
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <section className="min-w-0 overflow-hidden rounded-lg border border-border bg-background">
+        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2 sm:px-4">
+          <h3 className="shrink-0 text-sm font-semibold">
+            {t("library.candidates")}
+          </h3>
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            {activeItem?.headerActions}
+            {activeItem?.onOpen ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 gap-1 px-2 text-xs"
+                onClick={activeItem.onOpen}
+              >
+                <IconArrowUpRight className="h-3.5 w-3.5" />
+                {t("library.openDetails")}
+              </Button>
+            ) : activeItem?.href ? (
+              <Button
+                asChild
+                variant="ghost"
+                size="sm"
+                className="h-7 gap-1 px-2 text-xs"
+              >
+                <Link to={activeItem.href}>
+                  <IconArrowUpRight className="h-3.5 w-3.5" />
+                  {t("library.openDetails")}
+                </Link>
+              </Button>
+            ) : null}
+            <LiveCandidatesActions
+              slots={slots}
+              draftAssets={draftAssets}
+              libraryId={libraryId}
+            />
+          </div>
+        </div>
+        <div className="min-w-0 bg-muted/10 p-2.5 sm:p-3">
+          <div
+            className={[
+              "group relative overflow-hidden rounded-lg border border-border bg-background shadow-sm",
+              activeItem?.busy ? "opacity-80" : "",
+            ].join(" ")}
+            aria-busy={activeItem?.busy}
+          >
+            <div className="h-[min(60vh,30rem)] overflow-hidden bg-muted/30">
+              {activeItem?.onOpen ? (
+                <button
+                  type="button"
+                  onClick={activeItem.onOpen}
+                  className="block h-full w-full text-left"
+                >
+                  {activeItem.preview}
+                </button>
+              ) : activeItem?.href ? (
+                <Link to={activeItem.href} className="block h-full w-full">
+                  {activeItem.preview}
+                </Link>
+              ) : (
+                activeItem?.preview
+              )}
+            </div>
+            {activeItem?.busy ? (
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/20">
+                <Spinner className="h-5 w-5" />
+              </div>
+            ) : null}
+          </div>
+          <div className="mt-2.5 flex gap-2 overflow-x-auto pb-1">
+            {items.map((item) => {
+              const active = item.id === activeItem?.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setActiveItemId(item.id)}
+                  className={[
+                    "group relative h-16 w-24 shrink-0 overflow-hidden rounded-md border bg-background transition",
+                    active
+                      ? "border-primary ring-2 ring-primary/25"
+                      : "border-border/80 hover:border-foreground/30",
+                  ].join(" ")}
+                  aria-label={t("library.showCandidate", {
+                    title: item.title,
+                  })}
+                  aria-pressed={active}
+                >
+                  {item.thumbnail}
+                  <span className="pointer-events-none absolute inset-x-0 bottom-0 h-6 bg-linear-to-t from-background/90 to-transparent" />
+                  {item.busy && item.showBusyOverlay !== false ? (
+                    <span className="absolute right-1.5 top-1.5 rounded-full bg-background/90 p-1 shadow-sm">
+                      <Spinner className="h-3 w-3" />
+                    </span>
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </section>
+
+      <AssetPreviewDialog
+        asset={previewAsset}
+        assets={draftAssets as PreviewAsset[]}
+        onAssetChange={setPreviewAsset}
+      />
+    </>
   );
 }
 
@@ -4324,9 +4176,10 @@ function VariantPreview({
   slot,
   fit = "cover",
 }: {
-  slot: any;
+  slot: VariantSlot;
   fit?: "cover" | "contain";
 }) {
+  const t = useT();
   const [sourceIndex, setSourceIndex] = useState(0);
   const [previewUnavailable, setPreviewUnavailable] = useState(false);
   const previewSources = assetPreviewSources(slot, "thumbnail");
@@ -4364,575 +4217,114 @@ function VariantPreview({
         </div>
       ) : previewUnavailable ? (
         <div className="p-4 text-center text-xs text-muted-foreground">
-          Preview unavailable
+          {t("assetDetail.previewUnavailable")}
         </div>
       ) : (
-        <IconPhoto className="h-8 w-8 animate-pulse text-muted-foreground" />
+        <div className="flex flex-col items-center gap-2 text-muted-foreground">
+          <IconPhoto className="h-8 w-8 animate-pulse" />
+          {fit === "contain" ? (
+            <span className="text-xs font-medium">
+              {t("library.rendering")}
+            </span>
+          ) : null}
+        </div>
       )}
     </div>
   );
 }
 
-function VariantActionsMenu({
-  slot,
+function CandidateSaveMenu({
   libraryId,
-  busy,
-  onMoveToReferences,
+  folders,
+  allowCreateFolder = true,
+  saving,
+  disabled,
+  onSave,
 }: {
-  slot: any;
   libraryId: string;
-  busy?: boolean;
-  onMoveToReferences?: () => void;
+  folders: any[];
+  allowCreateFolder?: boolean;
+  saving?: boolean;
+  disabled?: boolean;
+  onSave: (folderId: string | null) => void;
 }) {
-  const dismissSlot = useActionMutation("dismiss-variant-slots");
+  const t = useT();
+  const createFolder = useActionMutation("create-folder");
   const queryClient = useQueryClient();
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const isFailed = slot.status === "failed";
-  const label = isFailed ? "Dismiss" : "Delete";
+  const [createOpen, setCreateOpen] = useState(false);
+  const pending = saving || createFolder.isPending;
 
   return (
     <>
+      {allowCreateFolder ? (
+        <CreateFolderDialog
+          open={createOpen}
+          onOpenChange={setCreateOpen}
+          onSubmit={async (title) => {
+            const folder = (await createFolder.mutateAsync({
+              libraryId,
+              title,
+              parentId: null,
+            })) as any;
+            void queryClient.invalidateQueries({
+              queryKey: ["action", "get-library", { id: libraryId }],
+              refetchType: "active",
+            });
+            void queryClient.invalidateQueries({
+              queryKey: ["action", "list-libraries"],
+              refetchType: "active",
+            });
+            setCreateOpen(false);
+            if (folder?.id) onSave(folder.id);
+          }}
+          pending={createFolder.isPending}
+        />
+      ) : null}
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
-            type="button"
-            variant="secondary"
-            size="icon"
-            className="h-8 w-8 shadow-sm"
-            aria-label="Candidate actions"
-            disabled={busy || dismissSlot.isPending}
+            size="sm"
+            className="min-w-0 px-2 text-xs"
+            disabled={disabled}
           >
-            <IconDotsVertical className="h-4 w-4" />
+            {pending ? (
+              <Spinner className="h-3.5 w-3.5" />
+            ) : (
+              t("library.saveTo")
+            )}
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end">
-          {onMoveToReferences && !isFailed ? (
-            <DropdownMenuItem
-              onSelect={(event) => {
-                event.preventDefault();
-                onMoveToReferences();
-              }}
-            >
-              <IconPhotoPlus className="mr-2 h-4 w-4 shrink-0" />
-              Add to References
-            </DropdownMenuItem>
-          ) : null}
-          <DropdownMenuItem
-            className="text-destructive focus:bg-destructive/10 focus:text-destructive"
-            onSelect={(event) => {
-              event.preventDefault();
-              setConfirmOpen(true);
-            }}
-          >
-            <IconTrash className="mr-2 h-4 w-4 shrink-0" />
-            {label}
+        <DropdownMenuContent align="start">
+          <DropdownMenuItem onSelect={() => onSave(null)}>
+            <IconFolder className="mr-2 h-4 w-4 shrink-0" />
+            {t("library.unfiled")}
           </DropdownMenuItem>
+          {folders.map((folder) => (
+            <DropdownMenuItem
+              key={folder.id}
+              onSelect={() => onSave(folder.id)}
+            >
+              <IconFolder className="mr-2 h-4 w-4 shrink-0" />
+              {t("library.folderLabel", { title: folder.title })}
+            </DropdownMenuItem>
+          ))}
+          {allowCreateFolder ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onSelect={(event) => {
+                  event.preventDefault();
+                  setCreateOpen(true);
+                }}
+              >
+                <IconFolderPlus className="mr-2 h-4 w-4 shrink-0" />
+                {t("library.newFolderEllipsis")}
+              </DropdownMenuItem>
+            </>
+          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
-
-      <AlertDialog
-        open={confirmOpen}
-        onOpenChange={(open) => {
-          if (!dismissSlot.isPending) setConfirmOpen(open);
-        }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {isFailed ? "Dismiss this slot?" : "Delete candidate?"}
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {isFailed
-                ? "Removes this failed slot from the live candidates panel."
-                : "Removes this candidate from the brand kit and clears its slot."}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={dismissSlot.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={dismissSlot.isPending}
-              onClick={(event) => {
-                event.preventDefault();
-                dismissSlot.mutate(
-                  { slotId: slot.slotId },
-                  {
-                    onSuccess: () => {
-                      removeVariantSlotFromCache(queryClient, slot);
-                      removeAssetsFromLibraryCache(queryClient, libraryId, [
-                        slot.assetId,
-                      ]);
-                      setConfirmOpen(false);
-                      void queryClient.invalidateQueries({
-                        queryKey: ["app-state", "asset-variants"],
-                        refetchType: "active",
-                      });
-                    },
-                    onError: (error) =>
-                      toast.error(
-                        error.message || "Could not clear candidate.",
-                      ),
-                  },
-                );
-              }}
-            >
-              {dismissSlot.isPending ? (
-                <>
-                  <Spinner className="h-4 w-4" />
-                  {isFailed ? "Dismissing..." : "Deleting..."}
-                </>
-              ) : (
-                label
-              )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </>
-  );
-}
-
-function PendingUploadLaneTile({ upload }: { upload: PendingUpload }) {
-  const isChecking = upload.status === "checking";
-  return (
-    <div className="w-[144px] shrink-0 overflow-hidden rounded-md border border-dashed border-border bg-background sm:w-[156px]">
-      <div className="flex aspect-[4/3] items-center justify-center bg-muted/30">
-        <div className="flex flex-col items-center gap-2 text-muted-foreground">
-          <Spinner className="h-5 w-5" />
-          <span className="text-xs font-medium">
-            {isChecking ? "Checking" : "Uploading"}
-          </span>
-        </div>
-      </div>
-      <div className="p-2.5">
-        <div className="flex items-center gap-2 truncate text-xs font-medium">
-          {upload.mediaType === "video" ? (
-            <IconVideo className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-          ) : (
-            <IconPhoto className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-          )}
-          <span className="truncate">{upload.name}</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function AssetLaneTile({
-  asset,
-  folders,
-  selected,
-  deleting,
-  saving,
-  promoting,
-  onToggle,
-  onDelete,
-  updateAsset,
-  onSave,
-  onMoveToReferences,
-}: {
-  asset: any;
-  folders: any[];
-  selected: boolean;
-  deleting?: boolean;
-  saving?: boolean;
-  promoting?: boolean;
-  onToggle: (checked: boolean) => void;
-  onDelete: () => void;
-  updateAsset: any;
-  onSave?: () => void;
-  onMoveToReferences?: () => void;
-}) {
-  const displayTitle = assetDisplayTitle(asset);
-  const sourceText = assetLineageSourceText(asset);
-  const canMoveToReferences = Boolean(onMoveToReferences);
-  const hasPrimaryActions = Boolean(onSave || canMoveToReferences);
-  const categoryLabel = assetCategoryLabel(asset);
-  const busy = deleting || saving || promoting;
-
-  return (
-    <div
-      className={[
-        "group relative w-[144px] shrink-0 overflow-hidden rounded-md border bg-background transition sm:w-[156px]",
-        selected
-          ? "border-primary ring-2 ring-primary/25"
-          : "border-border/80 hover:border-foreground/20",
-        deleting ? "opacity-60" : "",
-      ].join(" ")}
-      aria-busy={busy}
-    >
-      <div className="absolute left-2 top-2 z-10">
-        <Checkbox
-          checked={selected}
-          onCheckedChange={(checked) => onToggle(checked === true)}
-          aria-label={`Select ${displayTitle}`}
-          className={[
-            "border-background bg-background/90 shadow-sm opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100",
-            selected ? "sm:opacity-100" : "",
-          ].join(" ")}
-        />
-      </div>
-      <div className="absolute right-2 top-2 z-10">
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              type="button"
-              variant="secondary"
-              size="icon"
-              className="h-8 w-8 shadow-sm opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 data-[state=open]:opacity-100"
-              aria-label="Asset actions"
-              disabled={busy}
-            >
-              <IconDotsVertical className="h-4 w-4" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuItem asChild>
-              <Link to={`/asset/${asset.id}`}>View details</Link>
-            </DropdownMenuItem>
-            {canMoveToReferences ? (
-              <DropdownMenuItem
-                onSelect={(event) => {
-                  event.preventDefault();
-                  onMoveToReferences?.();
-                }}
-              >
-                <IconPhotoPlus className="mr-2 h-4 w-4 shrink-0" />
-                Add to References
-              </DropdownMenuItem>
-            ) : null}
-            <DropdownMenuSub>
-              <DropdownMenuSubTrigger>
-                <IconFolder className="mr-2 h-4 w-4 shrink-0" />
-                Move to
-              </DropdownMenuSubTrigger>
-              <DropdownMenuSubContent>
-                <DropdownMenuItem
-                  onSelect={() =>
-                    updateAsset.mutate({
-                      id: asset.id,
-                      folderId: null,
-                    })
-                  }
-                >
-                  Unfiled
-                </DropdownMenuItem>
-                {folders.map((folder) => (
-                  <DropdownMenuItem
-                    key={folder.id}
-                    onSelect={() =>
-                      updateAsset.mutate({
-                        id: asset.id,
-                        folderId: folder.id,
-                      })
-                    }
-                  >
-                    {folder.title}
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuSubContent>
-            </DropdownMenuSub>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              className="text-destructive focus:bg-destructive/10 focus:text-destructive"
-              onSelect={onDelete}
-            >
-              <IconTrash className="mr-2 h-4 w-4 shrink-0" />
-              Delete
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </div>
-      <Link to={`/asset/${asset.id}`} className="block outline-none">
-        <div className="relative aspect-[4/3] bg-muted">
-          <AssetPreview asset={asset} />
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-background via-background/90 to-transparent px-2 pb-2 pt-8">
-            <div className="flex items-center gap-1.5 truncate text-xs font-medium">
-              {asset.mediaType === "video" ? (
-                <IconVideo className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              ) : (
-                <IconPhoto className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              )}
-              <span className="truncate">{displayTitle}</span>
-            </div>
-            <div className="mt-1 flex min-w-0 items-center gap-1 overflow-hidden text-[10px] font-medium text-muted-foreground">
-              {sourceText ? (
-                <span className="truncate">{sourceText}</span>
-              ) : (
-                <>
-                  <span className="truncate">{asset.status}</span>
-                  {categoryLabel ? (
-                    <>
-                      <span className="shrink-0 text-muted-foreground/60">
-                        /
-                      </span>
-                      <span className="truncate">{categoryLabel}</span>
-                    </>
-                  ) : null}
-                </>
-              )}
-            </div>
-          </div>
-        </div>
-      </Link>
-      {hasPrimaryActions ? (
-        <div className="space-y-2 border-t border-border/70 p-2">
-          <div
-            className={
-              onSave && canMoveToReferences
-                ? "grid grid-cols-1 gap-2"
-                : "grid grid-cols-2 gap-2"
-            }
-          >
-            {onSave ? (
-              <Button
-                size="sm"
-                className="h-8 px-2 text-xs"
-                onClick={onSave}
-                disabled={busy}
-              >
-                {saving ? <Spinner className="h-3.5 w-3.5" /> : "Save"}
-              </Button>
-            ) : null}
-            {canMoveToReferences ? (
-              <Button
-                variant="outline"
-                size="sm"
-                className={
-                  onSave ? "h-8 px-2 text-xs" : "col-span-2 h-8 px-2 text-xs"
-                }
-                onClick={onMoveToReferences}
-                disabled={busy}
-                title="Add to References"
-              >
-                {promoting ? (
-                  <Spinner className="h-3.5 w-3.5" />
-                ) : (
-                  "Add to References"
-                )}
-              </Button>
-            ) : null}
-          </div>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function VariantLaneTile({
-  slot,
-  libraryId,
-  onSave,
-  onMoveToReferences,
-  saving = false,
-  promoting = false,
-}: {
-  slot: any;
-  libraryId: string;
-  onSave: () => void;
-  onMoveToReferences?: () => void;
-  saving?: boolean;
-  promoting?: boolean;
-}) {
-  const dismissSlot = useActionMutation("dismiss-variant-slots");
-  const queryClient = useQueryClient();
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const [sourceIndex, setSourceIndex] = useState(0);
-  const [previewUnavailable, setPreviewUnavailable] = useState(false);
-  const previewSources = assetPreviewSources(slot, "thumbnail");
-  const previewSourcesKey = previewSources.join("\n");
-  const isFailed = slot.status === "failed";
-  const label = isFailed ? "Dismiss" : "Delete";
-  const busy = saving || promoting || dismissSlot.isPending;
-  const previewSrc = previewSources[sourceIndex];
-
-  useEffect(() => {
-    setSourceIndex(0);
-    setPreviewUnavailable(false);
-  }, [previewSourcesKey]);
-
-  return (
-    <div
-      className="group relative w-[144px] shrink-0 overflow-hidden rounded-md border border-border/80 bg-background transition hover:border-foreground/20 sm:w-[156px]"
-      aria-busy={busy}
-    >
-      <div className="absolute right-2 top-2 z-10">
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              type="button"
-              variant="secondary"
-              size="icon"
-              className="h-8 w-8 shadow-sm opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 data-[state=open]:opacity-100"
-              aria-label="Candidate actions"
-              disabled={busy}
-            >
-              <IconDotsVertical className="h-4 w-4" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            {onMoveToReferences && !isFailed ? (
-              <DropdownMenuItem
-                onSelect={(event) => {
-                  event.preventDefault();
-                  onMoveToReferences?.();
-                }}
-              >
-                <IconPhotoPlus className="mr-2 h-4 w-4 shrink-0" />
-                Add to References
-              </DropdownMenuItem>
-            ) : null}
-            <DropdownMenuItem
-              className="text-destructive focus:bg-destructive/10 focus:text-destructive"
-              onSelect={(event) => {
-                event.preventDefault();
-                setConfirmOpen(true);
-              }}
-            >
-              <IconTrash className="mr-2 h-4 w-4 shrink-0" />
-              {label}
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </div>
-
-      <AlertDialog
-        open={confirmOpen}
-        onOpenChange={(open) => {
-          if (!dismissSlot.isPending) setConfirmOpen(open);
-        }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {isFailed ? "Dismiss this slot?" : "Delete candidate?"}
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {isFailed
-                ? "Removes this failed slot from the live candidates panel."
-                : "Removes this candidate from the brand kit and clears its slot."}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={dismissSlot.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={dismissSlot.isPending}
-              onClick={(event) => {
-                event.preventDefault();
-                dismissSlot.mutate(
-                  { slotId: slot.slotId },
-                  {
-                    onSuccess: () => {
-                      removeVariantSlotFromCache(queryClient, slot);
-                      removeAssetsFromLibraryCache(queryClient, libraryId, [
-                        slot.assetId,
-                      ]);
-                      setConfirmOpen(false);
-                      void queryClient.invalidateQueries({
-                        queryKey: ["app-state", "asset-variants"],
-                        refetchType: "active",
-                      });
-                    },
-                    onError: (error) =>
-                      toast.error(
-                        error.message || "Could not clear candidate.",
-                      ),
-                  },
-                );
-              }}
-            >
-              {dismissSlot.isPending ? (
-                <>
-                  <Spinner className="h-4 w-4" />
-                  {isFailed ? "Dismissing..." : "Deleting..."}
-                </>
-              ) : (
-                label
-              )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      <div className="relative flex aspect-[4/3] items-center justify-center bg-muted">
-        {previewSrc && !previewUnavailable ? (
-          <img
-            src={previewSrc}
-            alt=""
-            className="h-full w-full object-cover"
-            onError={() => {
-              const nextIndex = sourceIndex + 1;
-              if (nextIndex < previewSources.length) {
-                setSourceIndex(nextIndex);
-              } else {
-                setPreviewUnavailable(true);
-              }
-            }}
-          />
-        ) : isFailed ? (
-          <div className="p-4 text-center text-xs text-destructive">
-            {slot.error}
-          </div>
-        ) : previewUnavailable ? (
-          <div className="p-4 text-center text-xs text-muted-foreground">
-            Preview unavailable
-          </div>
-        ) : (
-          <IconPhoto className="h-8 w-8 animate-pulse text-muted-foreground" />
-        )}
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-background via-background/90 to-transparent px-2 pb-2 pt-8">
-          <div className="flex items-center justify-between gap-2">
-            <span className="truncate text-xs font-medium">
-              {slot.status === "ready" ? "Ready candidate" : "Generating"}
-            </span>
-            <span className="shrink-0 text-[10px] text-muted-foreground">
-              {slot.slotId ? shortId(String(slot.slotId)) : "slot"}
-            </span>
-          </div>
-        </div>
-      </div>
-      {slot.status === "ready" ? (
-        <div className="border-t border-border/70 p-2">
-          <div
-            className={
-              onMoveToReferences
-                ? "grid grid-cols-1 gap-2"
-                : "grid grid-cols-2 gap-2"
-            }
-          >
-            <Button
-              size="sm"
-              className="h-8 px-2 text-xs"
-              onClick={onSave}
-              disabled={busy}
-            >
-              {saving ? <Spinner className="h-3.5 w-3.5" /> : "Save"}
-            </Button>
-            {onMoveToReferences ? (
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-8 px-2 text-xs"
-                onClick={onMoveToReferences}
-                disabled={busy}
-                title="Add to References"
-              >
-                {promoting ? (
-                  <Spinner className="h-3.5 w-3.5" />
-                ) : (
-                  "Add to References"
-                )}
-              </Button>
-            ) : null}
-          </div>
-        </div>
-      ) : null}
-    </div>
   );
 }
 
@@ -4947,6 +4339,7 @@ function CreateFolderDialog({
   onSubmit: (title: string) => void | Promise<void>;
   pending?: boolean;
 }) {
+  const t = useT();
   const [title, setTitle] = useState("");
   async function submit() {
     const trimmed = title.trim();
@@ -4956,7 +4349,9 @@ function CreateFolderDialog({
       setTitle("");
     } catch (error) {
       toast.error(
-        error instanceof Error ? error.message : "Could not create folder",
+        error instanceof Error
+          ? error.message
+          : t("library.couldNotCreateFolder"),
       );
     }
   }
@@ -4964,14 +4359,13 @@ function CreateFolderDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>New folder</DialogTitle>
+          <DialogTitle>{t("library.newFolder")}</DialogTitle>
           <DialogDescription>
-            Group uploaded and generated assets for a campaign, channel, or
-            reusable collection.
+            {t("library.newFolderDescription")}
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-2">
-          <Label htmlFor="folder-title">Name</Label>
+          <Label htmlFor="folder-title">{t("library.name")}</Label>
           <Input
             id="folder-title"
             value={title}
@@ -4982,13 +4376,13 @@ function CreateFolderDialog({
                 void submit();
               }
             }}
-            placeholder="Campaign launch"
+            placeholder={t("library.folderNamePlaceholder")}
             autoFocus
           />
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Cancel
+            {t("library.cancel")}
           </Button>
           <Button
             disabled={!title.trim() || pending}
@@ -4996,7 +4390,7 @@ function CreateFolderDialog({
               void submit();
             }}
           >
-            Create
+            {t("library.create")}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -5006,19 +4400,74 @@ function CreateFolderDialog({
 
 function LiveCandidatesActions({
   slots,
+  draftAssets,
   libraryId,
 }: {
   slots: any[];
+  draftAssets: any[];
   libraryId: string;
 }) {
+  const t = useT();
   const dismissSlots = useActionMutation("dismiss-variant-slots");
+  const deleteAssets = useActionMutation("delete-assets");
   const queryClient = useQueryClient();
   const [pending, setPending] = useState<"failed" | "all" | null>(null);
   const failedCount = slots.filter((s) => s.status === "failed").length;
+  const draftCount = draftAssets.length;
+  const totalCount = slots.length + draftCount;
   const hasFailed = failedCount > 0;
-  const isClearing = dismissSlots.isPending;
-  const actionLabel = pending === "failed" ? "Dismiss failed" : "Clear all";
-  const busyLabel = pending === "failed" ? "Dismissing..." : "Clearing...";
+  const isClearing = dismissSlots.isPending || deleteAssets.isPending;
+  const actionLabel =
+    pending === "failed"
+      ? t("library.dismissFailed")
+      : t("library.clearAllWithCount", { count: totalCount });
+  const busyLabel =
+    pending === "failed" ? t("library.dismissing") : t("library.clearing");
+
+  async function handleClear(scope: "failed" | "all") {
+    const slotAssetIds = slots
+      .filter((slot) => scope === "all" || slot.status === "failed")
+      .map((slot) => slot.assetId)
+      .filter((assetId): assetId is string => typeof assetId === "string");
+    const draftAssetIds =
+      scope === "all" ? draftAssets.map((asset) => asset.id) : [];
+    const removedAssetIds = [...new Set([...slotAssetIds, ...draftAssetIds])];
+    try {
+      if (slots.length > 0 && (scope === "all" || failedCount > 0)) {
+        await dismissSlots.mutateAsync({ scope });
+        removeVariantSlotsByScopeFromCache(queryClient, scope);
+      }
+      if (draftAssetIds.length > 0) {
+        await deleteAssets.mutateAsync({ ids: draftAssetIds });
+      }
+      if (removedAssetIds.length > 0) {
+        removeAssetsFromLibraryCache(queryClient, libraryId, removedAssetIds);
+      }
+      setPending(null);
+      void queryClient.invalidateQueries({
+        queryKey: ["app-state"],
+        refetchType: "active",
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["action", "get-library", { id: libraryId }],
+        refetchType: "active",
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["action", "get-library"],
+        refetchType: "active",
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["action", "list-assets"],
+        refetchType: "active",
+      });
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t("library.couldNotClearCandidates"),
+      );
+    }
+  }
 
   return (
     <>
@@ -5032,17 +4481,19 @@ function LiveCandidatesActions({
           <AlertDialogHeader>
             <AlertDialogTitle>
               {pending === "failed"
-                ? `Dismiss ${failedCount} failed ${failedCount === 1 ? "slot" : "slots"}?`
-                : "Clear all live candidates?"}
+                ? t("library.dismissFailedSlotsTitle", { count: failedCount })
+                : t("library.clearCandidatesTitle", { count: totalCount })}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {pending === "failed"
-                ? "Removes every failed slot from the panel. Successful candidates stay."
-                : "Clears the live candidates panel and deletes any unsaved candidate rows."}
+                ? t("library.dismissFailedSlotsDescription")
+                : t("library.clearCandidatesDescription")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={isClearing}>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={isClearing}>
+              {t("library.cancel")}
+            </AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               disabled={isClearing || pending === null}
@@ -5050,31 +4501,7 @@ function LiveCandidatesActions({
                 event.preventDefault();
                 const scope = pending;
                 if (!scope) return;
-                const removedAssetIds = slots
-                  .filter((slot) => scope === "all" || slot.status === "failed")
-                  .map((slot) => slot.assetId);
-                dismissSlots.mutate(
-                  { scope },
-                  {
-                    onSuccess: () => {
-                      removeVariantSlotsByScopeFromCache(queryClient, scope);
-                      removeAssetsFromLibraryCache(
-                        queryClient,
-                        libraryId,
-                        removedAssetIds,
-                      );
-                      setPending(null);
-                      void queryClient.invalidateQueries({
-                        queryKey: ["app-state", "asset-variants"],
-                        refetchType: "active",
-                      });
-                    },
-                    onError: (error) =>
-                      toast.error(
-                        error.message || "Could not clear live candidates.",
-                      ),
-                  },
-                );
+                void handleClear(scope);
               }}
             >
               {isClearing ? (
@@ -5094,54 +4521,41 @@ function LiveCandidatesActions({
         <DropdownMenuTrigger asChild>
           <Button
             type="button"
-            variant="outline"
-            size="sm"
-            className="gap-2"
-            aria-label="Live candidates actions"
+            variant="ghost"
+            size="icon-sm"
+            aria-label={t("library.candidateActions")}
+            title={t("library.candidateActions")}
             disabled={isClearing}
           >
             <IconDotsVertical className="h-4 w-4" />
-            Clear
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          <DropdownMenuItem
-            disabled={!hasFailed || isClearing}
-            onSelect={(event) => {
-              event.preventDefault();
-              setPending("failed");
-            }}
-          >
-            <IconTrash className="mr-2 h-4 w-4 shrink-0" />
-            Dismiss failed ({failedCount})
-          </DropdownMenuItem>
+          {hasFailed ? (
+            <DropdownMenuItem
+              disabled={isClearing}
+              onSelect={(event) => {
+                event.preventDefault();
+                setPending("failed");
+              }}
+            >
+              <IconTrash className="mr-2 h-4 w-4 shrink-0" />
+              {t("library.dismissFailedWithCount", { count: failedCount })}
+            </DropdownMenuItem>
+          ) : null}
           <DropdownMenuItem
             className="text-destructive focus:bg-destructive/10 focus:text-destructive"
-            disabled={isClearing}
+            disabled={isClearing || totalCount === 0}
             onSelect={(event) => {
               event.preventDefault();
               setPending("all");
             }}
           >
             <IconTrash className="mr-2 h-4 w-4 shrink-0" />
-            Clear all
+            {t("library.clearAllWithCount", { count: totalCount })}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
     </>
   );
-}
-
-function useVariantState() {
-  return useQuery({
-    queryKey: ["app-state", "asset-variants"],
-    queryFn: async () => {
-      const res = await fetch(
-        agentNativePath("/_agent-native/application-state/asset-variants"),
-      );
-      if (!res.ok) return null;
-      return res.json();
-    },
-    refetchInterval: 1000,
-  }) as any;
 }

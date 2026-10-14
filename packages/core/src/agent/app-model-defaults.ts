@@ -1,3 +1,8 @@
+import { getDbExec } from "../db/client.js";
+import {
+  getRequestOrgId,
+  getRequestUserEmail,
+} from "../server/request-context.js";
 import {
   deleteOrgSetting,
   deleteUserSetting,
@@ -6,11 +11,6 @@ import {
   putOrgSetting,
   putUserSetting,
 } from "../settings/index.js";
-import { getDbExec } from "../db/client.js";
-import {
-  getRequestOrgId,
-  getRequestUserEmail,
-} from "../server/request-context.js";
 
 export const AGENT_APP_MODEL_DEFAULT_KEY_PREFIX = "agent-app-model-default";
 
@@ -169,7 +169,10 @@ export async function canUpdateAgentAppModelDefaultSettings(
   try {
     const exec = getDbExec();
     const { rows } = await exec.execute({
-      sql: `SELECT role FROM org_members WHERE org_id = ? AND LOWER(email) = ? LIMIT 1`,
+      sql: `SELECT role FROM org_members
+            WHERE org_id = ? AND LOWER(email) = ?
+              AND federation_removal_pending_at IS NULL
+            LIMIT 1`,
       args: [orgId, userEmail.toLowerCase()],
     });
     const role = String((rows[0] as any)?.role ?? "");

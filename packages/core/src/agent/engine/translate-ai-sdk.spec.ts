@@ -1,4 +1,12 @@
 import { describe, it, expect } from "vitest";
+import { z } from "zod";
+
+import { defineAction } from "../../action.js";
+import { actionsToEngineTools } from "../production-agent.js";
+import {
+  createProviderToolNameMap,
+  PROVIDER_TOOL_NAME_MAX_LENGTH,
+} from "./tool-name.js";
 import {
   engineToolsToAISDK,
   engineMessagesToAISDK,
@@ -52,7 +60,7 @@ describe("engineToolsToAISDK", () => {
     expect(result.greet.inputSchema.properties).toHaveProperty("name");
   });
 
-  it("preserves full JSON Schema constraints when translating tools", () => {
+  it("preserves property constraints and flattens a root oneOf", () => {
     const tools: EngineTool[] = [
       {
         name: "write",
@@ -74,10 +82,122 @@ describe("engineToolsToAISDK", () => {
     expect(result.write.inputSchema).toMatchObject({
       type: "object",
       additionalProperties: false,
-      oneOf: [{ required: ["sql"] }, { required: ["statements"] }],
+      required: [],
     });
+    expect(result.write.inputSchema).not.toHaveProperty("oneOf");
     expect(result.write.inputSchema.properties.sql.minLength).toBe(1);
     expect(result.write.inputSchema.properties.statements.pattern).toBe("^\\[");
+  });
+
+  describe("union action schemas", () => {
+    const COMPOSITIONS = ["anyOf", "oneOf", "allOf"];
+    const surfaceBranches = [
+      z.object({
+        conversationId: z.string(),
+        kind: z.literal("doc"),
+        docId: z.string(),
+      }),
+      z.object({
+        conversationId: z.string(),
+        kind: z.literal("app"),
+        appId: z.string(),
+      }),
+    ] as const;
+
+    function translate(schema: z.ZodType) {
+      const action = defineAction({
+        description: "Open a surface",
+        schema,
+        run: async () => "ok",
+      });
+      const tools = actionsToEngineTools({ probe: action });
+      expect(tools.map((tool) => tool.name)).toEqual(["probe"]);
+      return engineToolsToAISDK(tools).probe.inputSchema as Record<string, any>;
+    }
+
+    it.each([
+      ["z.union", z.union(surfaceBranches)],
+      ["z.discriminatedUnion", z.discriminatedUnion("kind", surfaceBranches)],
+    ])("flattens a %s into one object schema", (_label, schema) => {
+      const inputSchema = translate(schema);
+
+      expect(COMPOSITIONS.filter((key) => key in inputSchema)).toEqual([]);
+      expect(inputSchema.type).toBe("object");
+      expect(Object.keys(inputSchema.properties).sort()).toEqual([
+        "appId",
+        "conversationId",
+        "docId",
+        "kind",
+      ]);
+      expect([...inputSchema.required].sort()).toEqual([
+        "conversationId",
+        "kind",
+      ]);
+      expect(JSON.stringify(inputSchema.properties.kind)).toMatch(
+        /"doc".*"app"/,
+      );
+      expect(inputSchema).not.toHaveProperty("additionalProperties");
+    });
+
+    it("leaves a plain object action schema as it was", () => {
+      const schema = z.object({ q: z.string(), limit: z.number().optional() });
+      const [tool] = actionsToEngineTools({
+        probe: defineAction({
+          description: "Search",
+          schema,
+          run: async () => "ok",
+        }),
+      });
+
+      expect(engineToolsToAISDK([tool!]).probe.inputSchema).toEqual(
+        tool!.inputSchema,
+      );
+    });
+  });
+
+  it("aliases oversized provider names and restores them on tool events", () => {
+    const longName = `mcp__${"server_".repeat(8)}__get_meetings`;
+    const tools: EngineTool[] = [
+      {
+        name: longName,
+        description: "Get meetings",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ];
+    const toolNameMap = createProviderToolNameMap(tools);
+    const providerName = Object.keys(
+      engineToolsToAISDK(tools, undefined, toolNameMap),
+    )[0];
+
+    expect(providerName).toBeDefined();
+    expect(providerName).not.toBe(longName);
+    expect(providerName!.length).toBeLessThanOrEqual(
+      PROVIDER_TOOL_NAME_MAX_LENGTH,
+    );
+
+    const assistant = engineMessagesToAISDK(
+      [
+        {
+          role: "assistant",
+          content: [
+            { type: "tool-call", id: "tc-1", name: longName, input: {} },
+          ],
+        },
+      ],
+      { toolNameMap },
+    ).find((message) => message.role === "assistant");
+    expect(assistant?.content[0].toolName).toBe(providerName);
+    expect(
+      aiSdkPartToEngineEvents(
+        {
+          type: "tool-call",
+          toolCallId: "tc-1",
+          toolName: providerName,
+          input: {},
+        },
+        toolNameMap,
+      ),
+    ).toEqual([{ type: "tool-call", id: "tc-1", name: longName, input: {} }]);
   });
 });
 
@@ -120,6 +240,47 @@ describe("engineMessagesToAISDK", () => {
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
       data: "UEsDBA==",
     });
+  });
+
+  it("replays interrupted tool results as errors with an unknown outcome", () => {
+    const toolCall = (id: string) => ({
+      role: "assistant" as const,
+      content: [
+        { type: "tool-call" as const, id, name: "save-row", input: { id } },
+      ],
+    });
+    const result = engineMessagesToAISDK([
+      toolCall("orphan"),
+      { role: "user", content: [{ type: "text", text: "continue" }] },
+      toolCall("replayed"),
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "replayed",
+            toolName: "save-row",
+            content: "Interrupted before this tool returned a result.",
+          },
+        ],
+      },
+    ]);
+    const outputs = result
+      .flatMap((msg) => (Array.isArray(msg.content) ? msg.content : []))
+      .filter((part: any) => part.type === "tool-result")
+      .map((part: any) => [part.toolCallId, part.output]);
+
+    expect(outputs).toEqual(
+      ["orphan", "replayed"].map((id) => [
+        id,
+        {
+          type: "error-text",
+          value: expect.stringMatching(
+            /^Interrupted before this tool returned a result\. Its outcome is UNKNOWN: the tool may have run\. Verify the current state before repeating any write\.$/,
+          ),
+        },
+      ]),
+    );
   });
 
   it("converts assistant message with tool-call (v6 input field)", () => {
@@ -239,6 +400,81 @@ describe("engineMessagesToAISDK", () => {
     expect(reasoning).toBeDefined();
     expect(reasoning.text).toBe("reasoning about the problem");
     expect(reasoning.providerOptions?.anthropic?.signature).toBe("sig-abc");
+  });
+});
+
+describe("engineMessagesToAISDK tool-result images", () => {
+  const messagesWithImages = (
+    images: import("./types.js").EngineToolResultImagePart[],
+    isError = false,
+  ): EngineMessage[] => [
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "tc-1",
+          toolName: "screenshot",
+          toolInput: "{}",
+          content: "Captured",
+          images,
+          ...(isError ? { isError: true } : {}),
+        },
+      ],
+    },
+  ];
+
+  const firstToolResult = (result: any[]) =>
+    (result[0].content as any[]).find((p: any) => p.type === "tool-result");
+
+  it("emits content output with image-url and image-data when enabled", () => {
+    const result = engineMessagesToAISDK(
+      messagesWithImages([
+        { url: "https://cdn.example.com/shot.png" },
+        { data: "aGVsbG8=", mediaType: "image/jpeg" },
+      ]),
+      { toolResultImages: true },
+    );
+    expect(firstToolResult(result).output).toEqual({
+      type: "content",
+      value: [
+        { type: "text", text: "Captured" },
+        { type: "image-url", url: "https://cdn.example.com/shot.png" },
+        { type: "image-data", data: "aGVsbG8=", mediaType: "image/jpeg" },
+      ],
+    });
+  });
+
+  it("degrades to plain text output when the flag is off (default)", () => {
+    const result = engineMessagesToAISDK(
+      messagesWithImages([{ url: "https://cdn.example.com/shot.png" }]),
+    );
+    expect(firstToolResult(result).output).toEqual({
+      type: "text",
+      value: "Captured",
+    });
+  });
+
+  it("degrades to plain text output when all image entries are malformed", () => {
+    const result = engineMessagesToAISDK(
+      messagesWithImages([{ label: "nothing usable" } as any]),
+      { toolResultImages: true },
+    );
+    expect(firstToolResult(result).output).toEqual({
+      type: "text",
+      value: "Captured",
+    });
+  });
+
+  it("keeps error-text output for error results even with images", () => {
+    const result = engineMessagesToAISDK(
+      messagesWithImages([{ url: "https://cdn.example.com/shot.png" }], true),
+      { toolResultImages: true },
+    );
+    expect(firstToolResult(result).output).toEqual({
+      type: "error-text",
+      value: "Captured",
+    });
   });
 });
 
@@ -385,8 +621,6 @@ describe("aiSdkPartToEngineEvents (v6 stream protocol)", () => {
   });
 
   it("unpacks cacheReadTokens from v6 inputTokenDetails", () => {
-    // Usage is emitted from the terminal `finish` (totalUsage), not per-step,
-    // to avoid double-counting tokens. The cache-detail unpacking is identical.
     const events = aiSdkPartToEngineEvents({
       type: "finish",
       finishReason: "stop",
@@ -409,6 +643,16 @@ describe("aiSdkPartToEngineEvents (v6 stream protocol)", () => {
       cacheReadTokens: 50,
       cacheWriteTokens: 10,
     });
+    // `inputTokens` is the whole prompt and the cache counts are a slice of it,
+    // never an addition — `ai`'s `asLanguageModelUsage` maps `inputTokens.total`
+    // with `noCache` / `cacheRead` / `cacheWrite` beneath it. `calculateCost`
+    // subtracts to price each token once, so an exclusive value here would bill
+    // the cached tokens twice.
+    expect(
+      (usage as any).inputTokens -
+        (usage as any).cacheReadTokens -
+        (usage as any).cacheWriteTokens,
+    ).toBe(40);
   });
 
   it("falls back to deprecated cachedInputTokens on pre-v6 usage shapes", () => {

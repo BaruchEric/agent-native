@@ -8,14 +8,10 @@ import {
   setResponseStatus,
   type H3Event,
 } from "h3";
-import path from "path";
-import { agentEnv } from "../shared/agent-env.js";
+
+import { getAppConfig } from "../app-config/index.js";
+import { getEffectiveDatabaseEnvStatus } from "../db/runtime-diagnostics.js";
 import { readBody } from "../server/h3-helpers.js";
-import {
-  getAllowedCorsOrigin,
-  readCorsAllowedOrigins,
-} from "./cors-origins.js";
-import { isEnvVarWriteAllowed } from "./env-var-writes.js";
 import { EMBED_TARGET_HEADER } from "../shared/embed-auth.js";
 import {
   EMBED_TRANSPLANT_HEADER,
@@ -23,90 +19,38 @@ import {
   MCP_EMBED_CORS_ALLOW_HEADERS,
   shouldAllowMcpEmbedCredentials,
 } from "../shared/mcp-embed-headers.js";
-import { BUILDER_ENV_KEYS } from "./builder-browser.js";
+import { getRuntimeConfigReport } from "../shared/runtime-config.js";
+import { exceptionParts } from "../tracking/redaction.js";
+import {
+  getAllowedCorsOrigin,
+  readCorsAllowedOrigins,
+} from "./cors-origins.js";
+import { runWithRequestContext } from "./request-context.js";
+import type { ScopedKeySaveRequestScope } from "./scoped-key-storage.js";
+
+const getSession: (typeof import("./auth.js"))["getSession"] = (...args) =>
+  import("./auth.js").then(({ getSession }) => getSession(...args));
 
 export interface EnvKeyConfig {
-  /** Environment variable name (e.g. "HUBSPOT_ACCESS_TOKEN") */
   key: string;
-  /** Human-readable label (e.g. "HubSpot") */
   label: string;
-  /** Whether this key is required for the app to function */
   required?: boolean;
-  /** Optional UI hint shown next to the field describing where to find this value. */
   helpText?: string;
+  secret?: boolean;
+  /**
+   * The runtime reads this key only from the deployment environment, so a
+   * value saved in Settings would never be used. Settings shows it as a
+   * deployment variable instead of offering an input.
+   */
+  deploymentOnly?: boolean;
 }
 
 export interface CreateServerOptions {
-  /** CORS options. Ignored (H3 handles CORS via middleware). Default: enabled. */
   cors?: Record<string, unknown> | false;
-  /** JSON body parser limit. Kept for API compatibility (H3 uses readBody). */
   jsonLimit?: string;
-  /** Custom ping message. Default: reads PING_MESSAGE env var, falls back to "pong" */
   pingMessage?: string;
-  /** Disable the /_agent-native/ping health check. Default: false */
   disablePing?: boolean;
-  /** Env key configuration for the settings UI. Enables /_agent-native/env-status and /_agent-native/env-vars routes. */
   envKeys?: EnvKeyConfig[];
-}
-
-/**
- * Upsert vars into a .env file, preserving existing structure.
- */
-export async function upsertEnvFile(
-  envPath: string,
-  vars: Array<{ key: string; value: string }>,
-): Promise<void> {
-  // Sanitize: reject values that could inject additional env vars
-  for (const { key, value } of vars) {
-    if (/[\n\r\0]/.test(value)) {
-      throw new Error(
-        `Invalid env var value for ${key}: must not contain newlines or control characters`,
-      );
-    }
-  }
-
-  const fs = await import("fs");
-
-  let content = "";
-  try {
-    content = fs.readFileSync(envPath, "utf-8");
-  } catch {
-    // File doesn't exist yet
-  }
-
-  const lines = content.split("\n");
-  const remaining = new Map(vars.map((v) => [v.key, v.value]));
-
-  // Update existing lines in place
-  const updated = lines.map((line) => {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) return line;
-    const eqIndex = trimmed.indexOf("=");
-    if (eqIndex === -1) return line;
-    const key = trimmed.slice(0, eqIndex).trim();
-    if (remaining.has(key)) {
-      const value = remaining.get(key)!;
-      remaining.delete(key);
-      return `${key}=${value}`;
-    }
-    return line;
-  });
-
-  // Append new vars
-  for (const [key, value] of remaining) {
-    updated.push(`${key}=${value}`);
-  }
-
-  // Ensure trailing newline
-  let result = updated.join("\n");
-  if (!result.endsWith("\n")) result += "\n";
-
-  try {
-    fs.mkdirSync(path.dirname(envPath), { recursive: true });
-    fs.writeFileSync(envPath, result);
-  } catch {
-    // Edge runtimes don't have writable filesystem — skip silently
-  }
 }
 
 export interface CreateServerResult {
@@ -114,41 +58,27 @@ export interface CreateServerResult {
   router: ReturnType<typeof createRouter>;
 }
 
-/**
- * Create a pre-configured H3 app with standard agent-native setup:
- * - CORS headers via middleware
- * - /_agent-native/ping health check
- * - /_agent-native/env-status and /_agent-native/env-vars (when envKeys is provided)
- *
- * Returns { app, router } — mount routes on `router`.
- */
 export function createServer(
   options: CreateServerOptions = {},
 ): CreateServerResult {
   const app = createApp({
     onError(error, event) {
-      // Suppress connection-reset errors — client disconnected mid-request (tab close, reload)
       const err = error as NodeJS.ErrnoException;
       const code = err?.code || (err?.cause as NodeJS.ErrnoException)?.code;
       if (code === "ECONNRESET" || code === "ECONNABORTED") return;
       if (err?.message === "aborted") return;
+      const parts = exceptionParts(error);
       console.error(
         `[agent-native] Server error: ${event.method} ${event.path}`,
-        error,
+        parts,
       );
     },
   });
 
-  // CORS middleware
   if (options.cors !== false) {
     const allowedOrigins = readCorsAllowedOrigins();
     const isProduction = process.env.NODE_ENV === "production";
 
-    /**
-     * When CORS_ALLOWED_ORIGINS is unset, production only allows trusted
-     * localhost/native desktop origins. Development keeps the legacy "echo
-     * any origin" behavior so local tools and docs previews keep working.
-     */
     app.use(
       defineEventHandler((event) => {
         const requestOrigin = getRequestHeader(event, "origin");
@@ -167,14 +97,6 @@ export function createServer(
             Boolean(getRequestHeader(event, EMBED_TRANSPLANT_HEADER)) ||
             Boolean(getRequestHeader(event, "authorization")));
 
-        /**
-         * Decide whether the requesting origin is allowed. We never fall back
-         * to "the first allowlist entry" when the origin isn't in the list —
-         * that previously sent `Access-Control-Allow-Origin: <other-origin>`
-         * with credentials enabled to attacker-controlled origins, which was
-         * permissive enough that some clients followed through with the
-         * credentialed request.
-         */
         const allowedOrigin = embedCorsRequest
           ? requestOrigin
           : getAllowedCorsOrigin(requestOrigin, {
@@ -183,9 +105,6 @@ export function createServer(
               // Let the cors-origins default apply (dev-only). Passing `true`
               // here unconditionally would re-open the production localhost gap.
             });
-        // No origin header at all (same-origin fetch, server-to-server) and
-        // no allowlist → fall through with `*`-equivalent behaviour: omit
-        // ACAO entirely and let the browser apply its same-origin default.
 
         if (allowedOrigin) {
           setResponseHeader(
@@ -194,11 +113,6 @@ export function createServer(
             allowedOrigin,
           );
           setResponseHeader(event, "Vary", "Origin");
-          // A specific origin means we can honor credentialed requests
-          // (fetch with `credentials: "include"` — used by desktop tray
-          // apps that share a same-site cookie with the web app). The
-          // wildcard `*` is spec-incompatible with credentials, so only
-          // set this when we're echoing a concrete origin.
           if (shouldAllowMcpEmbedCredentials(allowedOrigin)) {
             setResponseHeader(
               event,
@@ -207,9 +121,6 @@ export function createServer(
             );
           }
         } else if (!requestOrigin) {
-          // No origin header — preserve the legacy permissive behaviour for
-          // tools/scripts that hit the API directly (no credentialed CORS
-          // semantics apply when there's no Origin).
           setResponseHeader(event, "Access-Control-Allow-Origin", "*");
         }
 
@@ -225,11 +136,6 @@ export function createServer(
         );
 
         if (method === "OPTIONS") {
-          // Reject preflights from disallowed cross-origin callers. We only
-          // 204 if either (a) there was no Origin header (same-origin or
-          // direct script invocation) or (b) the origin was in the allowlist
-          // / dev fallback above. Otherwise we 403 so the browser surfaces
-          // a hard CORS failure rather than blindly retrying with credentials.
           if (requestOrigin && !allowedOrigin) {
             return new Response(null, { status: 403 });
           }
@@ -240,90 +146,118 @@ export function createServer(
   }
 
   const router = createRouter();
-  app.use(router);
 
-  // Health check
   if (!options.disablePing) {
     router.get(
       "/_agent-native/ping",
-      defineEventHandler(() => {
-        const message =
-          options.pingMessage ?? process.env.PING_MESSAGE ?? "pong";
-        return { message };
+      defineEventHandler(async (event) => {
+        const message = options.pingMessage ?? getAppConfig().app.pingMessage;
+        const configuration =
+          event.url?.searchParams.get("configuration") === "1" ||
+          event.url?.searchParams.get("configuration") === "true";
+        if (!configuration) return { message };
+        // Imported lazily, like credential-provider in the env-status route
+        // below, so createServer does not load it at module load.
+        const { getMissingDeploySettings } =
+          await import("./deploy-settings.js");
+
+        const requirements = {
+          ...(event.url?.searchParams.get("auth") === "0"
+            ? { authEnabled: false }
+            : {}),
+          ...(event.url?.searchParams.get("database") === "0"
+            ? { databaseRequired: false }
+            : {}),
+        };
+        return {
+          message,
+          configuration: getRuntimeConfigReport(process.env, requirements, {
+            phase: "runtime",
+            appName: getAppConfig().app.name,
+            missingDeploySettings: getMissingDeploySettings(),
+          }),
+        };
       }),
     );
   }
 
-  // Env key management routes
   if (options.envKeys) {
     const envKeys = options.envKeys;
+    const allowedEnvKeyNames = envKeys.map(({ key }) => key);
 
     router.get(
       "/_agent-native/env-status",
-      defineEventHandler(() => {
-        return envKeys.map((cfg) => ({
-          key: cfg.key,
-          label: cfg.label,
-          required: cfg.required ?? false,
-          configured: !!process.env[cfg.key],
-          ...(cfg.helpText ? { helpText: cfg.helpText } : {}),
-        }));
+      defineEventHandler(async (event) => {
+        const { resolveSecret } = await import("./credential-provider.js");
+        const session = await getSession(event).catch(() => null);
+        const userEmail = session?.email;
+        let orgId: string | undefined;
+        if (userEmail) {
+          const { getOrgContext } = await import("../org/context.js");
+          const orgCtx = await getOrgContext(event).catch(() => null);
+          orgId = orgCtx?.orgId ?? undefined;
+        }
+        return Promise.all(
+          envKeys.map(async (cfg) => {
+            const effectiveDatabaseStatus = getEffectiveDatabaseEnvStatus(
+              cfg.key,
+            );
+            const configured =
+              effectiveDatabaseStatus ??
+              (await runWithRequestContext({ userEmail, orgId }, () =>
+                resolveSecret(cfg.key).then(Boolean),
+              ));
+            return {
+              key: cfg.key,
+              label: cfg.label,
+              required: cfg.required ?? false,
+              configured,
+              ...(cfg.helpText ? { helpText: cfg.helpText } : {}),
+              ...(cfg.secret === false ? { secret: false } : {}),
+            };
+          }),
+        );
       }),
     );
 
     router.post(
       "/_agent-native/env-vars",
       defineEventHandler(async (event: H3Event) => {
-        // Env vars are deployment-wide globals — see isEnvVarWriteAllowed
-        // above. Disable the endpoint on any multi-tenant deploy.
-        if (!isEnvVarWriteAllowed()) {
-          setResponseStatus(event, 403);
+        const body = await readBody(event);
+        const { vars, scope } = body as {
+          vars?: Array<{ key: string; value: string }>;
+          scope?: ScopedKeySaveRequestScope;
+        };
+        const {
+          findUnsupportedScopedKeyNames,
+          saveKeyValuesToScopedSecrets,
+          ScopedKeyStorageError,
+        } = await import("./scoped-key-storage.js");
+        const unsupportedKeys = findUnsupportedScopedKeyNames(
+          vars,
+          allowedEnvKeyNames,
+        );
+        if (unsupportedKeys.length > 0) {
+          setResponseStatus(event, 400);
           return {
-            error:
-              "env-vars endpoint disabled on multi-tenant deployments. Use scoped secrets or credentials for user/org API keys.",
+            error: `Unsupported env key${unsupportedKeys.length === 1 ? "" : "s"}: ${unsupportedKeys.join(", ")}`,
           };
         }
-
-        const body = await readBody(event);
-        const { vars } = body as {
-          vars?: Array<{ key: string; value: string }>;
-        };
-
-        if (!Array.isArray(vars) || vars.length === 0) {
-          setResponseStatus(event, 400);
-          return { error: "vars array required" };
+        try {
+          const result = await saveKeyValuesToScopedSecrets(event, vars, scope);
+          return { saved: result.saved, storage: "scoped-secrets" };
+        } catch (err) {
+          if (err instanceof ScopedKeyStorageError) {
+            setResponseStatus(event, err.statusCode);
+            return { error: err.message };
+          }
+          setResponseStatus(event, 500);
+          return { error: "Failed to save keys" };
         }
-
-        // Only allow keys that are in the env config
-        const allowedKeys = new Set(envKeys.map((k) => k.key));
-        const blockedEnvVarWriteKeys = new Set<string>(BUILDER_ENV_KEYS);
-        const filtered = vars.filter(
-          (v) =>
-            typeof v.key === "string" &&
-            allowedKeys.has(v.key) &&
-            !blockedEnvVarWriteKeys.has(v.key),
-        );
-        if (filtered.length === 0) {
-          setResponseStatus(event, 400);
-          return { error: "No recognized env keys in request" };
-        }
-
-        // Write to .env file
-        const envPath = path.join(process.cwd(), ".env");
-        await upsertEnvFile(envPath, filtered);
-
-        // Update process.env so the app picks up the new values immediately
-        for (const { key, value } of filtered) {
-          process.env[key] = value;
-        }
-
-        // Notify parent (Builder or frame) via postMessage
-        agentEnv.setVars(filtered);
-
-        return { saved: filtered.map((v) => v.key) };
       }),
     );
   }
 
+  app.use(router);
   return { app, router };
 }

@@ -8,10 +8,25 @@ import {
 } from "./provider-credentials";
 
 const API_BASE = "https://api.hubapi.com";
+const HUBSPOT_SEARCH_MIN_INTERVAL_MS = 200;
 
-// In-memory cache
+let hubspotSearchSchedule = Promise.resolve();
+let nextHubSpotSearchAt = 0;
+
+async function waitForHubSpotSearchSlot(): Promise<void> {
+  const scheduled = hubspotSearchSchedule.then(async () => {
+    const delay = Math.max(0, nextHubSpotSearchAt - Date.now());
+    if (delay > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    nextHubSpotSearchAt = Date.now() + HUBSPOT_SEARCH_MIN_INTERVAL_MS;
+  });
+  hubspotSearchSchedule = scheduled.catch(() => undefined);
+  await scheduled;
+}
+
 const cache = new Map<string, { data: unknown; ts: number }>();
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const CACHE_TTL_MS = 10 * 60 * 1000;
 const MAX_CACHE = 120;
 
 async function getToken(): Promise<string> {
@@ -23,7 +38,7 @@ async function getToken(): Promise<string> {
   });
   if (!credential) {
     throw new Error(
-      "HUBSPOT_PRIVATE_APP_TOKEN or HUBSPOT_ACCESS_TOKEN not configured",
+      "HubSpot is not connected for Analytics. Connect it in Data Sources, then retry.",
     );
   }
   return credential.value;
@@ -89,6 +104,10 @@ async function apiPost<T>(
     return cached.data as T;
   }
 
+  if (path.endsWith("/search")) {
+    await waitForHubSpotSearchSlot();
+  }
+
   const res = await hubspotFetch(`${API_BASE}${path}`, {
     method: "POST",
     headers: {
@@ -113,8 +132,6 @@ async function apiPost<T>(
 
   return data as T;
 }
-
-// -- Types --
 
 export const HUBSPOT_OBJECT_TYPES = [
   "contacts",
@@ -162,6 +179,18 @@ export interface Deal {
     hs_deal_stage_probability: string | null;
     [key: string]: string | null | undefined;
   };
+}
+
+export interface HubSpotSearchFilter {
+  propertyName: string;
+  operator: string;
+  value?: string;
+  values?: string[];
+  highValue?: string;
+}
+
+export interface HubSpotSearchFilterGroup {
+  filters: HubSpotSearchFilter[];
 }
 
 export interface HubSpotOwner {
@@ -221,8 +250,6 @@ interface PipelineListResponse {
   }[];
 }
 
-// -- API functions --
-
 const REQUIRED_DEAL_PROPERTIES = [
   "dealname",
   "dealstage",
@@ -259,7 +286,6 @@ const OPTIONAL_DEAL_PROPERTIES = [
   "risk_status_last_updated",
   "total_contract_value",
   "churn_notes",
-  // POV stage entry dates (hs_v2_date_entered_{stageId})
   "hs_v2_date_entered_2121599", // Enterprise: New Business — S2 - Proof of Value
   "hs_v2_date_entered_1166928645", // Enterprise: Expansion — S2 - Proof of Value
 ];
@@ -398,6 +424,7 @@ async function resolveObjectProperties(
 export async function searchHubSpotObjects(options: {
   objectType: HubSpotObjectType;
   query?: string;
+  filterGroups?: HubSpotSearchFilterGroup[];
   properties?: string[];
   limit?: number;
   after?: string;
@@ -408,19 +435,23 @@ export async function searchHubSpotObjects(options: {
   properties: string[];
 }> {
   const objectType = options.objectType;
-  const limit = Math.max(1, Math.min(100, options.limit ?? 25));
+  const limit = Math.max(1, Math.min(200, options.limit ?? 25));
   const query = options.query?.trim();
+  const filterGroups = options.filterGroups?.filter(
+    (group) => group.filters.length > 0,
+  );
   const properties = await resolveObjectProperties(
     objectType,
     options.properties ?? [],
   );
 
-  if (query) {
+  if (query || filterGroups?.length) {
     const body: Record<string, unknown> = {
-      query,
       limit,
       properties,
     };
+    if (query) body.query = query;
+    if (filterGroups?.length) body.filterGroups = filterGroups;
     if (options.after) body.after = options.after;
     const data = await apiPost<HubSpotObjectListResponse>(
       `/crm/v3/objects/${objectType}/search`,
@@ -569,7 +600,6 @@ export async function getDealPipelines(): Promise<Pipeline[]> {
   }));
 }
 
-// Pipelines to exclude from metrics — single-stage auto-complete or non-core
 const EXCLUDED_PIPELINE_LABELS = [
   "self-serve: new subscription",
   "self-serve: expansion",
@@ -577,7 +607,6 @@ const EXCLUDED_PIPELINE_LABELS = [
   "partner onboarding pipeline",
 ];
 
-// Pipelines to hide from the Kanban board
 const HIDDEN_KANBAN_LABELS = [
   "self serve pipeline",
   "enterprise: white label",
@@ -639,7 +668,6 @@ export async function getAllDeals(
 ): Promise<Deal[]> {
   const properties = await resolveDealProperties(extraProperties);
   const propertyKey = properties.slice().sort().join(",");
-  // Check full-result cache first
   const fullCacheKey = scopedCredentialCacheKey(
     `all-deals-full:${propertyKey}`,
     "HUBSPOT_ACCESS_TOKEN",
@@ -653,7 +681,6 @@ export async function getAllDeals(
   let after: string | undefined;
   const props = properties.join(",");
 
-  // Paginate through all deals (up to 10K)
   for (let i = 0; i < 100; i++) {
     const url = `/crm/v3/objects/deals?limit=100&properties=${props}${after ? `&after=${after}` : ""}`;
     const res = await hubspotFetch(`${API_BASE}${url}`, {
@@ -669,14 +696,10 @@ export async function getAllDeals(
     if (!after) break;
   }
 
-  // Cache the full result
   cache.set(fullCacheKey, { data: all, ts: Date.now() });
   return all;
 }
 
-// -- Computed metrics --
-
-// Known POV stage IDs — used for hs_v2_date_entered_ lookups
 const POV_STAGE_IDS = [
   "2121599", // Enterprise: New Business
   "1166928645", // Enterprise: Expansion
@@ -710,7 +733,6 @@ export function computeSalesMetrics(
   pipelines: Pipeline[],
   filterToMetricsPipelines = true,
 ): SalesMetrics {
-  // Filter deals to only enterprise/relevant pipelines for metrics
   const metricsPipelines = filterToMetricsPipelines
     ? getMetricsPipelines(pipelines)
     : pipelines;
@@ -718,7 +740,6 @@ export function computeSalesMetrics(
   const filteredDeals = deals.filter((d) =>
     metricsPipelineIds.has(d.properties.pipeline),
   );
-  // Build stage lookup — keyed by stageId
   const stageMap = new Map<string, DealStage>();
   const wonStageIds = new Set<string>();
   const lostStageIds = new Set<string>();
@@ -745,13 +766,11 @@ export function computeSalesMetrics(
   let lostDeals = 0;
   let lostValue = 0;
 
-  // POV tracking using actual stage entry dates (hs_v2_date_entered_)
   let povEntered = 0;
   let povWon = 0;
 
   const stageCount = new Map<string, { count: number; value: number }>();
 
-  // Track won deal amounts for ACV calculation
   const wonAmounts: number[] = [];
 
   for (const deal of filteredDeals) {
@@ -760,7 +779,6 @@ export function computeSalesMetrics(
 
     totalPipelineValue += amount;
 
-    // Count by stage
     const existing = stageCount.get(stageId) ?? { count: 0, value: 0 };
     existing.count++;
     existing.value += amount;
@@ -778,7 +796,6 @@ export function computeSalesMetrics(
       openPipelineValue += amount;
     }
 
-    // POV success: check hs_v2_date_entered_ for each known POV stage
     const enteredPov = POV_STAGE_IDS.some(
       (sid) => !!deal.properties[`hs_v2_date_entered_${sid}`],
     );
@@ -796,7 +813,6 @@ export function computeSalesMetrics(
     wonAmounts.length > 0
       ? wonAmounts.reduce((a, b) => a + b, 0) / wonAmounts.length
       : 0;
-  // Landing ACV: median of won deal amounts (less skewed by outliers)
   const sortedAmounts = [...wonAmounts].sort((a, b) => a - b);
   const landingAcv =
     sortedAmounts.length > 0
@@ -804,7 +820,6 @@ export function computeSalesMetrics(
       : 0;
   const povSuccessRate = povEntered > 0 ? povWon / povEntered : 0;
 
-  // Build stage breakdown
   const dealsByStage: SalesMetrics["dealsByStage"] = [];
   for (const [stageId, data] of stageCount) {
     const stage = stageMap.get(stageId);

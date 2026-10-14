@@ -3,6 +3,7 @@ name: composable-mini-apps
 description: >-
   Build many focused workspace apps that compose through agent discovery and
   A2A. Use when designing headless mini-apps or cross-app workflows.
+scope: dev
 ---
 
 # Composable Mini-Apps
@@ -32,15 +33,37 @@ The main agent should discover available siblings before assuming capability:
 
 - Runtime agents receive an `<available-apps>` block built from
   `discoverAgents()`. Workspace siblings are layered in by
-  `discoverWorkspaceAgents()`.
+  `discoverWorkspaceAgents()`. It carries one line per app — enough to know a
+  sibling exists, not enough to know what it can do.
+- Use the built-in `describe-workspace-apps` tool for actual capability.
+  It reads each peer's live `/.well-known/agent-card.json` and returns its
+  purpose plus any optional stable machine contracts; pass `app: "<id>"` for
+  one peer's full description. Use it only when the requested outcome depends
+  on peer-exclusive data or capability and you cannot tell which peer owns it
+  or whether a known peer can provide it, or when the user asks which app can
+  do the job.
+- Never hand-maintain a markdown or code list of what each workspace app does.
+  A stale catalog is worse than none: it reads as authoritative while pointing
+  at capabilities that moved or vanished. An app's purpose belongs in its own
+  `package.json` `description` (which flows into the workspace manifest and the
+  `<available-apps>` block), and its capabilities belong in its exposed
+  actions — both of which `describe-workspace-apps` reads live.
 - UI shells, headless surfaces, and scripts can read the same registry through
   `GET /_agent-native/agents?selfAppId=<app-id>`.
-- Code or CLI callers should use the first-class A2A invocation path
-  (`invokeAgent()` / `agent-native invoke`) when they need to call an app by
-  id, name, or URL.
-- In the agent loop, use `call-agent` with the sibling app id when another app
-  owns the work or data. Never call the current app through `call-agent`; use
-  local actions instead.
+- Code or CLI callers should use the first-class message-based A2A invocation
+  path (`invokeAgent()` / `agent-native invoke`) when they need to ask an app
+  by id, name, or URL.
+- In the agent loop, use `call-agent` with the sibling app id only when the
+  requested outcome depends on peer-exclusive data or capability, or the user
+  explicitly asks you to involve that app. A sibling's availability or ability
+  to enrich the result is not enough. Never call the current app through
+  `call-agent`; use local actions instead.
+- Send a natural-language objective by default so the sibling can apply its own
+  instructions, skills, schemas, data dictionary, credentials, and tools.
+  `invokeAgentAction()` or `call-agent` with `action` + `input` is only for an
+  explicit stable semantic read contract whose complete input is already known.
+  Never expose or call an implementation action as a workaround for slow or
+  failed message delegation.
 
 Send narrow prompts to siblings: name the exact question, relevant ids, date
 ranges, and expected output shape. Preserve returned ids and URLs verbatim.
@@ -93,7 +116,7 @@ For a sales-intelligence workspace, split the job into small apps:
 | `hubspot-pipeline` | CRM deals, contacts, companies, associations | `provider-api-request` with provider `hubspot` |
 | `gong-evidence` | Calls, transcripts, snippets, speaker evidence | `provider-api-request` with provider `gong` |
 | `knowledge-base` | Internal docs, pricing rules, playbooks | local search/read actions |
-| `deal-brief` | Orchestration and final brief | `invokeAgent()` or `call-agent` to the three apps |
+| `deal-brief` | Orchestration and final brief | message-based `invokeAgent()` or `call-agent` to the three apps |
 
 Flow: `deal-brief` asks `hubspot-pipeline` for the target account and open
 deals, asks `gong-evidence` for recent transcript evidence about those deals,

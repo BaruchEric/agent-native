@@ -1,10 +1,9 @@
-// View config CRUD: create, normalize, update, add, rename, duplicate, delete, move views.
-// Pure logic — no React, no icons.
 import type {
   ContentDatabaseView,
   ContentDatabaseViewConfig,
   ContentDatabaseViewType,
 } from "@shared/api";
+
 import {
   type DatabaseColumnCalculation,
   type DatabaseDropSide,
@@ -32,10 +31,12 @@ export function createDatabaseView(
   values: Partial<Omit<ContentDatabaseView, "id" | "name" | "type">> = {},
   type: ContentDatabaseViewType = "table",
 ): ContentDatabaseView {
+  const normalizedType = type === "sidebar" ? "table" : type;
   return {
     id,
-    name: name.trim() || databaseViewDefaultName(type),
-    type,
+    name: name.trim() || databaseViewDefaultName(normalizedType),
+    type: normalizedType,
+    icon: values.icon,
     sorts: values.sorts ?? [],
     filters: values.filters ?? [],
     filterMode: normalizeClientDatabaseFilterMode(values.filterMode),
@@ -45,12 +46,20 @@ export function createDatabaseView(
     endDatePropertyId: values.endDatePropertyId ?? null,
     hiddenPropertyIds: values.hiddenPropertyIds ?? [],
     propertyOrderIds: values.propertyOrderIds ?? [],
+    tableColumnOrderIds: values.tableColumnOrderIds ?? [],
     collapsedGroupIds: values.collapsedGroupIds ?? [],
     hideEmptyGroups: values.hideEmptyGroups === true,
     calculations: values.calculations ?? {},
     wrapCells: values.wrapCells === true,
+    columnWrapOverrides: normalizeClientColumnWrapOverrides(
+      values.columnWrapOverrides,
+    ),
+    frozenThroughColumnId: normalizeClientFrozenThroughColumnId(
+      values.frozenThroughColumnId,
+    ),
     rowDensity: normalizeClientDatabaseRowDensity(values.rowDensity),
     openPagesIn: normalizeClientDatabaseOpenPagesIn(values.openPagesIn),
+    formQuestions: normalizeClientDatabaseFormQuestions(values.formQuestions),
   };
 }
 
@@ -190,6 +199,7 @@ export function duplicateDatabaseView(
     uniqueDatabaseViewName(normalized.views, `${view.name} copy`),
     createDatabaseViewId(),
     {
+      icon: view.icon,
       sorts: view.sorts,
       filters: view.filters,
       filterMode: view.filterMode,
@@ -199,12 +209,16 @@ export function duplicateDatabaseView(
       endDatePropertyId: view.endDatePropertyId,
       hiddenPropertyIds: view.hiddenPropertyIds,
       propertyOrderIds: view.propertyOrderIds,
+      tableColumnOrderIds: view.tableColumnOrderIds,
       collapsedGroupIds: view.collapsedGroupIds,
       hideEmptyGroups: view.hideEmptyGroups,
       calculations: view.calculations,
       wrapCells: view.wrapCells,
+      columnWrapOverrides: view.columnWrapOverrides,
+      frozenThroughColumnId: view.frozenThroughColumnId,
       rowDensity: view.rowDensity,
       openPagesIn: view.openPagesIn,
+      formQuestions: view.formQuestions,
     },
     view.type,
   );
@@ -290,18 +304,26 @@ function normalizeClientDatabaseView(
   value: Partial<ContentDatabaseView> | null | undefined,
 ) {
   if (!value || typeof value.id !== "string" || !value.id.trim()) return null;
+  const retiredSidebar = value.type === "sidebar";
   const type =
     value.type === "board" ||
     value.type === "list" ||
     value.type === "gallery" ||
     value.type === "calendar" ||
-    value.type === "timeline"
+    value.type === "timeline" ||
+    value.type === "form" ||
+    value.type === "sidebar"
       ? value.type
       : "table";
   return createDatabaseView(
-    typeof value.name === "string" ? value.name : databaseViewDefaultName(type),
+    typeof value.name === "string"
+      ? retiredSidebar && value.name.trim() === "Sidebar"
+        ? "Table"
+        : value.name
+      : databaseViewDefaultName(type),
     value.id,
     {
+      icon: value.icon,
       sorts: Array.isArray(value.sorts)
         ? value.sorts.filter(isDatabaseSort)
         : [],
@@ -324,15 +346,46 @@ function normalizeClientDatabaseView(
           : null,
       hiddenPropertyIds: normalizeClientStringList(value.hiddenPropertyIds),
       propertyOrderIds: normalizeClientStringList(value.propertyOrderIds),
+      tableColumnOrderIds: normalizeClientStringList(value.tableColumnOrderIds),
       collapsedGroupIds: normalizeClientStringList(value.collapsedGroupIds),
       hideEmptyGroups: value.hideEmptyGroups === true,
       calculations: normalizeClientCalculations(value.calculations),
       wrapCells: value.wrapCells === true,
+      columnWrapOverrides: normalizeClientColumnWrapOverrides(
+        value.columnWrapOverrides,
+      ),
+      frozenThroughColumnId: normalizeClientFrozenThroughColumnId(
+        value.frozenThroughColumnId,
+      ),
       rowDensity: normalizeClientDatabaseRowDensity(value.rowDensity),
       openPagesIn: normalizeClientDatabaseOpenPagesIn(value.openPagesIn),
+      formQuestions: normalizeClientDatabaseFormQuestions(value.formQuestions),
     },
     type,
   );
+}
+
+export function normalizeClientDatabaseFormQuestions(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  return value.flatMap((candidate) => {
+    if (!candidate || typeof candidate !== "object") return [];
+    const question = candidate as {
+      key?: unknown;
+      enabled?: unknown;
+      required?: unknown;
+    };
+    const key = typeof question.key === "string" ? question.key.trim() : "";
+    if (!key || seen.has(key)) return [];
+    seen.add(key);
+    return [
+      {
+        key,
+        enabled: question.enabled !== false,
+        required: question.required === true,
+      },
+    ];
+  });
 }
 
 function normalizeClientCalculations(value: unknown) {
@@ -343,6 +396,21 @@ function normalizeClientCalculations(value: unknown) {
         typeof entry[0] === "string" && isDatabaseColumnCalculation(entry[1]),
     ),
   );
+}
+
+export function normalizeClientColumnWrapOverrides(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, boolean] =>
+        entry[0].length > 0 && typeof entry[1] === "boolean",
+    ),
+  );
+}
+
+export function normalizeClientFrozenThroughColumnId(value: unknown) {
+  if (value === null) return null;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function normalizeClientColumnWidths(value: unknown) {
@@ -431,6 +499,8 @@ export function databaseViewDefaultName(type: ContentDatabaseViewType) {
   if (type === "gallery") return "Gallery";
   if (type === "calendar") return "Calendar";
   if (type === "timeline") return "Timeline";
+  if (type === "form") return "Form";
+  if (type === "sidebar") return "Sidebar";
   return "Table";
 }
 
@@ -459,7 +529,6 @@ export function uniqueDatabaseViewName(
   }
 }
 
-// Normalize helpers used by normalizeClientDatabaseView and createDatabaseView.
 export function normalizeClientDatabaseFilterMode(
   value: unknown,
 ): import("./types").DatabaseFilterMode {

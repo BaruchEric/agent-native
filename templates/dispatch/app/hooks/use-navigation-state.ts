@@ -1,16 +1,16 @@
-import { useRef } from "react";
-import { useLocation } from "react-router";
 import {
-  appBasePath,
-  appPath,
+  isAgentChatHomeHandoffActive,
   markAgentChatHomeHandoff,
-  useAgentRouteState,
-} from "@agent-native/core/client";
-import { extensionIdFromPathname } from "@agent-native/core/client/extensions";
+} from "@agent-native/core/client/agent-chat";
+import { appBasePath, appPath } from "@agent-native/core/client/api-path";
+import { useAgentRouteState } from "@agent-native/core/client/navigation";
 import type {
   DispatchExtensionConfig,
   DispatchNavItem,
 } from "@agent-native/dispatch/components";
+import { extensionIdFromPathname } from "@agent-native/toolkit/app/extensions";
+import { useRef } from "react";
+import { useLocation } from "react-router";
 
 export interface NavigationState {
   view: string;
@@ -20,11 +20,12 @@ export interface NavigationState {
   dreamId?: string;
   sourceId?: string;
   query?: string;
+  automationId?: string;
+  operationsView?: "monitoring" | "database";
 }
 
 export function useNavigationState(extensions?: DispatchExtensionConfig) {
   const location = useLocation();
-  // Capture extensions in a ref so the stable callbacks always read latest.
   const extensionsRef = useRef(extensions);
   extensionsRef.current = extensions;
 
@@ -53,7 +54,9 @@ export function useNavigationState(extensions?: DispatchExtensionConfig) {
         routerPath(location.pathname) === "/chat" &&
         pathnameFromPath(path) !== "/chat"
       ) {
-        markAgentChatHomeHandoff("dispatch");
+        if (isAgentChatHomeHandoffActive("dispatch")) {
+          markAgentChatHomeHandoff("dispatch");
+        }
       }
     },
   });
@@ -92,6 +95,17 @@ export function buildDispatchNavigationState(
     if (query) state.query = query;
   }
 
+  if (state.view === "operations") {
+    const params = new URLSearchParams(search);
+    state.operationsView =
+      params.get("view") === "database" ? "database" : "monitoring";
+  }
+
+  if (state.view === "automations") {
+    const automationId = new URLSearchParams(search).get("automationId");
+    if (automationId) state.automationId = automationId;
+  }
+
   return state;
 }
 
@@ -99,10 +113,6 @@ function routerPath(path: string): string {
   const basePath = appBasePath();
   if (!basePath) return path;
   let result = path;
-  // Iteratively strip basename. A path that arrives doubly-prefixed
-  // (e.g. "/dispatch/dispatch/overview", possibly from a stale link or a
-  // prior bug) would otherwise get partially stripped here and then
-  // re-prefixed by react-router's basename, restoring the bad URL.
   for (let i = 0; i < 4; i += 1) {
     if (result === basePath) return "/";
     if (!result.startsWith(`${basePath}/`)) break;
@@ -139,7 +149,8 @@ function resolveExtensionPath(
   extensions?: DispatchExtensionConfig,
 ): string | undefined {
   if (!view) return undefined;
-  return extensions?.navItems?.find((item) => item.id === view)?.to;
+  const item = extensions?.navItems?.find((candidate) => candidate.id === view);
+  return item?.adminTo ?? item?.to;
 }
 
 function resolveView(
@@ -151,22 +162,36 @@ function resolveView(
   if (pathname === "/extensions" || pathname.startsWith("/extensions/")) {
     return "extensions";
   }
+  if (pathname === "/admin") return "admin";
+  if (
+    pathname === "/admin/integrations" ||
+    pathname.startsWith("/admin/integrations/")
+  ) {
+    return "integrations";
+  }
+  if (pathname.startsWith("/admin/")) {
+    const adminView = resolveView(pathname.slice("/admin".length), extensions);
+    return adminView === "overview" ? "admin" : adminView;
+  }
   if (pathname.startsWith("/chat")) return "chat";
   if (pathname.startsWith("/apps")) return "apps";
+  if (pathname.startsWith("/operations")) return "operations";
   if (pathname.startsWith("/metrics")) return "metrics";
   if (pathname.startsWith("/new-app")) return "new-app";
   if (pathname.startsWith("/vault")) return "vault";
-  if (pathname.startsWith("/integrations")) return "integrations";
   if (pathname.startsWith("/workspace")) return "workspace";
   if (pathname.startsWith("/agents")) return "agents";
   if (pathname.startsWith("/messaging")) return "messaging";
   if (pathname.startsWith("/destinations")) return "destinations";
   if (pathname.startsWith("/identities")) return "identities";
   if (pathname.startsWith("/approvals")) return "approvals";
+  if (pathname.startsWith("/transactional-email")) {
+    return "transactional-email";
+  }
   if (pathname.startsWith("/audit")) return "audit";
   if (pathname.startsWith("/dreams")) return "dreams";
   if (pathname.startsWith("/thread-debug")) return "thread-debug";
-  if (pathname.startsWith("/team")) return "team";
+  if (pathname.startsWith("/team")) return "settings";
   return "overview";
 }
 
@@ -176,6 +201,8 @@ function resolvePath(
   command?: Pick<NavigationState, "extensionId">,
 ): string | undefined {
   switch (view) {
+    case "admin":
+      return "/admin";
     case "chat":
     case "ask":
       return "/chat";
@@ -183,40 +210,49 @@ function resolvePath(
       return "/overview";
     case "apps":
       return "/apps";
+    case "operations":
+    case "monitoring":
+    case "observability":
+    case "database":
+      return view === "database"
+        ? "/admin/operations?view=database"
+        : "/admin/operations";
     case "metrics":
     case "usage":
-      return "/metrics";
+      return "/admin/metrics";
     case "new-app":
     case "create-app":
-      return "/new-app";
+      return "/admin/new-app";
     case "vault":
     case "secrets":
-      return "/vault";
+      return "/admin/vault";
     case "integrations":
-      return "/integrations";
+      return "/admin/integrations";
     case "workspace":
     case "resources":
-      return "/workspace";
+      return "/admin/workspace";
     case "agents":
-      return "/agents";
+      return "/admin/agents";
     case "messaging":
-      return "/messaging";
+      return "/admin/messaging";
     case "destinations":
     case "routes":
-      return "/destinations";
+      return "/admin/destinations";
     case "identities":
-      return "/identities";
+      return "/admin/identities";
     case "approvals":
-      return "/approvals";
+      return "/admin/approvals";
     case "audit":
-      return "/audit";
+      return "/admin/audit";
+    case "transactional-email":
+      return "/admin/transactional-email";
     case "dreams":
-      return "/dreams";
+      return "/admin/dreams";
     case "thread-debug":
     case "threads":
-      return "/thread-debug";
+      return "/admin/thread-debug";
     case "team":
-      return "/team";
+      return "/settings/organization";
     case "extensions":
       return command?.extensionId
         ? `/extensions/${encodeURIComponent(command.extensionId)}`

@@ -1,9 +1,7 @@
 ---
 name: bigquery
 description: >-
-  Query the configured BigQuery warehouse for analytics data. Use when the user
-  asks for warehouse SQL, BigQuery tables, Amplitude-in-BigQuery events, or a
-  metric/table that the data dictionary says lives in BigQuery.
+  Query the BigQuery warehouse. Use for warehouse SQL, BigQuery tables, Amplitude-in-BigQuery events, or a metric the data dictionary says lives in BigQuery.
 ---
 
 # BigQuery
@@ -13,14 +11,14 @@ description: >-
 **`bigquery` is available directly in the agent's tool list as a native callable tool.**
 
 - If you see `bigquery` in your available tools — **call it directly with your SQL**. Do not use HTTP workarounds, web-request hacks, or scripts as a substitute.
-- The `server/lib/bigquery.ts` description below is the *underlying implementation*. It does **not** mean BigQuery is only accessible via terminal commands or scripts.
+- The `server/lib/bigquery.ts` description below is the _underlying implementation_. It does **not** mean BigQuery is only accessible via terminal commands or scripts.
 - **When uncertain if the tool works, call it — don't reason your way to "it won't work".** Empirically test by calling the tool.
 
 ## Data-Dictionary-First Discipline
 
 **Before writing any SQL, verify the metric definition and exact table/column names.**
 
-1. Check the injected `<data-dictionary>` block and call `list-data-dictionary` first.
+1. Call `find-data` with the user’s metric or entity question first; it ranks dictionary definitions, saved SQL examples, and generated source metadata together.
 2. Use `search-bigquery-schema` to confirm exact dataset, table, and column names.
 3. Only write SQL after you know the correct table and columns. Do not guess.
 
@@ -33,7 +31,7 @@ writing the query is always faster than debugging a wrong result.
 
 Before writing SQL, use the highest-confidence source available:
 
-1. The injected `<data-dictionary>` block and `list-data-dictionary`.
+1. `find-data` with a focused metric or entity question.
 2. Existing dashboard SQL or saved analyses that already answer the same metric.
 3. `search-bigquery-schema` metadata for exact datasets, tables, and columns.
 4. A concise user clarification when the business meaning cannot be inferred.
@@ -69,14 +67,17 @@ answers the question.
 -- Or for TIMESTAMP columns: WHERE event_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
 ```
 
+For account health, verify the reporting period, as-of field, and freshness.
+Never label a current partial-month snapshot as last month's completed usage.
+
 ## Actions
 
-| Action | Use |
-| --- | --- |
-| `data-source-status --key bigquery` | Check whether BigQuery credentials and project are configured. |
-| `list-data-dictionary --search <topic>` | Find canonical metric/table definitions before SQL. |
-| `search-bigquery-schema` | List datasets, list tables in a dataset, or describe table columns. |
-| `bigquery --sql "<sql>"` | Run a real warehouse query after table/column names are known. |
+| Action                                  | Use                                                                 |
+| --------------------------------------- | ------------------------------------------------------------------- |
+| `data-source-status --key bigquery`     | Check whether BigQuery credentials and project are configured.      |
+| `find-data --question <topic>` | Find ranked metric definitions and saved query examples before SQL. |
+| `search-bigquery-schema`                | List datasets, list tables in a dataset, or describe table columns. |
+| `bigquery --sql "<sql>"`                | Run a real warehouse query after table/column names are known.      |
 
 For direct Amplitude/PostHog/Mixpanel product-event data (outside the warehouse
 copy), there is no first-class action — call `provider-api-catalog` /
@@ -122,15 +123,15 @@ prefer saving a reviewed dictionary update once the meaning is clear.
 
 ## Column Name Differences (Common Bug Sources)
 
-| Spec Column | Actual Column | Table |
-|---|---|---|
+| Spec Column           | Actual Column              | Table           |
+| --------------------- | -------------------------- | --------------- |
 | `first_pageview_date` | `created_date` (TIMESTAMP) | first_pageviews |
-| `channel` (pageviews) | `first_touch_channel` | all_pageviews |
-| `referrer` | `c_referrer` | all_pageviews |
-| `referrer_channel` | `session_channel` | all_pageviews |
-| `user_create_date` | `user_create_d` | product_signups |
-| `deal_stage` | `stage_name` | dim_deals |
-| `deal_amount` | `amount` | dim_deals |
+| `channel` (pageviews) | `first_touch_channel`      | all_pageviews   |
+| `referrer`            | `c_referrer`               | all_pageviews   |
+| `referrer_channel`    | `session_channel`          | all_pageviews   |
+| `user_create_date`    | `user_create_d`            | product_signups |
+| `deal_stage`          | `stage_name`               | dim_deals       |
+| `deal_amount`         | `amount`                   | dim_deals       |
 
 Always verify with `search-bigquery-schema` before writing SQL against an unfamiliar table.
 
@@ -158,7 +159,13 @@ Require both for exact matches; flag email-only or id-only joins as low-confiden
 - DATE columns need `DATE('2025-11-01')`.
 - Use `DATE(timestamp_col)` before `DATE_TRUNC` to avoid type mismatch errors.
 - Use `QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_at DESC) = 1`
-  for deduplication — cleaner than a subquery.
+  for deduplication — cleaner than a subquery. Put the partition-date filter in
+  the same `WHERE`: a dedupe over a whole table, or a view that dedupes before
+  your filter, scans every partition. For first-party events, read
+  `first_party_analytics_events_raw_query_range(start_date, end_date)`, not the
+  `first_party_analytics_events_raw_query` view. It leaves out `http.response`,
+  which holds most of the `properties` bytes; read that event from the raw table
+  with a narrow date range and an `event_name` filter.
 
 ### Type Casting
 

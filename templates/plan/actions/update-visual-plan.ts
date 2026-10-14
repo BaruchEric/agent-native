@@ -1,18 +1,21 @@
-import { defineAction, embedApp } from "@agent-native/core";
+import { defineAction, embedApp, fail } from "@agent-native/core";
+import { agentTouchDocument } from "@agent-native/core/collab";
+import {
+  getRequestUserEmail,
+  getRequestUserName,
+} from "@agent-native/core/server/request-context";
 import {
   ForbiddenError,
   currentAccess,
   resolveAccess,
+  roleSatisfies,
 } from "@agent-native/core/sharing";
+import { track } from "@agent-native/core/tracking";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
-import {
-  normalizePlanContent,
-  sanitizeStoredPlanHtml,
-  serializePlanContent,
-} from "../server/plan-content.js";
-import { exportPlanContentToMdxFolder } from "../server/plan-mdx.js";
+import { notifyPlanCommentRecipients } from "../server/lib/comment-notifications.js";
 import {
   isAnonymousPublicViewer,
   isGuestAuthorIdentity,
@@ -22,11 +25,15 @@ import {
 } from "../server/lib/local-identity.js";
 import { writePlanLocalFiles } from "../server/lib/local-plan-files.js";
 import { createPlanVersionSnapshot } from "../server/lib/plan-versions.js";
-import { notifyPlanCommentRecipients } from "../server/lib/comment-notifications.js";
 import {
-  getRequestUserEmail,
-  getRequestUserName,
-} from "@agent-native/core/server/request-context";
+  normalizePlanContent,
+  sanitizeStoredPlanHtml,
+  serializePlanContent,
+} from "../server/plan-content.js";
+import {
+  exportPlanContentToMdxFolder,
+  referencedBlockIdsForPlanComments,
+} from "../server/plan-mdx.js";
 import {
   assertPlanEditor,
   buildPlanHtml,
@@ -44,15 +51,25 @@ import {
   sectionInputSchema,
 } from "../server/plans.js";
 import {
+  agentPlanIncrementalContentPatchesSchema,
+  assertPlanContentAuthoringInput,
   applyPlanContentPatches,
+  findBlock,
+  getPlanContentValidationMessage,
   planContentPatchesSchema,
-  planContentSchema,
+  storedPlanContentSchema,
   type PlanBlock,
   type PlanContent,
   type PlanContentPatch,
 } from "../shared/plan-content.js";
 
 const CONTENT_PATCH_EXCERPT_LIMIT = 520;
+
+function failInvalidPlanContent(error: unknown): never {
+  const message = getPlanContentValidationMessage(error);
+  if (message === null) throw error;
+  fail(message, { errorCode: "invalid_plan_content", statusCode: 422 });
+}
 
 function compactExcerpt(value: unknown, limit = CONTENT_PATCH_EXCERPT_LIMIT) {
   const text =
@@ -85,26 +102,11 @@ function blockExcerpt(block: PlanBlock | null) {
   };
 }
 
-function findContentBlock(
-  blocks: PlanBlock[],
-  blockId: string,
-): PlanBlock | null {
-  for (const block of blocks) {
-    if (block.id === blockId) return block;
-    if (block.type === "tabs") {
-      for (const tab of block.data.tabs) {
-        const match = findContentBlock(tab.blocks, blockId);
-        if (match) return match;
-      }
-    }
-  }
-  return null;
-}
-
 function contentPatchTargetId(patch: PlanContentPatch) {
   if ("blockId" in patch) return patch.blockId;
   if ("screenId" in patch) return patch.screenId;
   if (patch.op === "set-metadata") return "plan-metadata";
+  if (patch.op === "set-visual-render-mode") return "visual-render-mode";
   if (patch.op === "set-prototype" || patch.op === "remove-prototype") {
     return "prototype";
   }
@@ -113,6 +115,68 @@ function contentPatchTargetId(patch: PlanContentPatch) {
   if (patch.op === "append-canvas-annotation") return patch.annotation.id;
   if (patch.op === "append-block") return patch.block.id;
   return null;
+}
+
+function affectedPlanBlockIds(
+  patches: PlanContentPatch[],
+  nextContent: PlanContent | null,
+): string[] {
+  const ids = new Set<string>();
+  for (const patch of patches) {
+    if (patch.op === "replace-blocks") {
+      for (const block of patch.blocks) ids.add(block.id);
+      continue;
+    }
+    const target = contentPatchTargetId(patch);
+    if (target) ids.add(target);
+  }
+  if (ids.size === 0 && nextContent) {
+    for (const block of nextContent.blocks) ids.add(block.id);
+  }
+  return Array.from(ids).slice(0, 12);
+}
+
+function collectPlanBlockIds(blocks: PlanBlock[], ids = new Set<string>()) {
+  for (const block of blocks) {
+    ids.add(block.id);
+    if (block.type === "tabs") {
+      for (const tab of block.data.tabs) {
+        collectPlanBlockIds(tab.blocks, ids);
+      }
+    }
+  }
+  return ids;
+}
+
+function destructiveStructuredReplacementWarnings(
+  before: PlanContent,
+  after: PlanContent,
+) {
+  const afterBlockIds = collectPlanBlockIds(after.blocks);
+  const removedBlockIds = Array.from(collectPlanBlockIds(before.blocks)).filter(
+    (id) => !afterBlockIds.has(id),
+  );
+  const warnings: string[] = [];
+  if (removedBlockIds.length > 0) {
+    const excerpt = removedBlockIds.slice(0, 8).join(", ");
+    const remaining = removedBlockIds.length - 8;
+    warnings.push(
+      `remove ${removedBlockIds.length} existing block ID${removedBlockIds.length === 1 ? "" : "s"} (${excerpt}${remaining > 0 ? `, and ${remaining} more` : ""})`,
+    );
+  }
+  if (
+    (before.canvas?.frames.length ?? 0) > 0 &&
+    (after.canvas?.frames.length ?? 0) === 0
+  ) {
+    warnings.push("collapse a nonempty canvas to zero frames");
+  }
+  if (
+    (before.prototype?.screens.length ?? 0) > 0 &&
+    (after.prototype?.screens.length ?? 0) === 0
+  ) {
+    warnings.push("collapse a nonempty prototype to zero screens");
+  }
+  return warnings;
 }
 
 function isNewOpenHumanComment(comment: {
@@ -143,7 +207,7 @@ function isCanvasReviewMarkupRequest(args: {
   status?: string;
   currentFocus?: string;
   html?: string;
-  content?: PlanContent;
+  content?: unknown;
   contentPatches: PlanContentPatch[];
   markdown?: string;
   sections: unknown[];
@@ -202,7 +266,7 @@ function isExistingCommentStatusUpdateRequest(args: {
   status?: string;
   currentFocus?: string;
   html?: string;
-  content?: PlanContent;
+  content?: unknown;
   contentPatches: PlanContentPatch[];
   markdown?: string;
   sections: unknown[];
@@ -332,11 +396,11 @@ function contentPatchDetails(input: {
     const targetId = contentPatchTargetId(patch);
     const beforeBlock =
       "blockId" in patch && input.before
-        ? findContentBlock(input.before.blocks, patch.blockId)
+        ? findBlock(input.before.blocks, patch.blockId)
         : null;
     const afterBlock =
       "blockId" in patch && input.after
-        ? findContentBlock(input.after.blocks, patch.blockId)
+        ? findBlock(input.after.blocks, patch.blockId)
         : patch.op === "append-block"
           ? patch.block
           : null;
@@ -373,68 +437,183 @@ function contentPatchDetails(input: {
   });
 }
 
+function canvasSurfaceProjection(content: PlanContent) {
+  return (content.canvas?.frames ?? []).flatMap((frame) => {
+    const referencedBlock = frame.blockId
+      ? findBlock(content.blocks, frame.blockId)
+      : null;
+    const wireframe =
+      frame.wireframe ??
+      (referencedBlock?.type === "wireframe" ? referencedBlock.data : null);
+    const legacyWireframe =
+      frame.legacyWireframe ??
+      (referencedBlock?.type === "legacy-wireframe"
+        ? referencedBlock.data
+        : null);
+    if (!wireframe && !legacyWireframe) return [];
+    return {
+      label: frame.label ?? referencedBlock?.title ?? null,
+      surface:
+        frame.surface ??
+        wireframe?.surface ??
+        (legacyWireframe?.viewport === "phone" ? "mobile" : undefined) ??
+        "desktop",
+      wireframe,
+      legacyWireframe,
+    };
+  });
+}
+
+function surfaceParityWarnings(
+  before: PlanContent | null,
+  after: PlanContent | null,
+) {
+  const beforeProjection = before ? canvasSurfaceProjection(before) : [];
+  const afterProjection = after ? canvasSurfaceProjection(after) : [];
+  if (beforeProjection.length === 0 && afterProjection.length === 0) {
+    return [];
+  }
+  const prototypeChanged =
+    JSON.stringify(before?.prototype) !== JSON.stringify(after?.prototype);
+  if (
+    !prototypeChanged ||
+    JSON.stringify(beforeProjection) !== JSON.stringify(afterProjection)
+  ) {
+    return [];
+  }
+  return [
+    "This update changes the prototype while leaving the visible canvas unchanged. Patch the matching canvas frame(s) too, or pass allowSurfaceMismatch: true only for an intentional single-surface edit.",
+  ];
+}
+
+const CONTENT_DESCRIPTION =
+  "Destructive full structured content replacement. Read the latest plan first and pass its updatedAt as expectedUpdatedAt. Prefer granular contentPatches for ordinary edits; use this only for intentional broad restructuring.";
+const CONTENT_PATCHES_DESCRIPTION =
+  "Targeted structured content edits addressed by stable id. Prefer granular operations for live plans. The destructive replace-blocks operation requires expectedUpdatedAt from a fresh read. patch-visual-plan-source is only for exported MDX folders. Supported ops: set-metadata for title/brief; set-visual-render-mode to persist `design` (high fidelity, authored CSS, no rough.js for any viewer) or `wireframe` across canvas, linked blocks, and prototype screens; set-prototype / remove-prototype / update-prototype-screen / patch-prototype-html for live prototype surfaces; update-block / replace-block, update-rich-text, patch-wireframe-html, patch-diagram-html, update-wireframe-node, replace-wireframe-screen, update-canvas-frame, update-canvas-annotation / append-canvas-annotation, append-block / remove-block, update-custom-html. A fidelity upgrade must also replace or patch the existing screen HTML/CSS with deliberate branded design; changing render mode alone only removes the sketch treatment.";
+
+function compactAgentWriteResult(
+  bundle: Awaited<ReturnType<typeof loadPlanBundle>>,
+  changed: Record<string, unknown>,
+) {
+  return {
+    planId: bundle.plan.id,
+    plan: {
+      id: bundle.plan.id,
+      title: bundle.plan.title,
+      brief: bundle.plan.brief,
+      kind: bundle.plan.kind,
+      status: bundle.plan.status,
+      currentFocus: bundle.plan.currentFocus,
+      updatedAt: bundle.plan.updatedAt,
+      surfaces: {
+        blocks: bundle.plan.content?.blocks.length ?? 0,
+        canvasFrames: bundle.plan.content?.canvas?.frames.length ?? 0,
+        prototypeScreens: bundle.plan.content?.prototype?.screens.length ?? 0,
+      },
+    },
+    changed,
+    path: planPath(bundle.plan.id, bundle.plan.kind),
+    url: planPath(bundle.plan.id, bundle.plan.kind),
+  };
+}
+
+const updateVisualPlanSchema = z.object({
+  planId: z.string().describe("Plan ID"),
+  title: z.string().optional().describe("Plan title."),
+  brief: z
+    .string()
+    .optional()
+    .describe("One-line plan summary shown under the title."),
+  status: planStatusSchema
+    .optional()
+    .describe(
+      'Plan status. Setting "approved" also records approvedAt timestamp.',
+    ),
+  currentFocus: z
+    .string()
+    .optional()
+    .describe("Current agent focus label shown in the review surface."),
+  expectedUpdatedAt: z
+    .string()
+    .optional()
+    .describe(
+      "Required optimistic-concurrency base revision for full content replacement and replace-blocks. Read the latest plan, copy plan.updatedAt exactly, and do not reuse a revision after another write succeeds. Granular patches do not require it.",
+    ),
+  allowDestructive: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "Explicit confirmation for a full content replacement or replace-blocks call that removes existing block IDs, collapses a nonempty canvas to zero frames, or collapses a nonempty prototype to zero screens. Keep false for normal rewrites. Set true only after reviewing the latest plan and intentionally accepting those losses; expectedUpdatedAt is still required.",
+    ),
+  allowSurfaceMismatch: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "Explicit confirmation for an intentional single-surface prototype edit when a visible canvas also exists. Keep false for normal UI revisions so stale canvas content is rejected before writing.",
+    ),
+  html: z
+    .string()
+    .optional()
+    .describe(
+      "Legacy-only standalone HTML. Allowed only while the current plan has no structured content. Structured plans reject this field because it would shadow blocks, inline editing, and MDX round-trip. Never use it for new plans.",
+    ),
+  content: z.unknown().optional().describe(CONTENT_DESCRIPTION),
+  contentPatches: planContentPatchesSchema
+    .optional()
+    .default([])
+    .describe(CONTENT_PATCHES_DESCRIPTION),
+  markdown: z
+    .string()
+    .optional()
+    .describe(
+      "Legacy-only markdown source. Allowed only while the current plan has no structured content. Structured plans reject explicit markdown, including calls that also carry contentPatches; structured edits generate their MDX projection automatically.",
+    ),
+  sections: z
+    .array(sectionInputSchema)
+    .optional()
+    .default([])
+    .describe("Legacy section array. Prefer content blocks."),
+  comments: z
+    .array(commentInputSchema)
+    .optional()
+    .default([])
+    .describe(
+      "Legacy comment array. Comment messages support inline Markdown for emphasis, inline code, links, and line breaks; headings are flattened. Prefer reply-to-plan-comment / resolve-plan-comment for new comments.",
+    ),
+  consumedCommentIds: z
+    .array(z.string())
+    .optional()
+    .default([])
+    .describe(
+      "Prefer consume-plan-feedback for marking feedback consumed. WARNING: consuming feedback does not resolve or hide its comments; after the requested change is verified, resolve handled comments with resolve-plan-comment.",
+    ),
+  note: z
+    .string()
+    .optional()
+    .describe("Short label saved as the version-history snapshot label."),
+});
+
+const agentUpdateVisualPlanSchema = updateVisualPlanSchema
+  .omit({ content: true, html: true, markdown: true, sections: true })
+  .extend({
+    contentPatches: agentPlanIncrementalContentPatchesSchema
+      .optional()
+      .default([])
+      .describe(
+        "Small targeted edits only. Do not send full content or replace-blocks; " +
+          "append or patch one existing block at a time.",
+      ),
+  });
+
 export default defineAction({
   description:
-    "Update an Agent-Native Plan's structured content blocks, prototype screens, sections, comments, or status. Prefer contentPatches for targeted edits. Use full content only for broad restructuring.",
-  schema: z.object({
-    planId: z.string().describe("Plan ID"),
-    title: z.string().optional().describe("Plan title."),
-    brief: z
-      .string()
-      .optional()
-      .describe("One-line plan summary shown under the title."),
-    status: planStatusSchema
-      .optional()
-      .describe(
-        'Plan status. Setting "approved" also records approvedAt timestamp.',
-      ),
-    currentFocus: z
-      .string()
-      .optional()
-      .describe("Current agent focus label shown in the review surface."),
-    html: z
-      .string()
-      .optional()
-      .describe(
-        "Legacy: a standalone HTML document. Setting this NULLS structured content — blocks, contentPatches, inline editing, and MDX round-trip all stop working for this plan. Only for preserving a pre-existing HTML artifact; never author new plans this way.",
-      ),
-    content: planContentSchema
-      .optional()
-      .describe(
-        "Full structured content replacement. Prefer contentPatches for targeted edits; use this only for broad restructuring.",
-      ),
-    contentPatches: planContentPatchesSchema
-      .optional()
-      .default([])
-      .describe(
-        "Targeted structured content edits addressed by stable id. For live plans this is the preferred edit path; patch-visual-plan-source is only for exported MDX folders. Supported ops: set-metadata for title/brief, set-prototype / remove-prototype / update-prototype-screen / patch-prototype-html for live prototype surfaces; update-block / replace-block, update-rich-text, patch-wireframe-html, patch-diagram-html, update-wireframe-node, replace-wireframe-screen, update-canvas-frame, update-canvas-annotation / append-canvas-annotation, append-block / remove-block, update-custom-html.",
-      ),
-    markdown: z
-      .string()
-      .optional()
-      .describe("Legacy markdown source. Prefer content blocks."),
-    sections: z
-      .array(sectionInputSchema)
-      .optional()
-      .default([])
-      .describe("Legacy section array. Prefer content blocks."),
-    comments: z
-      .array(commentInputSchema)
-      .optional()
-      .default([])
-      .describe(
-        "Legacy comment array. Prefer reply-to-plan-comment / resolve-plan-comment for new comments.",
-      ),
-    consumedCommentIds: z
-      .array(z.string())
-      .optional()
-      .default([])
-      .describe("Prefer consume-plan-feedback for marking feedback consumed."),
-    note: z
-      .string()
-      .optional()
-      .describe("Short label saved as the version-history snapshot label."),
-  }),
+    "Update an Agent-Native Plan's structured content blocks, prototype screens, visual fidelity, sections, comments, or status. For an existing plan, use small contentPatches such as append-block, update-rich-text, or a text patch; do not resend the full document for an incremental edit. When a user asks for higher fidelity on an existing plan, update that same plan in place: use set-visual-render-mode with design and provide polished screen HTML/CSS in the same call instead of creating a duplicate plan or only toggling the viewer-local clean style. Use a full replacement only for an explicit broad rebuild. Works on plans and recaps alike when you have editor access; with viewer access (common on PR recaps published by CI) only comment-only calls succeed - to change a recap you cannot edit, publish a replacement with create-visual-recap instead of retrying this call.",
+  schema: updateVisualPlanSchema,
+  changeResource: (input) =>
+    input.planId ? { resourceType: "plan", resourceId: input.planId } : null,
+  agentInputSchema: agentUpdateVisualPlanSchema,
   publicAgent: {
     expose: true,
     readOnly: false,
@@ -442,7 +621,7 @@ export default defineAction({
     isConsequential: true,
     title: "Update Visual Plan",
     description:
-      "Patch structured plan content, add visual sections, record comments, or mark feedback consumed.",
+      "Patch structured plan content, add visual sections, record comments, or mark feedback consumed. When canvas and prototype coexist, patch both visible surfaces; mismatches are rejected before writing unless allowSurfaceMismatch is explicitly true.",
   },
   mcpApp: {
     compactCatalog: true,
@@ -452,12 +631,14 @@ export default defineAction({
         "Open the Agent-Native Plan editor for structured content, comments, and status changes.",
       iframeTitle: "Agent-Native Plan",
       openLabel: "Open Plan",
-      height: 860,
+      height: 900,
     }),
   },
-  run: async (args) => {
+  run: async (args, ctx) => {
     const requesterEmail = getRequestUserEmail();
     const requesterName = getRequestUserName();
+    const isAgentCaller =
+      ctx?.caller === "tool" || ctx?.caller === "mcp" || ctx?.caller === "a2a";
     const onlyAddsNewComments =
       !args.title &&
       !args.brief &&
@@ -484,17 +665,6 @@ export default defineAction({
         : requesterEmail;
 
     if (onlyReviewerCommentWork) {
-      // Commenting on a plan (including a public-link plan) requires an
-      // agent-native account. The two synthetic anonymous identities must NOT be
-      // able to comment — only a real account (or the local single-user identity
-      // in local mode) can:
-      //   - Anonymous public-link viewers (`public-*@agent-native.local`, minted
-      //     by resolvePublicPlanViewerOwner) can read a public plan but not
-      //     comment.
-      //   - Legacy hosted guest authors (`guest-*@agent-native.guest`) cannot
-      //     comment; create/update authoring now requires a real account.
-      // This keeps "anyone with the link can view; accounts can create, comment,
-      // and share".
       if (isAnonymousPublicViewer(requesterEmail)) {
         throw new ForbiddenError(
           "Commenting on a plan requires an agent-native account. Sign in to leave a comment.",
@@ -515,9 +685,19 @@ export default defineAction({
         args.planId,
         resolvePlanAccessContext(currentAccess()),
       );
-      if (!access) throw new Error(`Plan ${args.planId} not found`);
+      if (!access) {
+        fail(`Plan ${args.planId} not found`, {
+          errorCode: "not_found",
+          statusCode: 404,
+        });
+      }
       if ((access.resource as typeof schema.plans.$inferSelect).deletedAt) {
         throw new ForbiddenError(`Plan ${args.planId} not found`);
+      }
+      if (!roleSatisfies(access.role, "commenter")) {
+        throw new ForbiddenError(
+          "Commenting on this plan requires commenter access or higher.",
+        );
       }
     } else {
       await assertPlanEditor(args.planId);
@@ -526,23 +706,122 @@ export default defineAction({
     const db = getDb();
     const now = nowIso();
     const insertedCommentIds: string[] = [];
-    let nextContent =
-      args.content !== undefined ? normalizePlanContent(args.content) : null;
+    const hasReplaceBlocksPatch = args.contentPatches.some(
+      (patch) => patch.op === "replace-blocks",
+    );
+    const isDestructiveStructuredWrite =
+      args.content !== undefined || hasReplaceBlocksPatch;
+    let nextContent: PlanContent | null = null;
+    let surfaceWarnings: string[] = [];
     let versionAtLoad: string | null = null;
     let bundleAtLoad: Awaited<ReturnType<typeof loadPlanBundle>> | null = null;
-    if (args.content === undefined && args.contentPatches.length > 0) {
-      const bundle = await loadPlanBundle(args.planId);
-      bundleAtLoad = bundle;
-      versionAtLoad = bundle.plan.updatedAt;
-      if (!bundle.plan.content) {
-        throw new Error(
-          "Targeted content patches require a structured plan. Pass content for a full conversion, or html for legacy artifacts.",
+
+    if (
+      args.status !== undefined ||
+      args.content !== undefined ||
+      args.contentPatches.length > 0 ||
+      args.html !== undefined ||
+      args.markdown !== undefined
+    ) {
+      bundleAtLoad = await loadPlanBundle(args.planId);
+      versionAtLoad = bundleAtLoad.plan.updatedAt;
+    }
+
+    if (
+      bundleAtLoad?.plan.content &&
+      (args.html !== undefined || args.markdown !== undefined)
+    ) {
+      const legacyFields = [
+        args.html !== undefined ? "html" : null,
+        args.markdown !== undefined ? "markdown" : null,
+      ].filter((field): field is string => Boolean(field));
+      fail(
+        `Structured plans do not accept explicit legacy ${legacyFields.join(" or ")} writes. Use granular contentPatches; the structured content's markdown projection is generated automatically.`,
+        { errorCode: "plan_legacy_write_rejected", statusCode: 422 },
+      );
+    }
+
+    if (isDestructiveStructuredWrite) {
+      if (!args.expectedUpdatedAt) {
+        fail(
+          "expectedUpdatedAt is required for full content replacement and replace-blocks. Read the latest plan, pass its plan.updatedAt, and retry.",
+          { errorCode: "expected_updated_at_required", statusCode: 422 },
         );
       }
-      nextContent = applyPlanContentPatches(
-        bundle.plan.content,
-        args.contentPatches,
+      if (bundleAtLoad?.plan.updatedAt !== args.expectedUpdatedAt) {
+        fail(
+          "This destructive update was prepared from an outdated plan revision. Reload the plan and retry with the latest expectedUpdatedAt.",
+          { errorCode: "plan_revision_conflict", statusCode: 409 },
+        );
+      }
+      versionAtLoad = args.expectedUpdatedAt;
+    }
+
+    if (args.content !== undefined) {
+      try {
+        nextContent = normalizePlanContent(args.content as PlanContent, {
+          allowStoredLegacyDefaults: true,
+        });
+        if (!nextContent) {
+          fail("Full plan content must be a structured object.", {
+            errorCode: "invalid_plan_content",
+            statusCode: 422,
+          });
+        }
+        assertPlanContentAuthoringInput(
+          args.content,
+          nextContent,
+          bundleAtLoad?.plan.content,
+        );
+      } catch (error) {
+        failInvalidPlanContent(error);
+      }
+    }
+
+    if (args.content === undefined && args.contentPatches.length > 0) {
+      if (!bundleAtLoad?.plan.content) {
+        fail(
+          "Targeted content patches require a structured plan. Pass content for a full conversion, or html for legacy artifacts.",
+          { errorCode: "plan_not_structured", statusCode: 422 },
+        );
+      }
+      try {
+        nextContent = applyPlanContentPatches(
+          bundleAtLoad.plan.content,
+          args.contentPatches,
+        );
+      } catch (error) {
+        failInvalidPlanContent(error);
+      }
+    }
+    const normalizedContentAtLoad = bundleAtLoad?.plan.content
+      ? storedPlanContentSchema.parse(bundleAtLoad.plan.content)
+      : null;
+    if (
+      isDestructiveStructuredWrite &&
+      !args.allowDestructive &&
+      bundleAtLoad?.plan.content &&
+      nextContent
+    ) {
+      const warnings = destructiveStructuredReplacementWarnings(
+        bundleAtLoad.plan.content,
+        nextContent,
       );
+      if (warnings.length > 0) {
+        fail(
+          `Destructive structured replacement would ${warnings.join(" and ")}. Reload and review the latest plan, then pass allowDestructive: true with its expectedUpdatedAt only if those losses are intentional.`,
+          { errorCode: "plan_destructive_replacement", statusCode: 409 },
+        );
+      }
+    }
+    surfaceWarnings = nextContent
+      ? surfaceParityWarnings(normalizedContentAtLoad, nextContent)
+      : [];
+    if (surfaceWarnings.length > 0 && !args.allowSurfaceMismatch) {
+      fail(surfaceWarnings.join(" "), {
+        errorCode: "plan_surface_mismatch",
+        statusCode: 422,
+      });
     }
     const sourceBundleForMarkdown =
       nextContent && args.markdown === undefined
@@ -563,6 +842,9 @@ export default defineAction({
                 sourceBundleForMarkdown.plan.brief,
               planId: args.planId,
               url: planPath(args.planId, sourceBundleForMarkdown.plan.kind),
+              referencedBlockIds: referencedBlockIdsForPlanComments(
+                sourceBundleForMarkdown.comments,
+              ),
             })
           )["plan.mdx"]
         : null;
@@ -571,6 +853,14 @@ export default defineAction({
     );
     const nextTitle = args.title ?? metadataPatch?.title;
     const nextBrief = args.brief ?? metadataPatch?.brief;
+    const contentChanged =
+      nextContent !== null &&
+      JSON.stringify(nextContent) !== JSON.stringify(normalizedContentAtLoad);
+    const contentPatchChanged =
+      args.contentPatches.length > 0 &&
+      (contentChanged ||
+        (nextTitle !== undefined && nextTitle !== bundleAtLoad?.plan.title) ||
+        (nextBrief !== undefined && nextBrief !== bundleAtLoad?.plan.brief));
     const planPatch = {
       ...(nextTitle !== undefined ? { title: nextTitle } : {}),
       ...(nextBrief !== undefined ? { brief: nextBrief } : {}),
@@ -644,11 +934,11 @@ export default defineAction({
       pendingCommentInserts.push(comment);
     }
     if (onlyUpdatesCommentStatuses && pendingCommentInserts.length > 0) {
-      // A client-minted id with status "open" is a new insert, not a missing
-      // resolve target. Only throw when the caller tried to close/reopen a
-      // comment that does not exist in the DB.
       if (pendingCommentInserts.some((c) => c.status !== "open")) {
-        throw new Error("Comment status update target was not found.");
+        fail("Comment status update target was not found.", {
+          errorCode: "not_found",
+          statusCode: 404,
+        });
       }
       onlyUpdatesCommentStatuses = false;
     }
@@ -671,17 +961,15 @@ export default defineAction({
         : null;
     const commentsBeforeInserts = bundleForCommentInserts?.comments ?? [];
 
-    // Validate that any sectionId referenced by a new comment actually exists on
-    // this plan. A bogus or cross-plan sectionId would silently store a dangling
-    // FK; reject early with a clear message instead.
     if (bundleForCommentInserts) {
       const validSectionIds = new Set(
         (bundleForCommentInserts.sections ?? []).map((s) => s.id),
       );
       for (const comment of pendingCommentInserts) {
         if (comment.sectionId && !validSectionIds.has(comment.sectionId)) {
-          throw new Error(
+          fail(
             `Section ${comment.sectionId} was not found on plan ${args.planId}.`,
+            { errorCode: "plan_section_not_found", statusCode: 422 },
           );
         }
       }
@@ -724,10 +1012,27 @@ export default defineAction({
       args.status !== undefined ||
       args.currentFocus !== undefined ||
       args.html !== undefined ||
-      args.content !== undefined ||
-      args.contentPatches.length > 0 ||
+      (args.content !== undefined && contentChanged) ||
+      contentPatchChanged ||
       args.markdown !== undefined ||
       args.sections.length > 0;
+    const hasPersistedPlanChanges =
+      hasPlanAuthoringChanges ||
+      pendingCommentInserts.length > 0 ||
+      existingCommentUpdates.length > 0 ||
+      args.consumedCommentIds.length > 0;
+    const diffCount =
+      args.contentPatches.length +
+      args.sections.length +
+      [
+        args.title,
+        args.brief,
+        args.status,
+        args.currentFocus,
+        args.html,
+        args.content,
+        args.markdown,
+      ].filter((value) => value !== undefined).length;
     if (!onlyReviewerCommentWork && hasPlanAuthoringChanges) {
       await createPlanVersionSnapshot(args.planId, {
         force: true,
@@ -736,13 +1041,7 @@ export default defineAction({
       });
     }
 
-    // The local better-sqlite3 driver rejects async transaction callbacks
-    // ("Transaction function cannot return a promise"), so the multi-statement
-    // write runs sequentially rather than inside `db.transaction`. The leading
-    // optimistic-lock UPDATE still guards concurrent writes; the libsql (prod)
-    // driver executes these awaits identically. (A driver-aware atomic helper is
-    // the proper long-term fix.)
-    await (async (tx: typeof db) => {
+    await db.transaction(async (tx) => {
       // guard:allow-unscoped -- gated above by editor access, or by public
       // viewer access plus new-open-human-comment / canvas-review-markup validation.
       //
@@ -772,8 +1071,9 @@ export default defineAction({
           .returning({ id: schema.plans.id });
 
         if (updatedRows.length === 0) {
-          throw new Error(
+          fail(
             "This plan was updated by someone else while your change was being saved. Reload the plan and retry.",
+            { errorCode: "plan_revision_conflict", statusCode: 409 },
           );
         }
       }
@@ -859,10 +1159,6 @@ export default defineAction({
                   sectionId: comment.sectionId ?? null,
                   kind: comment.kind,
                   status: comment.status,
-                  // Preserve stored anchor/resolutionTarget/mentionsJson when the
-                  // caller omits them (e.g. a mixed resolve+consume request that
-                  // only carries { id, status, message }). Only overwrite when the
-                  // input explicitly provides a value.
                   anchor:
                     comment.anchor !== undefined
                       ? (metadata?.anchor ?? null)
@@ -909,20 +1205,59 @@ export default defineAction({
           );
       }
 
-      await tx.insert(schema.planEvents).values({
-        id: newId("evt"),
-        planId: args.planId,
-        type: "plan.updated",
-        message:
-          !onlyReviewerCommentWork && args.note
-            ? args.note
-            : `Updated ${args.sections.length} section(s), ${args.comments.length} comment(s).`,
-        payload: JSON.stringify(reviewEventPayload),
-        createdBy: onlyReviewerCommentWork ? "human" : "agent",
-        createdAt: now,
-      });
-    })(db);
+      if (hasPersistedPlanChanges) {
+        await tx.insert(schema.planEvents).values({
+          id: newId("evt"),
+          planId: args.planId,
+          type: "plan.updated",
+          message:
+            !onlyReviewerCommentWork && args.note
+              ? args.note
+              : `Updated ${args.sections.length} section(s), ${args.comments.length} comment(s).`,
+          payload: JSON.stringify(reviewEventPayload),
+          createdBy: onlyReviewerCommentWork ? "human" : "agent",
+          createdAt: now,
+        });
+      }
+    });
+
+    if (isAgentCaller && hasPlanAuthoringChanges) {
+      try {
+        const blockIds = affectedPlanBlockIds(args.contentPatches, nextContent);
+        const ops = args.contentPatches.map((patch) => patch.op);
+        const label =
+          ops.length > 0
+            ? `Edited ${ops.length} block${ops.length === 1 ? "" : "s"}`
+            : "Updated plan";
+        agentTouchDocument(`plan:${args.planId}`, {
+          edit: {
+            descriptor: { kind: "paths", paths: blockIds },
+            label,
+          },
+          metadata: { blockIds },
+        });
+      } catch (error) {
+        console.error(
+          "[update-visual-plan] agent presence publish failed",
+          error,
+        );
+      }
+    }
+
     const bundle = await loadPlanBundle(args.planId);
+    if (hasPlanAuthoringChanges) {
+      track(
+        "plan_updated",
+        {
+          app_name: "plan",
+          template_name: "plan",
+          output_id: bundle.plan.id,
+          output_type: bundle.plan.kind,
+          diff_count: diffCount,
+        },
+        ctx,
+      );
+    }
     await notifyPlanCommentRecipients({
       bundle,
       insertedCommentIds,
@@ -930,7 +1265,6 @@ export default defineAction({
     }).catch((error) => {
       console.warn("[update-visual-plan] comment notification failed:", error);
     });
-    // Emit plan.commented for any newly inserted comments
     if (insertedCommentIds.length > 0) {
       const newComments = bundle.comments.filter((c) =>
         insertedCommentIds.includes(c.id),
@@ -949,27 +1283,48 @@ export default defineAction({
         ownerEmail: bundle.access.ownerEmail,
       });
     }
-    // Emit plan.status.changed when the status was explicitly changed
-    if (args.status) {
+    if (
+      args.status &&
+      bundleAtLoad?.plan.status !== undefined &&
+      args.status !== bundleAtLoad.plan.status
+    ) {
       emitPlanStatusChanged({
         planId: bundle.plan.id,
         title: bundle.plan.title,
         kind: bundle.plan.kind,
-        oldStatus: null, // status before update is not re-fetched here; use null as unknown-prior
+        oldStatus: bundleAtLoad.plan.status,
         newStatus: bundle.plan.status,
         changedBy: requesterEmail,
         ownerEmail: bundle.access.ownerEmail,
       });
     }
     const local = isLocalPlanRuntime()
-      ? await writePlanLocalFiles({
-          planId: bundle.plan.id,
-          title: bundle.plan.title,
-          brief: bundle.plan.brief,
-          content: bundle.plan.content,
-          url: planPath(bundle.plan.id, bundle.plan.kind),
-        })
+      ? hasPersistedPlanChanges
+        ? await writePlanLocalFiles({
+            planId: bundle.plan.id,
+            title: bundle.plan.title,
+            brief: bundle.plan.brief,
+            content: bundle.plan.content,
+            url: planPath(bundle.plan.id, bundle.plan.kind),
+            referencedBlockIds: referencedBlockIdsForPlanComments(
+              bundle.comments,
+            ),
+          })
+        : null
       : null;
+    if (isAgentCaller) {
+      return {
+        ...compactAgentWriteResult(bundle, {
+          titleChanged: args.title !== undefined,
+          briefChanged: args.brief !== undefined,
+          statusChanged: args.status !== undefined,
+          contentPatchOps: args.contentPatches.map((patch) => patch.op),
+          commentCount: insertedCommentIds.length,
+          ...(surfaceWarnings.length > 0 ? { warnings: surfaceWarnings } : {}),
+        }),
+        ...(local?.written ? { localFiles: local } : {}),
+      };
+    }
     return {
       ...bundle,
       planId: bundle.plan.id,

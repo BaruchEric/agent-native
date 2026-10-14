@@ -1,18 +1,5 @@
-import type { BlockSpec, BlockAttrReader, MdxAttrValue } from "./types.js";
 import type { BlockRegistry } from "./registry.js";
-
-/**
- * Registry-driven MDX serialize/parse, plus the shared encoder primitives that
- * are the round-trip contract. This module is React-free so the server MDX
- * adapter (`plan-mdx.ts`) and the agent schema export can import it. The encoder
- * + estree literal walker are kept BYTE-FOR-BYTE identical to the originals in
- * `plan-mdx.ts` — `plan-mdx.ts` re-imports them so nothing else there changes
- * and stored `.mdx` files round-trip the same.
- */
-
-/* -------------------------------------------------------------------------- */
-/* Serialize-side encoder primitives (moved verbatim from plan-mdx.ts)        */
-/* -------------------------------------------------------------------------- */
+import type { BlockSpec, BlockAttrReader, MdxAttrValue } from "./types.js";
 
 export function jsonExpression(value: unknown): string {
   return JSON.stringify(value, null, 2);
@@ -26,12 +13,6 @@ export function escapeAttr(value: string): string {
     .replace(/>/g, "&gt;");
 }
 
-/**
- * Encode a single attribute. Returns "" (the attribute is dropped) for
- * undefined/null; a bare/`={false}` flag for booleans; `={n}` for numbers; a
- * quoted string when it matches the safe charset and is short, else a JSON
- * expression. Objects/arrays always serialize as a JSON expression.
- */
 export function prop(name: string, value: unknown): string {
   if (value === undefined || value === null) return "";
   if (typeof value === "boolean") {
@@ -47,11 +28,6 @@ export function prop(name: string, value: unknown): string {
   return ` ${name}={${jsonExpression(value)}}`;
 }
 
-/* -------------------------------------------------------------------------- */
-/* Parse-side attribute resolution (moved verbatim from plan-mdx.ts)          */
-/* -------------------------------------------------------------------------- */
-
-/** Minimal MDX AST node shape (subset of the remark-mdx jsx element). */
 export type MdxAttrNode = {
   type: string;
   name?: string;
@@ -132,16 +108,11 @@ function literalNodeValue(node: EstreeNode | undefined | null): unknown {
   if (!node) return undefined;
   if (node.type === "Literal") return node.value;
   if (node.type === "TemplateLiteral") {
-    // A template literal WITH `${…}` interpolations can't be evaluated
-    // statically — fail loudly so the import errors instead of falling through
-    // to a confusing JSON parse error or silently dropping the attribute.
     if ((node.expressions?.length ?? 0) > 0) {
       throw new Error(
         "Template literal attribute values may not contain ${…} expressions; use a static string.",
       );
     }
-    // A template literal with no expressions is a static string:
-    // `<div>hi</div>` → "<div>hi</div>".
     return node.quasis?.[0]?.value?.cooked ?? "";
   }
   if (node.type === "ArrayExpression") {
@@ -178,7 +149,6 @@ function literalNodeValue(node: EstreeNode | undefined | null): unknown {
   return undefined;
 }
 
-/** Build a {@link BlockAttrReader} bound to one parsed JSX node. */
 export function createAttrReader(node: MdxJsxNode): BlockAttrReader {
   const read = (name: string) => attributeValue(findAttribute(node, name));
   return {
@@ -206,11 +176,56 @@ export function createAttrReader(node: MdxJsxNode): BlockAttrReader {
   };
 }
 
-/* -------------------------------------------------------------------------- */
-/* Registry serialize / parse                                                 */
-/* -------------------------------------------------------------------------- */
+type MdxCodeNode = {
+  type?: unknown;
+  lang?: unknown;
+  value?: unknown;
+};
 
-/** The base-attribute + body shape every block carries. */
+function codeFenceFor(value: string): string {
+  const longestBacktickRun =
+    value.match(/`+/g)?.reduce((max, run) => Math.max(max, run.length), 0) ?? 0;
+  return "`".repeat(Math.max(3, longestBacktickRun + 1));
+}
+
+function codeFenceLang(value: unknown): string | undefined {
+  return typeof value === "string"
+    ? value.trim().split(/\s+/)[0]?.toLowerCase()
+    : undefined;
+}
+
+export function childCodeFenceFields<TData extends object>(
+  childNodes: unknown[],
+  fieldsByLang: Record<string, keyof TData & string>,
+): Partial<TData> {
+  const out: Partial<TData> = {};
+  for (const node of childNodes as MdxCodeNode[]) {
+    if (!node || node.type !== "code" || typeof node.value !== "string") {
+      continue;
+    }
+    const field = fieldsByLang[codeFenceLang(node.lang) ?? ""];
+    if (field) {
+      (out as Record<string, string>)[field] = node.value;
+    }
+  }
+  return out;
+}
+
+export function serializeChildCodeFenceFields<TData extends object>(
+  data: TData,
+  fieldsByLang: Record<string, keyof TData & string>,
+): string {
+  const fences: string[] = [];
+  const record = data as Record<string, unknown>;
+  for (const [lang, field] of Object.entries(fieldsByLang)) {
+    const value = record[field];
+    if (typeof value !== "string" || value.length === 0) continue;
+    const fence = codeFenceFor(value);
+    fences.push(`${fence}${lang}\n${value.trimEnd()}\n${fence}`);
+  }
+  return fences.length ? `\n${fences.join("\n\n")}\n` : "";
+}
+
 export interface SerializableBlock {
   id: string;
   title?: string;
@@ -219,7 +234,6 @@ export interface SerializableBlock {
   data: unknown;
 }
 
-/** Base block attributes parsed from a node, before the type-specific data. */
 export interface ParsedBlockBase {
   id: string;
   title?: string;
@@ -227,12 +241,6 @@ export interface ParsedBlockBase {
   editable?: boolean;
 }
 
-/**
- * Serialize a block to its MDX element using its spec. Byte output MUST match
- * the legacy `serializeBlock` for every converted block: base attrs
- * (`id,title,summary,editable`) first, then the spec's `toAttrs` in insertion
- * order, then either nested children, prose children, or self-closing.
- */
 export function serializeSpecBlock(
   spec: BlockSpec<any>,
   block: SerializableBlock,
@@ -252,12 +260,12 @@ export function serializeSpecBlock(
 
   const tag = spec.mdx.tag;
 
-  // Custom nested-MDX children (e.g. wireframe Screen/kit tree).
   if (spec.mdx.serializeChildren) {
-    return `<${tag}${base}${attrStr}>\n${spec.mdx.serializeChildren(block.data)}\n</${tag}>`;
+    const children = spec.mdx.serializeChildren(block.data);
+    if (!children.trim()) return `<${tag}${base}${attrStr} />`;
+    return `<${tag}${base}${attrStr}>\n${children}\n</${tag}>`;
   }
 
-  // Prose children (rich-text, callout): body is a trimmed markdown string.
   if (childrenField) {
     const body = String(
       (block.data as Record<string, unknown>)[childrenField] ?? "",
@@ -265,16 +273,9 @@ export function serializeSpecBlock(
     return `<${tag}${base}${attrStr}>\n\n${body}\n\n</${tag}>`;
   }
 
-  // Self-closing structured block.
   return `<${tag}${base}${attrStr} />`;
 }
 
-/**
- * Parse one MDX JSX node into a block via the registry, if its tag is
- * registered. Returns `null` for unregistered tags so the caller can fall back
- * to its legacy parser. `base` is the already-extracted id/title/summary/
- * editable; `children` is the stringified prose children.
- */
 export function parseSpecBlock(
   registry: BlockRegistry,
   node: MdxJsxNode,

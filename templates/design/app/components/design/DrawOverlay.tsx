@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useT } from "@agent-native/core/client/i18n";
 import {
   IconEraser,
   IconArrowBackUp,
@@ -6,15 +6,18 @@ import {
   IconPlus,
   IconCursorText,
 } from "@tabler/icons-react";
+import { useState, useRef, useCallback, useEffect } from "react";
+
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { cn } from "@/lib/utils";
-import type { DrawAnnotation } from "./types";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
+
+import type { DrawAnnotation } from "./types";
 
 interface DrawOverlayProps {
   visible: boolean;
@@ -48,6 +51,7 @@ interface Stroke {
 }
 
 export function DrawOverlay({ visible, onQueue, onSend }: DrawOverlayProps) {
+  const t = useT();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [color, setColor] = useState(PRESET_COLORS[0].color);
   const [lineWidth, setLineWidth] = useState(LINE_WIDTHS[1].value);
@@ -62,14 +66,12 @@ export function DrawOverlay({ visible, onQueue, onSend }: DrawOverlayProps) {
   } | null>(null);
   const drawing = useRef(false);
 
-  // Redraw canvas when strokes change
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // Match canvas size to element size
     const rect = canvas.getBoundingClientRect();
     canvas.width = rect.width * window.devicePixelRatio;
     canvas.height = rect.height * window.devicePixelRatio;
@@ -77,12 +79,10 @@ export function DrawOverlay({ visible, onQueue, onSend }: DrawOverlayProps) {
 
     ctx.clearRect(0, 0, rect.width, rect.height);
 
-    // Draw completed strokes
     for (const stroke of strokes) {
       drawStroke(ctx, stroke.points, stroke.color, stroke.lineWidth);
     }
 
-    // Draw current stroke
     if (currentStroke && currentStroke.length > 0) {
       drawStroke(ctx, currentStroke, color, lineWidth);
     }
@@ -168,56 +168,49 @@ export function DrawOverlay({ visible, onQueue, onSend }: DrawOverlayProps) {
   const queueDrawing = () => {
     if (strokes.length === 0) return;
 
-    // Convert strokes to SVG path data
-    const pathData = strokes
-      .map((s) => {
-        const d = s.points
+    const newAnnotations: DrawAnnotation[] = strokes.map((s) => {
+      const pathData = s.points
+        .map(
+          (p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`,
+        )
+        .join(" ");
+      return {
+        id: crypto.randomUUID(),
+        type: "path",
+        pathData,
+        position: { x: 0, y: 0 },
+        color: s.color,
+        lineWidth: s.lineWidth,
+      };
+    });
+
+    for (const annotation of newAnnotations) {
+      onQueue(annotation);
+    }
+    setQueued((prev) => [...prev, ...newAnnotations]);
+    setStrokes([]);
+  };
+
+  const sendAll = () => {
+    let allAnnotations = [...queued];
+    if (strokes.length > 0) {
+      const strokeAnnotations: DrawAnnotation[] = strokes.map((s) => {
+        const pathData = s.points
           .map(
             (p, i) =>
               `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`,
           )
           .join(" ");
-        return d;
-      })
-      .join(" ");
-
-    const annotation: DrawAnnotation = {
-      id: crypto.randomUUID(),
-      type: "path",
-      pathData,
-      position: { x: 0, y: 0 },
-      color,
-      lineWidth,
-    };
-    onQueue(annotation);
-    setQueued((prev) => [...prev, annotation]);
-    setStrokes([]);
-  };
-
-  const sendAll = () => {
-    // Queue current drawing first if any
-    let allAnnotations = [...queued];
-    if (strokes.length > 0) {
-      const pathData = strokes
-        .map((s) => {
-          const d = s.points
-            .map(
-              (p, i) =>
-                `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`,
-            )
-            .join(" ");
-          return d;
-        })
-        .join(" ");
-
-      allAnnotations.push({
-        id: crypto.randomUUID(),
-        type: "path",
-        pathData,
-        position: { x: 0, y: 0 },
-        color,
-        lineWidth,
+        return {
+          id: crypto.randomUUID(),
+          type: "path",
+          pathData,
+          position: { x: 0, y: 0 },
+          color: s.color,
+          lineWidth: s.lineWidth,
+        };
       });
+      allAnnotations = [...allAnnotations, ...strokeAnnotations];
     }
 
     if (allAnnotations.length > 0) {
@@ -269,13 +262,13 @@ export function DrawOverlay({ visible, onQueue, onSend }: DrawOverlayProps) {
             }}
             className="h-7 w-48 border-primary bg-background text-sm"
             autoFocus
-            placeholder="Type annotation..."
+            placeholder={t("visualEditor.typeAnnotation")}
           />
         </div>
       )}
 
       {/* Bottom toolbar */}
-      <div className="absolute bottom-4 left-1/2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-xl border border-border bg-card px-3 py-2 shadow-2xl backdrop-blur-sm">
+      <div className="absolute bottom-16 left-1/2 z-30 flex max-w-[calc(100%-1rem)] -translate-x-1/2 flex-wrap items-center justify-center gap-2 rounded-xl border border-border bg-card px-3 py-2 shadow-2xl backdrop-blur-sm sm:bottom-20">
         {/* Color picker */}
         <div className="flex gap-1">
           {PRESET_COLORS.map((preset) => (
@@ -341,7 +334,7 @@ export function DrawOverlay({ visible, onQueue, onSend }: DrawOverlayProps) {
               <IconCursorText className="h-3.5 w-3.5" />
             </button>
           </TooltipTrigger>
-          <TooltipContent>Type anywhere</TooltipContent>
+          <TooltipContent>{t("visualEditor.typeAnywhere")}</TooltipContent>
         </Tooltip>
 
         {/* Undo */}
@@ -387,7 +380,7 @@ export function DrawOverlay({ visible, onQueue, onSend }: DrawOverlayProps) {
         <Button
           variant="ghost"
           size="sm"
-          className="h-6 gap-1 px-2 text-[11px] text-muted-foreground hover:text-foreground"
+          className="h-6 gap-1 px-2 !text-[11px] text-muted-foreground hover:text-foreground"
           onClick={queueDrawing}
           disabled={strokes.length === 0}
         >
@@ -398,7 +391,7 @@ export function DrawOverlay({ visible, onQueue, onSend }: DrawOverlayProps) {
         {/* Send button */}
         <Button
           size="sm"
-          className="h-6 gap-1 px-3 text-[11px]"
+          className="h-6 gap-1 px-3 !text-[11px]"
           onClick={sendAll}
           disabled={totalQueued === 0 && strokes.length === 0}
         >

@@ -1,8 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
 import { afterEach, describe, expect, it } from "vitest";
 
+import { fetchPlanBlockCatalog } from "./plan-blocks.js";
 import {
   buildLocalPlanPreviewHtml,
   localPlanFolderName,
@@ -14,7 +16,6 @@ import {
   verifyLocalPlanBridge,
   writeLocalPlanPreview,
 } from "./plan-local.js";
-import { fetchPlanBlockCatalog } from "./plan-blocks.js";
 
 const tmpRoots: string[] = [];
 const originalCwd = process.cwd();
@@ -253,6 +254,45 @@ function writeChecklistMissingItemLabel(dir: string) {
   );
 }
 
+function writeNestedChecklistMissingItemId(dir: string) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "plan.mdx"),
+    [
+      "---",
+      'title: "Repro: nested checklist false green"',
+      'kind: "plan"',
+      "---",
+      "",
+      "# Nested checklist",
+      "",
+      "<TabsBlock",
+      '  id="tabs-1"',
+      "  tabs={[",
+      "    {",
+      '      id: "tab-a",',
+      '      label: "Tasks",',
+      "      blocks: [",
+      "        {",
+      '          id: "cl-1",',
+      '          type: "checklist",',
+      "          data: {",
+      "            items: [",
+      '              { label: "No id here" },',
+      '              { label: "Second item also missing id" }',
+      "            ]",
+      "          }",
+      "        }",
+      "      ]",
+      "    }",
+      "  ]}",
+      "/>",
+      "",
+    ].join("\n"),
+    "utf-8",
+  );
+}
+
 function writeQuestionFormMissingTitleAndMode(dir: string) {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
@@ -292,9 +332,6 @@ function writeQuestionFormInvalidMode(dir: string) {
 }
 
 function writeScaffoldExamplePlan(dir: string) {
-  // Mirrors the `plan local init` scaffold prose, which documents block usage
-  // with an inline-code example. That example must NOT be linted as a real
-  // block (it previously tripped the wireframe linter → init → serve failed).
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
     path.join(dir, "plan.mdx"),
@@ -329,6 +366,12 @@ describe("local plan CLI helpers", () => {
     );
     expect(result.stdout).toContain(
       "agent-native plan local serve --dir <folder>",
+    );
+    expect(result.stdout).toContain(
+      "re-enable Local Network access in the plan.agent-native.com site",
+    );
+    expect(result.stdout).toContain(
+      "Keep the bridge command running while the page is open.",
     );
   });
 
@@ -372,16 +415,113 @@ describe("local plan CLI helpers", () => {
       expect(result.ok, label).toBe(true);
       expect(result.appUrl, label).toBe("https://plan.example.com");
       expect(result.bridgeUrl, label).toContain("http://127.0.0.1:");
-      expect(result.url, label).toBe(
-        `https://plan.example.com/local-plans/checkout?bridge=${encodeURIComponent(
-          result.bridgeUrl,
-        )}`,
+      const [pageUrl, encodedBridgeUrl] = result.url.split("#bridge=");
+      expect(pageUrl, label).toMatch(
+        /^https:\/\/plan\.example\.com\/local-plans\/local-[a-f0-9]{16}$/,
+      );
+      expect(decodeURIComponent(encodedBridgeUrl), label).toBe(
+        result.bridgeUrl,
       );
       expect(result.urlFile, label).toBe(urlFile);
       expect(fs.readFileSync(urlFile, "utf-8"), label).toBe(`${result.url}\n`);
       expect(captured.stderr, label).toContain("Local Plan bridge running at");
       expect(captured.stderr, label).toContain(
         `Open URL written to ${urlFile}`,
+      );
+      expect(captured.stderr, label).toContain(
+        "Chrome/Edge will ask for Local Network access",
+      );
+      expect(captured.stderr, label).toContain(
+        "re-enable Local Network access in the plan.example.com site settings",
+      );
+      expect(captured.stderr, label).toContain(
+        "Keep this bridge command running while the Plan page is open",
+      );
+      expect(captured.stderr, label).toContain("Safari may block");
+    }
+  });
+
+  it("persists local comments through the tokenized bridge", async () => {
+    const dir = path.join(tmpDir(), "checkout");
+    writeSamplePlan(dir);
+    const bridge = await startLocalPlanBridge({
+      dir,
+      appUrl: "https://plan.example.com",
+      urlFile: false,
+    });
+    const commentsUrl = new URL(bridge.result.bridgeUrl);
+    commentsUrl.pathname = "/local-plan-comments.json";
+
+    try {
+      const preflight = await fetch(commentsUrl, { method: "OPTIONS" });
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get("access-control-allow-methods")).toContain(
+        "POST",
+      );
+
+      const initial = (await (await fetch(bridge.result.bridgeUrl)).json()) as {
+        comments?: unknown[];
+      };
+      expect(initial.comments).toEqual([]);
+
+      const badTokenUrl = new URL(commentsUrl);
+      badTokenUrl.searchParams.set("token", "bad");
+      const rejected = await fetch(badTokenUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          comments: [{ id: "cmt_bad", message: "Must not write." }],
+        }),
+      });
+      expect(rejected.status).toBe(403);
+
+      const written = await fetch(commentsUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          comments: [
+            {
+              id: "cmt_local",
+              kind: "annotation",
+              status: "open",
+              message: "Tighten this local recap note.",
+              anchor: JSON.stringify({ kind: "document", blockId: "wf" }),
+            },
+          ],
+        }),
+      });
+      expect(written.status).toBe(200);
+      const payload = (await written.json()) as {
+        comments?: Array<{
+          id: string;
+          message: string;
+          resolutionTarget: string;
+        }>;
+      };
+      expect(payload.comments).toMatchObject([
+        {
+          id: "cmt_local",
+          message: "Tighten this local recap note.",
+          resolutionTarget: "agent",
+        },
+      ]);
+
+      const onDisk = JSON.parse(
+        fs.readFileSync(path.join(dir, "comments.json"), "utf-8"),
+      ) as Array<{ id: string; message: string }>;
+      expect(onDisk).toMatchObject([
+        { id: "cmt_local", message: "Tighten this local recap note." },
+      ]);
+
+      const reloaded = (await (
+        await fetch(bridge.result.bridgeUrl)
+      ).json()) as { comments?: Array<{ id: string }> };
+      expect(reloaded.comments?.map((comment) => comment.id)).toEqual([
+        "cmt_local",
+      ]);
+    } finally {
+      await new Promise<void>((resolve) =>
+        bridge.server.close(() => resolve()),
       );
     }
   });
@@ -534,6 +674,23 @@ describe("local plan CLI helpers", () => {
     );
   });
 
+  it("rejects a checklist nested in a TabsBlock missing item ids (no false green)", () => {
+    const dir = path.join(tmpDir(), "nested-checklist");
+    writeNestedChecklistMissingItemId(dir);
+
+    const issues = validateLocalPlanFiles(readLocalPlanFiles(dir));
+    const messages = issues.map((issue) => issue.message);
+    expect(messages).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/Checklist items\[0\]\.id is required/),
+        expect.stringMatching(/Checklist items\[1\]\.id is required/),
+      ]),
+    );
+    expect(() => writeLocalPlanPreview({ dir })).toThrow(
+      /Checklist items\[0\]\.id is required/,
+    );
+  });
+
   it("rejects missing question title, mode, and option label", () => {
     const dir = path.join(tmpDir(), "bad-question-required");
     writeQuestionFormMissingTitleAndMode(dir);
@@ -563,9 +720,6 @@ describe("local plan CLI helpers", () => {
   it("does not lint block tags written inside inline code (init scaffold passes)", () => {
     const dir = path.join(tmpDir(), "scaffold");
     writeScaffoldExamplePlan(dir);
-    // The scaffold's `<WireframeBlock><Screen>...` is a documentation example in
-    // inline code, not a real block — validation must not trip on it so the
-    // default `init` → `serve`/`check` flow works out of the box.
     expect(() => writeLocalPlanPreview({ dir })).not.toThrow();
   });
 
@@ -580,10 +734,12 @@ describe("local plan CLI helpers", () => {
     });
 
     try {
-      expect(bridge.result.url).toBe(
-        `https://plan.example.com/local-plans/checkout?bridge=${encodeURIComponent(
-          bridge.result.bridgeUrl,
-        )}`,
+      const [pageUrl, encodedBridgeUrl] = bridge.result.url.split("#bridge=");
+      expect(pageUrl).toMatch(
+        /^https:\/\/plan\.example\.com\/local-plans\/local-[a-f0-9]{16}$/,
+      );
+      expect(decodeURIComponent(encodedBridgeUrl)).toBe(
+        bridge.result.bridgeUrl,
       );
       expect(bridge.result.bridgeUrl).toContain("127.0.0.1");
       expect(bridge.result.files).toContain("plan.mdx");
@@ -629,15 +785,41 @@ describe("local plan CLI helpers", () => {
     }
   });
 
-  it("verifies the localhost bridge headlessly and reports Safari guidance", async () => {
+  function verifyFetchFn(
+    validation: { status?: number; body?: unknown } | null,
+  ): typeof fetch {
+    return (async (input, init) => {
+      const url = String(input);
+      if (url.includes("/actions/validate-local-plan-source")) {
+        if (!validation) throw new Error("network down");
+        return new Response(JSON.stringify(validation.body ?? {}), {
+          status: validation.status ?? 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return fetch(input as never, init);
+    }) as typeof fetch;
+  }
+
+  it("never sends local plan source to a remote renderer", async () => {
     const dir = path.join(tmpDir(), "checkout");
     writeSamplePlan(dir);
+    const remoteCalls: string[] = [];
+    const fetchFn: typeof fetch = (async (input, init) => {
+      const url = new URL(String(input));
+      if (url.hostname !== "127.0.0.1") {
+        remoteCalls.push(String(input));
+        throw new Error("Local plan verification attempted remote egress");
+      }
+      return fetch(input as never, init);
+    }) as typeof fetch;
 
     const result = await verifyLocalPlanBridge({
       dir,
       appUrl: "https://plan.example.com",
       token: "test-token",
       urlFile: false,
+      fetchFn,
     });
 
     expect(result.ok).toBe(true);
@@ -646,8 +828,112 @@ describe("local plan CLI helpers", () => {
     expect(result.bridge.ok).toBe(true);
     expect(result.bridge.source).toBe("agent-native-local-bridge");
     expect(result.bridge.mdxFiles).toContain("plan.mdx");
+    expect(result.validation.ran).toBe(false);
+    expect(result.validation.error).toContain("Skipped remote renderer");
+    expect(remoteCalls).toEqual([]);
+    expect(result.warnings.join("\n")).toContain(
+      "Chrome/Edge will ask for Local Network access",
+    );
+    expect(result.warnings.join("\n")).toContain(
+      "re-enable Local Network access in the plan.example.com site settings",
+    );
     expect(result.warnings.join("\n")).toContain("Safari may block");
     expect(fs.existsSync(path.join(dir, ".plan-url"))).toBe(false);
+  });
+
+  it("fails verify when the renderer schema rejects the plan", async () => {
+    const dir = path.join(tmpDir(), "checkout-invalid");
+    writeSamplePlan(dir);
+
+    const result = await verifyLocalPlanBridge({
+      dir,
+      appUrl: "http://localhost:8096",
+      token: "test-token",
+      urlFile: false,
+      fetchFn: verifyFetchFn({
+        body: {
+          valid: false,
+          issues: [
+            {
+              path: "blocks[1].data.tabs[0].blocks[0].data.items[0].id",
+              message: "Required",
+            },
+          ],
+        },
+      }),
+    });
+
+    expect(result.bridge.ok).toBe(true);
+    expect(result.validation.ran).toBe(true);
+    expect(result.validation.valid).toBe(false);
+    expect(result.ok).toBe(false);
+    expect(result.warnings.join("\n")).toContain(
+      "blocks[1].data.tabs[0].blocks[0].data.items[0].id",
+    );
+  });
+
+  it("verify stays ok but warns when the validate endpoint is unavailable", async () => {
+    const dir = path.join(tmpDir(), "checkout-no-endpoint");
+    writeSamplePlan(dir);
+
+    const result = await verifyLocalPlanBridge({
+      dir,
+      appUrl: "http://localhost:8096",
+      token: "test-token",
+      urlFile: false,
+      fetchFn: verifyFetchFn(null),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.validation.ran).toBe(false);
+    expect(result.warnings.join("\n")).toContain(
+      "NOT validated against a local renderer schema",
+    );
+  });
+
+  it("does not abort on the offline lint; reports the renderer verdict for an invalid plan", async () => {
+    const dir = path.join(tmpDir(), "verify-invalid-renderer");
+    writeNestedChecklistMissingItemId(dir);
+
+    const result = await verifyLocalPlanBridge({
+      dir,
+      appUrl: "http://localhost:8096",
+      token: "test-token",
+      urlFile: false,
+      fetchFn: verifyFetchFn({
+        body: {
+          valid: false,
+          issues: [
+            {
+              path: "blocks[0].data.tabs[0].blocks[0].data.items[0].id",
+              message: "Required",
+            },
+          ],
+        },
+      }),
+    });
+
+    expect(result.validation.ran).toBe(true);
+    expect(result.validation.valid).toBe(false);
+    expect(result.ok).toBe(false);
+  });
+
+  it("falls back to the offline lint when the renderer is unreachable", async () => {
+    const dir = path.join(tmpDir(), "verify-invalid-offline");
+    writeNestedChecklistMissingItemId(dir);
+
+    const result = await verifyLocalPlanBridge({
+      dir,
+      appUrl: "http://localhost:8096",
+      token: "test-token",
+      urlFile: false,
+      fetchFn: verifyFetchFn(null),
+    });
+
+    expect(result.validation.ran).toBe(false);
+    expect(result.ok).toBe(false);
+    expect(result.warnings.join("\n")).toContain("Offline lint rejected");
+    expect(result.warnings.join("\n")).toMatch(/items\[0\]\.id is required/);
   });
 
   it("fetches the no-auth block catalog for local authoring", async () => {

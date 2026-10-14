@@ -1,9 +1,72 @@
 import { describe, expect, it } from "vitest";
+
 import type { ContentDatabaseResponse, DocumentProperty } from "../shared/api";
 import {
+  buildSelectionScreenSection,
   databaseCurrentViewSnapshot,
+  documentContentPreview,
   serializeDocumentTreeItemForScreen,
+  SCREEN_DOCUMENT_PREVIEW_CHARS,
 } from "./view-screen";
+
+describe("buildSelectionScreenSection", () => {
+  it("returns null when there is no selection state", () => {
+    expect(buildSelectionScreenSection(null, "doc1")).toBeNull();
+  });
+
+  it("returns null when the selection belongs to a different document", () => {
+    const selection = {
+      documentId: "doc-other",
+      collapsed: false,
+      selectedText: "hello",
+    };
+    expect(buildSelectionScreenSection(selection, "doc1")).toBeNull();
+  });
+
+  it("returns null when no document is currently open", () => {
+    const selection = { documentId: "doc1", selectedText: "hello" };
+    expect(buildSelectionScreenSection(selection, undefined)).toBeNull();
+  });
+
+  it("builds a collapsed-selection section with a cursor-only hint", () => {
+    const selection = {
+      documentId: "doc1",
+      collapsed: true,
+      blockText: "Some paragraph text",
+      heading: "Intro",
+    };
+    const section = buildSelectionScreenSection(selection, "doc1");
+    expect(section).toMatchObject({
+      documentId: "doc1",
+      collapsed: true,
+      blockText: "Some paragraph text",
+      heading: "Intro",
+    });
+    expect(section?.hint).toMatch(/no text is selected/i);
+  });
+
+  it("builds a real-selection section naming the edit-document call", () => {
+    const selection = {
+      documentId: "doc1",
+      collapsed: false,
+      selectedText: "the quick brown fox",
+      textTruncated: false,
+      blockText: "The quick brown fox jumps.",
+      heading: "Section A",
+    };
+    const section = buildSelectionScreenSection(selection, "doc1");
+    expect(section).toMatchObject({
+      documentId: "doc1",
+      collapsed: false,
+      selectedText: "the quick brown fox",
+      textTruncated: false,
+      heading: "Section A",
+    });
+    expect(section?.hint).toContain("edit-document");
+    expect(section?.hint).toContain("baseRevision");
+    expect(section?.hint).toContain("idempotencyKey");
+  });
+});
 
 function property(
   id: string,
@@ -112,6 +175,8 @@ function databaseResponse(): ContentDatabaseResponse {
             hideEmptyGroups: true,
             calculations: { owner: "count_unique" },
             wrapCells: true,
+            columnWrapOverrides: { owner: false },
+            frozenThroughColumnId: null,
             rowDensity: "comfortable",
             hiddenPropertyIds: ["priority"],
             propertyOrderIds: ["owner", "status", "missing-property"],
@@ -249,6 +314,34 @@ describe("view-screen document tree", () => {
   });
 });
 
+describe("view-screen document previews", () => {
+  it("keeps short bodies and their full length", () => {
+    const content = "  A short page.  ";
+
+    expect(documentContentPreview(content)).toEqual({
+      contentPreview: "A short page.",
+      contentLength: content.length,
+      contentTruncated: false,
+    });
+  });
+
+  it("bounds long bodies and points to the full-document action", () => {
+    const content = `  ${"x".repeat(SCREEN_DOCUMENT_PREVIEW_CHARS + 100)}  `;
+    const preview = documentContentPreview(content);
+
+    expect(preview.contentLength).toBe(content.length);
+    expect(preview.contentTruncated).toBe(true);
+    expect(preview.contentPreview).toHaveLength(
+      SCREEN_DOCUMENT_PREVIEW_CHARS +
+        "... [document body truncated; call get-document for the full content]"
+          .length,
+    );
+    expect(preview.contentPreview).toContain(
+      "call get-document for the full content",
+    );
+  });
+});
+
 describe("view-screen current database view", () => {
   it("normalizes rich database navigation state into a current view snapshot", () => {
     expect(
@@ -337,6 +430,7 @@ describe("view-screen current database view", () => {
       collapsedGroupIds: ["status:published"],
       hideEmptyGroups: true,
       openPagesIn: "full_page",
+      formQuestions: [],
       datePropertyId: "publish",
       datePropertyName: "Publish Date",
       endDatePropertyId: "end",
@@ -389,6 +483,16 @@ describe("view-screen current database view", () => {
 
   it("falls back to the saved active view and database rows", () => {
     expect(databaseCurrentViewSnapshot({}, databaseResponse())).toEqual({
+      tableColumnOrderIds: ["name", "owner", "status"],
+      columnWrapOverrides: { owner: false },
+      effectiveColumnWrapById: {
+        name: true,
+        owner: false,
+        status: true,
+      },
+      frozenThroughColumnId: null,
+      intendedFrozenColumnIds: [],
+      effectiveFrozenColumnIds: undefined,
       id: "editorial",
       name: "Editorial",
       type: "table",
@@ -401,6 +505,7 @@ describe("view-screen current database view", () => {
       collapsedGroupIds: ["status:published"],
       hideEmptyGroups: true,
       openPagesIn: "preview",
+      formQuestions: [],
       datePropertyId: undefined,
       datePropertyName: undefined,
       endDatePropertyId: undefined,
@@ -479,6 +584,103 @@ describe("view-screen current database view", () => {
       visibleItemLimit: 50,
       selectedItemCount: 0,
       selectedItems: [],
+    });
+  });
+
+  it("preserves explicit navigation unfreeze and resolves effective column wrapping", () => {
+    expect(
+      databaseCurrentViewSnapshot(
+        {
+          databaseViewType: "table",
+          databaseColumnWrapOverrides: { name: false, owner: true },
+          databaseFrozenThroughColumnId: null,
+          databaseEffectiveFrozenColumnIds: ["name"],
+        },
+        databaseResponse(),
+      ),
+    ).toMatchObject({
+      columnWrapOverrides: { name: false, owner: true },
+      effectiveColumnWrapById: {
+        name: false,
+        owner: true,
+        status: true,
+      },
+      frozenThroughColumnId: null,
+      intendedFrozenColumnIds: [],
+      effectiveFrozenColumnIds: undefined,
+    });
+  });
+
+  it("reports observed viewport-capped freezing separately from the intended prefix", () => {
+    expect(
+      databaseCurrentViewSnapshot(
+        {
+          databaseViewType: "table",
+          databaseFrozenThroughColumnId: "status",
+          databaseEffectiveFrozenColumnIds: ["name"],
+        },
+        databaseResponse(),
+      ),
+    ).toMatchObject({
+      frozenThroughColumnId: "status",
+      intendedFrozenColumnIds: ["name", "owner", "status"],
+      effectiveFrozenColumnIds: ["name"],
+    });
+  });
+
+  it("does not report malformed or non-prefix observed freeze state", () => {
+    expect(
+      databaseCurrentViewSnapshot(
+        {
+          databaseViewType: "table",
+          databaseFrozenThroughColumnId: "status",
+          databaseEffectiveFrozenColumnIds: ["owner"],
+        },
+        databaseResponse(),
+      ).effectiveFrozenColumnIds,
+    ).toBeUndefined();
+  });
+
+  it("rejects a stale observation beyond a newly narrowed intended range", () => {
+    const response = databaseResponse();
+    response.database.viewConfig.views[0].frozenThroughColumnId = undefined;
+    expect(
+      databaseCurrentViewSnapshot(
+        {
+          databaseViewType: "table",
+          databaseEffectiveFrozenColumnIds: ["name", "owner"],
+        },
+        response,
+      ),
+    ).toMatchObject({
+      intendedFrozenColumnIds: ["name"],
+      effectiveFrozenColumnIds: undefined,
+    });
+  });
+
+  it("exposes ordered required questions for the active form view", () => {
+    const response = databaseResponse();
+    response.database.viewConfig.activeViewId = "request-form";
+    response.database.viewConfig.views.push({
+      id: "request-form",
+      name: "Request design",
+      type: "form",
+      sorts: [],
+      filters: [],
+      columnWidths: {},
+      formQuestions: [
+        { key: "name", enabled: true, required: true },
+        { key: "priority", enabled: true, required: true },
+      ],
+    });
+
+    expect(databaseCurrentViewSnapshot({}, response)).toMatchObject({
+      id: "request-form",
+      type: "form",
+      formQuestions: [
+        { key: "name", enabled: true, required: true },
+        { key: "priority", enabled: true, required: true },
+      ],
     });
   });
 
@@ -581,5 +783,22 @@ describe("view-screen current database view", () => {
         result: "Median 1.50",
       },
     ]);
+  });
+
+  it("keeps totals honest when the current database window is bounded", () => {
+    const response = databaseResponse();
+    response.pagination = {
+      offset: 0,
+      limit: 50,
+      totalItems: 120,
+      returnedItems: 50,
+      hasMore: true,
+    };
+
+    const snapshot = databaseCurrentViewSnapshot({}, response);
+
+    expect(snapshot.visibleItemCount).toBe(50);
+    expect(snapshot.totalItemCount).toBe(120);
+    expect(snapshot.calculationResults).toBeNull();
   });
 });

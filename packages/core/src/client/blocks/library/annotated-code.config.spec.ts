@@ -1,17 +1,12 @@
-import { describe, expect, it } from "vitest";
 import type { BlockAttrReader } from "@agent-native/core/blocks/server";
+import { describe, expect, it } from "vitest";
+
 import {
   annotatedCodeMdx,
   annotatedCodeSchema,
   type AnnotatedCodeData,
 } from "./annotated-code.config.js";
 
-/**
- * Minimal `BlockAttrReader` over a plain attribute bag, mirroring the runtime
- * `createAttrReader` value-domain narrowing (string-vs-number-vs-array-vs-object).
- * Lets the test assert the `toAttrs` → `fromAttrs` round-trip without spinning up
- * the full MDX serialize/parse pipeline.
- */
 function reader(attrs: Record<string, unknown>): BlockAttrReader {
   const read = (name: string) => attrs[name];
   return {
@@ -31,7 +26,6 @@ function reader(attrs: Record<string, unknown>): BlockAttrReader {
   };
 }
 
-/** Re-decode data from the attribute bag `toAttrs` produced. */
 function roundTrip(data: AnnotatedCodeData): AnnotatedCodeData {
   const attrs = annotatedCodeMdx.toAttrs(data) as Record<string, unknown>;
   return annotatedCodeMdx.fromAttrs(reader(attrs), "");
@@ -112,8 +106,6 @@ describe("annotated-code block config", () => {
     const data: AnnotatedCodeData = {
       code: "const x = 1\nconst y = 2",
     };
-    // No optional attributes are emitted, so the decode yields undefined
-    // filename/language and an empty annotations array (the forgiving default).
     expect(roundTrip(data)).toEqual({
       filename: undefined,
       language: undefined,

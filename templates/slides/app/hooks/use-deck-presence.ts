@@ -1,70 +1,89 @@
-import { useEffect, useState } from "react";
 import {
   useCollaborativeDoc,
+  usePresence,
+  useRecentEdits,
+  type AttributedRecentEdit,
   type CollabUser,
-} from "@agent-native/core/client";
+} from "@agent-native/core/client/collab";
+import { useEffect, useMemo } from "react";
+import type { Awareness } from "y-protocols/awareness";
 
 const TAB_ID = `slides-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-/**
- * Tracks deck-level presence: which slide each user is currently viewing.
- * Uses a presence-only Yjs doc (deck-{deckId}) with no TipTap content.
- * Returns a Map<slideId, CollabUser[]> for rendering avatars in the sidebar.
- */
+const AGENT_ACTIVE_MS = 6000;
+
+export interface DeckPresenceResult {
+  slidePresence: Map<string, CollabUser[]>;
+  agentPresent: boolean;
+  agentActive: boolean;
+  agentSlideId: string | null;
+  recentEdits: AttributedRecentEdit[];
+  awareness: Awareness | null;
+  localClientId: number | null;
+}
+
 export function useDeckPresence(options: {
   deckId: string | null;
   activeSlideId: string | null;
   user?: CollabUser;
-}) {
+}): DeckPresenceResult {
   const { deckId, activeSlideId, user } = options;
-  const selfEmail = user?.email;
-  const normalizedSelfEmail = selfEmail?.trim().toLowerCase();
+  const normalizedSelfEmail = user?.email?.trim().toLowerCase();
 
-  const { awareness } = useCollaborativeDoc({
+  const { ydoc, awareness, agentPresent } = useCollaborativeDoc({
     docId: deckId ? `deck-${deckId}` : null,
+    activityResource: deckId
+      ? { resourceType: "deck", resourceId: deckId }
+      : undefined,
     user,
     requestSource: TAB_ID,
     pollInterval: 3000,
   });
 
-  // Publish which slide this user is currently viewing
+  const localClientId = (ydoc?.clientID ?? null) as number | null;
+  const { others, setPresence } = usePresence(awareness, localClientId);
+
   useEffect(() => {
     if (!awareness || !activeSlideId) return;
-    awareness.setLocalStateField("slide", activeSlideId);
-    return () => {
-      awareness.setLocalStateField("slide", null);
-    };
-  }, [awareness, activeSlideId]);
+    setPresence({ slide: activeSlideId });
+    return () => setPresence({ slide: null });
+  }, [awareness, activeSlideId, setPresence]);
 
-  // Build Map<slideId, CollabUser[]> from all remote awareness states
-  const [slidePresence, setSlidePresence] = useState<Map<string, CollabUser[]>>(
-    new Map(),
-  );
+  const recentEdits = useRecentEdits(others);
 
-  useEffect(() => {
-    if (!awareness) return;
+  const slidePresence = useMemo(() => {
+    const map = new Map<string, CollabUser[]>();
+    for (const other of others) {
+      const slide = other.presence["slide"];
+      if (typeof slide !== "string" || !slide) continue;
+      const email = other.user.email?.trim().toLowerCase();
+      if (!other.isAgent && email && email === normalizedSelfEmail) continue;
+      if (!map.has(slide)) map.set(slide, []);
+      map.get(slide)!.push(other.user);
+    }
+    return map;
+  }, [others, normalizedSelfEmail]);
 
-    const update = () => {
-      const map = new Map<string, CollabUser[]>();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const selfId = (awareness as any).doc?.clientID;
-      awareness.getStates().forEach((state, clientId) => {
-        if (clientId === selfId) return;
-        const u = state.user as CollabUser | undefined;
-        const slide = state.slide as string | undefined;
-        const email = u?.email?.trim().toLowerCase();
-        if (u && slide && email !== normalizedSelfEmail) {
-          if (!map.has(slide)) map.set(slide, []);
-          map.get(slide)!.push(u);
-        }
-      });
-      setSlidePresence(map);
-    };
+  const agentEntry = useMemo(() => others.find((o) => o.isAgent), [others]);
+  const agentSlideId =
+    typeof agentEntry?.presence["slide"] === "string"
+      ? (agentEntry.presence["slide"] as string)
+      : null;
+  const agentActive = useMemo(() => {
+    const lastEditAt = agentEntry?.presence["lastEditAt"];
+    if (typeof lastEditAt === "number") {
+      return Date.now() - lastEditAt < AGENT_ACTIVE_MS;
+    }
+    return recentEdits.some((e) => e.isAgent);
+  }, [agentEntry, recentEdits]);
 
-    awareness.on("change", update);
-    update();
-    return () => awareness.off("change", update);
-  }, [awareness, normalizedSelfEmail]);
-
-  return { slidePresence };
+  return {
+    slidePresence,
+    agentPresent,
+    agentActive,
+    agentSlideId,
+    recentEdits,
+    awareness: awareness ?? null,
+    localClientId,
+  };
 }

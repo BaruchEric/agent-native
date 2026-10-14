@@ -1,8 +1,3 @@
-/**
- * manage-agent-loop-settings — inspect or update the agent loop step limit.
- */
-
-import type { ActionTool } from "../agent/types.js";
 import {
   canUpdateAgentLoopSettings,
   readAgentLoopSettings,
@@ -10,6 +5,7 @@ import {
   validateMaxIterationsInput,
   writeAgentLoopSettings,
 } from "../agent/loop-settings.js";
+import type { ActionTool } from "../agent/types.js";
 import {
   getRequestOrgId,
   getRequestUserEmail,

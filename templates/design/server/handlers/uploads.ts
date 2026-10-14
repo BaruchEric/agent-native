@@ -1,15 +1,46 @@
+import crypto from "crypto";
+import fs from "fs";
+import os from "os";
+import path from "path";
+
+import { getSession } from "@agent-native/core/server";
 import {
   defineEventHandler,
+  getRequestHeader,
+  readBody,
   readMultipartFormData,
   setResponseStatus,
 } from "h3";
-import fs from "fs";
-import path from "path";
-import crypto from "crypto";
 import { nanoid } from "nanoid";
-import { getSession } from "@agent-native/core/server";
 
-const UPLOADS_ROOT = path.join(process.cwd(), "data", "uploads");
+import {
+  MAX_UPLOAD_BYTES,
+  MAX_UPLOAD_FILES_PER_REQUEST,
+  MAX_UPLOAD_MB,
+  TOTAL_BODY_LIMIT,
+} from "../lib/request-body-limits.js";
+
+function isServerlessRuntime(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(
+    env.NETLIFY ||
+    env.VERCEL ||
+    env.AWS_LAMBDA_FUNCTION_NAME ||
+    env.LAMBDA_TASK_ROOT ||
+    env.CF_PAGES,
+  );
+}
+
+export function uploadsRootForRuntime(
+  cwd = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const baseDir = isServerlessRuntime(env)
+    ? path.join(os.tmpdir(), "agent-native-design")
+    : cwd;
+  return path.join(baseDir, "data", "uploads");
+}
+
+const UPLOADS_ROOT = uploadsRootForRuntime();
 const MAX_EXTRACTED_TEXT_CHARS = 8_000;
 const TEXT_EXTENSIONS = new Set([
   ".html",
@@ -56,11 +87,6 @@ function tenantUploadDir(email: string): string {
 function safeFilename(originalName: string): string | null {
   const ext = path.extname(originalName).toLowerCase();
   if (!ALLOWED_EXTENSIONS.has(ext)) return null;
-  // Filename uniqueness comes from nanoid (~21 chars, ~126 bits of entropy),
-  // not `Date.now()` — second-resolution timestamps are guessable and let
-  // someone with the per-tenant URL prefix probe the upload window. The
-  // tenant subdir already namespaces by user; nanoid makes the leaf
-  // unguessable too. (audit 10 medium / audit 01 medium).
   return `${nanoid()}${ext}`;
 }
 
@@ -131,11 +157,33 @@ async function extractUploadText(
   return {};
 }
 
+type UploadedFileResult = {
+  path: string;
+  originalName: string;
+  filename: string;
+  type: string;
+  size: number;
+  textContent?: string;
+  textTruncated?: boolean;
+};
+
+type InternalUploadedFileResult = UploadedFileResult & {
+  _destPath: string;
+};
+
 export const uploadFiles = defineEventHandler(async (event) => {
   const session = await getSession(event).catch(() => null);
   if (!session?.email) {
     setResponseStatus(event, 401);
     return { error: "Unauthorized" };
+  }
+
+  const contentLength = Number(
+    getRequestHeader(event, "content-length") ?? "0",
+  );
+  if (contentLength > TOTAL_BODY_LIMIT) {
+    setResponseStatus(event, 413);
+    return { error: "Request body too large" };
   }
 
   const parts = await readMultipartFormData(event);
@@ -146,55 +194,111 @@ export const uploadFiles = defineEventHandler(async (event) => {
     return { error: "No files uploaded" };
   }
 
-  const MAX_FILES = 20;
-  const MAX_FILE_SIZE = 50 * 1024 * 1024;
-
-  if (fileParts.length > MAX_FILES) {
+  if (fileParts.length > MAX_UPLOAD_FILES_PER_REQUEST) {
     setResponseStatus(event, 413);
-    return { error: `Too many files (max ${MAX_FILES})` };
+    return {
+      error: `Too many files (max ${MAX_UPLOAD_FILES_PER_REQUEST})`,
+    };
   }
 
-  const oversized = fileParts.find((p) => p.data.length > MAX_FILE_SIZE);
-  if (oversized) {
+  const totalBytes = fileParts.reduce((sum, p) => sum + p.data.length, 0);
+  if (totalBytes > MAX_UPLOAD_BYTES) {
     setResponseStatus(event, 413);
-    return { error: "File too large (max 50 MB per file)" };
+    return {
+      error: `Attachments are too large (max ${MAX_UPLOAD_MB} MB total)`,
+    };
+  }
+
+  const results = await Promise.allSettled<InternalUploadedFileResult>(
+    fileParts.map(async (part) => {
+      const originalName = part.filename || "upload";
+      const filename = safeFilename(originalName);
+      if (!filename) {
+        throw new Error(
+          "Unsupported file type. Allowed: code, docs, text, JSON, CSV, and raster images.",
+        );
+      }
+      const ext = path.extname(filename).toLowerCase();
+      if (!hasExpectedSignature(ext, part.data)) {
+        throw new Error(`File contents do not match ${ext} upload type`);
+      }
+      const uploadDir = tenantUploadDir(session.email);
+      await fs.promises.mkdir(uploadDir, { recursive: true });
+      const destPath = path.join(uploadDir, filename);
+      await fs.promises.writeFile(destPath, part.data);
+      const extracted = await extractUploadText(ext, part.data);
+
+      return {
+        path: filename,
+        originalName,
+        filename,
+        type: part.type || "application/octet-stream",
+        size: part.data.length,
+        ...extracted,
+        _destPath: destPath,
+      };
+    }),
+  );
+
+  const failures = results.filter((r) => r.status === "rejected");
+  if (failures.length > 0) {
+    const writtenPaths = results
+      .filter((r) => r.status === "fulfilled")
+      .map(
+        (r) =>
+          (r as PromiseFulfilledResult<InternalUploadedFileResult>).value
+            ._destPath,
+      );
+    await Promise.allSettled(writtenPaths.map((p) => fs.promises.unlink(p)));
+
+    const firstError = (failures[0] as PromiseRejectedResult).reason;
+    setResponseStatus(event, 400);
+    return {
+      error:
+        firstError instanceof Error ? firstError.message : "Invalid upload",
+    };
+  }
+
+  return results.map((r) => {
+    const { _destPath: _unused, ...rest } = (
+      r as PromiseFulfilledResult<InternalUploadedFileResult>
+    ).value;
+    return rest;
+  });
+});
+
+export const deleteUploadedFile = defineEventHandler(async (event) => {
+  // coercion-ok: an unreadable session is intentionally treated as unauthenticated.
+  const session = await getSession(event).catch(() => null);
+  if (!session?.email) {
+    setResponseStatus(event, 401);
+    return { error: "Unauthorized" };
+  }
+
+  // coercion-ok: malformed JSON is reported as the existing missing-path 400.
+  const body = (await readBody(event).catch(() => null)) as {
+    path?: unknown;
+  } | null;
+  if (typeof body?.path !== "string" || !body.path) {
+    setResponseStatus(event, 400);
+    return { error: "Uploaded file path is required" };
+  }
+
+  const uploadDir = path.resolve(tenantUploadDir(session.email));
+  const candidate = path.resolve(uploadDir, body.path);
+  if (path.dirname(candidate) !== uploadDir) {
+    setResponseStatus(event, 400);
+    return { error: "Invalid uploaded file reference" };
   }
 
   try {
-    return await Promise.all(
-      fileParts.map(async (part) => {
-        const originalName = part.filename || "upload";
-        const filename = safeFilename(originalName);
-        if (!filename) {
-          throw new Error(
-            "Unsupported file type. Allowed: code, docs, text, JSON, CSV, and raster images.",
-          );
-        }
-        const ext = path.extname(filename).toLowerCase();
-        if (!hasExpectedSignature(ext, part.data)) {
-          throw new Error(`File contents do not match ${ext} upload type`);
-        }
-        const uploadDir = tenantUploadDir(session.email);
-        await fs.promises.mkdir(uploadDir, { recursive: true });
-        const destPath = path.join(uploadDir, filename);
-        await fs.promises.writeFile(destPath, part.data);
-        const extracted = await extractUploadText(ext, part.data);
-
-        return {
-          path: path
-            .relative(process.cwd(), destPath)
-            .split(path.sep)
-            .join("/"),
-          originalName,
-          filename,
-          type: part.type || "application/octet-stream",
-          size: part.data.length,
-          ...extracted,
-        };
-      }),
-    );
-  } catch (err) {
-    setResponseStatus(event, 400);
-    return { error: err instanceof Error ? err.message : "Invalid upload" };
+    await fs.promises.unlink(candidate);
+    return { deleted: true };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { deleted: false };
+    }
+    setResponseStatus(event, 500);
+    return { error: "Could not delete uploaded file" };
   }
 });

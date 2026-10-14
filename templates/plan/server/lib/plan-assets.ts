@@ -1,26 +1,14 @@
-/**
- * Plan asset helpers: upsert, URL resolution, and size-cap enforcement.
- *
- * SIZE CAPS (per design):
- *   - single asset  ≤ 2 MB decoded
- *   - all assets per plan ≤ 10 MB total decoded
- *
- * MIME SNIFFING: derived from filename extension only (no magic-byte probe),
- * restricted to browser-safe image formats.
- *
- * SVG is accepted at the storage layer (mimeType = "image/svg+xml") but served
- * with `Content-Type: application/octet-stream` by the route handler to
- * prevent inline script execution.
- */
 import { randomUUID } from "node:crypto";
-import { and, eq, sum } from "drizzle-orm";
-import { getDb, schema } from "../db/index.js";
+
 import { uploadFile } from "@agent-native/core/file-upload";
+import { and, eq, sum } from "drizzle-orm";
+
 import {
   PLAN_ASSET_MAX_SINGLE_BYTES,
   PLAN_ASSET_MAX_TOTAL_BYTES,
   mimeTypeFromFilename,
 } from "../../shared/plan-assets.js";
+import { getDb, schema } from "../db/index.js";
 
 export {
   PLAN_ASSET_MAX_SINGLE_BYTES,
@@ -28,13 +16,10 @@ export {
   mimeTypeFromFilename,
 } from "../../shared/plan-assets.js";
 
-/** The route prefix under which plan assets are served. */
 export const PLAN_ASSET_ROUTE_PREFIX = "/_agent-native/plan-asset";
+const PLAN_ASSET_STORAGE_REQUIRED_REASON =
+  "Image storage is not connected yet. Use Builder.io (free tier available) or configure S3-compatible storage to add images to visual plans.";
 
-/**
- * Build the serving URL for an asset stored in the `plan_assets` table.
- * The URL is origin-relative so it works on any deployment.
- */
 export function planAssetUrl(assetId: string, filename: string): string {
   return `${PLAN_ASSET_ROUTE_PREFIX}/${encodeURIComponent(assetId)}/${encodeURIComponent(filename)}`;
 }
@@ -42,42 +27,41 @@ export function planAssetUrl(assetId: string, filename: string): string {
 export interface UpsertPlanAssetInput {
   planId: string;
   filename: string;
-  /** Base64-encoded image data. */
   base64: string;
-  /** If provided, overrides the MIME type derived from the filename. */
   mimeType?: string;
 }
 
 export interface UpsertPlanAssetResult {
-  /** The stored asset ID — use with `planAssetUrl` to build a src URL. */
   assetId: string;
-  /**
-   * A CDN URL when an upload provider was configured and the upload succeeded.
-   * `null` when falling back to the local `plan_assets` table.
-   */
   cdnUrl: string | null;
-  /**
-   * The final `src` to embed in the image block.
-   * - CDN URL when provider upload succeeded.
-   * - Local route URL (`/_agent-native/plan-asset/...`) otherwise.
-   */
   src: string;
   filename: string;
 }
 
-/**
- * Store a plan asset, uploading via the active file-upload provider first.
- * Falls back to the `plan_assets` SQL table when no provider is configured.
- *
- * Enforces single-asset and per-plan size caps.
- */
+function requiresConfiguredPlanAssetStorage(): boolean {
+  return process.env.NODE_ENV === "production" || !isPGlitePlanAssetDatabase();
+}
+
+function appDatabaseUrl(): string {
+  const appName = process.env.APP_NAME?.toUpperCase().replace(/-/g, "_");
+  if (appName) {
+    const appUrl = process.env[`${appName}_DATABASE_URL`];
+    if (appUrl) return appUrl;
+  }
+  return process.env.DATABASE_URL || process.env.NETLIFY_DATABASE_URL || "";
+}
+
+function isPGlitePlanAssetDatabase(): boolean {
+  const url = appDatabaseUrl().toLowerCase();
+  return url === "" || url.startsWith("pglite:");
+}
+
 export async function upsertPlanAsset(
   input: UpsertPlanAssetInput,
 ): Promise<UpsertPlanAssetResult> {
   const mimeType =
     input.mimeType ?? mimeTypeFromFilename(input.filename) ?? "image/png";
 
-  // Decode and validate size.
   const bytes = Buffer.from(input.base64, "base64");
   if (bytes.byteLength > PLAN_ASSET_MAX_SINGLE_BYTES) {
     throw new Error(
@@ -85,7 +69,6 @@ export async function upsertPlanAsset(
     );
   }
 
-  // Enforce per-plan total cap.
   const db = getDb();
   const [totalRow] = await db
     .select({ total: sum(schema.planAssets.byteSize) })
@@ -98,7 +81,6 @@ export async function upsertPlanAsset(
     );
   }
 
-  // Try provider upload (CDN path).
   const uploaded = await uploadFile({
     data: bytes,
     filename: input.filename,
@@ -106,8 +88,6 @@ export async function upsertPlanAsset(
   }).catch(() => null);
 
   if (uploaded?.url) {
-    // Provider upload succeeded — store a lightweight row (data="") to track
-    // the asset for export, but the image is served from the CDN URL.
     const assetId = `passet_${randomUUID().replace(/-/g, "")}`;
     const now = new Date().toISOString();
     await db.insert(schema.planAssets).values({
@@ -115,7 +95,6 @@ export async function upsertPlanAsset(
       planId: input.planId,
       filename: input.filename,
       mimeType,
-      // Store the CDN URL in the data field for export reconstruction.
       data: `cdn:${uploaded.url}`,
       byteSize: bytes.byteLength,
       createdAt: now,
@@ -128,7 +107,10 @@ export async function upsertPlanAsset(
     };
   }
 
-  // SQL fallback: store base64 in plan_assets.
+  if (requiresConfiguredPlanAssetStorage()) {
+    throw new Error(PLAN_ASSET_STORAGE_REQUIRED_REASON);
+  }
+
   const assetId = `passet_${randomUUID().replace(/-/g, "")}`;
   const now = new Date().toISOString();
   await db.insert(schema.planAssets).values({
@@ -149,14 +131,6 @@ export async function upsertPlanAsset(
   };
 }
 
-/**
- * Resolve the serving src for a stored plan asset.
- *
- * - CDN assets: `data` starts with `cdn:` — strip the prefix and return the URL.
- * - SQL fallback assets: return the local route URL.
- *
- * Returns `null` if the asset does not exist.
- */
 export async function resolveAssetSrc(assetId: string): Promise<string | null> {
   const db = getDb();
   const [asset] = await db
@@ -178,13 +152,6 @@ export async function resolveAssetSrc(assetId: string): Promise<string | null> {
   return planAssetUrl(asset.id, asset.filename);
 }
 
-/**
- * Load all assets for a plan as a `Record<filename, base64>` suitable for
- * the `"assets/"` key in a `PlanMdxFolder`.
- *
- * CDN assets are represented as `cdn:<url>` (their data field value) so the
- * export preserves the remote URL without re-fetching the bytes.
- */
 export async function loadPlanAssetsForExport(
   planId: string,
 ): Promise<Record<string, string>> {
@@ -209,17 +176,6 @@ export async function loadPlanAssetsForExport(
   return result;
 }
 
-/**
- * Import assets from a `Record<filename, base64>` (the `"assets/"` folder key).
- *
- * Returns a map from filename to the resolved `src` (CDN URL or local route URL).
- * Invalid / oversized entries are skipped with a console warning rather than
- * aborting the whole import.
- *
- * SIZE CAPS are applied per-asset and in aggregate. A single asset that exceeds
- * 2 MB is skipped; if the batch would push the plan over 10 MB total, remaining
- * assets are skipped.
- */
 export async function importPlanAssets(
   planId: string,
   assets: Record<string, string>,
@@ -251,14 +207,6 @@ export async function importPlanAssets(
   return srcByFilename;
 }
 
-/**
- * Rewrite image blocks in parsed `PlanContent` that reference a relative
- * `assets/<filename>` path (as emitted by `exportPlanContentToMdxFolder`),
- * replacing the `url` with the resolved CDN URL or local route URL.
- *
- * `srcByFilename` is the map returned by `importPlanAssets`.
- * Returns a new content object; original is not mutated.
- */
 export function applyImportedAssets(
   content: import("../../shared/plan-content.js").PlanContent,
   srcByFilename: Record<string, string>,
@@ -271,7 +219,6 @@ export function applyImportedAssets(
     blocks.map((block): import("../../shared/plan-content.js").PlanBlock => {
       if (block.type === "image") {
         const url = block.data.url ?? "";
-        // Match `assets/<filename>` (with or without leading slash).
         const filenameMatch = url.match(/^(?:\.\/)?assets\/(.+)$/);
         if (filenameMatch) {
           const filename = filenameMatch[1];
@@ -284,7 +231,6 @@ export function applyImportedAssets(
           }
         }
       }
-      // Recurse into tabs and columns.
       if (block.type === "tabs") {
         return {
           ...block,

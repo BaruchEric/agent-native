@@ -1,25 +1,56 @@
-import { getMethod, getRequestURL, type H3Event } from "h3";
-import { eq } from "drizzle-orm";
-import { getAppBasePath } from "@agent-native/core/server";
-import { DEFAULT_SSR_CACHE_HEADERS } from "@agent-native/core/server/ssr-handler";
+import {
+  getAppBasePath,
+  getForwardedRequestURL,
+} from "@agent-native/core/server";
+import { resolveSsrCacheHeaders } from "@agent-native/core/server/ssr-handler";
 import {
   AGENT_NATIVE_SOCIAL_IMAGE_ALT,
+  AGENT_NATIVE_SOCIAL_IMAGE_CACHE_BUSTER,
   AGENT_NATIVE_SOCIAL_IMAGE_HEIGHT,
   AGENT_NATIVE_SOCIAL_IMAGE_TYPE,
   AGENT_NATIVE_SOCIAL_IMAGE_WIDTH,
+  MAX_USER_REGEX_INPUT_LENGTH,
+  SSR_QUERY_CACHE_KEY_HEADER,
+  compileUserRegex,
   withAgentNativeSocialImageCacheBuster,
 } from "@agent-native/core/shared";
-import { getDb, schema } from "../db/index.js";
+import { eq } from "drizzle-orm";
+import { getMethod, type H3Event } from "h3";
+
+import { isConditionalFieldVisible } from "../../shared/conditional.js";
+import { SENSITIVE_QUERY_PARAMS } from "../../shared/page-url.js";
 import {
+  getFormCompletionMode,
+  getFormCompletionRefreshSeconds,
   toPublicFormSettings,
   type FormField,
   type FormSettings,
   type PublicFormSettings,
 } from "../../shared/types.js";
+import { getDb, schema } from "../db/index.js";
 
-// In-memory cache
 const cache = new Map<string, { data: any; ts: number }>();
 const TTL = 60_000;
+
+type PublicFormCacheKeys = {
+  id?: string | null;
+  slug?: string | null;
+};
+
+export function invalidatePublicFormCache(
+  ...forms: Array<PublicFormCacheKeys | null | undefined>
+) {
+  for (const form of forms) {
+    for (const key of [form?.id, form?.slug]) {
+      if (!key) continue;
+      cache.delete(key);
+      const versionPrefix = `${key}?v=`;
+      for (const cachedKey of cache.keys()) {
+        if (cachedKey.startsWith(versionPrefix)) cache.delete(cachedKey);
+      }
+    }
+  }
+}
 
 function getCached(key: string) {
   const entry = cache.get(key);
@@ -27,13 +58,16 @@ function getCached(key: string) {
   return null;
 }
 
-export async function getPublicFormBySlugOrId(slugOrId: string) {
-  const cached = getCached(slugOrId);
+export async function getPublicFormBySlugOrId(
+  slugOrId: string,
+  version?: string,
+) {
+  const cacheKey = version ? `${slugOrId}?v=${version}` : slugOrId;
+  const cached = getCached(cacheKey);
   if (cached) return cached;
 
   const db = getDb();
 
-  // Try matching by slug first, then fall back to ID
   let row = await db
     .select()
     .from(schema.forms)
@@ -50,30 +84,22 @@ export async function getPublicFormBySlugOrId(slugOrId: string) {
 
   if (!row || row.status !== "published" || row.deletedAt) return null;
 
-  // Project settings through the public allowlist before caching/rendering so
-  // owner-private integration webhook URLs and allowed-origins never reach the
-  // anonymous SSR payload.
   const settings = JSON.parse(row.settings) as FormSettings;
   const result = {
     id: row.id,
     slug: row.slug,
     title: row.title,
     description: row.description,
+    ownerEmail: row.ownerEmail,
+    updatedAt: row.updatedAt,
     fields: JSON.parse(row.fields) as FormField[],
     settings: toPublicFormSettings(settings),
   };
 
-  cache.set(slugOrId, { data: result, ts: Date.now() });
+  cache.set(cacheKey, { data: result, ts: Date.now() });
   return result;
 }
 
-// ---------------------------------------------------------------------------
-// Field rendering helpers
-// ---------------------------------------------------------------------------
-
-// Canonical type is string, but the agent occasionally writes objects like
-// `{ label, value }` or numbers. Coerce everything to a string here so the
-// renderer never crashes on bad data.
 function toSafeString(value: unknown): string {
   if (typeof value === "string") return value;
   if (value == null) return "";
@@ -83,7 +109,11 @@ function toSafeString(value: unknown): string {
     if (typeof v.value === "string") return v.value;
     return "";
   }
-  return String(value);
+  return typeof value === "string"
+    ? value
+    : value == null
+      ? ""
+      : JSON.stringify(value);
 }
 
 function escapeHtml(value: unknown): string {
@@ -100,6 +130,7 @@ const FALLBACK_PUBLIC_FORM_ORIGIN = "http://agent-native.local";
 function parsePublicFormUrl(url: string): {
   pathname: string;
   origin?: string;
+  version?: string;
 } {
   try {
     const parsed = new URL(url, FALLBACK_PUBLIC_FORM_ORIGIN);
@@ -107,13 +138,13 @@ function parsePublicFormUrl(url: string): {
     return {
       pathname: parsed.pathname,
       origin: isAbsolute ? parsed.origin : undefined,
+      version: parsed.searchParams.get("v") || undefined,
     };
   } catch {
     return { pathname: url.split("?")[0] || "/" };
   }
 }
 
-// Mirror app/components/builder/FieldRenderer.tsx#dedupeRenderableOptions.
 function normalizeOptions(options: unknown): string[] {
   if (!Array.isArray(options)) return [];
   const seen = new Set<string>();
@@ -127,23 +158,92 @@ function normalizeOptions(options: unknown): string[] {
   return out;
 }
 
-/**
- * Validate a form-author-supplied post-submit redirect URL. Returns the
- * value verbatim only if it parses as `http:` or `https:` — falls back to
- * an empty string otherwise (caller treats empty as "no redirect").
- *
- * Form publishers control `settings.redirectUrl` and the rendered page
- * assigns it to `window.location.href`. Without scheme validation a
- * `javascript:fetch(...)` redirectUrl would execute attacker JS in the
- * form-publisher origin against any anonymous submitter.
- */
+type PublicFieldValidation = Omit<
+  NonNullable<FormField["validation"]>,
+  "pattern"
+> & { pattern?: string; unsafePattern?: true };
+
+const PUBLIC_FORM_PATTERN_MESSAGES = {
+  "en-US": {
+    uncheckable:
+      "This form's rule for {label} can't be checked. Ask the form owner to fix it.",
+    tooLong:
+      "The value for {label} is too long to check against this form's rule.",
+  },
+  "zh-CN": {
+    uncheckable: "此表单中“{label}”的规则无法校验。请联系表单所有者修复。",
+    tooLong: "字段“{label}”的值过长，无法使用此表单规则校验。",
+  },
+  "zh-TW": {
+    uncheckable: "此表單中「{label}」的規則無法檢核。請聯絡表單擁有者修正。",
+    tooLong: "欄位「{label}」的值過長，無法使用此表單規則檢核。",
+  },
+  "es-ES": {
+    uncheckable:
+      "La regla de este formulario para {label} no se puede comprobar. Pide al propietario del formulario que la corrija.",
+    tooLong:
+      "El valor de {label} es demasiado largo para comprobarlo con la regla de este formulario.",
+  },
+  "fr-FR": {
+    uncheckable:
+      "La règle de ce formulaire pour {label} ne peut pas être vérifiée. Demandez au propriétaire du formulaire de la corriger.",
+    tooLong:
+      "La valeur de {label} est trop longue pour être vérifiée avec la règle de ce formulaire.",
+  },
+  "de-DE": {
+    uncheckable:
+      "Die Regel dieses Formulars für {label} kann nicht geprüft werden. Bitten Sie den Formularbesitzer, sie zu korrigieren.",
+    tooLong:
+      "Der Wert für {label} ist zu lang, um mit der Regel dieses Formulars geprüft zu werden.",
+  },
+  "ja-JP": {
+    uncheckable:
+      "このフォームの「{label}」のルールは検証できません。フォームの所有者に修正を依頼してください。",
+    tooLong:
+      "「{label}」の値が長すぎて、このフォームのルールを検証できません。",
+  },
+  "ko-KR": {
+    uncheckable:
+      "이 양식의 {label} 규칙을 확인할 수 없습니다. 양식 소유자에게 수정을 요청하세요.",
+    tooLong: "{label} 값이 너무 길어 이 양식의 규칙을 확인할 수 없습니다.",
+  },
+  "pt-BR": {
+    uncheckable:
+      "A regra deste formulário para {label} não pode ser verificada. Peça ao proprietário do formulário para corrigi-la.",
+    tooLong:
+      "O valor de {label} é longo demais para ser verificado pela regra deste formulário.",
+  },
+  "hi-IN": {
+    uncheckable:
+      "इस फ़ॉर्म में {label} का नियम जाँचा नहीं जा सकता। कृपया फ़ॉर्म स्वामी से इसे ठीक करने को कहें।",
+    tooLong:
+      "{label} का मान बहुत लंबा है, इसलिए इस फ़ॉर्म के नियम से जाँचा नहीं जा सकता।",
+  },
+  "ar-SA": {
+    uncheckable:
+      "تعذّر التحقق من قاعدة هذا النموذج الخاصة بـ {label}. يرجى الطلب من مالك النموذج إصلاحها.",
+    tooLong:
+      "قيمة {label} طويلة جدًا بحيث يتعذر التحقق منها باستخدام قاعدة هذا النموذج.",
+  },
+} as const;
+
+export function publicValidation(
+  validation: FormField["validation"],
+): PublicFieldValidation | undefined {
+  if (!validation) return undefined;
+  if (!validation.pattern) return validation;
+  if (compileUserRegex(validation.pattern).status === "ok") return validation;
+  const { pattern: _unsafe, ...rest } = validation;
+  return { ...rest, unsafePattern: true };
+}
+
 export function safeRedirectUrl(value: unknown): string {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
   if (!trimmed) return "";
-  // Reject control characters and protocol-relative URLs outright.
   if (/[\x00-\x1f]/.test(trimmed)) return "";
   if (trimmed.startsWith("//")) return "";
+  if (trimmed.startsWith("/")) return trimmed.includes("\\") ? "" : trimmed;
   try {
     const parsed = new URL(trimmed);
     return parsed.protocol === "http:" || parsed.protocol === "https:"
@@ -155,10 +255,6 @@ export function safeRedirectUrl(value: unknown): string {
 }
 
 function renderField(field: FormField): string {
-  // field.id is also gated to /^[A-Za-z0-9_-]+$/ at write time by
-  // assertValidFields (server/lib/validate-fields.ts), so escapeHtml here is
-  // defense-in-depth — if a malformed row ever slips into the DB through
-  // another path, the renderer still won't break out of the attribute.
   const id = escapeHtml(field.id);
   const req = field.required ? " required" : "";
   const ph = field.placeholder
@@ -171,6 +267,10 @@ function renderField(field: FormField): string {
     ? ` data-cond-field="${escapeHtml(field.conditional.fieldId)}" data-cond-op="${escapeHtml(field.conditional.operator)}" data-cond-val="${escapeHtml(field.conditional.value)}"`
     : "";
   const widthClass = field.width === "half" ? " field-half" : "";
+  const initiallyVisible = isConditionalFieldVisible(field, {});
+  const initialVisibility = initiallyVisible
+    ? ""
+    : ' style="display:none" data-hidden="1"';
 
   let input = "";
 
@@ -186,6 +286,9 @@ function renderField(field: FormField): string {
       break;
     case "textarea":
       input = `<textarea name="${id}" class="fi fi-ta" rows="4"${ph || ' placeholder="Type your answer..."'}${req}></textarea>`;
+      break;
+    case "file":
+      input = `<input type="file" name="${id}" class="fi fi-file"${field.accept ? ` accept="${escapeHtml(field.accept)}"` : ""}${field.multiple ? " multiple" : ""}${req}>`;
       break;
     case "date":
       input = `<input type="date" name="${id}" class="fi"${req}>`;
@@ -228,28 +331,18 @@ function renderField(field: FormField): string {
       break;
     }
     default:
-      // Mirror the builder's normalizeFields fallback: an unrecognized stored
-      // type (e.g. agent wrote "dropdown" instead of "select", or stored an
-      // object) renders a plain text input rather than nothing — without this
-      // a required field would have no <input>, leaving the form unsubmittable.
       input = `<input type="text" name="${id}" class="fi"${ph}${req}>`;
       break;
   }
 
-  return `<div class="field${widthClass}" data-field-id="${id}"${cond}>
+  return `<div class="field${widthClass}" data-field-id="${id}"${cond}${initialVisibility}>
     <label class="field-label">${escapeHtml(field.label)}${field.required ? '<span class="req">*</span>' : ""}</label>
     ${desc}${input}</div>`;
 }
 
-// ---------------------------------------------------------------------------
-// Pure render function — takes a URL, returns { html, status }
-// Used by both the H3 handler and the Vite dev plugin.
-// ---------------------------------------------------------------------------
-
 export async function renderPublicFormHtml(
   url: string,
 ): Promise<{ html: string; status: number }> {
-  // Extract everything after /f/ as the slug (may contain slashes for legacy URLs)
   const basePath = getAppBasePath();
   const parsedUrl = parsePublicFormUrl(url);
   const pathname = parsedUrl.pathname;
@@ -258,7 +351,9 @@ export async function renderPublicFormHtml(
       ? pathname.slice(basePath.length)
       : pathname;
   const slugOrId = decodeURIComponent(pathWithoutBase.replace(/^\/f\//, ""));
-  const form = slugOrId ? await getPublicFormBySlugOrId(slugOrId) : null;
+  const form = slugOrId
+    ? await getPublicFormBySlugOrId(slugOrId, parsedUrl.version)
+    : null;
 
   if (!form) {
     return { html: notFoundPage(parsedUrl.origin), status: 404 };
@@ -267,24 +362,17 @@ export async function renderPublicFormHtml(
   return { html: renderFormPage(form, parsedUrl.origin), status: 200 };
 }
 
-// ---------------------------------------------------------------------------
-// H3 handler wrapper — used in production (Nitro plugins / routes)
-// ---------------------------------------------------------------------------
-
 export async function renderPublicForm(event: H3Event) {
-  const reqUrl = getRequestURL(event);
+  const reqUrl = getForwardedRequestURL(event);
   const url = reqUrl.toString();
   const { html, status } = await renderPublicFormHtml(url);
 
   const headers: Record<string, string> = {
     "Content-Type": "text/html; charset=utf-8",
-    "Content-Security-Policy": "frame-ancestors *",
   };
   if (status === 200) {
-    // Public form SSR is anonymous HTML and follows the same framework-level
-    // short-fresh/long-SWR policy as React Router SSR. Keep all cache headers
-    // here; relying on provider config would make templates perform differently.
-    Object.assign(headers, DEFAULT_SSR_CACHE_HEADERS);
+    Object.assign(headers, resolveSsrCacheHeaders());
+    headers[SSR_QUERY_CACHE_KEY_HEADER] = "query";
   }
   return new Response(getMethod(event) === "HEAD" ? null : html, {
     status,
@@ -292,16 +380,14 @@ export async function renderPublicForm(event: H3Event) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// HTML generation
-// ---------------------------------------------------------------------------
-
 function renderFormPage(
   form: {
     id: string;
     slug: string;
     title: string;
     description?: string | null;
+    ownerEmail?: string | null;
+    updatedAt?: string | null;
     fields: FormField[];
     settings: PublicFormSettings;
   },
@@ -309,13 +395,21 @@ function renderFormPage(
 ): string {
   const settings: PublicFormSettings = form.settings || {};
   const fields: FormField[] = form.fields || [];
+  const completionMode = getFormCompletionMode(settings);
+  const completionRefreshMilliseconds =
+    getFormCompletionRefreshSeconds(settings.completionRefreshSeconds) * 1000;
   const turnstileSiteKey = process.env.VITE_TURNSTILE_SITE_KEY || "";
   const appBasePath = getAppBasePath();
   const submitPath = `${appBasePath}/api/submit/`;
+  const uploadPath = `${appBasePath}/api/upload/`;
   const faviconPath = `${appBasePath}/favicon.svg`;
   const ogImagePath = `${appBasePath}/api/forms/og/${encodeURIComponent(
     form.slug || form.id,
-  )}/og.png`;
+  )}/og.png?v=${encodeURIComponent(
+    [form.updatedAt, AGENT_NATIVE_SOCIAL_IMAGE_CACHE_BUSTER]
+      .filter(Boolean)
+      .join("-") || AGENT_NATIVE_SOCIAL_IMAGE_CACHE_BUSTER,
+  )}`;
   const ogImageUrl = origin
     ? new URL(ogImagePath, origin).toString()
     : ogImagePath;
@@ -334,6 +428,8 @@ function renderFormPage(
 <meta property="og:title" content="${escapeHtml(form.title)}">
 <meta property="og:description" content="${escapeHtml(metaDescription)}">
 <meta property="og:type" content="website">
+<meta name="twitter:title" content="${escapeHtml(form.title)}">
+<meta name="twitter:description" content="${escapeHtml(metaDescription)}">
 <meta property="og:image" content="${escapeHtml(ogImageUrl)}">
 <meta property="og:image:secure_url" content="${escapeHtml(ogImageUrl)}">
 <meta property="og:image:type" content="${AGENT_NATIVE_SOCIAL_IMAGE_TYPE}">
@@ -342,7 +438,7 @@ function renderFormPage(
 <meta property="og:image:alt" content="${escapeHtml(`${form.title} form preview`)}">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="${escapeHtml(ogImageUrl)}">
-<meta name="twitter:image:alt" content="${AGENT_NATIVE_SOCIAL_IMAGE_ALT}">
+<meta name="twitter:image:alt" content="${escapeHtml(`${form.title} form preview`)}">
 <link rel="icon" type="image/svg+xml" href="${faviconPath}">
 <!-- Self-hosted Inter via Bunny Fonts CDN (privacy-respecting, no tracking) -->
 <link rel="preconnect" href="https://fonts.bunny.net">
@@ -389,7 +485,7 @@ function renderFormPage(
 
   <a href="https://agent-native.com" target="_blank" rel="noopener noreferrer" class="powered-badge">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
-    Built with Agent Native
+    Built with Agent-Native
   </a>
 </div>
 
@@ -398,9 +494,93 @@ function renderFormPage(
 <script>
 (function(){
   var FORM_ID = ${JSON.stringify(form.id)};
+  var FORM_VERSION = ${JSON.stringify(form.updatedAt || "")};
+  var PUBLIC_FORM_API = ${JSON.stringify(`${appBasePath}/api/forms/public/${encodeURIComponent(form.slug || form.id)}`)};
+  var UPLOAD_PATH = ${JSON.stringify(uploadPath)};
+  var COMPLETION_MODE = ${JSON.stringify(completionMode)};
+  var COMPLETION_REFRESH_MS = ${completionRefreshMilliseconds};
   var REDIRECT = ${JSON.stringify(safeRedirectUrl(settings.redirectUrl))};
   var TURNSTILE_KEY = ${JSON.stringify(turnstileSiteKey)};
-  var FIELDS = ${JSON.stringify(fields.map((f) => ({ id: f.id, type: f.type, required: f.required, validation: f.validation, label: f.label, conditional: f.conditional })))};
+  var FIELDS = ${JSON.stringify(fields.map((f) => ({ id: f.id, type: f.type, required: f.required, validation: publicValidation(f.validation), label: f.label, conditional: f.conditional, multiple: f.multiple, accept: f.accept, maxSizeBytes: f.maxSizeBytes, maxFiles: f.maxFiles })))};
+  var PATTERN_MESSAGES = ${JSON.stringify(PUBLIC_FORM_PATTERN_MESSAGES)};
+  var SENSITIVE_QUERY_PARAMS = ${JSON.stringify(SENSITIVE_QUERY_PARAMS)};
+
+  function localizedPatternMessage(kind, label) {
+    var locales = typeof navigator !== "undefined" && navigator.languages && navigator.languages.length
+      ? navigator.languages
+      : [typeof navigator !== "undefined" ? navigator.language : "en-US"];
+    var keys = Object.keys(PATTERN_MESSAGES);
+    for (var i = 0; i < locales.length; i++) {
+      var locale = String(locales[i] || "").replace(/_/g, "-").toLowerCase();
+      for (var j = 0; j < keys.length; j++) {
+        var key = keys[j].toLowerCase();
+        if (key === locale)
+          return PATTERN_MESSAGES[keys[j]][kind].replace("{label}", label);
+      }
+      for (var j = 0; j < keys.length; j++) {
+        var key = keys[j].toLowerCase();
+        if (key.split("-")[0] === locale.split("-")[0])
+          return PATTERN_MESSAGES[keys[j]][kind].replace("{label}", label);
+      }
+    }
+    return PATTERN_MESSAGES["en-US"][kind].replace("{label}", label);
+  }
+
+  function localizedUncheckablePattern(label) {
+    return localizedPatternMessage("uncheckable", label);
+  }
+
+  function localizedTooLongPattern(label) {
+    return localizedPatternMessage("tooLong", label);
+  }
+
+  function scrubPageUrl(value) {
+    try {
+      var url = new URL(value);
+      if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+      url.username = "";
+      url.password = "";
+      scrubParams(url.searchParams);
+      if (url.hash.indexOf("=") >= 0) {
+        var hashParams = new URLSearchParams(url.hash.slice(1));
+        scrubParams(hashParams);
+        url.hash = hashParams.toString();
+      }
+      return url.toString();
+    // coercion-ok: an invalid browser URL is absent page context, not a valid submission value
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function scrubParams(params) {
+    Array.from(params.keys()).forEach(function(key) {
+      if (SENSITIVE_QUERY_PARAMS.indexOf(key.toLowerCase()) >= 0) {
+        params.set(key, "<redacted>");
+      }
+    });
+  }
+
+  function revalidateFormVersion() {
+    fetch(PUBLIC_FORM_API, { cache: "no-store" })
+      .then(function(response) {
+        if (response.status === 404) {
+          var currentUrl = new URL(window.location.href);
+          currentUrl.searchParams.set("v", String(Date.now()));
+          window.location.replace(currentUrl.toString());
+          return null;
+        }
+        return response.ok ? response.json() : null;
+      })
+      .then(function(latest) {
+        if (!latest || typeof latest.updatedAt !== "string" || !latest.updatedAt || latest.updatedAt === FORM_VERSION) return;
+        var currentUrl = new URL(window.location.href);
+        currentUrl.searchParams.set("v", latest.updatedAt);
+        window.location.replace(currentUrl.toString());
+      })
+      .catch(function() {});
+  }
+  revalidateFormVersion();
 
   // Theme toggle
   var html = document.documentElement;
@@ -463,19 +643,40 @@ function renderFormPage(
       var condVal = el.dataset.condVal;
       var depVal = getFieldValue(depId);
       var show = true;
-      if (op === "equals") show = depVal === condVal;
+      if (Array.isArray(depVal)) {
+        if (op === "equals") show = depVal.length === 1 && depVal[0] === condVal;
+        else if (op === "not_equals") show = depVal.indexOf(condVal) < 0;
+        else if (op === "contains") show = depVal.indexOf(condVal) >= 0;
+      } else if (op === "equals") show = depVal === condVal;
       else if (op === "not_equals") show = depVal !== condVal;
       else if (op === "contains") show = depVal.indexOf(condVal) >= 0;
       el.style.display = show ? "" : "none";
       el.dataset.hidden = show ? "" : "1";
+      el.querySelectorAll("input, textarea, select, button").forEach(function(control) {
+        control.disabled = !show;
+      });
     });
   }
 
   function getFieldValue(id) {
-    var el = document.querySelector('[name="' + id + '"]');
-    if (!el) return "";
-    if (el.type === "checkbox" && !el.closest(".ms-group")) return el.checked ? "true" : "";
-    return el.value || "";
+    var controls = document.getElementsByName(id);
+    if (!controls.length) return "";
+    var first = controls[0];
+    if (first.type === "checkbox") {
+      if (controls.length > 1) {
+        return Array.prototype.map.call(controls, function(control) {
+          return control.checked ? control.value : "";
+        }).filter(Boolean);
+      }
+      return first.checked ? "true" : "false";
+    }
+    if (first.type === "radio") {
+      for (var i = 0; i < controls.length; i++) {
+        if (controls[i].checked) return controls[i].value || "";
+      }
+      return "";
+    }
+    return first.value || "";
   }
 
   document.getElementById("mainForm").addEventListener("input", updateVisibility);
@@ -488,6 +689,7 @@ function renderFormPage(
     FIELDS.forEach(function(f) {
       var el = document.querySelector('[data-field-id="' + f.id + '"]');
       if (!el || el.dataset.hidden === "1") return;
+      if (f.type === "file") return;
       if (f.type === "multiselect") {
         var checked = [];
         el.querySelectorAll('input[type="checkbox"]:checked').forEach(function(cb) { checked.push(cb.value); });
@@ -499,6 +701,9 @@ function renderFormPage(
         if (v) data[f.id] = parseInt(v);
       } else if (f.type === "scale") {
         data[f.id] = parseInt(el.querySelector(".slider").value);
+      } else if (f.type === "radio") {
+        var checked = el.querySelector('input[type="radio"]:checked');
+        if (checked && checked.value) data[f.id] = checked.value;
       } else {
         var input = el.querySelector("input, textarea, select");
         if (input && input.value) data[f.id] = input.value;
@@ -507,12 +712,50 @@ function renderFormPage(
     return data;
   }
 
+  function collectFiles() {
+    var files = {};
+    FIELDS.forEach(function(f) {
+      if (f.type !== "file") return;
+      var el = document.querySelector('[data-field-id="' + f.id + '"]');
+      if (!el || el.dataset.hidden === "1") return;
+      var input = el.querySelector('input[type="file"]');
+      if (input && input.files && input.files.length) {
+        files[f.id] = Array.prototype.slice.call(input.files);
+      }
+    });
+    return files;
+  }
+
+  function acceptsFile(f, file) {
+    if (!f.accept) return true;
+    var mime = (file.type || "").toLowerCase();
+    var name = (file.name || "").toLowerCase();
+    return f.accept.split(",").some(function(raw) {
+      var token = raw.trim().toLowerCase();
+      if (!token || token === "*/*" || token === mime) return true;
+      if (token.slice(-2) === "/*") return mime.indexOf(token.slice(0, -1)) === 0;
+      return token.charAt(0) === "." && name.slice(-token.length) === token;
+    });
+  }
+
   // Validation
-  function validate(data) {
+  function validate(data, filesByField) {
     for (var i = 0; i < FIELDS.length; i++) {
       var f = FIELDS[i];
       var el = document.querySelector('[data-field-id="' + f.id + '"]');
       if (!el || el.dataset.hidden === "1") continue;
+      if (f.type === "file") {
+        var files = filesByField[f.id] || [];
+        if (f.required && files.length === 0) return f.label + " is required";
+        var maxFiles = f.multiple ? (f.maxFiles || 5) : 1;
+        if (files.length > maxFiles) return f.label + " accepts up to " + maxFiles + " file" + (maxFiles === 1 ? "" : "s");
+        var maxBytes = f.maxSizeBytes || 10485760;
+        for (var fileIndex = 0; fileIndex < files.length; fileIndex++) {
+          if (files[fileIndex].size > maxBytes) return files[fileIndex].name + " is larger than the " + Math.round(maxBytes / 1048576) + " MB limit";
+          if (!acceptsFile(f, files[fileIndex])) return files[fileIndex].name + " is not an accepted file type";
+        }
+        continue;
+      }
       if (f.required) {
         var val = data[f.id];
         if (val === undefined || val === null || val === "" || (Array.isArray(val) && val.length === 0)) {
@@ -525,11 +768,57 @@ function renderFormPage(
           return (f.validation.message || f.label + " must be at least " + f.validation.min);
         if (f.validation.max != null && Number(v) > f.validation.max)
           return (f.validation.message || f.label + " must be at most " + f.validation.max);
-        if (f.validation.pattern && typeof v === "string" && !new RegExp(f.validation.pattern).test(v))
-          return (f.validation.message || f.label + " is invalid");
+        // An absent value never reaches a pattern check in the React client or
+        // the submit handler, so an untouched optional field must not fail here
+        // just because the owner's stored rule is unrunnable.
+        var hasValue = typeof v === "string" ? v !== "" : v !== undefined && v !== null;
+        if (f.validation.unsafePattern && hasValue)
+          return localizedUncheckablePattern(f.label);
+        if (f.validation.pattern && typeof v === "string" && hasValue) {
+          if (v.length > ${MAX_USER_REGEX_INPUT_LENGTH})
+            return localizedTooLongPattern(f.label);
+          if (!new RegExp(f.validation.pattern).test(v))
+            return (f.validation.message || f.label + " is invalid");
+        }
       }
     }
     return null;
+  }
+
+  function uploadFiles(filesByField) {
+    var uploaded = {};
+    var requests = [];
+    FIELDS.forEach(function(f) {
+      if (f.type !== "file") return;
+      var files = filesByField[f.id] || [];
+      files.forEach(function(file) {
+        var body = new FormData();
+        body.append("fieldId", f.id);
+        body.append("file", file, file.name);
+        requests.push(fetch(UPLOAD_PATH + encodeURIComponent(FORM_ID), {
+          method: "POST",
+          body: body,
+        }).then(function(r) {
+          return r.json().then(function(d) {
+            if (!r.ok) throw new Error(d.error || "Failed to upload file");
+            return d;
+          }, function() {
+            throw new Error("File upload returned an invalid response");
+          });
+        }).then(function(fileValue) {
+          if (!uploaded[f.id]) uploaded[f.id] = [];
+          uploaded[f.id].push(fileValue);
+        }));
+      });
+    });
+    return Promise.all(requests).then(function() {
+      FIELDS.forEach(function(f) {
+        if (f.type === "file" && f.multiple !== true && uploaded[f.id]) {
+          uploaded[f.id] = uploaded[f.id][0];
+        }
+      });
+      return uploaded;
+    });
   }
 
   // Turnstile
@@ -556,26 +845,36 @@ function renderFormPage(
     e.preventDefault();
     if (submitting) return;
     var data = collectData();
-    var err = validate(data);
+    var filesByField = collectFiles();
+    var err = validate(data, filesByField);
     if (err) { showToast(err); return; }
     submitting = true;
     var btn = document.getElementById("submitBtn");
-    btn.textContent = "Submitting...";
+    btn.textContent = "Uploading...";
     btn.disabled = true;
     var hp = (document.getElementById("_hp") || {}).value || "";
+    var pageUrl = scrubPageUrl(window.location.href);
 
-    fetch(${JSON.stringify(submitPath)} + FORM_ID, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ data: data, captchaToken: captchaToken, _hp: hp, _t: PAGE_LOAD_T }),
+    uploadFiles(filesByField).then(function(uploaded) {
+      Object.keys(uploaded).forEach(function(fieldId) { data[fieldId] = uploaded[fieldId]; });
+      btn.textContent = "Submitting...";
+      return fetch(${JSON.stringify(submitPath)} + FORM_ID, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data: data, captchaToken: captchaToken, _hp: hp, _t: PAGE_LOAD_T, _meta: { pageUrl: pageUrl } }),
+      });
     })
     .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
     .then(function(res) {
       if (!res.ok) { throw new Error(res.data.error || "Failed to submit"); }
-      if (REDIRECT) { window.location.href = REDIRECT; return; }
+      if (COMPLETION_MODE === "redirect" && REDIRECT) { window.location.href = REDIRECT; return; }
+      if (COMPLETION_MODE === "refresh") { window.location.reload(); return; }
       document.querySelector(".container").style.display = "none";
       document.getElementById("successView").style.display = "flex";
-      if (html.classList.contains("embedded") && window.parent !== window) {
+      if (COMPLETION_MODE === "message_then_refresh") {
+        window.setTimeout(function() { window.location.reload(); }, COMPLETION_REFRESH_MS);
+      }
+      if ((COMPLETION_MODE === "message" || COMPLETION_MODE === "message_then_refresh") && html.classList.contains("embedded") && window.parent !== window) {
         try { window.parent.postMessage({ type: "agent-native-feedback-submitted" }, "*"); } catch (_) {}
       }
     })
@@ -591,10 +890,6 @@ function renderFormPage(
 </body>
 </html>`;
 }
-
-// ---------------------------------------------------------------------------
-// 404 page
-// ---------------------------------------------------------------------------
 
 function notFoundPage(origin?: string) {
   const appBasePath = getAppBasePath();
@@ -636,10 +931,6 @@ function notFoundPage(origin?: string) {
 </body>
 </html>`;
 }
-
-// ---------------------------------------------------------------------------
-// CSS
-// ---------------------------------------------------------------------------
 
 function CSS() {
   return `

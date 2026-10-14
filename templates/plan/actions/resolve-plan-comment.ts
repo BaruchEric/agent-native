@@ -1,23 +1,25 @@
-import { defineAction, embedApp } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
+import {
+  getRequestUserEmail,
+  getRequestUserName,
+} from "@agent-native/core/server/request-context";
 import {
   ForbiddenError,
   currentAccess,
   resolveAccess,
+  roleSatisfies,
 } from "@agent-native/core/sharing";
 import { and, eq, isNull } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
+import { notifyPlanCommentRecipients } from "../server/lib/comment-notifications.js";
 import {
   isAnonymousPublicViewer,
   isGuestAuthorIdentity,
   resolvePlanAccessContext,
   resolvePlanOwnerEmailForWrite,
 } from "../server/lib/local-identity.js";
-import { notifyPlanCommentRecipients } from "../server/lib/comment-notifications.js";
-import {
-  getRequestUserEmail,
-  getRequestUserName,
-} from "@agent-native/core/server/request-context";
 import {
   buildUpdatedPlanCommentRows,
   commentResolutionFields,
@@ -69,7 +71,7 @@ function threadCommentIdsFor(
 
 export default defineAction({
   description:
-    'Mark a plan comment thread as resolved or reopen it. Call this after addressing reviewer feedback to signal that the thread is handled. Pass status "resolved" to close the thread, "open" to reopen it. An optional resolutionNote posts a reply before the status change so reviewers see what was done. Resolving marks the thread done for reviewers; it does NOT remove it from get-plan-feedback — also call consume-plan-feedback (or pass consumedCommentIds to update-visual-plan) to stop the thread from appearing as pending work.',
+    'Mark a plan comment thread as resolved or reopen it. An optional resolutionNote supports inline Markdown for emphasis, inline code, links, and line breaks; headings are flattened. Call this after addressing reviewer feedback to signal that the thread is handled. Pass status "resolved" to close the thread, "open" to reopen it. Resolving marks the thread done for reviewers; it does NOT remove it from get-plan-feedback — also call consume-plan-feedback (or pass consumedCommentIds to update-visual-plan) to stop the thread from appearing as pending work.',
   schema: z.object({
     planId: z.string().describe("Plan ID"),
     commentId: z
@@ -86,7 +88,7 @@ export default defineAction({
       .string()
       .optional()
       .describe(
-        "Optional message to post as a reply before changing the status — use this to briefly explain what was done or why the thread is being closed.",
+        "Optional inline Markdown message to post as a reply before changing the status; headings are flattened.",
       ),
   }),
   publicAgent: {
@@ -100,15 +102,9 @@ export default defineAction({
   },
   mcpApp: {
     compactCatalog: true,
-    resource: embedApp({
-      title: "Resolve Comment",
-      description:
-        "Open the Agent-Native Plan surface to manage comment thread statuses.",
-      iframeTitle: "Agent-Native Plan",
-      openLabel: "Open Plan",
-      height: 860,
-    }),
   },
+  changeResource: (input) =>
+    input.planId ? { resourceType: "plan", resourceId: input.planId } : null,
   run: async (args) => {
     const requesterEmail = getRequestUserEmail();
     const requesterName = getRequestUserName();
@@ -116,7 +112,6 @@ export default defineAction({
       ? resolvePlanOwnerEmailForWrite(requesterEmail)
       : requesterEmail;
 
-    // Same identity checks as update-visual-plan comment paths.
     if (isAnonymousPublicViewer(requesterEmail)) {
       throw new ForbiddenError(
         "Resolving a comment requires an agent-native account. Sign in to resolve.",
@@ -133,7 +128,6 @@ export default defineAction({
       );
     }
 
-    // Viewer-level access is sufficient for status changes (mirrors update-visual-plan).
     const access = await resolveAccess(
       "plan",
       args.planId,
@@ -143,11 +137,15 @@ export default defineAction({
     if ((access.resource as typeof schema.plans.$inferSelect).deletedAt) {
       throw new ForbiddenError(`Plan ${args.planId} not found`);
     }
+    if (!roleSatisfies(access.role, "commenter")) {
+      throw new ForbiddenError(
+        "Commenting on this plan requires commenter access or higher.",
+      );
+    }
 
     const db = getDb();
     const now = nowIso();
 
-    // Load the existing comment — must be on this plan.
     const [existing] = await db
       .select({
         id: schema.planComments.id,
@@ -205,7 +203,6 @@ export default defineAction({
         ? existingThreadCommentIds
         : [existing.id];
 
-    // Optionally post a reply note before updating the status.
     let insertedNoteId: string | undefined;
     if (args.resolutionNote) {
       const noteRows = buildUpdatedPlanCommentRows({
@@ -264,7 +261,6 @@ export default defineAction({
       createdBy: "agent",
     });
 
-    // Notify and emit events for the reply note (if any).
     if (insertedNoteId) {
       const bundleAfter = await loadPlanBundle(args.planId);
       await notifyPlanCommentRecipients({

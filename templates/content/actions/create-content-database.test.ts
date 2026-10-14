@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+
 import { databaseTitleForPage } from "./create-content-database";
 
 describe("create content database", () => {
@@ -13,7 +14,7 @@ describe("create content database", () => {
   });
 
   it("defaults untitled database pages consistently", () => {
-    expect(databaseTitleForPage("", "")).toBe("Untitled database");
-    expect(databaseTitleForPage()).toBe("Untitled database");
+    expect(databaseTitleForPage("", "")).toBe("Untitled collection");
+    expect(databaseTitleForPage()).toBe("Untitled collection");
   });
 });

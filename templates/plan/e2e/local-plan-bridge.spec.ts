@@ -1,10 +1,10 @@
-import { test, expect, type Page } from "@playwright/test";
-import http from "node:http";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
-import { startLocalPlanBridge } from "../../../packages/core/src/cli/plan-local.js";
+import { startLocalPlanBridge } from "@agent-native/core/testing";
+import { test, expect, type Page } from "@playwright/test";
 
 async function getAvailablePort(): Promise<number> {
   const server = http.createServer();
@@ -67,7 +67,7 @@ test("local bridge retries startup and survives a hard reload", async ({
   const appUrl =
     baseURL ?? process.env.PLAN_BASE_URL ?? "http://localhost:8081";
   const localPlanUrl = new URL(
-    `/local-plans/bridge-reload-fixture?bridge=${encodeURIComponent(
+    `/local-plans/bridge-reload-fixture#bridge=${encodeURIComponent(
       bridgeUrl,
     )}`,
     appUrl,

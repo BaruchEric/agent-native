@@ -1,8 +1,9 @@
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
+import { defineAction } from "@agent-native/core/action";
 import { assertAccess } from "@agent-native/core/sharing";
+import { eq } from "drizzle-orm";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
 import { notifyClients } from "../server/handlers/decks.js";
 
 export default defineAction({
@@ -14,7 +15,6 @@ export default defineAction({
     designSystemId: z.string().describe("Design system ID to link to the deck"),
   }),
   run: async ({ deckId, designSystemId }) => {
-    // Verify access to both the deck and the design system
     await assertAccess("deck", deckId, "editor");
     await assertAccess("design-system", designSystemId, "viewer");
 
@@ -26,7 +26,7 @@ export default defineAction({
       .set({ designSystemId, updatedAt: now })
       .where(eq(schema.decks.id, deckId));
 
-    notifyClients(deckId);
+    await notifyClients(deckId);
 
     return { deckId, designSystemId, applied: true };
   },

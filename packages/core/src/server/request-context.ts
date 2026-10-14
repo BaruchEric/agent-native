@@ -1,123 +1,349 @@
-/**
- * Per-request context using AsyncLocalStorage.
- *
- * Replaces the unsafe pattern of mutating `process.env.AGENT_USER_EMAIL` /
- * `process.env.AGENT_ORG_ID` on every request. On Node.js (Netlify, self-hosted)
- * concurrent requests would overwrite each other's env vars. AsyncLocalStorage
- * gives each async call-chain its own isolated context.
- *
- * Supported on all deployment targets:
- * - Node.js (native)
- * - Cloudflare Workers (via nodejs_compat flag)
- * - Deno Deploy (via node:async_hooks compat)
- *
- * For CLI scripts that run outside a request context, the getters fall back to
- * process.env so existing `AGENT_USER_EMAIL=x pnpm action foo` invocations
- * continue to work.
- */
-import { AsyncLocalStorage } from "node:async_hooks";
+import type { AgentActionScope } from "../agent/types.js";
+import type { TrackingEventScope } from "../observability/tracing.js";
+import type { ContextStatus } from "../shared/context-status.js";
+import type { SignupAttributionContext } from "./attribution.js";
 
-/**
- * Per-request agent-run state. Lives on `RequestContext.run` so the
- * agent-chat plugin can populate fields as the run progresses (owner,
- * resolved API key, system prompt, engine, model, threadId) without
- * mutating module-scope `let` bindings — those leak across concurrent
- * requests on a single Node.js process.
- *
- * Mutated in-place by `prepareRun`, `onEngineResolved`, `onRunStart` so
- * tool factory closures (automation, fetch, team, builder-browser) read
- * the live per-request value via `getRequestRunContext()`.
- */
+type AsyncLocalStorageLike<T> = {
+  getStore(): T | undefined;
+  run<R>(store: T, callback: () => R): R;
+};
+
+type AsyncLocalStorageCtor = new <T>() => AsyncLocalStorageLike<T>;
+
+class StackAsyncLocalStorage<T> implements AsyncLocalStorageLike<T> {
+  private readonly stack: T[] = [];
+
+  getStore(): T | undefined {
+    return this.stack.at(-1);
+  }
+
+  run<R>(store: T, callback: () => R): R {
+    this.stack.push(store);
+    try {
+      const result = callback();
+      const maybePromise = result as unknown as
+        | { finally?: (callback: () => void) => unknown }
+        | undefined;
+      if (maybePromise && typeof maybePromise.finally === "function") {
+        return maybePromise.finally(() => {
+          this.stack.pop();
+        }) as R;
+      }
+      this.stack.pop();
+      return result;
+    } catch (error) {
+      this.stack.pop();
+      throw error;
+    }
+  }
+}
+
+function getAsyncLocalStorageCtor(): AsyncLocalStorageCtor | undefined {
+  if (
+    typeof window !== "undefined" ||
+    typeof process === "undefined" ||
+    !process.versions?.node ||
+    typeof process.getBuiltinModule !== "function"
+  ) {
+    return undefined;
+  }
+  return process.getBuiltinModule("node:async_hooks")?.AsyncLocalStorage as
+    | AsyncLocalStorageCtor
+    | undefined;
+}
+
+const AsyncLocalStorageCtor = getAsyncLocalStorageCtor();
+
+function processEnv(name: string): string | undefined {
+  if (typeof process === "undefined") return undefined;
+  return process.env?.[name];
+}
+
 export interface RequestRunContext {
-  /** Origin of the current request (used by the builder-browser tool). */
+  waitUntil?: (promise: Promise<unknown>) => void;
   requestOrigin?: string;
-  /** Stable browser tab id for tab-scoped app-state reads/writes. */
   browserTabId?: string;
-  /** Resource scope for the current chat thread, e.g. the active deck. */
   chatScope?: {
     type: string;
     id: string;
     label?: string;
   } | null;
-  /** Resolved owner email (set by prepareRun). */
   owner?: string;
-  /** Owner's active Anthropic API key (set by prepareRun). */
   userApiKey?: string;
-  /** Thread ID for the current run (set by onRunStart). */
+  userApiKeyEnvVar?: string;
   threadId?: string;
-  /** System prompt actually sent to the model for this run. */
+  runId?: string;
   systemPrompt?: string;
-  /** Engine instance for this run (set by onEngineResolved). */
   engine?: import("../agent/engine/types.js").AgentEngine;
-  /** Model name for this run (set by onEngineResolved). */
   model?: string;
-  /** Tool calls made so far in the current agent loop. */
+  allowedActionNames?: readonly string[];
+  actionScope?: Readonly<AgentActionScope>;
+  appAuthorization?: {
+    appId: string;
+    roles: string[];
+    permissions: Record<string, string[]>;
+  } | null;
+  hostedHarnessRuntime?: "claude-code" | "codex" | "pi" | "opencode";
+  isBackgroundWorker?: boolean;
+  analyticsJevPrefetch?: {
+    preloadedReferenceCount: number;
+  };
+  /** Whether the pre-model reference prefetch and screen grounding reached the model. */
+  contextStatus?: { prefetch?: ContextStatus; screen?: ContextStatus };
   toolCalls?: Array<{ name: string; input: unknown }>;
-  /** Tool results returned so far in the current agent loop. */
   toolResults?: Array<{ name: string; content: string; isError: boolean }>;
+  extensionContentReads?: Record<string, string>;
+  extensionExcerptReads?: Record<string, true>;
+  toolSearchReads?: Record<
+    string,
+    { totalTools: number; resultNames: string[] }
+  >;
 }
 
 export interface RequestContext {
+  isSyntheticTraffic?: boolean;
+  mcpRequestId?: string;
   userEmail?: string;
+  /** Keep data-source credentials within the selected org, not the user. */
+  credentialScope?: "org";
+  /** Storage-only org selection; null prevents an active-org fallback. */
+  builderStorageCredentialOrgId?: string | null;
+  /** Provenance set only after a stored org service token is verified. */
+  verifiedServiceIdentity?: { userEmail: string; orgId: string };
+  identityAuthenticatedAtMs?: number;
+  identitySessionToken?: string;
+  /** Signed MCP credential issue time, used to revoke derived widget grants. */
+  mcpCredentialIssuedAtMs?: number | null;
+  authUserId?: string;
+  agentRunAnonymous?: boolean;
   userName?: string;
   orgId?: string;
+  orgScope?: "personal";
+  /**
+   * Narrow authorization capability verified from an embed session. This is
+   * deliberately separate from user identity: capability-only sessions must
+   * not satisfy account-backed auth or inherit the ticket owner's privileges.
+   */
+  authCapability?: string;
   timezone?: string;
   /**
-   * Set when code reads authenticated request context. Public SSR shell/data
-   * should not depend on this value; user/org-specific reads belong behind
-   * client-side actions/API after hydration.
+   * The caller's browser analytics session id, when the request came from a
+   * page. Emitted as PostHog's `$session_id` so agent traces join to session
+   * replay; never used for authorization.
    */
+  browserSessionId?: string;
+  trackingScope?: TrackingEventScope;
+  /**
+   * Browser attribution captured before a Better Auth signup crosses into its
+   * async user-create hook. Analytics-only; never used for authorization.
+   */
+  signupAttribution?: SignupAttributionContext;
+  signupOrigin?: import("./attribution.js").SignupOrigin;
+  clientPlatform?: import("../shared/analytics-platform.js").AnalyticsClientPlatform;
   authContextAccessed?: boolean;
-  /**
-   * Origin of the inbound request (e.g. `http://127.0.0.1:8100`). Set by the
-   * MCP mount from the request headers so actions that build externally
-   * fetchable URLs (e.g. design `export-coding-handoff`'s signed raw-code URL)
-   * resolve the real local-workspace origin instead of a prod/localhost
-   * fallback. Optional — absent on paths that don't populate it.
-   */
   requestOrigin?: string;
+  federationMembershipValidated?: boolean;
   /**
-   * True when this request is being processed by an integration-platform
-   * webhook (Slack, Telegram, etc.) where the function timeout is the
-   * binding constraint. Code that calls slow remote APIs can use this to apply
-   * tighter budgets on this path while leaving normal agent-chat callers
-   * (5+ min budget) unaffected.
+   * True when the request's real socket peer is loopback, captured by the
+   * action-route handler while the h3 event is still in scope (nothing below
+   * that layer can see the event). Derived from `getRequestIP()` WITHOUT
+   * `x-forwarded-for`, so a remote client cannot set it via headers.
+   *
+   * A local-dev gate only. A tunnel or reverse proxy that reaches the dev
+   * server over loopback also presents as loopback, so this is necessary but
+   * not sufficient on its own — pair it with something that scopes the blast
+   * radius (a resource that is itself local-only, NODE_ENV, etc.).
    */
+  isLoopbackRequest?: boolean;
   isIntegrationCaller?: boolean;
-  /**
-   * Metadata for the currently-processing integration task. This lets tools
-   * that start long-running remote work persist a continuation that can update
-   * the originating platform thread after the current function budget ends.
-   */
   integration?: {
     taskId: string;
     attempts?: number;
     incoming: import("../integrations/types.js").IncomingMessage;
     placeholderRef?: string;
+    progressRef?: import("../integrations/types.js").PlatformRunProgressRef;
+    installationId?: string;
+    scopeId?: string;
+    principalType?: "user" | "service";
+    lineage?: {
+      runId?: string;
+      parentTaskId?: string;
+      source?: {
+        kind: string;
+        platform?: string;
+        id: string;
+        url?: string;
+      };
+      network?: {
+        protocol: "a2a" | "mcp" | "provider-api";
+        id: string;
+        peer?: string;
+      };
+    };
   };
-  /**
-   * Mutable per-request agent-run state. Populated by the agent-chat plugin
-   * during a run; tool closures dereference it on each invocation.
-   */
   run?: RequestRunContext;
+}
+
+const EXPLICIT_PERSONAL_ORG_SCOPE_KEY = "__anExplicitPersonalOrgScope";
+const VERIFIED_SERVICE_IDENTITY_EVENT_KEY = "__anVerifiedServiceIdentity";
+
+type RequestContextEvent = { context?: Record<string, unknown> };
+
+export function markVerifiedServiceIdentityForEvent(
+  event: RequestContextEvent,
+  identity: { userEmail: string; orgId: string },
+): void {
+  const context = (event.context ??= {});
+  context[VERIFIED_SERVICE_IDENTITY_EVENT_KEY] = identity;
+}
+
+export function getVerifiedServiceIdentityFromEvent(
+  event: RequestContextEvent,
+): { userEmail: string; orgId: string } | undefined {
+  const identity = event.context?.[VERIFIED_SERVICE_IDENTITY_EVENT_KEY] as
+    | { userEmail?: unknown; orgId?: unknown }
+    | undefined;
+  const userEmail = identity?.userEmail;
+  const orgId = identity?.orgId;
+  if (
+    typeof userEmail !== "string" ||
+    !userEmail.trim() ||
+    typeof orgId !== "string" ||
+    !orgId.trim()
+  ) {
+    return undefined;
+  }
+  return { userEmail: userEmail.trim(), orgId: orgId.trim() };
+}
+
+export function markExplicitPersonalOrgScope(event: {
+  context?: Record<string, unknown>;
+}): void {
+  if (event.context) {
+    event.context[EXPLICIT_PERSONAL_ORG_SCOPE_KEY] = true;
+  }
+}
+
+export function hasExplicitPersonalOrgScope(event: {
+  context?: Record<string, unknown>;
+}): boolean {
+  return event.context?.[EXPLICIT_PERSONAL_ORG_SCOPE_KEY] === true;
+}
+
+const REQUEST_IDENTITY_AUTH_TIME_KEY = "__anRequestIdentityAuthTime";
+
+type RequestIdentityAuthTime = {
+  email: string;
+  authenticatedAtMs: number;
+  sessionToken?: string;
+};
+
+export function markRequestIdentityAuthenticatedAtMs(
+  event: { context?: Record<string, unknown> },
+  email: string,
+  authenticatedAtMs: number,
+  sessionToken?: string,
+): void {
+  const normalizedEmail = email.trim().toLowerCase();
+  if (
+    !event.context ||
+    !normalizedEmail ||
+    !Number.isFinite(authenticatedAtMs)
+  ) {
+    return;
+  }
+
+  const existing = event.context[REQUEST_IDENTITY_AUTH_TIME_KEY] as
+    | RequestIdentityAuthTime
+    | undefined;
+  event.context[REQUEST_IDENTITY_AUTH_TIME_KEY] = {
+    email: normalizedEmail,
+    authenticatedAtMs:
+      existing?.email === normalizedEmail &&
+      Number.isFinite(existing.authenticatedAtMs)
+        ? Math.min(existing.authenticatedAtMs, authenticatedAtMs)
+        : authenticatedAtMs,
+    ...(existing?.email === normalizedEmail &&
+    existing.authenticatedAtMs <= authenticatedAtMs
+      ? existing.sessionToken
+        ? { sessionToken: existing.sessionToken }
+        : sessionToken
+          ? { sessionToken }
+          : {}
+      : sessionToken
+        ? { sessionToken }
+        : {}),
+  } satisfies RequestIdentityAuthTime;
+}
+
+export function getRequestIdentityAuthenticatedAtMs(
+  event: { context?: Record<string, unknown> },
+  email: string,
+): number | undefined {
+  const normalizedEmail = email.trim().toLowerCase();
+  const identity = event.context?.[REQUEST_IDENTITY_AUTH_TIME_KEY] as
+    | RequestIdentityAuthTime
+    | undefined;
+  return identity?.email === normalizedEmail &&
+    Number.isFinite(identity.authenticatedAtMs)
+    ? identity.authenticatedAtMs
+    : undefined;
+}
+
+export function getRequestIdentitySessionToken(
+  event: { context?: Record<string, unknown> },
+  email: string,
+): string | undefined {
+  const normalizedEmail = email.trim().toLowerCase();
+  const identity = event.context?.[REQUEST_IDENTITY_AUTH_TIME_KEY] as
+    | RequestIdentityAuthTime
+    | undefined;
+  return identity?.email === normalizedEmail &&
+    typeof identity.sessionToken === "string"
+    ? identity.sessionToken
+    : undefined;
 }
 
 const GLOBAL_KEY = "__agentNativeRequestContextAls" as const;
 const OBSERVERS_KEY = "__agentNativeRequestContextObservers" as const;
+const BOUNDARY_KEY = "__agentNativeRequestBoundaryInstalled" as const;
+const CONTINUATION_LOCAL_KEY =
+  "__agentNativeRequestContextContinuationLocal" as const;
 type RequestContextObserver = (ctx: RequestContext) => void;
 type GlobalWithRequestContext = typeof globalThis & {
-  [GLOBAL_KEY]?: AsyncLocalStorage<RequestContext>;
+  [GLOBAL_KEY]?: AsyncLocalStorageLike<RequestContext>;
   [OBSERVERS_KEY]?: RequestContextObserver[];
+  [BOUNDARY_KEY]?: boolean;
+  [CONTINUATION_LOCAL_KEY]?: boolean;
 };
 const globalRef = globalThis as GlobalWithRequestContext;
 if (!globalRef[GLOBAL_KEY]) {
-  globalRef[GLOBAL_KEY] = new AsyncLocalStorage<RequestContext>();
+  globalRef[CONTINUATION_LOCAL_KEY] = Boolean(AsyncLocalStorageCtor);
+  globalRef[GLOBAL_KEY] = AsyncLocalStorageCtor
+    ? new AsyncLocalStorageCtor<RequestContext>()
+    : new StackAsyncLocalStorage<RequestContext>();
 }
 if (!globalRef[OBSERVERS_KEY]) {
   globalRef[OBSERVERS_KEY] = [];
 }
 const als = globalRef[GLOBAL_KEY]!;
 const observers = globalRef[OBSERVERS_KEY]!;
+
+/**
+ * Authorization state must never use the shared-stack compatibility fallback:
+ * overlapping async requests are only isolated by native AsyncLocalStorage.
+ */
+export function assertRequestActionSurfaceIsolation(): void {
+  if (globalRef[CONTINUATION_LOCAL_KEY] === true) return;
+  throw new Error(
+    "Request-scoped action surfaces require continuation-local request context storage; " +
+      "this runtime only provides the non-isolated fallback.",
+  );
+}
+
+export function hasContinuationLocalRequestContext(): boolean {
+  return globalRef[CONTINUATION_LOCAL_KEY] === true;
+}
 
 /**
  * Register a callback fired every time `runWithRequestContext` enters a new
@@ -139,19 +365,100 @@ export function addRequestContextObserver(
   };
 }
 
-/**
- * Run a callback within a per-request context. The context is available to all
- * async operations spawned from `fn` via `getRequestUserEmail()` / `getRequestOrgId()`.
- *
- * Any registered `addRequestContextObserver` callbacks fire inside the new
- * scope before `fn` runs, so observability code can pin user/org info onto
- * isolation-scoped backends (Sentry, OpenTelemetry, etc.).
- */
 export function runWithRequestContext<T>(
   ctx: RequestContext,
   fn: () => T | Promise<T>,
 ): T | Promise<T> {
-  return als.run(ctx, () => {
+  const inheritedContext = als.getStore();
+  const inheritedSyntheticTraffic = inheritedContext?.isSyntheticTraffic;
+  let context =
+    ctx.isSyntheticTraffic === undefined &&
+    inheritedSyntheticTraffic !== undefined
+      ? { ...ctx, isSyntheticTraffic: inheritedSyntheticTraffic }
+      : ctx;
+  if (
+    context.trackingScope === undefined &&
+    inheritedContext?.trackingScope !== undefined
+  ) {
+    context = { ...context, trackingScope: inheritedContext.trackingScope };
+  }
+  const contextUserEmail = context.userEmail?.trim().toLowerCase();
+  if (contextUserEmail) {
+    const inheritedUserEmail = inheritedContext?.userEmail
+      ?.trim()
+      .toLowerCase();
+    const inheritedAuthTime =
+      typeof inheritedContext?.identityAuthenticatedAtMs === "number" &&
+      Number.isFinite(inheritedContext.identityAuthenticatedAtMs)
+        ? inheritedContext.identityAuthenticatedAtMs
+        : undefined;
+    const contextAuthTime =
+      typeof context.identityAuthenticatedAtMs === "number" &&
+      Number.isFinite(context.identityAuthenticatedAtMs)
+        ? context.identityAuthenticatedAtMs
+        : undefined;
+    const inheritedMcpCredentialIssuedAtMs =
+      inheritedUserEmail === contextUserEmail &&
+      typeof inheritedContext?.mcpCredentialIssuedAtMs === "number" &&
+      Number.isSafeInteger(inheritedContext?.mcpCredentialIssuedAtMs)
+        ? inheritedContext.mcpCredentialIssuedAtMs
+        : undefined;
+    const contextMcpCredentialIssuedAtMs =
+      typeof context.mcpCredentialIssuedAtMs === "number" &&
+      Number.isSafeInteger(context.mcpCredentialIssuedAtMs)
+        ? context.mcpCredentialIssuedAtMs
+        : undefined;
+    const clearMcpCredentialIssuedAt = context.mcpCredentialIssuedAtMs === null;
+    const inheritedSessionToken =
+      inheritedUserEmail === contextUserEmail &&
+      typeof inheritedContext?.identitySessionToken === "string"
+        ? inheritedContext.identitySessionToken
+        : undefined;
+    context = {
+      ...context,
+      identityAuthenticatedAtMs:
+        inheritedUserEmail === contextUserEmail &&
+        inheritedAuthTime !== undefined
+          ? Math.min(inheritedAuthTime, contextAuthTime ?? inheritedAuthTime)
+          : (contextAuthTime ?? Date.now()),
+      ...(clearMcpCredentialIssuedAt
+        ? { mcpCredentialIssuedAtMs: null }
+        : inheritedMcpCredentialIssuedAtMs !== undefined ||
+            contextMcpCredentialIssuedAtMs !== undefined
+          ? {
+              mcpCredentialIssuedAtMs:
+                inheritedUserEmail === contextUserEmail &&
+                inheritedMcpCredentialIssuedAtMs !== undefined
+                  ? Math.min(
+                      inheritedMcpCredentialIssuedAtMs,
+                      contextMcpCredentialIssuedAtMs ??
+                        inheritedMcpCredentialIssuedAtMs,
+                    )
+                  : contextMcpCredentialIssuedAtMs,
+            }
+          : {}),
+      ...(context.identitySessionToken === undefined && inheritedSessionToken
+        ? { identitySessionToken: inheritedSessionToken }
+        : {}),
+    };
+  } else if (
+    context.identityAuthenticatedAtMs !== undefined ||
+    context.identitySessionToken !== undefined ||
+    context.mcpCredentialIssuedAtMs !== undefined
+  ) {
+    const contextWithoutIdentityTime = { ...context };
+    delete contextWithoutIdentityTime.identityAuthenticatedAtMs;
+    delete contextWithoutIdentityTime.identitySessionToken;
+    delete contextWithoutIdentityTime.mcpCredentialIssuedAtMs;
+    context = contextWithoutIdentityTime;
+  }
+  if (
+    context.run?.allowedActionNames !== undefined ||
+    context.run?.actionScope !== undefined
+  ) {
+    assertRequestActionSurfaceIsolation();
+  }
+  return als.run(context, () => {
     if (observers.length > 0) {
       for (const obs of observers) {
         try {
@@ -165,82 +472,101 @@ export function runWithRequestContext<T>(
   });
 }
 
-/**
- * Return the active request context, if this call chain is running under one.
- *
- * This is intentionally distinct from `getRequestUserEmail()`: callers that
- * have an active context with no authenticated user must not fall through to
- * process-wide CLI fallbacks such as `AGENT_USER_EMAIL` or "latest session".
- */
 export function getRequestContext(): RequestContext | undefined {
   const store = als.getStore();
   markAuthContextAccess(store);
   return store;
 }
 
-/**
- * True when AsyncLocalStorage has an active context for this call chain.
- * Useful for helpers that support both HTTP requests and standalone CLI runs.
- */
 export function hasRequestContext(): boolean {
   return als.getStore() !== undefined;
 }
 
-/**
- * Get the current request's user email.
- *
- * - If a request context exists (HTTP/A2A path), returns its `userEmail` —
- *   even when that value is `undefined`. The env fallback MUST NOT fire here:
- *   a stale process-wide `AGENT_USER_EMAIL` from a CLI run or previous bug
- *   would leak into an unauthenticated A2A/API call (e.g. unsigned or API-key
- *   modes where `runWithRequestContext({ userEmail: undefined })` is used).
- * - Only when there is NO request context (CLI scripts) do we fall back to
- *   `process.env.AGENT_USER_EMAIL`.
- */
+export function markRequestBoundaryInstalled(): void {
+  globalRef[BOUNDARY_KEY] = true;
+}
+
+export function hasRequestBoundary(): boolean {
+  return globalRef[BOUNDARY_KEY] === true;
+}
+
+export function getAmbientUserEmail(): string | undefined {
+  return processEnv("AGENT_USER_EMAIL");
+}
+
+export function getAmbientOrgId(): string | undefined {
+  return processEnv("AGENT_ORG_ID");
+}
+
+const warnedAmbientIdentities = new Set<string>();
+
+function warnAmbientIdentitySatisfiedRead(email: string): void {
+  if (!hasRequestBoundary()) return;
+  if (warnedAmbientIdentities.has(email)) return;
+  warnedAmbientIdentities.add(email);
+  console.warn(
+    `[agent-native] getRequestUserEmail() found no request context and answered with the ambient ` +
+      `AGENT_USER_EMAIL identity (${email}). This process serves HTTP requests, so a request-scoped ` +
+      `read reaching the ambient identity is a bug: it authorizes the deploy env, not the signed-in ` +
+      `user. Wrap the caller in runWithRequestContext({ userEmail }), or call getAmbientUserEmail() ` +
+      `explicitly if the process identity really is what you mean.`,
+  );
+}
+
 export function getRequestUserEmail(): string | undefined {
   const store = als.getStore();
   if (store !== undefined) {
     if (store.userEmail) markAuthContextAccess(store);
     return store.userEmail;
   }
-  return process.env.AGENT_USER_EMAIL;
+  const ambient = processEnv("AGENT_USER_EMAIL");
+  if (ambient) warnAmbientIdentitySatisfiedRead(ambient);
+  return ambient;
 }
 
-/**
- * Get the current request's display name, when the auth provider supplied one.
- *
- * The same request-context fallback rules as `getRequestUserEmail()` apply:
- * HTTP/A2A calls only read AsyncLocalStorage, while CLI scripts may opt in via
- * `AGENT_USER_NAME`.
- */
 export function getRequestUserName(): string | undefined {
   const store = als.getStore();
   if (store !== undefined) {
     if (store.userName) markAuthContextAccess(store);
     return store.userName;
   }
-  return process.env.AGENT_USER_NAME;
+  return processEnv("AGENT_USER_NAME");
 }
 
-/**
- * Get the current request's org ID.
- *
- * Same store-aware semantics as `getRequestUserEmail()` — env fallback is
- * CLI-only, so a request that explicitly has no org doesn't inherit a stale
- * `process.env.AGENT_ORG_ID` from a prior request on the same Lambda instance.
- */
 export function getRequestOrgId(): string | undefined {
   const store = als.getStore();
   if (store !== undefined) {
     if (store.orgId) markAuthContextAccess(store);
     return store.orgId;
   }
-  return process.env.AGENT_ORG_ID;
+  return processEnv("AGENT_ORG_ID");
+}
+
+export function getRequestBuilderStorageCredentialOrgId():
+  | string
+  | null
+  | undefined {
+  const store = als.getStore();
+  if (store?.builderStorageCredentialOrgId !== undefined) {
+    markAuthContextAccess(store);
+  }
+  return store?.builderStorageCredentialOrgId;
+}
+
+export function getRequestAuthCapability(): string | undefined {
+  const store = als.getStore();
+  if (!store) return undefined;
+  if (store.authCapability) markAuthContextAccess(store);
+  return store.authCapability;
+}
+
+export function getRequestIsLoopback(): boolean {
+  return als.getStore()?.isLoopbackRequest === true;
 }
 
 function markAuthContextAccess(ctx: RequestContext | undefined) {
   if (!ctx) return;
-  if (ctx.userEmail || ctx.userName || ctx.orgId) {
+  if (ctx.userEmail || ctx.userName || ctx.orgId || ctx.authCapability) {
     ctx.authContextAccessed = true;
   }
 }
@@ -249,26 +575,12 @@ export function hasAuthContextAccess(ctx: RequestContext | undefined): boolean {
   return Boolean(ctx?.authContextAccessed);
 }
 
-/**
- * Get the current request's IANA timezone (e.g. "America/Los_Angeles").
- * The UI sends this via the `x-user-timezone` header on every action call, and
- * the agent chat plugin propagates it into the request context so that
- * agent-initiated tool calls also see the user's timezone. Falls back to
- * `process.env.AGENT_USER_TIMEZONE` only for CLI scripts (no request context).
- */
 export function getRequestTimezone(): string | undefined {
   const store = als.getStore();
   if (store !== undefined) return store.timezone;
-  return process.env.AGENT_USER_TIMEZONE;
+  return processEnv("AGENT_USER_TIMEZONE");
 }
 
-/**
- * Returns true when this request is on an integration-platform path (Slack,
- * Telegram, etc.) — i.e. we're inside the integration plugin's processor
- * function and the platform's deliver-by deadline plus the host's function
- * timeout are the binding budget. Non-integration callers (CLI, normal
- * agent chat) should treat this as `false`.
- */
 export function isIntegrationCallerRequest(): boolean {
   return als.getStore()?.isIntegrationCaller === true;
 }
@@ -279,43 +591,27 @@ export function getIntegrationRequestContext():
   return als.getStore()?.integration;
 }
 
-/**
- * Convenience: returns `{ userEmail, orgId }` from the active request context,
- * suitable for passing to `resolveCredential(key, ctx)`. Returns `null` when
- * no user is associated with the call (e.g. an unauthenticated public route).
- *
- * For framework actions auto-mounted at `/_agent-native/actions/...` this is
- * always populated because action-routes wraps every invocation in
- * `runWithRequestContext`. For hand-written `/api/*` routes the calling code
- * is responsible for setting up the context (see `runWithRequestContext`).
- */
 export function getCredentialContext(): {
   userEmail: string;
   orgId: string | null;
+  credentialScope?: "org";
 } | null {
   const userEmail = getRequestUserEmail();
   if (!userEmail) return null;
-  return { userEmail, orgId: getRequestOrgId() ?? null };
+  const store = als.getStore();
+  return {
+    userEmail,
+    orgId: getRequestOrgId() ?? null,
+    ...(store?.credentialScope === "org" ? { credentialScope: "org" } : {}),
+  };
 }
 
-/**
- * Get the active request's mutable agent-run state. Returns `undefined` when
- * called outside an agent run (e.g. before `prepareRun` or in a non-agent
- * code path). Callers must tolerate the field absence; use the helper
- * `requireRequestRunContext()` if missing context is a programming error.
- */
 export function getRequestRunContext(): RequestRunContext | undefined {
   const store = als.getStore();
   if (!store) return undefined;
   return store.run;
 }
 
-/**
- * Ensure a `RequestRunContext` exists on the active request store and
- * return it. Used by the agent-chat handler to attach run state once it
- * starts processing a chat request. Returns `undefined` if there is no
- * active request store (caller should not be invoking this outside ALS).
- */
 export function ensureRequestRunContext(): RequestRunContext | undefined {
   const store = als.getStore();
   if (!store) return undefined;

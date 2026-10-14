@@ -1,13 +1,6 @@
-/**
- * Durable state for provider corpus jobs.
- *
- * Jobs are scoped by (app_id, owner_email), matching staged datasets. The
- * runner stores only request configuration, checkpoints, and compact search
- * hits so large provider corpora never enter chat context or filesystem
- * scratch files.
- */
-
-import { getDbExec, intType, isPostgres, type DbExec } from "../db/client.js";
+import { getDbExec, type DbExec } from "../db/client.js";
+import { ensureTableExists, ensureIndexExists } from "../db/ddl-guard.js";
+import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
 
 export type ProviderCorpusJobStatus =
   | "running"
@@ -76,12 +69,12 @@ export interface UpdateProviderCorpusJobOptions {
 
 let initPromise: Promise<void> | undefined;
 
-async function ensureTables(): Promise<void> {
+export async function ensureTables(): Promise<void> {
   if (!initPromise) {
-    initPromise = (async () => {
+    const initPromiseWithRequestDbPoolScope = (async () => {
       const db = getDbExec();
-      const integerType = intType();
-      await db.execute(`
+      const integerType = "BIGINT";
+      const createJobsSql = `
         CREATE TABLE IF NOT EXISTS provider_corpus_jobs (
           id TEXT NOT NULL,
           app_id TEXT NOT NULL,
@@ -108,33 +101,35 @@ async function ensureTables(): Promise<void> {
           updated_at ${integerType} NOT NULL,
           PRIMARY KEY (id)
         )
-      `);
-      await db.execute(`
+      `;
+      const createHitsSql = `
         CREATE TABLE IF NOT EXISTS provider_corpus_job_hits (
           job_id TEXT NOT NULL,
           hit_index ${integerType} NOT NULL,
           hit_data TEXT NOT NULL,
           PRIMARY KEY (job_id, hit_index)
         )
-      `);
-      if (isPostgres()) {
-        await widenPostgresIntegerColumns(db);
-      }
-      for (const ddl of [
+      `;
+      await ensureTableExists("provider_corpus_jobs", createJobsSql);
+      await ensureTableExists("provider_corpus_job_hits", createHitsSql);
+      await widenPostgresIntegerColumns(db);
+      await ensureIndexExists(
+        "provider_corpus_jobs_scope_idx",
         `CREATE INDEX IF NOT EXISTS provider_corpus_jobs_scope_idx ON provider_corpus_jobs (app_id, owner_email, updated_at)`,
+      );
+      await ensureIndexExists(
+        "provider_corpus_jobs_status_idx",
         `CREATE INDEX IF NOT EXISTS provider_corpus_jobs_status_idx ON provider_corpus_jobs (app_id, owner_email, status)`,
+      );
+      await ensureIndexExists(
+        "provider_corpus_job_hits_job_idx",
         `CREATE INDEX IF NOT EXISTS provider_corpus_job_hits_job_idx ON provider_corpus_job_hits (job_id)`,
-      ]) {
-        try {
-          await db.execute(ddl);
-        } catch {
-          // Index already exists or the backend rejected best-effort indexing.
-        }
-      }
+      );
     })().catch((err) => {
       initPromise = undefined;
       throw err;
     });
+    initPromise = retainRequestDbPoolScope(initPromiseWithRequestDbPoolScope);
   }
   return initPromise;
 }
@@ -168,8 +163,7 @@ export async function createProviderCorpusJob(
   const db = getDbExec();
   const now = Date.now();
   await db.execute({
-    sql: isPostgres()
-      ? `
+    sql: `
         INSERT INTO provider_corpus_jobs
           (id, app_id, owner_email, name, mode, status, provider, request_json, pagination_json, batch_json, search_json, limits_json, checkpoint_json, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -197,35 +191,6 @@ export async function createProviderCorpusJob(
           updated_at = EXCLUDED.updated_at
         WHERE provider_corpus_jobs.app_id = EXCLUDED.app_id
           AND provider_corpus_jobs.owner_email = EXCLUDED.owner_email
-      `
-      : `
-        INSERT INTO provider_corpus_jobs
-          (id, app_id, owner_email, name, mode, status, provider, request_json, pagination_json, batch_json, search_json, limits_json, checkpoint_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (id) DO UPDATE SET
-          app_id = excluded.app_id,
-          owner_email = excluded.owner_email,
-          name = excluded.name,
-          mode = excluded.mode,
-          status = excluded.status,
-          provider = excluded.provider,
-          request_json = excluded.request_json,
-          pagination_json = excluded.pagination_json,
-          batch_json = excluded.batch_json,
-          search_json = excluded.search_json,
-          limits_json = excluded.limits_json,
-          checkpoint_json = excluded.checkpoint_json,
-          pages_processed = 0,
-          batches_processed = 0,
-          items_processed = 0,
-          matched_items = 0,
-          total_hits = 0,
-          stored_hits = 0,
-          error = NULL,
-          next_resume_at = NULL,
-          updated_at = excluded.updated_at
-        WHERE provider_corpus_jobs.app_id = excluded.app_id
-          AND provider_corpus_jobs.owner_email = excluded.owner_email
       `,
     args: [
       options.id,
@@ -255,10 +220,6 @@ export async function createProviderCorpusJob(
     ownerEmail: options.ownerEmail,
   });
   if (!job) {
-    // The scoped upsert above only updates a row that already belongs to this
-    // (app_id, owner_email). A null read here means a job with this id exists
-    // under a different owner, so the conflicting insert was skipped rather
-    // than clobbering the other tenant's job.
     throw new Error(
       `Failed to create provider corpus job ${options.id}: a job with this id ` +
         `already exists for a different owner. Use a different jobId.`,
@@ -370,11 +331,6 @@ export async function appendProviderCorpusJobHits(options: {
   if (options.hits.length === 0) return;
   await ensureTables();
   const db = getDbExec();
-  // Insert in chunked multi-row statements rather than one round-trip per hit,
-  // and ignore conflicts on (job_id, hit_index). The runner writes hits before
-  // it advances the stored-hits counter and checkpoint, so a crash between the
-  // two means resume re-fetches the same page and re-appends the same indices;
-  // DO NOTHING makes that retry idempotent instead of a primary-key violation.
   const CHUNK = 100;
   for (let start = 0; start < options.hits.length; start += CHUNK) {
     const chunk = options.hits.slice(start, start + CHUNK);

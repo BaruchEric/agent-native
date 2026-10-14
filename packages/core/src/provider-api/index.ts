@@ -1,6 +1,15 @@
 import { createHash } from "node:crypto";
+
+import { AgentConnectionRequiredError } from "../action.js";
 import {
-  resolveCredential,
+  getWorkspaceConnectionProvider,
+  type WorkspaceConnectionTemplateUse,
+} from "../connections/catalog.js";
+import {
+  assertCredentialCanReachEndpoint,
+  describeCredentialScopeGap,
+  resolveCredentialDetailed,
+  type CredentialEndpointOwner,
   type CredentialContext,
 } from "../credentials/index.js";
 import {
@@ -18,9 +27,15 @@ import {
   listOAuthAccountsByOwner,
   saveOAuthTokens,
 } from "../oauth-tokens/index.js";
+import { resolveSecret } from "../server/credential-provider.js";
+import { resolveGoogleProviderCredentialCandidates } from "../server/google-oauth-credentials.js";
 import { getCredentialContext } from "../server/request-context.js";
+import { mergeDefinitionsById } from "../shared/merge-by-id.js";
 import { resolveWorkspaceConnectionCredentialForApp } from "../workspace-connections/credentials.js";
-import type { WorkspaceConnectionTemplateUse } from "../connections/catalog.js";
+import {
+  resolveWorkspaceConnectionForApp,
+  type WorkspaceConnection,
+} from "../workspace-connections/store.js";
 import type {
   CustomProviderConfig,
   CustomProviderAuthKind,
@@ -45,24 +60,33 @@ export {
   listCustomProviders,
   getCustomProvider,
   validateCustomBaseUrl,
+  assertCanMutateCustomProviderScope,
+  CustomProviderAuthError,
 } from "./custom-registry.js";
 
 export const PROVIDER_API_IDS = [
   "amplitude",
   "apollo",
   "bigquery",
+  "clay",
   "commonroom",
   "dataforseo",
+  "dbt",
   "ga4",
   "gcloud",
   "github",
+  "figma",
+  "fullstory",
   "gmail",
   "gong",
   "google_calendar",
   "google_drive",
+  "google_sheets",
+  "google_slides",
   "granola",
   "grafana",
   "hubspot",
+  "salesforce",
   "jira",
   "mixpanel",
   "notion",
@@ -70,6 +94,7 @@ export const PROVIDER_API_IDS = [
   "prometheus",
   "pylon",
   "sentry",
+  "sigma",
   "slack",
   "stripe",
   "twitter",
@@ -85,31 +110,11 @@ export type ProviderApiMethod =
   | "DELETE"
   | "HEAD";
 
-/** Cursor-pagination config for fetchAllPages. */
 export interface FetchAllPagesConfig {
-  /**
-   * Dot-path into the JSON response body where the next-page cursor lives,
-   * e.g. "meta.next_cursor" or "pagination.next_page_token".
-   */
   cursorPath: string;
-  /**
-   * Query parameter name to pass the cursor on the next request,
-   * e.g. "cursor" or "page_token".
-   */
   cursorParam?: string;
-  /**
-   * Dot-path in the JSON request body to set to the cursor on the next request.
-   * Use this for POST-body pagination, e.g. Gong's top-level `cursor`.
-   */
   cursorBodyPath?: string;
-  /**
-   * Dot-path to the items array in each response body.
-   * When omitted, the whole response body is appended to the items array.
-   */
   itemsPath?: string;
-  /**
-   * Maximum number of pages to fetch. Default 10, max 50.
-   */
   maxPages?: number;
 }
 
@@ -122,20 +127,11 @@ export interface ProviderApiRequestArgs {
   body?: unknown;
   auth?: "default" | "none";
   timeoutMs?: number;
+  signal?: AbortSignal;
   maxBytes?: number;
   connectionId?: string | null;
   accountId?: string | null;
-  /**
-   * When set, write the full response body to this workspace file path instead
-   * of returning it in context. Returns a compact summary with status, bytes,
-   * path, and a preview. Allows up to 20 MB (vs the normal 4 MB context limit).
-   */
   saveToFile?: string;
-  /**
-   * When set, automatically paginate by cursor until the cursor field is empty
-   * or maxPages is reached. Accumulates items from itemsPath (or whole bodies)
-   * across all pages. Combine with saveToFile to write the full dataset.
-   */
   fetchAllPages?: FetchAllPagesConfig;
 }
 
@@ -334,11 +330,46 @@ export type ProviderApiAuthKind =
   | {
       type: "google-service-account";
       scopes: readonly string[];
+      oauthProvider?: string;
+      workspaceProvider?: string;
     }
   | {
       type: "oauth-bearer";
       oauthProvider: string;
       tokenLabel: string;
+      workspaceProvider?: string;
+    }
+  | {
+      type: "oauth-client-credentials";
+      clientIdKey: string;
+      clientSecretKey: string;
+      tokenPath: string;
+      workspaceProvider: string;
+    }
+  | {
+      type: "oauth-bearer-or-api-key-header";
+      oauthProvider: string;
+      tokenLabel: string;
+      key: string;
+      fallbackKeys?: readonly string[];
+      header: string;
+      workspaceProvider: string;
+    }
+  | {
+      type: "oauth-bearer-or-bearer-key";
+      oauthProvider: string;
+      tokenLabel: string;
+      key: string;
+      fallbackKeys?: readonly string[];
+      workspaceProvider: string;
+    }
+  | {
+      type: "oauth-bearer-or-basic";
+      oauthProvider: string;
+      tokenLabel: string;
+      usernameKey: string;
+      passwordKey: string;
+      workspaceProvider: string;
     }
   | {
       type: "prometheus";
@@ -348,18 +379,25 @@ export interface ProviderApiConfig {
   id: ProviderApiId;
   label: string;
   defaultBaseUrl: string;
+  requiresConnectionId?: boolean;
+  requiresWorkspaceConnection?: boolean;
   baseUrlCredentialKey?: string;
+  baseUrlConnectionConfigKey?: string;
+  baseUrlMustMatchAllowedHost?: boolean;
   auth: ProviderApiAuthKind;
   credentialKeys: readonly string[];
   docsUrls: readonly string[];
   specUrls?: readonly string[];
   allowedHostSuffixes?: readonly string[];
+  requireHttps?: boolean;
   defaultHeaders?: Record<string, string>;
   placeholders?: readonly ProviderApiPlaceholder[];
   examples?: readonly ProviderApiExample[];
   notes?: readonly string[];
+  accessErrorGuidance?: string;
   corpusRecipes?: readonly ProviderApiCorpusRecipe[];
   templateUses?: readonly WorkspaceConnectionTemplateUse[];
+  bodyOkField?: string;
 }
 
 export interface ProviderApiPlaceholder {
@@ -372,6 +410,7 @@ export interface ProviderApiExample {
   label: string;
   method: ProviderApiMethod;
   path: string;
+  query?: unknown;
   body?: unknown;
 }
 
@@ -419,6 +458,7 @@ export interface ProviderApiResolvedCredential {
   accountId?: string;
   accountLabel?: string | null;
   scope?: string;
+  scopeId?: string;
 }
 
 export interface ProviderApiCredentialLookupOptions {
@@ -438,20 +478,11 @@ export type ProviderApiCredentialResolver = (
 export interface ProviderApiRuntimeOptions {
   appId: string;
   providerIds?: readonly (ProviderApiId | string)[];
+  providerOverrides?: readonly ProviderApiConfig[];
   localCredentialSource?: string;
   getCredentialContext?: () => CredentialContext | null;
   resolveCredential?: ProviderApiCredentialResolver;
-  /**
-   * Template-specific OAuth token provider overrides for built-in provider API
-   * configs. Use when an app stores a provider's OAuth grant under a narrower
-   * local provider id, e.g. Google Drive scoped to a "google-docs" connection.
-   */
   oauthProviderOverrides?: Record<string, string>;
-  /**
-   * Optional loader for custom providers registered at runtime. When provided,
-   * custom providers are merged with the static built-in registry for catalog,
-   * docs, and request operations. Custom providers cannot shadow built-in ids.
-   */
   getCustomProviders?: () => Promise<CustomProviderConfig[]>;
 }
 
@@ -462,6 +493,11 @@ export interface ProviderApiRuntime {
   ): ReturnType<typeof listProviderApiCatalog> | Promise<unknown[]>;
   fetchDocs(options: ProviderApiDocsOptions): Promise<unknown>;
   executeRequest(args: ProviderApiRequestArgs): Promise<unknown>;
+  resolveOAuthAccessToken(args: {
+    provider: ProviderApiId;
+    connectionId?: string | null;
+    accountId?: string | null;
+  }): Promise<ProviderApiOAuthAccessToken>;
   listGitHubRepositoryFiles(
     args: GitHubRepositoryFileListArgs,
   ): Promise<GitHubRepositoryFileListResult>;
@@ -479,10 +515,23 @@ export interface ProviderApiRuntime {
   ): Promise<GitHubRepositoryFileDeleteResult>;
 }
 
+export interface ProviderApiOAuthAccessToken {
+  accessToken: string;
+  accountId: string | null;
+  accountLabel: string | null;
+  connectionId: string | null;
+  connectionLabel: string | null;
+}
+
 interface ResolvedAuth {
   headers: Record<string, string>;
   credentialSources: Array<Omit<ProviderApiResolvedCredential, "value">>;
   secretValues: string[];
+}
+
+interface ResolvedProviderEndpoint {
+  url: string;
+  owner?: CredentialEndpointOwner;
 }
 
 interface ProviderApiHttpResponse {
@@ -529,14 +578,28 @@ const PERMANENT_GOOGLE_OAUTH_REFRESH_ERRORS = new Set([
   "unauthorized_client",
   "invalid_client",
 ]);
+const GOOGLE_SHEETS_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+const GOOGLE_SHEETS_LEGACY_ALLOWED_SCOPES = new Set([
+  GOOGLE_SHEETS_DRIVE_SCOPE,
+  "openid",
+  "email",
+  "profile",
+  "https://www.googleapis.com/auth/userinfo.email",
+  "https://www.googleapis.com/auth/userinfo.profile",
+]);
+
+function hasIsolatedGoogleSheetsScopes(scopes: ReadonlySet<string>): boolean {
+  return (
+    scopes.has(GOOGLE_SHEETS_DRIVE_SCOPE) &&
+    [...scopes].every((scope) => GOOGLE_SHEETS_LEGACY_ALLOWED_SCOPES.has(scope))
+  );
+}
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_BYTES = 1024 * 1024;
 const MAX_MAX_BYTES = 4 * 1024 * 1024;
-/** When saveToFile is used, allow a much larger per-page response since the
- *  content won't enter the model's context window. */
-const SAVE_TO_FILE_MAX_BYTES = 20 * 1024 * 1024; // 20 MB
+const SAVE_TO_FILE_MAX_BYTES = 20 * 1024 * 1024;
 const FETCH_ALL_PAGES_MAX = 50;
 const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const BLOCKED_OUTBOUND_HEADERS = new Set([
@@ -582,6 +645,55 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
       },
     ],
   },
+  sigma: {
+    id: "sigma",
+    label: "Sigma REST API",
+    defaultBaseUrl: "https://aws-api.sigmacomputing.com",
+    baseUrlCredentialKey: "SIGMA_BASE_URL",
+    baseUrlMustMatchAllowedHost: true,
+    requiresConnectionId: true,
+    requireHttps: true,
+    auth: {
+      type: "oauth-client-credentials",
+      clientIdKey: "SIGMA_CLIENT_ID",
+      clientSecretKey: "SIGMA_CLIENT_SECRET",
+      tokenPath: "/v2/auth/token",
+      workspaceProvider: "sigma",
+    },
+    credentialKeys: [
+      "SIGMA_CLIENT_ID",
+      "SIGMA_CLIENT_SECRET",
+      "SIGMA_BASE_URL",
+    ],
+    docsUrls: [
+      "https://help.sigmacomputing.com/reference/get-started-sigma-api",
+      "https://help.sigmacomputing.com/reference/post-token",
+      "https://help.sigmacomputing.com/reference/list-workbooks",
+      "https://help.sigmacomputing.com/reference/list-workbook-elements",
+      "https://help.sigmacomputing.com/reference/list-workbook-queries",
+    ],
+    specUrls: [
+      "https://help.sigmacomputing.com/openapi/openapi/sigma-rest-api.json",
+    ],
+    allowedHostSuffixes: ["sigmacomputing.com"],
+    templateUses: ["analytics"],
+    examples: [
+      { label: "List workbooks", method: "GET", path: "/v2/workbooks" },
+      {
+        label: "List workbook elements",
+        method: "GET",
+        path: "/v2/workbooks/{workbookId}/elements",
+      },
+      {
+        label: "List workbook queries",
+        method: "GET",
+        path: "/v2/workbooks/{workbookId}/queries",
+      },
+    ],
+    notes: [
+      "Uses OAuth client-credentials exchange through a Sigma workspace connection. Sigma is optional; use it for reviewed examples, and use dbt as the canonical schema and grain source.",
+    ],
+  },
   apollo: {
     id: "apollo",
     label: "Apollo",
@@ -613,10 +725,12 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
         "https://www.googleapis.com/auth/cloud-platform",
         "https://www.googleapis.com/auth/bigquery",
       ],
+      oauthProvider: "google",
+      workspaceProvider: "bigquery",
     },
     credentialKeys: [
-      "GOOGLE_APPLICATION_CREDENTIALS_JSON",
       "BIGQUERY_PROJECT_ID",
+      "GOOGLE_APPLICATION_CREDENTIALS_JSON",
     ],
     docsUrls: ["https://cloud.google.com/bigquery/docs/reference/rest"],
     specUrls: ["https://bigquery.googleapis.com/$discovery/rest?version=v2"],
@@ -641,6 +755,56 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
         path: "/projects/{projectId}/queries",
         body: { query: "SELECT 1", useLegacySql: false },
       },
+    ],
+  },
+  clay: {
+    id: "clay",
+    label: "Clay Public API",
+    defaultBaseUrl: "https://api.clay.com/public/v0",
+    auth: {
+      type: "api-key-header",
+      key: "CLAY_PUBLIC_API_KEY",
+      header: "clay-api-key",
+    },
+    credentialKeys: ["CLAY_PUBLIC_API_KEY"],
+    docsUrls: [
+      "https://developers.clay.com/llms.txt",
+      "https://developers.clay.com/public-api/authentication",
+      "https://developers.clay.com/concepts/execution-model.md",
+    ],
+    specUrls: ["https://developers.clay.com/openapi.json"],
+    templateUses: ["analytics"],
+    examples: [
+      {
+        label: "Get authenticated user and workspace",
+        method: "GET",
+        path: "/me",
+      },
+      {
+        label: "List people search filter fields",
+        method: "GET",
+        path: "/search/filters-mode/fields",
+        query: { source_type: "people" },
+      },
+      {
+        label: "Create a people search",
+        method: "POST",
+        path: "/search/filters-mode",
+        body: {
+          source_type: "people",
+          filters: {
+            job_title_keywords: ["software engineer"],
+            location_cities_include: ["New York"],
+          },
+        },
+      },
+    ],
+    notes: [
+      "Clay is a GTM provider API capability, not a messaging channel.",
+      "The Public API key is tied to a Clay user and workspace. It is separate from the optional local clay CLI/MCP session created by clay login; hosted Agent-Native access does not require that plugin session.",
+      "Search results use a stateful forward-only iterator: repeat POST /search/filters-mode/{search_id}/run while has_more is true.",
+      "The Tables API is query-only, requires an Enterprise plan, and needs a known table id; the Public API does not list, create, or update tables.",
+      "Routine runs are asynchronous. Start a run, then poll the documented results endpoint or use a verified completion webhook.",
     ],
   },
   commonroom: {
@@ -677,6 +841,38 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
           { keyword: "builder.io", location_code: 2840, language_code: "en" },
         ],
       },
+    ],
+  },
+  dbt: {
+    id: "dbt",
+    label: "dbt Semantic Layer",
+    defaultBaseUrl: "https://wg204.semantic-layer.us1.dbt.com/api/graphql",
+    baseUrlConnectionConfigKey: "semanticLayerBaseUrl",
+    baseUrlMustMatchAllowedHost: true,
+    requiresConnectionId: true,
+    requireHttps: true,
+    auth: {
+      type: "bearer",
+      keys: ["DBT_SEMANTIC_LAYER_TOKEN"],
+      workspaceProvider: "dbt",
+    },
+    credentialKeys: ["DBT_SEMANTIC_LAYER_TOKEN"],
+    docsUrls: ["https://docs.getdbt.com/docs/dbt-apis/sl-graphql"],
+    allowedHostSuffixes: ["dbt.com", "getdbt.com"],
+    templateUses: ["analytics"],
+    examples: [
+      {
+        label: "List metric metadata",
+        method: "POST",
+        path: "/api/graphql",
+        body: {
+          query:
+            "query Metrics($environmentId: BigInt!, $search: String) { metricsPaginated(environmentId: $environmentId, search: $search, pageNum: 1, pageSize: 20) { items { name description type dimensions { name description type } queryableGranularities } totalItems totalPages } }",
+        },
+      },
+    ],
+    notes: [
+      "Use the Semantic Layer only for owner-defined dbt metrics. Sigma and Amplitude are examples and cross-checks, not metric definitions.",
     ],
   },
   ga4: {
@@ -756,8 +952,10 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
     label: "GitHub REST API",
     defaultBaseUrl: "https://api.github.com",
     auth: {
-      type: "bearer",
-      keys: ["GITHUB_TOKEN"],
+      type: "oauth-bearer-or-bearer-key",
+      oauthProvider: "github",
+      tokenLabel: "GitHub OAuth token",
+      key: "GITHUB_TOKEN",
       workspaceProvider: "github",
     },
     credentialKeys: ["GITHUB_TOKEN"],
@@ -775,6 +973,90 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
       { label: "Search issues", method: "GET", path: "/search/issues" },
     ],
   },
+  figma: {
+    id: "figma",
+    label: "Figma REST API",
+    defaultBaseUrl: "https://api.figma.com/v1",
+    auth: {
+      type: "oauth-bearer-or-api-key-header",
+      oauthProvider: "figma",
+      tokenLabel: "Figma OAuth token",
+      key: "FIGMA_ACCESS_TOKEN",
+      header: "X-Figma-Token",
+      workspaceProvider: "figma",
+    },
+    credentialKeys: ["FIGMA_ACCESS_TOKEN"],
+    docsUrls: [
+      "https://developers.figma.com/docs/rest-api/",
+      "https://developers.figma.com/docs/rest-api/scopes/",
+      "https://developers.figma.com/docs/rest-api/file-endpoints/",
+    ],
+    allowedHostSuffixes: ["figma.com"],
+    templateUses: ["design"],
+    examples: [
+      {
+        label: "Get file document",
+        method: "GET",
+        path: "/files/{fileKey}",
+      },
+      {
+        label: "Get exact file nodes",
+        method: "GET",
+        path: "/files/{fileKey}/nodes",
+        query: { ids: "1:2" },
+      },
+      {
+        label: "List file components",
+        method: "GET",
+        path: "/files/{fileKey}/components",
+      },
+      {
+        label: "Render file nodes",
+        method: "GET",
+        path: "/images/{fileKey}",
+        query: { ids: "1:2", format: "svg" },
+      },
+    ],
+    notes: [
+      "Personal access tokens should include current_user:read for validation and file_content:read for file/node imports. Add library_content:read for file libraries, team_library_content:read for team libraries, or library_assets:read for individual published assets only when needed.",
+      "Enterprise Variables endpoints require file_variables:read; writes additionally require file_variables:write, a Full seat, and edit access.",
+      "The REST API cannot create arbitrary canvas frames or layers. Use Figma's official OAuth MCP write tools when connected, or export a Design selection as Figma-compatible SVG for visual handoff.",
+    ],
+  },
+  fullstory: {
+    id: "fullstory",
+    label: "FullStory Server API",
+    defaultBaseUrl: "https://api.fullstory.com",
+    auth: {
+      type: "basic-raw",
+      key: "FULLSTORY_API_KEY",
+    },
+    credentialKeys: ["FULLSTORY_API_KEY"],
+    docsUrls: [
+      "https://developer.fullstory.com/server/authentication/",
+      "https://developer.fullstory.com/server/sessions/introduction/",
+      "https://developer.fullstory.com/server/sessions/get-session-events/",
+    ],
+    allowedHostSuffixes: ["fullstory.com"],
+    templateUses: ["analytics"],
+    examples: [
+      {
+        label: "List sessions for a user",
+        method: "GET",
+        path: "/sessions/v2",
+        query: { email: "<user-email>", limit: 20 },
+      },
+      {
+        label: "Get session events",
+        method: "GET",
+        path: "/v2/sessions/{sessionId}/events",
+      },
+    ],
+    notes: [
+      "FullStory Server API uses Basic <API_KEY> authentication. Architect access is required for user-data reads and exports.",
+      "Use the connected FullStory MCP for natural-language metrics, session replay, screenshots, and accessibility trees; this API fallback is for structured reads and event payloads.",
+    ],
+  },
   gmail: {
     id: "gmail",
     label: "Gmail API",
@@ -783,6 +1065,7 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
       type: "oauth-bearer",
       oauthProvider: "google",
       tokenLabel: "Google OAuth token",
+      workspaceProvider: "gmail",
     },
     credentialKeys: ["GOOGLE_OAUTH_ACCOUNT"],
     docsUrls: ["https://developers.google.com/gmail/api/reference/rest"],
@@ -844,9 +1127,38 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
     ],
     notes: [
       "For broad corpus work, call /calls/extensive with provider-api-request and stageAs/saveToFile. Gong returns the next cursor at records.cursor and expects the next cursor in the POST body at cursor, so use pagination { nextCursorPath: 'records.cursor', cursorBodyPath: 'cursor' } for stageAs or fetchAllPages { cursorPath: 'records.cursor', cursorBodyPath: 'cursor' } for saveToFile.",
-      "Batch transcripts with POST /calls/transcript and body { filter: { callIds: [...] } } after narrowing or staging call ids.",
+      "The public Gong REST API does not expose an arbitrary transcript-text filter. Use configured keyword tracker results from /calls/extensive when they cover the requested term; otherwise batch transcripts with POST /calls/transcript and body { filter: { callIds: [...] } } after narrowing or staging call ids.",
     ],
     corpusRecipes: [
+      {
+        label: "Stage Gong calls with configured keyword tracker hits",
+        useWhen:
+          "Use when the requested term or phrase already exists as a Gong keyword tracker and the answer can use tracker matches instead of arbitrary transcript-text search.",
+        workflow: [
+          "Call /calls/extensive with the narrowest date, workspace, or owner filters available and contentSelector.exposedFields.content.trackers = true.",
+          "Stage the calls pages with provider-api-request stageAs or saveToFile; use the POST-body cursor at records.cursor for complete pagination.",
+          "Use query-staged-dataset or a Data Program to flatten content.trackers, filter by tracker id/name/phrase, and aggregate counts or occurrences.",
+          "Tracker results are provider-indexed evidence for configured trackers, not an arbitrary transcript search. For an unconfigured term, use Gong native Search when connected or the transcript batch recipe below.",
+        ],
+        request: {
+          method: "POST",
+          path: "/calls/extensive",
+          body: {
+            filter: { fromDateTime: "<iso-date-time>" },
+            contentSelector: {
+              exposedFields: {
+                content: { trackers: true, trackerOccurrences: true },
+              },
+            },
+          },
+        },
+        pagination: {
+          itemsPath: "calls",
+          nextCursorPath: "records.cursor",
+          cursorBodyPath: "cursor",
+          maxPages: 200,
+        },
+      },
       {
         label: "Batch-search Gong call transcripts from staged call ids",
         useWhen:
@@ -908,6 +1220,7 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
       type: "oauth-bearer",
       oauthProvider: "google",
       tokenLabel: "Google OAuth token",
+      workspaceProvider: "google_calendar",
     },
     credentialKeys: ["GOOGLE_OAUTH_ACCOUNT"],
     docsUrls: ["https://developers.google.com/calendar/api/v3/reference"],
@@ -938,17 +1251,78 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
       type: "oauth-bearer",
       oauthProvider: "google",
       tokenLabel: "Google OAuth token",
+      workspaceProvider: "google_drive",
     },
     credentialKeys: ["GOOGLE_OAUTH_ACCOUNT"],
     docsUrls: ["https://developers.google.com/drive/api/reference/rest/v3"],
     specUrls: ["https://www.googleapis.com/discovery/v1/apis/drive/v3/rest"],
     allowedHostSuffixes: ["googleapis.com"],
-    templateUses: ["brain", "content", "slides", "dispatch"],
+    templateUses: ["brain", "content", "slides", "dispatch", "analytics"],
     examples: [
       { label: "List files", method: "GET", path: "/files" },
       { label: "Get file metadata", method: "GET", path: "/files/{fileId}" },
     ],
     notes: [
+      "Uses the current user's stored Google OAuth account. Pass accountId when the user has multiple Google accounts connected.",
+    ],
+  },
+  google_sheets: {
+    id: "google_sheets",
+    label: "Google Sheets API",
+    defaultBaseUrl: "https://sheets.googleapis.com/v4",
+    requiresWorkspaceConnection: true,
+    auth: {
+      type: "oauth-bearer",
+      oauthProvider: "google_sheets",
+      tokenLabel: "Google OAuth token",
+      workspaceProvider: "google_sheets",
+    },
+    credentialKeys: ["GOOGLE_OAUTH_ACCOUNT"],
+    docsUrls: [
+      "https://developers.google.com/workspace/sheets/api/reference/rest",
+    ],
+    specUrls: ["https://sheets.googleapis.com/$discovery/rest?version=v4"],
+    templateUses: ["analytics"],
+    examples: [
+      { label: "Create a spreadsheet", method: "POST", path: "/spreadsheets" },
+      {
+        label: "Write spreadsheet values",
+        method: "PUT",
+        path: "/spreadsheets/{spreadsheetId}/values/{range}",
+      },
+    ],
+    notes: [
+      "Uses the current user's Google Sheets connection and the non-sensitive drive.file scope, limited to files created by this app or explicitly selected by the user.",
+      "Google Sheets authorization is isolated from scopes previously granted to other Google integrations.",
+      "Pass accountId when the user has multiple Google accounts connected.",
+    ],
+  },
+  google_slides: {
+    id: "google_slides",
+    label: "Google Slides API",
+    defaultBaseUrl: "https://slides.googleapis.com/v1",
+    auth: {
+      type: "oauth-bearer",
+      oauthProvider: "google",
+      tokenLabel: "Google OAuth token",
+      workspaceProvider: "google_drive",
+    },
+    credentialKeys: ["GOOGLE_OAUTH_ACCOUNT"],
+    docsUrls: [
+      "https://developers.google.com/workspace/slides/api/reference/rest",
+    ],
+    specUrls: ["https://slides.googleapis.com/$discovery/rest?version=v1"],
+    allowedHostSuffixes: ["googleapis.com"],
+    templateUses: ["brain", "content", "slides", "dispatch"],
+    examples: [
+      {
+        label: "Get presentation with slides and speaker notes",
+        method: "GET",
+        path: "/presentations/{presentationId}",
+      },
+    ],
+    notes: [
+      "Creative context imports use the non-sensitive drive.file scope. A user must choose each presentation through Google Picker before the Slides API can read it; unrestricted Drive-wide discovery is intentionally unavailable.",
       "Uses the current user's stored Google OAuth account. Pass accountId when the user has multiple Google accounts connected.",
     ],
   },
@@ -990,8 +1364,11 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
     label: "HubSpot",
     defaultBaseUrl: "https://api.hubapi.com",
     auth: {
-      type: "bearer",
-      keys: ["HUBSPOT_PRIVATE_APP_TOKEN", "HUBSPOT_ACCESS_TOKEN"],
+      type: "oauth-bearer-or-bearer-key",
+      oauthProvider: "hubspot",
+      tokenLabel: "HubSpot OAuth token",
+      key: "HUBSPOT_PRIVATE_APP_TOKEN",
+      fallbackKeys: ["HUBSPOT_PRIVATE_APP_TOKEN", "HUBSPOT_ACCESS_TOKEN"],
       workspaceProvider: "hubspot",
     },
     credentialKeys: ["HUBSPOT_PRIVATE_APP_TOKEN", "HUBSPOT_ACCESS_TOKEN"],
@@ -1025,15 +1402,55 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
       },
     ],
   },
+  salesforce: {
+    id: "salesforce",
+    label: "Salesforce",
+    defaultBaseUrl: "https://login.salesforce.com",
+    requiresConnectionId: true,
+    auth: {
+      type: "oauth-bearer",
+      oauthProvider: "salesforce",
+      tokenLabel: "Salesforce OAuth token",
+      workspaceProvider: "salesforce",
+    },
+    credentialKeys: ["SALESFORCE_OAUTH_ACCOUNT"],
+    docsUrls: [
+      "https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/",
+    ],
+    allowedHostSuffixes: [],
+    templateUses: ["analytics", "brain", "crm", "dispatch"],
+    examples: [
+      {
+        label: "List recent Accounts",
+        method: "GET",
+        path: "/services/data/v60.0/sobjects/Account",
+      },
+      {
+        label: "Query Opportunity records with SOQL",
+        method: "GET",
+        path: "/services/data/v60.0/query",
+        query: {
+          q: "SELECT Id, Name, StageName, Amount, CloseDate FROM Opportunity LIMIT 100",
+        },
+      },
+    ],
+    notes: [
+      "Workspace OAuth stores the Salesforce instance URL on the connection. Requests with a connectionId use that instance instead of the login host.",
+      "CRM templates own object allow-lists, field projections, and API-version selection.",
+    ],
+  },
   jira: {
     id: "jira",
     label: "Jira Cloud",
     defaultBaseUrl: "https://example.atlassian.net",
     baseUrlCredentialKey: "JIRA_BASE_URL",
     auth: {
-      type: "basic",
+      type: "oauth-bearer-or-basic",
+      oauthProvider: "jira",
+      tokenLabel: "Jira",
       usernameKey: "JIRA_USER_EMAIL",
       passwordKey: "JIRA_API_TOKEN",
+      workspaceProvider: "jira",
     },
     credentialKeys: ["JIRA_BASE_URL", "JIRA_USER_EMAIL", "JIRA_API_TOKEN"],
     docsUrls: [
@@ -1086,15 +1503,51 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
     label: "Notion",
     defaultBaseUrl: "https://api.notion.com/v1",
     auth: {
-      type: "bearer",
-      keys: ["NOTION_API_KEY"],
+      type: "oauth-bearer-or-bearer-key",
+      oauthProvider: "notion",
+      tokenLabel: "Notion OAuth token",
+      key: "NOTION_API_KEY",
       workspaceProvider: "notion",
     },
     credentialKeys: ["NOTION_API_KEY"],
     docsUrls: ["https://developers.notion.com/reference/intro"],
-    defaultHeaders: { "Notion-Version": "2022-06-28" },
+    defaultHeaders: { "Notion-Version": "2026-03-11" },
     templateUses: ["analytics", "brain", "content", "dispatch"],
     examples: [{ label: "Search", method: "POST", path: "/search", body: {} }],
+    notes: [
+      "The name GET /users/me returns is the label whoever minted the token typed into Notion, so it often names an unrelated product or team. Call it the Notion-side integration label and never restate it as the workspace, app, or product the user is currently in.",
+    ],
+    accessErrorGuidance:
+      "Notion 401/403/404 on a specific page or database usually means that object was never shared with the integration, not that the id is wrong or the key is invalid. Fix: open the page or database in Notion, then ••• → Connections → add the integration. When naming the integration, describe it as the Notion-side integration label from GET /users/me and note that it may not match this app or workspace.",
+    corpusRecipes: [
+      {
+        label: "Search a Notion data source with complete cursor coverage",
+        useWhen:
+          "Use for coverage-sensitive searches across one known Notion data source's page properties. This does not search page block bodies.",
+        workflow: [
+          "Resolve the exact data source id and apply the narrowest provider-side filter and filter_properties projection first.",
+          "Start provider-corpus-job with mode=paginated-search and pass next_cursor back as start_cursor in the POST body.",
+          "Search only the returned properties and report the 10,000-result API ceiling plus any incomplete request_status.",
+          "For page body text, stage page ids and fetch block children through a separate bounded data program; property search is not body search.",
+        ],
+        request: {
+          method: "POST",
+          path: "/data_sources/<data-source-id>/query",
+          body: { page_size: 100 },
+        },
+        pagination: {
+          itemsPath: "results",
+          nextCursorPath: "next_cursor",
+          cursorBodyPath: "start_cursor",
+          maxPages: 100,
+        },
+        search: {
+          textPaths: ["properties"],
+          idPaths: ["id"],
+          metadataPaths: ["id", "url", "created_time", "last_edited_time"],
+        },
+      },
+    ],
   },
   posthog: {
     id: "posthog",
@@ -1117,10 +1570,20 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
     ],
     examples: [
       {
-        label: "List events",
-        method: "GET",
-        path: "/api/projects/{projectId}/events/",
+        label: "Aggregate events with HogQL",
+        method: "POST",
+        path: "/api/projects/{projectId}/query/",
+        body: {
+          query: {
+            kind: "HogQLQuery",
+            query:
+              "SELECT event, count() AS events FROM events WHERE timestamp >= now() - INTERVAL 7 DAY GROUP BY event ORDER BY events DESC LIMIT 100",
+          },
+        },
       },
+    ],
+    notes: [
+      "Prefer the query endpoint with a bounded HogQL projection or server-side aggregation over paging raw events into the agent context.",
     ],
   },
   prometheus: {
@@ -1163,8 +1626,12 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
     label: "Sentry",
     defaultBaseUrl: "https://sentry.io/api/0",
     auth: {
-      type: "bearer",
-      keys: ["SENTRY_AUTH_TOKEN", "SENTRY_SERVER_TOKEN"],
+      type: "oauth-bearer-or-bearer-key",
+      oauthProvider: "sentry",
+      tokenLabel: "Sentry OAuth token",
+      key: "SENTRY_AUTH_TOKEN",
+      fallbackKeys: ["SENTRY_AUTH_TOKEN", "SENTRY_SERVER_TOKEN"],
+      workspaceProvider: "sentry",
     },
     credentialKeys: [
       "SENTRY_AUTH_TOKEN",
@@ -1192,6 +1659,7 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
     id: "slack",
     label: "Slack Web API",
     defaultBaseUrl: "https://slack.com/api",
+    bodyOkField: "ok",
     auth: {
       type: "bearer",
       keys: ["SLACK_BOT_TOKEN"],
@@ -1206,6 +1674,39 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
     examples: [
       { label: "Search messages", method: "GET", path: "/search.messages" },
       { label: "Post message", method: "POST", path: "/chat.postMessage" },
+    ],
+    notes: [
+      "Bot-token reads must not call conversations.join implicitly. A bot can read only conversations it is already a member of with the required history scope.",
+      "search.messages requires a compatible user token; do not assume a bot token can use it. Use conversations.history for channel-scoped bot reads.",
+    ],
+    corpusRecipes: [
+      {
+        label: "Search complete Slack channel history",
+        useWhen:
+          "Use for all-message, mention, phrase, or absence-sensitive searches in one known Slack conversation without one agent turn per cursor page.",
+        workflow: [
+          "Resolve the exact channel id without joining or mutating membership.",
+          "Start provider-corpus-job with mode=paginated-search against conversations.history, bounded by oldest/latest when possible.",
+          "Pass response_metadata.next_cursor back as cursor and let quota_wait pause/resume rate-limited installations.",
+          "Report channel id, time bounds, pages, messages searched, matches, and is_limited or access gaps.",
+        ],
+        request: {
+          method: "GET",
+          path: "/conversations.history",
+          query: { channel: "<channel-id>" },
+        },
+        pagination: {
+          itemsPath: "messages",
+          nextCursorPath: "response_metadata.next_cursor",
+          cursorParam: "cursor",
+          maxPages: 500,
+        },
+        search: {
+          textPaths: ["text", "blocks", "attachments"],
+          idPaths: ["ts", "client_msg_id"],
+          metadataPaths: ["ts", "user", "thread_ts", "type", "subtype"],
+        },
+      },
     ],
   },
   stripe: {
@@ -1248,10 +1749,26 @@ const PROVIDER_CONFIGS: Record<ProviderApiId, ProviderApiConfig> = {
 
 export function getProviderApiConfig(
   provider: ProviderApiId | string,
+  overrides: readonly ProviderApiConfig[] = [],
 ): ProviderApiConfig {
-  const config = PROVIDER_CONFIGS[provider as ProviderApiId];
+  const config = mergeProviderApiConfigs(overrides).find(
+    (candidate) => candidate.id === provider,
+  );
   if (!config) throw new Error(`Unsupported provider API: ${provider}`);
   return config;
+}
+
+export function mergeProviderApiConfigs(
+  overrides: readonly ProviderApiConfig[] = [],
+): ProviderApiConfig[] {
+  for (const override of overrides) {
+    if (!isProviderApiId(override.id)) {
+      throw new Error(
+        `Provider API overrides must replace a built-in id: ${override.id}`,
+      );
+    }
+  }
+  return mergeDefinitionsById(Object.values(PROVIDER_CONFIGS), overrides);
 }
 
 export function isProviderApiId(provider: string): provider is ProviderApiId {
@@ -1260,27 +1777,37 @@ export function isProviderApiId(provider: string): provider is ProviderApiId {
 
 export function listProviderApiIdsForTemplateUse(
   templateUse: WorkspaceConnectionTemplateUse,
+  overrides: readonly ProviderApiConfig[] = [],
 ): ProviderApiId[] {
+  const configs = new Map(
+    mergeProviderApiConfigs(overrides).map((config) => [config.id, config]),
+  );
   return PROVIDER_API_IDS.filter((id) =>
-    (PROVIDER_CONFIGS[id].templateUses ?? []).includes(templateUse),
+    (configs.get(id)?.templateUses ?? []).includes(templateUse),
   );
 }
 
 export function listProviderApiCatalog(
   provider?: ProviderApiId | string,
-  options: { providerIds?: readonly (ProviderApiId | string)[] } = {},
+  options: {
+    providerIds?: readonly (ProviderApiId | string)[];
+    providerOverrides?: readonly ProviderApiConfig[];
+  } = {},
 ) {
   const providerIds = normalizeProviderIds(options.providerIds);
   if (provider) {
     assertProviderAllowed(provider, providerIds);
   }
   const configs = provider
-    ? [getProviderApiConfig(provider)]
-    : providerIds.map((id) => getProviderApiConfig(id));
+    ? [getProviderApiConfig(provider, options.providerOverrides)]
+    : providerIds.map((id) =>
+        getProviderApiConfig(id, options.providerOverrides),
+      );
   return configs.map((config) => ({
     id: config.id,
     label: config.label,
     defaultBaseUrl: config.defaultBaseUrl,
+    requiresConnectionId: config.requiresConnectionId ?? false,
     baseUrlCredentialKey: config.baseUrlCredentialKey ?? null,
     auth: describeAuth(config.auth),
     credentialKeys: config.credentialKeys,
@@ -1291,6 +1818,7 @@ export function listProviderApiCatalog(
     defaultHeaders: config.defaultHeaders ?? {},
     examples: config.examples ?? [],
     notes: config.notes ?? [],
+    accessErrorGuidance: config.accessErrorGuidance ?? null,
     corpusRecipes: config.corpusRecipes ?? [],
     templateUses: config.templateUses ?? [],
   }));
@@ -1299,6 +1827,7 @@ export function listProviderApiCatalog(
 export function createProviderApiRuntime(
   options: ProviderApiRuntimeOptions,
 ): ProviderApiRuntime {
+  mergeProviderApiConfigs(options.providerOverrides);
   const providerIds = normalizeProviderIds(options.providerIds);
   const runtimeOptions: Required<
     Pick<ProviderApiRuntimeOptions, "appId" | "localCredentialSource">
@@ -1313,12 +1842,14 @@ export function createProviderApiRuntime(
     listCatalog: (provider) =>
       listProviderApiCatalogWithCustom(
         provider,
-        { providerIds },
+        { providerIds, providerOverrides: options.providerOverrides },
         runtimeOptions,
       ),
     fetchDocs: (docsOptions) =>
       fetchProviderApiDocs(docsOptions, runtimeOptions),
     executeRequest: (args) => executeProviderApiRequest(args, runtimeOptions),
+    resolveOAuthAccessToken: (args) =>
+      resolveProviderApiOAuthAccessToken(args, runtimeOptions),
     listGitHubRepositoryFiles: (args) =>
       listGitHubRepositoryFiles(args, runtimeOptions),
     searchGitHubRepositoryFiles: (args) =>
@@ -1338,9 +1869,8 @@ export async function fetchProviderApiDocs(
 ) {
   await assertProviderAllowedAsync(options.provider, runtime);
 
-  // Resolve config — may be a built-in or a custom provider.
   const builtIn = isProviderApiId(options.provider)
-    ? getProviderApiConfig(options.provider)
+    ? getProviderApiConfig(options.provider, runtime.providerOverrides)
     : null;
   const customConfig = builtIn
     ? null
@@ -1354,7 +1884,9 @@ export async function fetchProviderApiDocs(
   }
 
   const catalog = builtIn
-    ? listProviderApiCatalog(options.provider)[0]
+    ? listProviderApiCatalog(options.provider, {
+        providerOverrides: runtime.providerOverrides,
+      })[0]
     : customProviderToCatalogEntry(customConfig!);
 
   if (!options.url) {
@@ -1366,8 +1898,6 @@ export async function fetchProviderApiDocs(
     };
   }
 
-  // Open docs fetching: allow ANY public https/http URL.
-  // The SSRF guard still applies — private/internal addresses are blocked.
   let url: URL;
   try {
     url = new URL(options.url);
@@ -1389,7 +1919,7 @@ export async function fetchProviderApiDocs(
   const responseBody =
     response.text ??
     (response.json !== undefined ? JSON.stringify(response.json, null, 2) : "");
-  const content = processWebContent({
+  const content = await processWebContent({
     url: url.href,
     body: responseBody,
     contentType: response.contentType,
@@ -1430,9 +1960,8 @@ export async function executeProviderApiRequest(
 ) {
   await assertProviderAllowedAsync(args.provider, runtime);
 
-  // Check whether this is a built-in or custom provider.
   const builtIn = isProviderApiId(args.provider)
-    ? getProviderApiConfig(args.provider)
+    ? getProviderApiConfig(args.provider, runtime.providerOverrides)
     : null;
   const customConfig = builtIn
     ? null
@@ -1449,18 +1978,22 @@ export async function executeProviderApiRequest(
     return executeCustomProviderApiRequest(args, customConfig, runtime);
   }
 
-  // --- built-in provider path (original code) ---
   const config = builtIn!;
+  if (config.requiresConnectionId && !args.connectionId?.trim()) {
+    throw new Error(
+      `${config.label} Provider API requests require a workspace connectionId.`,
+    );
+  }
   const ctx = requireRuntimeCredentialContext(
     runtime,
     config.credentialKeys[0] ?? config.id,
   );
-  const baseUrl = await resolveBaseUrl(config, runtime, ctx, args);
+  const endpoint = await resolveBaseUrl(config, runtime, ctx, args);
   const placeholders = await resolvePlaceholders(config, runtime, ctx, args);
   const method = normalizeMethod(args.method);
   const url = buildProviderUrl({
     config,
-    baseUrl,
+    baseUrl: endpoint.url,
     rawPath: substituteString(args.path, placeholders),
     query: substituteUnknown(args.query, placeholders),
   });
@@ -1471,7 +2004,16 @@ export async function executeProviderApiRequest(
   const auth =
     args.auth === "none"
       ? emptyAuth()
-      : await resolveAuth(config, runtime, ctx, args);
+      : await resolveAuth(config, runtime, ctx, args, endpoint);
+  if (endpoint.owner) {
+    for (const credential of auth.credentialSources) {
+      assertCredentialCanReachEndpoint(
+        endpoint.owner,
+        credential,
+        credential.key,
+      );
+    }
+  }
   const extraHeaders = substituteUnknown(args.headers ?? {}, placeholders);
   const headers = sanitizeOutboundHeaders({
     ...(config.defaultHeaders ?? {}),
@@ -1479,7 +2021,6 @@ export async function executeProviderApiRequest(
     ...auth.headers,
   });
 
-  // Allow a much larger maxBytes ceiling when writing to a workspace file.
   const effectiveMaxBytes = args.saveToFile
     ? SAVE_TO_FILE_MAX_BYTES
     : clampMaxBytes(args.maxBytes);
@@ -1492,43 +2033,50 @@ export async function executeProviderApiRequest(
     accountId: args.accountId,
   });
 
-  // --- fetchAllPages mode ---
   if (args.fetchAllPages) {
     const pageCfg = args.fetchAllPages;
-    const { items, pageCount, lastStatus, lastContentType } =
-      await fetchAllPages(pageCfg, async (extra) => {
-        const queryWithCursor = extra?.query
-          ? mergeQueryObjects(
-              substituteUnknown(args.query, placeholders),
-              extra.query,
-            )
-          : substituteUnknown(args.query, placeholders);
-        const pageUrl = buildProviderUrl({
-          config,
-          baseUrl,
-          rawPath: substituteString(args.path, placeholders),
-          query: queryWithCursor,
-        });
-        const bodyWithCursor = extra?.bodyCursor
-          ? setValueAtPath(
-              substituteUnknown(args.body, placeholders),
-              extra.bodyCursor.path,
-              extra.bodyCursor.value,
-            )
-          : substituteUnknown(args.body, placeholders);
-        const pageBody = prepareBody(bodyWithCursor, { ...headers });
-        const requestKey = createProviderRequestDedupeKey({
-          method,
-          url: pageUrl.href,
-          body: pageBody,
-          headers,
-        });
-        const resp = await fetchWithTimeout(pageUrl.href, {
+    const {
+      items,
+      pageCount,
+      lastStatus,
+      lastContentType,
+      truncated,
+      nextCursor,
+    } = await fetchAllPages(pageCfg, async (extra) => {
+      const queryWithCursor = extra?.query
+        ? mergeQueryObjects(
+            substituteUnknown(args.query, placeholders),
+            extra.query,
+          )
+        : substituteUnknown(args.query, placeholders);
+      const pageUrl = buildProviderUrl({
+        config,
+        baseUrl: endpoint.url,
+        rawPath: substituteString(args.path, placeholders),
+        query: queryWithCursor,
+      });
+      const bodyWithCursor = extra?.bodyCursor
+        ? setValueAtPath(
+            substituteUnknown(args.body, placeholders),
+            extra.bodyCursor.path,
+            extra.bodyCursor.value,
+          )
+        : substituteUnknown(args.body, placeholders);
+      const pageBody = prepareBody(bodyWithCursor, headers);
+      const requestKey = createProviderRequestDedupeKey({
+        method,
+        url: pageUrl.href,
+        body: pageBody,
+        headers,
+      });
+      const resp = applyBodyEnvelopeOutcome(
+        await fetchWithTimeout(pageUrl.href, {
           method,
           headers,
           body: pageBody,
           maxBytes: effectiveMaxBytes,
           timeoutMs: clampTimeout(args.timeoutMs),
+          signal: args.signal,
           secretValues: auth.secretValues,
           quota: {
             identity: quotaIdentity,
@@ -1539,16 +2087,18 @@ export async function executeProviderApiRequest(
             ),
             requestKey,
           },
-        });
-        return {
-          text:
-            resp.text ??
-            (resp.json !== undefined ? JSON.stringify(resp.json) : ""),
-          contentType: resp.contentType,
-          status: resp.status,
-          ok: resp.ok,
-        };
-      });
+        }),
+        config,
+      );
+      return {
+        text:
+          resp.text ??
+          (resp.json !== undefined ? JSON.stringify(resp.json) : ""),
+        contentType: resp.contentType,
+        status: resp.status,
+        ok: resp.ok,
+      };
+    });
 
     const allItemsJson = JSON.stringify(items, null, 2);
     const metadata = {
@@ -1556,6 +2106,8 @@ export async function executeProviderApiRequest(
       pagesRead: pageCount,
       totalItems: Array.isArray(items) ? items.length : 0,
       lastStatus,
+      truncated,
+      nextCursor,
     };
 
     if (args.saveToFile) {
@@ -1571,7 +2123,6 @@ export async function executeProviderApiRequest(
     return { ...metadata, items };
   }
 
-  // --- Single request ---
   const body = prepareBody(substituteUnknown(args.body, placeholders), headers);
   const requestKey = createProviderRequestDedupeKey({
     method,
@@ -1579,22 +2130,25 @@ export async function executeProviderApiRequest(
     body,
     headers,
   });
-  const response = await fetchWithTimeout(url.href, {
-    method,
-    headers,
-    body,
-    maxBytes: effectiveMaxBytes,
-    timeoutMs: clampTimeout(args.timeoutMs),
-    secretValues: auth.secretValues,
-    quota: {
-      identity: quotaIdentity,
+  const response = applyBodyEnvelopeOutcome(
+    await fetchWithTimeout(url.href, {
       method,
-      target: describeProviderRequestTarget(url.href, auth.secretValues),
-      requestKey,
-    },
-  });
+      headers,
+      body,
+      maxBytes: effectiveMaxBytes,
+      timeoutMs: clampTimeout(args.timeoutMs),
+      signal: args.signal,
+      secretValues: auth.secretValues,
+      quota: {
+        identity: quotaIdentity,
+        method,
+        target: describeProviderRequestTarget(url.href, auth.secretValues),
+        requestKey,
+      },
+    }),
+    config,
+  );
 
-  // saveToFile: write full body to workspace file and return compact summary.
   if (args.saveToFile) {
     const rawText =
       response.text ??
@@ -1604,6 +2158,7 @@ export async function executeProviderApiRequest(
       rawText,
       response.contentType,
       response.status,
+      response.ok,
     )) as Record<string, unknown>;
     return {
       provider: { id: config.id, label: config.label },
@@ -1639,8 +2194,110 @@ export async function executeProviderApiRequest(
       ...(args.connectionId ? { connectionId: args.connectionId } : {}),
     },
     response,
-    guidance:
+    guidance: [
       "This was a raw provider API request. Use provider docs/spec URLs to choose endpoints and include method/path/status plus relevant filters in the methodology. Prefer this escape hatch whenever canned actions are too narrow.",
+      providerAccessErrorGuidance(config, response.status),
+    ]
+      .filter(Boolean)
+      .join(" "),
+  };
+}
+
+const PROVIDER_ACCESS_ERROR_STATUSES = new Set([401, 403, 404]);
+
+function providerAccessErrorGuidance(
+  config: ProviderApiConfig,
+  status: number,
+): string | null {
+  if (!PROVIDER_ACCESS_ERROR_STATUSES.has(status)) return null;
+  return config.accessErrorGuidance ?? null;
+}
+
+/**
+ * Resolve a provider OAuth token for a trusted server-side integration bridge
+ * such as a CRM adapter or Google Picker. Callers must keep the result out of
+ * agent, MCP, A2A, logs, persistence, and extension/tool surfaces.
+ */
+export async function resolveProviderApiOAuthAccessToken(
+  args: {
+    provider: ProviderApiId;
+    connectionId?: string | null;
+    accountId?: string | null;
+  },
+  runtime: ProviderApiRuntimeOptions,
+): Promise<ProviderApiOAuthAccessToken> {
+  await assertProviderAllowedAsync(args.provider, runtime);
+  const config = getProviderApiConfig(args.provider, runtime.providerOverrides);
+  const auth = config.auth;
+  const oauthAuth =
+    auth.type === "oauth-bearer"
+      ? auth
+      : auth.type === "oauth-bearer-or-api-key-header" ||
+          auth.type === "oauth-bearer-or-bearer-key"
+        ? {
+            type: "oauth-bearer" as const,
+            oauthProvider: auth.oauthProvider,
+            tokenLabel: auth.tokenLabel,
+            workspaceProvider: auth.workspaceProvider,
+          }
+        : auth.type === "oauth-bearer-or-basic"
+          ? {
+              type: "oauth-bearer" as const,
+              oauthProvider: auth.oauthProvider,
+              tokenLabel: auth.tokenLabel,
+              workspaceProvider: auth.workspaceProvider,
+            }
+          : auth.type === "google-service-account" && auth.oauthProvider
+            ? {
+                type: "oauth-bearer" as const,
+                oauthProvider: auth.oauthProvider,
+                tokenLabel: "Google OAuth token",
+                workspaceProvider: auth.workspaceProvider,
+              }
+            : null;
+  if (!oauthAuth) {
+    throw new Error(
+      `Provider API ${args.provider} does not use a direct OAuth bearer token.`,
+    );
+  }
+  const ctx = requireRuntimeCredentialContext(
+    runtime,
+    config.credentialKeys[0] ?? config.id,
+  );
+  if (args.provider === "bigquery" && ctx.credentialScope === "org") {
+    throw new Error(
+      "Personal BigQuery OAuth is unavailable for org-only credential scope.",
+    );
+  }
+  const credential = oauthAuth.workspaceProvider
+    ? await resolveOptionalConnectionBoundOAuthBearerToken({
+        auth: oauthAuth,
+        runtime,
+        ctx,
+        workspaceProvider: oauthAuth.workspaceProvider,
+        connectionId: args.connectionId,
+        accountId: args.accountId,
+      })
+    : await resolveOAuthBearerToken({
+        auth: oauthAuth,
+        runtime,
+        ctx,
+        accountId: args.accountId,
+      });
+  if (!credential) {
+    return throwWorkspaceConnectionRequired({
+      runtime,
+      provider: oauthAuth.workspaceProvider ?? oauthAuth.oauthProvider,
+      connectionId: args.connectionId,
+      message: `${oauthAuth.tokenLabel} workspace connection is not available to ${runtime.appId}.`,
+    });
+  }
+  return {
+    accessToken: credential.value,
+    accountId: credential.accountId ?? null,
+    accountLabel: credential.accountLabel ?? null,
+    connectionId: credential.connectionId ?? null,
+    connectionLabel: credential.connectionLabel ?? null,
   };
 }
 
@@ -2310,10 +2967,6 @@ function numberOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-// ---------------------------------------------------------------------------
-// Custom provider execution
-// ---------------------------------------------------------------------------
-
 async function executeCustomProviderApiRequest(
   args: ProviderApiRequestArgs,
   customConfig: CustomProviderConfig,
@@ -2323,8 +2976,6 @@ async function executeCustomProviderApiRequest(
   const method = normalizeMethod(args.method);
   const baseUrl = customConfig.baseUrl;
 
-  // Build a lightweight ProviderApiConfig-like object so we can reuse
-  // buildProviderUrl (which validates allowed hosts).
   const syntheticConfig: ProviderApiConfig = {
     id: customConfig.id as ProviderApiId,
     label: customConfig.label,
@@ -2351,6 +3002,13 @@ async function executeCustomProviderApiRequest(
     args.auth === "none"
       ? emptyAuth()
       : await resolveCustomAuth(customConfig, runtime, ctx, args);
+  for (const credential of auth.credentialSources) {
+    assertCredentialCanReachEndpoint(
+      { scope: customConfig.scope, scopeId: customConfig.scopeId },
+      credential,
+      credential.key,
+    );
+  }
 
   const extraHeaders = args.headers ?? {};
   const headers = sanitizeOutboundHeaders({
@@ -2372,60 +3030,66 @@ async function executeCustomProviderApiRequest(
     accountId: args.accountId,
   });
 
-  // --- fetchAllPages mode (same cursor pagination as built-in providers) ---
   if (args.fetchAllPages) {
     const pageCfg = args.fetchAllPages;
-    const { items, pageCount, lastStatus, lastContentType } =
-      await fetchAllPages(pageCfg, async (extra) => {
-        const queryWithCursor = extra?.query
-          ? mergeQueryObjects(args.query, extra.query)
-          : args.query;
-        const pageUrl = buildProviderUrl({
-          config: syntheticConfig,
-          baseUrl,
-          rawPath: args.path,
-          query: queryWithCursor,
-        });
-        const bodyWithCursor = extra?.bodyCursor
-          ? setValueAtPath(
-              args.body,
-              extra.bodyCursor.path,
-              extra.bodyCursor.value,
-            )
-          : args.body;
-        const pageBody = prepareBody(bodyWithCursor, { ...headers });
-        const requestKey = createProviderRequestDedupeKey({
-          method,
-          url: pageUrl.href,
-          body: pageBody,
-          headers,
-        });
-        const resp = await fetchWithTimeout(pageUrl.href, {
-          method,
-          headers,
-          body: pageBody,
-          maxBytes: effectiveMaxBytes,
-          timeoutMs: clampTimeout(args.timeoutMs),
-          secretValues: auth.secretValues,
-          quota: {
-            identity: quotaIdentity,
-            method,
-            target: describeProviderRequestTarget(
-              pageUrl.href,
-              auth.secretValues,
-            ),
-            requestKey,
-          },
-        });
-        return {
-          text:
-            resp.text ??
-            (resp.json !== undefined ? JSON.stringify(resp.json) : ""),
-          contentType: resp.contentType,
-          status: resp.status,
-          ok: resp.ok,
-        };
+    const {
+      items,
+      pageCount,
+      lastStatus,
+      lastContentType,
+      truncated,
+      nextCursor,
+    } = await fetchAllPages(pageCfg, async (extra) => {
+      const queryWithCursor = extra?.query
+        ? mergeQueryObjects(args.query, extra.query)
+        : args.query;
+      const pageUrl = buildProviderUrl({
+        config: syntheticConfig,
+        baseUrl,
+        rawPath: args.path,
+        query: queryWithCursor,
       });
+      const bodyWithCursor = extra?.bodyCursor
+        ? setValueAtPath(
+            args.body,
+            extra.bodyCursor.path,
+            extra.bodyCursor.value,
+          )
+        : args.body;
+      const pageBody = prepareBody(bodyWithCursor, headers);
+      const requestKey = createProviderRequestDedupeKey({
+        method,
+        url: pageUrl.href,
+        body: pageBody,
+        headers,
+      });
+      const resp = await fetchWithTimeout(pageUrl.href, {
+        method,
+        headers,
+        body: pageBody,
+        maxBytes: effectiveMaxBytes,
+        timeoutMs: clampTimeout(args.timeoutMs),
+        signal: args.signal,
+        secretValues: auth.secretValues,
+        quota: {
+          identity: quotaIdentity,
+          method,
+          target: describeProviderRequestTarget(
+            pageUrl.href,
+            auth.secretValues,
+          ),
+          requestKey,
+        },
+      });
+      return {
+        text:
+          resp.text ??
+          (resp.json !== undefined ? JSON.stringify(resp.json) : ""),
+        contentType: resp.contentType,
+        status: resp.status,
+        ok: resp.ok,
+      };
+    });
 
     const allItemsJson = JSON.stringify(items, null, 2);
     const metadata = {
@@ -2437,6 +3101,8 @@ async function executeCustomProviderApiRequest(
       pagesRead: pageCount,
       totalItems: Array.isArray(items) ? items.length : 0,
       lastStatus,
+      truncated,
+      nextCursor,
     };
 
     if (args.saveToFile) {
@@ -2458,6 +3124,7 @@ async function executeCustomProviderApiRequest(
     body,
     maxBytes: effectiveMaxBytes,
     timeoutMs: clampTimeout(args.timeoutMs),
+    signal: args.signal,
     secretValues: auth.secretValues,
     quota: {
       identity: quotaIdentity,
@@ -2481,6 +3148,7 @@ async function executeCustomProviderApiRequest(
       rawText,
       response.contentType,
       response.status,
+      response.ok,
     )) as Record<string, unknown>;
     return {
       provider: {
@@ -2600,7 +3268,6 @@ async function resolveCustomAuth(
   return emptyAuth();
 }
 
-/** Resolve a credential by key name (no workspace-provider lookup for custom). */
 async function resolveRequiredCredentialByKey(options: {
   provider: string;
   key: string;
@@ -2621,7 +3288,10 @@ async function resolveRequiredCredentialByKey(options: {
   };
   const resolver =
     options.runtime.resolveCredential ?? defaultProviderApiCredentialResolver;
-  const credential = await resolver(lookup);
+  const credential = withCredentialConnectionIdentity(
+    await resolver(lookup),
+    options.connectionId,
+  );
   if (!credential?.value) {
     throw new Error(
       `Credential "${options.key}" not configured for custom provider "${options.provider}".`,
@@ -2639,13 +3309,6 @@ function describeCustomAuth(auth: CustomProviderAuthKind): string {
   return "unknown";
 }
 
-// ---------------------------------------------------------------------------
-// Catalog helpers with custom provider support
-// ---------------------------------------------------------------------------
-
-/**
- * Convert a custom provider to the same catalog shape as built-in providers.
- */
 function customProviderToCatalogEntry(config: CustomProviderConfig) {
   return {
     id: config.id,
@@ -2680,12 +3343,12 @@ function extractCredentialKeysFromCustomAuth(
   return [];
 }
 
-/**
- * List catalog entries including custom providers (merged after built-ins).
- */
 async function listProviderApiCatalogWithCustom(
   provider: ProviderApiId | string | undefined,
-  options: { providerIds?: readonly (ProviderApiId | string)[] },
+  options: {
+    providerIds?: readonly (ProviderApiId | string)[];
+    providerOverrides?: readonly ProviderApiConfig[];
+  },
   runtime: ProviderApiRuntimeOptions,
 ): Promise<unknown[]> {
   const customConfigs = runtime.getCustomProviders
@@ -2693,11 +3356,9 @@ async function listProviderApiCatalogWithCustom(
     : [];
 
   if (provider) {
-    // Check built-ins first
     if (isProviderApiId(provider)) {
       return listProviderApiCatalog(provider, options) as unknown[];
     }
-    // Check custom
     const custom = customConfigs.find((c) => c.id === provider);
     if (custom) return [customProviderToCatalogEntry(custom)];
     const known = [
@@ -2722,9 +3383,6 @@ async function listProviderApiCatalogWithCustom(
   return [...builtInEntries, ...customEntries];
 }
 
-/**
- * Look up a custom provider by id from the runtime loader.
- */
 async function resolveCustomProvider(
   id: string,
   runtime: ProviderApiRuntimeOptions,
@@ -2734,9 +3392,6 @@ async function resolveCustomProvider(
   return configs.find((c) => c.id === id) ?? null;
 }
 
-/**
- * List all provider ids (built-in + custom) visible to this runtime.
- */
 async function listAllProviderIds(
   runtime: ProviderApiRuntimeOptions,
 ): Promise<string[]> {
@@ -2746,24 +3401,17 @@ async function listAllProviderIds(
   return [...builtIn, ...custom.map((c) => c.id)];
 }
 
-/**
- * Assert that a provider is either a known built-in or a registered custom
- * provider. Throws with a descriptive message listing known providers.
- */
 async function assertProviderAllowedAsync(
   provider: string,
   runtime: ProviderApiRuntimeOptions,
 ): Promise<void> {
-  // Built-in check (fast path)
   if (isProviderApiId(provider)) {
-    // Still check the providerIds whitelist if set
     const allowed = normalizeProviderIds(runtime.providerIds);
     if (!allowed.includes(provider as ProviderApiId)) {
       throw new Error(`Provider API ${provider} is not enabled for this app.`);
     }
     return;
   }
-  // Custom provider check
   const custom = await resolveCustomProvider(provider, runtime);
   if (custom) return;
   const known = await listAllProviderIds(runtime);
@@ -2783,6 +3431,9 @@ export async function defaultProviderApiCredentialResolver(
       connectionId: options.connectionId,
       userEmail: options.ctx.userEmail,
       orgId: options.ctx.orgId,
+      ...(options.ctx.credentialScope === "org"
+        ? { credentialScope: "org" as const }
+        : {}),
     });
     if (result.available && result.value) {
       return {
@@ -2796,17 +3447,25 @@ export async function defaultProviderApiCredentialResolver(
           typeof result.provenance?.secretScope === "string"
             ? result.provenance.secretScope
             : undefined,
+        ...(result.provenance?.secretScope === "user"
+          ? { scopeId: options.ctx.userEmail }
+          : result.provenance?.secretScope === "org" ||
+              result.provenance?.secretScope === "workspace"
+            ? { scopeId: options.ctx.orgId ?? undefined }
+            : {}),
       };
     }
   }
 
-  const value = await resolveCredential(options.key, options.ctx);
-  if (!value) return null;
+  const credential = await resolveCredentialDetailed(options.key, options.ctx);
+  if (!credential) return null;
   return {
     key: options.key,
-    value,
+    value: credential.value,
     source: options.localCredentialSource,
     provider: options.provider,
+    scope: credential.scope,
+    scopeId: credential.scopeId,
   };
 }
 
@@ -2845,6 +3504,18 @@ function describeAuth(auth: ProviderApiAuthKind): string {
   if (auth.type === "api-key-header") return `api-key-header:${auth.header}`;
   if (auth.type === "google-service-account") return "google-service-account";
   if (auth.type === "oauth-bearer") return `oauth-bearer:${auth.oauthProvider}`;
+  if (auth.type === "oauth-client-credentials") {
+    return `oauth-client-credentials:${auth.workspaceProvider}`;
+  }
+  if (auth.type === "oauth-bearer-or-api-key-header") {
+    return `oauth-bearer:${auth.oauthProvider}-or-api-key-header:${auth.header}:${(auth.fallbackKeys ?? [auth.key]).join(",")}`;
+  }
+  if (auth.type === "oauth-bearer-or-bearer-key") {
+    return `oauth-bearer:${auth.oauthProvider}-or-bearer-key:${(auth.fallbackKeys ?? [auth.key]).join(",")}`;
+  }
+  if (auth.type === "oauth-bearer-or-basic") {
+    return `oauth-bearer:${auth.oauthProvider}-or-basic:${auth.usernameKey}:${auth.passwordKey}`;
+  }
   return "prometheus-basic-or-bearer";
 }
 
@@ -2866,16 +3537,176 @@ async function resolveBaseUrl(
   runtime: ProviderApiRuntimeOptions,
   ctx: CredentialContext,
   args: ProviderApiRequestArgs,
-): Promise<string> {
-  if (!config.baseUrlCredentialKey) return config.defaultBaseUrl;
-  const configured = await resolveCredentialValue({
+): Promise<ResolvedProviderEndpoint> {
+  const oauthEndpoint = await resolveWorkspaceOAuthBaseUrl(
+    config,
+    runtime,
+    args,
+  );
+  if (oauthEndpoint) return oauthEndpoint;
+  if (config.baseUrlConnectionConfigKey) {
+    const auth = config.auth;
+    const workspaceProvider =
+      "workspaceProvider" in auth ? auth.workspaceProvider : undefined;
+    if (!workspaceProvider) {
+      throw new Error(
+        `${config.label} connection URL configuration requires a workspace provider.`,
+      );
+    }
+    const resolved = await resolveWorkspaceConnectionForApp({
+      appId: runtime.appId,
+      provider: workspaceProvider,
+      connectionId: args.connectionId ?? undefined,
+      requireConnected: true,
+    });
+    if (!resolved.available || !resolved.connection) {
+      throw new Error(
+        `${config.label} requires an available workspace connection.`,
+      );
+    }
+    const configured =
+      resolved.connection.config[config.baseUrlConnectionConfigKey];
+    const value =
+      typeof configured === "string" && configured.trim()
+        ? configured.trim()
+        : config.defaultBaseUrl;
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new Error(`${config.label} connection URL is invalid.`);
+    }
+    if (
+      (config.requireHttps && url.protocol !== "https:") ||
+      url.username ||
+      url.password ||
+      url.port ||
+      url.search ||
+      url.hash ||
+      url.pathname !== "/api/graphql" ||
+      (config.baseUrlMustMatchAllowedHost &&
+        !isAllowedProviderHost(url.hostname, config))
+    ) {
+      throw new Error(
+        `${config.label} requests must use the HTTPS /api/graphql endpoint on a registered provider host suffix.`,
+      );
+    }
+    return {
+      url: value.replace(/\/+$/, ""),
+      owner: workspaceConnectionEndpointOwner(resolved.connection),
+    };
+  }
+  if (!config.baseUrlCredentialKey) return { url: config.defaultBaseUrl };
+  const auth = config.auth;
+  const workspaceProvider =
+    "workspaceProvider" in auth ? auth.workspaceProvider : undefined;
+  const configured = await resolveCredentialResult({
     config,
     runtime,
     ctx,
     key: config.baseUrlCredentialKey,
     args,
+    workspaceProvider,
   });
-  return (configured || config.defaultBaseUrl).replace(/\/+$/, "");
+  const url = (configured?.value || config.defaultBaseUrl).replace(/\/+$/, "");
+  if (
+    config.baseUrlMustMatchAllowedHost &&
+    !isAllowedProviderHost(new URL(url).hostname, config)
+  ) {
+    throw new Error(
+      `${config.label} API requests must stay on the configured provider host or registered provider host suffix.`,
+    );
+  }
+  return {
+    url,
+    ...(configured
+      ? {
+          owner: {
+            scope: configured.scope ?? "unknown",
+            scopeId: configured.scopeId,
+            source: configured.source,
+            connectionId: configured.connectionId,
+          },
+        }
+      : {}),
+  };
+}
+
+async function resolveWorkspaceOAuthBaseUrl(
+  config: ProviderApiConfig,
+  runtime: ProviderApiRuntimeOptions,
+  args: ProviderApiRequestArgs,
+): Promise<ResolvedProviderEndpoint | null> {
+  const auth = config.auth;
+  const workspaceProvider =
+    auth.type === "oauth-bearer" ||
+    auth.type === "oauth-bearer-or-api-key-header" ||
+    auth.type === "oauth-bearer-or-bearer-key" ||
+    auth.type === "oauth-bearer-or-basic"
+      ? auth.workspaceProvider
+      : undefined;
+  if (workspaceProvider !== "jira" && workspaceProvider !== "salesforce") {
+    return null;
+  }
+  let resolved: Awaited<ReturnType<typeof resolveWorkspaceConnectionForApp>>;
+  try {
+    resolved = await resolveWorkspaceConnectionForApp({
+      appId: runtime.appId,
+      provider: workspaceProvider,
+      connectionId: args.connectionId ?? undefined,
+      requireConnected: true,
+    });
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message === "Workspace connections require an authenticated user."
+    ) {
+      return null;
+    }
+    throw error;
+  }
+  if (!resolved.available || !resolved.connection) return null;
+  const connectionConfig = resolved.connection.config;
+  if (connectionConfig.credentialMode !== "oauth") return null;
+  const baseUrl =
+    workspaceProvider === "salesforce"
+      ? connectionConfig.salesforceInstanceUrl
+      : connectionConfig.atlassianApiBaseUrl;
+  if (typeof baseUrl !== "string" || !baseUrl.trim()) return null;
+  if (workspaceProvider === "salesforce" && !isSalesforceInstanceUrl(baseUrl)) {
+    return null;
+  }
+  return {
+    url: baseUrl.replace(/\/+$/, ""),
+    owner: workspaceConnectionEndpointOwner(resolved.connection),
+  };
+}
+
+function workspaceConnectionEndpointOwner(
+  connection: Pick<WorkspaceConnection, "id" | "ownerEmail" | "orgId">,
+): CredentialEndpointOwner {
+  return {
+    scope: connection.orgId !== null ? "org" : "user",
+    scopeId: connection.orgId ?? connection.ownerEmail,
+    source: "workspace_connection",
+    connectionId: connection.id,
+  };
+}
+
+function isSalesforceInstanceUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    return (
+      url.protocol === "https:" &&
+      !url.username &&
+      !url.password &&
+      !url.port &&
+      (host === "salesforce.com" || host.endsWith(".salesforce.com"))
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function resolvePlaceholders(
@@ -2906,7 +3737,18 @@ async function resolveCredentialValue(options: {
   args: ProviderApiRequestArgs;
   workspaceProvider?: string;
 }): Promise<string | undefined> {
-  const credential = await resolveOptionalCredential({
+  return (await resolveCredentialResult(options))?.value;
+}
+
+async function resolveCredentialResult(options: {
+  config: ProviderApiConfig;
+  runtime: ProviderApiRuntimeOptions;
+  ctx: CredentialContext;
+  key: string;
+  args: ProviderApiRequestArgs;
+  workspaceProvider?: string;
+}): Promise<ProviderApiResolvedCredential | null> {
+  return resolveOptionalCredential({
     provider: options.config.id,
     workspaceProvider: options.workspaceProvider,
     key: options.key,
@@ -2914,7 +3756,6 @@ async function resolveCredentialValue(options: {
     runtime: options.runtime,
     connectionId: options.args.connectionId,
   });
-  return credential?.value;
 }
 
 function substituteString(
@@ -2998,8 +3839,17 @@ function isAllowedProviderUrl(
   config: ProviderApiConfig,
 ): boolean {
   if (url.protocol !== "https:" && url.protocol !== "http:") return false;
-  if (url.origin === base.origin) return true;
-  const host = url.hostname.toLowerCase();
+  if (config.requireHttps && url.protocol !== "https:") return false;
+  return (
+    url.origin === base.origin || isAllowedProviderHost(url.hostname, config)
+  );
+}
+
+function isAllowedProviderHost(
+  hostname: string,
+  config: ProviderApiConfig,
+): boolean {
+  const host = hostname.toLowerCase();
   return (config.allowedHostSuffixes ?? []).some((suffix) => {
     const normalized = suffix.toLowerCase().replace(/^\./, "");
     return host === normalized || host.endsWith(`.${normalized}`);
@@ -3030,6 +3880,7 @@ async function resolveAuth(
   runtime: ProviderApiRuntimeOptions,
   ctx: CredentialContext,
   args: ProviderApiRequestArgs,
+  endpoint: ResolvedProviderEndpoint,
 ): Promise<ResolvedAuth> {
   const auth = config.auth;
   if (auth.type === "none") return emptyAuth();
@@ -3113,7 +3964,116 @@ async function resolveAuth(
       secretValues: [credential.value],
     };
   }
+  if (auth.type === "oauth-client-credentials") {
+    const clientId = await resolveRequiredCredential({
+      provider: config.id,
+      workspaceProvider: auth.workspaceProvider,
+      key: auth.clientIdKey,
+      ctx,
+      runtime,
+      connectionId: args.connectionId,
+    });
+    const clientSecret = await resolveRequiredCredential({
+      provider: config.id,
+      workspaceProvider: auth.workspaceProvider,
+      key: auth.clientSecretKey,
+      ctx,
+      runtime,
+      connectionId: args.connectionId,
+    });
+    if (endpoint.owner) {
+      assertCredentialCanReachEndpoint(endpoint.owner, clientId, clientId.key);
+      assertCredentialCanReachEndpoint(
+        endpoint.owner,
+        clientSecret,
+        clientSecret.key,
+      );
+    }
+    const tokenUrl = buildProviderUrl({
+      config,
+      baseUrl: endpoint.url,
+      rawPath: auth.tokenPath,
+      query: undefined,
+    });
+    if (await isBlockedExtensionUrlWithDns(tokenUrl.href)) {
+      throw new Error(
+        `Blocked private/internal provider URL: ${tokenUrl.href}`,
+      );
+    }
+    const tokenResponse = await fetchWithTimeout(tokenUrl.href, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: clientId.value,
+        client_secret: clientSecret.value,
+      }),
+      timeoutMs: clampTimeout(args.timeoutMs),
+      signal: args.signal,
+      maxBytes: 16_384,
+      secretValues: [clientId.value, clientSecret.value],
+    });
+    if (!tokenResponse.ok) {
+      throw new Error(
+        `${config.label} client-credentials exchange failed (HTTP ${tokenResponse.status}).`,
+      );
+    }
+    const accessToken = asRecord(tokenResponse.json).access_token;
+    if (typeof accessToken !== "string" || !accessToken.trim()) {
+      throw new Error(`${config.label} did not return an access token.`);
+    }
+    return {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      credentialSources: [
+        omitCredentialValue(clientId),
+        omitCredentialValue(clientSecret),
+      ],
+      secretValues: [clientId.value, clientSecret.value, accessToken],
+    };
+  }
   if (auth.type === "google-service-account") {
+    if (
+      auth.oauthProvider &&
+      auth.workspaceProvider &&
+      !(auth.workspaceProvider === "bigquery" && ctx.credentialScope === "org")
+    ) {
+      let oauthCredential: ProviderApiResolvedCredential | null;
+      try {
+        oauthCredential = await resolveOptionalConnectionBoundOAuthBearerToken({
+          auth: {
+            type: "oauth-bearer",
+            oauthProvider: auth.oauthProvider,
+            tokenLabel: "Google OAuth token",
+            workspaceProvider: auth.workspaceProvider,
+          },
+          runtime,
+          ctx,
+          workspaceProvider: auth.workspaceProvider,
+          connectionId: args.connectionId,
+          accountId: args.accountId,
+        });
+      } catch (error) {
+        if (
+          auth.workspaceProvider !== "bigquery" ||
+          !(error instanceof AgentConnectionRequiredError) ||
+          error.provider !== "bigquery" ||
+          error.reason !== "reauthorize"
+        ) {
+          throw error;
+        }
+        if (args.connectionId?.trim() || args.accountId?.trim()) {
+          throw error;
+        }
+        oauthCredential = null;
+      }
+      if (oauthCredential) {
+        return {
+          headers: { Authorization: `Bearer ${oauthCredential.value}` },
+          credentialSources: [omitCredentialValue(oauthCredential)],
+          secretValues: [oauthCredential.value],
+        };
+      }
+    }
     const token = await getGoogleServiceAccountToken(auth.scopes, runtime, ctx);
     return {
       headers: { Authorization: `Bearer ${token}` },
@@ -3130,10 +4090,161 @@ async function resolveAuth(
   if (auth.type === "oauth-bearer") {
     const oauthProvider =
       runtime.oauthProviderOverrides?.[config.id] ?? auth.oauthProvider;
-    const credential = await resolveOAuthBearerToken({
-      auth: { ...auth, oauthProvider },
+    const credential =
+      auth.workspaceProvider &&
+      (args.connectionId || config.requiresWorkspaceConnection)
+        ? await resolveConnectionBoundOAuthBearerToken({
+            auth: { ...auth, oauthProvider },
+            runtime,
+            ctx,
+            workspaceProvider: auth.workspaceProvider,
+            connectionId: args.connectionId,
+            accountId: args.accountId,
+          })
+        : await resolveOAuthBearerToken({
+            auth: { ...auth, oauthProvider },
+            runtime,
+            ctx,
+            accountId: args.accountId,
+            connectionId: args.connectionId,
+          });
+    return {
+      headers: { Authorization: `Bearer ${credential.value}` },
+      credentialSources: [omitCredentialValue(credential)],
+      secretValues: [credential.value],
+    };
+  }
+  if (auth.type === "oauth-bearer-or-api-key-header") {
+    const explicitConnectionFallback =
+      Boolean(args.connectionId?.trim()) && Boolean(runtime.resolveCredential);
+    const resolvedFallback = explicitConnectionFallback
+      ? await resolveHybridFallbackCredential({
+          auth,
+          config,
+          runtime,
+          ctx,
+          args,
+        })
+      : null;
+    if (resolvedFallback) {
+      return {
+        headers: { [auth.header]: resolvedFallback.value },
+        credentialSources: [omitCredentialValue(resolvedFallback)],
+        secretValues: [resolvedFallback.value],
+      };
+    }
+    const workspaceCredential =
+      await resolveOptionalConnectionBoundOAuthBearerToken({
+        auth: {
+          type: "oauth-bearer",
+          oauthProvider: auth.oauthProvider,
+          tokenLabel: auth.tokenLabel,
+        },
+        runtime,
+        ctx,
+        connectionId: args.connectionId,
+        accountId: args.accountId,
+        workspaceProvider: auth.workspaceProvider,
+        allowUnbound: true,
+      });
+    if (workspaceCredential) {
+      return {
+        headers: { Authorization: `Bearer ${workspaceCredential.value}` },
+        credentialSources: [omitCredentialValue(workspaceCredential)],
+        secretValues: [workspaceCredential.value],
+      };
+    }
+    if (!explicitConnectionFallback) {
+      const resolvedFallback = await resolveHybridFallbackCredential({
+        auth,
+        config,
+        runtime,
+        ctx,
+        args,
+      });
+      if (resolvedFallback) {
+        return {
+          headers: { [auth.header]: resolvedFallback.value },
+          credentialSources: [omitCredentialValue(resolvedFallback)],
+          secretValues: [resolvedFallback.value],
+        };
+      }
+    }
+    const credential = await resolveAnyCredential({
+      provider: config.id,
+      workspaceProvider: auth.workspaceProvider,
+      keys: auth.fallbackKeys ?? [auth.key],
       ctx,
-      accountId: args.accountId,
+      runtime,
+    });
+    return {
+      headers: { [auth.header]: credential.value },
+      credentialSources: [omitCredentialValue(credential)],
+      secretValues: [credential.value],
+    };
+  }
+  if (auth.type === "oauth-bearer-or-bearer-key") {
+    const explicitConnectionFallback =
+      Boolean(args.connectionId?.trim()) && Boolean(runtime.resolveCredential);
+    const resolvedFallback = explicitConnectionFallback
+      ? await resolveHybridFallbackCredential({
+          auth,
+          config,
+          runtime,
+          ctx,
+          args,
+        })
+      : null;
+    if (resolvedFallback) {
+      return {
+        headers: { Authorization: `Bearer ${resolvedFallback.value}` },
+        credentialSources: [omitCredentialValue(resolvedFallback)],
+        secretValues: [resolvedFallback.value],
+      };
+    }
+    const workspaceCredential =
+      await resolveOptionalConnectionBoundOAuthBearerToken({
+        auth: {
+          type: "oauth-bearer",
+          oauthProvider: auth.oauthProvider,
+          tokenLabel: auth.tokenLabel,
+        },
+        runtime,
+        ctx,
+        connectionId: args.connectionId,
+        accountId: args.accountId,
+        workspaceProvider: auth.workspaceProvider,
+        allowUnbound: true,
+      });
+    if (workspaceCredential) {
+      return {
+        headers: { Authorization: `Bearer ${workspaceCredential.value}` },
+        credentialSources: [omitCredentialValue(workspaceCredential)],
+        secretValues: [workspaceCredential.value],
+      };
+    }
+    if (!explicitConnectionFallback) {
+      const resolvedFallback = await resolveHybridFallbackCredential({
+        auth,
+        config,
+        runtime,
+        ctx,
+        args,
+      });
+      if (resolvedFallback) {
+        return {
+          headers: { Authorization: `Bearer ${resolvedFallback.value}` },
+          credentialSources: [omitCredentialValue(resolvedFallback)],
+          secretValues: [resolvedFallback.value],
+        };
+      }
+    }
+    const credential = await resolveAnyCredential({
+      provider: config.id,
+      workspaceProvider: auth.workspaceProvider,
+      keys: auth.fallbackKeys ?? [auth.key],
+      ctx,
+      runtime,
     });
     return {
       headers: { Authorization: `Bearer ${credential.value}` },
@@ -3141,58 +4252,96 @@ async function resolveAuth(
       secretValues: [credential.value],
     };
   }
+  if (auth.type === "oauth-bearer-or-basic") {
+    const workspaceCredential =
+      await resolveOptionalConnectionBoundOAuthBearerToken({
+        auth: {
+          type: "oauth-bearer",
+          oauthProvider: auth.oauthProvider,
+          tokenLabel: auth.tokenLabel,
+        },
+        runtime,
+        ctx,
+        connectionId: args.connectionId,
+        accountId: args.accountId,
+        workspaceProvider: auth.workspaceProvider,
+        allowUnbound: true,
+      });
+    if (workspaceCredential) {
+      return {
+        headers: { Authorization: `Bearer ${workspaceCredential.value}` },
+        credentialSources: [omitCredentialValue(workspaceCredential)],
+        secretValues: [workspaceCredential.value],
+      };
+    }
+    const username = await resolveRequiredCredential({
+      provider: config.id,
+      workspaceProvider: auth.workspaceProvider,
+      key: auth.usernameKey,
+      ctx,
+      runtime,
+      connectionId: args.connectionId,
+    });
+    const password = await resolveRequiredCredential({
+      provider: config.id,
+      workspaceProvider: auth.workspaceProvider,
+      key: auth.passwordKey,
+      ctx,
+      runtime,
+      connectionId: args.connectionId,
+    });
+    const encoded = Buffer.from(`${username.value}:${password.value}`).toString(
+      "base64",
+    );
+    return {
+      headers: { Authorization: `Basic ${encoded}` },
+      credentialSources: [
+        omitCredentialValue(username),
+        omitCredentialValue(password),
+      ],
+      secretValues: [username.value, password.value, encoded],
+    };
+  }
 
-  const bearer = await resolveCredentialValue({
+  const bearer = await resolveCredentialResult({
     config,
     runtime,
     ctx,
     key: "PROMETHEUS_BEARER_TOKEN",
     args,
   });
-  if (bearer) {
+  if (bearer?.value) {
     return {
-      headers: { Authorization: `Bearer ${bearer}` },
-      credentialSources: [
-        {
-          key: "PROMETHEUS_BEARER_TOKEN",
-          provider: config.id,
-          source: runtime.localCredentialSource ?? "app_local",
-        },
-      ],
-      secretValues: [bearer],
+      headers: { Authorization: `Bearer ${bearer.value}` },
+      credentialSources: [omitCredentialValue(bearer)],
+      secretValues: [bearer.value],
     };
   }
-  const username = await resolveCredentialValue({
+  const username = await resolveCredentialResult({
     config,
     runtime,
     ctx,
     key: "PROMETHEUS_USERNAME",
     args,
   });
-  const password = await resolveCredentialValue({
+  const password = await resolveCredentialResult({
     config,
     runtime,
     ctx,
     key: "PROMETHEUS_PASSWORD",
     args,
   });
-  if (username && password) {
-    const encoded = Buffer.from(`${username}:${password}`).toString("base64");
+  if (username?.value && password?.value) {
+    const encoded = Buffer.from(`${username.value}:${password.value}`).toString(
+      "base64",
+    );
     return {
       headers: { Authorization: `Basic ${encoded}` },
       credentialSources: [
-        {
-          key: "PROMETHEUS_USERNAME",
-          provider: config.id,
-          source: runtime.localCredentialSource ?? "app_local",
-        },
-        {
-          key: "PROMETHEUS_PASSWORD",
-          provider: config.id,
-          source: runtime.localCredentialSource ?? "app_local",
-        },
+        omitCredentialValue(username),
+        omitCredentialValue(password),
       ],
-      secretValues: [username, password, encoded],
+      secretValues: [username.value, password.value, encoded],
     };
   }
   return emptyAuth();
@@ -3200,6 +4349,26 @@ async function resolveAuth(
 
 function emptyAuth(): ResolvedAuth {
   return { headers: {}, credentialSources: [], secretValues: [] };
+}
+
+async function resolveHybridFallbackCredential(options: {
+  auth:
+    | Extract<ProviderApiAuthKind, { type: "oauth-bearer-or-api-key-header" }>
+    | Extract<ProviderApiAuthKind, { type: "oauth-bearer-or-bearer-key" }>;
+  config: ProviderApiConfig;
+  runtime: ProviderApiRuntimeOptions;
+  ctx: CredentialContext;
+  args: ProviderApiRequestArgs;
+}): Promise<ProviderApiResolvedCredential | null> {
+  if (!options.runtime.resolveCredential) return null;
+  return resolveOptionalCredential({
+    provider: options.config.id,
+    workspaceProvider: options.auth.workspaceProvider,
+    key: options.auth.key,
+    ctx: options.ctx,
+    runtime: options.runtime,
+    connectionId: options.args.connectionId,
+  });
 }
 
 async function resolveAnyCredential(options: {
@@ -3214,10 +4383,22 @@ async function resolveAnyCredential(options: {
     const credential = await resolveOptionalCredential({ ...options, key });
     if (credential?.value) return credential;
   }
+  const scopeGap = await describeCredentialScopeGap(
+    options.keys,
+    options.ctx,
+  ).catch(() => null);
+  if (options.workspaceProvider && !scopeGap) {
+    return throwWorkspaceConnectionRequired({
+      runtime: options.runtime,
+      provider: options.workspaceProvider,
+      connectionId: options.connectionId,
+      message: `${options.provider} requires an available workspace connection.`,
+    });
+  }
   throw new Error(
     `${options.provider} credential not configured. Tried: ${options.keys.join(
       ", ",
-    )}`,
+    )}${scopeGap ? `. ${scopeGap}` : ""}`,
   );
 }
 
@@ -3230,8 +4411,22 @@ async function resolveRequiredCredential(options: {
   connectionId?: string | null;
 }): Promise<ProviderApiResolvedCredential> {
   const credential = await resolveOptionalCredential(options);
-  if (!credential?.value) throw new Error(`${options.key} not configured`);
-  return credential;
+  if (credential?.value) return credential;
+  const scopeGap = await describeCredentialScopeGap([options.key], options.ctx)
+    // coercion-ok: only enriches an error we throw either way — losing the scope
+    // hint still surfaces the real "not configured" failure, never a success.
+    .catch(() => null);
+  if (options.workspaceProvider && !scopeGap) {
+    return throwWorkspaceConnectionRequired({
+      runtime: options.runtime,
+      provider: options.workspaceProvider,
+      connectionId: options.connectionId,
+      message: `${options.provider} requires an available workspace connection.`,
+    });
+  }
+  throw new Error(
+    `${options.key} not configured${scopeGap ? `. ${scopeGap}` : ""}`,
+  );
 }
 
 async function resolveOptionalCredential(options: {
@@ -3254,9 +4449,23 @@ async function resolveOptionalCredential(options: {
     localCredentialSource,
   };
   if (options.runtime.resolveCredential) {
-    return options.runtime.resolveCredential(lookup);
+    return withCredentialConnectionIdentity(
+      await options.runtime.resolveCredential(lookup),
+      options.connectionId,
+    );
   }
   return defaultProviderApiCredentialResolver(lookup);
+}
+
+function withCredentialConnectionIdentity(
+  credential: ProviderApiResolvedCredential | null,
+  connectionId?: string | null,
+): ProviderApiResolvedCredential | null {
+  return credential?.source === "workspace_connection" &&
+    !credential.connectionId &&
+    connectionId
+    ? { ...credential, connectionId }
+    : credential;
 }
 
 function omitCredentialValue(
@@ -3270,6 +4479,42 @@ const googleServiceTokenCache = new Map<
   string,
   { token: string; expiresAt: number }
 >();
+
+const DEFAULT_GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token";
+const ALLOWED_GOOGLE_TOKEN_URI_HOSTS = new Set([
+  "oauth2.googleapis.com",
+  "accounts.google.com",
+  "www.googleapis.com",
+]);
+
+async function resolveGoogleServiceAccountTokenUri(
+  tokenUri: string | undefined,
+): Promise<string> {
+  const aud = tokenUri?.trim() || DEFAULT_GOOGLE_TOKEN_URI;
+  let parsed: URL;
+  try {
+    parsed = new URL(aud);
+  } catch {
+    throw new Error(
+      "Invalid or untrusted token_uri in service account credentials",
+    );
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error(
+      "Invalid or untrusted token_uri in service account credentials",
+    );
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (
+    !ALLOWED_GOOGLE_TOKEN_URI_HOSTS.has(host) ||
+    (await isBlockedExtensionUrlWithDns(aud))
+  ) {
+    throw new Error(
+      "Invalid or untrusted token_uri in service account credentials",
+    );
+  }
+  return aud;
+}
 
 async function getGoogleServiceAccountToken(
   scopes: readonly string[],
@@ -3285,7 +4530,7 @@ async function getGoogleServiceAccountToken(
   if (cached && Date.now() < cached.expiresAt - 30_000) return cached.token;
 
   const credsJson = await resolveCredentialValue({
-    config: getProviderApiConfig("gcloud"),
+    config: getProviderApiConfig("gcloud", runtime.providerOverrides),
     runtime,
     ctx,
     key: "GOOGLE_APPLICATION_CREDENTIALS_JSON",
@@ -3314,7 +4559,7 @@ async function getGoogleServiceAccountToken(
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const aud = creds.token_uri || "https://oauth2.googleapis.com/token";
+  const aud = await resolveGoogleServiceAccountTokenUri(creds.token_uri);
   const jwt = await signRs256Jwt(
     {
       iss: creds.client_email,
@@ -3349,34 +4594,147 @@ async function getGoogleServiceAccountToken(
 
 async function resolveOAuthBearerToken(options: {
   auth: Extract<ProviderApiAuthKind, { type: "oauth-bearer" }>;
+  runtime: ProviderApiRuntimeOptions;
   ctx: CredentialContext;
   accountId?: string | null;
+  ownerEmail?: string | null;
+  salesforceLoginUrl?: string | null;
+  connectionId?: string | null;
 }): Promise<ProviderApiResolvedCredential> {
+  const ownerEmail = options.ownerEmail?.trim() || options.ctx.userEmail;
+  const requestedAccountId = options.accountId?.trim();
   const accounts = await listOAuthAccountsByOwner(
     options.auth.oauthProvider,
-    options.ctx.userEmail,
+    ownerEmail,
   );
-  if (accounts.length === 0) {
-    throw new Error(
-      `${options.auth.tokenLabel} is not connected for ${options.ctx.userEmail}.`,
-    );
-  }
-  const accountId = options.accountId?.trim();
-  const account = accountId
-    ? accounts.find((entry) => entry.accountId === accountId)
+  const account = requestedAccountId
+    ? accounts.find((entry) => entry.accountId === requestedAccountId)
     : accounts[0];
+  if (
+    !account &&
+    options.auth.oauthProvider === "google_sheets" &&
+    requestedAccountId &&
+    options.connectionId?.trim()
+  ) {
+    const legacyAccounts = await listOAuthAccountsByOwner("google", ownerEmail);
+    const legacyAccount = legacyAccounts.find(
+      (entry) => entry.accountId === requestedAccountId,
+    );
+    const legacyTokens = legacyAccount?.tokens as OAuthTokens | undefined;
+    const legacyAccessToken =
+      legacyTokens?.access_token ?? legacyTokens?.accessToken;
+    const legacyExpiresAt =
+      legacyTokens?.expiry_date ?? legacyTokens?.expiresAt;
+    const legacyRefreshToken =
+      legacyTokens?.refresh_token ?? legacyTokens?.refreshToken;
+    const legacyScopes = new Set(
+      typeof legacyTokens?.scope === "string"
+        ? legacyTokens.scope.split(/[\s,]+/).filter(Boolean)
+        : [],
+    );
+    if (
+      legacyAccount &&
+      legacyTokens &&
+      typeof legacyAccessToken === "string" &&
+      legacyAccessToken &&
+      hasIsolatedGoogleSheetsScopes(legacyScopes) &&
+      typeof legacyExpiresAt === "number" &&
+      Number.isFinite(legacyExpiresAt) &&
+      (legacyExpiresAt > Date.now() + 60_000 ||
+        (typeof legacyRefreshToken === "string" && legacyRefreshToken))
+    ) {
+      let accessToken = legacyAccessToken;
+      if (legacyExpiresAt <= Date.now() + 60_000) {
+        try {
+          accessToken = await getValidOAuthAccessToken({
+            oauthProvider: "google",
+            accountId: legacyAccount.accountId,
+            ownerEmail,
+            tokens: legacyTokens,
+            preserveTokensOnPermanentFailure: true,
+          });
+        } catch (error) {
+          if (!isPermanentGoogleOAuthRefreshFailure(error)) throw error;
+          return throwWorkspaceConnectionRequired({
+            runtime: options.runtime,
+            provider: options.auth.workspaceProvider ?? "google_sheets",
+            connectionId: options.connectionId,
+            message:
+              "Google Sheets needs to be reconnected because its Google authorization has expired.",
+            reason: "reauthorize",
+          });
+        }
+      }
+      return {
+        key: "GOOGLE_OAUTH_TOKEN",
+        value: accessToken,
+        source: "oauth_token",
+        provider: "google",
+        accountId: legacyAccount.accountId,
+        accountLabel: legacyAccount.displayName,
+      };
+    }
+    return throwWorkspaceConnectionRequired({
+      runtime: options.runtime,
+      provider: options.auth.workspaceProvider ?? "google_sheets",
+      connectionId: options.connectionId,
+      message:
+        "Google Sheets needs to be reconnected because its saved access token is missing, expired, or lacks file-level access.",
+      reason: "reauthorize",
+    });
+  }
   if (!account) {
+    if (accounts.length === 0) {
+      if (options.auth.workspaceProvider) {
+        return throwWorkspaceConnectionRequired({
+          runtime: options.runtime,
+          provider: options.auth.workspaceProvider,
+          connectionId: options.connectionId,
+          message: `${options.auth.tokenLabel} requires an available workspace connection.`,
+          ...(options.auth.oauthProvider === "google_sheets" &&
+          options.connectionId
+            ? { reason: "reauthorize" as const }
+            : {}),
+        });
+      }
+      throw new Error(
+        `${options.auth.tokenLabel} is not connected for ${ownerEmail}.`,
+      );
+    }
     throw new Error(
-      `${options.auth.tokenLabel} account ${accountId} is not available to ${options.ctx.userEmail}.`,
+      `${options.auth.tokenLabel} account ${requestedAccountId} is not available to ${ownerEmail}.`,
     );
   }
   const tokens = account.tokens as OAuthTokens;
-  const token = await getValidOAuthAccessToken({
-    oauthProvider: options.auth.oauthProvider,
-    accountId: account.accountId,
-    ownerEmail: options.ctx.userEmail,
-    tokens,
-  });
+  const preserveSharedGoogleGrant =
+    options.auth.oauthProvider === "google" &&
+    Boolean(options.auth.workspaceProvider);
+  let token: string;
+  try {
+    token = await getValidOAuthAccessToken({
+      oauthProvider: options.auth.oauthProvider,
+      accountId: account.accountId,
+      ownerEmail,
+      tokens,
+      preserveTokensOnPermanentFailure: preserveSharedGoogleGrant,
+      salesforceLoginUrl: options.salesforceLoginUrl,
+    });
+  } catch (error) {
+    if (
+      preserveSharedGoogleGrant &&
+      options.auth.workspaceProvider &&
+      isPermanentGoogleOAuthRefreshFailure(error)
+    ) {
+      return throwWorkspaceConnectionRequired({
+        runtime: options.runtime,
+        provider: options.auth.workspaceProvider,
+        connectionId: options.connectionId,
+        message: `${options.auth.tokenLabel} requires an available workspace connection.`,
+        reason: "reauthorize",
+      });
+    }
+    throw error;
+  }
   return {
     key: `${options.auth.oauthProvider.toUpperCase()}_OAUTH_TOKEN`,
     value: token,
@@ -3387,11 +4745,185 @@ async function resolveOAuthBearerToken(options: {
   };
 }
 
+async function resolveConnectionBoundOAuthBearerToken(options: {
+  auth: Extract<ProviderApiAuthKind, { type: "oauth-bearer" }>;
+  runtime: ProviderApiRuntimeOptions;
+  ctx: CredentialContext;
+  workspaceProvider: string;
+  connectionId?: string | null;
+  accountId?: string | null;
+}): Promise<ProviderApiResolvedCredential> {
+  const credential =
+    await resolveOptionalConnectionBoundOAuthBearerToken(options);
+  if (credential) return credential;
+  return throwWorkspaceConnectionRequired({
+    runtime: options.runtime,
+    provider: options.workspaceProvider,
+    connectionId: options.connectionId,
+    message: `${options.auth.tokenLabel} requires an available workspace connection.`,
+  });
+}
+
+async function throwWorkspaceConnectionRequired(options: {
+  runtime: ProviderApiRuntimeOptions;
+  provider: string;
+  connectionId?: string | null;
+  message: string;
+  reason?: "connect" | "grant" | "reauthorize";
+}): Promise<never> {
+  let reason: "connect" | "grant" | "reauthorize" = options.reason ?? "connect";
+  const resolved = await resolveWorkspaceConnectionForApp({
+    appId: options.runtime.appId,
+    provider: options.provider,
+    connectionId: options.connectionId?.trim() || undefined,
+    includeDisabled: true,
+    requireConnected: false,
+  });
+  if (
+    !options.reason &&
+    resolved.connection &&
+    resolved.appAccess?.available === false
+  ) {
+    reason = "grant";
+  } else if (
+    !options.reason &&
+    resolved.connection &&
+    resolved.connection.status !== "connected"
+  ) {
+    reason = "reauthorize";
+  }
+  const connectionProvider = getWorkspaceConnectionProvider(options.provider);
+  throw new AgentConnectionRequiredError(options.message, {
+    provider: options.provider,
+    reason,
+    appId: options.runtime.appId,
+    ...(connectionProvider
+      ? {
+          source: {
+            id: options.provider,
+            kind: "workspace_connection",
+            label: connectionProvider.label,
+          },
+        }
+      : {}),
+  });
+}
+
+async function resolveOptionalConnectionBoundOAuthBearerToken(options: {
+  auth: Extract<ProviderApiAuthKind, { type: "oauth-bearer" }>;
+  runtime: ProviderApiRuntimeOptions;
+  ctx: CredentialContext;
+  workspaceProvider: string;
+  connectionId?: string | null;
+  accountId?: string | null;
+  allowUnbound?: boolean;
+}): Promise<ProviderApiResolvedCredential | null> {
+  const requestedConnectionId = options.connectionId?.trim();
+  const requestedAccountId = options.accountId?.trim();
+  let resolved: Awaited<ReturnType<typeof resolveWorkspaceConnectionForApp>>;
+  try {
+    resolved = await resolveWorkspaceConnectionForApp({
+      appId: options.runtime.appId,
+      provider: options.workspaceProvider,
+      connectionId: requestedConnectionId,
+      accountId: requestedAccountId,
+      ...(options.workspaceProvider === "bigquery"
+        ? { connectionOwnerEmail: options.ctx.userEmail }
+        : {}),
+      requireConnected: true,
+    });
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message === "Workspace connections require an authenticated user."
+    ) {
+      if (requestedConnectionId || requestedAccountId) {
+        return throwWorkspaceConnectionRequired({
+          runtime: options.runtime,
+          provider: options.workspaceProvider,
+          connectionId: requestedConnectionId,
+          message: "Sign in to use the selected workspace connection.",
+        });
+      }
+      return null;
+    }
+    throw error;
+  }
+  if (!resolved.available || !resolved.connection) {
+    if (requestedConnectionId || requestedAccountId) {
+      return throwWorkspaceConnectionRequired({
+        runtime: options.runtime,
+        provider: options.workspaceProvider,
+        connectionId: requestedConnectionId,
+        message: resolved.reason,
+      });
+    }
+    return null;
+  }
+  if (
+    options.workspaceProvider === "google_sheets" &&
+    !resolved.connection.scopes.includes(GOOGLE_SHEETS_DRIVE_SCOPE)
+  ) {
+    return throwWorkspaceConnectionRequired({
+      runtime: options.runtime,
+      provider: options.workspaceProvider,
+      connectionId: requestedConnectionId,
+      message:
+        "Google Sheets needs to be reconnected to grant file-level access.",
+      reason: "reauthorize",
+    });
+  }
+  const connectionAccountId = resolved.connection.accountId?.trim();
+  if (!connectionAccountId) {
+    if (options.allowUnbound) return null;
+    throw new Error(
+      `${options.auth.tokenLabel} workspace connection ${resolved.connection.id} is missing its OAuth account binding.`,
+    );
+  }
+  if (requestedAccountId && requestedAccountId !== connectionAccountId) {
+    throw new Error(
+      `${options.auth.tokenLabel} account binding does not match the requested workspace connection.`,
+    );
+  }
+  const credential = await resolveOAuthBearerToken({
+    auth: options.auth,
+    runtime: options.runtime,
+    ctx: options.ctx,
+    accountId: connectionAccountId,
+    ownerEmail: resolved.connection.ownerEmail,
+    connectionId: resolved.connection.id,
+    salesforceLoginUrl:
+      options.auth.oauthProvider === "salesforce" &&
+      typeof resolved.connection.config?.salesforceLoginUrl === "string"
+        ? resolved.connection.config.salesforceLoginUrl
+        : null,
+  });
+  const endpointOwner = workspaceConnectionEndpointOwner(resolved.connection);
+  return {
+    ...credential,
+    scope: endpointOwner.scope,
+    scopeId: endpointOwner.scopeId,
+    connectionId: endpointOwner.connectionId,
+    connectionLabel: resolved.connection.label,
+  };
+}
+
+function isPermanentGoogleOAuthRefreshFailure(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const oauthError = (error as { oauthError?: unknown }).oauthError;
+  return (
+    typeof oauthError === "string" &&
+    PERMANENT_GOOGLE_OAUTH_REFRESH_ERRORS.has(oauthError)
+  );
+}
+
 async function getValidOAuthAccessToken(options: {
   oauthProvider: string;
   accountId: string;
   ownerEmail: string;
   tokens: OAuthTokens;
+  preserveTokensOnPermanentFailure?: boolean;
+  salesforceLoginUrl?: string | null;
 }): Promise<string> {
   const accessToken =
     options.tokens.access_token ?? options.tokens.accessToken ?? "";
@@ -3414,16 +4946,38 @@ async function getValidOAuthAccessToken(options: {
   if (!refreshToken) return accessToken;
   if (
     options.oauthProvider === "google" ||
-    options.oauthProvider === "google-docs"
+    options.oauthProvider === "google-docs" ||
+    options.oauthProvider === "google_sheets"
   ) {
     return refreshGoogleOAuthToken(options, refreshToken);
+  }
+  if (options.oauthProvider === "figma") {
+    return refreshFigmaOAuthToken(options, refreshToken);
+  }
+  if (options.oauthProvider === "notion") {
+    return refreshNotionOAuthToken(options, refreshToken);
+  }
+  if (options.oauthProvider === "github") {
+    return refreshGitHubOAuthToken(options, refreshToken);
+  }
+  if (options.oauthProvider === "hubspot") {
+    return refreshHubSpotOAuthToken(options, refreshToken);
+  }
+  if (options.oauthProvider === "salesforce") {
+    return refreshSalesforceOAuthToken(options, refreshToken);
+  }
+  if (options.oauthProvider === "jira") {
+    return refreshJiraOAuthToken(options, refreshToken);
+  }
+  if (options.oauthProvider === "sentry") {
+    return refreshSentryOAuthToken(options, refreshToken);
   }
   throw new Error(
     `${options.oauthProvider} OAuth token is expired and automatic refresh is not configured for provider-api.`,
   );
 }
 
-async function refreshGoogleOAuthToken(
+async function refreshFigmaOAuthToken(
   options: {
     oauthProvider: string;
     accountId: string;
@@ -3432,37 +4986,695 @@ async function refreshGoogleOAuthToken(
   },
   refreshToken: string,
 ): Promise<string> {
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const [clientId, clientSecret] = await Promise.all([
+    resolveSecret("FIGMA_CLIENT_ID"),
+    resolveSecret("FIGMA_CLIENT_SECRET"),
+  ]);
   if (!clientId || !clientSecret) {
+    throw new Error(
+      "FIGMA_CLIENT_ID and FIGMA_CLIENT_SECRET are required to refresh Figma OAuth tokens.",
+    );
+  }
+  const { response, data } = await fetchBoundedOAuthRefreshJson<{
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    token_type?: string;
+  }>(
+    "https://api.figma.com/v1/oauth/token",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+      }),
+    },
+    "Figma",
+  );
+  if (!response.ok || !data.access_token) {
+    throw new Error(`Figma OAuth refresh failed (${response.status}).`);
+  }
+  const updated = {
+    ...options.tokens,
+    access_token: data.access_token,
+    token_type: data.token_type ?? "bearer",
+    expiry_date: Date.now() + (data.expires_in ?? 3600) * 1_000,
+    refresh_token: data.refresh_token ?? refreshToken,
+  };
+  await saveOAuthTokens(
+    options.oauthProvider,
+    options.accountId,
+    updated as unknown as Record<string, unknown>,
+    options.ownerEmail,
+  );
+  return data.access_token;
+}
+
+async function refreshNotionOAuthToken(
+  options: {
+    oauthProvider: string;
+    accountId: string;
+    ownerEmail: string;
+    tokens: OAuthTokens;
+  },
+  refreshToken: string,
+): Promise<string> {
+  const [clientId, clientSecret] = await Promise.all([
+    resolveSecret("NOTION_CLIENT_ID"),
+    resolveSecret("NOTION_CLIENT_SECRET"),
+  ]);
+  if (!clientId || !clientSecret) {
+    throw new Error(
+      "NOTION_CLIENT_ID and NOTION_CLIENT_SECRET are required to refresh Notion OAuth tokens.",
+    );
+  }
+  const { response, data } = await fetchBoundedOAuthRefreshJson<{
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    token_type?: string;
+  }>(
+    "https://api.notion.com/v1/oauth/token",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`,
+        "Content-Type": "application/json",
+        "Notion-Version": "2026-03-11",
+      },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+      }),
+    },
+    "Notion",
+  );
+  if (!response.ok || !data.access_token) {
+    throw new Error(`Notion OAuth refresh failed (${response.status}).`);
+  }
+  const updated = {
+    ...options.tokens,
+    access_token: data.access_token,
+    token_type: data.token_type ?? "bearer",
+    expiry_date: Date.now() + (data.expires_in ?? 3600) * 1_000,
+    refresh_token: data.refresh_token ?? refreshToken,
+  };
+  await saveOAuthTokens(
+    options.oauthProvider,
+    options.accountId,
+    updated as unknown as Record<string, unknown>,
+    options.ownerEmail,
+  );
+  return data.access_token;
+}
+
+async function refreshGitHubOAuthToken(
+  options: {
+    oauthProvider: string;
+    accountId: string;
+    ownerEmail: string;
+    tokens: OAuthTokens;
+  },
+  refreshToken: string,
+): Promise<string> {
+  const credentials = await resolveOAuthClientCredentialCandidates("GITHUB");
+  if (!credentials.length) {
+    throw new Error(
+      "GITHUB_CLIENT_ID/SECRET not set for GitHub OAuth refresh.",
+    );
+  }
+
+  let response: Response | null = null;
+  let data: {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    token_type?: string;
+  } = {};
+  for (const credential of credentials) {
+    const result = await fetchBoundedOAuthRefreshJson<{
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+      token_type?: string;
+    }>(
+      "https://github.com/login/oauth/access_token",
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          client_id: credential.clientId,
+          client_secret: credential.clientSecret,
+          grant_type: "refresh_token",
+          refresh_token: refreshToken,
+        }),
+      },
+      "GitHub",
+    );
+    response = result.response;
+    data = result.data;
+    if (response.ok && data.access_token) break;
+  }
+
+  if (!response?.ok || !data.access_token) {
+    throw new Error(`GitHub OAuth refresh failed (${response?.status ?? 0}).`);
+  }
+  const updated = {
+    ...options.tokens,
+    access_token: data.access_token,
+    refresh_token: data.refresh_token ?? refreshToken,
+    token_type: data.token_type ?? options.tokens.token_type,
+    ...(Number.isFinite(data.expires_in) && (data.expires_in ?? 0) > 0
+      ? { expiry_date: Date.now() + (data.expires_in as number) * 1_000 }
+      : {}),
+  };
+  await saveOAuthTokens(
+    options.oauthProvider,
+    options.accountId,
+    updated as unknown as Record<string, unknown>,
+    options.ownerEmail,
+  );
+  return data.access_token;
+}
+
+async function saveOAuthTokensAndLinkedJiraAccounts(options: {
+  options: {
+    oauthProvider: string;
+    accountId: string;
+    ownerEmail: string;
+    tokens: OAuthTokens;
+  };
+  previousRefreshToken: string;
+  updated: OAuthTokens;
+}): Promise<void> {
+  const serializedTokens = options.updated as unknown as Record<
+    string,
+    unknown
+  >;
+  await saveOAuthTokens(
+    options.options.oauthProvider,
+    options.options.accountId,
+    serializedTokens,
+    options.options.ownerEmail,
+  );
+
+  const accounts = await listOAuthAccountsByOwner(
+    options.options.oauthProvider,
+    options.options.ownerEmail,
+  );
+  for (const account of accounts) {
+    if (account.accountId === options.options.accountId) continue;
+    const accountRefreshToken =
+      (account.tokens.refresh_token as string | undefined) ??
+      (account.tokens.refreshToken as string | undefined);
+    if (accountRefreshToken !== options.previousRefreshToken) continue;
+    await saveOAuthTokens(
+      options.options.oauthProvider,
+      account.accountId,
+      serializedTokens,
+      options.options.ownerEmail,
+    );
+  }
+}
+
+async function refreshHubSpotOAuthToken(
+  options: {
+    oauthProvider: string;
+    accountId: string;
+    ownerEmail: string;
+    tokens: OAuthTokens;
+  },
+  refreshToken: string,
+): Promise<string> {
+  const credentials = await resolveOAuthClientCredentialCandidates("HUBSPOT");
+  if (!credentials.length) {
+    throw new Error(
+      "HUBSPOT_CLIENT_ID/SECRET not set for HubSpot OAuth refresh.",
+    );
+  }
+
+  let response: Response | null = null;
+  let data: {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    token_type?: string;
+  } = {};
+  for (const credential of credentials) {
+    const result = await fetchBoundedOAuthRefreshJson<{
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+      token_type?: string;
+    }>(
+      "https://api.hubapi.com/oauth/v3/token",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          client_id: credential.clientId,
+          client_secret: credential.clientSecret,
+          refresh_token: refreshToken,
+        }),
+      },
+      "HubSpot",
+    );
+    response = result.response;
+    data = result.data;
+    if (response.ok && data.access_token) break;
+  }
+
+  if (!response?.ok || !data.access_token) {
+    throw new Error(`HubSpot OAuth refresh failed (${response?.status ?? 0}).`);
+  }
+  const updated = {
+    ...options.tokens,
+    access_token: data.access_token,
+    refresh_token: data.refresh_token ?? refreshToken,
+    token_type: data.token_type ?? options.tokens.token_type,
+    ...(Number.isFinite(data.expires_in) && (data.expires_in ?? 0) > 0
+      ? { expiry_date: Date.now() + (data.expires_in as number) * 1_000 }
+      : {}),
+  };
+  await saveOAuthTokens(
+    options.oauthProvider,
+    options.accountId,
+    updated as unknown as Record<string, unknown>,
+    options.ownerEmail,
+  );
+  return data.access_token;
+}
+
+async function refreshSalesforceOAuthToken(
+  options: {
+    oauthProvider: string;
+    accountId: string;
+    ownerEmail: string;
+    tokens: OAuthTokens;
+    salesforceLoginUrl?: string | null;
+  },
+  refreshToken: string,
+): Promise<string> {
+  const credentials =
+    await resolveOAuthClientCredentialCandidates("SALESFORCE");
+  if (!credentials.length) {
+    throw new Error(
+      "SALESFORCE_CLIENT_ID/SECRET not set for Salesforce OAuth refresh.",
+    );
+  }
+
+  let response: Response | null = null;
+  let data: {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    token_type?: string;
+  } = {};
+  for (const credential of credentials) {
+    const result = await fetchBoundedOAuthRefreshJson<{
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+      token_type?: string;
+    }>(
+      salesforceOAuthRefreshUrl(options.salesforceLoginUrl),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          client_id: credential.clientId,
+          client_secret: credential.clientSecret,
+          refresh_token: refreshToken,
+        }),
+      },
+      "Salesforce",
+    );
+    response = result.response;
+    data = result.data;
+    if (response.ok && data.access_token) break;
+  }
+
+  if (!response?.ok || !data.access_token) {
+    throw new Error(
+      `Salesforce OAuth refresh failed (${response?.status ?? 0}).`,
+    );
+  }
+  const updated = {
+    ...options.tokens,
+    access_token: data.access_token,
+    refresh_token: data.refresh_token ?? refreshToken,
+    token_type: data.token_type ?? options.tokens.token_type,
+    ...(Number.isFinite(data.expires_in) && (data.expires_in ?? 0) > 0
+      ? { expiry_date: Date.now() + (data.expires_in as number) * 1_000 }
+      : {}),
+  };
+  await saveOAuthTokens(
+    options.oauthProvider,
+    options.accountId,
+    updated as unknown as Record<string, unknown>,
+    options.ownerEmail,
+  );
+  return data.access_token;
+}
+
+function salesforceOAuthRefreshUrl(value: string | null | undefined): string {
+  const loginUrl = value?.trim() || "https://login.salesforce.com";
+  try {
+    const url = new URL(loginUrl);
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      url.port ||
+      url.pathname !== "/" ||
+      url.search ||
+      url.hash ||
+      (url.hostname !== "login.salesforce.com" &&
+        url.hostname !== "test.salesforce.com")
+    ) {
+      throw new Error("Invalid Salesforce OAuth login URL.");
+    }
+    return `${url.origin}/services/oauth2/token`;
+  } catch {
+    throw new Error("Invalid Salesforce OAuth login URL.");
+  }
+}
+
+async function refreshJiraOAuthToken(
+  options: {
+    oauthProvider: string;
+    accountId: string;
+    ownerEmail: string;
+    tokens: OAuthTokens;
+  },
+  refreshToken: string,
+): Promise<string> {
+  const credentials = await resolveOAuthClientCredentialCandidates("JIRA");
+  if (!credentials.length) {
+    throw new Error("JIRA_CLIENT_ID/SECRET not set for Jira OAuth refresh.");
+  }
+
+  let response: Response | null = null;
+  let data: {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    token_type?: string;
+  } = {};
+  for (const credential of credentials) {
+    const result = await fetchBoundedOAuthRefreshJson<{
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+      token_type?: string;
+    }>(
+      "https://auth.atlassian.com/oauth/token",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          grant_type: "refresh_token",
+          client_id: credential.clientId,
+          client_secret: credential.clientSecret,
+          refresh_token: refreshToken,
+        }),
+      },
+      "Jira",
+    );
+    response = result.response;
+    data = result.data;
+    if (response.ok && data.access_token) break;
+  }
+
+  if (!response?.ok || !data.access_token) {
+    throw new Error(`Jira OAuth refresh failed (${response?.status ?? 0}).`);
+  }
+  const updated = {
+    ...options.tokens,
+    access_token: data.access_token,
+    refresh_token: data.refresh_token ?? refreshToken,
+    token_type: data.token_type ?? options.tokens.token_type,
+    ...(Number.isFinite(data.expires_in) && (data.expires_in ?? 0) > 0
+      ? { expiry_date: Date.now() + (data.expires_in as number) * 1_000 }
+      : {}),
+  };
+  await saveOAuthTokensAndLinkedJiraAccounts({
+    options,
+    previousRefreshToken: refreshToken,
+    updated,
+  });
+  return data.access_token;
+}
+
+async function refreshSentryOAuthToken(
+  options: {
+    oauthProvider: string;
+    accountId: string;
+    ownerEmail: string;
+    tokens: OAuthTokens;
+  },
+  refreshToken: string,
+): Promise<string> {
+  const credentials = await resolveOAuthClientCredentialCandidates("SENTRY");
+  if (!credentials.length) {
+    throw new Error(
+      "SENTRY_CLIENT_ID/SECRET not set for Sentry OAuth refresh.",
+    );
+  }
+
+  let response: Response | null = null;
+  let data: {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    token_type?: string;
+  } = {};
+  for (const credential of credentials) {
+    const result = await fetchBoundedOAuthRefreshJson<{
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+      token_type?: string;
+    }>(
+      "https://sentry.io/oauth/token/",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          client_id: credential.clientId,
+          client_secret: credential.clientSecret,
+          refresh_token: refreshToken,
+        }),
+      },
+      "Sentry",
+    );
+    response = result.response;
+    data = result.data;
+    if (response.ok && data.access_token) break;
+  }
+
+  if (!response?.ok || !data.access_token) {
+    throw new Error(`Sentry OAuth refresh failed (${response?.status ?? 0}).`);
+  }
+  const updated = {
+    ...options.tokens,
+    access_token: data.access_token,
+    refresh_token: data.refresh_token ?? refreshToken,
+    token_type: data.token_type ?? options.tokens.token_type,
+    ...(Number.isFinite(data.expires_in) && (data.expires_in ?? 0) > 0
+      ? { expiry_date: Date.now() + (data.expires_in as number) * 1_000 }
+      : {}),
+  };
+  await saveOAuthTokens(
+    options.oauthProvider,
+    options.accountId,
+    updated as unknown as Record<string, unknown>,
+    options.ownerEmail,
+  );
+  return data.access_token;
+}
+
+const OAUTH_REFRESH_TIMEOUT_MS = 10_000;
+const OAUTH_REFRESH_MAX_BYTES = 256 * 1024;
+
+async function fetchBoundedOAuthRefreshJson<T extends Record<string, unknown>>(
+  url: string,
+  init: RequestInit,
+  providerLabel: string,
+): Promise<{ response: Response; data: T }> {
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      signal: AbortSignal.timeout(OAUTH_REFRESH_TIMEOUT_MS),
+    });
+  } catch {
+    throw new Error(`${providerLabel} OAuth refresh request failed.`);
+  }
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (
+    Number.isFinite(declaredLength) &&
+    declaredLength > OAUTH_REFRESH_MAX_BYTES
+  ) {
+    throw new Error(
+      `${providerLabel} OAuth refresh response exceeded the size limit.`,
+    );
+  }
+  if (!response.body) return { response, data: {} as T };
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      length += chunk.value.byteLength;
+      if (length > OAUTH_REFRESH_MAX_BYTES) {
+        await reader.cancel();
+        break;
+      }
+      chunks.push(chunk.value);
+    }
+  } catch {
+    throw new Error(`${providerLabel} OAuth refresh request failed.`);
+  }
+  if (length > OAUTH_REFRESH_MAX_BYTES) {
+    throw new Error(
+      `${providerLabel} OAuth refresh response exceeded the size limit.`,
+    );
+  }
+  try {
+    const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    return {
+      response,
+      data:
+        parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? (parsed as T)
+          : ({} as T),
+    };
+  } catch {
+    return { response, data: {} as T };
+  }
+}
+
+async function refreshGoogleOAuthToken(
+  options: {
+    oauthProvider: string;
+    accountId: string;
+    ownerEmail: string;
+    tokens: OAuthTokens;
+    preserveTokensOnPermanentFailure?: boolean;
+  },
+  refreshToken: string,
+): Promise<string> {
+  const [scopedClientId, scopedClientSecret] = await Promise.all([
+    resolveSecret("GOOGLE_CLIENT_ID"),
+    resolveSecret("GOOGLE_CLIENT_SECRET"),
+  ]);
+  const credentialCandidates = dedupeGoogleOAuthCredentials([
+    ...(scopedClientId && scopedClientSecret
+      ? [{ clientId: scopedClientId, clientSecret: scopedClientSecret }]
+      : []),
+    ...resolveGoogleProviderCredentialCandidates(),
+  ]);
+  if (!credentialCandidates.length) {
     throw new Error(
       "GOOGLE_CLIENT_ID/SECRET not set for Google OAuth refresh.",
     );
   }
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      refresh_token: refreshToken,
-      client_id: clientId,
-      client_secret: clientSecret,
-      grant_type: "refresh_token",
-    }),
-  });
-  const data = (await res.json()) as {
+
+  let data: {
     access_token?: string;
     expires_in?: number;
     token_type?: string;
     scope?: string;
     error?: string;
     error_description?: string;
-  };
-  if (!res.ok || !data.access_token) {
-    if (data.error && PERMANENT_GOOGLE_OAUTH_REFRESH_ERRORS.has(data.error)) {
-      await deleteOAuthTokens(options.oauthProvider, options.accountId);
+  } | null = null;
+  let lastStatusText = "refresh failed";
+  for (const credentials of credentialCandidates) {
+    let res: Response;
+    try {
+      res = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          refresh_token: refreshToken,
+          client_id: credentials.clientId,
+          client_secret: credentials.clientSecret,
+          grant_type: "refresh_token",
+        }),
+      });
+    } catch (error) {
+      const isRetryableTransportError =
+        error instanceof TypeError ||
+        (typeof error === "object" &&
+          error !== null &&
+          "name" in error &&
+          error.name === "AbortError");
+      if (!isRetryableTransportError) throw error;
+      const retryableError = new Error(
+        `Google OAuth refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+      Object.assign(retryableError, { retryable: true });
+      throw retryableError;
     }
-    const detail = data.error_description ?? data.error ?? res.statusText;
-    throw new Error(`Google OAuth refresh failed: ${detail}`);
+    lastStatusText = res.statusText;
+    try {
+      data = (await res.json()) as {
+        access_token?: string;
+        expires_in?: number;
+        token_type?: string;
+        scope?: string;
+        error?: string;
+        error_description?: string;
+      };
+    } catch (error) {
+      if (res.ok) throw error;
+      data = null;
+    }
+    const retryable =
+      res.status === 408 || res.status === 429 || res.status >= 500;
+    if (res.ok && data?.access_token) break;
+    if (
+      !retryable &&
+      data?.error &&
+      PERMANENT_GOOGLE_OAUTH_REFRESH_ERRORS.has(data.error)
+    ) {
+      continue;
+    }
+    const detail = data?.error_description ?? data?.error ?? lastStatusText;
+    const error = new Error(`Google OAuth refresh failed: ${detail}`);
+    Object.assign(error, {
+      status: res.status,
+      ...(retryable ? { retryable: true } : {}),
+    });
+    throw error;
+  }
+
+  if (!data?.access_token) {
+    if (data?.error && PERMANENT_GOOGLE_OAUTH_REFRESH_ERRORS.has(data.error)) {
+      if (!options.preserveTokensOnPermanentFailure) {
+        await deleteOAuthTokens(options.oauthProvider, options.accountId);
+      }
+    }
+    const detail = data?.error_description ?? data?.error ?? lastStatusText;
+    const error = new Error(`Google OAuth refresh failed: ${detail}`);
+    if (data?.error && PERMANENT_GOOGLE_OAUTH_REFRESH_ERRORS.has(data.error)) {
+      Object.assign(error, { oauthError: data.error });
+    }
+    throw error;
   }
   const merged: OAuthTokens = {
     ...options.tokens,
@@ -3478,6 +5690,52 @@ async function refreshGoogleOAuthToken(
     options.ownerEmail,
   );
   return data.access_token;
+}
+
+function dedupeGoogleOAuthCredentials(
+  candidates: Array<{ clientId: string; clientSecret: string }>,
+): Array<{ clientId: string; clientSecret: string }> {
+  const seen = new Set<string>();
+  return candidates.filter((candidate) => {
+    if (seen.has(candidate.clientId)) return false;
+    seen.add(candidate.clientId);
+    return true;
+  });
+}
+
+async function resolveOAuthClientCredentialCandidates(
+  provider: string,
+): Promise<Array<{ clientId: string; clientSecret: string }>> {
+  const [clientId, clientSecret, integrationClientId, integrationClientSecret] =
+    await Promise.all([
+      resolveSecret(`${provider}_CLIENT_ID`),
+      resolveSecret(`${provider}_CLIENT_SECRET`),
+      resolveSecret(`${provider}_INTEGRATION_CLIENT_ID`),
+      resolveSecret(`${provider}_INTEGRATION_CLIENT_SECRET`),
+    ]);
+  const candidates = [
+    integrationClientId && integrationClientSecret
+      ? { clientId: integrationClientId, clientSecret: integrationClientSecret }
+      : null,
+    clientId && clientSecret ? { clientId, clientSecret } : null,
+  ].filter((value): value is { clientId: string; clientSecret: string } =>
+    Boolean(value),
+  );
+  if (provider === "SALESFORCE") {
+    const [consumerKey, consumerSecret] = await Promise.all([
+      resolveSecret("SALESFORCE_CONSUMER_KEY"),
+      resolveSecret("SALESFORCE_CONSUMER_SECRET"),
+    ]);
+    if (consumerKey && consumerSecret) {
+      candidates.push({ clientId: consumerKey, clientSecret: consumerSecret });
+    }
+  }
+  const seen = new Set<string>();
+  return candidates.filter((candidate) => {
+    if (seen.has(candidate.clientId)) return false;
+    seen.add(candidate.clientId);
+    return true;
+  });
 }
 
 function normalizeMethod(
@@ -3537,6 +5795,7 @@ async function fetchWithTimeout(
     headers?: Record<string, string>;
     body?: BodyInit;
     timeoutMs?: number;
+    signal?: AbortSignal;
     maxBytes?: number;
     secretValues?: string[];
     quota?: ProviderApiFetchQuotaOptions;
@@ -3554,7 +5813,9 @@ async function fetchWithTimeout(
         method,
         headers: options.headers,
         body: options.body,
-        signal: controller.signal,
+        signal: options.signal
+          ? AbortSignal.any([options.signal, controller.signal])
+          : controller.signal,
         redirect: "manual",
       };
       if (dispatcher) fetchOptions.dispatcher = dispatcher;
@@ -3641,6 +5902,51 @@ function providerQuotaExhaustedResponse(
       retryAt: detail.retryAt,
       reason: detail.reason,
     },
+  };
+}
+
+export function providerApiResponseOutcomeForUrl(
+  url: string,
+  response: Pick<ProviderApiHttpResponse, "ok" | "statusText">,
+  body: string,
+): Pick<ProviderApiHttpResponse, "ok" | "statusText"> {
+  const target = new URL(url);
+  const config = Object.values(PROVIDER_CONFIGS).find((candidate) => {
+    if (!candidate.bodyOkField) return false;
+    const base = new URL(candidate.defaultBaseUrl);
+    const path = base.pathname.replace(/\/$/, "");
+    return (
+      target.origin === base.origin &&
+      (target.pathname === path || target.pathname.startsWith(`${path}/`))
+    );
+  });
+  return config
+    ? applyBodyEnvelopeOutcome(
+        {
+          ok: response.ok,
+          statusText: response.statusText,
+          json: tryParseJson(body),
+        },
+        config,
+      )
+    : response;
+}
+
+function applyBodyEnvelopeOutcome<
+  T extends Pick<ProviderApiHttpResponse, "ok" | "statusText" | "json">,
+>(response: T, config: ProviderApiConfig): T {
+  const field = config.bodyOkField;
+  if (!field || !response.ok) return response;
+  const body = response.json;
+  if (!body || typeof body !== "object" || Array.isArray(body)) return response;
+  if ((body as Record<string, unknown>)[field] !== false) return response;
+  const error = stringOrNull((body as Record<string, unknown>).error);
+  return {
+    ...response,
+    ok: false,
+    statusText: error
+      ? `${response.statusText} (${config.label} reported ${field}: false — ${error})`
+      : `${response.statusText} (${config.label} reported ${field}: false)`,
   };
 }
 
@@ -3868,7 +6174,6 @@ function clampMaxBytes(maxBytes: number | undefined): number {
   return Math.max(1_000, Math.min(MAX_MAX_BYTES, Math.floor(maxBytes!)));
 }
 
-/** Resolve a dot-path from a parsed JSON object, e.g. "meta.next_cursor". */
 function dotGet(obj: unknown, path: string): unknown {
   if (!path) return obj;
   let current: unknown = obj;
@@ -3879,18 +6184,19 @@ function dotGet(obj: unknown, path: string): unknown {
   return current;
 }
 
-/**
- * Handle saveToFile: write the full provider-api response body to a workspace
- * file and return a compact summary.
- */
 async function handleSaveToFile(
   filePath: string,
   responseText: string,
   contentType: string | null,
   status: number,
+  ok = true,
 ): Promise<unknown> {
-  const { writeWorkspaceFile, SAVE_TO_FILE_MAX_BYTES: maxSaveBytes } =
-    await import("../workspace-files/store.js");
+  const {
+    writeWorkspaceFile,
+    SAVE_TO_FILE_MAX_BYTES: maxSaveBytes,
+    isScratchWorkspacePath,
+    toWorkspaceFileCard,
+  } = await import("../workspace-files/store.js");
   const { getRequestOrgId, getRequestUserEmail } =
     await import("../server/request-context.js");
 
@@ -3908,26 +6214,37 @@ async function handleSaveToFile(
     );
   }
 
+  const scratchPath = isScratchWorkspacePath(filePath);
+  if (!ok && !scratchPath) {
+    throw new Error(
+      `Refusing to save a failed provider response to durable workspace file "${filePath}" (status ${status}). Use a scratch/... path for diagnostics.`,
+    );
+  }
+
   const mimeType = contentType?.split(";")[0].trim() ?? "text/plain";
-  await writeWorkspaceFile(scope, filePath, responseText, mimeType, {
-    maxFileBytes: maxSaveBytes,
-  });
+  const meta = await writeWorkspaceFile(
+    scope,
+    filePath,
+    responseText,
+    mimeType,
+    {
+      maxFileBytes: maxSaveBytes,
+    },
+  );
   const bytes = Buffer.byteLength(responseText, "utf8");
   const preview = responseText.slice(0, 2000);
   return {
     savedToFile: true,
     savedTo: filePath,
     status,
+    ok,
     bytes,
     contentType: mimeType,
     preview: preview.length < responseText.length ? `${preview}…` : preview,
+    ...(scratchPath ? {} : { file: toWorkspaceFileCard(meta) }),
   };
 }
 
-/**
- * Execute paginated requests, accumulating items across pages.
- * Returns the accumulated items array and the last response for metadata.
- */
 async function fetchAllPages(
   config: FetchAllPagesConfig,
   executeOnePage: (extra?: {
@@ -3944,6 +6261,8 @@ async function fetchAllPages(
   pageCount: number;
   lastStatus: number;
   lastContentType: string | null;
+  truncated: boolean;
+  nextCursor: string | null;
 }> {
   const maxPages = Math.min(
     Number.isFinite(config.maxPages) && config.maxPages! > 0
@@ -3957,6 +6276,7 @@ async function fetchAllPages(
   let pageCount = 0;
   let lastStatus = 0;
   let lastContentType: string | null = null;
+  let truncated = false;
 
   if (!config.cursorParam && !config.cursorBodyPath) {
     throw new Error(
@@ -4002,7 +6322,6 @@ async function fetchAllPages(
       body = page.text;
     }
 
-    // Extract items
     if (config.itemsPath) {
       const extracted = dotGet(body, config.itemsPath);
       if (Array.isArray(extracted)) {
@@ -4014,7 +6333,6 @@ async function fetchAllPages(
       items.push(body);
     }
 
-    // Extract next cursor
     const nextCursor = dotGet(body, config.cursorPath);
     if (
       !nextCursor ||
@@ -4022,12 +6340,21 @@ async function fetchAllPages(
       nextCursor === null ||
       nextCursor === cursor
     ) {
+      truncated = false;
       break;
     }
     cursor = String(nextCursor);
+    truncated = pageCount >= maxPages;
   }
 
-  return { items, pageCount, lastStatus, lastContentType };
+  return {
+    items,
+    pageCount,
+    lastStatus,
+    lastContentType,
+    truncated,
+    nextCursor: truncated ? (cursor ?? null) : null,
+  };
 }
 
 function fingerprint(value: string): string {

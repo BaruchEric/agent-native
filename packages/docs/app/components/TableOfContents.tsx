@@ -1,12 +1,74 @@
-import { useEffect, useState } from "react";
+import { useT } from "@agent-native/core/client/i18n";
+import { Button } from "@agent-native/toolkit/ui/button";
+import { IconCheck, IconCopy, IconMessage, IconX } from "@tabler/icons-react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
+
+import { useAssistantReady } from "../shell-ready";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "./ui/tooltip";
 
 interface TocItem {
   id: string;
   label: string;
-  /** Heading depth: 2=top-level, 3=indented, 4=double-indented */
   level?: number;
-  /** Legacy boolean alias — treated as level 3 when true */
   indent?: boolean;
+}
+
+const LazyAgentAskPopover = lazy(() =>
+  import("@agent-native/toolkit/app/chat").then(({ AgentAskPopover }) => ({
+    default: AgentAskPopover,
+  })),
+);
+
+function DocsAskPopover() {
+  const t = useT();
+  const [requested, setRequested] = useState(false);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const ensureAssistantReady = useAssistantReady();
+  const className =
+    "mt-4 w-full cursor-pointer border border-[var(--docs-border)] bg-transparent text-[var(--fg-secondary)] hover:bg-[var(--bg-secondary)] hover:text-[var(--fg)]";
+  const icon = <IconMessage aria-hidden="true" size={16} stroke={1.5} />;
+  const trigger = (
+    <Button
+      type="button"
+      variant="outline"
+      size="sm"
+      className={className}
+      aria-busy={loading || requested}
+      disabled={loading}
+      onClick={async () => {
+        setLoading(true);
+        await ensureAssistantReady();
+        setRequested(true);
+        setOpen(true);
+        setLoading(false);
+      }}
+    >
+      {icon}
+      {t("header.askAssistant")}
+    </Button>
+  );
+  if (!requested) return trigger;
+  return (
+    <Suspense fallback={trigger}>
+      <LazyAgentAskPopover
+        label={t("header.askAssistant")}
+        title={t("header.askAssistant")}
+        icon={icon}
+        placeholder={t("agent.emptyState")}
+        prompt=""
+        draftScope="docs:table-of-contents-ask"
+        className={className}
+        open={open}
+        onOpenChange={setOpen}
+      />
+    </Suspense>
+  );
 }
 
 function findScrollParent(el: HTMLElement | null): HTMLElement | Window {
@@ -43,15 +105,58 @@ export function getActiveTocId(
   return active;
 }
 
-/** Resolve indent depth (in multiples of 12px) from a TocItem. */
+type MarkdownWriter = (text: string) => Promise<void> | void;
+
+export async function copyMarkdownFromUrl(
+  markdownUrl: string,
+  writeText: MarkdownWriter = (text) => {
+    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+      throw new Error("Clipboard API is unavailable");
+    }
+    return navigator.clipboard.writeText(text);
+  },
+) {
+  const response = await fetch(markdownUrl, {
+    headers: {
+      Accept: "text/markdown, text/plain;q=0.9, */*;q=0.1",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch Markdown: ${response.status}`);
+  }
+  await writeText(await response.text());
+}
+
 function indentDepth(item: TocItem): number {
-  if (item.level && item.level >= 3) return item.level - 2; // h3→1, h4→2
+  if (item.level && item.level >= 3) return item.level - 2;
   if (item.indent) return 1;
   return 0;
 }
 
-export default function TableOfContents({ items }: { items: TocItem[] }) {
+interface TableOfContentsProps {
+  items: TocItem[];
+  markdownUrl?: string;
+}
+
+export default function TableOfContents({
+  items,
+  markdownUrl,
+}: TableOfContentsProps) {
   const [activeId, setActiveId] = useState<string>("");
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">(
+    "idle",
+  );
+  const [isCopying, setIsCopying] = useState(false);
+  const copyResetTimer = useRef<number | null>(null);
+  const t = useT();
+
+  useEffect(() => {
+    return () => {
+      if (copyResetTimer.current !== null) {
+        window.clearTimeout(copyResetTimer.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const ids = items.map((item) => item.id);
@@ -97,12 +202,69 @@ export default function TableOfContents({ items }: { items: TocItem[] }) {
     };
   }, [items]);
 
+  const resetCopyStatusSoon = () => {
+    if (copyResetTimer.current !== null) {
+      window.clearTimeout(copyResetTimer.current);
+    }
+    copyResetTimer.current = window.setTimeout(() => {
+      setCopyStatus("idle");
+      copyResetTimer.current = null;
+    }, 1600);
+  };
+
+  const handleCopyMarkdown = async () => {
+    if (!markdownUrl || isCopying) return;
+    setIsCopying(true);
+    try {
+      await copyMarkdownFromUrl(markdownUrl);
+      setCopyStatus("copied");
+    } catch {
+      setCopyStatus("error");
+    } finally {
+      setIsCopying(false);
+      resetCopyStatusSoon();
+    }
+  };
+
+  const copyTooltip =
+    copyStatus === "copied"
+      ? t("docs.copiedMarkdown")
+      : copyStatus === "error"
+        ? t("docs.copyMarkdownError")
+        : t("docs.copyMarkdown");
+
   return (
     <aside className="hidden w-[200px] shrink-0 xl:block">
-      <nav className="sticky top-[65px] max-h-[calc(100vh-65px)] overflow-y-auto pb-8 pt-8 pl-4">
-        <p className="mb-2 text-xs font-semibold text-[var(--fg-secondary)]">
-          On this page
-        </p>
+      <nav className="sticky top-[65px] max-h-[calc(100vh-65px)] overflow-y-auto pb-8 pt-8 ps-4">
+        <div className="mb-2 flex items-center gap-2">
+          <p className="min-w-0 flex-1 text-xs font-semibold text-[var(--fg-secondary)]">
+            {t("docs.onThisPage")}
+          </p>
+          {markdownUrl ? (
+            <TooltipProvider delayDuration={150}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label={t("docs.copyMarkdown")}
+                    disabled={isCopying}
+                    onClick={handleCopyMarkdown}
+                    className="inline-flex size-7 shrink-0 items-center justify-center rounded-md text-[var(--fg-secondary)] transition hover:bg-[var(--bg-secondary)] hover:text-[var(--fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--docs-accent)] disabled:cursor-wait disabled:opacity-60"
+                  >
+                    {copyStatus === "copied" ? (
+                      <IconCheck className="size-3.5" />
+                    ) : copyStatus === "error" ? (
+                      <IconX className="size-3.5" />
+                    ) : (
+                      <IconCopy className="size-3.5" />
+                    )}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="left">{copyTooltip}</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : null}
+        </div>
         <ul className="list-none space-y-0 p-0">
           {items.map((item) => {
             const depth = indentDepth(item);
@@ -111,7 +273,9 @@ export default function TableOfContents({ items }: { items: TocItem[] }) {
                 <a
                   href={`#${item.id}`}
                   className={`toc-link${activeId === item.id ? " is-active" : ""}`}
-                  style={depth > 0 ? { paddingLeft: 12 * depth } : undefined}
+                  style={
+                    depth > 0 ? { paddingInlineStart: 12 * depth } : undefined
+                  }
                 >
                   {item.label}
                 </a>
@@ -119,6 +283,7 @@ export default function TableOfContents({ items }: { items: TocItem[] }) {
             );
           })}
         </ul>
+        <DocsAskPopover />
       </nav>
     </aside>
   );

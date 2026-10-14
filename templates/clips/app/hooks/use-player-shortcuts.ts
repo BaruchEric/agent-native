@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+
 import type { VideoPlayerHandle } from "@/components/player/video-player";
 import {
   parsePlaybackSpeed,
@@ -16,22 +17,6 @@ export interface UsePlayerShortcutsOpts {
   enabled?: boolean;
 }
 
-/**
- * Wires up Clips' player-page keyboard shortcuts.
- *
- *  Space / K      → play/pause
- *  J / ←          → back 6s
- *  L / →          → forward 6s
- *  Shift+← / →   → previous/next chapter
- *  ↑ / ↓          → volume up/down 10%
- *  F              → fullscreen
- *  M              → mute
- *  > / .          → speed up
- *  < / ,          → speed down
- *  C              → toggle captions
- *
- * Ignores events when focus is inside an input/textarea/contenteditable.
- */
 export function usePlayerShortcuts(opts: UsePlayerShortcutsOpts) {
   const { playerRef, chapters = [], enabled = true } = opts;
 
@@ -39,6 +24,7 @@ export function usePlayerShortcuts(opts: UsePlayerShortcutsOpts) {
     if (!enabled) return;
 
     function onKey(e: KeyboardEvent) {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (shouldIgnore(e.target)) return;
       const player = playerRef.current;
       if (!player) return;
@@ -56,40 +42,42 @@ export function usePlayerShortcuts(opts: UsePlayerShortcutsOpts) {
         case "j":
         case "J":
           e.preventDefault();
-          v.currentTime = Math.max(0, v.currentTime - 6);
+          player.seek(Math.max(0, v.currentTime * 1000 - 6000));
           break;
         case "l":
         case "L":
           e.preventDefault();
-          v.currentTime = Math.min(
-            v.duration || v.currentTime,
-            v.currentTime + 6,
+          player.seek(
+            Math.min(
+              (v.duration || v.currentTime) * 1000,
+              v.currentTime * 1000 + 6000,
+            ),
           );
           break;
         case "ArrowLeft":
           e.preventDefault();
           if (e.shiftKey) {
-            // Previous chapter
             const currentMs = v.currentTime * 1000;
             const prev = [...chapters]
               .reverse()
               .find((c) => c.startMs < currentMs - 500);
-            v.currentTime = prev ? prev.startMs / 1000 : 0;
+            player.seek(prev ? prev.startMs : 0);
           } else {
-            v.currentTime = Math.max(0, v.currentTime - 6);
+            player.seek(Math.max(0, v.currentTime * 1000 - 6000));
           }
           break;
         case "ArrowRight":
           e.preventDefault();
           if (e.shiftKey) {
-            // Next chapter
             const currentMs = v.currentTime * 1000;
             const next = chapters.find((c) => c.startMs > currentMs + 500);
-            if (next) v.currentTime = next.startMs / 1000;
+            if (next) player.seek(next.startMs);
           } else {
-            v.currentTime = Math.min(
-              v.duration || v.currentTime,
-              v.currentTime + 6,
+            player.seek(
+              Math.min(
+                (v.duration || v.currentTime) * 1000,
+                v.currentTime * 1000 + 6000,
+              ),
             );
           }
           break;

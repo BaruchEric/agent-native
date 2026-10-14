@@ -1,11 +1,12 @@
-import {
-  createH3SSRHandler,
-  DEFAULT_SSR_CACHE_HEADERS,
-} from "@agent-native/core/server/ssr-handler";
-import { buildMarkdownResponseHeaders } from "../../../core/src/agent-web/index";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+
+import {
+  createH3SSRHandler,
+  resolveSsrCacheHeaders,
+  resolveSsrCacheKeyHeaders,
+} from "@agent-native/core/server/ssr-handler";
 import {
   createError,
   getRequestHeader,
@@ -14,7 +15,23 @@ import {
   type H3Event,
 } from "h3";
 
+import { buildMarkdownResponseHeaders } from "../../../core/src/agent-web/index";
+import { isLegacyChunkRecoveryRequest } from "../../../core/src/shared/route-chunk-recovery-bootstrap.js";
+import {
+  applyCommunityAppSsrCacheHeaders,
+  applyDocsSsrCacheKeyHeaders,
+  isCloudGettingStartedPath,
+} from "../../lib/ssr-cache";
+import {
+  acceptsMarkdown,
+  agentWebAssetContentType,
+  appendVary,
+  buildMarkdownNotFoundResponse,
+} from "../lib/agent-web-responses";
+import { fetchMarkdownMirror } from "../lib/markdown-mirror";
+
 const SITE_URL = "https://www.agent-native.com";
+const MARKDOWN_REWRITE_PREFIX = "/__agent-native-markdown";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const ssrHandler = createH3SSRHandler(
@@ -25,12 +42,12 @@ export default async function docsPageHandler(event: H3Event) {
   const agentWebAsset = readAgentWebAssetForRequest(event);
   if (agentWebAsset) {
     setHeader(event, "content-type", agentWebAsset.contentType);
-    setDefaultSsrCacheHeaders(event);
+    setSsrCacheHeaders(event);
     setHeader(event, "link", `<${SITE_URL}/llms.txt>; rel="llms-txt"`);
     return agentWebAsset.content;
   }
 
-  const markdown = readMarkdownForRequest(event);
+  const markdown = await readMarkdownForRequest(event);
   if (markdown) {
     for (const [name, value] of Object.entries(
       buildMarkdownResponseHeaders({
@@ -42,34 +59,52 @@ export default async function docsPageHandler(event: H3Event) {
     )) {
       setHeader(event, name, value);
     }
-    setDefaultSsrCacheHeaders(event);
-    // These page URLs can return either HTML or markdown based on Accept.
-    // Keep the variants isolated in browser/CDN caches.
-    setHeader(event, "vary", "Accept");
+    setSsrCacheHeaders(event);
+    setHeader(event, "vary", "Accept, Accept-Encoding");
+    for (const [k, v] of Object.entries(resolveSsrCacheKeyHeaders())) {
+      setHeader(event, k, v);
+    }
     return markdown.content;
   }
 
-  if (getRequestURL(event).pathname.endsWith(".md")) {
+  if (markdownRequestPath(event).endsWith(".md")) {
     throw createError({ statusCode: 404, statusMessage: "Markdown not found" });
   }
 
   const response = await ssrHandler(event);
-  return responseWithVaryAccept(response);
+  if (
+    acceptsMarkdown(getRequestHeader(event, "accept")) &&
+    response.status === 404
+  ) {
+    return buildMarkdownNotFoundResponse();
+  }
+  const requestUrl = getRequestURL(event);
+  return responseWithVaryAccept(response, requestUrl);
 }
 
-function setDefaultSsrCacheHeaders(event: H3Event) {
-  // Keep docs-only public text/markdown assets on the same framework SSR cache
-  // policy as HTML and React Router .data. Do not move these back to
-  // netlify.toml: core owns the browser/CDN/Netlify durable header set so every
-  // provider and template gets the same short-fresh/long-SWR behavior.
-  for (const [name, value] of Object.entries(DEFAULT_SSR_CACHE_HEADERS)) {
+function setSsrCacheHeaders(event: H3Event) {
+  for (const [name, value] of Object.entries(resolveSsrCacheHeaders())) {
     setHeader(event, name, value);
+  }
+  for (const [k, v] of Object.entries(resolveSsrCacheKeyHeaders())) {
+    setHeader(event, k, v);
   }
 }
 
-function responseWithVaryAccept(response: Response): Response {
+function responseWithVaryAccept(response: Response, requestUrl: URL): Response {
   const headers = new Headers(response.headers);
-  appendVary(headers, "Accept");
+  appendVary(headers, ["Accept", "Accept-Encoding"]);
+  const isLegacyRecovery = isLegacyChunkRecoveryRequest(requestUrl);
+  applyDocsSsrCacheKeyHeaders(headers, {
+    varyByQuery: isCloudGettingStartedPath(requestUrl),
+    varyByLegacyRecovery: isLegacyRecovery,
+  });
+  applyCommunityAppSsrCacheHeaders(
+    headers,
+    requestUrl.pathname,
+    response.status,
+    { isLegacyRecovery },
+  );
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -77,33 +112,11 @@ function responseWithVaryAccept(response: Response): Response {
   });
 }
 
-function appendVary(headers: Headers, value: string) {
-  const existing = headers.get("vary");
-  if (!existing) {
-    headers.set("vary", value);
-    return;
-  }
-
-  const lowerValue = value.toLowerCase();
-  const alreadyPresent = existing
-    .split(",")
-    .some((part) => part.trim().toLowerCase() === lowerValue);
-  if (!alreadyPresent) {
-    headers.set("vary", `${existing}, ${value}`);
-  }
-}
-
 function readAgentWebAssetForRequest(
   event: H3Event,
 ): { content: string; contentType: string } | undefined {
   const pathname = getRequestURL(event).pathname.replace(/\/+$/, "") || "/";
-  const contentTypeByPath: Record<string, string> = {
-    "/llms.txt": "text/plain; charset=utf-8",
-    "/llms-full.txt": "text/plain; charset=utf-8",
-    "/robots.txt": "text/plain; charset=utf-8",
-    "/sitemap.xml": "application/xml; charset=utf-8",
-  };
-  const contentType = contentTypeByPath[pathname];
+  const contentType = agentWebAssetContentType(pathname);
   if (!contentType) return undefined;
 
   const relativePath = pathname.replace(/^\//, "");
@@ -116,27 +129,49 @@ function readAgentWebAssetForRequest(
   };
 }
 
-function readMarkdownForRequest(
+async function readMarkdownForRequest(
   event: H3Event,
-): { content: string; pagePath: string; relativePath: string } | undefined {
-  const requestUrl = getRequestURL(event);
-  const acceptsMarkdown =
-    getRequestHeader(event, "accept")?.includes("text/markdown") ?? false;
-  const pathname = requestUrl.pathname.replace(/\/+$/, "") || "/";
+): Promise<
+  { content: string; pagePath: string; relativePath: string } | undefined
+> {
+  const wantsMarkdown = acceptsMarkdown(getRequestHeader(event, "accept"));
+  const pathname = markdownRequestPath(event).replace(/\/+$/, "") || "/";
   const isMarkdownPath = pathname.endsWith(".md");
-  if (!isMarkdownPath && !acceptsMarkdown) return undefined;
+  if (!isMarkdownPath && !wantsMarkdown) return undefined;
 
   const relativePath = markdownRelativePathForRequest(pathname, isMarkdownPath);
   if (!relativePath) return undefined;
 
-  const absolutePath = findPublicFile(relativePath);
-  if (!absolutePath) return undefined;
+  const content = await readMarkdownContent(relativePath, event);
+  if (content === undefined) return undefined;
 
   return {
-    content: fs.readFileSync(absolutePath, "utf8"),
+    content,
     pagePath: pagePathForMarkdownRequest(pathname, relativePath),
     relativePath,
   };
+}
+
+function markdownRequestPath(event: H3Event): string {
+  const pathname = getRequestURL(event).pathname;
+  if (pathname === MARKDOWN_REWRITE_PREFIX) return "/";
+  if (pathname.startsWith(`${MARKDOWN_REWRITE_PREFIX}/`)) {
+    return pathname.slice(MARKDOWN_REWRITE_PREFIX.length) || "/";
+  }
+  return pathname;
+}
+
+async function readMarkdownContent(
+  relativePath: string,
+  event: H3Event,
+): Promise<string | undefined> {
+  const absolutePath = findPublicFile(relativePath);
+  if (absolutePath) return fs.readFileSync(absolutePath, "utf8");
+
+  const mirror = await fetchMarkdownMirror(relativePath, event);
+  if (mirror.kind === "found") return mirror.content;
+  if (mirror.kind === "absent") return undefined;
+  throw createError({ statusCode: 502, statusMessage: mirror.reason });
 }
 
 function markdownRelativePathForRequest(

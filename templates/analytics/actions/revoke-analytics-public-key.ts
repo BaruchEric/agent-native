@@ -1,9 +1,10 @@
-import { defineAction } from "@agent-native/core";
+import { defineAction } from "@agent-native/core/action";
 import {
   getRequestOrgId,
   getRequestUserEmail,
 } from "@agent-native/core/server";
 import { z } from "zod";
+
 import { revokeAnalyticsPublicKey } from "../server/lib/first-party-analytics.js";
 
 function resolveScope() {

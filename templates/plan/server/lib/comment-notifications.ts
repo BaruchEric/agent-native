@@ -2,13 +2,20 @@ import {
   emailStrong,
   getAppProductionUrl,
   isEmailConfigured,
+  isTestIdentity,
   renderEmail,
   sendEmail,
 } from "@agent-native/core/server";
 import { eq } from "drizzle-orm";
-import { getDb, schema } from "../db/index.js";
-import { extractCommentMentions } from "../../shared/comment-context.js";
+
+import {
+  SOURCE_AUTHOR_COMMENT_MENTION_EMAIL,
+  extractCommentMentions,
+} from "../../shared/comment-context.js";
 import type { PlanBundle, PlanComment } from "../../shared/types.js";
+import { getDb, schema } from "../db/index.js";
+
+export const PLAN_COMMENT_EMAIL_ID = "plan.plan-comment";
 
 type CommentNotificationInput = {
   bundle: PlanBundle;
@@ -27,17 +34,9 @@ function normalizeEmail(email: string | null | undefined): string | null {
 }
 
 function isSyntheticQaEmail(email: string): boolean {
-  const trimmed = email.trim().toLowerCase();
-  const at = trimmed.lastIndexOf("@");
-  if (at <= 0) return false;
-  const local = trimmed.slice(0, at);
-  const domain = trimmed.slice(at + 1);
   return (
-    local.includes("+qa") &&
-    (domain === "example.test" ||
-      domain.endsWith(".test") ||
-      domain === "example.invalid" ||
-      domain.endsWith(".invalid"))
+    email.trim().toLowerCase() === SOURCE_AUTHOR_COMMENT_MENTION_EMAIL ||
+    isTestIdentity(email)
   );
 }
 
@@ -149,9 +148,11 @@ export function planCommentNotificationRecipients(input: {
   comment: PlanComment;
   comments: PlanComment[];
   planOwnerEmail?: string | null;
+  sourceAuthorEmail?: string | null;
 }): NotificationRecipient[] {
   if (input.comment.createdBy !== "human") return [];
   const actorEmail = normalizeEmail(input.comment.authorEmail);
+  const sourceAuthorEmail = normalizeEmail(input.sourceAuthorEmail);
   const recipients = new Map<string, NotificationRecipient>();
   const addRecipient = (
     email: string | null | undefined,
@@ -165,12 +166,22 @@ export function planCommentNotificationRecipients(input: {
     recipients.set(normalized, { email: normalized, reason });
   };
 
-  addRecipient(input.planOwnerEmail, "plan-owner");
   const mentionedPeople =
     input.comment.mentions && input.comment.mentions.length > 0
       ? input.comment.mentions
       : extractCommentMentions(input.comment.message);
+  const mentionsSourceAuthor = mentionedPeople.some(
+    (mention) =>
+      normalizeEmail(mention.email) === SOURCE_AUTHOR_COMMENT_MENTION_EMAIL,
+  );
+  if (!(mentionsSourceAuthor && sourceAuthorEmail)) {
+    addRecipient(input.planOwnerEmail, "plan-owner");
+  }
   for (const mention of mentionedPeople) {
+    if (normalizeEmail(mention.email) === SOURCE_AUTHOR_COMMENT_MENTION_EMAIL) {
+      addRecipient(sourceAuthorEmail, "mention");
+      continue;
+    }
     addRecipient(mention.email, "mention");
   }
 
@@ -188,40 +199,64 @@ export function planCommentNotificationRecipients(input: {
   return Array.from(recipients.values());
 }
 
+export function renderPlanCommentEmail(input: {
+  actor: string;
+  app: string;
+  planTitle: string;
+  planUrl: string;
+  message: string;
+  isReply: boolean;
+  reason: NotificationRecipient["reason"];
+}) {
+  const actionText =
+    input.reason === "mention"
+      ? "mentioned you in a comment on"
+      : input.reason === "plan-owner"
+        ? "left a comment on your plan"
+        : "replied in a comment thread you participated in";
+  return {
+    subject: input.isReply
+      ? `${input.actor} replied to a comment on "${input.planTitle}"`
+      : `${input.actor} commented on "${input.planTitle}"`,
+    ...renderEmail({
+      preheader: `${input.actor} ${actionText} on ${input.app}.`,
+      heading: input.isReply
+        ? "New reply on your plan"
+        : "New comment on your plan",
+      paragraphs: [
+        `${emailStrong(input.actor)} ${actionText} ${emailStrong(input.planTitle)}.`,
+        `Comment: "${commentExcerpt(input.message)}"`,
+      ],
+      cta: { label: "Open plan", url: input.planUrl },
+      footer:
+        input.reason === "plan-owner"
+          ? "You received this because you own this plan."
+          : input.reason === "mention"
+            ? "You received this because you were mentioned in this comment."
+            : "You received this because you participated in this comment thread.",
+    }),
+  };
+}
+
 async function sendPlanCommentNotification(input: {
   recipient: NotificationRecipient;
   comment: PlanComment;
   planTitle: string;
   planId: string;
 }) {
-  const actor = actorName(input.comment);
-  const app = appName();
-  const isReply = Boolean(input.comment.parentCommentId);
-  const subject = isReply
-    ? `${actor} replied to a comment on "${input.planTitle}"`
-    : `${actor} commented on "${input.planTitle}"`;
-  const actionText =
-    input.recipient.reason === "mention"
-      ? "mentioned you in a comment on"
-      : input.recipient.reason === "plan-owner"
-        ? "left a comment on your plan"
-        : "replied in a comment thread you participated in";
-  const { html, text } = renderEmail({
-    preheader: `${actor} ${actionText} on ${app}.`,
-    heading: isReply ? "New reply on your plan" : "New comment on your plan",
-    paragraphs: [
-      `${emailStrong(actor)} ${actionText} ${emailStrong(input.planTitle)}.`,
-      `Comment: "${commentExcerpt(input.comment.message)}"`,
-    ],
-    cta: { label: "Open plan", url: planUrl(input.planId) },
-    footer:
-      input.recipient.reason === "plan-owner"
-        ? "You received this because you own this plan."
-        : input.recipient.reason === "mention"
-          ? "You received this because you were mentioned in this comment."
-          : "You received this because you participated in this comment thread.",
+  await sendEmail({
+    ...renderPlanCommentEmail({
+      actor: actorName(input.comment),
+      app: appName(),
+      planTitle: input.planTitle,
+      planUrl: planUrl(input.planId),
+      message: input.comment.message,
+      isReply: Boolean(input.comment.parentCommentId),
+      reason: input.recipient.reason,
+    }),
+    to: input.recipient.email,
+    templateId: PLAN_COMMENT_EMAIL_ID,
   });
-  await sendEmail({ to: input.recipient.email, subject, html, text });
 }
 
 export async function notifyPlanCommentRecipients({
@@ -229,7 +264,7 @@ export async function notifyPlanCommentRecipients({
   insertedCommentIds,
   priorComments,
 }: CommentNotificationInput): Promise<void> {
-  if (insertedCommentIds.length === 0 || !isEmailConfigured()) return;
+  if (insertedCommentIds.length === 0 || !(await isEmailConfigured())) return;
 
   const db = getDb();
   const [planRow] = await db
@@ -237,10 +272,12 @@ export async function notifyPlanCommentRecipients({
       id: schema.plans.id,
       title: schema.plans.title,
       ownerEmail: schema.plans.ownerEmail,
+      sourceAuthorEmail: schema.plans.sourceAuthorEmail,
     })
     .from(schema.plans)
     .where(eq(schema.plans.id, bundle.plan.id));
   const planOwnerEmail = planRow?.ownerEmail ?? null;
+  const sourceAuthorEmail = planRow?.sourceAuthorEmail ?? null;
   const planTitle = planRow?.title ?? bundle.plan.title;
   const insertedById = new Map(
     bundle.comments
@@ -260,6 +297,7 @@ export async function notifyPlanCommentRecipients({
       comment,
       comments: commentsForRecipients,
       planOwnerEmail,
+      sourceAuthorEmail,
     });
     for (const recipient of recipients) {
       try {

@@ -1,61 +1,74 @@
 # {{APP_NAME}} - Agent Guide
 
-This is a headless Agent Native app. It starts with actions instead of a browser UI, so the first useful primitive is callable from the agent, CLI, and action runtime.
-
-This app is not stateless. The Agent Native runtime uses SQL-backed stores for app state, settings, auth/session data, resources, and other framework capabilities when those surfaces are used. Local development can use SQLite at `data/app.db`; hosted or long-lived deployments should set `DATABASE_URL` to a persistent database.
-
-## Working In This App
-
-- Prefer actions in `actions/` for every app operation. Do not create REST wrappers around actions.
-- Keep action inputs validated with Zod and return structured data, not JSON strings.
-- Do not hardcode API keys, tokens, webhook URLs, private data, or credential-looking literals.
-- `actions/run.ts` is the CLI dispatcher for `pnpm action ...`, not an app
-  action. Leave it in place and add callable primitives as separate
-  `actions/<name>.ts` files.
-- There is intentionally no `app/` UI shell in this scaffold. When you need a browser UI, use the Chat template as the UI on-ramp and keep `agent-native add` for integration blueprints.
-
-## Framework Docs Lookup
-
-Version-matched Agent Native docs ship with `@agent-native/core` in
-`node_modules/@agent-native/core/docs`.
-
-- Use `pnpm action docs-search --query "<topic>"` to search framework docs,
-  bundled `AGENTS.md`, and codebase skills.
-- Use `pnpm action docs-search --slug <slug>` to read a full page. Start with
-  `actions`, `pure-agent-apps`, `automations`, `recurring-jobs`,
-  `a2a-protocol`, `external-agents`, `mcp-protocol`, `database`, `sharing`,
-  and `security` for advanced headless workflows.
-- Use `pnpm action docs-search --list` to see everything available.
-- If the action runner is unavailable, read
-  `node_modules/@agent-native/core/docs/AGENTS.md` and search
-  `node_modules/@agent-native/core/docs/content/` directly with `rg`.
-
-Read these local package docs before implementing advanced Agent Native
-features. Prefer this app's own `AGENTS.md` for app-specific rules.
-
-## Actions
-
-| Action      | Args              | Purpose                 |
-| ----------- | ----------------- | ----------------------- |
-| `hello`     | `[--name <name>]` | Return a greeting       |
-| `db-schema` |                   | Show SQL schema         |
-| `db-query`  | `--sql "SELECT"`  | Run a scoped SELECT     |
-| `db-exec`   | `--sql "UPDATE"`  | Last-resort maintenance |
-
-Run actions from this app root:
-
-```bash
-pnpm action hello --name Builder
-```
-
-Run the app-agent loop against those actions:
-
-```bash
-pnpm agent "Call the hello action for Builder and explain the result"
-```
+This headless app starts with callable actions, not a browser UI. Runtime state,
+auth, and framework stores use PostgreSQL; local development uses PGlite at
+`DATABASE_URL=pglite:./data/pglite`, while hosted deployments need persistent
+PostgreSQL.
 
 ## Skills
 
-Skills in `.agents/skills/` provide detailed guidance. Read
-`.agents/skills/agent-native-docs/SKILL.md` before using advanced Agent Native
-framework APIs, generated-app features, automations, A2A, sharing, or MCP.
+Read linked guides before changing that area; use `rg --hidden --follow` to
+search hidden or linked directories. This scaffold ships
+`.agents/skills/actions/SKILL.md`,
+`.agents/skills/adding-a-feature/SKILL.md`,
+`.agents/skills/agent-native-docs/SKILL.md`,
+`.agents/skills/agent-native-toolkit/SKILL.md`,
+`.agents/skills/customizing-agent-native/SKILL.md`,
+`.agents/skills/delegate-to-agent/SKILL.md`,
+`.agents/skills/performance/SKILL.md`,
+`.agents/skills/reliable-mutations/SKILL.md`,
+`.agents/skills/secrets/SKILL.md`,
+`.agents/skills/security/SKILL.md`,
+`.agents/skills/self-modifying-code/SKILL.md`,
+`.agents/skills/sharing/SKILL.md`, and
+`.agents/skills/storing-data/SKILL.md`.
+
+## Core rules
+
+- Put app operations in `actions/` with Zod validation and structured results.
+  `actions/run.ts` dispatches `pnpm action ...`; it is not an app action. Do not
+  create REST wrappers around actions.
+- SQL stores structured records and references. Keep schemas PostgreSQL-specific;
+  store large payloads in configured file/blob storage. Never hardcode keys,
+  tokens, webhook URLs, or private/customer data.
+- For external integrations, inspect the workspace/provider connection catalog
+  first; reuse its scoped resolver before app-local vault/OAuth/settings.
+- There is no `app/` UI shell. For browser UI, use the Chat template as the
+  on-ramp; `agent-native add` is for integration blueprints.
+- UI feedback: target 100 ms, never exceed 400 ms; acknowledge before network work.
+
+## Docs and framework changes
+
+Use local version-matched package docs only (no web research):
+`pnpm action docs-search --query "<topic>"`,
+`pnpm action docs-search --slug "<slug>"`, `pnpm action docs-search --list`,
+`pnpm action source-search --query "<pattern>"`, and
+`pnpm action source-search --path <path>`. Docs are in
+`node_modules/@agent-native/core/docs`; optional template examples are in
+`node_modules/@agent-native/core-corpus/corpus` (install the matching version
+with `pnpm add -D @agent-native/core-corpus@<installed-core-version>` if needed).
+If the runner is unavailable, read `node_modules/@agent-native/core/docs/AGENTS.md`
+and search its `content/` directory with `rg`.
+
+Before building common workspace or agent UI, read `agent-native-toolkit`; for
+supported UI customization, read `customizing-agent-native`. Use configure → compose → eject
+the smallest unit; preview ejection before applying and preserve protected
+contracts. To upgrade, use `pnpm upgrade:agent-native` or
+`npx @agent-native/core@latest upgrade`; after a manual core bump,
+`pnpm skills:update` refreshes scaffold skills. Do not patch dependencies or
+edit `node_modules/@agent-native/*`; fix app code or ask. See
+`self-modifying-code`.
+
+## Actions
+
+| Action | Args | Purpose |
+| --- | --- | --- |
+| `hello` | `[--name <name>]` | Return a greeting |
+| `db-schema` | | Show SQL schema |
+| `db-query` | `--sql "SELECT"` | Run a scoped SELECT |
+
+Raw SQL writes are not exposed by default. Add typed write actions or opt into
+`databaseTools: "write"` only for deliberate maintenance. Run
+`pnpm action hello '{"name":"Builder"}'` and
+`pnpm agent "Call the hello action for Builder and explain the result"` from
+the app root.

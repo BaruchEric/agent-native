@@ -1,7 +1,9 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 import {
   planContentSchema,
   type PlanContent,
@@ -55,6 +57,7 @@ describe("local-plan-files", () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     if (savedDir === undefined) delete process.env.PLAN_LOCAL_DIR;
     else process.env.PLAN_LOCAL_DIR = savedDir;
     if (savedRepoRoot === undefined) delete process.env.PLAN_REPO_ROOT;
@@ -122,8 +125,6 @@ describe("local-plan-files", () => {
     expect(planMdx).not.toMatch(/^planId:/m);
     expect(planMdx).not.toMatch(/^source:/m);
 
-    // The on-disk MDX must round-trip back to a parseable plan content model,
-    // so import/patch actions can consume it.
     const folder: { "plan.mdx": string; "canvas.mdx"?: string } = {
       "plan.mdx": planMdx,
     };
@@ -146,6 +147,54 @@ describe("local-plan-files", () => {
     expect(local.folder).toBe(path.join(tmpDir, "local-sync-flow"));
     expect(local.mdx["plan.mdx"]).toContain("Local sync flow");
     expect(local.content.title).toBe("Local sync flow");
+    expect(local.hasSalvagedInvalidBlocks).toBe(false);
+  });
+
+  it("keeps valid local-folder blocks visible when authored MDX contains malformed blocks", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const folder = path.join(tmpDir, "partially-valid-plan");
+    const planMdx = `---
+title: "Partially valid plan"
+version: 2
+---
+
+This valid introduction stays visible.
+
+<Columns id="empty-columns" />
+
+<Callout id="empty-callout" />
+`;
+    await fs.mkdir(folder, { recursive: true });
+    await fs.writeFile(path.join(folder, "plan.mdx"), planMdx, "utf-8");
+
+    await expect(parsePlanMdxFolder({ "plan.mdx": planMdx })).rejects.toThrow();
+
+    const local = await readPlanLocalFolder("partially-valid-plan");
+
+    expect(local.hasSalvagedInvalidBlocks).toBe(true);
+    expect(local.content.blocks).toHaveLength(3);
+    expect(local.content.blocks[0]).toMatchObject({
+      type: "rich-text",
+      data: { markdown: "This valid introduction stays visible." },
+    });
+    expect(local.content.blocks.slice(1)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "empty-columns",
+          type: "callout",
+          data: expect.objectContaining({
+            body: expect.stringContaining("__unknown_block__:columns"),
+          }),
+        }),
+        expect.objectContaining({
+          id: "empty-callout",
+          type: "callout",
+          data: expect.objectContaining({
+            body: expect.stringContaining("__unknown_block__:callout"),
+          }),
+        }),
+      ]),
+    );
   });
 
   it("writes prototype.mdx for prototype plans and round-trips it", async () => {

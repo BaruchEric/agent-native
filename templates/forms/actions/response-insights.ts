@@ -2,6 +2,7 @@ import {
   ACTION_CHAT_UI_DATA_WIDGET_RENDERER,
   dataWidgetResultSchema,
   defineAction,
+  fail,
 } from "@agent-native/core";
 import {
   createDataChartWidgetResult,
@@ -10,9 +11,13 @@ import {
 } from "@agent-native/core/data-widgets";
 import { buildDeepLink } from "@agent-native/core/server";
 import { accessFilter, assertAccess } from "@agent-native/core/sharing";
+import { track } from "@agent-native/core/tracking";
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
+
 import { getDb, schema } from "../server/db/index.js";
+import { assertFormsPermissionForAccessibleForms } from "../server/lib/app-roles.js";
+import { publicSubmitterEmail } from "../shared/submitter-email.js";
 import type {
   FormField,
   ResponseInsightsChartSeries,
@@ -75,7 +80,10 @@ const responseInsightsSchema = z.object({
 type ResponseInsightsArgs = z.infer<typeof responseInsightsSchema>;
 
 type FormRow = typeof schema.forms.$inferSelect;
-type ResponseRow = typeof schema.responses.$inferSelect;
+type ResponseRow = Pick<
+  typeof schema.responses.$inferSelect,
+  "id" | "formId" | "data" | "submittedAt" | "submitterEmail"
+>;
 
 function safeJson<T>(value: string, fallback: T): T {
   try {
@@ -94,7 +102,12 @@ function cleanText(value: unknown, maxLength = 180): string {
         .join(", ")
     : typeof value === "object"
       ? JSON.stringify(value)
-      : String(value);
+      : typeof value === "string" ||
+          typeof value === "number" ||
+          typeof value === "boolean" ||
+          typeof value === "bigint"
+        ? String(value)
+        : JSON.stringify(value);
   const normalized = text.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLength) return normalized;
   return `${normalized.slice(0, maxLength - 3)}...`;
@@ -160,7 +173,9 @@ function buildSpecificFormTable(
   totalRows: number,
 ): ResponseInsightsTable {
   const fields = safeJson<FormField[]>(form.fields, []).slice(0, 7);
-  const hasSubmitter = responses.some((row) => row.submitterEmail);
+  const hasSubmitter = responses.some((row) =>
+    publicSubmitterEmail(row.submitterEmail),
+  );
   const columns = [
     { key: "submittedAt", label: "Submitted" },
     ...(hasSubmitter ? [{ key: "submitterEmail", label: "Email" }] : []),
@@ -172,7 +187,9 @@ function buildSpecificFormTable(
       id: response.id,
       submittedAt: response.submittedAt,
       ...(hasSubmitter
-        ? { submitterEmail: response.submitterEmail ?? "" }
+        ? {
+            submitterEmail: publicSubmitterEmail(response.submitterEmail) ?? "",
+          }
         : {}),
       ...Object.fromEntries(
         fields.map((field) => [field.id, cleanText(data[field.id])]),
@@ -197,7 +214,9 @@ function buildAllFormsTable(
   tableLimit: number,
   totalRows: number,
 ): ResponseInsightsTable {
-  const hasSubmitter = responses.some((row) => row.submitterEmail);
+  const hasSubmitter = responses.some((row) =>
+    publicSubmitterEmail(row.submitterEmail),
+  );
   const columns = [
     { key: "submittedAt", label: "Submitted" },
     { key: "form", label: "Form" },
@@ -209,7 +228,9 @@ function buildAllFormsTable(
     formId: response.formId,
     submittedAt: response.submittedAt,
     form: formsById.get(response.formId)?.title ?? response.formId,
-    ...(hasSubmitter ? { submitterEmail: response.submitterEmail ?? "" } : {}),
+    ...(hasSubmitter
+      ? { submitterEmail: publicSubmitterEmail(response.submitterEmail) ?? "" }
+      : {}),
     summary: responseSummary(response, fieldsByForm),
   }));
 
@@ -292,14 +313,18 @@ export default defineAction({
       view: "response-insights",
     };
   },
-  run: async (args) => {
+  run: async (args, ctx) => {
     const formId = args.formId ?? args.form;
     const db = getDb();
     const forms = await loadForms(args);
     const formIds = forms.map((form) => form.id);
+    await assertFormsPermissionForAccessibleForms("forms.review", forms, ctx);
 
     if (formId && forms.length === 0) {
-      throw new Error(`Form ${formId} not found`);
+      fail(`Form ${formId} not found`, {
+        errorCode: "form_not_found",
+        statusCode: 404,
+      });
     }
 
     const responseFilter =
@@ -316,7 +341,6 @@ export default defineAction({
             formId: schema.responses.formId,
             data: schema.responses.data,
             submittedAt: schema.responses.submittedAt,
-            ip: schema.responses.ip,
             submitterEmail: schema.responses.submitterEmail,
           })
           .from(schema.responses)
@@ -424,6 +448,23 @@ export default defineAction({
         },
       },
     };
+
+    track(
+      "submissions_viewed",
+      {
+        app_name: "forms",
+        template_name: "forms",
+        ...(targetForm
+          ? { output_id: targetForm.id, form_id: targetForm.id }
+          : {}),
+        output_type: "form",
+        view_type: args.displayMode,
+        form_count: forms.length,
+        response_count: totalResponses,
+        sampled_response_count: responses.length,
+      },
+      ctx,
+    );
 
     if (args.displayMode === "chart") {
       return createDataChartWidgetResult({

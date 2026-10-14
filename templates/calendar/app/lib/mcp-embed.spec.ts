@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+
 import { isMcpEmbedSurface } from "./mcp-embed";
 
 describe("isMcpEmbedSurface (calendar)", () => {
@@ -18,6 +19,13 @@ describe("isMcpEmbedSurface (calendar)", () => {
   it("accepts the truthy 'true' legacy value", () => {
     vi.stubGlobal("window", { location: { search: "?embedded=true" } });
     expect(isMcpEmbedSurface()).toBe(true);
+  });
+
+  it("keeps Electron chat-first surfaces out of the MCP embed path", () => {
+    vi.stubGlobal("window", {
+      location: { search: "?embedded=1&chatFirst=1" },
+    });
+    expect(isMcpEmbedSurface()).toBe(false);
   });
 
   it("ignores ordinary in-app routes without the embed flag", () => {

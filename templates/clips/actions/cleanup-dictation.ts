@@ -1,20 +1,16 @@
-/**
- * Run the Gemini cleanup pass on a dictation's raw transcript text.
- * Persists `cleanedText` on the dictation row.
- */
-
-import { defineAction } from "@agent-native/core";
-import { z } from "zod";
-import { eq } from "drizzle-orm";
-import { getDb, schema } from "../server/db/index.js";
+import { defineAction } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { assertAccess } from "@agent-native/core/sharing";
+import { eq } from "drizzle-orm";
+import { z } from "zod";
+
+import { getDb, schema } from "../server/db/index.js";
 import cleanupTranscript from "./cleanup-transcript.js";
 import { loadAgentsMdContext } from "./lib/agents-md-context.js";
 
 export default defineAction({
   description:
-    "Clean up a dictation's raw text via the Gemini 3.1 Flash-Lite cleanup pass. Stores the result on `dictations.cleanedText`. Editor access required.",
+    "Clean up a dictation's raw text via the low-cost text-model cleanup pass. Stores the result on `dictations.cleanedText`. Editor access required.",
   schema: z.object({
     id: z.string().describe("Dictation id"),
   }),

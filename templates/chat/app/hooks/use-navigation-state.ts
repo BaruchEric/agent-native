@@ -1,65 +1,82 @@
+import { appBasePath, appPath } from "@agent-native/core/client/api-path";
+import { useAgentRouteState } from "@agent-native/core/client/navigation";
+
 import {
-  appBasePath,
-  appPath,
-  markAgentChatHomeHandoff,
-  useAgentRouteState,
-} from "@agent-native/core/client";
-import { useLocation } from "react-router";
+  chatThreadPath,
+  HOME_PATH,
+  isChatPathname,
+  NEW_CHAT_PATH,
+  threadIdFromPath,
+} from "@/lib/chat-paths";
 import { TAB_ID } from "@/lib/tab-id";
 
 export interface NavigationState {
   view: string;
   path?: string;
+  threadId?: string;
 }
 
 export function useNavigationState() {
-  const location = useLocation();
   useAgentRouteState<NavigationState>({
     browserTabId: TAB_ID,
     requestSource: TAB_ID,
-    getNavigationState: ({ pathname, search, hash }) => ({
-      view: viewForPath(pathname),
-      path: appPath(pathname),
-    }),
-    getCommandPath: (command) =>
-      routerPath(command.path || pathForView(command.view)),
-    onNavigate: (_command, path) => {
-      if (location.pathname === "/" && pathnameFromPath(path) !== "/") {
-        markAgentChatHomeHandoff("chat");
-      }
+    getNavigationState: ({ pathname }) => {
+      const threadId = threadIdFromPath(pathname);
+      return {
+        view: viewForPath(pathname),
+        path: appPath(pathname),
+        ...(threadId ? { threadId } : {}),
+      };
     },
+    getCommandPath: (command) =>
+      routerPath(command.path || pathForCommand(command)),
   });
 }
 
-function pathnameFromPath(path: string): string {
-  return path.split(/[?#]/, 1)[0] || "/";
-}
-
 function viewForPath(pathname: string): string {
+  if (isChatPathname(pathname)) return "chat";
+  if (pathname === HOME_PATH) return "home";
   if (pathname.startsWith("/database")) return "database";
   if (pathname.startsWith("/extensions")) return "extensions";
   if (pathname.startsWith("/observability")) return "observability";
-  if (pathname.startsWith("/team")) return "team";
+  if (pathname.startsWith("/settings/agent") || pathname.startsWith("/agent")) {
+    return "agent";
+  }
+  if (pathname.startsWith("/settings")) return "settings";
+  if (pathname.startsWith("/team")) return "settings";
   return "chat";
 }
 
 function pathForView(view?: string): string {
   switch (view) {
     case "chat":
-    case "home":
     case "ask":
-      return "/";
+      return NEW_CHAT_PATH;
+    case "home":
+      return HOME_PATH;
     case "database":
       return "/database";
     case "extensions":
       return "/extensions";
     case "observability":
       return "/observability";
+    case "agent":
+      return "/settings/agent";
+    case "settings":
+      return "/settings";
     case "team":
-      return "/team";
+      return "/settings/organization";
     default:
-      return "/";
+      return HOME_PATH;
   }
+}
+
+export function pathForCommand(command: any): string {
+  const path = pathForView(command?.view);
+  if (command?.view !== "chat" && command?.view !== "ask") return path;
+  const threadId =
+    typeof command?.threadId === "string" ? command.threadId.trim() : "";
+  return threadId ? chatThreadPath(threadId) : path;
 }
 
 function routerPath(path: string): string {

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+
 import { generateAgentCard } from "./agent-card.js";
 import type { A2AConfig } from "./types.js";
 
@@ -108,6 +109,16 @@ describe("generateAgentCard", () => {
       "https://example.com",
     );
     expect(card.capabilities.streaming).toBe(true);
+  });
+
+  it("advertises connect support only when configured", () => {
+    expect(
+      generateAgentCard({ ...baseConfig, connect: true }, "https://example.com")
+        .capabilities.connect,
+    ).toBe(true);
+    expect(
+      generateAgentCard(baseConfig, "https://example.com").capabilities.connect,
+    ).toBeUndefined();
   });
 
   it("always sets pushNotifications to false and stateTransitionHistory to true", () => {

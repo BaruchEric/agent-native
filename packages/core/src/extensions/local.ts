@@ -1,6 +1,7 @@
-import fs from "node:fs/promises";
 import fsSync from "node:fs";
+import fs from "node:fs/promises";
 import path from "node:path";
+
 import {
   loadAgentNativeManifest,
   resolveAgentNativeDataMode,
@@ -321,6 +322,7 @@ async function readLocalExtensionFolder(options: {
     icon: typeof manifest.icon === "string" ? manifest.icon : null,
     createdAt,
     updatedAt,
+    archivedAt: null,
     hiddenAt: null,
     hiddenBy: null,
     ownerEmail: "local-files",

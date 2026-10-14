@@ -1,18 +1,15 @@
-import { useState, useEffect } from "react";
-import { useLocation, useNavigate } from "react-router";
-import { IconMenu2 } from "@tabler/icons-react";
-import { Sidebar } from "./Sidebar";
-import { Header } from "./Header";
-import { HeaderActionsProvider } from "./HeaderActions";
+import { useT } from "@agent-native/core/client/i18n";
+import { HeaderActionsProvider } from "@agent-native/toolkit/app-shell/header-actions";
 import {
-  AgentSidebar,
-  focusAgentChat,
-  navigateWithAgentChatViewTransition,
+  isAgentChatHomeHandoffActive,
   useAgentChatHomeHandoff,
   useAgentChatHomeHandoffLinks,
-} from "@agent-native/core/client";
-import { APP_TITLE } from "@/lib/app-config";
-import { TAB_ID } from "@/lib/tab-id";
+} from "@agent-native/toolkit/app/chat/agentkit-chat/rail";
+import { isSettingsPathname } from "@agent-native/toolkit/app/settings";
+import { IconMenu2 } from "@tabler/icons-react";
+import { lazy, Suspense, useEffect, useState } from "react";
+import { useLocation } from "react-router";
+
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
@@ -20,6 +17,19 @@ import {
   SheetDescription,
   SheetTitle,
 } from "@/components/ui/sheet";
+import { APP_TITLE } from "@/lib/app-config";
+import { HOME_PATH, isChatPathname } from "@/lib/chat-paths";
+
+import { Sidebar } from "./Sidebar";
+
+const Header = lazy(() =>
+  import("./Header").then((module) => ({ default: module.Header })),
+);
+const AgentInspector = lazy(() =>
+  import("./AgentInspector").then((module) => ({
+    default: module.AgentInspector,
+  })),
+);
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -27,14 +37,10 @@ interface LayoutProps {
 
 const SIDEBAR_COLLAPSE_KEY = "chat.sidebar.collapsed";
 
-/**
- * Routes whose page renders its own toolbar. Layout still wraps these with the
- * left Sidebar and agent surfaces but skips the global Header so they don't
- * double-stack chrome.
- */
 function routeOwnsToolbar(pathname: string): boolean {
   return (
-    pathname === "/" ||
+    pathname === HOME_PATH ||
+    isChatPathname(pathname) ||
     pathname === "/database" ||
     pathname.startsWith("/extensions")
   );
@@ -42,16 +48,24 @@ function routeOwnsToolbar(pathname: string): boolean {
 
 export function Layout({ children }: LayoutProps) {
   const location = useLocation();
-  const navigate = useNavigate();
+  const t = useT();
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
-  const isChatRoute = location.pathname === "/";
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const isChatRoute = isChatPathname(location.pathname);
+  // Settings brings its own navigation, header, and agent toggle, so it
+  // renders full width.
+  const settingsOwnsChrome = isSettingsPathname(location.pathname);
   const chatHomeHandoffActive = useAgentChatHomeHandoff({
     storageKey: "chat",
     activePath: location.pathname,
     enabled: !isChatRoute,
   });
-  useAgentChatHomeHandoffLinks({ storageKey: "chat", chatPath: "/" });
+  const chatHomeHandoffPending = isAgentChatHomeHandoffActive("chat");
+  useAgentChatHomeHandoffLinks({
+    storageKey: "chat",
+    isChatPath: isChatPathname,
+    requireActiveHandoff: true,
+  });
 
   useEffect(() => {
     setMobileSidebarOpen(false);
@@ -86,11 +100,6 @@ export function Layout({ children }: LayoutProps) {
   }, [sidebarCollapsed]);
 
   const ownsToolbar = routeOwnsToolbar(location.pathname);
-  function openAskAgentFullscreen() {
-    focusAgentChat();
-    navigateWithAgentChatViewTransition(navigate, "/");
-  }
-
   const contentFrame = (
     <div className="flex h-full min-w-0 flex-1 flex-col overflow-hidden">
       {isChatRoute ? (
@@ -100,7 +109,7 @@ export function Layout({ children }: LayoutProps) {
             variant="ghost"
             size="icon"
             onClick={() => setMobileSidebarOpen(true)}
-            aria-label="Open navigation"
+            aria-label={t("navigation.openNavigation")}
           >
             <IconMenu2 className="size-4" />
           </Button>
@@ -111,16 +120,18 @@ export function Layout({ children }: LayoutProps) {
           <button
             type="button"
             onClick={() => setMobileSidebarOpen(true)}
-            aria-label="Open navigation"
+            aria-label={t("navigation.openNavigation")}
             className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
           >
             <IconMenu2 className="h-4 w-4" />
           </button>
         </div>
-      ) : (
-        <Header onOpenMobileSidebar={() => setMobileSidebarOpen(true)} />
+      ) : settingsOwnsChrome ? null : (
+        <Suspense fallback={<div className="h-12 shrink-0" />}>
+          <Header onOpenMobileSidebar={() => setMobileSidebarOpen(true)} />
+        </Suspense>
       )}
-      <main className="min-w-0 flex-1 overflow-y-auto overscroll-contain">
+      <main className="agent-native-app-main min-w-0 flex-1 overflow-y-auto overscroll-contain">
         {children}
       </main>
     </div>
@@ -128,41 +139,48 @@ export function Layout({ children }: LayoutProps) {
 
   return (
     <HeaderActionsProvider>
-      <div className="flex h-screen w-full overflow-hidden bg-background text-foreground">
-        <div className="hidden md:block">
-          <Sidebar
-            collapsed={sidebarCollapsed}
-            onCollapsedChange={setSidebarCollapsed}
-          />
-        </div>
+      <div className="agent-layout-shell chat-layout-shell flex h-screen w-full overflow-hidden bg-background text-foreground">
+        {settingsOwnsChrome ? null : (
+          <div
+            data-collapsed={sidebarCollapsed ? "true" : "false"}
+            className="agent-layout-left-drawer hidden md:block"
+          >
+            <Sidebar
+              collapsed={sidebarCollapsed}
+              onCollapsedChange={setSidebarCollapsed}
+            />
+          </div>
+        )}
         <Sheet open={mobileSidebarOpen} onOpenChange={setMobileSidebarOpen}>
-          <SheetContent side="left" className="p-0 w-[260px]">
-            <SheetTitle className="sr-only">Navigation</SheetTitle>
+          <SheetContent
+            side="left"
+            className="w-[var(--chat-sidebar-width)] p-0"
+          >
+            <SheetTitle className="sr-only">
+              {t("navigation.navigation")}
+            </SheetTitle>
             <SheetDescription className="sr-only">
-              App navigation links
+              {t("navigation.navigationDescription")}
             </SheetDescription>
             <Sidebar collapsed={false} collapsible={false} />
           </SheetContent>
         </Sheet>
         {isChatRoute ? (
-          contentFrame
-        ) : (
-          <AgentSidebar
-            position="right"
-            chatViewTransition
-            storageKey="chat"
-            browserTabId={TAB_ID}
-            openOnChatRunning={chatHomeHandoffActive}
-            onFullscreenRequest={openAskAgentFullscreen}
-            emptyStateText="Ask the agent to inspect or change this app."
-            suggestions={[
-              "What can you do here?",
-              "Call hello for Builder",
-              "Add a new action and show it in the UI",
-            ]}
+          <div
+            data-agent-chat-canvas="true"
+            className="agent-layout-main-surface flex min-w-0 flex-1 overflow-hidden"
           >
             {contentFrame}
-          </AgentSidebar>
+          </div>
+        ) : (
+          <Suspense fallback={contentFrame}>
+            <AgentInspector
+              chatHomeHandoffActive={chatHomeHandoffActive}
+              chatHomeHandoffPending={chatHomeHandoffPending}
+            >
+              {contentFrame}
+            </AgentInspector>
+          </Suspense>
         )}
       </div>
     </HeaderActionsProvider>

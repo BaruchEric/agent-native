@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+
 import type { EngineMessage } from "../engine/types.js";
 
 const observerMod = vi.hoisted(() => ({ runObserver: vi.fn() }));
@@ -42,7 +43,6 @@ describe("maybeCompactThread", () => {
     expect(observerMod.runObserver).toHaveBeenCalledTimes(1);
     expect(observerMod.runObserver.mock.calls[0][0].messages).toBe(messages);
     expect(reflectorMod.runReflector).toHaveBeenCalledTimes(1);
-    // Both threaded the same owner scope through.
     expect(observerMod.runObserver.mock.calls[0][0].ownerEmail).toBe(
       "alice@example.com",
     );
@@ -51,7 +51,6 @@ describe("maybeCompactThread", () => {
     );
     expect(result.observer.observed).toBe(false);
     expect(result.reflector.reflected).toBe(false);
-    // No thread load needed when messages are supplied.
     expect(threadStoreMod.getThread).not.toHaveBeenCalled();
   });
 

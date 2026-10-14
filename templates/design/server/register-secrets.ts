@@ -1,8 +1,10 @@
 import { registerRequiredSecret } from "@agent-native/core/secrets";
 
-// Optional: enables design-system import from private GitHub repositories.
-// The import-github action reads this server-side via resolveSecret(); tokens
-// should never be pasted into chat or passed as action parameters.
+import {
+  FIGMA_FILE_URL_TOKEN_VALIDATION_CODE,
+  isFigmaFileUrl,
+} from "../shared/figma-url.js";
+
 registerRequiredSecret({
   key: "GITHUB_TOKEN",
   label: "GitHub token",
@@ -12,6 +14,13 @@ registerRequiredSecret({
     "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens",
   scope: "user",
   kind: "api-key",
+  usedFor: [
+    {
+      appId: "design",
+      feature: "Design system import",
+      effectWhenRemoved: "Private GitHub repositories can't be imported.",
+    },
+  ],
   required: false,
   validator: async (value) => {
     if (!value) return true;
@@ -35,10 +44,74 @@ registerRequiredSecret({
         };
       }
       return { ok: false, error: `GitHub returned ${res.status}.` };
-    } catch (err: any) {
+    } catch {
       return {
         ok: false,
-        error: `Could not reach GitHub: ${err?.message ?? err}`,
+        error: "Could not reach GitHub. Check your network and try again.",
+      };
+    }
+  },
+});
+
+// Optional: connects Figma frame import, library browsing, and open-ended REST
+// reads in agent chat. The provider API injects this server-side as
+// X-Figma-Token; never pass it through action parameters or chat.
+registerRequiredSecret({
+  key: "FIGMA_ACCESS_TOKEN",
+  label: "Figma access token",
+  description:
+    "Connect Figma frame links, exact clipboard paste, libraries, styles, and open-ended agent queries. Generate a personal access token with current_user:read and file_content:read; add library_content:read for file libraries, team_library_content:read for team libraries, or Enterprise file_variables:read only when needed.",
+  docsUrl: "https://developers.figma.com/docs/rest-api/personal-access-tokens/",
+  scope: "user",
+  kind: "api-key",
+  usedFor: [
+    {
+      appId: "design",
+      feature: "Figma import",
+      effectWhenRemoved: "Figma frames, libraries, and styles stop loading.",
+    },
+  ],
+  required: false,
+  validator: async (value) => {
+    if (!value) return true;
+    if (isFigmaFileUrl(value)) {
+      return {
+        ok: false,
+        error: "Paste a Figma access token, not a Figma file URL.",
+        validationCode: FIGMA_FILE_URL_TOKEN_VALIDATION_CODE,
+      };
+    }
+    try {
+      const res = await fetch("https://api.figma.com/v1/me", {
+        headers: {
+          "X-Figma-Token": value,
+          "User-Agent": "AgentNative/1.0",
+        },
+      });
+      console.log("[figma-validator] GET /v1/me status:", res.status);
+      if (res.ok) {
+        console.log("[figma-validator] token accepted");
+        return true;
+      }
+      let body = "";
+      try {
+        body = await res.text();
+      } catch {
+        /* ignore */
+      }
+      console.log("[figma-validator] Figma error body:", body);
+      if (res.status === 401 || res.status === 403) {
+        return {
+          ok: false,
+          error: `Figma rejected this token (${res.status}). Check that it is active and includes current_user:read; frame import also needs file_content:read.`,
+        };
+      }
+      return { ok: false, error: `Figma returned ${res.status}.` };
+    } catch (err) {
+      console.log("[figma-validator] fetch threw:", err);
+      return {
+        ok: false,
+        error: "Could not reach Figma. Check your network and try again.",
       };
     }
   },

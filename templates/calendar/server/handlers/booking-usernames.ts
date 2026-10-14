@@ -1,5 +1,6 @@
-import { and, eq, gte } from "drizzle-orm";
 import { getUserSetting, putUserSetting } from "@agent-native/core/settings";
+import { and, eq, gte } from "drizzle-orm";
+
 import type { AvailabilityConfig } from "../../shared/api.js";
 import { getDb, schema } from "../db/index.js";
 
@@ -61,6 +62,12 @@ async function findUsernameOwner(username: string): Promise<string | null> {
     .where(eq(schema.bookingUsernames.username, username))
     .then((rows) => rows[0]);
   return row?.ownerEmail ?? null;
+}
+
+export function getBookingUsernameOwner(
+  username: string,
+): Promise<string | null> {
+  return findUsernameOwner(username);
 }
 
 async function chooseAvailableUsername(

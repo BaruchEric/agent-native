@@ -1,22 +1,26 @@
-/**
- * Loads all markdown doc files from @agent-native/core at build time via Vite glob import.
- * The source of truth for docs lives in packages/core/docs/content/.
- * Provides parsed frontmatter, raw markdown, and heading extraction for TOC + search.
- */
-
-// Import all .md files from core's docs as raw strings
-const mdModules = import.meta.glob("../../../core/docs/content/*.md", {
-  query: "?raw",
-  import: "default",
-  eager: true,
-}) as Record<string, string>;
+import {
+  docSourceFilenamesForSlug,
+  docSourceSlugFromFilename,
+  preferMdxDocSourceFiles,
+} from "../../lib/docs-source";
+import { hasDocBlockSyntax } from "./doc-block-detection";
+import { preloadDocBlocksContent } from "./doc-block-renderer";
+import {
+  DEFAULT_DOCS_LOCALE,
+  docsPathForSlug,
+  docsLocaleFromSegment,
+  type DocsLocale,
+} from "./docs-locale";
+import { docSourceLoaders, localizedDocLoaders } from "./docs-source-loaders";
+import { slugifyHeading } from "./heading-slug";
 
 export interface DocEntry {
   slug: string;
   title: string;
   description: string;
   search: string;
-  body: string; // markdown body (without frontmatter)
+  draft?: boolean;
+  body: string;
   headings: { id: string; label: string; level: number }[];
 }
 
@@ -27,6 +31,11 @@ export interface SearchEntry {
   sectionId: string;
   text: string;
   keywords: string;
+}
+
+interface MarkdownLine {
+  lineNumber: number;
+  text: string;
 }
 
 function parseFrontmatter(raw: string): {
@@ -44,84 +53,269 @@ function parseFrontmatter(raw: string): {
   return { data, body: match[2] };
 }
 
+function nonFencedMarkdownLines(body: string): MarkdownLine[] {
+  const lines = body.split("\n");
+  const result: MarkdownLine[] = [];
+  let inFence = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const text = lines[index];
+    if (/^\s*(?:```|~~~)/.test(text)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (!inFence) {
+      result.push({ lineNumber: index + 1, text });
+    }
+  }
+
+  return result;
+}
+
 function extractHeadings(
   body: string,
 ): { id: string; label: string; level: number }[] {
   const headings: { id: string; label: string; level: number }[] = [];
-  const pattern = /^(#{2,4})\s+(.+?)(?:\s+\{#([\w-]+)\})?\s*$/gm;
-  let match;
-  while ((match = pattern.exec(body)) !== null) {
-    const level = match[1].length; // 2, 3, or 4
+  const pattern = /^(#{2,4})\s+(.+?)(?:\s+\{#([\w-]+)\})?\s*$/;
+  let inMdxBlock = false;
+  for (const line of nonFencedMarkdownLines(body)) {
+    if (/^<[A-Z][A-Za-z]*[\s>]/.test(line.text)) {
+      if (!line.text.trimEnd().endsWith("/>")) inMdxBlock = true;
+      continue;
+    }
+    if (/^<\/[A-Z][A-Za-z]*>/.test(line.text) || /^\s*\/>/.test(line.text)) {
+      inMdxBlock = false;
+      continue;
+    }
+    if (inMdxBlock) continue;
+    const match = line.text.match(pattern);
+    if (!match) continue;
+    const level = match[1].length;
     const label = match[2].replace(/`([^`]+)`/g, "$1").trim();
-    const id =
-      match[3] ||
-      label
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-|-$/g, "");
+    const id = match[3] || slugifyHeading(label);
     headings.push({ id, label, level });
   }
   return headings;
 }
 
-// Build the docs map once
 const docs = new Map<string, DocEntry>();
+const localizedDocs = new Map<DocsLocale, Map<string, DocEntry>>();
+const docPromises = new Map<string, Promise<DocEntry | undefined>>();
+const localizedDocPromises = new Map<string, Promise<DocEntry | undefined>>();
 
-for (const [path, raw] of Object.entries(mdModules)) {
+function docEntryFromPath(path: string, raw: string): DocEntry {
   const filename = path.split("/").pop()!;
-  const slug = filename.replace(/\.md$/, "");
+  const slug = docSourceSlugFromFilename(filename);
   const { data, body } = parseFrontmatter(raw);
   const headings = extractHeadings(body);
-  docs.set(slug, {
+  return {
     slug,
     title: data.title || slug,
     description: data.description || "",
     search: data.search || "",
+    draft: data.draft === "true" || undefined,
     body,
     headings,
-  });
+  };
 }
 
-export function getDoc(slug: string): DocEntry | undefined {
+function normalizeDocsLocale(locale: unknown): DocsLocale {
+  return docsLocaleFromSegment(locale) ?? DEFAULT_DOCS_LOCALE;
+}
+
+function localizedDocKey(locale: DocsLocale, slug: string): string | undefined {
+  for (const filename of docSourceFilenamesForSlug(slug)) {
+    const key = `../../../core/docs/content/locales/${locale}/${filename}`;
+    if (localizedDocLoaders[key]) return key;
+  }
+  return undefined;
+}
+
+function defaultDocKey(slug: string): string | undefined {
+  return preferMdxDocSourceFiles(Object.keys(docSourceLoaders)).find(
+    (path) => docSourceSlugFromFilename(path) === slug,
+  );
+}
+
+function cacheLocalizedDoc(locale: DocsLocale, entry: DocEntry) {
+  const localeDocs = localizedDocs.get(locale) ?? new Map<string, DocEntry>();
+  localeDocs.set(entry.slug, entry);
+  localizedDocs.set(locale, localeDocs);
+}
+
+export function getDoc(
+  slug: string,
+  locale: unknown = DEFAULT_DOCS_LOCALE,
+): DocEntry | undefined {
+  const docsLocale = normalizeDocsLocale(locale);
+  if (docsLocale !== DEFAULT_DOCS_LOCALE) {
+    const localized = localizedDocs.get(docsLocale)?.get(slug);
+    if (localized) return localized;
+  }
   return docs.get(slug);
 }
 
-export function getAllDocs(): DocEntry[] {
-  return Array.from(docs.values());
+export async function loadDoc(
+  slug: string,
+  locale: unknown = DEFAULT_DOCS_LOCALE,
+): Promise<DocEntry | undefined> {
+  const docsLocale = normalizeDocsLocale(locale);
+  if (docsLocale === DEFAULT_DOCS_LOCALE) {
+    const cached = docs.get(slug);
+    if (cached) return cached;
+
+    const key = defaultDocKey(slug);
+    if (!key) return undefined;
+    const existingPromise = docPromises.get(key);
+    if (existingPromise) return existingPromise;
+
+    const promise = docSourceLoaders[key]()
+      .then((raw) => {
+        const entry = docEntryFromPath(key, raw);
+        docs.set(entry.slug, entry);
+        return entry;
+      })
+      .catch((error) => {
+        docPromises.delete(key);
+        throw error;
+      });
+    docPromises.set(key, promise);
+    return promise;
+  }
+
+  const cached = localizedDocs.get(docsLocale)?.get(slug);
+  if (cached) return cached;
+
+  const key = localizedDocKey(docsLocale, slug);
+  if (!key) {
+    return loadDoc(slug, DEFAULT_DOCS_LOCALE);
+  }
+  const loader = localizedDocLoaders[key];
+
+  const existingPromise = localizedDocPromises.get(key);
+  if (existingPromise) return existingPromise;
+
+  const promise = loader()
+    .then((raw) => {
+      const entry = docEntryFromPath(key, raw);
+      cacheLocalizedDoc(docsLocale, entry);
+      return entry;
+    })
+    .catch((error) => {
+      localizedDocPromises.delete(key);
+      throw error;
+    });
+  localizedDocPromises.set(key, promise);
+  return promise;
 }
 
-/** Build a search index from all markdown content */
-export function buildSearchIndex(): SearchEntry[] {
-  const entries: SearchEntry[] = [];
+export async function loadDocRespectingDraftVisibility(
+  slug: string,
+  locale: unknown = DEFAULT_DOCS_LOCALE,
+): Promise<DocEntry | undefined> {
+  const doc = await loadDoc(slug, locale);
+  if (!doc) return undefined;
 
-  for (const doc of docs.values()) {
-    const path = doc.slug === "getting-started" ? "/docs" : `/docs/${doc.slug}`;
-    const lines = doc.body.split("\n");
+  const docsLocale = normalizeDocsLocale(locale);
+  const canonical =
+    docsLocale === DEFAULT_DOCS_LOCALE
+      ? doc
+      : await loadDoc(slug, DEFAULT_DOCS_LOCALE);
+  const isDraft = Boolean(doc.draft || canonical?.draft);
+
+  if (isDraft && import.meta.env.VITE_SHOW_DRAFTS !== "true") return undefined;
+  const visibleDoc =
+    isDraft === Boolean(doc.draft) ? doc : { ...doc, draft: isDraft };
+
+  return preloadDocBlocksForDoc(visibleDoc);
+}
+
+export async function preloadDocBlocksForDoc(doc: DocEntry): Promise<DocEntry> {
+  if (hasDocBlockSyntax(doc.body)) await preloadDocBlocksContent();
+  return doc;
+}
+
+export function hasLocalizedDoc(locale: unknown, slug: string): boolean {
+  const docsLocale = normalizeDocsLocale(locale);
+  if (docsLocale === DEFAULT_DOCS_LOCALE) {
+    return Boolean(docs.has(slug) || defaultDocKey(slug));
+  }
+  return Boolean(
+    localizedDocs.get(docsLocale)?.has(slug) ||
+    localizedDocKey(docsLocale, slug),
+  );
+}
+
+export function getAllDocs(locale: unknown = DEFAULT_DOCS_LOCALE): DocEntry[] {
+  const docsLocale = normalizeDocsLocale(locale);
+  if (docsLocale === DEFAULT_DOCS_LOCALE) return Array.from(docs.values());
+
+  const overrides = localizedDocs.get(docsLocale);
+  if (!overrides) return Array.from(docs.values());
+
+  return Array.from(docs.values()).map((doc) => overrides.get(doc.slug) ?? doc);
+}
+
+export async function loadAllDocs(
+  locale: unknown = DEFAULT_DOCS_LOCALE,
+): Promise<DocEntry[]> {
+  const docsLocale = normalizeDocsLocale(locale);
+  if (docsLocale === DEFAULT_DOCS_LOCALE) {
+    await Promise.all(
+      preferMdxDocSourceFiles(Object.keys(docSourceLoaders)).map((path) =>
+        loadDoc(docSourceSlugFromFilename(path), docsLocale),
+      ),
+    );
+    return Array.from(docs.values());
+  }
+
+  await loadAllDocs(DEFAULT_DOCS_LOCALE);
+  const prefix = `../../../core/docs/content/locales/${docsLocale}/`;
+  await Promise.all(
+    preferMdxDocSourceFiles(
+      Object.keys(localizedDocLoaders).filter((key) => key.startsWith(prefix)),
+    ).map((key) => {
+      const slug = docSourceSlugFromFilename(key);
+      return loadDoc(slug, docsLocale);
+    }),
+  );
+  return getAllDocs(docsLocale);
+}
+
+async function buildSearchIndexFromDocs(
+  docsList: DocEntry[],
+  locale: unknown = DEFAULT_DOCS_LOCALE,
+): Promise<SearchEntry[]> {
+  const { docsBodyToMarkdownMirror } =
+    await import("../../lib/docs-markdown-export");
+  const entries: SearchEntry[] = [];
+  const docsLocale = normalizeDocsLocale(locale);
+
+  for (const doc of docsList) {
+    const path = docsPathForSlug(doc.slug, docsLocale);
+    const lines = nonFencedMarkdownLines(docsBodyToMarkdownMirror(doc.body));
+    const lastLineNumber = lines.at(-1)?.lineNumber ?? 0;
     const sections: { id: string; label: string; startLine: number }[] = [];
 
-    // Find all h2/h3 headings
-    for (let i = 0; i < lines.length; i++) {
-      const m = lines[i].match(/^(#{2,3})\s+(.+?)(?:\s+\{#([\w-]+)\})?\s*$/);
+    for (const line of lines) {
+      const m = line.text.match(/^(#{2,3})\s+(.+?)(?:\s+\{#([\w-]+)\})?\s*$/);
       if (m) {
         const label = m[2].replace(/`([^`]+)`/g, "$1").trim();
-        const id =
-          m[3] ||
-          label
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, "-")
-            .replace(/^-|-$/g, "");
-        sections.push({ id, label, startLine: i + 1 });
+        const id = m[3] || slugifyHeading(label);
+        sections.push({ id, label, startLine: line.lineNumber });
       }
     }
 
-    // Add a page-level entry for the title + intro text (before first h2/h3)
     const introEndLine =
-      sections.length > 0 ? sections[0].startLine - 1 : lines.length;
+      sections.length > 0 ? sections[0].startLine - 1 : lastLineNumber;
     const introText = lines
-      .slice(0, introEndLine)
-      .filter((l) => !l.startsWith("```") && !l.startsWith("#"))
+      .filter(
+        (line) => line.lineNumber <= introEndLine, // i18n-ignore -- source-index field, not visible copy.
+      )
+      .map((line) => line.text)
+      .filter((l) => !l.startsWith("#"))
       .join(" ")
-      .replace(/[`*_\[\](){}]/g, "")
+      .replace(/[`*_[\](){}]/g, "")
       .replace(/\s+/g, " ")
       .trim();
 
@@ -143,12 +337,18 @@ export function buildSearchIndex(): SearchEntry[] {
     for (let i = 0; i < sections.length; i++) {
       const section = sections[i];
       const endLine =
-        i + 1 < sections.length ? sections[i + 1].startLine - 1 : lines.length;
+        i + 1 < sections.length
+          ? sections[i + 1].startLine - 1
+          : lastLineNumber;
       const text = lines
-        .slice(section.startLine, endLine)
-        .filter((l) => !l.startsWith("```") && !l.startsWith("#"))
+        .filter(
+          (line) =>
+            line.lineNumber >= section.startLine && line.lineNumber <= endLine,
+        )
+        .map((line) => line.text)
+        .filter((l) => !l.startsWith("#"))
         .join(" ")
-        .replace(/[`*_\[\](){}]/g, "")
+        .replace(/[`*_[\](){}]/g, "")
         .replace(/\s+/g, " ")
         .trim();
 
@@ -169,4 +369,18 @@ export function buildSearchIndex(): SearchEntry[] {
   }
 
   return entries;
+}
+
+export function buildSearchIndex(
+  locale: unknown = DEFAULT_DOCS_LOCALE,
+): Promise<SearchEntry[]> {
+  return loadAllDocs(locale).then((docsList) =>
+    buildSearchIndexFromDocs(docsList, locale),
+  );
+}
+
+export async function buildSearchIndexAsync(
+  locale: unknown = DEFAULT_DOCS_LOCALE,
+): Promise<SearchEntry[]> {
+  return buildSearchIndexFromDocs(await loadAllDocs(locale), locale);
 }

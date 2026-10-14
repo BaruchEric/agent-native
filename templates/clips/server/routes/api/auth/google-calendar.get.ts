@@ -16,43 +16,47 @@
  */
 
 import {
-  defineEventHandler,
-  getQuery,
-  sendRedirect,
-  setResponseStatus,
-  type H3Event,
-} from "h3";
-import {
   getSession,
   isElectron,
   encodeOAuthState,
   resolveOAuthRedirectUri,
+  wrapNetlifyPreviewGoogleOAuthState,
   safeReturnPath,
 } from "@agent-native/core/server";
 import {
+  defineEventHandler,
+  getQuery,
+  setResponseStatus,
+  type H3Event,
+} from "h3";
+
+import {
   GOOGLE_AUTH_URL,
   GOOGLE_CALENDAR_SCOPES,
+  resolveGoogleOAuthCredentialCandidates,
 } from "../../../lib/google-calendar-client.js";
 import { CLIPS_GOOGLE_OAUTH_APP_ID } from "../../../lib/google-calendar-oauth.js";
 
 export default defineEventHandler(async (event: H3Event) => {
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  if (!clientId || !clientSecret) {
+  const [credentials] = await resolveGoogleOAuthCredentialCandidates();
+  if (!credentials) {
     setResponseStatus(event, 422);
     return {
       error: "missing_credentials",
       message:
-        "Google Calendar OAuth is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in your environment, or paste them in the agent settings.",
+        "Google Calendar OAuth is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in your environment, or paste them in Manage agent.",
     };
   }
 
   try {
     const q = getQuery(event);
-    // Use the framework-standard callback path. The local Google OAuth client
-    // is documented/configured for `/_agent-native/google/callback`; using a
-    // custom `/api/auth/...` callback causes redirect_uri_mismatch locally.
-    const redirectUri = resolveOAuthRedirectUri(event);
+    const redirectUri = resolveOAuthRedirectUri(
+      event,
+      "/_agent-native/google/callback",
+      {
+        useNetlifyPreviewGoogleOAuthRelay: true,
+      },
+    );
     if (!redirectUri) {
       setResponseStatus(event, 400);
       return {
@@ -86,9 +90,10 @@ export default defineEventHandler(async (event: H3Event) => {
       app: CLIPS_GOOGLE_OAUTH_APP_ID,
       returnUrl,
     });
+    const oauthState = wrapNetlifyPreviewGoogleOAuthState(event, state);
 
     const params = new URLSearchParams({
-      client_id: clientId,
+      client_id: credentials.clientId,
       redirect_uri: redirectUri,
       response_type: "code",
       // We need a refresh token, so always force prompt=consent — Google only
@@ -97,15 +102,15 @@ export default defineEventHandler(async (event: H3Event) => {
       prompt: "consent",
       include_granted_scopes: "true",
       scope: GOOGLE_CALENDAR_SCOPES.join(" "),
-      state,
+      state: oauthState,
     });
     const url = `${GOOGLE_AUTH_URL}?${params.toString()}`;
 
-    // Default: 302 redirect — the natural behavior for a browser hitting
-    // this route (popup, direct nav, etc.). Only return JSON when the
-    // caller explicitly wants the URL string.
     if (q.json === "1") return { url };
-    return sendRedirect(event, url, 302);
+    return new Response(null, {
+      status: 302,
+      headers: { Location: url },
+    });
   } catch (err: any) {
     setResponseStatus(event, 500);
     return { error: err?.message ?? "Unknown error" };

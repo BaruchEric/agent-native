@@ -1,10 +1,11 @@
+import { render, screen, cleanup } from "@testing-library/react";
 // @vitest-environment happy-dom
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, cleanup } from "@testing-library/react";
 
 afterEach(() => cleanup());
-import { MemoryRouter } from "react-router";
 import type { ReactNode } from "react";
+import { MemoryRouter } from "react-router";
+
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 vi.mock("@agent-native/core", () => ({
@@ -14,22 +15,75 @@ vi.mock("@agent-native/core", () => ({
       .filter((v) => typeof v === "string" && v.length > 0)
       .join(" "),
 }));
-vi.mock("@agent-native/core/client/extensions", () => ({
-  ExtensionsSidebarSection: () => null,
-}));
-vi.mock("@agent-native/core/client", () => ({
-  // `@/lib/utils` re-exports `cn` from `@agent-native/core/client`, so the
-  // client mock must provide it or components crash on first render.
-  cn: (...args: unknown[]) =>
-    args
-      .flat(Infinity)
-      .filter((v) => typeof v === "string" && v.length > 0)
-      .join(" "),
-  appPath: (path: string) => path,
+vi.mock(
+  import("@agent-native/core/client/api-path"),
+  async (importOriginal) => {
+    const actual = await importOriginal();
+    return {
+      ...actual,
+      appPath: (path: string) => path,
+      agentNativePath: (path: string) => path,
+    };
+  },
+);
+
+vi.mock("@agent-native/toolkit/app/db-admin", () => ({
   DevDatabaseLink: () => null,
+}));
+
+vi.mock("@agent-native/toolkit/app/feedback", () => ({
   FeedbackButton: () => null,
 }));
-vi.mock("@agent-native/core/client/org", () => ({
+
+vi.mock(import("@agent-native/toolkit/app/shared"), async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    openCommandMenu: vi.fn(),
+    AgentNativeIcon: ({
+      size = 24,
+      ...props
+    }: React.SVGProps<SVGSVGElement> & { size?: number | string }) => (
+      <svg data-agent-native-icon width={size} height={size} {...props} />
+    ),
+  };
+});
+
+vi.mock("@agent-native/core/client/i18n", () => ({
+  useT: () => (key: string) =>
+    ({
+      "navigation.brand": "Slides",
+      "navigation.decks": "Decks",
+      "navigation.designSystems": "Design Systems",
+      "navigation.settings": "Settings",
+      "settings.agentTitle": "Manage agent",
+      "sidebar.search": "Search",
+      "sidebar.expandSidebar": "Expand sidebar",
+      "sidebar.collapseSidebar": "Collapse sidebar",
+    })[key] ?? key,
+}));
+vi.mock(import("@agent-native/toolkit/app-shell"), async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    SidebarFooterActions: ({
+      feedback,
+      search,
+      collapse,
+    }: {
+      feedback?: ReactNode;
+      search?: ReactNode;
+      collapse?: ReactNode;
+    }) => (
+      <div>
+        {feedback}
+        {search}
+        {collapse}
+      </div>
+    ),
+  };
+});
+vi.mock("@agent-native/toolkit/app/org", () => ({
   OrgSwitcher: () => null,
 }));
 
@@ -44,14 +98,14 @@ function renderAt(path: string, ui: ReactNode) {
 }
 
 describe("<Sidebar collapsed>", () => {
-  it("renders the icon-only rail (w-12) with an Expand button", () => {
+  it("renders the icon-only rail (md:w-14) with an Expand button", () => {
     const onToggle = vi.fn();
     renderAt("/", <Sidebar collapsed={true} onToggleCollapsed={onToggle} />);
 
     const aside = screen.getByRole("complementary");
-    expect(aside.className).toContain("w-12");
+    expect(aside.className).toContain("md:w-14");
 
-    const expandBtn = screen.getByLabelText("Expand sidebar");
+    const expandBtn = screen.getAllByLabelText("Expand sidebar")[0];
     expect(expandBtn).toBeDefined();
     expandBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     expect(onToggle).toHaveBeenCalledTimes(1);
@@ -64,28 +118,43 @@ describe("<Sidebar collapsed>", () => {
     renderAt("/", <Sidebar collapsed={true} onToggleCollapsed={() => {}} />);
     expect(screen.queryByText("Decks")).toBeNull();
     expect(screen.queryByText("Design Systems")).toBeNull();
-    expect(screen.queryByText("Team")).toBeNull();
+    expect(screen.queryByText("Settings")).toBeNull();
 
     expect(screen.getByLabelText("Decks")).toBeDefined();
     expect(screen.getByLabelText("Design Systems")).toBeDefined();
-    expect(screen.getByLabelText("Team")).toBeDefined();
+    expect(screen.queryByLabelText("Settings")).toBeNull();
   });
 });
 
 describe("<Sidebar expanded>", () => {
-  it("renders the full sidebar (w-56) with the Collapse button and labelled nav", () => {
+  it("uses compact dimensions for the brand mark", () => {
+    const { container } = renderAt(
+      "/",
+      <Sidebar collapsed={false} onToggleCollapsed={() => {}} />,
+    );
+
+    const brandMark = container.querySelector("svg[data-agent-native-icon]");
+
+    expect(brandMark).not.toBeNull();
+    expect(brandMark?.getAttribute("width")).toBe("24");
+    expect(brandMark?.getAttribute("height")).toBe("24");
+    expect(brandMark?.className).toContain("w-6");
+    expect(brandMark?.className).toContain("h-3.5");
+  });
+
+  it("renders the full sidebar (w-[260px]) with the Collapse button and labelled nav", () => {
     const onToggle = vi.fn();
     renderAt("/", <Sidebar collapsed={false} onToggleCollapsed={onToggle} />);
 
     const aside = screen.getByRole("complementary");
-    expect(aside.className).toContain("w-56");
+    expect(aside.className).toContain("w-[260px]");
 
     expect(screen.getByText("Slides")).toBeDefined();
     expect(screen.getByText("Decks")).toBeDefined();
     expect(screen.getByText("Design Systems")).toBeDefined();
-    expect(screen.getByText("Team")).toBeDefined();
+    expect(screen.queryByText("Settings")).toBeNull();
 
-    const collapseBtn = screen.getByLabelText("Collapse sidebar");
+    const collapseBtn = screen.getAllByLabelText("Collapse sidebar")[0];
     collapseBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     expect(onToggle).toHaveBeenCalledTimes(1);
 
@@ -98,11 +167,11 @@ describe("<Sidebar expanded>", () => {
       <Sidebar collapsed={false} onToggleCollapsed={() => {}} />,
     );
 
-    const designSystems = screen.getByText("Design Systems").closest("a")!;
-    const decks = screen.getByText("Decks").closest("a")!;
+    const designSystems = screen.getByText("Design Systems").closest("div")!;
+    const decks = screen.getByText("Decks").closest("div")!;
 
-    expect(designSystems.classList.contains("bg-sidebar-accent")).toBe(true);
-    expect(decks.classList.contains("bg-sidebar-accent")).toBe(false);
+    expect(designSystems.classList.contains("bg-primary/10")).toBe(true);
+    expect(decks.classList.contains("bg-primary/10")).toBe(false);
   });
 });
 
@@ -110,14 +179,12 @@ describe("<Sidebar> without onToggleCollapsed (mobile drawer)", () => {
   it("hides the Collapse button in the expanded layout", () => {
     renderAt("/", <Sidebar collapsed={false} />);
     expect(screen.queryByLabelText("Collapse sidebar")).toBeNull();
-    // Nav still renders.
     expect(screen.getByText("Decks")).toBeDefined();
   });
 
   it("hides the Expand button in the collapsed layout", () => {
     renderAt("/", <Sidebar collapsed={true} />);
     expect(screen.queryByLabelText("Expand sidebar")).toBeNull();
-    // Nav icons still render.
     expect(screen.getByLabelText("Decks")).toBeDefined();
   });
 });
@@ -125,14 +192,13 @@ describe("<Sidebar> without onToggleCollapsed (mobile drawer)", () => {
 describe("<Sidebar> accessibility", () => {
   it("gives icon-only controls aria-labels", () => {
     renderAt("/", <Sidebar collapsed={true} onToggleCollapsed={() => {}} />);
-    expect(screen.getByLabelText("Expand sidebar")).toBeDefined();
+    expect(screen.getAllByLabelText("Expand sidebar")).toHaveLength(1);
     expect(screen.getByLabelText("Decks")).toBeDefined();
     expect(screen.getByLabelText("Design Systems")).toBeDefined();
-    expect(screen.getByLabelText("Team")).toBeDefined();
   });
 
   it("labels the Collapse button in the expanded layout", () => {
     renderAt("/", <Sidebar collapsed={false} onToggleCollapsed={() => {}} />);
-    expect(screen.getByLabelText("Collapse sidebar")).toBeDefined();
+    expect(screen.getAllByLabelText("Collapse sidebar")).toHaveLength(1);
   });
 });

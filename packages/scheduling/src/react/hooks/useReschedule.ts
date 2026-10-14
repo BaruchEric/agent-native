@@ -1,8 +1,5 @@
-/**
- * useReschedule — fetch an existing booking + drive the Booker through a
- * reschedule flow that replaces its start/end time.
- */
 import { useEffect, useState } from "react";
+
 import type { Booking } from "../../shared/index.js";
 
 export interface UseRescheduleOpts {
